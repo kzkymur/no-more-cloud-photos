@@ -11,6 +11,7 @@ type ErrorCode string
 const (
 	CodeInvalidID         ErrorCode = "invalid_id"
 	CodeInvalidRequest    ErrorCode = "invalid_request"
+	CodeInvalidCursor     ErrorCode = "invalid_cursor"
 	CodeInvalidProfile    ErrorCode = "invalid_profile"
 	CodeMediaNotFound     ErrorCode = "media_not_found"
 	CodeOriginalNotFound  ErrorCode = "original_not_found"
@@ -88,6 +89,10 @@ func NewInvalidRequest(fields map[string]string) *SemanticError {
 		details["fields"] = copied
 	}
 	return semanticError(KindInvalidRequest, http.StatusBadRequest, CodeInvalidRequest, "request is invalid", details, nil)
+}
+
+func NewInvalidCursor() *SemanticError {
+	return semanticError(KindInvalidRequest, http.StatusBadRequest, CodeInvalidCursor, "cursor is invalid for this query", nil, nil)
 }
 
 func NewInvalidProfile(profile string) *SemanticError {
