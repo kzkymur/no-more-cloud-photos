@@ -676,31 +676,71 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 
 	t.Run("reentrant advisory lock is fully released", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
-		sql := fmt.Sprintf("SELECT pg_catalog.pg_advisory_lock(%d)", migrationLockKey)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// Reserve the observer before Up so it cannot be the migration backend.
+		verifier, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("acquire lock observer: %v", err)
+		}
+		defer verifier.Release()
+		// Record the actual executor, rather than guessing which pooled connection
+		// Up used. The table lives in this test's isolated schema.
+		sql := fmt.Sprintf(`
+			CREATE TABLE migration_backend AS SELECT pg_catalog.pg_backend_pid() AS pid;
+			SELECT pg_catalog.pg_advisory_lock(%d)`, migrationLockKey)
 		migrator := newMigrator(pool, []migration{testMigration(1, "reentrant_lock", sql)})
-		if err := migrator.Up(context.Background()); err != nil {
+		if err := migrator.Up(ctx); err != nil {
 			t.Fatalf("Up() error = %v", err)
 		}
+		var migrationPID int32
+		if err := verifier.QueryRow(ctx, `SELECT pid FROM migration_backend`).Scan(&migrationPID); err != nil {
+			t.Fatalf("read migration backend PID: %v", err)
+		}
+		if backendHasAdvisoryLocks(t, ctx, verifier, migrationPID) {
+			t.Fatalf("migration backend %d retained advisory locks after Up", migrationPID)
+		}
 
-		first, err := pool.Acquire(context.Background())
+		// A legitimate foreign holder of the same database-global key must not
+		// look like our migration leaked. Use a new physical session, not the pool.
+		foreign, err := pgx.Connect(ctx, databaseURL)
 		if err != nil {
-			t.Fatalf("acquire first connection: %v", err)
+			t.Fatalf("connect foreign lock holder: %v", err)
 		}
-		defer first.Release()
-		second, err := pool.Acquire(context.Background())
-		if err != nil {
-			t.Fatalf("acquire independent lock-check connection: %v", err)
+		defer foreign.Close(context.Background())
+		if _, err := foreign.Exec(ctx, `SELECT pg_catalog.pg_advisory_lock($1)`, migrationLockKey); err != nil {
+			t.Fatalf("acquire foreign migration lock: %v", err)
 		}
-		defer second.Release()
+		if backendHasAdvisoryLocks(t, ctx, verifier, migrationPID) {
+			t.Fatal("foreign holder was misidentified as a migration lock leak")
+		}
 		var acquired bool
-		if err := second.QueryRow(context.Background(), `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&acquired); err != nil {
-			t.Fatalf("try advisory lock from independent session: %v", err)
+		if err := verifier.QueryRow(ctx, `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&acquired); err != nil {
+			t.Fatalf("try lock held by foreign backend: %v", err)
 		}
-		if !acquired {
-			t.Fatal("reentrant migration lock remained held after Up")
+		if acquired {
+			_, _ = verifier.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock_all()`)
+			t.Fatal("foreign holder did not exclude the old one-shot lock probe")
 		}
-		if _, err := second.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock_all()`); err != nil {
-			t.Fatalf("release independent lock: %v", err)
+
+		// Positive control: one unlock of a twice-acquired lock leaves a real
+		// reentrant leak. The same observer predicate must detect that remainder.
+		if _, err := foreign.Exec(ctx, `SELECT pg_catalog.pg_advisory_lock($1)`, migrationLockKey); err != nil {
+			t.Fatalf("reenter control lock: %v", err)
+		}
+		var unlocked bool
+		if err := foreign.QueryRow(ctx, `SELECT pg_catalog.pg_advisory_unlock($1)`, migrationLockKey).Scan(&unlocked); err != nil || !unlocked {
+			t.Fatalf("release one control lock acquisition: unlocked=%t, err=%v", unlocked, err)
+		}
+		foreignPID := int32(foreign.PgConn().PID())
+		if !backendHasAdvisoryLocks(t, ctx, verifier, foreignPID) {
+			t.Fatal("observer missed an intentionally retained reentrant lock")
+		}
+		if _, err := foreign.Exec(ctx, `SELECT pg_catalog.pg_advisory_unlock_all()`); err != nil {
+			t.Fatalf("release control locks: %v", err)
+		}
+		if backendHasAdvisoryLocks(t, ctx, verifier, foreignPID) {
+			t.Fatal("observer reported a leak after control locks were released")
 		}
 	})
 
@@ -795,6 +835,21 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 			t.Fatalf("Up() error = %v, want ErrInvalidMigrationHistory", err)
 		}
 	})
+}
+
+func backendHasAdvisoryLocks(t *testing.T, ctx context.Context, verifier *pgxpool.Conn, pid int32) bool {
+	t.Helper()
+	if pid <= 0 || uint32(pid) == verifier.Conn().PgConn().PID() {
+		t.Fatalf("lock observation requires a distinct backend, got PID %d", pid)
+	}
+	var held bool
+	if err := verifier.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_catalog.pg_locks WHERE locktype='advisory' AND pid=$1
+		)`, pid).Scan(&held); err != nil {
+		t.Fatalf("observe advisory locks for backend %d: %v", pid, err)
+	}
+	return held
 }
 
 func assertProfileMigrationRolledBack(t *testing.T, pool *pgxpool.Pool, profileCount int) {
