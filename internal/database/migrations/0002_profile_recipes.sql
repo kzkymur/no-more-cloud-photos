@@ -300,7 +300,7 @@ $$;
 
 CREATE FUNCTION nmcp_profile_recipe_certified(
     profile_processor text, schema_version integer, mime_value text,
-    source_mode text, recipe jsonb
+    recipe_source_mode text, recipe jsonb
 )
 RETURNS boolean
 LANGUAGE plpgsql
@@ -318,7 +318,7 @@ BEGIN
             WHERE certification.processor = profile_processor
               AND certification.parameters_schema_version = schema_version
               AND certification.input_mime_type = mime_value
-              AND certification.source_mode = source_mode
+              AND certification.source_mode = recipe_source_mode
               AND certification.output_kind = 'still-avif'
               AND certification.max_long_edge >= max_edge
               AND setting BETWEEN certification.minimum_setting AND certification.maximum_setting
@@ -331,7 +331,7 @@ BEGIN
             WHERE certification.processor = profile_processor
               AND certification.parameters_schema_version = schema_version
               AND certification.input_mime_type = mime_value
-              AND certification.source_mode = source_mode
+              AND certification.source_mode = recipe_source_mode
               AND certification.output_kind = 'animation-webp'
               AND certification.max_long_edge >= max_edge
               AND setting BETWEEN certification.minimum_setting AND certification.maximum_setting
@@ -344,7 +344,7 @@ BEGIN
             WHERE certification.processor = profile_processor
               AND certification.parameters_schema_version = schema_version
               AND certification.input_mime_type = mime_value
-              AND certification.source_mode = source_mode
+              AND certification.source_mode = recipe_source_mode
               AND certification.output_kind = 'video-av1'
               AND certification.max_long_edge >= max_edge
               AND setting BETWEEN certification.minimum_setting AND certification.maximum_setting
