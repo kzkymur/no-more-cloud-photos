@@ -132,10 +132,13 @@ func TestReadHTTPPostgreSQLIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("empty jobs and bundled profiles through HTTP", func(t *testing.T) {
+	t.Run("job list and bundled profiles through HTTP", func(t *testing.T) {
 		response := serve(handler, http.MethodGet, "/jobs?media_id="+mediaID, "pg-http-jobs")
 		assertResponse(t, response, http.StatusOK, "pg-http-jobs")
-		assertJSON(t, response, map[string]any{"items": []any{}, "next_cursor": nil})
+		var jobs readapi.JobPage
+		if err := json.Unmarshal(response.Body.Bytes(), &jobs); err != nil || len(jobs.Items) != 1 || jobs.Items[0].ID != jobID || jobs.NextCursor != nil {
+			t.Fatalf("job page = %#v, %v", jobs, err)
+		}
 
 		response = serve(handler, http.MethodGet, "/profiles?status=draft", "pg-http-profiles")
 		assertResponse(t, response, http.StatusOK, "pg-http-profiles")
