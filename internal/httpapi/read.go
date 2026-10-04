@@ -68,14 +68,13 @@ func matchReadRoute(path string) (readRoute, bool) {
 }
 
 func (h *handler) read(w http.ResponseWriter, r *http.Request, requestID string, route readRoute) {
-	if !acceptsJSON(r.Header.Get("Accept")) {
-		closeIfDeclaredBody(w, r)
-		writeError(w, http.StatusNotAcceptable, "not_acceptable", "JSON response is not acceptable", requestID)
-		return
-	}
 	if readRequestHasBody(r) {
 		closeUploadConnection(w, r)
 		h.writeReadError(w, requestID, readapi.NewInvalidRequest(map[string]string{"body": "invalid"}))
+		return
+	}
+	if !acceptsJSON(r.Header.Get("Accept")) {
+		writeError(w, http.StatusNotAcceptable, "not_acceptable", "JSON response is not acceptable", requestID)
 		return
 	}
 

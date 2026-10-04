@@ -242,9 +242,9 @@ func TestReadQueriesAreStrict(t *testing.T) {
 	}
 }
 
-func TestReadNegotiationBodyAndUnavailablePrecedeService(t *testing.T) {
+func TestReadBodyNegotiationAndUnavailablePrecedeService(t *testing.T) {
 	reads := &recordingReadService{}
-	request := httptest.NewRequest(http.MethodGet, "/media?limit=bad", strings.NewReader("body"))
+	request := httptest.NewRequest(http.MethodGet, "/media?limit=bad", nil)
 	request.Header.Set("Accept", "text/plain")
 	request.Header.Set("X-Request-ID", "accept-first")
 	response := httptest.NewRecorder()
@@ -253,6 +253,7 @@ func TestReadNegotiationBodyAndUnavailablePrecedeService(t *testing.T) {
 	assertError(t, response, "not_acceptable", "accept-first")
 
 	request = httptest.NewRequest(http.MethodGet, "/media", strings.NewReader("x"))
+	request.Header.Set("Accept", "text/plain")
 	request.Header.Set("X-Request-ID", "body-request")
 	response = httptest.NewRecorder()
 	NewHandler(Dependencies{Reads: reads}).ServeHTTP(response, request)
