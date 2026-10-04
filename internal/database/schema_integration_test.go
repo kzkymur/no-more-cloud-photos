@@ -411,6 +411,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		close(deleteStart)
 		assertConcurrentFailures(t, deleteResults, 2)
 		expectExecError(t, pool, `DELETE FROM jobs WHERE id=$1`, deleteJobID)
+		expectExecError(t, pool, `UPDATE jobs SET original_id=NULL WHERE id=$1`, deleteJobID)
+		expectExecError(t, pool, `TRUNCATE job_targets CASCADE`)
+		expectExecError(t, pool, `TRUNCATE jobs CASCADE`)
 
 		if _, err := pool.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID); err != nil {
 			t.Fatalf("physically purge media: %v", err)
