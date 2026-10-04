@@ -62,6 +62,17 @@ func (e *OutcomeUnknown) ResponseBody(requestID string) json.RawMessage {
 	return (&Failure{Status: 503, Code: "unavailable", Message: "service is temporarily unavailable", Cause: e.Cause}).ResponseBody(requestID)
 }
 
+// CommitRolledBack means PostgreSQL proved that COMMIT rolled the transaction
+// back. A published final file must remain for retry/reconciliation.
+type CommitRolledBack struct{ Cause error }
+
+func (e *CommitRolledBack) Error() string   { return "upload commit was rolled back" }
+func (e *CommitRolledBack) Unwrap() error   { return e.Cause }
+func (e *CommitRolledBack) HTTPStatus() int { return 503 }
+func (e *CommitRolledBack) ResponseBody(requestID string) json.RawMessage {
+	return (&Failure{Status: 503, Code: "unavailable", Message: "service is temporarily unavailable", Cause: e.Cause}).ResponseBody(requestID)
+}
+
 type errorResponse struct {
 	Error errorDetail `json:"error"`
 }

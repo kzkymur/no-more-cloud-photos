@@ -1024,6 +1024,18 @@ func (store *Store) Probe(ctx context.Context) (returnErr error) {
 	return nil
 }
 
+// DatabaseCheckpoint exposes only the two upload commit fault boundaries to
+// database coordination code. General fault injection remains internal.
+func (store *Store) DatabaseCheckpoint(ctx context.Context, boundary Boundary, key string) error {
+	phase := Before
+	if boundary == BoundaryAfterDBCommit {
+		phase = After
+	} else if boundary != BoundaryBeforeDBCommit {
+		return ErrInvalidDatabaseBoundary
+	}
+	return store.inject(ctx, boundary, phase, key, 0)
+}
+
 func (store *Store) inject(ctx context.Context, boundary Boundary, phase Phase, key string, depth int) error {
 	return Inject(ctx, store.faults, FaultEvent{Boundary: boundary, Phase: phase, Key: key, Depth: depth})
 }

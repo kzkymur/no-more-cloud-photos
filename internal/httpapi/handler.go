@@ -122,10 +122,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.ready(w, r, requestID)
 	case "/media":
 		if r.Method != http.MethodPost {
+			closeUploadConnection(w, r)
 			h.methodNotAllowed(w, requestID, http.MethodPost)
 			return
 		}
 		if !acceptsJSON(r.Header.Get("Accept")) {
+			closeUploadConnection(w, r)
 			writeError(w, http.StatusNotAcceptable, "not_acceptable", "JSON response is not acceptable", requestID)
 			return
 		}
@@ -178,12 +180,14 @@ func (h *handler) methodNotAllowed(w http.ResponseWriter, requestID, allow strin
 func (h *handler) upload(w http.ResponseWriter, r *http.Request, requestID string) {
 	keyValues, keyPresent := r.Header[http.CanonicalHeaderKey("Idempotency-Key")]
 	if !keyPresent {
+		closeUploadConnection(w, r)
 		writeUploadFailure(w, requestID, &upload.Failure{
 			Status: http.StatusBadRequest, Code: "missing_idempotency_key", Message: "idempotency key is required",
 		})
 		return
 	}
 	if len(keyValues) != 1 || upload.ValidateIdempotencyKey(keyValues[0]) != nil {
+		closeUploadConnection(w, r)
 		writeUploadFailure(w, requestID, &upload.Failure{
 			Status: http.StatusBadRequest, Code: "invalid_idempotency_key", Message: "idempotency key is invalid",
 		})
@@ -192,10 +196,12 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request, requestID strin
 
 	boundary, err := multipartBoundary(r.Header.Values("Content-Type"))
 	if err != nil {
+		closeUploadConnection(w, r)
 		writeUploadFailure(w, requestID, invalidMultipart("Content-Type must be multipart/form-data with a valid boundary", err))
 		return
 	}
 	if h.dependencies.Upload == nil {
+		closeUploadConnection(w, r)
 		writeUploadFailure(w, requestID, &upload.Failure{
 			Status: http.StatusServiceUnavailable, Code: "unavailable", Message: "service is temporarily unavailable",
 		})
@@ -292,9 +298,14 @@ func (h *handler) writeUploadResult(w http.ResponseWriter, r *http.Request, cont
 
 func closeUploadConnectionOnTooLarge(w http.ResponseWriter, r *http.Request, status int) {
 	if status == http.StatusRequestEntityTooLarge {
-		w.Header().Set("Connection", "close")
-		r.Close = true
+		closeUploadConnection(w, r)
 	}
+}
+
+func closeUploadConnection(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Connection", "close")
+	r.Close = true
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 }
 
 func multipartBoundary(values []string) (string, error) {

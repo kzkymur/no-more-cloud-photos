@@ -1,6 +1,11 @@
 -- Tighten upload MIME invariants without rewriting the immutable initial
 -- schema. Existing valid rows are preserved; incompatible rows stop upgrade.
 
+-- Take the strongest lock needed by the later DDL up front, in parent-before-child
+-- order. ACCESS EXCLUSIVE conflicts with legacy INSERT/UPDATE/DELETE writers, and
+-- the transactional migrator holds both locks through preflight and installation.
+LOCK TABLE media, originals IN ACCESS EXCLUSIVE MODE;
+
 DO $$
 DECLARE
     invalid_media record;

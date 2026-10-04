@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/kzkymur/no-more-cloud-photos/internal/metadata"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
@@ -264,6 +265,27 @@ func TestServiceAcceptPreservesPublishedFileOnUnknownCommit(t *testing.T) {
 	}
 }
 
+func TestCommitErrorClassification(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		commitErr  error
+		rolledBack bool
+	}{
+		{name: "explicit rollback", commitErr: pgx.ErrTxCommitRollback, rolledBack: true},
+		{name: "server error response", commitErr: &pgconn.PgError{Code: "23514", Message: "deferred constraint failed"}, rolledBack: true},
+		{name: "connection loss", commitErr: errors.New("connection lost")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := commitUpload(context.Background(), commitErrorTx{commitErr: test.commitErr})
+			var rolledBack *CommitRolledBack
+			var unknown *OutcomeUnknown
+			if errors.As(err, &rolledBack) != test.rolledBack || errors.As(err, &unknown) == test.rolledBack {
+				t.Fatalf("commitUpload() error = %#v, rolled back=%v", err, test.rolledBack)
+			}
+		})
+	}
+}
+
 func TestServiceAcceptDoesNotAbortPublishedPublishFailure(t *testing.T) {
 	publishErr := &storage.PublishError{Published: true, Uncertain: true}
 	temporary := &fakeStagedOriginal{publishErr: publishErr}
@@ -476,6 +498,14 @@ func (r *fakeAcceptanceRepository) Finalize(ctx context.Context, input acceptanc
 type bodyErrorReader struct{}
 
 func (bodyErrorReader) Read([]byte) (int, error) { return 0, errors.New("body read failed") }
+
+type commitErrorTx struct {
+	pgx.Tx
+	commitErr error
+}
+
+func (tx commitErrorTx) Commit(context.Context) error { return tx.commitErr }
+func (commitErrorTx) Conn() *pgx.Conn                 { return nil }
 
 func testService(store originalStore, prober metadataProber, repository acceptanceRepository) *Service {
 	service := newService(store, prober, repository)

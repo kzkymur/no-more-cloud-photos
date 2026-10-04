@@ -301,6 +301,12 @@ func TestRepositoryIntegrationMaintenanceAndTimezoneRejection(t *testing.T) {
 
 func uploadIntegrationRepository(t *testing.T) (*pgxpool.Pool, *pgRepository) {
 	t.Helper()
+	pool := uploadIntegrationPool(t, nil)
+	return pool, newPGRepository(pool, nil)
+}
+
+func uploadIntegrationPool(t *testing.T, configure func(*pgxpool.Config, *pgxpool.Pool)) *pgxpool.Pool {
+	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
 		databaseURL = os.Getenv("NMCP_TEST_DATABASE_URL")
@@ -309,7 +315,14 @@ func uploadIntegrationRepository(t *testing.T) (*pgxpool.Pool, *pgRepository) {
 		t.Skip("TEST_DATABASE_URL is not set")
 	}
 	ctx := context.Background()
-	base, err := pgxpool.New(ctx, databaseURL)
+	baseConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseConfig.MaxConns < 2 {
+		baseConfig.MaxConns = 2
+	}
+	base, err := pgxpool.NewWithConfig(ctx, baseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,6 +350,9 @@ func uploadIntegrationRepository(t *testing.T) (*pgxpool.Pool, *pgRepository) {
 		_, err := connection.Exec(ctx, `SELECT pg_catalog.set_config('search_path',$1,false)`, schema+",pg_catalog,pg_temp")
 		return err
 	}
+	if configure != nil {
+		configure(config, base)
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		t.Fatal(err)
@@ -349,7 +365,7 @@ func uploadIntegrationRepository(t *testing.T) (*pgxpool.Pool, *pgRepository) {
 	if err := migrator.Up(ctx); err != nil {
 		t.Fatal(err)
 	}
-	return pool, newPGRepository(pool)
+	return pool
 }
 
 func assertUploadRowCounts(t *testing.T, pool *pgxpool.Pool, media, originals, jobs, events, idempotency int) {

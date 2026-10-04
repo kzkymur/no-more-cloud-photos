@@ -212,18 +212,23 @@ func TestWriteFaultPhasesAreInjectable(t *testing.T) {
 	}
 }
 
-func TestSharedDatabaseCommitBoundaries(t *testing.T) {
+func TestStoreDatabaseCheckpointRestrictsBoundaries(t *testing.T) {
 	var got []FaultEvent
-	injector := FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+	store := openTestStore(t, t.TempDir(), Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
 		got = append(got, event)
 		return nil
-	})
+	})})
+	key := testOriginalKey(t).String()
 	for _, boundary := range []Boundary{BoundaryBeforeDBCommit, BoundaryAfterDBCommit} {
-		if err := Inject(context.Background(), injector, FaultEvent{Boundary: boundary, Phase: Before, Key: testOriginalKey(t).String()}); err != nil {
+		if err := store.DatabaseCheckpoint(context.Background(), boundary, key); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if len(got) != 2 || got[0].Boundary != BoundaryBeforeDBCommit || got[1].Boundary != BoundaryAfterDBCommit {
+	if err := store.DatabaseCheckpoint(context.Background(), BoundaryRename, key); !errors.Is(err, ErrInvalidDatabaseBoundary) {
+		t.Fatalf("non-DB checkpoint error = %v", err)
+	}
+	if len(got) != 2 || got[0] != (FaultEvent{Boundary: BoundaryBeforeDBCommit, Phase: Before, Key: key}) ||
+		got[1] != (FaultEvent{Boundary: BoundaryAfterDBCommit, Phase: After, Key: key}) {
 		t.Fatalf("DB boundary events = %v", got)
 	}
 }

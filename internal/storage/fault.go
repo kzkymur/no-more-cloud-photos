@@ -1,6 +1,11 @@
 package storage
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+var ErrInvalidDatabaseBoundary = errors.New("invalid storage database boundary")
 
 type Boundary string
 

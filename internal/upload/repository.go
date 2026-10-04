@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/metadata"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 const transformMaxAttempts = 3
@@ -31,12 +33,13 @@ type acceptanceRepository interface {
 }
 
 type pgRepository struct {
-	db    database
-	newID func() (string, error)
+	db         database
+	newID      func() (string, error)
+	checkpoint func(context.Context, storage.Boundary, string) error
 }
 
-func newPGRepository(pool *pgxpool.Pool) *pgRepository {
-	return &pgRepository{db: pool, newID: NewUUIDv4}
+func newPGRepository(pool *pgxpool.Pool, checkpoint func(context.Context, storage.Boundary, string) error) *pgRepository {
+	return &pgRepository{db: pool, newID: NewUUIDv4, checkpoint: checkpoint}
 }
 
 type acceptance struct {
@@ -130,8 +133,8 @@ func (r *pgRepository) Finalize(ctx context.Context, input acceptance, publish f
 		if err := insertIdempotency(ctx, tx, input.Key, requestHash, 409, body, &existingMediaID); err != nil {
 			return Outcome{}, err
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return Outcome{}, &OutcomeUnknown{Cause: err}
+		if err := commitUpload(ctx, tx); err != nil {
+			return Outcome{}, err
 		}
 		return Outcome{Status: 409, Body: body}, nil
 	}
@@ -200,10 +203,34 @@ func (r *pgRepository) Finalize(ctx context.Context, input acceptance, publish f
 	if err := insertIdempotency(ctx, tx, input.Key, requestHash, 201, body, &input.MediaID); err != nil {
 		return Outcome{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return Outcome{}, &OutcomeUnknown{Cause: err}
+	if r.checkpoint != nil {
+		if err := r.checkpoint(ctx, storage.BoundaryBeforeDBCommit, relativePath); err != nil {
+			return Outcome{}, err
+		}
+	}
+	if err := commitUpload(ctx, tx); err != nil {
+		return Outcome{}, err
+	}
+	if r.checkpoint != nil {
+		if err := r.checkpoint(ctx, storage.BoundaryAfterDBCommit, relativePath); err != nil {
+			return Outcome{}, &OutcomeUnknown{Cause: err}
+		}
 	}
 	return Outcome{Status: 201, Body: body}, nil
+}
+
+func commitUpload(ctx context.Context, tx pgx.Tx) error {
+	if err := tx.Commit(ctx); err != nil {
+		// A server ErrorResponse to COMMIT and pgx's explicit rollback result
+		// both prove that COMMIT did not succeed. Connection, protocol, and
+		// context errors remain indeterminate; TxStatus is not sufficient proof.
+		var pgError *pgconn.PgError
+		if errors.Is(err, pgx.ErrTxCommitRollback) || errors.As(err, &pgError) {
+			return &CommitRolledBack{Cause: err}
+		}
+		return &OutcomeUnknown{Cause: err}
+	}
+	return nil
 }
 
 type timezoneChangedError struct{ Timezone string }

@@ -66,7 +66,7 @@ func NewService(db *pgxpool.Pool, store *storage.Store, prober *metadata.Prober)
 	if db == nil || store == nil || prober == nil {
 		return nil, errors.New("upload service dependencies must not be nil")
 	}
-	return newService(storageAdapter{store}, prober, newPGRepository(db)), nil
+	return newService(storageAdapter{store}, prober, newPGRepository(db, store.DatabaseCheckpoint)), nil
 }
 
 func newService(store originalStore, prober metadataProber, repository acceptanceRepository) *Service {
@@ -199,6 +199,10 @@ func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) 
 		var unknown *OutcomeUnknown
 		if errors.As(finalizeErr, &unknown) {
 			return Outcome{}, unknown
+		}
+		var rolledBack *CommitRolledBack
+		if errors.As(finalizeErr, &rolledBack) {
+			return Outcome{}, rolledBack
 		}
 		var failure *Failure
 		if errors.As(finalizeErr, &failure) {

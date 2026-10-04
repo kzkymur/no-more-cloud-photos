@@ -1,11 +1,13 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -621,6 +623,101 @@ func TestUploadRejectsDuplicateIdempotencyKey(t *testing.T) {
 	assertError(t, response, "invalid_idempotency_key", "duplicate-key-request")
 	if len(acceptor.requests) != 0 {
 		t.Fatalf("service called %d times", len(acceptor.requests))
+	}
+}
+
+func TestUploadEarlyRejectionsCloseTricklingHTTP11Connection(t *testing.T) {
+	tests := []struct {
+		name        string
+		method      string
+		accept      string
+		key         *string
+		contentType string
+		nilUpload   bool
+		wantStatus  int
+	}{
+		{name: "wrong method", method: http.MethodPut, key: stringPointerTest("key"), contentType: "multipart/form-data; boundary=b", wantStatus: http.StatusMethodNotAllowed},
+		{name: "unacceptable response", method: http.MethodPost, accept: "text/plain", key: stringPointerTest("key"), contentType: "multipart/form-data; boundary=b", wantStatus: http.StatusNotAcceptable},
+		{name: "missing key", method: http.MethodPost, contentType: "multipart/form-data; boundary=b", wantStatus: http.StatusBadRequest},
+		{name: "invalid key", method: http.MethodPost, key: stringPointerTest("bad key"), contentType: "multipart/form-data; boundary=b", wantStatus: http.StatusBadRequest},
+		{name: "invalid content type", method: http.MethodPost, key: stringPointerTest("key"), contentType: "application/json", wantStatus: http.StatusBadRequest},
+		{name: "missing boundary", method: http.MethodPost, key: stringPointerTest("key"), contentType: "multipart/form-data", wantStatus: http.StatusBadRequest},
+		{name: "nil upload", method: http.MethodPost, key: stringPointerTest("key"), contentType: "multipart/form-data; boundary=b", nilUpload: true, wantStatus: http.StatusServiceUnavailable},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dependencies := Dependencies{Upload: &fakeUploadAcceptor{}}
+			if test.nilUpload {
+				dependencies.Upload = nil
+			}
+			closed := make(chan struct{}, 1)
+			server := httptest.NewUnstartedServer(NewHandler(dependencies))
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateClosed {
+					closed <- struct{}{}
+				}
+			}
+			server.Start()
+			t.Cleanup(server.Close)
+
+			connection, err := net.DialTimeout("tcp", server.Listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = connection.Close() })
+			if err := connection.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			var request strings.Builder
+			request.WriteString(test.method + " /media HTTP/1.1\r\n")
+			request.WriteString("Host: example.test\r\n")
+			request.WriteString("Transfer-Encoding: chunked\r\n")
+			request.WriteString("X-Request-ID: trickle-request\r\n")
+			if test.accept != "" {
+				request.WriteString("Accept: " + test.accept + "\r\n")
+			}
+			if test.key != nil {
+				request.WriteString("Idempotency-Key: " + *test.key + "\r\n")
+			}
+			if test.contentType != "" {
+				request.WriteString("Content-Type: " + test.contentType + "\r\n")
+			}
+			request.WriteString("\r\n1\r\nx\r\n") // Deliberately omit the terminal chunk.
+
+			started := time.Now()
+			if _, err := io.WriteString(connection, request.String()); err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(connection)
+			response, err := http.ReadResponse(reader, &http.Request{Method: test.method})
+			if err != nil {
+				t.Fatalf("read early response: %v", err)
+			}
+			_, readErr := io.Copy(io.Discard, response.Body)
+			closeErr := response.Body.Close()
+			if err := errors.Join(readErr, closeErr); err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
+			if elapsed := time.Since(started); elapsed > 2*time.Second {
+				t.Fatalf("early response took %v", elapsed)
+			}
+			if response.StatusCode != test.wantStatus {
+				t.Fatalf("status = %d, want %d", response.StatusCode, test.wantStatus)
+			}
+			if !response.Close {
+				t.Fatal("HTTP/1.1 response did not signal connection close")
+			}
+			if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+				t.Fatalf("connection remained open after early response: %v", err)
+			}
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("server connection did not reach closed state")
+			}
+		})
 	}
 }
 
