@@ -1,0 +1,89 @@
+erDiagram
+    direction LR
+    accTitle: Core ER（レビュー案）
+    accDescr: Mediaは論理写真・動画1件。原本と1対1。変換ジョブのtargetsがプロファイルの特定版を固定し、renditionsはMediaに属してtargetが生成した実ファイルの履歴を保持する。system_configは保持期間、既定timezone、DB backup間隔と保持日数を型付き列で持つsingleton。
+    media ||--|| originals : has
+    originals o|--o{ jobs : input
+    media ||--o{ renditions : owns
+    jobs ||--o{ job_targets : requests
+    profiles ||--o{ job_targets : pins
+    job_targets ||--o{ renditions : generates
+
+    system_config {
+        smallint id PK "always 1 CHECK"
+        integer deleted_media_retention_days "nullable nonnegative"
+        integer superseded_rendition_retention_days "nullable nonnegative"
+        text default_timezone "NOT NULL IANA default Asia/Tokyo"
+        integer db_backup_interval_hours "positive default 24"
+        integer db_backup_retention_days "positive default 30"
+        timestamptz updated_at
+    }
+
+    media {
+        uuid id PK
+        text media_type
+        timestamptz taken_at "nullable"
+        text taken_at_source "embedded offset or config"
+        text taken_at_timezone "nullable IANA name"
+        timestamptz created_at
+        timestamptz deleted_at "nullable"
+        timestamptz purge_after "nullable"
+    }
+    originals {
+        uuid id PK
+        uuid media_id FK,UK
+        char64 sha256 UK
+        text original_filename
+        text original_path UK
+        text mime_type
+        bigint size_bytes
+        integer width
+        integer height
+        timestamptz created_at
+        jsonb exif_json
+    }
+    jobs {
+        uuid id PK
+        text type "transform or purge"
+        uuid original_id FK "nullable SET NULL"
+        uuid media_id_snapshot
+        text status
+        integer attempts
+        integer max_attempts
+        timestamptz available_at
+        timestamptz lease_expires_at "nullable"
+        uuid lease_token "nullable"
+        timestamptz started_at "nullable"
+        text last_error "nullable"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    profiles {
+        uuid id PK
+        text key
+        integer version ">= 1"
+        text status
+        text_array input_mime_types "nonempty exact MIME set"
+        jsonb parameters
+        timestamptz created_at
+    }
+    job_targets {
+        uuid id PK
+        uuid job_id FK
+        uuid profile_id FK
+        text status
+        text last_error "nullable"
+    }
+    renditions {
+        uuid id PK
+        uuid media_id FK
+        uuid job_target_id FK
+        boolean is_current
+        timestamptz purge_after "nullable"
+        text relative_path UK
+        text mime_type
+        integer width
+        integer height
+        bigint size_bytes
+        timestamptz created_at
+    }

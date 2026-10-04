@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>写真管理システム｜責務整理</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f7fa; color: #203047; font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif; line-height: 1.8; }
+    main { width: min(100% - 40px, 1100px); margin: 48px auto; }
+    h1 { margin: 0 0 12px; font-size: clamp(1.4rem, 4vw, 2rem); line-height: 1.5; }
+    h2 { margin: 0 0 8px; font-size: 1.15rem; }
+    h3 { margin: 14px 0 4px; font-size: 1rem; }
+    p { margin: 0; font-size: .95rem; }
+    p + p { margin-top: 8px; }
+    a { color: #245d91; }
+    .lead { margin-bottom: 22px; padding: 14px 18px; background: #e5eef8; border-radius: 10px; }
+    .features { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-bottom: 14px; }
+    .features section, .panel { padding: 20px 24px; background: #fff; border: 1px solid #e0e6ed; border-radius: 12px; }
+    .app-functions { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+    .layers { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .layers section { padding: 20px 24px; border-radius: 12px; }
+    .searcher { background: #e5eef8; border: 1px solid #cbdced; }
+    .core { background: #203c59; color: #fff; }
+    .block { margin-top: 28px; }
+    .scroll { overflow-x: auto; background: #fff; border: 1px solid #e0e6ed; border-radius: 12px; margin-top: 10px; }
+    .scroll:focus-visible, summary:focus-visible { outline: 2px solid #203c59; outline-offset: 3px; }
+    .diagram-scroll { padding: 16px; }
+    .diagram-scroll img { display: block; width: 100%; min-width: 1050px; height: auto; }
+    .er-scroll img { min-width: 1700px; }
+    .figure-links { margin-top: 6px; font-size: .85rem; }
+    table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: .9rem; }
+    th, td { padding: 9px 14px; border-bottom: 1px solid #e0e6ed; text-align: left; vertical-align: top; }
+    th { background: #e5eef8; }
+    td:first-child { font-weight: 600; white-space: nowrap; }
+    details { margin-top: 12px; padding: 12px 16px; background: #fff; border: 1px solid #e0e6ed; border-radius: 10px; }
+    summary { cursor: pointer; font-weight: 600; }
+    details p:first-of-type { margin-top: 8px; }
+    ul { margin: 8px 0 0; padding-left: 22px; }
+    li { margin-top: 5px; font-size: .9rem; }
+    code { font-size: .88em; overflow-wrap: anywhere; }
+    pre { padding: 12px; background: #f5f7fa; overflow-x: auto; line-height: 1.7; font-size: .85rem; }
+    pre code { overflow-wrap: normal; }
+    .note { margin-top: 8px; font-size: .9rem; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 0 0 18px; font-size: .9rem; }
+    .callout { margin-top: 12px; padding: 14px 18px; background: #fff8e8; border: 1px solid #efd79c; border-radius: 10px; }
+    @media (max-width: 600px) {
+      main { width: calc(100% - 28px); margin: 24px auto; }
+      .features, .layers, .app-functions { grid-template-columns: 1fr; gap: 10px; }
+      .features section, .layers section, .panel { padding: 16px 18px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <nav aria-label="資料ナビゲーション"><strong>資料:</strong> <a href="architecture.html" aria-current="page">全体アーキテクチャ</a> <a href="worker-spec.html">Core Worker仕様</a> <a href="wishlist.html">やりたいことリスト</a></nav>
+  <h1>写真管理システム｜責務整理</h1>
+  <p class="lead"><strong>Mediaを一覧し、profile keyで生成物を選んで添付。原本は明示取得。</strong><br><code>standard</code>／<code>thumbnail</code>を標準同梱し、custom keyも同じ仕組みで扱います。以下は実装前のレビュー案です。</p>
+  <p class="note">変換形式・processor・低資源実行の詳細は <a href="worker-spec.html">Core Worker仕様骨子</a>、延期項目は<a href="wishlist.html">やりたいことリスト</a>を参照。</p>
+
+  <div class="features">
+    <section aria-labelledby="photo-app">
+      <h2 id="photo-app">Photo App</h2>
+      <p>一つのアプリ内に、2つのHTTPクライアント機能。</p>
+      <div class="app-functions">
+        <div><h3 id="viewer">Viewer</h3><p>Mediaの一覧・詳細・標準化済み写真／動画を表示。</p></div>
+        <div><h3 id="uploader">Uploader</h3><p>原本を送信し、進捗を表示。</p></div>
+      </div>
+    </section>
+    <section aria-labelledby="share"><h2 id="share">Share API</h2><p>HTTPサーバー。共有の作成・参照・解除を提供。</p></section>
+  </div>
+  <div class="layers">
+    <section class="searcher" aria-labelledby="searcher"><h2 id="searcher">Searcher</h2><p>Search APIがHTTP検索を提供。Index WorkerがCoreから更新・削除を取得し、共有Search Indexを更新。</p></section>
+    <section class="core" aria-labelledby="core"><h2 id="core">Core</h2><p>Core API、Core Worker、File Serverは同じCore責務内の別プロセス。APIはmetadataとfile URL、File Serverはbytes、Workerは非同期処理を担い、独立してスケールできます。</p></section>
+  </div>
+
+  <section class="block" aria-labelledby="dependencies">
+    <h2 id="dependencies">依存先・プロトコル（レビュー案）</h2>
+    <p>矢印は呼び出す側 → 依存先。File ServerはHDDをread-onlyで参照し、画像・動画・原本をCore API経由せず配信します。</p>
+    <div class="scroll diagram-scroll" role="region" aria-labelledby="dependencies" tabindex="0"><img src="dependencies.svg" alt="Photo App、CoreとSearcherのAPI・Worker、専用File Server、Share API、PostgreSQL、HDD、Search Indexの依存図。ViewerはCoreからJSON、File Serverからbytesを取得する。"></div>
+    <p class="figure-links">横スクロール可 · <a href="dependencies.svg">図を単体表示</a> · <a href="dependencies.mmd">Mermaidソース</a></p>
+  </section>
+
+  <section class="block" aria-labelledby="core-er">
+    <h2 id="core-er">Core ER（レビュー案）</h2>
+    <p><strong>Media＝論理1件、Job＝変換または物理削除、Rendition＝成功した実ファイル。</strong>job_targetsがprofilesの特定版を固定し、RenditionはMediaと生成元targetを参照します。</p>
+    <div class="scroll diagram-scroll er-scroll" role="region" aria-labelledby="core-er" tabindex="0"><img src="core-er.svg" alt="Core ER。mediaとoriginalsは1対1。job_targetsがprofilesを指定して複数renditionsを生成し、renditionsはmediaに属する。system_configは保持期間、既定timezone、DB backup間隔と保持日数を型付き列で持つ。"></div>
+    <p class="figure-links">横スクロール可 · <a href="core-er.svg">ERを単体表示</a> · <a href="core-er.mmd">Mermaidソース</a></p>
+    <details>
+      <summary>制約メモ：変換プロファイル、現行生成物、保持期限、ジョブ種別</summary>
+      <ul>
+        <li><code>originals.media_id</code>はUNIQUE FK、<code>originals.sha256</code>は論理削除済みを含む全行でUNIQUE。撮影日・削除日時は<code>media</code>に保持します。</li>
+        <li><code>job_targets.id</code>を主キーとし、<code>UNIQUE(job_id, profile_id)</code>。Renditionは<code>job_target_id</code>だけでジョブと変換プロファイル版をたどり、profile_idや直接のjob_idを重複保持しません。</li>
+        <li><code>renditions.media_id</code>はMediaへのFKで、<code>CREATE INDEX renditions_media_id_idx ON renditions (media_id)</code>を設け、一覧・詳細はMediaから直接JOINします。original_idは重複保持せず、生成由来はtarget → job → originalでたどります。登録時にjobのoriginal.media_idとRenditionのmedia_idが一致することを検証します。</li>
+        <li>生成履歴は残し、同じMedia・profile keyの現行は1件。keyはJOIN先なので単純な部分UNIQUEでは保証できません。media行をロックし、旧<code>is_current</code>解除と新規登録を同一トランザクションで行うアプリケーション不変条件とし、直接SQL更新は禁止・整合検査の対象にします。同じ成功トランザクションで旧currentだけに設定時点の保持日数から<code>renditions.purge_after</code>を設定し、新currentはNULLにします。</li>
+        <li><code>jobs.type IN ('transform', 'purge')</code>。transformは1件以上のjob_targetsを持ち、各targetのprofile_idで特定版を固定。同じジョブ内の同一profile_idは受付時に拒否します。purgeはtargetを持ちません。</li>
+        <li><code>jobs.original_id</code>はNULL可・<code>ON DELETE SET NULL</code>。<code>media_id_snapshot</code>を残すため、purge完了後も<code>GET /jobs/{id}</code>で状態を確認できます。</li>
+        <li>Renditionは成功時のみ登録し、ファイル情報は必須。<code>media.taken_at / deleted_at / purge_after</code>、<code>renditions.purge_after</code>、ジョブのリース情報・開始日時・エラーはNULL可。EXIF不明は<code>{}</code>。</li>
+        <li><code>system_config</code>は<code>id = 1</code>をCHECKするsingletonのレビュー案です。自由なkey/valueではなく明確な型付き列を持ちます。保持2列は非負integer/NULLで、確定初期値はどちらもNULL（自動削除なし）。<code>default_timezone</code>はIANA名を検証するNOT NULL textで初期<code>Asia/Tokyo</code>。DB backupの間隔と保持日数は正integerで初期24時間／30日です。初期値は後から変更できます。</li>
+        <li>撮影日時は既知offsetを優先し、不明な場合だけ受付時の<code>default_timezone</code>で補完します。設定変更は既存<code>taken_at</code>へ遡及しません。原EXIFは<code>originals.exif_json</code>に保持し、Mediaには補完根拠と利用timezoneを残します。</li>
+      </ul>
+    </details>
+  </section>
+
+  <section class="block" aria-labelledby="core-tech">
+    <h2 id="core-tech">Core技術仕様</h2>
+    <p>初期実装は次の構成とします。</p>
+    <div class="scroll" role="region" aria-labelledby="core-tech" tabindex="0">
+      <table>
+        <thead><tr><th scope="col">構成要素</th><th scope="col">技術</th><th scope="col">役割</th></tr></thead>
+        <tbody>
+          <tr><td>OS</td><td>Ubuntu Server</td><td>Core全体を動かします。</td></tr>
+          <tr><td>Core API</td><td>Go（<code>net/http</code>、<code>pgx</code>）</td><td>HTTP受付とメタデータ操作を行います。</td></tr>
+          <tr><td>Core Worker</td><td>Go（<code>os/exec</code>）</td><td>ジョブの実行と変換ツールの起動。</td></tr>
+          <tr><td>管理CLI</td><td>Go（<code>flag</code>）</td><td>設定変更、再生成・再試行、バックアップ・復元。</td></tr>
+          <tr><td>DB</td><td>PostgreSQL</td><td>メタデータ、設定、Jobを保存します。</td></tr>
+          <tr><td>File Server</td><td>Nginx</td><td>原本と生成物のファイル配信。</td></tr>
+          <tr><td>画像変換</td><td>libvips / libheif、LibRaw</td><td>画像・RAWを読み込み、AVIF等を生成します。</td></tr>
+          <tr><td>動画変換</td><td>FFmpeg、SVT-AV1</td><td>AV1動画（MP4）とサムネイルの生成。</td></tr>
+          <tr><td>プロセス管理</td><td>systemd</td><td>各プロセスを起動・再起動し、ログを記録します。</td></tr>
+          <tr><td>アクセス</td><td>Tailscale</td><td>Core APIとFile ServerをTailnet内だけへ公開します。</td></tr>
+          <tr><td>DBバックアップ</td><td><code>pg_dump</code> / <code>pg_restore</code></td><td>DBのバックアップ・復元。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <details>
+      <summary>受付・再送・ファイルとDBの境界</summary>
+      <p>アップロード成功は、原本ファイル、Media / Originalメタデータ、必要な変換Jobを永続化した時点です。変換は待たずに非同期で進めます。ファイルとDBは一つのトランザクションではないため、一時ファイル・最終ファイル・DB行を照合して回復します。</p>
+      <p>通信再送には<code>Idempotency-Key</code>を使う初期案とし、同じkeyには同じ受付結果を返します。これは内容SHA-256による重複Media拒否とは別です。</p>
+    </details>
+    <details>
+      <summary>ジョブのリース・変換ツール・資源上限</summary>
+      <p>ジョブ取得と状態更新だけを短いDBトランザクションにし、<code>FOR UPDATE SKIP LOCKED</code>を使います。変換ツールの実行中はトランザクションを保持しません。リース更新とトークン照合により、古いWorkerによる結果公開を防ぎます。</p>
+      <p>変換ツールにはスレッド数上限・タイムアウト・終了時の子プロセス回収を適用します。systemdのcgroupで全体予算を各サービスへ分け、CPU 2個分・4GiBを重複配賦しません。AVIF / AV1品質と処理時間はサンプルで実測します。</p>
+    </details>
+    <details>
+      <summary>バックアップ・復旧・定期処理</summary>
+      <p>設定値24時間／30日でDBをバックアップし、最後の成功1件を残して失敗を通知します。WAL archive / PITRは導入せず、通常のWAL / fsyncは維持します。systemd timerを使う場合も固定周期を埋め込まず、<code>system_config</code>から次回期限を判定します。</p>
+      <p>復旧・照合中は期限切れファイルなどの自動削除を止め、DBとファイルの対応を確認して再開します。保存先と認証情報は環境設定で管理します。</p>
+    </details>
+  </section>
+
+  <section class="block" aria-labelledby="apis">
+    <h2 id="apis">Core API一覧（レビュー案）</h2>
+    <div class="scroll" role="region" aria-labelledby="apis" tabindex="0">
+      <table>
+        <thead><tr><th scope="col">メソッド</th><th scope="col">パス</th><th scope="col">用途</th></tr></thead>
+        <tbody>
+          <tr><td>POST</td><td><code>/media</code></td><td>multipart原本アップロード。内容から検出したMIMEに一致するactive profileごとのtargetを自動作成し、受付時のprofile ID（version）を固定して非同期実行。</td></tr>
+          <tr><td>GET</td><td><code>/media?profile=standard&amp;cursor=…&amp;limit=50</code></td><td>未削除Media一覧。現行生成物のmetadataとfile_urlをあれば添付し、未生成Mediaも残す。</td></tr>
+          <tr><td>GET</td><td><code>/media?deleted=only&amp;profile=thumbnail&amp;cursor=…</code></td><td>論理削除済みだけを一覧。profileの扱いと並び順は通常一覧と同じ。</td></tr>
+          <tr><td>GET</td><td><code>/media/{id}</code></td><td>詳細・現行生成物metadata・file_url・ジョブ／target状態。</td></tr>
+          <tr><td>GET</td><td><code>/media/{id}/display</code></td><td>現行standardのmetadataとfile_urlを返す（bytesは配信しない）。</td></tr>
+          <tr><td>GET</td><td><code>/media/{id}/thumbnail</code></td><td>現行thumbnailのmetadataとfile_urlを返す（bytesは配信しない）。</td></tr>
+          <tr><td>GET</td><td><code>/media/{id}/original</code></td><td>明示要求時に原本metadataとfile_urlを返す（bytesは配信しない）。</td></tr>
+          <tr><td>GET</td><td><code>/jobs?status=running&amp;media_id=…&amp;cursor=…&amp;limit=50</code></td><td>ジョブ一覧。statusとmedia_idは任意フィルタ、cursor / limitでページング。</td></tr>
+          <tr><td>GET</td><td><code>/jobs/{id}</code></td><td>transform／purgeジョブと各targetの状態。purge後も照会可。</td></tr>
+          <tr><td>DELETE</td><td><code>/media/{id}</code></td><td>論理削除。<code>deleted_at</code>と、その時点の設定がNULLでなければ<code>deleted_at + 保持日数</code>を<code>purge_after</code>へ設定。</td></tr>
+          <tr><td>POST</td><td><code>/media/{id}/restore</code></td><td>purgeの初回開始前まで論理削除から復元し、<code>deleted_at / purge_after</code>をclearして待機中purgeジョブを無効化。</td></tr>
+          <tr><td>DELETE</td><td><code>/media/{id}/purge</code></td><td>削除済みMediaだけ受付。202とpurge job IDを返し、非同期で原本・生成物・DB本体を物理削除。</td></tr>
+          <tr><td>GET</td><td><code>/changes?cursor=…</code></td><td>indexing向け更新・削除通知。詳細は未確定。</td></tr>
+          <tr><td>GET</td><td><code>/profiles?status=active</code></td><td>ID・key・version・status・input_mime_types・parametersを一覧。keyは用途名、IDはtargetが特定versionを固定する識別子。</td></tr>
+          <tr><td>GET</td><td><code>/renditions/{id}</code></td><td>不変IDの生成物metadataとfile_urlを返す。bytesはFile Serverから取得。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note"><strong>Media一覧：</strong><code>CREATE INDEX media_list_order_idx ON media (taken_at DESC NULLS LAST, id DESC)</code>とcursor比較を同じ順序へ統一。cursorは両値とNULL区分を含むopaque値です。既定50件・最大200件、応答は<code>items / next_cursor</code>（終端はNULL）。撮影日時のないMediaも末尾に並び、登録日時で代用しません。</p>
+    <details>
+      <summary>profile選択・未生成時・削除の扱い</summary>
+      <p><code>profile</code>はprofiles.keyを指定します。standard／thumbnailは標準同梱し、同じ規則でcustom keyも選択可能。対応する<code>is_current = true</code>のRenditionを添付し、なければrenditionは<code>null</code>のままMediaを返します。</p>
+      <p>active version切替後も旧versionのcurrentを使用し、新versionの生成成功時にだけcurrentを切替。成功結果が一つもないdisplay／thumbnail取得は<code>409 rendition_not_ready</code>です。</p>
+       <p>論理削除では本体を保持します。purge受付・restore・Workerの初回開始は同じMedia単位で直列化します。開始前のrestoreは待機中purgeを無効化し、Workerは開始時に削除状態を再確認。初回開始日時<code>started_at</code>を一度だけ設定して再試行でも保持し、以後はジョブがqueuedへ戻っても復元不可です。保持日数0は次回Worker走査以降の対象で、即時実行を保証しません。</p>
+    </details>
+    <details>
+      <summary>File Server・URL・初期アクセス境界</summary>
+      <p>File ServerはCoreの責務境界内に置き、Core API／Core Workerとは別プロセスとして独立にスケールします。Core APIはDBの保存root配下相対file keyまたは不変IDからブラウザ用URLを構築し、内部絶対パスを返しません。Viewerは返却URLをそのまま<code>&lt;img src&gt;</code>／<code>&lt;video src&gt;</code>へ設定し、各bytes要求でCore APIやDBを通りません。</p>
+      <p>File ServerのNginxは専用URL名前空間を保存rootへ安全に対応付け、GET / HEAD / Rangeだけを提供。<code>..</code>等の任意pathを拒否し、directory listingを無効化し、HDDはread-onlyでマウントします。</p>
+      <p>初期はCore APIとFile ServerをTailnet経由だけで公開し、Funnelは使いません。bind・ホストfirewall・経路を合わせてLAN／Internetからの迂回アクセスを許可しない構成とします。Tailnetを許可された利用者は全ファイルを閲覧可能という前提で、アプリ独自のファイル認可、署名URL、cookie認証、CDNは導入しません。</p>
+      <p>file URLは実ファイルごとに不変、再生成は別ファイル・別URLです。レスポンスは<code>Cache-Control: private</code>によるbrowser cacheとRangeに対応します。論理削除したMediaは一覧から除外しますが、既知URLは物理削除完了まで取得できる場合があります。</p>
+    </details>
+  </section>
+
+  <section class="block" aria-labelledby="retention">
+    <h2 id="retention">保持設定・cleanup（推奨レビュー案）</h2>
+    <div class="panel">
+      <p>設定変更は変更後の論理削除・現行切替から適用し、既存の<code>purge_after</code>は書き換えません。短縮時の意図しない一括即削除を避けるためです。設定操作APIは今回具体化しません。</p>
+      <p>期限を過ぎた旧Renditionは実ファイルと対応するRendition行を削除し、Media・Original・Job／target履歴は維持します。物理削除後の該当Rendition metadata APIは<code>404</code>とし、処理履歴はJob／target単位で残します。過去のRendition行まで無期限には保存しません。Mediaのpurgeは旧版を含む全ファイルとDB本体が対象です。currentは<code>purge_after = NULL</code>でcleanup対象外とし、cleanup時も同じMediaをロックしてcurrentを再確認します。</p>
+      <p>DBとファイル削除は非原子的なので、再試行・照合で回復可能にします。</p>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="backup">
+    <h2 id="backup">DBバックアップ（承認済み初期運用案）</h2>
+    <div class="panel">
+      <p>PostgreSQLのデータディレクトリ自体をHDDへ移すのではなく、DBから整合したバックアップをHDDへ出力する案です。同一物理ディスク内のコピーは、そのディスク故障への対策にはなりません。</p>
+      <p><code>db_backup_interval_hours = 24</code>、<code>db_backup_retention_days = 30</code>を変更可能な初期値にします。正常完了を確認したbackupだけを期限cleanupし、最後に成功した1件は期限超過でも残します。失敗は通知対象です。backup pathとcredentialsは環境設定で管理し、<code>system_config</code>へ詰め込みません。</p>
+      <p>DB WAL archive / PITRは今回不要です。ただし通常運用のWALや<code>fsync</code>は無効化しません。restore手順と実効的な損失許容時間は運用検証対象です。原本のクラウドストレージバックアップは今回の範囲から外し、<a href="wishlist.html">やりたいことリスト</a>へ延期します。そのため、現時点では原本HDD故障への保護を提供しません。</p>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="storage">
+    <h2 id="storage">保存・標準化・実行（レビュー案）</h2>
+    <div class="panel">
+      <p>原本を無改変で保持し、<strong>静止画AVIF、animationは動き保持、動画はMP4 + AV1（音声があればAAC）</strong>を標準化形式にします。animationの出力形式は技術初期値としてanimated WebPを採用する案です。Renditionはprofile key別の履歴として保存し、再生成でMedia IDも既存ファイルも変えません。</p>
+      <p>変換の全target成功でジョブはsucceeded。部分失敗時も成功結果を残し、purgeは別typeのジョブとして非同期実行します。</p>
+    </div>
+    <details>
+      <summary>保存パス・永続化</summary>
+      <pre><code>originals/{shard}/{original_id}/original.{ext}
+renditions/{shard}/{original_id}/{job_target_id}/{rendition_id}.{ext}</code></pre>
+      <p>保存root配下の相対file keyをDBに保存し、絶対パスは外部公開しません。IDはUUIDv4の小文字表記、shardは入力jobのoriginal_idのハイフンを除いた先頭2桁。profile名をファイル配置規則へ埋め込まず、job_target_idからkey・versionをたどります。extは出力形式から正規化し、元ファイル名と内容照合用sha256は原本のDB項目に保持します。</p>
+      <p>同一FSの一時ファイル → rename等で永続化 → DB登録。attempt固有のRendition UUIDを使い、lease tokenと期限のCASで現行Workerだけが登録・current切替を行います。DBとファイルは非原子的で、敗者ファイルは照合・回復対象です。</p>
+    </details>
+    <details>
+      <summary>変換プロファイル・版管理</summary>
+      <ul>
+        <li><code>standard / v1</code>：静止画はAVIF。動画はMP4 + AV1、音声があればAAC。いずれもcropせず縦横比を維持し、長辺を最大1920pxへ縮小、小さい原本は非拡大。動画の奇数寸法はencoder要件に合わせ縮小側の偶数へ丸めます。</li>
+        <li><code>thumbnail / v1</code>：AVIF。cropせず縦横比を維持し、長辺を最大640pxへ縮小。小さい原本は拡大しません。動画とanimationは先頭frameの静止画です。</li>
+        <li><code>standard / v1</code>のanimation recipe：動きを保持。技術初期値はanimated WebPとし、alpha・frame timing・loopを保持します。ユーザー指定形式ではなく、decoder / encoder対応の検証が必要な初期実装案です。</li>
+        <li><code>custom-key / v1</code>：用途固有の追加変換も同じprofileモデルで定義できます。</li>
+      </ul>
+      <p>向き／rotationは画素へ適用して正規化。静止画SDRはsRGB、動画SDRはBT.709へ統一し、HDR入力はSDRへtone mapします。動画へsRGB metadataを機械適用しません。品質、bit depth、metadata範囲は実測・Viewer検証後に調整します。parametersはサイズ・色空間・コーデック・品質・encoder版等を保持します。詳細は<a href="worker-spec.html">Core Worker仕様骨子</a>へ分離します。</p>
+      <p><code>profiles: UNIQUE(key, version)</code>、versionは1以上。同じkeyのactiveは部分UNIQUEで最大1件。<code>draft → active → retired</code>とし、job_targetsはprofile_idで受付時の特定版を固定します。Renditionはjob_target経由でprofileへ到達し、表示契約はkeyとcurrentで決めます。</p>
+      <p><code>input_mime_types text[] NOT NULL</code>は非空かつワイルドカードなしの正規化MIME許可集合（例：<code>image/jpeg</code>、<code>image/png</code>、<code>image/heic</code>）。POST /mediaでは申告値でなくファイル内容から検出・正規化したMIMEと一致するactive profilesをtarget化します。</p>
+      <p>同じstandard keyで画像・動画を扱うため、parameters内の入力MIME別レシピに許可集合の各MIMEが対応することをprofile登録時に検証し、出力形式は各レシピ側へ保持します。適用profileが0件ならMediaと原本だけを保存し、transformジョブは作らず未生成として扱います。</p>
+    </details>
+    <details>
+      <summary>ジョブ・再試行</summary>
+      <p>ジョブは<code>queued → running → succeeded / failed</code>。適用profileが1件以上ならPOST /mediaの受付トランザクションで1件のtransformジョブとprofileごとのtargetを自動作成し、targetは<code>pending / succeeded / failed</code>。purgeはtargetを持ちません。<code>started_at</code>は初回の物理削除開始時だけ設定して再試行でも保持し、値があれば状態にかかわらずrestoreを拒否します。</p>
+      <p>変換・purgeとも同じジョブ行をqueuedへ戻し、available_at以降に再取得します。実行取得ごとにattemptsを増やし、期限切れリースもmax_attempts内で再取得。transformは成功済みtargetを再実行せず、未成功targetだけを再試行します。上限到達ならjob failedです。</p>
+      <p><code>lease_expires_at</code>はWorkerの実行権期限、<code>lease_token</code>は取得ごとの識別子です。実行中はheartbeatで期限を更新し、期限切れなら別Workerが再取得できます。生成物公開はtokenと期限のCASで古いWorkerを拒否しますが、処理そのものの厳密一回実行は保証しません。</p>
+      <p>runtime、外部process、Ubuntu基準、資源制御は<a href="#core-tech">Core技術仕様</a>に集約します。AV1 software encodingの時間は実機で測り、遅くてもH.264へ自動fallbackしません。</p>
+    </details>
+  </section>
+</main>
+</body>
+</html>

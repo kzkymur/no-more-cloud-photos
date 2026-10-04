@@ -1,0 +1,46 @@
+flowchart TB
+    accTitle: 依存先・プロトコル（レビュー案）
+    accDescr: Core APIはmetadataとfile URLを返し、専用File ServerがHDDからbytesを直接配信する。APIとFile ServerはTailnet限定。矢印は呼び出し側から依存先。
+    subgraph APP[Photo App]
+        Viewer[Viewer<br/>HTTP client]
+        Uploader[Uploader<br/>HTTP client]
+    end
+    Share[Share API<br/>HTTP server]
+    subgraph CORE[Core]
+        API[Core API<br/>metadata・file URL<br/>HTTP server]
+        Worker[Core Worker<br/>background]
+        Files[File Server<br/>Nginx等・技術候補<br/>GET / HEAD / Range]
+    end
+    subgraph SEARCH[Searcher]
+        Search[Search API<br/>HTTP server]
+        Indexer[Index Worker<br/>background]
+    end
+    DB[(PostgreSQL)]
+    HDD[(HDD)]
+    Index[(Search Index<br/>shared storage<br/>技術未定)]
+
+    Viewer -->|一覧・詳細<br/>Tailnet HTTPS REST/JSON| API
+    Viewer -->|file URL<br/>Tailnet HTTPS<br/>GET / HEAD / Range bytes| Files
+    Viewer -->|検索<br/>HTTPS REST/JSON| Search
+    Uploader -->|HTTPS<br/>multipart/form-data| API
+    Share -->|共有・メディア<br/>HTTPS REST/JSON| API
+    Indexer -->|indexing・changes<br/>HTTPS REST/JSON| API
+    API -->|SQL / TCP| DB
+    API -->|原本アップロード保存<br/>POSIX I/O| HDD
+    Worker -->|jobs・lease<br/>SQL / TCP| DB
+    Worker -->|原本読取・生成物保存<br/>POSIX I/O| HDD
+    Files -->|readonly<br/>POSIX I/O| HDD
+    Indexer -->|write| Index
+    Search -->|read| Index
+
+    classDef app fill:#ffffff,stroke:#94a9bf,color:#203047
+    classDef core fill:#203c59,stroke:#203c59,color:#ffffff
+    classDef search fill:#e5eef8,stroke:#94a9bf,color:#203047
+    classDef storage fill:#eef3f7,stroke:#94a9bf,color:#203047
+    class Viewer,Uploader,Share app
+    class API,Worker,Files core
+    class Search,Indexer search
+    class DB,HDD,Index storage
+    style APP fill:#f5f7fa,stroke:#94a9bf
+    style CORE fill:#eef3f7,stroke:#94a9bf
+    style SEARCH fill:#f5f7fa,stroke:#94a9bf

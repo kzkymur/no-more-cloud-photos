@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>写真管理システム｜やりたいことリスト</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f7fa; color: #203047; font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif; line-height: 1.8; }
+    main { width: min(100% - 40px, 760px); margin: 48px auto; }
+    h1 { margin: 0 0 12px; font-size: clamp(1.4rem, 4vw, 2rem); line-height: 1.5; }
+    h2 { margin: 0 0 8px; font-size: 1.15rem; }
+    p { margin: 0; font-size: .95rem; }
+    a { color: #245d91; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 0 0 18px; font-size: .9rem; }
+    .lead { margin-bottom: 20px; padding: 14px 18px; background: #e5eef8; border-radius: 10px; }
+    section { padding: 20px 24px; background: #fff; border: 1px solid #e0e6ed; border-radius: 12px; }
+    .state { display: inline-block; margin-right: 6px; padding: 1px 8px; border-radius: 999px; background: #fff0cf; color: #72510b; font-size: .75rem; font-weight: 700; }
+    @media (max-width: 600px) { main { width: calc(100% - 28px); margin: 24px auto; } section { padding: 16px 18px; } }
+  </style>
+</head>
+<body>
+<main>
+  <nav aria-label="資料ナビゲーション"><strong>資料:</strong> <a href="architecture.html">全体アーキテクチャ</a> <a href="worker-spec.html">Core Worker仕様</a> <a href="wishlist.html" aria-current="page">やりたいことリスト</a></nav>
+  <h1>やりたいことリスト</h1>
+  <p class="lead">今回の実装範囲から外し、将来検討する項目だけを管理します。</p>
+  <section aria-labelledby="cloud-backup">
+    <h2 id="cloud-backup"><span class="state">延期</span>原本のクラウドストレージバックアップ</h2>
+    <p>原本をクラウドストレージへバックアップする機能／オプション。保存先、暗号化、費用、復元、同期方式を含めて将来検討します。現行案では原本HDD故障への保護を提供しません。</p>
+  </section>
+</main>
+</body>
+</html>

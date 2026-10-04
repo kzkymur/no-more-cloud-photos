@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>写真管理システム｜Core Worker仕様骨子</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f5f7fa; color: #203047; font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif; line-height: 1.8; }
+    main { width: min(100% - 40px, 900px); margin: 48px auto; }
+    h1 { margin: 0 0 12px; font-size: clamp(1.4rem, 4vw, 2rem); line-height: 1.5; }
+    h2 { margin: 0 0 8px; font-size: 1.15rem; }
+    h3 { margin: 16px 0 4px; font-size: 1rem; }
+    p { margin: 0; font-size: .95rem; }
+    p + p { margin-top: 8px; }
+    a { color: #245d91; }
+    section { margin-top: 14px; padding: 20px 24px; background: #fff; border: 1px solid #e0e6ed; border-radius: 12px; }
+    ul { margin: 8px 0 0; padding-left: 22px; }
+    li { margin-top: 6px; font-size: .9rem; }
+    code { font-size: .88em; overflow-wrap: anywhere; }
+    .lead { margin-bottom: 20px; padding: 14px 18px; background: #e5eef8; border-radius: 10px; }
+    .state { display: inline-block; margin-right: 6px; padding: 1px 8px; border-radius: 999px; font-size: .75rem; font-weight: 700; vertical-align: .08em; }
+    .fixed { background: #dcefe4; color: #215d3a; }
+    .proposal { background: #e5eef8; color: #245d91; }
+    .open { background: #fff0cf; color: #72510b; }
+    .back { margin-top: 18px; font-size: .9rem; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 0 0 18px; font-size: .9rem; }
+    @media (max-width: 600px) {
+      main { width: calc(100% - 28px); margin: 24px auto; }
+      section { padding: 16px 18px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <nav aria-label="資料ナビゲーション"><strong>資料:</strong> <a href="architecture.html">全体アーキテクチャ</a> <a href="worker-spec.html" aria-current="page">Core Worker仕様</a> <a href="wishlist.html">やりたいことリスト</a></nav>
+  <h1>Core Worker仕様骨子</h1>
+  <p class="lead"><strong>短いレビュー版です。</strong><br><span class="state fixed">確定</span><span class="state proposal">提案</span><span class="state open">要確認</span>を分け、変換実装前に必要な境界だけを示します。</p>
+  <p class="back">Core WorkerはGo（<code>os/exec</code>）、管理CLIはGo（<code>flag</code>）で作ります。全体構成は<a href="architecture.html#core-tech">Core技術仕様</a>を参照。</p>
+
+  <section aria-labelledby="io">
+    <h2 id="io">1. 入出力</h2>
+    <ul>
+      <li><span class="state fixed">確定</span>原本は無改変で保持。初期入力はJPEG / PNG / GIF / HEIC / RAW / WebP / BMP、動画はMP4 / MOVを対象とし、将来は消費者向け形式全般を目標にします。</li>
+      <li><span class="state fixed">確定</span>RAWは形式群の総称、MP4 / MOVはcontainerです。列挙した全codec・全RAW派生形式の読込成功を一律には保証せず、内容検出MIMEとprocessor能力で判定します。</li>
+      <li><span class="state fixed">確定</span>静止画<code>standard</code>はAVIF。cropせず縦横比を保って<strong>長辺を最大1920px</strong>へ縮小し、小さい原本は拡大しません。</li>
+      <li><span class="state fixed">確定</span><code>thumbnail</code>はcropせず縦横比を保って<strong>長辺を最大640px</strong>へ縮小し、小さい原本は拡大しません。</li>
+      <li><span class="state fixed">確定</span>動画<code>standard</code>はMP4 container + AV1 video、音声があればAAC。cropせず縦横比を保って長辺を最大1920pxへ縮小し、小さい原本は拡大しません。encoder要件に合わせ、奇数寸法は縮小側の偶数へ丸めます。</li>
+      <li><span class="state open">要確認</span>AVIF／AV1の品質値、bit depth、metadata保持範囲は実測とViewer検証後に調整します。</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="media-types">
+    <h2 id="media-types">2. 静止画・動画・animation</h2>
+    <ul>
+      <li><span class="state fixed">確定</span>向き・rotationは画素へ適用して正規化します。静止画SDRはsRGB、動画SDRはBT.709へ統一し、HDR入力はSDRへtone mapします。動画へsRGB metadataを機械的に適用しません。原本は無改変です。</li>
+      <li><span class="state fixed">確定</span>動画<code>thumbnail</code>は先頭frameをAVIF静止画にし、長辺最大640px、縦横比維持、cropなし、非拡大を適用します。</li>
+      <li><span class="state fixed">確定</span>GIF / WebP animationの<code>standard</code>は動きを保持し、<code>thumbnail</code>は先頭frameの静止画にします。</li>
+      <li><span class="state proposal">技術初期値</span>animationの<code>standard</code>出力はanimated WebPを採用し、alpha・frame timing・loopを保持します。これはユーザー指定の形式ではなく初期実装案であり、decoder / encoderの対応を実装前に検証します。</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="processor">
+    <h2 id="processor">3. Profile ↔ Processor契約</h2>
+    <ul>
+      <li><span class="state fixed">確定</span>active profileには、その<code>input_mime_types</code>とparameters schema/versionを実行できるprocessorが必要です。Workerはjob targetが固定したprofile版を実行します。</li>
+      <li><span class="state fixed">確定</span>profile追加が常に1対1の新processor実装を意味するわけではありません。既存processorを設定違いの複数profileで再利用できます。新しい変換能力には対応processor追加が必要です。</li>
+      <li><span class="state proposal">提案</span>profileをactiveにする前に、processor名・対応schema version・入力MIME・出力recipeの互換性を検証し、対応実装がなければactive化を拒否します。</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="boundaries">
+    <h2 id="boundaries">4. 自動生成と受付境界</h2>
+    <ul>
+      <li><span class="state fixed">確定</span>POST /media時、Coreが内容検出MIMEに一致するactive profilesを選び、1 jobとprofileごとのtargetsを作成。0件なら原本だけ保存しjobは作りません。</li>
+      <li><span class="state fixed">確定</span>profile新版は新規uploadから利用。既存Mediaは旧currentを表示し、必要な再生成は管理batchで行います。profile activationだけで一斉再生成しません。</li>
+      <li><span class="state fixed">確定</span>同一sha256は重複として新規登録しません。<span class="state proposal">提案</span>Coreが<code>409</code>と既存Media IDを返します。通信再送の冪等性もCore API側の責務です。</li>
+      <li><span class="state fixed">確定</span>撮影日時に既知のoffsetがあればそれを優先し、不明な場合だけ<code>system_config.default_timezone</code>で補完します。初期値はIANA名<code>Asia/Tokyo</code>で、設定時にIANA timezone名として検証します。</li>
+      <li><span class="state fixed">確定</span>既定timezoneの変更は既存<code>taken_at</code>へ遡及しません。原EXIFは<code>originals.exif_json</code>へ保ち、補完根拠と利用timezoneをMediaに記録します。</li>
+    </ul>
+    <p>重複判定・撮影日時補完・job作成はCore受付責務であり、Worker単体の変換仕様ではありません。</p>
+  </section>
+
+  <section aria-labelledby="resources">
+    <h2 id="resources">5. 低資源での実行案</h2>
+    <ul>
+      <li><span class="state proposal">提案</span>CPU 2個分・メモリ4GiBをシステム全体の初期目安とし、Workerは並列1と変換toolのthread上限から始めます。各serviceへ同じ上限を重複配賦しません。</li>
+      <li><span class="state open">要確認</span>品質・処理時間・peak memoryは未検証です。AVIF／AV1と巨大RAWを代表sampleで実測して調整し、AV1が遅くてもH.264へ自動fallbackしません。</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="questions">
+    <h2 id="questions">6. 次に確認する項目</h2>
+    <ul>
+      <li>AVIF／AV1品質、bit depth、metadata保持範囲。</li>
+      <li>animated WebPのdecoder / encoder対応、Viewer対象端末での表示品質。</li>
+      <li>AV1 software encodeの処理時間と資源上限。</li>
+    </ul>
+  </section>
+
+  <p class="back"><a href="architecture.html">← 全体アーキテクチャ</a> · <a href="wishlist.html">やりたいことリスト →</a></p>
+</main>
+</body>
+</html>
