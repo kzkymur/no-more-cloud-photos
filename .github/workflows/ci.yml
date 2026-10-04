@@ -83,3 +83,7 @@ jobs:
         run: go test -v -count=1 -run '^TestMigratorIntegration$' ./internal/database
       - name: Explicit upload PostgreSQL integration evidence
         run: go test -v -count=1 -run '^TestRepositoryIntegration' ./internal/upload
+      - name: Explicit read PostgreSQL integration evidence
+        run: go test -v -count=1 -run '^TestReadServiceIntegration$' ./internal/readapi
+      - name: Explicit read HTTP and PostgreSQL integration evidence
+        run: go test -v -count=1 -run '^TestReadHTTPPostgreSQLIntegration$' ./internal/httpapi

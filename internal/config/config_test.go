@@ -12,7 +12,7 @@ func TestLoadAPIDefaults(t *testing.T) {
 	cfg, err := LoadAPIFrom(env(map[string]string{
 		databaseURLEnv:   "postgres://user:password@db/photos",
 		storageRootEnv:   "/srv/nmcp/media",
-		fileBaseURLEnv:   "https://files.example.test",
+		fileBaseURLEnv:   "https://files.example.test/files",
 		cursorHMACKeyEnv: strings.Repeat("k", 32),
 	}))
 	if err != nil {
@@ -36,7 +36,7 @@ func TestLoadAPIValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadAPIFrom() error = %v", err)
 	}
-	if cfg.DatabaseURL != "postgres://db-secret" || cfg.StorageRoot != "/var/lib/nmcp" || cfg.FileBaseURL != "https://files.example.test/media" {
+	if cfg.DatabaseURL != "postgres://db-secret" || cfg.StorageRoot != "/var/lib/nmcp" || cfg.FileBaseURL != "https://files.example.test/media/" {
 		t.Fatalf("LoadAPIFrom() returned unexpected required values: %#v", cfg)
 	}
 	if cfg.Addr != "[::1]:9443" || cfg.LogLevel != "debug" || cfg.ShutdownTimeout != 45*time.Second {
@@ -44,6 +44,34 @@ func TestLoadAPIValid(t *testing.T) {
 	}
 	if len(cfg.CursorHMACKey) != 32 {
 		t.Fatalf("cursor key length = %d, want 32 bytes", len(cfg.CursorHMACKey))
+	}
+}
+
+func TestFileBaseURLIsNormalizedAndUnambiguous(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		want  string
+	}{
+		{input: "https://files.example.test/files", want: "https://files.example.test/files/"},
+		{input: "https://files.example.test/prefix/files/", want: "https://files.example.test/prefix/files/"},
+		{input: "https://files.example.test/photo%20root/files", want: "https://files.example.test/photo%20root/files/"},
+	} {
+		got, err := normalizeFileBaseURL(test.input)
+		if err != nil || got != test.want {
+			t.Errorf("normalizeFileBaseURL(%q) = %q, %v; want %q", test.input, got, err, test.want)
+		}
+	}
+	for _, input := range []string{
+		"https://files.example.test/a/../files",
+		"https://files.example.test/a//files",
+		"https://files.example.test/%66iles",
+		"https://files.example.test/files%2fother",
+		"https://files.example.test/files//",
+		" https://files.example.test/files",
+	} {
+		if got, err := normalizeFileBaseURL(input); err == nil {
+			t.Errorf("normalizeFileBaseURL(%q) = %q, want error", input, got)
+		}
 	}
 }
 
@@ -110,7 +138,7 @@ func TestLoadAdminDefaultsAndValid(t *testing.T) {
 func TestLoadFromProcessEnvironment(t *testing.T) {
 	t.Setenv(databaseURLEnv, "postgres://localhost/photos")
 	t.Setenv(storageRootEnv, "/data")
-	t.Setenv(fileBaseURLEnv, "https://files.example.test")
+	t.Setenv(fileBaseURLEnv, "https://files.example.test/files")
 	t.Setenv(cursorHMACKeyEnv, strings.Repeat("x", 32))
 	t.Setenv(apiAddrEnv, "127.0.0.1:8081")
 	t.Setenv(logLevelEnv, "warn")
@@ -129,7 +157,7 @@ func TestLoadFromProcessEnvironment(t *testing.T) {
 
 func TestMissingRequiredConfiguration(t *testing.T) {
 	apiBase := map[string]string{
-		databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test",
+		databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files",
 		cursorHMACKeyEnv: strings.Repeat("x", 32),
 	}
 	tests := []struct {
@@ -160,7 +188,7 @@ func TestMissingRequiredConfiguration(t *testing.T) {
 
 func TestInvalidAPIConfiguration(t *testing.T) {
 	valid := map[string]string{
-		databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test",
+		databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files",
 		cursorHMACKeyEnv: strings.Repeat("x", 32),
 	}
 	tests := []struct {
@@ -173,6 +201,8 @@ func TestInvalidAPIConfiguration(t *testing.T) {
 		{name: "unclean storage parent", key: storageRootEnv, value: "/srv/tmp/../data"},
 		{name: "HTTP file URL", key: fileBaseURLEnv, value: "http://files.example.test"},
 		{name: "relative file URL", key: fileBaseURLEnv, value: "files.example.test"},
+		{name: "root-only file URL", key: fileBaseURLEnv, value: "https://files.example.test"},
+		{name: "slash-only file URL", key: fileBaseURLEnv, value: "https://files.example.test/"},
 		{name: "file URL user info", key: fileBaseURLEnv, value: "https://user:pass@files.example.test"},
 		{name: "file URL query", key: fileBaseURLEnv, value: "https://files.example.test?q=secret"},
 		{name: "file URL empty query", key: fileBaseURLEnv, value: "https://files.example.test?"},
@@ -232,14 +262,14 @@ func TestErrorsAndLogAttrsRedactSecretsAndPaths(t *testing.T) {
 
 	_, err := LoadAPIFrom(env(map[string]string{
 		databaseURLEnv: databaseSecret, storageRootEnv: storagePath,
-		fileBaseURLEnv:   "https://files.example.test?token=" + urlSecret,
+		fileBaseURLEnv:   "https://files.example.test/files?token=" + urlSecret,
 		cursorHMACKeyEnv: cursorSecret,
 	}))
 	assertOmits(t, err.Error(), databaseSecret, storagePath, cursorSecret, urlSecret)
 
 	cfg, err := LoadAPIFrom(env(map[string]string{
 		databaseURLEnv: databaseSecret, storageRootEnv: storagePath,
-		fileBaseURLEnv: "https://files.example.test", cursorHMACKeyEnv: cursorSecret,
+		fileBaseURLEnv: "https://files.example.test/files", cursorHMACKeyEnv: cursorSecret,
 	}))
 	if err != nil {
 		t.Fatalf("LoadAPIFrom() error = %v", err)

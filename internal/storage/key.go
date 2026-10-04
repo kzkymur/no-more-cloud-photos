@@ -164,10 +164,16 @@ func (key OriginalKey) String() string {
 	return fmt.Sprintf("originals/%s/%s/original.%s", id[0:2], id, originalExtensions[key.extension])
 }
 
+func (key OriginalKey) OriginalID() OriginalID { return key.originalID }
+
 func (key RenditionKey) String() string {
 	originalID := key.originalID.String()
 	return fmt.Sprintf("renditions/%s/%s/%s/%s.%s", originalID[0:2], originalID, key.targetID.String(), key.renditionID.String(), renditionExtensions[key.extension])
 }
+
+func (key RenditionKey) OriginalID() OriginalID   { return key.originalID }
+func (key RenditionKey) JobTargetID() JobTargetID { return key.targetID }
+func (key RenditionKey) RenditionID() RenditionID { return key.renditionID }
 
 func ParseOriginalKey(value string) (OriginalKey, error) {
 	if invalidRawKey(value) {
