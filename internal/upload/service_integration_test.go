@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,9 +161,9 @@ func TestServiceIntegrationCommitDisconnectIsOutcomeUnknown(t *testing.T) {
 	if !errors.As(err, &unknown) {
 		t.Fatalf("Accept() error = %#v, want OutcomeUnknown", err)
 	}
-	termination := awaitCommitTermination(t, ctx, tracer.result)
-	if termination.err != nil || !termination.terminated {
-		t.Fatalf("terminate blocked COMMIT: terminated=%t error=%v", termination.terminated, termination.err)
+	disconnection := awaitCommitTermination(t, ctx, tracer.result)
+	if disconnection.err != nil || !disconnection.terminated {
+		t.Fatalf("disconnect blocked COMMIT: disconnected=%t error=%v", disconnection.terminated, disconnection.err)
 	}
 	assertFinalFileCount(t, root, 1)
 	assertUploadRowCounts(t, pool, 0, 0, 0, 0, 0)
@@ -180,7 +181,7 @@ func TestServiceIntegrationCommitDisconnectIsOutcomeUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	if idempotencyCount != 0 {
-		t.Fatalf("idempotency rows after terminated COMMIT = %d, want 0", idempotencyCount)
+		t.Fatalf("idempotency rows after disconnected blocked COMMIT = %d, want 0", idempotencyCount)
 	}
 	outcome, retryErr := service.Accept(ctx, integrationRequest("disconnect-key", "disconnect-retry", "disconnect-content"))
 	if retryErr != nil || outcome.Status != 201 || outcome.Replayed {
@@ -215,7 +216,7 @@ func (t *commitDisconnectTracer) TraceQueryStart(ctx context.Context, connection
 	if disabled {
 		return ctx
 	}
-	go t.terminateWhenCommitWaits(connection.PgConn().PID())
+	go t.disconnectWhenCommitWaits(connection.PgConn().PID(), connection.PgConn().Conn())
 	return ctx
 }
 
@@ -234,7 +235,7 @@ func (t *commitDisconnectTracer) enable() {
 	t.mu.Unlock()
 }
 
-func (t *commitDisconnectTracer) terminateWhenCommitWaits(pid uint32) {
+func (t *commitDisconnectTracer) disconnectWhenCommitWaits(pid uint32, client net.Conn) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -250,14 +251,15 @@ func (t *commitDisconnectTracer) terminateWhenCommitWaits(pid uint32) {
 			return
 		}
 		if waiting {
-			var terminated bool
-			err := t.admin.QueryRow(ctx, `SELECT pg_catalog.pg_terminate_backend($1)`, int32(pid)).Scan(&terminated)
+			// Drop the actual client socket while PostgreSQL is executing COMMIT.
+			// The client cannot receive a commit result, which is the production
+			// uncertainty case; this is deliberately not pg_terminate_backend,
+			// whose server ErrorResponse would prove rollback.
+			err := client.Close()
 			if err != nil {
-				err = fmt.Errorf("terminate COMMIT backend %d: %w", pid, err)
-			} else if !terminated {
-				err = fmt.Errorf("terminate COMMIT backend %d returned false", pid)
+				err = fmt.Errorf("close COMMIT connection for backend %d: %w", pid, err)
 			}
-			t.result <- commitTerminationResult{terminated: terminated, err: err}
+			t.result <- commitTerminationResult{terminated: err == nil, err: err}
 			return
 		}
 		select {
