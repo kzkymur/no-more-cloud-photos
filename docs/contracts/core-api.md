@@ -113,7 +113,7 @@ Original EXIF is intentionally not returned by v1; it is retained in storage for
 | `status` | string | `queued`, `running`, `succeeded`, `failed`, or `cancelled`. |
 | `media_id` | UUID | Live media ID, or the immutable snapshot after purge. |
 | `original_id` | UUID? | Null after original removal. |
-| `attempts`, `max_attempts` | integer | Claim count and configured positive limit. |
+| `attempts`, `max_attempts` | integer | Claim count and snapshotted positive limit. New upload transform jobs start with `max_attempts=3`; later policy changes do not rewrite existing jobs. |
 | `available_at` | timestamp | Earliest next claim. |
 | `started_at` | timestamp? | First execution start; for purge it is never cleared. |
 | `finished_at` | timestamp? | Terminal transition time. |
@@ -153,10 +153,23 @@ Core streams to a same-filesystem temporary file while computing SHA-256. It nev
 - Multipart framing/header allowance: 1 MiB beyond the file limit; excess returns `413 upload_too_large` and the connection body is not reused.
 - Request headers: 64 KiB and 10 seconds.
 - Body idle timeout: 120 seconds with no bytes read. Hard upload duration: 24 hours. Either returns `408 upload_timeout` if a response remains possible.
-- After the complete body is read, Core has 30 seconds to write the JSON response. If the connection disappears after commit, the stored idempotency result remains authoritative for retry.
+- The 30-second response-write deadline starts only after the probe and database work have produced a response ready to write; it does not include probe or database/lock time. If the connection disappears after commit, the stored idempotency result remains authoritative for retry.
 - Metadata probe after the complete temporary upload, but before final acceptance publication: 60 seconds and 1 GiB address-space limit per probe process. Decode/probe failure, malformed input, decompression-bomb policy violation, or unsupported codec returns `422 invalid_media`; unknown/unregistered content MIME returns `415 unsupported_media_type`. Malformed optional EXIF alone does not reject otherwise decodable media.
+- Body idle/hard deadlines, the 60-second probe deadline, a finite initial-timezone-read database budget, a separate finite final database/lock budget, and the 30-second response-write deadline are independent. The final budget is shared by all timezone-change finalization retries; database statements and advisory-lock acquisition use the applicable bounded context and cancellation. Budget exhaustion returns `503 unavailable`, not an unbounded post-body wait.
 
-The canonical idempotency request hash is SHA-256 over a versioned, length-prefixed encoding of the file SHA-256, exact byte size, and normalized filename, with a distinct marker for null. Multipart boundaries, `filename` spelling before the normalization above, and advisory MIME headers are excluded, so a correctly reconstructed retry matches.
+The canonical idempotency request hash v1 is SHA-256 over `NMCP-UPLOAD-REQUEST`, version byte `0x01`, then ordered fields encoded as `tag || u64BE(length) || value`: `0x01` with the raw 32-byte content SHA-256, `0x02` with the size as exactly eight unsigned big-endian bytes, and either `0x03` with length zero for a null filename or `0x04` with the normalized filename's UTF-8 bytes. The idempotency scope is exactly `POST /media`. Multipart boundaries, `filename` spelling before normalization, and advisory MIME headers are excluded, so a correctly reconstructed retry matches.
+
+Golden vectors, copied from `internal/upload/canonical_test.go`:
+
+```text
+SHA=000102...1f, size=0x0102030405060708, filename="é.jpg"
+bytes=4e4d43502d55504c4f41442d5245515545535401010000000000000020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0200000000000000080102030405060708040000000000000006c3a92e6a7067
+hash=91d13f559a9d1656c002777e60a9af86a600f8ca55e396a96df091ade64902cf
+
+SHA=32 zero bytes, size=0, filename=null
+bytes=4e4d43502d55504c4f41442d52455155455354010100000000000000200000000000000000000000000000000000000000000000000000000000000000000200000000000000080000000000000000030000000000000000
+hash=427e1b1bbc329ee0f2d616c5a77b3fa799784b48c27f561ccdf056676d19c272
+```
 
 On first success, the response is `201`:
 
@@ -167,15 +180,18 @@ On first success, the response is `201`:
 }
 ```
 
-`job` is `null` when no active profile accepts the detected MIME. Otherwise one transform job and one target for each matching active profile are committed with Media and Original. The upload response does not wait for conversion.
+`media.mime_type` is the detected normalized MIME, not a broad category such as `image` or `video`, and must equal the Original MIME. `job` is `null` when no active profile accepts that MIME. Otherwise one transform job with `max_attempts=3` and one target for each matching active profile are committed with Media and Original. The matching active profile IDs and versions come from one ordered query in the final transaction, so they are one transaction snapshot; later activation does not alter the job. The upload response does not wait for conversion.
 
 Idempotency behavior is persistent across restart and has no v1 expiry:
 
-- After streaming and fingerprinting, concurrent requests for the same scope/key are serialized by a PostgreSQL advisory lock. The winner's acceptance transaction inserts the completed idempotency row; a waiter then reads that row. A process death releases the lock and leaves either a complete result or no result, never a committed placeholder.
-- The first terminal acceptance result (`201` or SHA duplicate `409`) and its exact response body are committed with the idempotency record.
-- A retry with the same key and canonical request hash returns the stored status/body and `Idempotency-Replayed: true`, even if the media has since been deleted. It creates no file, row, job, or event.
+- Body streaming and metadata probing occur outside a database transaction. The final transaction takes the maintenance row `FOR SHARE` and rejects non-normal mode, then acquires transaction-scoped advisory locks in the fixed order idempotency scope/key then original SHA. Every upload writer uses `maintenance -> idempotency -> SHA`; lock acquisition and all final database work share the separate finite final database/lock budget. Idempotency locks hash `NMCP-UPLOAD-IDEMPOTENCY-LOCK-V1 || u64BE(scope length) || scope || u64BE(key length) || key`; content locks hash `NMCP-UPLOAD-CONTENT-SHA256-LOCK-V1 || raw SHA-256`. Lock IDs are the leading signed 64 bits of those SHA-256 digests. For scope `POST /media`, key `example-key`, the golden lock ID is `-5421086791864445937`; for raw SHA bytes `00` through `1f`, it is `5729185527926754934`. Digest collision only causes extra serialization: Core still compares the full database scope/key and request hash and never treats equal lock IDs as equal requests.
+- The winner inserts the completed idempotency row only in the acceptance or duplicate transaction; a waiter reads it after acquiring the same lock. There is no committed in-progress placeholder. Same-key contenders therefore cannot both accept. The fixed global lock order prevents the cycle in which one writer holds SHA while waiting for idempotency and another holds idempotency while waiting for SHA.
+- The first terminal acceptance result (`201` or SHA duplicate `409`) is stored as a JSON semantic value with its status. Initial and replay responses pass that value through the same typed serializer. All schema fields, numbers, explicit nulls, and any preserved unknown fields must survive; byte-for-byte JSON identity, whitespace, and object-key order are not promised.
+- If the stored body schema contains `request_id` (including the duplicate error body), it remains the first request's ID. Every response header `X-Request-ID` is the current attempt's ID. A replay also sets `Idempotency-Replayed: true`; the `201` body above does not gain an otherwise unnecessary `request_id` field.
+- A retry with the same key and canonical request hash returns the stored semantic status/body, even if the media has since been deleted. It creates no durable file, row, job, or event; its temporary file is aborted.
 - The same key with a different canonical hash returns `409 idempotency_conflict` with `details.original_request_hash`; concurrent requests are serialized and obey the same rule.
-- Transient `408`, `413`, `415`, `422`, `500`, and `503` responses are not stored. Published-but-unreferenced files after a crash are reconciled as described in the storage contract.
+- A different key whose SHA is already present returns stored `409 duplicate_media`; the duplicate is decided before final file publication, and only its temporary file is aborted. The SHA lock plus the database uniqueness constraint prevent two different keys from both accepting the same original.
+- Transient `408`, `413`, `415`, `422`, `500`, and `503` responses are not stored. Published-but-unreferenced files and commit-uncertain outcomes are handled without request-path deletion as described in the storage contract.
 
 Original SHA uniqueness is independent of idempotency. A new key whose file SHA already exists, including for logically deleted media, returns:
 

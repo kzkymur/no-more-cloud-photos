@@ -34,8 +34,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 2 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version two", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 3 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version three", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -58,12 +58,55 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 2 || status.ExpectedVersion != 2 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version two", status)
+		if status.CurrentVersion != 3 || status.ExpectedVersion != 3 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version three", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
 		}
+	})
+
+	t.Run("media MIME migration preserves valid rows and enforces exact MIME values", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:2]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one and two: %v", err)
+		}
+		mediaID := newUUIDv4(t)
+		originalID := newUUIDv4(t)
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+			t.Fatalf("insert valid preexisting Media: %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+			VALUES ($1,$2,$3,'originals/00/preexisting/original.jpg','image/jpeg',1)`,
+			originalID, mediaID, strings.Repeat("a", 64)); err != nil {
+			t.Fatalf("insert valid preexisting Original: %v", err)
+		}
+		if err := full.Up(context.Background()); err != nil {
+			t.Fatalf("upgrade valid preexisting Media/Original: %v", err)
+		}
+
+		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image','unknown')`, newUUIDv4(t))
+		mismatchMediaID := newUUIDv4(t)
+		if _, err := pool.Exec(context.Background(), `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/png','unknown')`, mismatchMediaID); err != nil {
+			t.Fatalf("insert MIME-normalized Media: %v", err)
+		}
+		expectExecError(t, pool, `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+			VALUES ($1,$2,$3,'originals/00/mismatch/original.jpg','image/jpeg',1)`,
+			newUUIDv4(t), mismatchMediaID, strings.Repeat("b", 64))
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+			VALUES ($1,$2,$3,'originals/00/matching/original.png','image/png',1)`,
+			newUUIDv4(t), mismatchMediaID, strings.Repeat("c", 64)); err != nil {
+			t.Fatalf("insert matching Original MIME: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE media SET media_type='image/jpeg' WHERE id=$1`, mismatchMediaID)
 	})
 
 	t.Run("profile migration rejects seed conflicts without adoption", func(t *testing.T) {
@@ -149,6 +192,207 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatal("profile migration accepted active profile without certification evidence")
 		}
 		assertProfileMigrationRolledBack(t, pool, 1)
+	})
+
+	t.Run("media MIME migration waits for an earlier incompatible legacy writer", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:2]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one and two: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		writer, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin legacy writer: %v", err)
+		}
+		defer writer.Rollback(context.Background())
+		mediaID := newUUIDv4(t)
+		if _, err := writer.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/png','unknown')`, mediaID); err != nil {
+			t.Fatalf("stage legacy Media: %v", err)
+		}
+		if _, err := writer.Exec(ctx, `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+			VALUES ($1,$2,$3,'originals/00/legacy-race/original.jpg','image/jpeg',1)`,
+			newUUIDv4(t), mediaID, strings.Repeat("d", 64)); err != nil {
+			t.Fatalf("stage incompatible legacy Original: %v", err)
+		}
+
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(ctx) }()
+		awaitRelationLock(t, pool, ctx, 0, "media", "AccessExclusiveLock", false)
+		if err := writer.Commit(ctx); err != nil {
+			t.Fatalf("commit legacy writer: %v", err)
+		}
+		if err := awaitContextResult(t, ctx, migrationResult); err == nil {
+			t.Fatal("migration succeeded after an incompatible legacy writer committed")
+		}
+
+		var version int64
+		if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 2 {
+			t.Fatalf("migration version after incompatible writer = %d, err=%v", version, err)
+		}
+		var mismatches int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM media AS m JOIN originals AS o ON o.media_id=m.id
+			WHERE o.mime_type IS DISTINCT FROM m.media_type`).Scan(&mismatches); err != nil || mismatches != 1 {
+			t.Fatalf("incompatible legacy rows = %d, err=%v", mismatches, err)
+		}
+	})
+
+	t.Run("media MIME migration waits for an earlier matching legacy writer without deadlock", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:2]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one and two: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		writer, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin legacy writer: %v", err)
+		}
+		defer writer.Rollback(context.Background())
+		mediaID := newUUIDv4(t)
+		if _, err := writer.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/png','unknown')`, mediaID); err != nil {
+			t.Fatalf("stage legacy Media: %v", err)
+		}
+		if _, err := writer.Exec(ctx, `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+			VALUES ($1,$2,$3,'originals/00/legacy-matching/original.png','image/png',1)`,
+			newUUIDv4(t), mediaID, strings.Repeat("1", 64)); err != nil {
+			t.Fatalf("stage matching legacy Original: %v", err)
+		}
+
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(ctx) }()
+		awaitRelationLock(t, pool, ctx, 0, "media", "AccessExclusiveLock", false)
+		if err := writer.Commit(ctx); err != nil {
+			t.Fatalf("commit matching legacy writer: %v", err)
+		}
+		if err := awaitContextResult(t, ctx, migrationResult); err != nil {
+			t.Fatalf("migration after matching legacy writer: %v", err)
+		}
+
+		var matches int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM media AS m JOIN originals AS o ON o.media_id=m.id
+			WHERE m.id=$1 AND o.mime_type=m.media_type`, mediaID).Scan(&matches); err != nil || matches != 1 {
+			t.Fatalf("matching legacy rows = %d, err=%v", matches, err)
+		}
+	})
+
+	t.Run("media MIME migration blocks a later writer until triggers are installed", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:2]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one and two: %v", err)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		barrier, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("acquire migration barrier connection: %v", err)
+		}
+		defer barrier.Release()
+		const barrierKey = int64(0x4e4d435030303033) // "NMCP0003"
+		if _, err := barrier.Exec(ctx, `SELECT pg_catalog.pg_advisory_lock($1)`, barrierKey); err != nil {
+			t.Fatalf("acquire migration barrier: %v", err)
+		}
+		defer barrier.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, barrierKey)
+
+		migrationUnderTest := full.migrations[2]
+		const lockStatement = "LOCK TABLE media, originals IN ACCESS EXCLUSIVE MODE;"
+		instrumentedSQL := strings.Replace(migrationUnderTest.sql, lockStatement, lockStatement+fmt.Sprintf("\nSELECT pg_catalog.pg_advisory_xact_lock(%d);", barrierKey), 1)
+		if instrumentedSQL == migrationUnderTest.sql {
+			t.Fatal("migration lock statement was not found for test instrumentation")
+		}
+		migrationUnderTest.sql = instrumentedSQL
+		migrationUnderTest.checksum = checksumSQL([]byte(instrumentedSQL))
+		migrationResult := make(chan error, 1)
+		go func() {
+			migrationResult <- newMigrator(pool, []migration{full.migrations[0], full.migrations[1], migrationUnderTest}).Up(ctx)
+		}()
+		awaitRelationLock(t, pool, ctx, 0, "media", "AccessExclusiveLock", true)
+		awaitRelationLock(t, pool, ctx, 0, "originals", "AccessExclusiveLock", true)
+
+		writerConn, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("acquire later writer connection: %v", err)
+		}
+		defer writerConn.Release()
+		var writerPID int32
+		if err := writerConn.QueryRow(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&writerPID); err != nil {
+			t.Fatalf("read later writer PID: %v", err)
+		}
+		writerResult := make(chan error, 1)
+		mediaID := newUUIDv4(t)
+		originalID := newUUIDv4(t)
+		go func() {
+			tx, err := writerConn.Begin(ctx)
+			if err == nil {
+				_, err = tx.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/png','unknown')`, mediaID)
+			}
+			if err == nil {
+				_, err = tx.Exec(ctx, `
+					INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+					VALUES ($1,$2,$3,'originals/00/blocked-race/original.jpg','image/jpeg',1)`,
+					originalID, mediaID, strings.Repeat("e", 64))
+			}
+			if err == nil {
+				err = tx.Commit(ctx)
+			} else if tx != nil {
+				_ = tx.Rollback(context.Background())
+			}
+			writerResult <- err
+		}()
+		awaitRelationLock(t, pool, ctx, writerPID, "media", "RowExclusiveLock", false)
+
+		if _, err := barrier.Exec(ctx, `SELECT pg_catalog.pg_advisory_unlock($1)`, barrierKey); err != nil {
+			t.Fatalf("release migration barrier: %v", err)
+		}
+		if err := awaitContextResult(t, ctx, migrationResult); err != nil {
+			t.Fatalf("migration after releasing barrier: %v", err)
+		}
+		if err := awaitContextResult(t, ctx, writerResult); err == nil {
+			t.Fatal("later incompatible writer passed the installed trigger")
+		}
+		var mediaRows int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM media WHERE id=$1`, mediaID).Scan(&mediaRows); err != nil || mediaRows != 0 {
+			t.Fatalf("failed writer Media rows = %d, err=%v", mediaRows, err)
+		}
+
+		matchingWriter, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin matching writer after migration: %v", err)
+		}
+		matchingMediaID := newUUIDv4(t)
+		if _, err = matchingWriter.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/png','unknown')`, matchingMediaID); err == nil {
+			_, err = matchingWriter.Exec(ctx, `
+				INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+				VALUES ($1,$2,$3,'originals/00/matching-after-lock/original.png','image/png',1)`,
+				newUUIDv4(t), matchingMediaID, strings.Repeat("f", 64))
+		}
+		if err == nil {
+			err = matchingWriter.Commit(ctx)
+		} else {
+			_ = matchingWriter.Rollback(context.Background())
+		}
+		if err != nil {
+			t.Fatalf("matching writer after migration: %v", err)
+		}
 	})
 
 	t.Run("profile migration preserves compatible custom draft", func(t *testing.T) {
@@ -366,26 +610,66 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 
 	t.Run("cancellation still releases session lock", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
-		migrator := newMigrator(pool, []migration{testMigration(1, "cancel", "SELECT pg_sleep(10)")})
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
+		applicationName := "nmcp_cancel_" + strings.ReplaceAll(newUUIDv4(t), "-", "")
+		migrationSQL := fmt.Sprintf(
+			"SELECT pg_catalog.set_config('application_name', '%s', false); SELECT pg_catalog.pg_sleep(10)",
+			applicationName,
+		)
+		migrator := newMigrator(pool, []migration{testMigration(1, "cancel", migrationSQL)})
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() { result <- migrator.Up(ctx) }()
 
-		if err := migrator.Up(ctx); err == nil {
+		observeCtx, observeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		migrationPID := awaitApplicationBackendPID(t, pool, observeCtx, applicationName)
+		observeCancel()
+		cancel()
+		resultCtx, resultCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer resultCancel()
+		if err := awaitContextResult(t, resultCtx, result); err == nil {
 			t.Fatal("Up() expected cancellation error")
 		}
-		conn, err := pool.Acquire(context.Background())
+
+		candidate, err := pool.Acquire(context.Background())
 		if err != nil {
 			t.Fatalf("acquire lock-check connection: %v", err)
 		}
-		defer conn.Release()
+		defer candidate.Release()
+		verifier := candidate
+		var candidatePID int32
+		if err := candidate.QueryRow(context.Background(), `SELECT pg_catalog.pg_backend_pid()`).Scan(&candidatePID); err != nil {
+			t.Fatalf("read lock-check backend PID: %v", err)
+		}
+		if candidatePID == migrationPID {
+			verifier, err = pool.Acquire(context.Background())
+			if err != nil {
+				t.Fatalf("acquire distinct lock-check connection: %v", err)
+			}
+			defer verifier.Release()
+		}
+		var verifierPID int32
+		if err := verifier.QueryRow(context.Background(), `SELECT pg_catalog.pg_backend_pid()`).Scan(&verifierPID); err != nil {
+			t.Fatalf("read distinct verifier PID: %v", err)
+		}
+		if verifierPID == migrationPID {
+			t.Fatalf("lock verifier reused migration backend PID %d", migrationPID)
+		}
+		lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer lockCancel()
 		var locked bool
-		if err := conn.QueryRow(context.Background(), `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
-			t.Fatalf("try migration lock: %v", err)
+		for !locked {
+			if err := verifier.QueryRow(lockCtx, `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
+				t.Fatalf("try migration lock: %v", err)
+			}
+			if !locked {
+				select {
+				case <-lockCtx.Done():
+					t.Fatalf("migration session lock remained held after cancellation: %v", lockCtx.Err())
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
 		}
-		if !locked {
-			t.Fatal("migration session lock remained held after cancellation")
-		}
-		if _, err := conn.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, migrationLockKey); err != nil {
+		if _, err := verifier.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, migrationLockKey); err != nil {
 			t.Fatalf("release lock-check lock: %v", err)
 		}
 	})
@@ -541,6 +825,72 @@ func testNonTransactionalMigration(version int64, name, sql string) migration {
 	return migration{version: version, name: name, checksum: checksumSQL([]byte(sql)), sql: sql, idempotent: true}
 }
 
+func awaitRelationLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context, pid int32, relation, mode string, granted bool) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var found bool
+		err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_locks AS l
+				JOIN pg_catalog.pg_class AS c ON c.oid=l.relation
+				JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+				WHERE n.nspname=current_schema()
+				  AND c.relname=$1 AND l.mode=$2 AND l.granted=$3
+				  AND ($4::integer = 0 OR l.pid=$4)
+			)`, relation, mode, granted, pid).Scan(&found)
+		if err != nil {
+			t.Fatalf("poll %s lock on %s: %v", mode, relation, err)
+		}
+		if found {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for granted=%t %s lock on %s: %v", granted, mode, relation, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func awaitContextResult(t *testing.T, ctx context.Context, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		t.Fatalf("wait for concurrent database operation: %v", ctx.Err())
+		return ctx.Err()
+	}
+}
+
+func awaitApplicationBackendPID(t *testing.T, pool *pgxpool.Pool, ctx context.Context, applicationName string) int32 {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var pid int32
+		err := pool.QueryRow(ctx, `
+			SELECT pid FROM pg_catalog.pg_stat_activity
+			WHERE application_name=$1 AND state='active'
+			ORDER BY pid LIMIT 1`, applicationName).Scan(&pid)
+		if err == nil {
+			return pid
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("observe migration backend PID: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for migration backend %q: %v", applicationName, ctx.Err())
+			return 0
+		case <-ticker.C:
+		}
+	}
+}
+
 func integrationPool(t *testing.T, databaseURL string) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
@@ -574,6 +924,9 @@ func integrationPool(t *testing.T, databaseURL string) *pgxpool.Pool {
 		config.ConnConfig.RuntimeParams = make(map[string]string)
 	}
 	config.ConnConfig.RuntimeParams["search_path"] = identifier
+	if config.MaxConns < 5 {
+		config.MaxConns = 5
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		t.Fatalf("connect using isolated test schema: %v", err)

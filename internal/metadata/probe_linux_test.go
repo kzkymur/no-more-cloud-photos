@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -421,6 +422,108 @@ printf '[{"ImageWidth":2,"ImageHeight":3}]'
 	}
 	if time.Since(started) > time.Second {
 		t.Fatal("FIFO open blocked")
+	}
+}
+
+func TestProbeKeepsCallerDescriptorOpenAndIgnoresOffset(t *testing.T) {
+	input := writeMedia(t, "input.jpg", []byte{0xff, 0xd8, 0xff, 0xd9})
+	file, err := os.Open(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.Seek(3, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	exiftool := writeExecutable(t, "exiftool", `#!/bin/sh
+if [ "$1" = "-ver" ]; then printf '13.36\n'; else printf '[{"ImageWidth":2,"ImageHeight":3}]'; fi
+`)
+	prober := newTestProber(t, exiftool, writeExecutable(t, "unused", "#!/bin/sh\nexit 1\n"), DefaultPolicy())
+	result, err := prober.Probe(context.Background(), file, "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Width != 2 || result.Height != 3 {
+		t.Fatalf("result = %#v", result)
+	}
+	if offset, err := file.Seek(0, io.SeekCurrent); err != nil || offset != 3 {
+		t.Fatalf("caller descriptor offset = %d, %v; want 3", offset, err)
+	}
+	assertOpenJPEGDescriptor(t, file)
+}
+
+func TestProbeRejectsNilNonRegularAndWritableDescriptors(t *testing.T) {
+	prober := newTestProber(t, "/unused/exiftool", "/unused/ffprobe", DefaultPolicy())
+	if _, err := prober.Probe(context.Background(), nil, "UTC"); !errors.Is(err, ErrInvalidMedia) {
+		t.Fatalf("nil descriptor error = %v", err)
+	}
+
+	directory, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	if _, err := prober.Probe(context.Background(), directory, "UTC"); !errors.Is(err, ErrInvalidMedia) {
+		t.Fatalf("directory descriptor error = %v", err)
+	}
+
+	input := writeMedia(t, "writable.jpg", []byte{0xff, 0xd8, 0xff, 0xd9})
+	writable, err := os.OpenFile(input, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writable.Close()
+	if _, err := prober.Probe(context.Background(), writable, "UTC"); !errors.Is(err, ErrInvalidMedia) {
+		t.Fatalf("writable descriptor error = %v", err)
+	}
+}
+
+func TestProbeUsesOpenedInodeAfterPathRename(t *testing.T) {
+	input := writeMedia(t, "input.jpg", []byte{0xff, 0xd8, 0xff, 0xd9})
+	file, err := os.Open(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := os.Rename(input, input+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(input, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exiftool := writeExecutable(t, "exiftool", `#!/bin/sh
+if [ "$1" = "-ver" ]; then printf '13.36\n'; else printf '[{"ImageWidth":4,"ImageHeight":5}]'; fi
+`)
+	prober := newTestProber(t, exiftool, writeExecutable(t, "unused", "#!/bin/sh\nexit 1\n"), DefaultPolicy())
+	result, err := prober.Probe(context.Background(), file, "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Width != 4 || result.Height != 5 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestProbeDoesNotCloseCallerDescriptorOnToolError(t *testing.T) {
+	input := writeMedia(t, "input.jpg", []byte{0xff, 0xd8, 0xff, 0xd9})
+	file, err := os.Open(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	tool := writeExecutable(t, "failing-exiftool", "#!/bin/sh\nexit 1\n")
+	prober := newTestProber(t, tool, writeExecutable(t, "unused", "#!/bin/sh\nexit 1\n"), DefaultPolicy())
+	if _, err := prober.Probe(context.Background(), file, "UTC"); !errors.Is(err, ErrProbeFailed) {
+		t.Fatalf("Probe error = %v", err)
+	}
+	assertOpenJPEGDescriptor(t, file)
+}
+
+func assertOpenJPEGDescriptor(t *testing.T, file *os.File) {
+	t.Helper()
+	header := make([]byte, 2)
+	if n, err := file.ReadAt(header, 0); err != nil || n != len(header) || header[0] != 0xff || header[1] != 0xd8 {
+		t.Fatalf("caller descriptor is not usable: read %x (%d bytes), error %v", header, n, err)
 	}
 }
 

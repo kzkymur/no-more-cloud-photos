@@ -69,9 +69,21 @@ func (p *Prober) ProbeFile(ctx context.Context, path string, defaultTimezone str
 	}
 	file := os.NewFile(uintptr(fd), "metadata-input")
 	defer file.Close()
+	return p.Probe(ctx, file, defaultTimezone)
+}
+
+// Probe extracts metadata from a caller-owned read-only regular file descriptor.
+func (p *Prober) Probe(ctx context.Context, file *os.File, defaultTimezone string) (Result, error) {
+	if file == nil {
+		return Result{}, fmt.Errorf("%w: probe input is nil", ErrInvalidMedia)
+	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return Result{}, fmt.Errorf("%w: probe input is not a regular file", ErrInvalidMedia)
+	}
+	flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFL, 0)
+	if err != nil || flags&unix.O_ACCMODE != unix.O_RDONLY || flags&unix.O_PATH != 0 {
+		return Result{}, fmt.Errorf("%w: probe input is not an open read-only file", ErrInvalidMedia)
 	}
 	detected, detectErr := Detect(file, info.Size())
 	if detectErr != nil {
