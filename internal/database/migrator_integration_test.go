@@ -622,12 +622,20 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 			t.Fatalf("acquire lock-check connection: %v", err)
 		}
 		defer conn.Release()
+		lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer lockCancel()
 		var locked bool
-		if err := conn.QueryRow(context.Background(), `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
-			t.Fatalf("try migration lock: %v", err)
-		}
-		if !locked {
-			t.Fatal("migration session lock remained held after cancellation")
+		for !locked {
+			if err := conn.QueryRow(lockCtx, `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
+				t.Fatalf("try migration lock: %v", err)
+			}
+			if !locked {
+				select {
+				case <-lockCtx.Done():
+					t.Fatalf("migration session lock remained held after cancellation: %v", lockCtx.Err())
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
 		}
 		if _, err := conn.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, migrationLockKey); err != nil {
 			t.Fatalf("release lock-check lock: %v", err)
