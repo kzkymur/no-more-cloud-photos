@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,9 +13,11 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	corestorage "github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/upload"
 )
 
 type fakeDatabase struct {
@@ -35,6 +39,20 @@ type fakeMigrations struct {
 type fakeStorage struct {
 	err   error
 	calls int
+}
+
+type fakeUploadAcceptor struct {
+	requests []upload.Request
+	accept   func(context.Context, upload.Request) (upload.Outcome, error)
+}
+
+func (f *fakeUploadAcceptor) Accept(ctx context.Context, request upload.Request) (upload.Outcome, error) {
+	f.requests = append(f.requests, request)
+	if f.accept != nil {
+		return f.accept(ctx, request)
+	}
+	_, err := io.Copy(io.Discard, request.Body)
+	return upload.Outcome{Status: http.StatusCreated, Body: json.RawMessage(`{"media":{},"job":null}`)}, err
 }
 
 func (f *fakeStorage) Probe(context.Context) error {
@@ -284,6 +302,503 @@ func TestStorageProbeLeavesExistingFilesAndNoArtifact(t *testing.T) {
 		t.Fatalf("storage entries after probe = %v, want only existing", entries)
 	}
 }
+
+func TestUploadStreamsNormalizedRequestAndRawOutcome(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{}
+	var received []byte
+	acceptor.accept = func(_ context.Context, request upload.Request) (upload.Outcome, error) {
+		var err error
+		received, err = io.ReadAll(request.Body)
+		if err != nil {
+			return upload.Outcome{}, err
+		}
+		return upload.Outcome{
+			Status: http.StatusConflict, Replayed: true,
+			Body: json.RawMessage(`{"future":{"number":9007199254740993},"nullable":null}`),
+		}, nil
+	}
+	h := NewHandler(Dependencies{Upload: acceptor})
+	body := rawMultipart("boundary", `form-data; name="file"; filename="C:\\fakepath\\photo.jpg"`, "image/not-trusted", nil, "content", "")
+	request := uploadHTTPReq(body, "multipart/form-data; boundary=boundary", "key-1", "current-request")
+	response := httptest.NewRecorder()
+
+	h.ServeHTTP(response, request)
+
+	assertResponse(t, response, http.StatusConflict, "current-request")
+	if got, want := response.Body.String(), `{"future":{"number":9007199254740993},"nullable":null}`; got != want {
+		t.Fatalf("raw response = %q, want %q", got, want)
+	}
+	if response.Header().Get("Idempotency-Replayed") != "true" {
+		t.Fatal("replay response omitted Idempotency-Replayed")
+	}
+	if len(acceptor.requests) != 1 || string(received) != "content" {
+		t.Fatalf("accept requests/body = %d/%q", len(acceptor.requests), received)
+	}
+	requestSeen := acceptor.requests[0]
+	if requestSeen.IdempotencyKey != "key-1" || requestSeen.RequestID != "current-request" || requestSeen.Filename == nil || *requestSeen.Filename != "photo.jpg" {
+		t.Fatalf("service request = %#v", requestSeen)
+	}
+}
+
+func TestUploadFilenameParsingAndNormalization(t *testing.T) {
+	tests := []struct {
+		name        string
+		disposition string
+		want        *string
+		wantCode    string
+	}{
+		{name: "absent", disposition: `form-data; name="file"`},
+		{name: "empty", disposition: `form-data; name="file"; filename=""`},
+		{name: "quoted semicolon and backslash path", disposition: `form-data; name="file"; filename="C:\\fakepath\\semi;name.jpg"`, want: stringPointerTest("semi;name.jpg")},
+		{name: "browser single backslash fake path", disposition: `form-data; name="file"; filename="C:\fakepath\photo.jpg"`, want: stringPointerTest("photo.jpg")},
+		{name: "literal percent fallback", disposition: `form-data; name="file"; filename="100%.jpg"`, want: stringPointerTest("100%.jpg")},
+		{name: "extended takes precedence", disposition: `form-data; name="file"; filename="fallback.jpg"; filename*=UTF-8''preferred.jpg`, want: stringPointerTest("preferred.jpg")},
+		{name: "extended path and NFC", disposition: `form-data; name="file"; filename*=UTF-8''dir%2Fsub%2Fe%CC%81.jpg`, want: stringPointerTest("é.jpg")},
+		{name: "invalid charset never falls back", disposition: `form-data; name="file"; filename="safe.jpg"; filename*=ISO-8859-1''bad.jpg`, wantCode: "invalid_filename"},
+		{name: "bad percent never falls back", disposition: `form-data; name="file"; filename="safe.jpg"; filename*=UTF-8''bad%ZZ.jpg`, wantCode: "invalid_filename"},
+		{name: "invalid UTF-8", disposition: `form-data; name="file"; filename*=UTF-8''bad%C3%28.jpg`, wantCode: "invalid_filename"},
+		{name: "encoded control", disposition: `form-data; name="file"; filename*=UTF-8''bad%00.jpg`, wantCode: "invalid_filename"},
+		{name: "quoted control", disposition: "form-data; name=\"file\"; filename=\"bad\tname.jpg\"", wantCode: "invalid_filename"},
+		{name: "quoted extended rejected", disposition: `form-data; name="file"; filename*="UTF-8''name.jpg"`, wantCode: "invalid_filename"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			acceptor := &fakeUploadAcceptor{}
+			h := NewHandler(Dependencies{Upload: acceptor})
+			request := uploadHTTPReq(rawMultipart("b", test.disposition, "", nil, "x", ""), "multipart/form-data; boundary=b", "key", "filename-request")
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, request)
+			if test.wantCode != "" {
+				assertResponse(t, response, http.StatusBadRequest, "filename-request")
+				assertError(t, response, test.wantCode, "filename-request")
+				if len(acceptor.requests) != 0 {
+					t.Fatalf("service called %d times", len(acceptor.requests))
+				}
+				return
+			}
+			assertResponse(t, response, http.StatusCreated, "filename-request")
+			if len(acceptor.requests) != 1 || !reflect.DeepEqual(acceptor.requests[0].Filename, test.want) {
+				t.Fatalf("filename = %#v, want %#v", acceptor.requests, test.want)
+			}
+		})
+	}
+}
+
+func TestUploadRejectsMalformedRequestsBeforeService(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		key         *string
+		body        string
+		code        string
+	}{
+		{name: "missing key", contentType: "multipart/form-data; boundary=b", body: rawMultipart("b", `form-data; name="file"`, "", nil, "x", ""), code: "missing_idempotency_key"},
+		{name: "empty key", contentType: "multipart/form-data; boundary=b", key: stringPointerTest(""), body: rawMultipart("b", `form-data; name="file"`, "", nil, "x", ""), code: "invalid_idempotency_key"},
+		{name: "whitespace key", contentType: "multipart/form-data; boundary=b", key: stringPointerTest("bad key"), body: rawMultipart("b", `form-data; name="file"`, "", nil, "x", ""), code: "invalid_idempotency_key"},
+		{name: "missing content type", key: stringPointerTest("key"), code: "invalid_multipart"},
+		{name: "wrong content type", contentType: "application/json", key: stringPointerTest("key"), code: "invalid_multipart"},
+		{name: "missing boundary", contentType: "multipart/form-data", key: stringPointerTest("key"), code: "invalid_multipart"},
+		{name: "extended boundary", contentType: "multipart/form-data; boundary*=UTF-8''b", key: stringPointerTest("key"), code: "invalid_multipart"},
+		{name: "empty boundary", contentType: `multipart/form-data; boundary=""`, key: stringPointerTest("key"), code: "invalid_multipart"},
+		{name: "invalid boundary", contentType: `multipart/form-data; boundary="line\nbreak"`, key: stringPointerTest("key"), code: "invalid_multipart"},
+		{name: "missing part", contentType: "multipart/form-data; boundary=b", key: stringPointerTest("key"), body: "--b--\r\n", code: "invalid_multipart"},
+		{name: "unexpected part", contentType: "multipart/form-data; boundary=b", key: stringPointerTest("key"), body: rawMultipart("b", `form-data; name="caption"`, "", nil, "x", ""), code: "invalid_multipart"},
+		{name: "transfer encoding", contentType: "multipart/form-data; boundary=b", key: stringPointerTest("key"), body: rawMultipart("b", `form-data; name="file"`, "", []string{"Content-Transfer-Encoding: binary"}, "x", ""), code: "invalid_multipart"},
+		{name: "empty transfer encoding", contentType: "multipart/form-data; boundary=b", key: stringPointerTest("key"), body: rawMultipart("b", `form-data; name="file"`, "", []string{"Content-Transfer-Encoding:"}, "x", ""), code: "invalid_multipart"},
+		{name: "nested multipart", contentType: "multipart/form-data; boundary=b", key: stringPointerTest("key"), body: rawMultipart("b", `form-data; name="file"`, "multipart/mixed; boundary=inner", nil, "x", ""), code: "invalid_multipart"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			acceptor := &fakeUploadAcceptor{}
+			h := NewHandler(Dependencies{Upload: acceptor})
+			request := httptest.NewRequest(http.MethodPost, "/media", strings.NewReader(test.body))
+			request.Header.Set("X-Request-ID", "malformed-request")
+			if test.contentType != "" {
+				request.Header.Set("Content-Type", test.contentType)
+			}
+			if test.key != nil {
+				request.Header.Set("Idempotency-Key", *test.key)
+			}
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, request)
+			assertResponse(t, response, http.StatusBadRequest, "malformed-request")
+			assertError(t, response, test.code, "malformed-request")
+			if len(acceptor.requests) != 0 {
+				t.Fatalf("service called %d times", len(acceptor.requests))
+			}
+		})
+	}
+}
+
+func TestUploadTrailingPartFailsDuringServiceRead(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{}
+	acceptor.accept = func(_ context.Context, request upload.Request) (upload.Outcome, error) {
+		content, err := io.ReadAll(request.Body)
+		if string(content) != "first" {
+			t.Fatalf("service read %q", content)
+		}
+		if err == nil {
+			t.Fatal("service reached EOF without trailing-part error")
+		}
+		return upload.Outcome{}, err
+	}
+	body := "--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nfirst\r\n" +
+		"--b\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\nsecond\r\n--b--\r\n"
+	response := httptest.NewRecorder()
+	NewHandler(Dependencies{Upload: acceptor}).ServeHTTP(response, uploadHTTPReq(body, "multipart/form-data; boundary=b", "key", "trailing-request"))
+	assertResponse(t, response, http.StatusBadRequest, "trailing-request")
+	assertError(t, response, "invalid_multipart", "trailing-request")
+	if len(acceptor.requests) != 1 {
+		t.Fatalf("service calls = %d, want 1", len(acceptor.requests))
+	}
+}
+
+func TestUploadTrailingPartOversizeTakesPrecedence(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{}
+	acceptor.accept = func(_ context.Context, request upload.Request) (upload.Outcome, error) {
+		content, err := io.ReadAll(request.Body)
+		if string(content) != "first" {
+			t.Fatalf("service read %q", content)
+		}
+		if err == nil {
+			t.Fatal("service reached EOF without trailing-part error")
+		}
+		return upload.Outcome{}, err
+	}
+	prefix := "--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nfirst\r\n" +
+		"--b\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\n"
+	body := prefix + strings.Repeat("x", 1024) + "\r\n--b--\r\n"
+	h := NewHandler(Dependencies{Upload: acceptor}).(*handler)
+	h.maxBodyBytes = int64(len(prefix) + 16)
+	request := uploadHTTPReq(body, "multipart/form-data; boundary=b", "key", "trailing-large-request")
+	response := httptest.NewRecorder()
+
+	h.ServeHTTP(response, request)
+
+	assertResponse(t, response, http.StatusRequestEntityTooLarge, "trailing-large-request")
+	assertError(t, response, "upload_too_large", "trailing-large-request")
+	if response.Header().Get("Connection") != "close" || !request.Close {
+		t.Fatalf("413 connection state = header %q, request.Close %v", response.Header().Get("Connection"), request.Close)
+	}
+}
+
+func TestUploadTrailingPartTimeoutTakesPrecedence(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{}
+	acceptor.accept = func(_ context.Context, request upload.Request) (upload.Outcome, error) {
+		content, err := io.ReadAll(request.Body)
+		if string(content) != "first" {
+			t.Fatalf("service read %q", content)
+		}
+		if err == nil {
+			t.Fatal("service reached EOF without trailing-part error")
+		}
+		return upload.Outcome{}, err
+	}
+	prefix := "--b\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nfirst\r\n" +
+		"--b\r\nContent-Disposition: form-data; name=\"other\"\r\n\r\npartial"
+	request := httptest.NewRequest(http.MethodPost, "/media", io.MultiReader(strings.NewReader(prefix), timeoutReader{}))
+	request.Header.Set("Content-Type", "multipart/form-data; boundary=b")
+	request.Header.Set("Idempotency-Key", "key")
+	request.Header.Set("X-Request-ID", "trailing-timeout-request")
+	response := httptest.NewRecorder()
+
+	NewHandler(Dependencies{Upload: acceptor}).ServeHTTP(response, request)
+
+	assertResponse(t, response, http.StatusRequestTimeout, "trailing-timeout-request")
+	assertError(t, response, "upload_timeout", "trailing-timeout-request")
+}
+
+func TestUploadTotalBodyLimitIncludesEpilogue(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{}
+	h := NewHandler(Dependencies{Upload: acceptor}).(*handler)
+	base := rawMultipart("b", `form-data; name="file"`, "", nil, "x", "")
+	h.maxBodyBytes = int64(len(base) + 2)
+	request := uploadHTTPReq(base+"oversized epilogue", "multipart/form-data; boundary=b", "key", "large-request")
+	response := httptest.NewRecorder()
+
+	h.ServeHTTP(response, request)
+
+	assertResponse(t, response, http.StatusRequestEntityTooLarge, "large-request")
+	assertError(t, response, "upload_too_large", "large-request")
+	if response.Header().Get("Connection") != "close" {
+		t.Fatalf("413 Connection = %q, want close", response.Header().Get("Connection"))
+	}
+	if !request.Close {
+		t.Fatal("413 did not mark request connection for closure")
+	}
+}
+
+func TestUploadServiceTooLargeClosesConnectionBeforeHeaders(t *testing.T) {
+	const maxFileBytes = int64(4)
+	var bytesRead int64
+	acceptor := &fakeUploadAcceptor{accept: func(_ context.Context, request upload.Request) (upload.Outcome, error) {
+		count, err := io.CopyN(io.Discard, request.Body, maxFileBytes+1)
+		bytesRead = count
+		if err != nil {
+			return upload.Outcome{}, err
+		}
+		return upload.Outcome{}, &upload.Failure{
+			Status: http.StatusRequestEntityTooLarge, Code: "upload_too_large", Message: "uploaded file exceeds the size limit",
+		}
+	}}
+	body := rawMultipart("b", `form-data; name="file"`, "", nil, "content remains unread", "")
+	request := uploadHTTPReq(body, "multipart/form-data; boundary=b", "key", "service-large-request")
+	response := &closeCheckingRecorder{ResponseRecorder: httptest.NewRecorder(), request: request}
+
+	NewHandler(Dependencies{Upload: acceptor}).ServeHTTP(response, request)
+
+	assertResponse(t, response.ResponseRecorder, http.StatusRequestEntityTooLarge, "service-large-request")
+	assertError(t, response.ResponseRecorder, "upload_too_large", "service-large-request")
+	if bytesRead != maxFileBytes+1 {
+		t.Fatalf("service read %d bytes, want %d", bytesRead, maxFileBytes+1)
+	}
+	if !response.closedBeforeHeaders {
+		t.Fatal("413 response headers were written before request connection was marked for closure")
+	}
+	if response.Header().Get("Connection") != "close" || !request.Close {
+		t.Fatalf("413 connection state = header %q, request.Close %v", response.Header().Get("Connection"), request.Close)
+	}
+	for _, deadline := range response.readDeadlines {
+		if deadline.IsZero() {
+			t.Fatalf("incomplete request body cleared read deadline: %v", response.readDeadlines)
+		}
+	}
+}
+
+func TestUploadFailureUsesServiceBodyWithoutCause(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{accept: func(_ context.Context, request upload.Request) (upload.Outcome, error) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		return upload.Outcome{}, &upload.Failure{
+			Status: http.StatusConflict, Code: "idempotency_conflict", Message: "request conflicts",
+			Details: map[string]any{"original_request_hash": "hash"}, Cause: errors.New("password=secret"),
+		}
+	}}
+	response := httptest.NewRecorder()
+	NewHandler(Dependencies{Upload: acceptor}).ServeHTTP(response, uploadHTTPReq(rawMultipart("b", `form-data; name="file"`, "", nil, "x", ""), "multipart/form-data; boundary=b", "key", "failure-request"))
+	assertResponse(t, response, http.StatusConflict, "failure-request")
+	if strings.Contains(response.Body.String(), "secret") {
+		t.Fatalf("response exposed cause: %s", response.Body.String())
+	}
+	var body errorResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error.Code != "idempotency_conflict" || body.Error.RequestID != "failure-request" || body.Error.Details["original_request_hash"] != "hash" {
+		t.Fatalf("service error body = %#v", body)
+	}
+}
+
+func TestUploadMethodsAndNegotiation(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{}
+	h := NewHandler(Dependencies{Upload: acceptor})
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodHead} {
+		response := serve(h, method, "/media", "method-request")
+		assertResponse(t, response, http.StatusMethodNotAllowed, "method-request")
+		if response.Header().Get("Allow") != http.MethodPost {
+			t.Fatalf("Allow = %q", response.Header().Get("Allow"))
+		}
+	}
+	request := uploadHTTPReq("", "multipart/form-data; boundary=b", "key", "accept-request")
+	request.Header.Set("Accept", "text/html")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	assertResponse(t, response, http.StatusNotAcceptable, "accept-request")
+	assertError(t, response, "not_acceptable", "accept-request")
+	if len(acceptor.requests) != 0 {
+		t.Fatalf("service called %d times", len(acceptor.requests))
+	}
+	unknown := serve(h, http.MethodPost, "/media/", "exact-path-request")
+	assertResponse(t, unknown, http.StatusNotFound, "exact-path-request")
+}
+
+func TestUploadRejectsDuplicateIdempotencyKey(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{}
+	request := uploadHTTPReq(rawMultipart("b", `form-data; name="file"`, "", nil, "x", ""), "multipart/form-data; boundary=b", "first", "duplicate-key-request")
+	request.Header.Add("Idempotency-Key", "second")
+	response := httptest.NewRecorder()
+	NewHandler(Dependencies{Upload: acceptor}).ServeHTTP(response, request)
+	assertResponse(t, response, http.StatusBadRequest, "duplicate-key-request")
+	assertError(t, response, "invalid_idempotency_key", "duplicate-key-request")
+	if len(acceptor.requests) != 0 {
+		t.Fatalf("service called %d times", len(acceptor.requests))
+	}
+}
+
+func TestUploadHardTimeoutDoesNotChargePostBodyWork(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	acceptor := &fakeUploadAcceptor{accept: func(ctx context.Context, request upload.Request) (upload.Outcome, error) {
+		if _, err := io.Copy(io.Discard, request.Body); err != nil {
+			return upload.Outcome{}, err
+		}
+		now = now.Add(time.Hour + time.Second)
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("accept context expired after body completion: %v", err)
+		}
+		return upload.Outcome{Status: http.StatusCreated, Body: json.RawMessage(`{"media":{},"job":null}`)}, nil
+	}}
+	h := NewHandler(Dependencies{Upload: acceptor}).(*handler)
+	h.hardTimeout = time.Hour
+	h.now = func() time.Time { return now }
+	request := uploadHTTPReq(rawMultipart("b", `form-data; name="file"`, "", nil, "x", ""), "multipart/form-data; boundary=b", "key", "timeout-request")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	assertResponse(t, response, http.StatusCreated, "timeout-request")
+}
+
+func TestUploadPreservesClientCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	acceptor := &fakeUploadAcceptor{accept: func(ctx context.Context, request upload.Request) (upload.Outcome, error) {
+		if _, err := io.Copy(io.Discard, request.Body); err != nil {
+			return upload.Outcome{}, err
+		}
+		cancel()
+		<-ctx.Done()
+		return upload.Outcome{}, ctx.Err()
+	}}
+	request := uploadHTTPReq(rawMultipart("b", `form-data; name="file"`, "", nil, "x", ""), "multipart/form-data; boundary=b", "key", "canceled-request")
+	request = request.WithContext(ctx)
+	response := httptest.NewRecorder()
+
+	NewHandler(Dependencies{Upload: acceptor}).ServeHTTP(response, request)
+
+	assertResponse(t, response, http.StatusRequestTimeout, "canceled-request")
+	assertError(t, response, "upload_timeout", "canceled-request")
+}
+
+func TestUploadElapsedBodyDeadlineReturnsRequestTimeout(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	body := rawMultipart("b", `form-data; name="file"`, "", nil, "content", "")
+	request := uploadHTTPReq(body, "multipart/form-data; boundary=b", "key", "elapsed-timeout-request")
+	request.Body = &advancingReadCloser{
+		Reader: strings.NewReader(body),
+		afterRead: func() {
+			now = now.Add(time.Hour + time.Second)
+		},
+	}
+	h := NewHandler(Dependencies{Upload: &fakeUploadAcceptor{}}).(*handler)
+	h.now = func() time.Time { return now }
+	h.hardTimeout = time.Hour
+	h.idleTimeout = 2 * time.Hour
+	response := httptest.NewRecorder()
+
+	h.ServeHTTP(response, request)
+
+	assertResponse(t, response, http.StatusRequestTimeout, "elapsed-timeout-request")
+	assertError(t, response, "upload_timeout", "elapsed-timeout-request")
+}
+
+type closeCheckingRecorder struct {
+	*httptest.ResponseRecorder
+	request             *http.Request
+	closedBeforeHeaders bool
+	readDeadlines       []time.Time
+}
+
+func (r *closeCheckingRecorder) WriteHeader(status int) {
+	if status == http.StatusRequestEntityTooLarge {
+		r.closedBeforeHeaders = r.request.Close && r.Header().Get("Connection") == "close"
+	}
+	r.ResponseRecorder.WriteHeader(status)
+}
+
+func (r *closeCheckingRecorder) SetReadDeadline(deadline time.Time) error {
+	r.readDeadlines = append(r.readDeadlines, deadline)
+	return nil
+}
+
+type advancingReadCloser struct {
+	io.Reader
+	afterRead func()
+}
+
+func (r *advancingReadCloser) Read(value []byte) (int, error) {
+	count, err := r.Reader.Read(value)
+	if r.afterRead != nil {
+		r.afterRead()
+		r.afterRead = nil
+	}
+	return count, err
+}
+
+func (*advancingReadCloser) Close() error { return nil }
+
+type timeoutReader struct{}
+
+func (timeoutReader) Read([]byte) (int, error) { return 0, timeoutReadError{} }
+
+type timeoutReadError struct{}
+
+func (timeoutReadError) Error() string   { return "read timed out" }
+func (timeoutReadError) Timeout() bool   { return true }
+func (timeoutReadError) Temporary() bool { return true }
+
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	readDeadlines  []time.Time
+	writeDeadlines []time.Time
+}
+
+func (r *deadlineRecorder) SetReadDeadline(deadline time.Time) error {
+	r.readDeadlines = append(r.readDeadlines, deadline)
+	return nil
+}
+
+func (r *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.writeDeadlines = append(r.writeDeadlines, deadline)
+	return nil
+}
+
+func TestUploadRenewsAndTransitionsDeadlines(t *testing.T) {
+	acceptor := &fakeUploadAcceptor{}
+	h := NewHandler(Dependencies{Upload: acceptor}).(*handler)
+	now := time.Unix(1_000, 0)
+	h.now = func() time.Time { return now }
+	response := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	request := uploadHTTPReq(rawMultipart("b", `form-data; name="file"`, "", nil, "content", ""), "multipart/form-data; boundary=b", "key", "deadline-request")
+
+	h.ServeHTTP(response, request)
+
+	assertResponse(t, response.ResponseRecorder, http.StatusCreated, "deadline-request")
+	if len(response.readDeadlines) < 3 {
+		t.Fatalf("read deadline updates = %v, want initial, renewal, and clear", response.readDeadlines)
+	}
+	cleared := false
+	for _, deadline := range response.readDeadlines {
+		if deadline.IsZero() {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatalf("read deadline was not cleared: %v", response.readDeadlines)
+	}
+	if len(response.writeDeadlines) != 1 || !response.writeDeadlines[0].Equal(now.Add(uploadWriteTimeout)) {
+		t.Fatalf("write deadlines = %v", response.writeDeadlines)
+	}
+}
+
+func rawMultipart(boundary, disposition, contentType string, extraHeaders []string, content, epilogue string) string {
+	var body strings.Builder
+	body.WriteString("--" + boundary + "\r\n")
+	body.WriteString("Content-Disposition: " + disposition + "\r\n")
+	if contentType != "" {
+		body.WriteString("Content-Type: " + contentType + "\r\n")
+	}
+	for _, header := range extraHeaders {
+		body.WriteString(header + "\r\n")
+	}
+	body.WriteString("\r\n" + content + "\r\n--" + boundary + "--\r\n" + epilogue)
+	return body.String()
+}
+
+func uploadHTTPReq(body, contentType, key, requestID string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, "/media", bytes.NewBufferString(body))
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("Idempotency-Key", key)
+	request.Header.Set("X-Request-ID", requestID)
+	return request
+}
+
+func stringPointerTest(value string) *string { return &value }
 
 func serve(h http.Handler, method, path, requestID string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest(method, path, nil)

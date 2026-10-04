@@ -375,10 +375,10 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		insertMedia(t, pool, mediaTwo)
 
 		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source) VALUES ($1,'image',now(),'unknown')`, newUUIDv4(t))
-		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source,taken_at_timezone) VALUES ($1,'image',now(),'embedded_offset','UTC')`, newUUIDv4(t))
-		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source,taken_at_timezone) VALUES ($1,'image',now(),'default_timezone','Not/A_Real_Zone')`, newUUIDv4(t))
+		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source,taken_at_timezone) VALUES ($1,'image/jpeg',now(),'embedded_offset','UTC')`, newUUIDv4(t))
+		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source,taken_at_timezone) VALUES ($1,'image/jpeg',now(),'default_timezone','Not/A_Real_Zone')`, newUUIDv4(t))
 		expectExecError(t, pool, `UPDATE media SET purge_after=now() WHERE id=$1`, mediaOne)
-		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at_source) VALUES ('00000000-0000-0000-0000-000000000000','image','unknown')`)
+		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at_source) VALUES ('00000000-0000-0000-0000-000000000000','image/jpeg','unknown')`)
 
 		sha := strings.Repeat("a", 64)
 		if _, err := pool.Exec(ctx, `
@@ -906,7 +906,7 @@ func expectTxCommitError(t *testing.T, pool *pgxpool.Pool, run func(pgx.Tx) erro
 
 func insertMedia(t *testing.T, pool *pgxpool.Pool, id string) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image','unknown')`, id); err != nil {
+	if _, err := pool.Exec(context.Background(), `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, id); err != nil {
 		t.Fatalf("insert media %s: %v", id, err)
 	}
 }

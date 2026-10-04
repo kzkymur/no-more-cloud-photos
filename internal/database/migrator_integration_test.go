@@ -34,8 +34,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 2 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version two", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 3 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version three", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -58,12 +58,55 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 2 || status.ExpectedVersion != 2 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version two", status)
+		if status.CurrentVersion != 3 || status.ExpectedVersion != 3 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version three", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
 		}
+	})
+
+	t.Run("media MIME migration preserves valid rows and enforces exact MIME values", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:2]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one and two: %v", err)
+		}
+		mediaID := newUUIDv4(t)
+		originalID := newUUIDv4(t)
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+			t.Fatalf("insert valid preexisting Media: %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+			VALUES ($1,$2,$3,'originals/00/preexisting/original.jpg','image/jpeg',1)`,
+			originalID, mediaID, strings.Repeat("a", 64)); err != nil {
+			t.Fatalf("insert valid preexisting Original: %v", err)
+		}
+		if err := full.Up(context.Background()); err != nil {
+			t.Fatalf("upgrade valid preexisting Media/Original: %v", err)
+		}
+
+		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image','unknown')`, newUUIDv4(t))
+		mismatchMediaID := newUUIDv4(t)
+		if _, err := pool.Exec(context.Background(), `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/png','unknown')`, mismatchMediaID); err != nil {
+			t.Fatalf("insert MIME-normalized Media: %v", err)
+		}
+		expectExecError(t, pool, `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+			VALUES ($1,$2,$3,'originals/00/mismatch/original.jpg','image/jpeg',1)`,
+			newUUIDv4(t), mismatchMediaID, strings.Repeat("b", 64))
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
+			VALUES ($1,$2,$3,'originals/00/matching/original.png','image/png',1)`,
+			newUUIDv4(t), mismatchMediaID, strings.Repeat("c", 64)); err != nil {
+			t.Fatalf("insert matching Original MIME: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE media SET media_type='image/jpeg' WHERE id=$1`, mismatchMediaID)
 	})
 
 	t.Run("profile migration rejects seed conflicts without adoption", func(t *testing.T) {

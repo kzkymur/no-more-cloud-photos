@@ -98,6 +98,23 @@ func (store *Store) BeginOriginal(ctx context.Context, key OriginalKey, attempt 
 	return store.begin(ctx, key.String(), attempt)
 }
 
+// BeginOriginalUpload stages an original before its content-detected extension
+// is known. Publish accepts only a closed OriginalExtension and constructs the
+// final key from the OriginalID retained here.
+func (store *Store) BeginOriginalUpload(ctx context.Context, originalID OriginalID, attempt AttemptID) (*OriginalUpload, error) {
+	if !originalID.uuidV4.valid() || !attempt.uuidV4.valid() {
+		return nil, ErrInvalidKey
+	}
+	id := originalID.String()
+	directories := []string{"originals", id[0:2], id}
+	stagingKey := strings.Join(append(append([]string(nil), directories...), "original"), "/")
+	temporary, err := store.beginAt(ctx, stagingKey, directories, "original", "", attempt)
+	if err != nil {
+		return nil, err
+	}
+	return &OriginalUpload{temporary: temporary, originalID: originalID}, nil
+}
+
 func (store *Store) BeginRendition(ctx context.Context, key RenditionKey, attempt AttemptID) (*Temp, error) {
 	if _, err := ParseRenditionKey(key.String()); err != nil || !attempt.uuidV4.valid() {
 		return nil, ErrInvalidKey
@@ -106,17 +123,71 @@ func (store *Store) BeginRendition(ctx context.Context, key RenditionKey, attemp
 }
 
 type Temp struct {
-	store       *Store
-	ctx         context.Context
-	parentFD    int
-	fileFD      int
-	key         string
-	tempName    string
-	finalName   string
-	finished    bool
-	published   bool
-	writeFailed error
-	mu          sync.Mutex
+	store            *Store
+	ctx              context.Context
+	parentFD         int
+	fileFD           int
+	key              string
+	tempName         string
+	finalName        string
+	cleanupParentFD  int
+	cleanupDirName   string
+	finished         bool
+	published        bool
+	active           bool
+	stateChanged     chan struct{}
+	sealed           bool
+	sealedInfo       ObjectInfo
+	sealedValidation validationSignature
+	writeFailed      error
+	mu               sync.Mutex
+}
+
+type OriginalUpload struct {
+	temporary  *Temp
+	originalID OriginalID
+}
+
+func (upload *OriginalUpload) Write(value []byte) (int, error) {
+	return upload.temporary.Write(value)
+}
+
+// UseReadOnlyFile calls use with a separately opened read-only descriptor.
+// The descriptor has an independent offset and is closed before this method
+// returns or propagates a panic. Storage operations are serialized with the
+// callback without holding an internal mutex. The callback must not call back
+// into this upload; such calls wait for the callback to return.
+func (upload *OriginalUpload) UseReadOnlyFile(use func(*os.File) error) error {
+	return upload.temporary.useReadOnlyFile(use)
+}
+
+func (upload *OriginalUpload) Seal(ctx context.Context, validation Validation) (ObjectInfo, error) {
+	return upload.temporary.seal(ctx, validation)
+}
+
+func (upload *OriginalUpload) PublishSealed(ctx context.Context, extension OriginalExtension) (OriginalKey, ObjectInfo, error) {
+	key, err := NewOriginalKey(upload.originalID, extension)
+	if err != nil {
+		return OriginalKey{}, ObjectInfo{}, err
+	}
+	_, finalName := splitKey(key.String())
+	info, err := upload.temporary.publishSealed(ctx, finalName, key.String())
+	return key, info, err
+}
+
+func (upload *OriginalUpload) Publish(ctx context.Context, extension OriginalExtension, validation Validation) (OriginalKey, ObjectInfo, error) {
+	key, err := NewOriginalKey(upload.originalID, extension)
+	if err != nil {
+		return OriginalKey{}, ObjectInfo{}, err
+	}
+	if _, err := upload.Seal(ctx, validation); err != nil {
+		return key, ObjectInfo{}, err
+	}
+	return upload.PublishSealed(ctx, extension)
+}
+
+func (upload *OriginalUpload) Abort(ctx context.Context) error {
+	return upload.temporary.Abort(ctx)
 }
 
 type Validation struct {
@@ -130,39 +201,76 @@ type ObjectInfo struct {
 	SHA256 [sha256.Size]byte
 }
 
+type validationSignature struct {
+	expectedSize int64
+	hasSHA256    bool
+	sha256       [sha256.Size]byte
+	hasValidate  bool
+}
+
+func signatureOf(validation Validation) validationSignature {
+	signature := validationSignature{expectedSize: validation.ExpectedSize}
+	if validation.ExpectedSHA256 != nil {
+		signature.hasSHA256 = true
+		signature.sha256 = *validation.ExpectedSHA256
+	}
+	if validation.Validate != nil {
+		signature.hasValidate = true
+	}
+	return signature
+}
+
 type DeleteResult struct {
 	Missing bool
 }
 
 func (store *Store) begin(ctx context.Context, key string, attempt AttemptID) (*Temp, error) {
+	directories, finalName := splitKey(key)
+	return store.beginAt(ctx, key, directories, finalName, finalName, attempt)
+}
+
+func (store *Store) beginAt(ctx context.Context, key string, directories []string, tempBase, finalName string, attempt AttemptID) (*Temp, error) {
 	store.mu.RLock()
 	if store.closed {
 		store.mu.RUnlock()
 		return nil, ErrClosed
 	}
-	directories, finalName := splitKey(key)
 	parentFD, err := unix.Dup(store.rootFD)
 	store.mu.RUnlock()
 	if err != nil {
 		return nil, classifyError("duplicate root", err)
 	}
+	cleanupParentFD := -1
+	cleanupDirName := ""
 	for depth, directory := range directories {
+		created := false
 		nextFD, openErr := store.ops.openat(parentFD, directory, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if openErr != nil && errors.Is(openErr, unix.ENOENT) {
 			if err = store.inject(ctx, BoundaryDirectoryCreate, Before, key, depth); err == nil {
 				err = store.ops.mkdirat(parentFD, directory, 0o700)
 			}
-			created := err == nil
+			created = err == nil
 			if errors.Is(err, unix.EEXIST) {
 				// Another trusted publisher won the same directory creation race.
 				// Open and sync both sides of that new entry ourselves before use.
 				err = nil
 			}
-			if err == nil && created {
-				err = store.inject(ctx, BoundaryDirectoryCreate, After, key, depth)
-			}
 			if err == nil {
 				nextFD, err = store.ops.openat(parentFD, directory, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			}
+			if err == nil && created && depth == len(directories)-1 && finalName == "" {
+				cleanupParentFD, err = unix.Dup(parentFD)
+				if err != nil {
+					cleanupErr := store.removeCreatedUploadDirectory(context.WithoutCancel(ctx), nextFD, parentFD, directory, key)
+					_ = unix.Close(nextFD)
+					_ = unix.Close(parentFD)
+					return nil, errors.Join(classifyError("pin upload directory parent", err), cleanupErr)
+				}
+				unix.CloseOnExec(cleanupParentFD)
+				cleanupDirName = directory
+			}
+			if err == nil && created {
+				err = store.inject(ctx, BoundaryDirectoryCreate, After, key, depth)
 			}
 		} else {
 			err = openErr
@@ -188,24 +296,35 @@ func (store *Store) begin(ctx context.Context, key string, attempt AttemptID) (*
 			}
 		}
 		if err != nil {
+			var cleanupErr error
+			if cleanupParentFD >= 0 {
+				cleanupErr = store.cleanupFailedBegin(context.WithoutCancel(ctx), nextFD, -1, "", cleanupParentFD, cleanupDirName, key)
+			}
 			_ = unix.Close(parentFD)
+			if cleanupParentFD >= 0 {
+				_ = unix.Close(cleanupParentFD)
+			}
 			if nextFD >= 0 {
 				_ = unix.Close(nextFD)
 			}
 			if errors.Is(err, ErrDurability) {
-				return nil, err
+				return nil, errors.Join(err, cleanupErr)
 			}
-			return nil, classifyError("open key directory", err)
+			return nil, errors.Join(classifyError("open key directory", err), cleanupErr)
 		}
 		_ = unix.Close(parentFD)
 		parentFD = nextFD
 	}
-	tempName := "." + finalName + "." + attempt.String() + ".tmp"
+	tempName := "." + tempBase + "." + attempt.String() + ".tmp"
 	if err := store.inject(ctx, BoundaryTempCreate, Before, key, len(directories)); err != nil {
+		cleanupErr := store.cleanupFailedBegin(context.WithoutCancel(ctx), parentFD, -1, "", cleanupParentFD, cleanupDirName, key)
 		_ = unix.Close(parentFD)
-		return nil, err
+		if cleanupParentFD >= 0 {
+			_ = unix.Close(cleanupParentFD)
+		}
+		return nil, errors.Join(err, cleanupErr)
 	}
-	fileFD, err := store.ops.openat(parentFD, tempName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	fileFD, err := store.ops.openat(parentFD, tempName, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err == nil {
 		err = store.inject(ctx, BoundaryTempCreate, After, key, len(directories))
 		if err == nil {
@@ -213,23 +332,56 @@ func (store *Store) begin(ctx context.Context, key string, attempt AttemptID) (*
 		}
 	}
 	if err != nil {
+		cleanupErr := store.cleanupFailedBegin(context.WithoutCancel(ctx), parentFD, fileFD, tempName, cleanupParentFD, cleanupDirName, key)
 		if fileFD >= 0 {
 			_ = unix.Close(fileFD)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				cleanupErr := store.cleanupUnownedTemp(context.WithoutCancel(ctx), parentFD, tempName, key)
-				_ = unix.Close(parentFD)
-				return nil, errors.Join(err, cleanupErr)
-			}
 		}
 		_ = unix.Close(parentFD)
-		return nil, classifyError("create temporary object", err)
+		if cleanupParentFD >= 0 {
+			_ = unix.Close(cleanupParentFD)
+		}
+		return nil, errors.Join(classifyError("create temporary object", err), cleanupErr)
 	}
-	return &Temp{store: store, ctx: ctx, parentFD: parentFD, fileFD: fileFD, key: key, tempName: tempName, finalName: finalName}, nil
+	return &Temp{
+		store: store, ctx: ctx, parentFD: parentFD, fileFD: fileFD, key: key,
+		tempName: tempName, finalName: finalName, cleanupParentFD: cleanupParentFD,
+		cleanupDirName: cleanupDirName, stateChanged: make(chan struct{}),
+	}, nil
 }
 
-func (store *Store) cleanupUnownedTemp(ctx context.Context, parentFD int, tempName, key string) error {
-	if err := store.ops.unlinkat(parentFD, tempName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
-		return errors.Join(ErrOutcomeUncertain, ErrDurability, classifyError("clean canceled temporary object", err))
+func (store *Store) cleanupFailedBegin(ctx context.Context, uploadFD, fileFD int, tempName string, cleanupParentFD int, cleanupDirName, key string) error {
+	var cleanupErr error
+	if fileFD >= 0 {
+		cleanupErr = store.removeOwnedTemp(ctx, uploadFD, fileFD, tempName, key)
+	}
+	if cleanupParentFD >= 0 && uploadFD >= 0 {
+		cleanupErr = errors.Join(cleanupErr, store.removeCreatedUploadDirectory(ctx, uploadFD, cleanupParentFD, cleanupDirName, key))
+	}
+	return cleanupErr
+}
+
+func (store *Store) removeOwnedTemp(ctx context.Context, parentFD, fileFD int, tempName, key string) error {
+	var pinned, leaf unix.Stat_t
+	if err := unix.Fstat(fileFD, &pinned); err != nil {
+		return classifyError("stat pinned temporary object for cleanup", err)
+	}
+	if err := store.ops.fstatat(parentFD, tempName, &leaf, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return classifyError("stat temporary object for cleanup", err)
+	}
+	if pinned.Mode&unix.S_IFMT != unix.S_IFREG || leaf.Mode&unix.S_IFMT != unix.S_IFREG {
+		return ErrUnexpectedType
+	}
+	if pinned.Dev != leaf.Dev || pinned.Ino != leaf.Ino {
+		return errors.Join(ErrValidation, errors.New("temporary object identity changed during cleanup"))
+	}
+	if err := store.ops.unlinkat(parentFD, tempName, 0); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return errors.Join(ErrOutcomeUncertain, ErrDurability, classifyError("clean failed temporary object", err))
 	}
 	durable, err := store.syncDeleteDirectory(ctx, parentFD, key)
 	if err == nil || durable {
@@ -239,14 +391,21 @@ func (store *Store) cleanupUnownedTemp(ctx context.Context, parentFD int, tempNa
 }
 
 func (temp *Temp) Write(value []byte) (written int, returnErr error) {
-	temp.mu.Lock()
-	defer temp.mu.Unlock()
+	if err := temp.startOperation(temp.ctx); err != nil {
+		return 0, err
+	}
+	defer temp.endOperation()
 	defer func() {
 		if returnErr != nil {
+			temp.mu.Lock()
 			temp.writeFailed = returnErr
+			temp.mu.Unlock()
 		}
 	}()
-	if temp.finished {
+	temp.mu.Lock()
+	sealed := temp.sealed
+	temp.mu.Unlock()
+	if sealed {
 		return 0, ErrClosed
 	}
 	for written < len(value) {
@@ -272,12 +431,18 @@ func (temp *Temp) Write(value []byte) (written int, returnErr error) {
 }
 
 // UseWritableFile calls a trusted streaming/codec operation with a duplicate
-// descriptor and closes it before returning. Publish cannot run concurrently,
-// so no writable descriptor supplied by this API survives publication.
+// descriptor and closes it before returning. Storage operations cannot run
+// concurrently, so no writable descriptor supplied by this API survives seal.
+// The callback must not call back into this Temp.
 func (temp *Temp) UseWritableFile(use func(*os.File) error) (returnErr error) {
+	if err := temp.startOperation(temp.ctx); err != nil {
+		return err
+	}
+	defer temp.endOperation()
 	temp.mu.Lock()
-	defer temp.mu.Unlock()
-	if temp.finished {
+	sealed := temp.sealed
+	temp.mu.Unlock()
+	if sealed {
 		return ErrClosed
 	}
 	fd, err := unix.Dup(temp.fileFD)
@@ -289,6 +454,8 @@ func (temp *Temp) UseWritableFile(use func(*os.File) error) (returnErr error) {
 	returned := false
 	defer func() {
 		closeErr := file.Close()
+		temp.mu.Lock()
+		defer temp.mu.Unlock()
 		if !returned {
 			temp.writeFailed = errors.New("writable callback did not return")
 		} else if returnErr != nil {
@@ -303,14 +470,58 @@ func (temp *Temp) UseWritableFile(use func(*os.File) error) (returnErr error) {
 	return returnErr
 }
 
-func (temp *Temp) Publish(ctx context.Context, validation Validation) (ObjectInfo, error) {
-	temp.mu.Lock()
-	defer temp.mu.Unlock()
-	if temp.finished {
-		return ObjectInfo{}, ErrClosed
+func (temp *Temp) useReadOnlyFile(use func(*os.File) error) (returnErr error) {
+	if err := temp.startOperation(temp.ctx); err != nil {
+		return err
 	}
-	if temp.writeFailed != nil {
-		return ObjectInfo{}, errors.Join(ErrValidation, temp.writeFailed)
+	defer temp.endOperation()
+	if err := temp.store.inject(temp.ctx, BoundaryReadOnlyProbe, Before, temp.key, 0); err != nil {
+		return err
+	}
+	fd, err := openPinnedReadOnly(temp.fileFD)
+	if err != nil {
+		return classifyError("open pinned temporary object for reading", err)
+	}
+	file := os.NewFile(uintptr(fd), "storage-original-input")
+	defer func() {
+		if closeErr := file.Close(); returnErr == nil && closeErr != nil {
+			returnErr = classifyError("close temporary object reader", closeErr)
+		}
+	}()
+	returnErr = use(file)
+	if returnErr == nil {
+		returnErr = temp.store.inject(temp.ctx, BoundaryReadOnlyProbe, After, temp.key, 0)
+	}
+	return returnErr
+}
+
+func (temp *Temp) Publish(ctx context.Context, validation Validation) (ObjectInfo, error) {
+	if _, err := temp.seal(ctx, validation); err != nil {
+		return ObjectInfo{}, err
+	}
+	return temp.publishSealed(ctx, temp.finalName, temp.key)
+}
+
+func (temp *Temp) seal(ctx context.Context, validation Validation) (ObjectInfo, error) {
+	if err := temp.startOperation(ctx); err != nil {
+		return ObjectInfo{}, err
+	}
+	defer temp.endOperation()
+	signature := signatureOf(validation)
+	temp.mu.Lock()
+	if temp.sealed {
+		info := temp.sealedInfo
+		compatible := !temp.sealedValidation.hasValidate && validation.Validate == nil && temp.sealedValidation == signature
+		temp.mu.Unlock()
+		if !compatible {
+			return ObjectInfo{}, errors.Join(ErrValidation, errors.New("upload already sealed with different validation"))
+		}
+		return info, nil
+	}
+	writeFailed := temp.writeFailed
+	temp.mu.Unlock()
+	if writeFailed != nil {
+		return ObjectInfo{}, errors.Join(ErrValidation, writeFailed)
 	}
 	if durable, err := temp.store.syncBoundary(ctx, temp.fileFD, BoundaryFileSync, temp.key, 0, "sync temporary object"); err != nil {
 		if !durable {
@@ -318,23 +529,45 @@ func (temp *Temp) Publish(ctx context.Context, validation Validation) (ObjectInf
 		}
 		return ObjectInfo{}, &PublishError{operation: "file sync", cause: err}
 	}
-	info, err := temp.inspect(ctx, validation)
+	info, err := temp.inspectPinned(ctx, temp.key, validation)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	if err := temp.store.inject(ctx, BoundaryRename, Before, temp.key, 0); err != nil {
+	temp.mu.Lock()
+	temp.sealed = true
+	temp.sealedInfo = info
+	temp.sealedValidation = signature
+	temp.mu.Unlock()
+	return info, nil
+}
+
+func (temp *Temp) publishSealed(ctx context.Context, finalName, key string) (ObjectInfo, error) {
+	if err := temp.startOperation(ctx); err != nil {
 		return ObjectInfo{}, err
 	}
-	err = temp.store.ops.renameat2(temp.parentFD, temp.tempName, temp.parentFD, temp.finalName, unix.RENAME_NOREPLACE)
+	defer temp.endOperation()
+	temp.mu.Lock()
+	sealed, info := temp.sealed, temp.sealedInfo
+	temp.mu.Unlock()
+	if !sealed {
+		return ObjectInfo{}, errors.Join(ErrValidation, errors.New("upload is not sealed"))
+	}
+	if err := temp.store.inject(ctx, BoundaryRename, Before, key, 0); err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := temp.verifyTempIdentity(); err != nil {
+		return ObjectInfo{}, err
+	}
+	err := temp.store.ops.renameat2(temp.parentFD, temp.tempName, temp.parentFD, finalName, unix.RENAME_NOREPLACE)
 	if err != nil {
 		return ObjectInfo{}, classifyError("publish object", err)
 	}
 	temp.published = true
-	if err := temp.store.inject(ctx, BoundaryRename, After, temp.key, 0); err != nil {
+	if err := temp.store.inject(ctx, BoundaryRename, After, key, 0); err != nil {
 		temp.finish()
 		return ObjectInfo{}, &PublishError{Published: true, Uncertain: true, operation: "after rename", cause: errors.Join(ErrOutcomeUncertain, err)}
 	}
-	if durable, err := temp.store.syncBoundary(ctx, temp.parentFD, BoundaryFinalDirectorySync, temp.key, 0, "sync final object directory"); err != nil {
+	if durable, err := temp.store.syncBoundary(ctx, temp.parentFD, BoundaryFinalDirectorySync, key, 0, "sync final object directory"); err != nil {
 		temp.finish()
 		if durable {
 			return ObjectInfo{}, &PublishError{Published: true, operation: "after final directory sync", cause: err}
@@ -345,16 +578,18 @@ func (temp *Temp) Publish(ctx context.Context, validation Validation) (ObjectInf
 	return info, nil
 }
 
-func (temp *Temp) inspect(ctx context.Context, validation Validation) (ObjectInfo, error) {
-	if err := temp.store.inject(ctx, BoundaryValidation, Before, temp.key, 0); err != nil {
+func (temp *Temp) inspectPinned(ctx context.Context, key string, validation Validation) (ObjectInfo, error) {
+	if err := temp.store.inject(ctx, BoundaryValidation, Before, key, 0); err != nil {
 		return ObjectInfo{}, err
 	}
-	readFD, err := temp.store.ops.openat(temp.parentFD, temp.tempName, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	offset, err := unix.Seek(temp.fileFD, 0, io.SeekCurrent)
 	if err != nil {
-		return ObjectInfo{}, classifyError("open object for validation", err)
+		return ObjectInfo{}, errors.Join(ErrValidation, classifyError("get object offset for validation", err))
 	}
-	file := os.NewFile(uintptr(readFD), "storage-validation")
-	defer file.Close()
+	defer func() { _, _ = unix.Seek(temp.fileFD, offset, io.SeekStart) }()
+	if _, err := unix.Seek(temp.fileFD, 0, io.SeekStart); err != nil {
+		return ObjectInfo{}, errors.Join(ErrValidation, classifyError("seek object for validation", err))
+	}
 	hash := sha256.New()
 	var size int64
 	buffer := make([]byte, 128*1024)
@@ -362,7 +597,7 @@ func (temp *Temp) inspect(ctx context.Context, validation Validation) (ObjectInf
 		if err := ctx.Err(); err != nil {
 			return ObjectInfo{}, err
 		}
-		count, readErr := temp.store.ops.read(readFD, buffer)
+		count, readErr := temp.store.ops.read(temp.fileFD, buffer)
 		if count > 0 {
 			_, _ = hash.Write(buffer[:count])
 			size += int64(count)
@@ -392,27 +627,49 @@ func (temp *Temp) inspect(ctx context.Context, validation Validation) (ObjectInf
 		return ObjectInfo{}, ErrValidation
 	}
 	if validation.Validate != nil {
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			return ObjectInfo{}, errors.Join(ErrValidation, err)
+		readFD, err := openPinnedReadOnly(temp.fileFD)
+		if err != nil {
+			return ObjectInfo{}, errors.Join(ErrValidation, classifyError("open pinned object for validation", err))
 		}
-		if err := validation.Validate(ctx, file); err != nil {
+		file := os.NewFile(uintptr(readFD), "storage-validation")
+		validateErr, closeErr := func() (returnErr, closeErr error) {
+			defer func() { closeErr = file.Close() }()
+			returnErr = validation.Validate(ctx, file)
+			return returnErr, nil
+		}()
+		if validateErr != nil {
+			return ObjectInfo{}, errors.Join(ErrValidation, validateErr)
+		}
+		if closeErr != nil {
+			return ObjectInfo{}, errors.Join(ErrValidation, closeErr)
+		}
+		if err := ctx.Err(); err != nil {
 			return ObjectInfo{}, errors.Join(ErrValidation, err)
 		}
 	}
-	if err := temp.store.inject(ctx, BoundaryValidation, After, temp.key, 0); err != nil {
+	if err := temp.store.inject(ctx, BoundaryValidation, After, key, 0); err != nil {
 		return ObjectInfo{}, err
 	}
 	return ObjectInfo{Size: size, SHA256: digest}, nil
 }
 
 func (temp *Temp) Abort(ctx context.Context) error {
-	temp.mu.Lock()
-	defer temp.mu.Unlock()
-	if temp.finished {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
+	if err := temp.startOperation(ctx); err != nil {
+		if errors.Is(err, ErrClosed) {
+			return nil
+		}
 		return err
+	}
+	defer temp.endOperation()
+	var leafStat unix.Stat_t
+	statErr := temp.store.ops.fstatat(temp.parentFD, temp.tempName, &leafStat, unix.AT_SYMLINK_NOFOLLOW)
+	if statErr == nil {
+		if err := temp.verifyTempIdentity(); err != nil {
+			temp.finish()
+			return err
+		}
+	} else if !errors.Is(statErr, unix.ENOENT) {
+		return classifyError("stat temporary object for abort", statErr)
 	}
 	if err := temp.store.ops.unlinkat(temp.parentFD, temp.tempName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
 		return classifyError("abort temporary object", err)
@@ -427,17 +684,131 @@ func (temp *Temp) Abort(ctx context.Context) error {
 		}
 		return errors.Join(ErrOutcomeUncertain, ErrDurability, err)
 	}
+	if err := temp.removeCreatedUploadDirectory(context.WithoutCancel(ctx)); err != nil {
+		temp.finish()
+		return err
+	}
 	temp.finish()
 	return nil
 }
 
 func (temp *Temp) finish() {
+	temp.mu.Lock()
 	if temp.finished {
+		temp.mu.Unlock()
 		return
 	}
 	temp.finished = true
+	cleanupParentFD := temp.cleanupParentFD
+	temp.cleanupParentFD = -1
+	temp.mu.Unlock()
 	_ = unix.Close(temp.fileFD)
 	_ = unix.Close(temp.parentFD)
+	if cleanupParentFD >= 0 {
+		_ = unix.Close(cleanupParentFD)
+	}
+}
+
+func (temp *Temp) startOperation(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		temp.mu.Lock()
+		if temp.finished {
+			temp.mu.Unlock()
+			return ErrClosed
+		}
+		if !temp.active {
+			temp.active = true
+			temp.mu.Unlock()
+			return nil
+		}
+		changed := temp.stateChanged
+		temp.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (temp *Temp) endOperation() {
+	temp.mu.Lock()
+	temp.active = false
+	close(temp.stateChanged)
+	temp.stateChanged = make(chan struct{})
+	temp.mu.Unlock()
+}
+
+func openPinnedReadOnly(fd int) (int, error) {
+	return unix.Open(fmt.Sprintf("/proc/self/fd/%d", fd), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+}
+
+func (temp *Temp) verifyTempIdentity() error {
+	var pinned, leaf unix.Stat_t
+	if err := unix.Fstat(temp.fileFD, &pinned); err != nil {
+		return classifyError("stat pinned temporary object", err)
+	}
+	if err := temp.store.ops.fstatat(temp.parentFD, temp.tempName, &leaf, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return classifyError("stat temporary object identity", err)
+	}
+	if leaf.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return ErrSymlink
+	}
+	if pinned.Mode&unix.S_IFMT != unix.S_IFREG || leaf.Mode&unix.S_IFMT != unix.S_IFREG {
+		return ErrUnexpectedType
+	}
+	if pinned.Dev != leaf.Dev || pinned.Ino != leaf.Ino {
+		return errors.Join(ErrValidation, errors.New("temporary object identity changed"))
+	}
+	return nil
+}
+
+func (temp *Temp) removeCreatedUploadDirectory(ctx context.Context) error {
+	if temp.cleanupParentFD < 0 {
+		return nil
+	}
+	return temp.store.removeCreatedUploadDirectory(ctx, temp.parentFD, temp.cleanupParentFD, temp.cleanupDirName, temp.key)
+}
+
+func (store *Store) removeCreatedUploadDirectory(ctx context.Context, uploadFD, cleanupParentFD int, cleanupDirName, key string) error {
+	var pinned, leaf unix.Stat_t
+	if err := unix.Fstat(uploadFD, &pinned); err != nil {
+		return classifyError("stat pinned upload directory", err)
+	}
+	if err := store.ops.fstatat(cleanupParentFD, cleanupDirName, &leaf, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return classifyError("stat upload directory for cleanup", err)
+	}
+	if pinned.Mode&unix.S_IFMT != unix.S_IFDIR || leaf.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return ErrUnexpectedType
+	}
+	if pinned.Dev != leaf.Dev || pinned.Ino != leaf.Ino {
+		return errors.Join(ErrValidation, errors.New("upload directory identity changed"))
+	}
+	if err := store.inject(ctx, BoundaryUploadDirectoryDelete, Before, key, 0); err != nil {
+		return err
+	}
+	err := store.ops.unlinkat(cleanupParentFD, cleanupDirName, unix.AT_REMOVEDIR)
+	if errors.Is(err, unix.ENOTEMPTY) || errors.Is(err, unix.EEXIST) {
+		return nil
+	}
+	if err != nil {
+		return classifyError("remove empty upload directory", err)
+	}
+	var deleteErr error
+	if err := store.inject(ctx, BoundaryUploadDirectoryDelete, After, key, 0); err != nil {
+		deleteErr = errors.Join(ErrOutcomeUncertain, err)
+	}
+	durable, err := store.syncBoundary(ctx, cleanupParentFD, BoundaryUploadDirectorySync, key, 0, "sync removed upload directory parent")
+	if err == nil || durable {
+		return errors.Join(deleteErr, err)
+	}
+	return errors.Join(deleteErr, ErrOutcomeUncertain, ErrDurability, err)
 }
 
 func (store *Store) OpenOriginal(ctx context.Context, key OriginalKey) (*os.File, error) {

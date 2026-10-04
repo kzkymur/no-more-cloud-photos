@@ -16,7 +16,9 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/httpapi"
 	"github.com/kzkymur/no-more-cloud-photos/internal/lifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
+	"github.com/kzkymur/no-more-cloud-photos/internal/metadata"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/upload"
 )
 
 func main() {
@@ -57,10 +59,18 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("open storage: %w", err)
 	}
 	defer store.Close()
+	prober, err := metadata.NewProber(metadata.DefaultPolicy(), metadata.DefaultToolPaths())
+	if err != nil {
+		return fmt.Errorf("configure metadata prober: %w", err)
+	}
+	uploadService, err := upload.NewService(pool, store, prober)
+	if err != nil {
+		return fmt.Errorf("configure upload service: %w", err)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewHandler(httpapi.Dependencies{Database: pool, Migrations: migrator, Storage: store}),
+		Handler:           httpapi.NewHandler(httpapi.Dependencies{Database: pool, Migrations: migrator, Storage: store, Upload: uploadService}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
