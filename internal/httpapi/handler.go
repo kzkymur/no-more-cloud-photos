@@ -119,7 +119,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.methodNotAllowed(w, requestID, http.MethodGet)
 			return
 		}
-		if !acceptsJSON(r.Header.Get("Accept")) {
+		if !acceptsJSON(acceptHeader(r)) {
 			writeError(w, http.StatusNotAcceptable, "not_acceptable", "JSON response is not acceptable", requestID)
 			return
 		}
@@ -129,7 +129,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.methodNotAllowed(w, requestID, http.MethodGet)
 			return
 		}
-		if !acceptsJSON(r.Header.Get("Accept")) {
+		if !acceptsJSON(acceptHeader(r)) {
 			writeError(w, http.StatusNotAcceptable, "not_acceptable", "JSON response is not acceptable", requestID)
 			return
 		}
@@ -152,7 +152,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.methodNotAllowed(w, requestID, http.MethodGet+", "+http.MethodPost)
 			return
 		}
-		if !acceptsJSON(r.Header.Get("Accept")) {
+		if !acceptsJSON(acceptHeader(r)) {
 			closeUploadConnection(w, r)
 			writeError(w, http.StatusNotAcceptable, "not_acceptable", "JSON response is not acceptable", requestID)
 			return
@@ -206,6 +206,10 @@ func acceptsJSON(header string) bool {
 		}
 	}
 	return bestSpecificity >= 0 && bestQuality > 0
+}
+
+func acceptHeader(r *http.Request) string {
+	return strings.Join(r.Header.Values("Accept"), ",")
 }
 
 func (h *handler) methodNotAllowed(w http.ResponseWriter, requestID, allow string) {

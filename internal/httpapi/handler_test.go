@@ -259,6 +259,23 @@ func TestAcceptNegotiation(t *testing.T) {
 	}
 }
 
+func TestAcceptNegotiationCombinesRepeatedFieldLines(t *testing.T) {
+	h, _, _, _ := readyHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	request.Header["Accept"] = []string{"text/plain", "application/json"}
+	request.Header.Set("X-Request-ID", "repeated-accept")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	assertResponse(t, response, http.StatusOK, "repeated-accept")
+
+	request = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	request.Header["Accept"] = []string{"*/*;q=1", "application/json;q=0"}
+	request.Header.Set("X-Request-ID", "repeated-reject")
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	assertResponse(t, response, http.StatusNotAcceptable, "repeated-reject")
+}
+
 func TestRequestIDs(t *testing.T) {
 	h, _, _, _ := readyHandler(t)
 

@@ -298,7 +298,7 @@ func TestReadDeclaredBodiesRejectWithoutReading(t *testing.T) {
 	}
 }
 
-func TestReadSafelyProbesAmbiguousReplayableBody(t *testing.T) {
+func TestReadRejectsAnyPotentialBodyWithoutProbing(t *testing.T) {
 	reads := &recordingReadService{}
 	request := httptest.NewRequest(http.MethodGet, "/profiles", nil)
 	request.Body = io.NopCloser(strings.NewReader("ignored actual body"))
@@ -315,17 +315,6 @@ func TestReadSafelyProbesAmbiguousReplayableBody(t *testing.T) {
 		t.Fatalf("service called: %v", reads.calls)
 	}
 
-	request = httptest.NewRequest(http.MethodGet, "/profiles", nil)
-	request.Body = io.NopCloser(strings.NewReader(""))
-	request.ContentLength = 0
-	request.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(strings.NewReader("")), nil
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Request-ID", "probed-empty")
-	response = httptest.NewRecorder()
-	NewHandler(Dependencies{Reads: reads}).ServeHTTP(response, request)
-	assertResponse(t, response, http.StatusOK, "probed-empty")
 }
 
 type panicReadCloser struct{}
@@ -379,6 +368,42 @@ func TestReadTricklingHTTP11BodyRespondsPromptlyAndCloses(t *testing.T) {
 	case <-closed:
 	case <-time.After(time.Second):
 		t.Fatal("server connection did not close")
+	}
+}
+
+func TestReadHTTP2BodyWithoutContentLengthIsRejectedBeforeService(t *testing.T) {
+	reads := &recordingReadService{}
+	server := httptest.NewUnstartedServer(NewHandler(Dependencies{Reads: reads}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/media", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Body = io.NopCloser(strings.NewReader("x"))
+	request.ContentLength = -1
+	request.GetBody = nil
+	request.Header.Set("X-Request-ID", "http2-body")
+
+	started := time.Now()
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	if err := errors.Join(readErr, response.Body.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if response.ProtoMajor != 2 {
+		t.Fatalf("protocol = %s, want HTTP/2", response.Proto)
+	}
+	if response.StatusCode != http.StatusBadRequest || time.Since(started) > 2*time.Second {
+		t.Fatalf("status/elapsed = %d/%v; body=%s", response.StatusCode, time.Since(started), body)
+	}
+	if len(reads.calls) != 0 {
+		t.Fatalf("service called for HTTP/2 body: %v", reads.calls)
 	}
 }
 

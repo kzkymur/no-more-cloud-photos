@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"errors"
-	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -127,17 +126,13 @@ func readRequestHasBody(r *http.Request) bool {
 	if requestDeclaresBody(r) {
 		return true
 	}
-	if r.Body == nil || r.Body == http.NoBody || r.GetBody == nil {
+	if r.Body == nil || r.Body == http.NoBody {
 		return false
 	}
-	body, err := r.GetBody()
-	if err != nil {
-		return true
-	}
-	defer body.Close()
-	var one [1]byte
-	count, err := body.Read(one[:])
-	return count != 0 || err != nil && !errors.Is(err, io.EOF)
+	// An incoming HTTP/2 request can carry DATA without Content-Length or
+	// Transfer-Encoding. Never probe or drain a potentially live stream here:
+	// net/http represents a truly absent body as http.NoBody.
+	return true
 }
 
 func requestDeclaresBody(r *http.Request) bool {
