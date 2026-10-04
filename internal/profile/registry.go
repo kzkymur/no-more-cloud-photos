@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"strings"
+
+	"github.com/kzkymur/no-more-cloud-photos/internal/mediaformat"
 )
 
 type Capability struct {
@@ -36,25 +38,25 @@ type Registry struct {
 	certifications []Certification
 }
 
-var candidateCapabilities = []Capability{
-	{MIMEType: "image/bmp", SourceMode: SourceStill},
-	{MIMEType: "image/dng", SourceMode: SourceStill},
-	{MIMEType: "image/gif", SourceMode: SourceProbeAnimation},
-	{MIMEType: "image/heic", SourceMode: SourceStill},
-	{MIMEType: "image/heif", SourceMode: SourceStill},
-	{MIMEType: "image/jpeg", SourceMode: SourceStill},
-	{MIMEType: "image/png", SourceMode: SourceStill},
-	{MIMEType: "image/webp", SourceMode: SourceProbeAnimation},
-	{MIMEType: "image/x-canon-cr2", SourceMode: SourceStill},
-	{MIMEType: "image/x-canon-cr3", SourceMode: SourceStill},
-	{MIMEType: "image/x-fuji-raf", SourceMode: SourceStill},
-	{MIMEType: "image/x-nikon-nef", SourceMode: SourceStill},
-	{MIMEType: "image/x-olympus-orf", SourceMode: SourceStill},
-	{MIMEType: "image/x-panasonic-rw2", SourceMode: SourceStill},
-	{MIMEType: "image/x-sony-arw", SourceMode: SourceStill},
-	{MIMEType: "video/mp4", SourceMode: SourceVideo},
-	{MIMEType: "video/quicktime", SourceMode: SourceVideo},
-}
+var candidateCapabilities = func() []Capability {
+	formats := mediaformat.Formats()
+	result := make([]Capability, 0, len(formats))
+	for _, format := range formats {
+		var sourceMode SourceMode
+		switch format.Family {
+		case mediaformat.FamilyStill:
+			sourceMode = SourceStill
+		case mediaformat.FamilyProbeAnimation:
+			sourceMode = SourceProbeAnimation
+		case mediaformat.FamilyVideo:
+			sourceMode = SourceVideo
+		default:
+			panic("unknown media format family")
+		}
+		result = append(result, Capability{MIMEType: format.MIMEType, SourceMode: sourceMode})
+	}
+	return result
+}()
 
 // CandidateRegistry returns the fixed provisional MIME registry without certifications.
 func CandidateRegistry() Registry {

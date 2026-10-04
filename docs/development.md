@@ -15,6 +15,14 @@
 - PostgreSQL integration tests run against the `postgres:17-alpine` service.
   This is a test entry point, not a claim that later backup/restore and
   deployment compatibility have already passed.
+- Metadata acceptance uses ExifTool 13.36 for still/RAW inputs, FFprobe/FFmpeg
+  6.0.1 for video evidence, and util-linux `prlimit` for the inherited
+  address-space limit. CI downloads the immutable named archives, verifies
+  their documented SHA-256 digests before extraction, and records all tool
+  versions in each run. The Ubuntu 24.04 CI image supplies `prlimit`; issue #20
+  must pin the production image digest (and therefore its exact util-linux
+  patch version) and verify these absolute executable paths:
+  `/usr/bin/exiftool`, `/usr/bin/ffprobe`, and `/usr/bin/prlimit`.
 
 The repository sets `go 1.27.0` as its language/toolchain floor while CI pins
 the security patch release `1.27.1`. Set `GOTOOLCHAIN=local` so an unexpected
@@ -128,3 +136,71 @@ certification is deployment compatibility metadata, not proof that a particular
 Worker process has its binary/plugin/codec; #11–#13 add startup/runtime probes
 and must refuse execution on mismatch. Migration application alone never
 certifies a capability.
+
+## Metadata probe boundary
+
+`internal/mediaformat` is the shared closed registry used by profile recipes,
+content detection, and original storage-extension mapping. `internal/metadata`
+accepts a complete regular temporary file. Issue #8 owns wiring it into the
+upload acceptance transaction and late selection of the detected extension;
+issue #7 does not claim that HTTP upload is implemented.
+
+Detection never consumes a multipart MIME declaration or filename. It performs
+at most 1 MiB of cumulative structural reads of JPEG/PNG/GIF/WebP/BMP, RAF, TIFF-derived RAW, and
+ISO-BMFF/legacy QuickTime headers. Generic TIFF, vendor-name-only TIFF, invalid
+offsets/lengths/loops, and contradictory BMFF brands are not coerced into a
+registered MIME. HEIF/HEIC sequence brands are rejected, including files that
+mix still and sequence compatibility, because the closed registry contains no
+sequence MIME. Header recognition proves only a candidate container/family;
+ExifTool/FFprobe must still extract valid dimensions and video duration, and
+issues #11–#13 remain responsible for codec/transform runtime capability.
+
+The complete regular file is opened once with `O_NOFOLLOW|O_NONBLOCK`, detected
+through that read-only descriptor, and exposed to the tool as
+`/proc/self/fd/3`; the pathname is not reopened after detection. External tools
+are invoked without a shell through trusted absolute paths. Their environment
+is replaced with `LC_ALL=C`, `LANG=C`, and `TZ=UTC`; ExifTool is additionally
+started with configuration loading disabled.
+Each probe inherits a 1 GiB `RLIMIT_AS` through `prlimit`, has a 60 second wall
+deadline, and caps stdout and stderr independently at 1 MiB. A short-lived copy
+of the current Core executable supervises each probe as a Linux child
+subreaper. It kills the initial process group, repeatedly kills session/group
+escapees adopted from the probe tree, and reaps until `ECHILD` on timeout,
+cancellation, output overflow, and normal direct-child exit. A bounded cleanup
+failure is reported as a probe failure. This containment is designed for the
+trusted, same-UID pinned tools; it is not a defense against uninterruptible
+kernel sleep, privilege/namespace escape, or a hostile fork bomb. The address
+space limit is neither a sandbox nor an RSS guarantee. Tool output,
+absolute input paths, stderr, and environment data are never copied into API or
+stored metadata.
+
+The configurable acceptance policy defaults to dimensions no greater than
+100,000 on either axis and a checked product no greater than 1,000,000,000
+pixels. Rejection reports whether the dimension or pixel limit failed. These
+are metadata acceptance limits, not a statement that such an image can be
+decoded in 4 GiB; decoder/frame/transform limits belong to #11–#13 and real
+resource evidence belongs to #21.
+
+Capture candidates remain ordered: EXIF DateTimeOriginal, DateTimeDigitized,
+DateTime; or primary video stream creation time then container creation time.
+A malformed matching offset invalidates that candidate rather than being
+guessed as local time. Valid offsetless candidates use the acceptance
+transaction's timezone snapshot; DST folds select the earlier UTC instant and
+gaps fall through. Filesystem times are never candidates.
+
+`originals.exif_json` is a typed allowlist (camera/lens, orientation, exposure,
+aperture, ISO, focal length, GPS, and selected raw capture strings), not a full
+copy of every EXIF tag and not an instruction to modify the original. Derived
+detector evidence, capture decision/fold, selected video stream/codec, and
+probe tool version are kept separately in source metadata. Missing EXIF
+serializes as `{}`. Fixture provenance and SHA-256 values are recorded in
+`internal/metadata/testdata/README.md`; synthetic 17-format detector evidence is
+reported separately from real ExifTool/FFprobe executions.
+
+FFprobe excludes attached pictures, still-image thumbnails, and unusable
+zero-dimension video streams. It selects a default usable stream first, then
+the largest pixel area and lowest stream index. Duration uses the positive
+container duration first with the selected-stream duration as fallback and is
+converted to milliseconds with checked decimal arithmetic. Issue #13 must use
+the persisted primary stream index rather than independently choosing another
+stream.

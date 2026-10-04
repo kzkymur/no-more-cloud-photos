@@ -70,6 +70,13 @@ Capture candidates are deterministic:
 
 Changing the default timezone never rewrites existing Media. Original EXIF is `{}` when absent; source value, raw candidate, offset/fold decision, and applied timezone remain auditable.
 
+`exif_json` is the normalized typed allowlist used by Core, not a lossless copy
+of every source EXIF tag. It includes camera/lens, orientation, exposure,
+aperture, ISO, focal length, GPS, and selected raw capture strings when valid.
+Detector/probe version, selected stream, capture source, timezone, and fold
+decision are derived audit metadata and remain distinct from source EXIF.
+Extraction never edits the durable original bytes.
+
 ## 5. State machines
 
 ### 5.1 Media and purge eligibility

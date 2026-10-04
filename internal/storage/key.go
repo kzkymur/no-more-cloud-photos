@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/kzkymur/no-more-cloud-photos/internal/mediaformat"
 )
 
 var ErrInvalidKey = errors.New("invalid storage key")
@@ -102,6 +104,21 @@ var originalExtensions = map[OriginalExtension]string{
 	OriginalHEIF: "heif", OriginalWebP: "webp", OriginalBMP: "bmp", OriginalMP4: "mp4",
 	OriginalMOV: "mov", OriginalDNG: "dng", OriginalNEF: "nef", OriginalCR2: "cr2",
 	OriginalCR3: "cr3", OriginalARW: "arw", OriginalRAF: "raf", OriginalORF: "orf", OriginalRW2: "rw2",
+}
+
+// OriginalExtensionForMIME maps the shared content-detected registry to a
+// closed storage extension. Upload wiring uses this only after metadata probe
+// success; user filenames and declared MIME types never enter this mapping.
+func OriginalExtensionForMIME(mimeType string) (OriginalExtension, error) {
+	format, ok := mediaformat.Lookup(mimeType)
+	if !ok {
+		return 0, ErrInvalidKey
+	}
+	extension, ok := lookupOriginalExtension(format.Extension)
+	if !ok {
+		return 0, ErrInvalidKey
+	}
+	return extension, nil
 }
 
 type RenditionExtension uint8
