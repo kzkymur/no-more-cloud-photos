@@ -219,7 +219,7 @@ func TestStrictJSONRejectsCaseVariantUnknownField(t *testing.T) {
 	}
 }
 
-func TestStrictJSONUsesJSONBLastDuplicateRecipesValue(t *testing.T) {
+func TestStrictJSONRejectsDuplicateRecipesBeforeCollapse(t *testing.T) {
 	recipe, err := json.Marshal(StandardV1Parameters().Recipes["image/jpeg"])
 	if err != nil {
 		t.Fatal(err)
@@ -229,6 +229,34 @@ func TestStrictJSONUsesJSONBLastDuplicateRecipesValue(t *testing.T) {
 	definition.Parameters = []byte(`{"evidence_status":"provisional-unverified","recipes":{"image/jpeg":` + string(recipe) + `},"recipes":{}}`)
 	if err := ValidateDraft(definition); err == nil {
 		t.Fatal("ValidateDraft(duplicate recipes with empty last value) error = nil")
+	}
+}
+
+func TestStrictJSONRejectsDiscardedJSONBInvalidTokens(t *testing.T) {
+	definition, parameters := mutableStandard(t)
+	parameters.Recipes = map[string]Recipe{"image/jpeg": parameters.Recipes["image/jpeg"]}
+	definition.InputMIMETypes = []string{"image/jpeg"}
+	valid := string(encodeForTest(t, parameters))
+	tests := [][]byte{
+		[]byte(strings.Replace(valid, `"evidence_status":"provisional-unverified"`, `"evidence_status":"\u0000","evidence_status":"provisional-unverified"`, 1)),
+		[]byte(strings.Replace(valid, `"evidence_status":"provisional-unverified"`, `"evidence_status":"\uD800","evidence_status":"provisional-unverified"`, 1)),
+		[]byte(strings.Replace(valid, `"quality":60`, `"quality":1e1000000,"quality":60`, 1)),
+	}
+	invalidUTF8 := []byte(strings.Replace(valid, `"evidence_status":"provisional-unverified"`, `"evidence_status":"x","evidence_status":"provisional-unverified"`, 1))
+	invalidUTF8[strings.Index(string(invalidUTF8), `"evidence_status":"x"`)+len(`"evidence_status":"`)] = 0xff
+	tests = append(tests, invalidUTF8)
+	for index, raw := range tests {
+		definition.Parameters = raw
+		if err := ValidateDraft(definition); err == nil {
+			t.Errorf("case %d: ValidateDraft() error = nil", index)
+		}
+	}
+}
+
+func TestJSONBPreflightBoundsNesting(t *testing.T) {
+	raw := []byte(strings.Repeat("[", maxParametersJSONDepth+1) + "0" + strings.Repeat("]", maxParametersJSONDepth+1))
+	if err := validateJSONBRepresentable(raw); err == nil {
+		t.Fatal("validateJSONBRepresentable(over-depth JSON) error = nil")
 	}
 }
 

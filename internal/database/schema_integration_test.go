@@ -1,6 +1,7 @@
 package database
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -172,6 +173,17 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		validRecipes := mustJSON(t, validObject["recipes"])
 		duplicateRecipes := []byte(`{"evidence_status":"provisional-unverified","recipes":` + string(validRecipes) + `,"recipes":{}}`)
 		expectBothReject("bad-duplicate-recipes-last-empty", []string{"image/jpeg"}, "nmcp-media", 1, duplicateRecipes)
+		for _, test := range []struct {
+			key        string
+			parameters []byte
+		}{
+			{key: "bad-discarded-nul", parameters: replaceJSONOnce(t, valid, `"evidence_status":"provisional-unverified"`, `"evidence_status":"\u0000","evidence_status":"provisional-unverified"`)},
+			{key: "bad-discarded-surrogate", parameters: replaceJSONOnce(t, valid, `"evidence_status":"provisional-unverified"`, `"evidence_status":"\uD800","evidence_status":"provisional-unverified"`)},
+			{key: "bad-discarded-numeric-overflow", parameters: replaceJSONOnce(t, valid, `"quality":60`, `"quality":1e1000000,"quality":60`)},
+			{key: "bad-discarded-invalid-utf8", parameters: replaceJSONBytesOnce(t, valid, []byte(`"evidence_status":"provisional-unverified"`), append(append([]byte(`"evidence_status":"`), 0xff), []byte(`","evidence_status":"provisional-unverified"`)...))},
+		} {
+			expectBothReject(test.key, []string{"image/jpeg"}, "nmcp-media", 1, test.parameters)
+		}
 
 		for _, test := range []struct {
 			key, mimeType string
@@ -339,9 +351,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 
 		gifID := insertProfile("gif-certification", "image/gif")
 		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, gifID)
-		certify("image/gif", "probe-animation", "animation-webp", 1, 100)
-		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, gifID)
 		certify("image/gif", "probe-animation", "still-avif", 1, 100)
+		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, gifID)
+		certify("image/gif", "probe-animation", "animation-webp", 1, 100)
 		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, gifID); err != nil {
 			t.Fatalf("activate fully certified animation profile: %v", err)
 		}
@@ -946,6 +958,14 @@ func replaceJSONOnce(t *testing.T, value []byte, old, replacement string) []byte
 		t.Fatalf("JSON fixture contains %q %d times, want exactly once: %s", old, strings.Count(string(value), old), value)
 	}
 	return []byte(strings.Replace(string(value), old, replacement, 1))
+}
+
+func replaceJSONBytesOnce(t *testing.T, value, old, replacement []byte) []byte {
+	t.Helper()
+	if bytes.Count(value, old) != 1 {
+		t.Fatalf("JSON fixture contains %q %d times, want exactly once", old, bytes.Count(value, old))
+	}
+	return bytes.Replace(value, old, replacement, 1)
 }
 
 func mustJSON(t *testing.T, value any) []byte {

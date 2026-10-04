@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -47,12 +48,12 @@ type Parameters struct {
 }
 
 func (p *Parameters) UnmarshalJSON(data []byte) error {
+	if err := validateJSONBRepresentable(data); err != nil {
+		return err
+	}
 	if err := requireObjectFields(data, []string{"evidence_status", "recipes"}); err != nil {
 		return err
 	}
-	// Keep recipes raw until the last duplicate top-level key has been
-	// selected, matching PostgreSQL jsonb's last-key-wins semantics instead of
-	// encoding/json's merge behavior for repeated map-valued struct fields.
 	type wire struct {
 		EvidenceStatus string          `json:"evidence_status"`
 		Recipes        json.RawMessage `json:"recipes"`
@@ -69,6 +70,153 @@ func (p *Parameters) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("decode parameters: recipes must be an object")
 	}
 	*p = Parameters{EvidenceStatus: decoded.EvidenceStatus, Recipes: recipes}
+	return nil
+}
+
+const (
+	maxParametersJSONBytes       = 1 << 20
+	maxJSONNumericTokenBytes     = 128
+	maxParametersJSONDepth       = 64
+	maxPostgreSQLNumericExponent = int64(1_073_741_823)
+	maxPostgreSQLNumericWeight   = int64(131_071)
+	maxPostgreSQLNumericScale    = int64(16_383)
+)
+
+// validateJSONBRepresentable rejects input that encoding/json can normalize
+// but PostgreSQL jsonb cannot store. Duplicate keys are rejected rather than
+// collapsed so discarded values cannot hide invalid Unicode or numerics.
+func validateJSONBRepresentable(data []byte) error {
+	if len(data) > maxParametersJSONBytes {
+		return fmt.Errorf("decode parameters: JSON document exceeds %d bytes", maxParametersJSONBytes)
+	}
+	if !utf8.Valid(data) {
+		return fmt.Errorf("decode parameters: JSON document is not valid UTF-8")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var walk func(int) error
+	walk = func(depth int) error {
+		if depth > maxParametersJSONDepth {
+			return fmt.Errorf("decode parameters: JSON nesting exceeds %d", maxParametersJSONDepth)
+		}
+		token, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("decode parameters token: %w", err)
+		}
+		switch value := token.(type) {
+		case json.Delim:
+			switch value {
+			case '{':
+				seen := make(map[string]struct{})
+				for decoder.More() {
+					keyToken, err := decoder.Token()
+					if err != nil {
+						return fmt.Errorf("decode parameters object key: %w", err)
+					}
+					key, ok := keyToken.(string)
+					if !ok {
+						return fmt.Errorf("decode parameters object key: expected string")
+					}
+					if err := validateJSONBString(key); err != nil {
+						return err
+					}
+					if _, duplicate := seen[key]; duplicate {
+						return fmt.Errorf("decode parameters object: duplicate field %q", key)
+					}
+					seen[key] = struct{}{}
+					if err := walk(depth + 1); err != nil {
+						return err
+					}
+				}
+				closing, err := decoder.Token()
+				if err != nil || closing != json.Delim('}') {
+					return fmt.Errorf("decode parameters object: invalid closing delimiter")
+				}
+			case '[':
+				for decoder.More() {
+					if err := walk(depth + 1); err != nil {
+						return err
+					}
+				}
+				closing, err := decoder.Token()
+				if err != nil || closing != json.Delim(']') {
+					return fmt.Errorf("decode parameters array: invalid closing delimiter")
+				}
+			default:
+				return fmt.Errorf("decode parameters: unexpected delimiter %q", value)
+			}
+		case string:
+			return validateJSONBString(value)
+		case json.Number:
+			return validateJSONBNumeric(value.String())
+		case bool, nil:
+			return nil
+		default:
+			return fmt.Errorf("decode parameters: unsupported token %T", token)
+		}
+		return nil
+	}
+	if err := walk(1); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("decode parameters: trailing JSON value")
+		}
+		return fmt.Errorf("decode parameters: trailing data: %w", err)
+	}
+	return nil
+}
+
+func validateJSONBString(value string) error {
+	if strings.ContainsRune(value, '\x00') {
+		return fmt.Errorf("decode parameters: PostgreSQL jsonb cannot store U+0000")
+	}
+	// encoding/json replaces unpaired UTF-16 surrogates with U+FFFD. Rejecting
+	// U+FFFD conservatively prevents that normalization from hiding input that
+	// PostgreSQL rejects; profile schema literals do not require this rune.
+	if strings.ContainsRune(value, utf8.RuneError) {
+		return fmt.Errorf("decode parameters: invalid or unsupported Unicode replacement rune")
+	}
+	return nil
+}
+
+func validateJSONBNumeric(encoded string) error {
+	if len(encoded) > maxJSONNumericTokenBytes {
+		return fmt.Errorf("decode parameters: numeric token exceeds %d bytes", maxJSONNumericTokenBytes)
+	}
+	mantissa := encoded
+	exponent := int64(0)
+	if index := strings.IndexAny(encoded, "eE"); index >= 0 {
+		mantissa = encoded[:index]
+		parsed, err := strconv.ParseInt(encoded[index+1:], 10, 32)
+		if err != nil {
+			return fmt.Errorf("decode parameters: invalid JSON numeric exponent")
+		}
+		exponent = parsed
+	}
+	if exponent < -maxPostgreSQLNumericExponent || exponent > maxPostgreSQLNumericExponent {
+		return fmt.Errorf("decode parameters: JSON numeric exponent exceeds PostgreSQL range")
+	}
+	mantissa = strings.TrimPrefix(mantissa, "-")
+	whole, fraction, _ := strings.Cut(mantissa, ".")
+	digits := whole + fraction
+	firstSignificant := strings.IndexFunc(digits, func(r rune) bool { return r != '0' })
+	displayScale := int64(len(fraction)) - exponent
+	if displayScale < 0 {
+		displayScale = 0
+	}
+	if displayScale > maxPostgreSQLNumericScale {
+		return fmt.Errorf("decode parameters: JSON numeric scale exceeds PostgreSQL range")
+	}
+	if firstSignificant < 0 {
+		return nil
+	}
+	decimalWeight := int64(len(whole)-firstSignificant-1) + exponent
+	if decimalWeight > maxPostgreSQLNumericWeight {
+		return fmt.Errorf("decode parameters: JSON numeric weight exceeds PostgreSQL range")
+	}
 	return nil
 }
 
@@ -270,7 +418,6 @@ func decodeJSONBInteger(number json.RawMessage) (int, error) {
 		}
 		exponent = parsed
 	}
-	const maxPostgreSQLNumericExponent = int64(1_073_741_823)
 	if exponent < -maxPostgreSQLNumericExponent || exponent > maxPostgreSQLNumericExponent {
 		return 0, fmt.Errorf("JSON number exponent exceeds PostgreSQL numeric range")
 	}
