@@ -4,13 +4,16 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 )
 
 func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
@@ -35,9 +38,10 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("unexpected initial config: deleted=%v rendition=%v timezone=%q interval=%d retention=%d",
 				deletedRetention, renditionRetention, timezone, interval, backupRetention)
 		}
-		if profiles != 0 {
-			t.Fatalf("profile seed count = %d, want 0", profiles)
+		if profiles != 2 {
+			t.Fatalf("profile seed count = %d, want 2", profiles)
 		}
+		assertBundledProfileSeeds(t, pool)
 		var position int64
 		var mode string
 		if err := pool.QueryRow(ctx, `SELECT last_position FROM change_feed_state WHERE id=1`).Scan(&position); err != nil {
@@ -66,6 +70,136 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err := pool.Exec(ctx, `UPDATE system_config SET default_timezone='UTC', deleted_media_retention_days=0 WHERE id=1`); err != nil {
 			t.Fatalf("valid config update: %v", err)
 		}
+	})
+
+	t.Run("profile definitions require exact recipes and certified activation", func(t *testing.T) {
+		pool := migratedIntegrationPool(t, databaseURL)
+		ctx := context.Background()
+		valid := testProfileParameters(t)
+		profileID := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'capability-check',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, profileID, valid); err != nil {
+			t.Fatalf("insert valid candidate draft: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, profileID)
+		if _, err := pool.Exec(ctx, testJPEGCertificationSQL); err != nil {
+			t.Fatalf("certify JPEG fixture capability: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, profileID); err != nil {
+			t.Fatalf("activate certified profile: %v", err)
+		}
+
+		customID := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'family-wall',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, customID, valid); err != nil {
+			t.Fatalf("custom key did not reuse profile validation: %v", err)
+		}
+
+		insert := `INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,$2,1,'draft',$3,$4,$5,$6::jsonb)`
+		expectBothReject := func(key string, mimeTypes []string, processorName string, schemaVersion int, parameters []byte) {
+			t.Helper()
+			definition := profile.Definition{
+				ID: newUUIDv4(t), Key: key, Version: 1, InputMIMETypes: mimeTypes,
+				Processor: processorName, ParametersSchemaVersion: schemaVersion, Parameters: parameters,
+			}
+			if err := profile.ValidateDraft(definition); err == nil {
+				t.Fatalf("Go validator accepted %s", key)
+			}
+			expectExecError(t, pool, insert, definition.ID, key, mimeTypes, processorName, schemaVersion, parameters)
+		}
+		expectBothReject("bad-wildcard", []string{"image/*"}, "nmcp-media", 1, valid)
+		expectBothReject("bad-unknown-mime", []string{"image/x-unknown"}, "nmcp-media", 1, valid)
+		expectBothReject("bad-processor", []string{"image/jpeg"}, "unknown", 1, valid)
+		expectBothReject("bad-schema", []string{"image/jpeg"}, "nmcp-media", 2, valid)
+
+		var parameters map[string]any
+		if err := json.Unmarshal(valid, &parameters); err != nil {
+			t.Fatal(err)
+		}
+		parameters["unexpected"] = true
+		expectBothReject("bad-top-field", []string{"image/jpeg"}, "nmcp-media", 1, mustJSON(t, parameters))
+
+		parameters = decodeJSONMap(t, valid)
+		parameters["recipes"] = map[string]any{}
+		expectBothReject("bad-missing", []string{"image/jpeg"}, "nmcp-media", 1, mustJSON(t, parameters))
+
+		parameters = decodeJSONMap(t, valid)
+		recipes := parameters["recipes"].(map[string]any)
+		recipes["image/png"] = recipes["image/jpeg"]
+		expectBothReject("bad-extra", []string{"image/jpeg"}, "nmcp-media", 1, mustJSON(t, parameters))
+
+		parameters = decodeJSONMap(t, valid)
+		recipe := parameters["recipes"].(map[string]any)["image/jpeg"].(map[string]any)
+		recipe["still_output"].(map[string]any)["quality"] = 0
+		expectBothReject("bad-quality", []string{"image/jpeg"}, "nmcp-media", 1, mustJSON(t, parameters))
+
+		parameters = decodeJSONMap(t, valid)
+		parameters["recipes"].(map[string]any)["image/jpeg"].(map[string]any)["source_mode"] = "video"
+		expectBothReject("bad-capability-pair", []string{"image/jpeg"}, "nmcp-media", 1, mustJSON(t, parameters))
+
+		for name, mutate := range map[string]func(map[string]any){
+			"null-evidence": func(value map[string]any) { value["evidence_status"] = nil },
+			"null-upscale": func(value map[string]any) {
+				value["recipes"].(map[string]any)["image/jpeg"].(map[string]any)["allow_upscale"] = nil
+			},
+			"null-crop": func(value map[string]any) {
+				value["recipes"].(map[string]any)["image/jpeg"].(map[string]any)["crop"] = nil
+			},
+			"null-quality": func(value map[string]any) {
+				value["recipes"].(map[string]any)["image/jpeg"].(map[string]any)["still_output"].(map[string]any)["quality"] = nil
+			},
+		} {
+			parameters := decodeJSONMap(t, valid)
+			mutate(parameters)
+			expectBothReject("bad-"+name, []string{"image/jpeg"}, "nmcp-media", 1, mustJSON(t, parameters))
+		}
+	})
+
+	t.Run("profile certification is an immutable option envelope", func(t *testing.T) {
+		pool := migratedIntegrationPool(t, databaseURL)
+		ctx := context.Background()
+		profileID := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'envelope',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, profileID, testProfileParameters(t)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profile_processor_certifications (
+				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+				max_long_edge,minimum_setting,maximum_setting,evidence
+			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','still-avif',640,1,50,'deliberately narrow test envelope')`, newUUIDv4(t)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profile_processor_certifications (
+				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+				max_long_edge,minimum_setting,maximum_setting,evidence
+			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','still-avif',4096,61,100,'second independent option envelope')`, newUUIDv4(t)); err != nil {
+			t.Fatalf("append second immutable envelope: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, profileID)
+		expectExecError(t, pool, `UPDATE profile_processor_certifications SET max_long_edge=4096 WHERE input_mime_type='image/jpeg'`)
+		expectExecError(t, pool, `DELETE FROM profile_processor_certifications WHERE input_mime_type='image/jpeg'`)
+		expectExecError(t, pool, `TRUNCATE profile_processor_certifications`)
+		expectExecError(t, pool, `
+			INSERT INTO profile_processor_certifications (
+				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+				max_long_edge,minimum_setting,maximum_setting,evidence
+			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','video-av1',4096,0,63,'wrong output kind')`, newUUIDv4(t))
+		expectExecError(t, pool, `
+			INSERT INTO profile_processor_certifications (
+				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+				max_long_edge,minimum_setting,maximum_setting,evidence
+			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','still-avif',4096,1,100,'   ')`, newUUIDv4(t))
+		expectExecError(t, pool, `
+			INSERT INTO profile_processor_certifications (
+				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+				max_long_edge,minimum_setting,maximum_setting,evidence
+			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','still-avif',4096,1,100,' provisional-unverified ')`, newUUIDv4(t))
 	})
 
 	t.Run("media original uniqueness and checks", func(t *testing.T) {
@@ -130,9 +264,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 	t.Run("profile activation is monotonic and immutable", func(t *testing.T) {
 		pool := migratedIntegrationPool(t, databaseURL)
 		ctx := context.Background()
-		profileOne := insertDraftProfile(t, pool, "standard", 1)
-		profileTwo := insertDraftProfile(t, pool, "standard", 2)
-		profileThree := insertDraftProfile(t, pool, "standard", 3)
+		profileOne := insertDraftProfile(t, pool, "test-standard", 1)
+		profileTwo := insertDraftProfile(t, pool, "test-standard", 2)
+		profileThree := insertDraftProfile(t, pool, "test-standard", 3)
 
 		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, profileOne); err != nil {
 			t.Fatalf("activate v1: %v", err)
@@ -141,13 +275,15 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("activate v3: %v", err)
 		}
 		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, profileTwo)
-		expectExecError(t, pool, `UPDATE profiles SET parameters='{"changed":true}'::jsonb WHERE id=$1`, profileThree)
+		changedParameters := decodeJSONMap(t, testProfileParameters(t))
+		changedParameters["recipes"].(map[string]any)["image/jpeg"].(map[string]any)["still_output"].(map[string]any)["quality"] = 61
+		expectExecError(t, pool, `UPDATE profiles SET parameters=$2::jsonb WHERE id=$1`, profileThree, mustJSON(t, changedParameters))
 		expectExecError(t, pool, `UPDATE profiles SET status='draft' WHERE id=$1`, profileOne)
-		expectExecError(t, pool, `INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters,activated_at) VALUES ($1,'bad',1,'active',ARRAY['image/jpeg'],'still',1,'{}',now())`, newUUIDv4(t))
-		expectExecError(t, pool, `INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters) VALUES ($1,'bad',1,'draft',ARRAY['image/jpeg','image/jpeg'],'still',1,'{}')`, newUUIDv4(t))
+		expectExecError(t, pool, `INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters,activated_at) VALUES ($1,'bad',1,'active',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb,now())`, newUUIDv4(t), testProfileParameters(t))
+		expectExecError(t, pool, `INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters) VALUES ($1,'bad',1,'draft',ARRAY['image/jpeg','image/jpeg'],'nmcp-media',1,$2::jsonb)`, newUUIDv4(t), testProfileParameters(t))
 
 		var activeVersion int
-		if err := pool.QueryRow(ctx, `SELECT version FROM profiles WHERE key='standard' AND status='active'`).Scan(&activeVersion); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT version FROM profiles WHERE key='test-standard' AND status='active'`).Scan(&activeVersion); err != nil {
 			t.Fatalf("read active profile: %v", err)
 		}
 		if activeVersion != 3 {
@@ -227,7 +363,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 	t.Run("concurrent current-rendition uniqueness", func(t *testing.T) {
 		pool := migratedIntegrationPool(t, databaseURL)
 		ctx := context.Background()
-		profileID := insertDraftProfile(t, pool, "standard", 1)
+		profileID := insertDraftProfile(t, pool, "rendition-standard", 1)
 		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, profileID); err != nil {
 			t.Fatalf("activate profile: %v", err)
 		}
@@ -262,7 +398,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		close(start)
 		assertOneConcurrentWinner(t, results)
 		var currentCount int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM renditions WHERE media_id=$1 AND profile_key='standard' AND is_current`, mediaID).Scan(&currentCount); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM renditions WHERE media_id=$1 AND profile_key='rendition-standard' AND is_current`, mediaID).Scan(&currentCount); err != nil {
 			t.Fatalf("count current renditions: %v", err)
 		}
 		if currentCount != 1 {
@@ -273,7 +409,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 	t.Run("job target rendition and purge history invariants", func(t *testing.T) {
 		pool := migratedIntegrationPool(t, databaseURL)
 		ctx := context.Background()
-		profileID := insertDraftProfile(t, pool, "standard", 1)
+		profileID := insertDraftProfile(t, pool, "history-standard", 1)
 		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, profileID); err != nil {
 			t.Fatalf("activate profile: %v", err)
 		}
@@ -365,7 +501,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 
 		var profileKey string
-		if err := pool.QueryRow(ctx, `SELECT profile_key FROM renditions WHERE id=$1`, renditionID).Scan(&profileKey); err != nil || profileKey != "standard" {
+		if err := pool.QueryRow(ctx, `SELECT profile_key FROM renditions WHERE id=$1`, renditionID).Scan(&profileKey); err != nil || profileKey != "history-standard" {
 			t.Fatalf("derived rendition profile key = %q, err=%v", profileKey, err)
 		}
 		expectExecError(t, pool, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256) VALUES ($1,$2,$3,'standard',false,$4,'image/avif',1,$5)`, newUUIDv4(t), otherMediaID, targetID, "renditions/dd/bad/target/output.avif", strings.Repeat("f", 64))
@@ -382,7 +518,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			return err
 		})
 
-		secondProfileID := insertDraftProfile(t, pool, "thumbnail", 1)
+		secondProfileID := insertDraftProfile(t, pool, "history-thumbnail", 1)
 		deleteJobID := newUUIDv4(t)
 		deleteTargets := []string{newUUIDv4(t), newUUIDv4(t)}
 		deleteTx, err := pool.Begin(ctx)
@@ -625,13 +761,114 @@ func insertOriginal(t *testing.T, pool *pgxpool.Pool, mediaID, digestNibble, suf
 func insertDraftProfile(t *testing.T, pool *pgxpool.Pool, key string, version int) string {
 	t.Helper()
 	id := newUUIDv4(t)
+	if _, err := pool.Exec(context.Background(), testJPEGCertificationSQL+` ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatalf("certify test profile capability: %v", err)
+	}
 	if _, err := pool.Exec(context.Background(), `
 		INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
-		VALUES ($1,$2,$3,'draft',ARRAY['image/jpeg'],'still',1,'{}')`, id, key, version); err != nil {
+		VALUES ($1,$2,$3,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$4::jsonb)`, id, key, version, testProfileParameters(t)); err != nil {
 		t.Fatalf("insert draft profile %s/%d: %v", key, version, err)
 	}
 	return id
 }
+
+func testProfileParameters(t *testing.T) []byte {
+	t.Helper()
+	parameters := profile.StandardV1Parameters()
+	parameters.Recipes = map[string]profile.Recipe{"image/jpeg": parameters.Recipes["image/jpeg"]}
+	return mustJSON(t, parameters)
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func decodeJSONMap(t *testing.T, value []byte) map[string]any {
+	t.Helper()
+	var decoded map[string]any
+	if err := json.Unmarshal(value, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}
+
+func assertBundledProfileSeeds(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := pool.Query(ctx, `
+		SELECT id::text,key,version,status,input_mime_types,processor,
+		       parameters_schema_version,parameters,activated_at,retired_at
+		FROM profiles ORDER BY key`)
+	if err != nil {
+		t.Fatalf("query bundled profiles: %v", err)
+	}
+	defer rows.Close()
+	actual := make(map[string]profile.Definition)
+	for rows.Next() {
+		var definition profile.Definition
+		var status string
+		var activatedAt, retiredAt *time.Time
+		if err := rows.Scan(
+			&definition.ID, &definition.Key, &definition.Version, &status,
+			&definition.InputMIMETypes, &definition.Processor,
+			&definition.ParametersSchemaVersion, &definition.Parameters,
+			&activatedAt, &retiredAt,
+		); err != nil {
+			t.Fatalf("scan bundled profile: %v", err)
+		}
+		if status != "draft" || activatedAt != nil || retiredAt != nil {
+			t.Fatalf("bundled profile %s lifecycle = %s, %v, %v", definition.Key, status, activatedAt, retiredAt)
+		}
+		if err := profile.ValidateDraft(definition); err != nil {
+			t.Fatalf("database seed %s diverges from Go validator: %v", definition.Key, err)
+		}
+		actual[definition.Key] = definition
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range profile.BundledDefinitions() {
+		got, ok := actual[expected.Key]
+		if !ok {
+			t.Fatalf("missing bundled profile %s", expected.Key)
+		}
+		var gotParameters, wantParameters any
+		if err := json.Unmarshal(got.Parameters, &gotParameters); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(expected.Parameters, &wantParameters); err != nil {
+			t.Fatal(err)
+		}
+		got.Parameters, expected.Parameters = nil, nil
+		if !reflect.DeepEqual(got, expected) || !reflect.DeepEqual(gotParameters, wantParameters) {
+			t.Fatalf("bundled profile %s differs from Go definition", expected.Key)
+		}
+	}
+	var capabilityCount, certificationCount int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM profile_processor_capabilities),(SELECT count(*) FROM profile_processor_certifications)`).Scan(&capabilityCount, &certificationCount); err != nil {
+		t.Fatal(err)
+	}
+	if capabilityCount != 17 || certificationCount != 0 {
+		t.Fatalf("capability seed counts = %d candidates, %d certifications", capabilityCount, certificationCount)
+	}
+	expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE key='standard' AND version=1`)
+	expectExecError(t, pool, `INSERT INTO profile_processor_capabilities (processor,parameters_schema_version,input_mime_type,source_mode,evidence) VALUES ('nmcp-media',1,'image/x-unknown','still','fabricated')`)
+	expectExecError(t, pool, `INSERT INTO profile_processor_capabilities (processor,parameters_schema_version,input_mime_type,source_mode,evidence) VALUES ('nmcp-media',1,'image/jpeg','video','fabricated')`)
+	expectExecError(t, pool, `UPDATE profile_processor_capabilities SET evidence='changed' WHERE input_mime_type='image/jpeg'`)
+	expectExecError(t, pool, `DELETE FROM profile_processor_capabilities WHERE input_mime_type='image/jpeg'`)
+	expectExecError(t, pool, `TRUNCATE profile_processor_capabilities`)
+}
+
+const testJPEGCertificationSQL = `
+	INSERT INTO profile_processor_certifications (
+		id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+		max_long_edge,minimum_setting,maximum_setting,evidence
+	) VALUES ('70000000-0000-4000-8000-000000000001','nmcp-media',1,'image/jpeg','still','still-avif',4096,1,100,'isolated PostgreSQL test fixture')`
 
 func insertPendingTransform(t *testing.T, pool *pgxpool.Pool, mediaID, originalID, profileID string) string {
 	t.Helper()
