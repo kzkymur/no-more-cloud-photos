@@ -610,23 +610,55 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 
 	t.Run("cancellation still releases session lock", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
-		migrator := newMigrator(pool, []migration{testMigration(1, "cancel", "SELECT pg_sleep(10)")})
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
+		applicationName := "nmcp_cancel_" + strings.ReplaceAll(newUUIDv4(t), "-", "")
+		migrationSQL := fmt.Sprintf(
+			"SELECT pg_catalog.set_config('application_name', '%s', false); SELECT pg_catalog.pg_sleep(10)",
+			applicationName,
+		)
+		migrator := newMigrator(pool, []migration{testMigration(1, "cancel", migrationSQL)})
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() { result <- migrator.Up(ctx) }()
 
-		if err := migrator.Up(ctx); err == nil {
+		observeCtx, observeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		migrationPID := awaitApplicationBackendPID(t, pool, observeCtx, applicationName)
+		observeCancel()
+		cancel()
+		resultCtx, resultCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer resultCancel()
+		if err := awaitContextResult(t, resultCtx, result); err == nil {
 			t.Fatal("Up() expected cancellation error")
 		}
-		conn, err := pool.Acquire(context.Background())
+
+		candidate, err := pool.Acquire(context.Background())
 		if err != nil {
 			t.Fatalf("acquire lock-check connection: %v", err)
 		}
-		defer conn.Release()
+		defer candidate.Release()
+		verifier := candidate
+		var candidatePID int32
+		if err := candidate.QueryRow(context.Background(), `SELECT pg_catalog.pg_backend_pid()`).Scan(&candidatePID); err != nil {
+			t.Fatalf("read lock-check backend PID: %v", err)
+		}
+		if candidatePID == migrationPID {
+			verifier, err = pool.Acquire(context.Background())
+			if err != nil {
+				t.Fatalf("acquire distinct lock-check connection: %v", err)
+			}
+			defer verifier.Release()
+		}
+		var verifierPID int32
+		if err := verifier.QueryRow(context.Background(), `SELECT pg_catalog.pg_backend_pid()`).Scan(&verifierPID); err != nil {
+			t.Fatalf("read distinct verifier PID: %v", err)
+		}
+		if verifierPID == migrationPID {
+			t.Fatalf("lock verifier reused migration backend PID %d", migrationPID)
+		}
 		lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer lockCancel()
 		var locked bool
 		for !locked {
-			if err := conn.QueryRow(lockCtx, `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
+			if err := verifier.QueryRow(lockCtx, `SELECT pg_catalog.pg_try_advisory_lock($1)`, migrationLockKey).Scan(&locked); err != nil {
 				t.Fatalf("try migration lock: %v", err)
 			}
 			if !locked {
@@ -637,7 +669,7 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 				}
 			}
 		}
-		if _, err := conn.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, migrationLockKey); err != nil {
+		if _, err := verifier.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, migrationLockKey); err != nil {
 			t.Fatalf("release lock-check lock: %v", err)
 		}
 	})
@@ -831,6 +863,31 @@ func awaitContextResult(t *testing.T, ctx context.Context, result <-chan error) 
 	case <-ctx.Done():
 		t.Fatalf("wait for concurrent database operation: %v", ctx.Err())
 		return ctx.Err()
+	}
+}
+
+func awaitApplicationBackendPID(t *testing.T, pool *pgxpool.Pool, ctx context.Context, applicationName string) int32 {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var pid int32
+		err := pool.QueryRow(ctx, `
+			SELECT pid FROM pg_catalog.pg_stat_activity
+			WHERE application_name=$1 AND state='active'
+			ORDER BY pid LIMIT 1`, applicationName).Scan(&pid)
+		if err == nil {
+			return pid
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("observe migration backend PID: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for migration backend %q: %v", applicationName, ctx.Err())
+			return 0
+		case <-ticker.C:
+		}
 	}
 }
 
