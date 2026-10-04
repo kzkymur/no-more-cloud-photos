@@ -100,7 +100,7 @@ func (r Registry) WithCertification(certification Certification) (Registry, erro
 	if certification.SettingMin < minimum || certification.SettingMax > maximum || certification.SettingMin > certification.SettingMax {
 		return Registry{}, fmt.Errorf("setting range must be within %d..%d", minimum, maximum)
 	}
-	if evidence := strings.TrimSpace(certification.Evidence); evidence == "" || evidence == EvidenceProvisional {
+	if evidence := strings.Trim(certification.Evidence, " \t\n\r\f\v"); evidence == "" || evidence == EvidenceProvisional {
 		return Registry{}, fmt.Errorf("certification evidence must not be empty")
 	}
 

@@ -431,7 +431,9 @@ func TestCertificationValidation(t *testing.T) {
 		{name: "reversed range", mutate: func(c *Certification) { c.SettingMin = 80; c.SettingMax = 50 }},
 		{name: "empty evidence", mutate: func(c *Certification) { c.Evidence = "" }},
 		{name: "blank evidence", mutate: func(c *Certification) { c.Evidence = "  " }},
+		{name: "tab evidence", mutate: func(c *Certification) { c.Evidence = "\t\n" }},
 		{name: "provisional evidence", mutate: func(c *Certification) { c.Evidence = " provisional-unverified " }},
+		{name: "provisional tab evidence", mutate: func(c *Certification) { c.Evidence = "\nprovisional-unverified\t" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

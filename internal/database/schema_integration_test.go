@@ -200,6 +200,16 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
 				max_long_edge,minimum_setting,maximum_setting,evidence
 			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','still-avif',4096,1,100,' provisional-unverified ')`, newUUIDv4(t))
+		expectExecError(t, pool, `
+			INSERT INTO profile_processor_certifications (
+				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+				max_long_edge,minimum_setting,maximum_setting,evidence
+			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','still-avif',4096,1,100,E'\t\n')`, newUUIDv4(t))
+		expectExecError(t, pool, `
+			INSERT INTO profile_processor_certifications (
+				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+				max_long_edge,minimum_setting,maximum_setting,evidence
+			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','still-avif',4096,1,100,E'\nprovisional-unverified\t')`, newUUIDv4(t))
 	})
 
 	t.Run("media original uniqueness and checks", func(t *testing.T) {
