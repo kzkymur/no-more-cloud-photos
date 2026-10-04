@@ -200,14 +200,12 @@ func TestReadServiceIntegration(t *testing.T) {
 	})
 
 	t.Run("job lookups preserve UUID indexes", func(t *testing.T) {
-		const bulkMediaID = "82000000-0000-4000-8000-000000000001"
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,available_at,started_at,finished_at,created_at,updated_at)
+			INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,available_at,created_at,updated_at)
 			SELECT ('81000000-0000-4000-8000-' || lpad(to_hex(value),12,'0'))::uuid,
-			       'purge',$1::uuid,'succeeded',3,$2::timestamptz + value * interval '1 microsecond',
-			       $2::timestamptz + value * interval '1 microsecond',$2::timestamptz + value * interval '1 microsecond',
-			       $2::timestamptz + value * interval '1 microsecond',$2::timestamptz + value * interval '1 microsecond'
-			FROM generate_series(1,2048) AS value`, bulkMediaID, base.Add(4*time.Hour)); err != nil {
+			       'purge',('82000000-0000-4000-8000-' || lpad(to_hex(value),12,'0'))::uuid,'queued',3,
+			       $1::timestamptz + value * interval '1 microsecond',$1::timestamptz + value * interval '1 microsecond'
+			FROM generate_series(1,2048) AS value`, base.Add(4*time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := pool.Exec(ctx, `ANALYZE jobs`); err != nil {
@@ -220,7 +218,7 @@ func TestReadServiceIntegration(t *testing.T) {
 			t.Fatalf("job ID plan does not use jobs_pkey:\n%s", idPlan)
 		}
 		mediaPlan := integrationExplain(t, pool, jobHeadersSQL,
-			nil, "", bulkMediaID, false, nil, nil, 13)
+			nil, "", integrationUUID(10), false, nil, nil, 13)
 		if !strings.Contains(mediaPlan, "jobs_media_list_idx") {
 			t.Fatalf("job media plan does not use jobs_media_list_idx:\n%s", mediaPlan)
 		}
@@ -275,10 +273,16 @@ func TestReadServiceIntegration(t *testing.T) {
 			t.Fatalf("custom profile current missing from page: %#v", customPage.Items)
 		}
 
+		if _, err := pool.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER profiles_definition_validate`); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, standardV1); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, standardV2); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `ALTER TABLE profiles ENABLE TRIGGER profiles_definition_validate`); err != nil {
 			t.Fatal(err)
 		}
 		standardRequest := NewMediaListRequest()

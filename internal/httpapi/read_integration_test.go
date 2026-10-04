@@ -203,6 +203,11 @@ func readHTTPIntegrationPool(t *testing.T) *pgxpool.Pool {
 func insertReadHTTPRendition(t *testing.T, pool *pgxpool.Pool, mediaID, originalID, jobID, targetID, renditionID string, now time.Time) {
 	t.Helper()
 	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	path := "renditions/71/" + originalID + "/" + targetID + "/" + renditionID + ".avif"
 	leaseID := "75000000-0000-4000-8000-000000000001"
 	statements := []struct {
@@ -217,9 +222,12 @@ func insertReadHTTPRendition(t *testing.T, pool *pgxpool.Pool, mediaID, original
 		{`UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=$2,updated_at=$2 WHERE id=$1`, []any{jobID, now}},
 	}
 	for _, statement := range statements {
-		if _, err := pool.Exec(ctx, statement.query, statement.args...); err != nil {
+		if _, err := tx.Exec(ctx, statement.query, statement.args...); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
