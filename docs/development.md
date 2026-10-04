@@ -7,6 +7,8 @@
   `63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445`.
 - `github.com/jackc/pgx/v5` `v5.11.0`, locked with all transitive module
   checksums in `go.sum`.
+- `golang.org/x/sys` `v0.36.0` supplies Linux descriptor-relative filesystem
+  and no-replace rename operations used by the storage durability layer.
 - CI uses immutable action commits: `actions/checkout` v7.0.1 at
   `3d3c42e5aac5ba805825da76410c181273ba90b1` and `actions/setup-go` v7.0.0
   at `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e`.
@@ -63,9 +65,39 @@ transactional migrations, non-transactional execution, and recovery.
 | `TEST_DATABASE_URL` | tests | tests | tests | Enables isolated-schema real PostgreSQL migration tests. |
 
 API `GET /healthz` checks only the process handler. `GET /readyz` checks the
-database, migration currency/checksums, and a temporary create/sync/remove in a
-non-symlink storage root. Dependency failures return only the stable
+database, migration currency/checksums, and the shared storage probe. The probe
+uses exclusive create, write, file sync, no-replace rename, directory sync,
+unlink, and deletion-directory sync beneath the pinned non-symlink root. Worker
+startup uses the same probe. Dependency failures return only the stable
 `unavailable` error and do not expose DSNs, paths, or SQL details.
+
+## Storage durability boundary
+
+`internal/storage` is Linux-specific because the approved deployment target is
+Ubuntu Server. It pins `NMCP_STORAGE_ROOT` as a directory descriptor, walks and
+creates key components with `openat`/`mkdirat` plus `O_NOFOLLOW`, creates the
+attempt temp in the final directory, syncs every new child and parent directory,
+syncs and validates file bytes, publishes with `renameat2(RENAME_NOREPLACE)`, and
+syncs the final directory. The configured root must be on a local POSIX
+filesystem whose atomic rename and file/directory `fsync` semantics are trusted;
+NFS/FUSE behavior is not claimed. The storage tree is owned by the Core service
+identity and must not be writable by other users or processes. Descriptor-
+relative operations prevent traversal and symlink following; higher-level
+Media/lease locks in #14/#16 serialize publish versus delete and prevent a
+trusted writer from replacing an entry across the delete type-check/unlink
+window.
+
+Only canonical typed Original/Rendition keys enter filesystem methods. Temp
+files remain before rename after a crash; a final file after rename but before a
+database commit is an orphan for explicit reconciliation. A post-rename sync
+failure is reported as a published but uncertain outcome, never as an absent
+file. Deletion is exact-key and idempotent, syncs its directory, and deliberately
+does not prune directories. Deterministic before/after fault injection models
+recovery-visible namespace states; process termination and real physical
+power-loss persistence remain explicit system evidence for issue #21.
+`Store.Close` prevents new work but existing Temp descriptors remain independent;
+every owner must finish `Publish` or call `Abort`. API draining and Worker
+shutdown complete owned operations before closing the Store.
 
 API and Worker handle SIGINT/SIGTERM. The API stops intake and drains HTTP
 requests within the configured timeout; the Worker stops accepting future work

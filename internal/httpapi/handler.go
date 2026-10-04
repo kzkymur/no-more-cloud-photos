@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"mime"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -28,11 +27,16 @@ type MigrationChecker interface {
 	Status(context.Context) (database.Status, error)
 }
 
+// StorageProber is the secure storage capability required by readiness.
+type StorageProber interface {
+	Probe(context.Context) error
+}
+
 // Dependencies contains the services checked by the readiness probe.
 type Dependencies struct {
-	Database    DatabasePinger
-	Migrations  MigrationChecker
-	StorageRoot string
+	Database   DatabasePinger
+	Migrations MigrationChecker
+	Storage    StorageProber
 }
 
 type handler struct {
@@ -130,7 +134,7 @@ func (h *handler) methodNotAllowed(w http.ResponseWriter, requestID string) {
 }
 
 func (h *handler) ready(w http.ResponseWriter, r *http.Request, requestID string) {
-	if h.dependencies.Database == nil || h.dependencies.Migrations == nil || h.dependencies.StorageRoot == "" {
+	if h.dependencies.Database == nil || h.dependencies.Migrations == nil || h.dependencies.Storage == nil {
 		writeUnavailable(w, requestID)
 		return
 	}
@@ -143,38 +147,12 @@ func (h *handler) ready(w http.ResponseWriter, r *http.Request, requestID string
 		writeUnavailable(w, requestID)
 		return
 	}
-	if err := checkStorageRoot(h.dependencies.StorageRoot); err != nil {
+	if err := h.dependencies.Storage.Probe(r.Context()); err != nil {
 		writeUnavailable(w, requestID)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ready"})
-}
-
-func checkStorageRoot(root string) error {
-	info, err := os.Lstat(root)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return os.ErrInvalid
-	}
-
-	file, err := os.CreateTemp(root, ".readyz-")
-	if err != nil {
-		return err
-	}
-	name := file.Name()
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		_ = os.Remove(name)
-		return err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(name)
-		return err
-	}
-	return os.Remove(name)
 }
 
 func writeUnavailable(w http.ResponseWriter, requestID string) {
