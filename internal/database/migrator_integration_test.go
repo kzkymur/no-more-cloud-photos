@@ -34,8 +34,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 1 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version one", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 2 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version two", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -58,11 +58,120 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 1 || status.ExpectedVersion != 1 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version one", status)
+		if status.CurrentVersion != 2 || status.ExpectedVersion != 2 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version two", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
+		}
+	})
+
+	t.Run("profile migration rejects seed conflicts without adoption", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:1]).Up(context.Background()); err != nil {
+			t.Fatalf("apply version one: %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'standard',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, newUUIDv4(t), testProfileParameters(t)); err != nil {
+			t.Fatalf("insert preexisting standard/v1: %v", err)
+		}
+		if err := full.Up(context.Background()); err == nil {
+			t.Fatal("profile migration adopted or overwrote standard/v1 conflict")
+		}
+		assertProfileMigrationRolledBack(t, pool, 1)
+	})
+
+	t.Run("profile migration rejects incompatible legacy profile", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:1]).Up(context.Background()); err != nil {
+			t.Fatalf("apply version one: %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'legacy',1,'draft',ARRAY['image/jpeg'],'still',1,'{}')`, newUUIDv4(t)); err != nil {
+			t.Fatalf("insert legacy profile: %v", err)
+		}
+		if err := full.Up(context.Background()); err == nil {
+			t.Fatal("profile migration accepted incompatible legacy profile")
+		}
+		assertProfileMigrationRolledBack(t, pool, 1)
+	})
+
+	t.Run("profile migration rejects decimal-form fixed integers", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:1]).Up(context.Background()); err != nil {
+			t.Fatalf("apply version one: %v", err)
+		}
+		decimalBitDepth := replaceJSONOnce(t, testProfileParameters(t), `"bit_depth":8`, `"bit_depth":8.0`)
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'legacy-decimal',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, newUUIDv4(t), decimalBitDepth); err != nil {
+			t.Fatalf("insert decimal-form legacy profile under version one: %v", err)
+		}
+		if err := full.Up(context.Background()); err == nil {
+			t.Fatal("profile migration accepted decimal-form fixed integer")
+		}
+		assertProfileMigrationRolledBack(t, pool, 1)
+	})
+
+	t.Run("profile migration rejects uncertified legacy active profile", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:1]).Up(context.Background()); err != nil {
+			t.Fatalf("apply version one: %v", err)
+		}
+		profileID := newUUIDv4(t)
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'legacy-active',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, profileID, testProfileParameters(t)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(context.Background(), `UPDATE profiles SET status='active' WHERE id=$1`, profileID); err != nil {
+			t.Fatalf("activate under version one rules: %v", err)
+		}
+		if err := full.Up(context.Background()); err == nil {
+			t.Fatal("profile migration accepted active profile without certification evidence")
+		}
+		assertProfileMigrationRolledBack(t, pool, 1)
+	})
+
+	t.Run("profile migration preserves compatible custom draft", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:1]).Up(context.Background()); err != nil {
+			t.Fatalf("apply version one: %v", err)
+		}
+		customID := newUUIDv4(t)
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'custom',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, customID, testProfileParameters(t)); err != nil {
+			t.Fatalf("insert compatible custom draft: %v", err)
+		}
+		if err := full.Up(context.Background()); err != nil {
+			t.Fatalf("upgrade compatible custom draft: %v", err)
+		}
+		var count int
+		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM profiles WHERE id=$1 OR key IN ('standard','thumbnail')`, customID).Scan(&count); err != nil || count != 3 {
+			t.Fatalf("preserved/seeded profiles count = %d, err=%v", count, err)
 		}
 	})
 
@@ -402,6 +511,26 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 			t.Fatalf("Up() error = %v, want ErrInvalidMigrationHistory", err)
 		}
 	})
+}
+
+func assertProfileMigrationRolledBack(t *testing.T, pool *pgxpool.Pool, profileCount int) {
+	t.Helper()
+	ctx := context.Background()
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 1 {
+		t.Fatalf("migration version after rollback = %d, err=%v", version, err)
+	}
+	var capabilitiesExist bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('profile_processor_capabilities') IS NOT NULL`).Scan(&capabilitiesExist); err != nil {
+		t.Fatal(err)
+	}
+	if capabilitiesExist {
+		t.Fatal("failed profile migration left capability table behind")
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM profiles`).Scan(&count); err != nil || count != profileCount {
+		t.Fatalf("profiles after rollback = %d, err=%v", count, err)
+	}
 }
 
 func testMigration(version int64, name, sql string) migration {

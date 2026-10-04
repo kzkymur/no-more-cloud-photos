@@ -27,3 +27,17 @@ baseline. It creates the relational invariants and singleton configuration/feed/
 maintenance seeds. It deliberately creates no profile rows: complete bundled
 profile recipes are owned by issue #6, after processor/schema capability
 validation exists.
+
+`0002_profile_recipes.sql` adds the closed candidate MIME/source registry,
+immutable evidence-backed output option certifications, strict schema-v1 recipe
+validation on every profile write, and the bundled `standard/v1` and
+`thumbnail/v1` drafts. Candidate membership is not executable capability: no
+certifications are seeded, and activation fails until later codec fixture
+evidence records an input/output option envelope.
+
+The `0001` upgrade preflight preserves compatible custom drafts, but fails closed
+for incompatible rows, uncertified active rows, or bundled `(key,version)`
+conflicts. The shipped `0001` state contains zero profiles and exposes no profile
+creation API, so such rows indicate unsupported manual database mutation; repair
+uses a reviewed forward migration or tested backup restore rather than silently
+adopting or rewriting immutable provenance.

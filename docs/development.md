@@ -102,3 +102,29 @@ shutdown complete owned operations before closing the Store.
 API and Worker handle SIGINT/SIGTERM. The API stops intake and drains HTTP
 requests within the configured timeout; the Worker stops accepting future work
 (the job loop is added in issue #10) and closes its database pool.
+
+## Profile recipe boundary
+
+`internal/profile` and migration `0002` define `nmcp-media` parameter schema v1.
+Recipes exactly cover their normalized input MIME allowlist and encode source
+probing, frame/loop behavior, primary-stream selection, resize/even-dimension,
+orientation, color/tone-map, metadata, alpha, audio, and output settings.
+Unknown fields, wildcards, unregistered candidate MIMEs, missing/extra recipes,
+and invalid output combinations fail in both Go and PostgreSQL.
+
+Bundled `standard/v1` and `thumbnail/v1` are drafts. Their AVIF Q60/Q50 at
+8-bit, animated-WebP Q80 at 8-bit, and AV1 CRF32 at 10-bit 4:2:0 with AAC
+128kbit/s are provisional starting points, not verified quality or compatibility
+claims. Q80 is an initial lossy animation balance consistent with the other
+draft quality targets; #12 and #21 must replace it through a new immutable
+profile version if fixture/device evidence rejects it. The exact candidate MIME
+aliases are likewise versioned inputs for #7 detector evidence, never a promise
+that every vendor variant works.
+
+Candidate registry rows are immutable and carry pending evidence only. A profile
+can activate only when immutable certification rows cover every required exact
+MIME/source/output kind, maximum edge, and quality/CRF range. A database
+certification is deployment compatibility metadata, not proof that a particular
+Worker process has its binary/plugin/codec; #11–#13 add startup/runtime probes
+and must refuse execution on mismatch. Migration application alone never
+certifies a capability.
