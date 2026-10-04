@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -90,6 +91,24 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `
 			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
 			VALUES ($1,$2,$3,$4,'image/jpeg',1)`, newUUIDv4(t), mediaTwo, sha, "originals/bb/two/original.jpg")
+
+		concurrentMediaOne := newUUIDv4(t)
+		concurrentMediaTwo := newUUIDv4(t)
+		insertMedia(t, pool, concurrentMediaOne)
+		insertMedia(t, pool, concurrentMediaTwo)
+		start := make(chan struct{})
+		errorsByInsert := make(chan error, 2)
+		originalIDs := []string{newUUIDv4(t), newUUIDv4(t)}
+		for index, id := range []string{concurrentMediaOne, concurrentMediaTwo} {
+			go func(index int, id string) {
+				<-start
+				_, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`,
+					originalIDs[index], id, strings.Repeat("9", 64), fmt.Sprintf("originals/99/concurrent-%d/original.jpg", index))
+				errorsByInsert <- err
+			}(index, id)
+		}
+		close(start)
+		assertOneConcurrentWinner(t, errorsByInsert)
 	})
 
 	t.Run("profile activation is monotonic and immutable", func(t *testing.T) {
@@ -117,6 +136,99 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		if activeVersion != 3 {
 			t.Fatalf("active version = %d, want 3", activeVersion)
+		}
+
+		concurrentTwo := insertDraftProfile(t, pool, "concurrent", 2)
+		concurrentThree := insertDraftProfile(t, pool, "concurrent", 3)
+		highTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin high activation: %v", err)
+		}
+		if _, err := highTx.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, concurrentThree); err != nil {
+			_ = highTx.Rollback(ctx)
+			t.Fatalf("stage high activation: %v", err)
+		}
+		lowResult := make(chan error, 1)
+		go func() {
+			_, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, concurrentTwo)
+			lowResult <- err
+		}()
+		if err := highTx.Commit(ctx); err != nil {
+			t.Fatalf("commit high activation: %v", err)
+		}
+		if err := awaitResult(t, lowResult); err == nil {
+			t.Fatal("lower concurrent activation unexpectedly succeeded after higher version")
+		}
+
+		orderedTwo := insertDraftProfile(t, pool, "ordered", 2)
+		orderedThree := insertDraftProfile(t, pool, "ordered", 3)
+		lowTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin low activation: %v", err)
+		}
+		if _, err := lowTx.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, orderedTwo); err != nil {
+			_ = lowTx.Rollback(ctx)
+			t.Fatalf("stage low activation: %v", err)
+		}
+		highResult := make(chan error, 1)
+		go func() {
+			_, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, orderedThree)
+			highResult <- err
+		}()
+		if err := lowTx.Commit(ctx); err != nil {
+			t.Fatalf("commit low activation: %v", err)
+		}
+		if err := awaitResult(t, highResult); err != nil {
+			t.Fatalf("higher concurrent activation after lower commit: %v", err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT version FROM profiles WHERE key='ordered' AND status='active'`).Scan(&activeVersion); err != nil || activeVersion != 3 {
+			t.Fatalf("ordered concurrent active version = %d, err=%v", activeVersion, err)
+		}
+	})
+
+	t.Run("concurrent current-rendition uniqueness", func(t *testing.T) {
+		pool := migratedIntegrationPool(t, databaseURL)
+		ctx := context.Background()
+		profileID := insertDraftProfile(t, pool, "standard", 1)
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, profileID); err != nil {
+			t.Fatalf("activate profile: %v", err)
+		}
+		mediaID := newUUIDv4(t)
+		insertMedia(t, pool, mediaID)
+		originalID := insertOriginal(t, pool, mediaID, "8", "concurrent")
+		targetOne := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		targetTwo := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		renditionIDs := []string{newUUIDv4(t), newUUIDv4(t)}
+		for index, targetID := range []string{targetOne, targetTwo} {
+			go func(index int, targetID string) {
+				<-start
+				tx, err := pool.Begin(ctx)
+				if err == nil {
+					_, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID)
+				}
+				if err == nil {
+					_, err = tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256) VALUES ($1,$2,$3,'ignored',true,$4,'image/avif',1,$5)`,
+						renditionIDs[index], mediaID, targetID, fmt.Sprintf("renditions/88/concurrent/target-%d/output.avif", index), strings.Repeat(fmt.Sprintf("%x", index+6), 64))
+				}
+				if err == nil {
+					err = tx.Commit(ctx)
+				} else if tx != nil {
+					_ = tx.Rollback(ctx)
+				}
+				results <- err
+			}(index, targetID)
+		}
+		close(start)
+		assertOneConcurrentWinner(t, results)
+		var currentCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM renditions WHERE media_id=$1 AND profile_key='standard' AND is_current`, mediaID).Scan(&currentCount); err != nil {
+			t.Fatalf("count current renditions: %v", err)
+		}
+		if currentCount != 1 {
+			t.Fatalf("current rendition count = %d, want 1", currentCount)
 		}
 	})
 
@@ -212,6 +324,19 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		expectExecError(t, pool, `UPDATE idempotency_requests SET http_status=409 WHERE scope='POST /media' AND key='request-1'`)
 		expectExecError(t, pool, `INSERT INTO idempotency_requests (scope,key,request_hash,http_status,response_body) VALUES ('POST /other','x',$1,201,'{}')`, requestHash)
+		start := make(chan struct{})
+		idempotencyResults := make(chan error, 2)
+		idempotencyMediaIDs := []string{newUUIDv4(t), newUUIDv4(t)}
+		for index := 0; index < 2; index++ {
+			go func(index int) {
+				<-start
+				_, err := pool.Exec(ctx, `INSERT INTO idempotency_requests (scope,key,request_hash,http_status,response_body,media_id_snapshot) VALUES ('POST /media','concurrent',$1,201,$2,$3)`,
+					strings.Repeat(fmt.Sprintf("%x", index+3), 64), fmt.Sprintf(`{"winner":%d}`, index), idempotencyMediaIDs[index])
+				idempotencyResults <- err
+			}(index)
+		}
+		close(start)
+		assertOneConcurrentWinner(t, idempotencyResults)
 
 		eventID := newUUIDv4(t)
 		if _, err := pool.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id,payload) VALUES ($1,1,'media_upsert','upload',$2,'{}')`, eventID, mediaID); err != nil {
@@ -247,7 +372,15 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 				t.Errorf("required index %s: %v", name, err)
 			}
 		}
-		rows, err := pool.Query(ctx, `EXPLAIN (FORMAT JSON) SELECT id FROM jobs WHERE status='queued' AND available_at <= now() ORDER BY available_at,created_at,id LIMIT 1`)
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("acquire explain connection: %v", err)
+		}
+		defer conn.Release()
+		if _, err := conn.Exec(ctx, `SET enable_seqscan=off`); err != nil {
+			t.Fatalf("disable sequential scans for index capability evidence: %v", err)
+		}
+		rows, err := conn.Query(ctx, `EXPLAIN (FORMAT JSON) SELECT id FROM jobs WHERE status='queued' AND available_at <= now() ORDER BY available_at,created_at,id LIMIT 1`)
 		if err != nil {
 			t.Fatalf("explain dequeue query: %v", err)
 		}
@@ -265,6 +398,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		if len(lines) == 0 {
 			t.Fatal("EXPLAIN returned no plan")
+		}
+		if plan := strings.Join(lines, "\n"); !strings.Contains(plan, "jobs_dequeue_idx") {
+			t.Fatalf("dequeue plan does not use jobs_dequeue_idx with sequential scans disabled: %s", plan)
 		}
 	})
 }
@@ -344,4 +480,53 @@ func insertDraftProfile(t *testing.T, pool *pgxpool.Pool, key string, version in
 		t.Fatalf("insert draft profile %s/%d: %v", key, version, err)
 	}
 	return id
+}
+
+func insertPendingTransform(t *testing.T, pool *pgxpool.Pool, mediaID, originalID, profileID string) string {
+	t.Helper()
+	ctx := context.Background()
+	jobID := newUUIDv4(t)
+	targetID := newUUIDv4(t)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin transform fixture: %v", err)
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err == nil {
+		_, err = tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profileID)
+	}
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("create transform fixture: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit transform fixture: %v", err)
+	}
+	return targetID
+}
+
+func assertOneConcurrentWinner(t *testing.T, results <-chan error) {
+	t.Helper()
+	successes := 0
+	failures := 0
+	for index := 0; index < 2; index++ {
+		if err := awaitResult(t, results); err != nil {
+			failures++
+		} else {
+			successes++
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("concurrent results = %d success, %d failure; want one each", successes, failures)
+	}
+}
+
+func awaitResult(t *testing.T, results <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-results:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for concurrent database operation")
+		return nil
+	}
 }
