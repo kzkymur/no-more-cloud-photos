@@ -4,7 +4,24 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/kzkymur/no-more-cloud-photos/internal/mediaformat"
 )
+
+func TestEveryDetectedMIMEHasClosedOriginalExtension(t *testing.T) {
+	for _, format := range mediaformat.Formats() {
+		extension, err := OriginalExtensionForMIME(format.MIMEType)
+		if err != nil {
+			t.Fatalf("OriginalExtensionForMIME(%q): %v", format.MIMEType, err)
+		}
+		if got := originalExtensions[extension]; got != format.Extension {
+			t.Fatalf("extension for %q = %q, want %q", format.MIMEType, got, format.Extension)
+		}
+	}
+	if _, err := OriginalExtensionForMIME("image/tiff"); err == nil {
+		t.Fatal("unknown MIME mapped to storage extension")
+	}
+}
 
 const (
 	testOriginalID  = "01234567-89ab-4cde-8f01-23456789abcd"

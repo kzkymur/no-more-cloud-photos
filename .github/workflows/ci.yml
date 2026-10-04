@@ -37,6 +37,25 @@ jobs:
         with:
           go-version: 1.27.1
           cache: true
+      - name: Install metadata probe tools
+        run: |
+          mkdir -p .tools
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends util-linux xz-utils
+          curl --fail --location --silent --show-error \
+            https://github.com/exiftool/exiftool/archive/refs/tags/13.36.tar.gz \
+            --output .tools/exiftool-13.36.tar.gz
+          curl --fail --location --silent --show-error \
+            https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz \
+            --output .tools/ffmpeg-6.0.1-amd64-static.tar.xz
+          printf '%s  %s\n' \
+            f70ecbcdccc18268d4d3c290faf8cf73b1cf128e3e7f8671e24d6604cae4dc73 .tools/exiftool-13.36.tar.gz \
+            28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5 .tools/ffmpeg-6.0.1-amd64-static.tar.xz | sha256sum --check
+          tar -xzf .tools/exiftool-13.36.tar.gz -C .tools
+          tar -xJf .tools/ffmpeg-6.0.1-amd64-static.tar.xz -C .tools
+          .tools/exiftool-13.36/exiftool -ver
+          .tools/ffmpeg-6.0.1-amd64-static/ffprobe -version
+          prlimit --version
       - name: Verify modules
         run: go mod verify
       - name: Check formatting
@@ -49,6 +68,13 @@ jobs:
         run: go test -count=1 ./...
       - name: Explicit profile schema and bundled recipe evidence
         run: go test -v -count=1 ./internal/profile
+      - name: Explicit metadata detector and real probe evidence
+        env:
+          TEST_METADATA_TOOLS: "1"
+          TEST_EXIFTOOL_PATH: ${{ github.workspace }}/.tools/exiftool-13.36/exiftool
+          TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
+          TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
+        run: go test -v -count=1 ./internal/mediaformat ./internal/metadata
       - name: Explicit Linux storage durability evidence
         run: go test -v -count=1 ./internal/storage
       - name: Race tests
