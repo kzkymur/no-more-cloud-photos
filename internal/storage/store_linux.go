@@ -20,6 +20,7 @@ import (
 type systemOperations struct {
 	openat    func(int, string, int, uint32) (int, error)
 	mkdirat   func(int, string, uint32) error
+	read      func(int, []byte) (int, error)
 	write     func(int, []byte) (int, error)
 	fsync     func(int) error
 	renameat2 func(int, string, int, string, uint) error
@@ -30,6 +31,7 @@ type systemOperations struct {
 var linuxOperations = systemOperations{
 	openat:    unix.Openat,
 	mkdirat:   unix.Mkdirat,
+	read:      unix.Read,
 	write:     unix.Write,
 	fsync:     unix.Fsync,
 	renameat2: unix.Renameat2,
@@ -168,13 +170,21 @@ func (store *Store) begin(ctx context.Context, key string, attempt AttemptID) (*
 		// Sync every traversed component. This is intentionally redundant for
 		// old directories so a retry repairs a prior crash/failure after mkdir.
 		if err == nil {
-			if syncErr := store.syncBoundary(ctx, nextFD, BoundaryNewDirectorySync, key, depth); syncErr != nil {
-				err = errors.Join(ErrDurability, classifyError("sync key directory", syncErr))
+			if durable, syncErr := store.syncBoundary(ctx, nextFD, BoundaryNewDirectorySync, key, depth, "sync key directory"); syncErr != nil {
+				if durable {
+					err = syncErr
+				} else {
+					err = errors.Join(ErrDurability, syncErr)
+				}
 			}
 		}
 		if err == nil {
-			if syncErr := store.syncBoundary(ctx, parentFD, BoundaryParentDirectorySync, key, depth); syncErr != nil {
-				err = errors.Join(ErrDurability, classifyError("sync key directory parent", syncErr))
+			if durable, syncErr := store.syncBoundary(ctx, parentFD, BoundaryParentDirectorySync, key, depth, "sync key directory parent"); syncErr != nil {
+				if durable {
+					err = syncErr
+				} else {
+					err = errors.Join(ErrDurability, syncErr)
+				}
 			}
 		}
 		if err != nil {
@@ -198,15 +208,34 @@ func (store *Store) begin(ctx context.Context, key string, attempt AttemptID) (*
 	fileFD, err := store.ops.openat(parentFD, tempName, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err == nil {
 		err = store.inject(ctx, BoundaryTempCreate, After, key, len(directories))
+		if err == nil {
+			err = ctx.Err()
+		}
 	}
 	if err != nil {
 		if fileFD >= 0 {
 			_ = unix.Close(fileFD)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				cleanupErr := store.cleanupUnownedTemp(context.WithoutCancel(ctx), parentFD, tempName, key)
+				_ = unix.Close(parentFD)
+				return nil, errors.Join(err, cleanupErr)
+			}
 		}
 		_ = unix.Close(parentFD)
 		return nil, classifyError("create temporary object", err)
 	}
 	return &Temp{store: store, ctx: ctx, parentFD: parentFD, fileFD: fileFD, key: key, tempName: tempName, finalName: finalName}, nil
+}
+
+func (store *Store) cleanupUnownedTemp(ctx context.Context, parentFD int, tempName, key string) error {
+	if err := store.ops.unlinkat(parentFD, tempName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return errors.Join(ErrOutcomeUncertain, ErrDurability, classifyError("clean canceled temporary object", err))
+	}
+	durable, err := store.syncDeleteDirectory(ctx, parentFD, key)
+	if err == nil || durable {
+		return err
+	}
+	return errors.Join(ErrOutcomeUncertain, ErrDurability, err)
 }
 
 func (temp *Temp) Write(value []byte) (written int, returnErr error) {
@@ -283,8 +312,11 @@ func (temp *Temp) Publish(ctx context.Context, validation Validation) (ObjectInf
 	if temp.writeFailed != nil {
 		return ObjectInfo{}, errors.Join(ErrValidation, temp.writeFailed)
 	}
-	if err := temp.store.syncBoundary(ctx, temp.fileFD, BoundaryFileSync, temp.key, 0); err != nil {
-		return ObjectInfo{}, &PublishError{operation: "file sync", cause: errors.Join(ErrDurability, classifyError("sync temporary object", err))}
+	if durable, err := temp.store.syncBoundary(ctx, temp.fileFD, BoundaryFileSync, temp.key, 0, "sync temporary object"); err != nil {
+		if !durable {
+			err = errors.Join(ErrDurability, err)
+		}
+		return ObjectInfo{}, &PublishError{operation: "file sync", cause: err}
 	}
 	info, err := temp.inspect(ctx, validation)
 	if err != nil {
@@ -302,17 +334,12 @@ func (temp *Temp) Publish(ctx context.Context, validation Validation) (ObjectInf
 		temp.finish()
 		return ObjectInfo{}, &PublishError{Published: true, Uncertain: true, operation: "after rename", cause: errors.Join(ErrOutcomeUncertain, err)}
 	}
-	if err := temp.store.inject(ctx, BoundaryFinalDirectorySync, Before, temp.key, 0); err != nil {
+	if durable, err := temp.store.syncBoundary(ctx, temp.parentFD, BoundaryFinalDirectorySync, temp.key, 0, "sync final object directory"); err != nil {
 		temp.finish()
+		if durable {
+			return ObjectInfo{}, &PublishError{Published: true, operation: "after final directory sync", cause: err}
+		}
 		return ObjectInfo{}, &PublishError{Published: true, Uncertain: true, operation: "final directory sync", cause: errors.Join(ErrOutcomeUncertain, ErrDurability, err)}
-	}
-	if err := temp.store.ops.fsync(temp.parentFD); err != nil {
-		temp.finish()
-		return ObjectInfo{}, &PublishError{Published: true, Uncertain: true, operation: "final directory sync", cause: errors.Join(ErrOutcomeUncertain, ErrDurability, err)}
-	}
-	if err := temp.store.inject(ctx, BoundaryFinalDirectorySync, After, temp.key, 0); err != nil {
-		temp.finish()
-		return ObjectInfo{}, &PublishError{Published: true, operation: "after final directory sync", cause: err}
 	}
 	temp.finish()
 	return info, nil
@@ -329,9 +356,32 @@ func (temp *Temp) inspect(ctx context.Context, validation Validation) (ObjectInf
 	file := os.NewFile(uintptr(readFD), "storage-validation")
 	defer file.Close()
 	hash := sha256.New()
-	size, err := io.Copy(hash, file)
-	if err != nil {
-		return ObjectInfo{}, errors.Join(ErrValidation, err)
+	var size int64
+	buffer := make([]byte, 128*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return ObjectInfo{}, err
+		}
+		count, readErr := temp.store.ops.read(readFD, buffer)
+		if count > 0 {
+			_, _ = hash.Write(buffer[:count])
+			size += int64(count)
+		}
+		if err := ctx.Err(); err != nil {
+			return ObjectInfo{}, err
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if errors.Is(readErr, unix.EINTR) {
+			continue
+		}
+		if readErr != nil {
+			return ObjectInfo{}, errors.Join(ErrValidation, readErr)
+		}
+		if count == 0 {
+			break
+		}
 	}
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))
@@ -369,8 +419,12 @@ func (temp *Temp) Abort(ctx context.Context) error {
 	}
 	// Once the namespace was (or may already have been) mutated, cancellation
 	// cannot safely skip the directory sync or descriptor cleanup.
-	if err := temp.store.syncBoundary(context.WithoutCancel(ctx), temp.parentFD, BoundaryDeleteDirectorySync, temp.key, 0); err != nil {
+	durable, err := temp.store.syncDeleteDirectory(context.WithoutCancel(ctx), temp.parentFD, temp.key)
+	if err != nil {
 		temp.finish()
+		if durable {
+			return err
+		}
 		return errors.Join(ErrOutcomeUncertain, ErrDurability, err)
 	}
 	temp.finish()
@@ -603,27 +657,21 @@ func (store *Store) inject(ctx context.Context, boundary Boundary, phase Phase, 
 	return Inject(ctx, store.faults, FaultEvent{Boundary: boundary, Phase: phase, Key: key, Depth: depth})
 }
 
-func (store *Store) syncBoundary(ctx context.Context, fd int, boundary Boundary, key string, depth int) error {
+func (store *Store) syncBoundary(ctx context.Context, fd int, boundary Boundary, key string, depth int, operation string) (bool, error) {
 	if err := store.inject(ctx, boundary, Before, key, depth); err != nil {
-		return err
-	}
-	if err := store.ops.fsync(fd); err != nil {
-		return err
-	}
-	return store.inject(ctx, boundary, After, key, depth)
-}
-
-func (store *Store) syncDeleteDirectory(ctx context.Context, fd int, key string) (bool, error) {
-	if err := store.inject(ctx, BoundaryDeleteDirectorySync, Before, key, 0); err != nil {
 		return false, err
 	}
 	if err := store.ops.fsync(fd); err != nil {
-		return false, err
+		return false, classifyError(operation, err)
 	}
-	if err := store.inject(ctx, BoundaryDeleteDirectorySync, After, key, 0); err != nil {
+	if err := store.inject(ctx, boundary, After, key, depth); err != nil {
 		return true, err
 	}
 	return true, nil
+}
+
+func (store *Store) syncDeleteDirectory(ctx context.Context, fd int, key string) (bool, error) {
+	return store.syncBoundary(ctx, fd, BoundaryDeleteDirectorySync, key, 0, "sync deleted object directory")
 }
 
 func splitKey(key string) ([]string, string) {

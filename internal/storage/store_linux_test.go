@@ -312,14 +312,16 @@ func TestEveryDirectoryDurabilityBoundaryIsInjectable(t *testing.T) {
 	fault := errors.New("crash boundary")
 	for _, boundary := range []Boundary{BoundaryDirectoryCreate, BoundaryNewDirectorySync, BoundaryParentDirectorySync} {
 		for _, phase := range []Phase{Before, After} {
-			t.Run(string(boundary)+"_"+string(phase), func(t *testing.T) {
-				root := t.TempDir()
-				store := openTestStore(t, root, Options{Faults: faultAt(boundary, phase, fault)})
-				if _, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t)); !errors.Is(err, fault) {
-					t.Fatalf("BeginOriginal() error = %v", err)
-				}
-				assertFinalMissing(t, root, testOriginalKey(t).String())
-			})
+			for depth := range 4 {
+				t.Run(fmt.Sprintf("%s_%s_depth_%d", boundary, phase, depth), func(t *testing.T) {
+					root := t.TempDir()
+					store := openTestStore(t, root, Options{Faults: faultAtDepth(boundary, phase, depth, fault)})
+					if _, err := store.BeginRendition(context.Background(), testRenditionKey(t), testAttempt(t)); !errors.Is(err, fault) {
+						t.Fatalf("BeginRendition() error = %v", err)
+					}
+					assertFinalMissing(t, root, testRenditionKey(t).String())
+				})
+			}
 		}
 	}
 }
@@ -336,32 +338,45 @@ func TestDirectoryDurabilityRetryRepairsPartialCreation(t *testing.T) {
 		{BoundaryParentDirectorySync, Before},
 		{BoundaryParentDirectorySync, After},
 	} {
-		t.Run(string(point.boundary)+"_"+string(point.phase), func(t *testing.T) {
-			store := openTestStore(t, t.TempDir(), Options{Faults: faultAt(point.boundary, point.phase, fault)})
-			if _, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t)); !errors.Is(err, fault) {
-				t.Fatalf("first BeginOriginal() error = %v", err)
-			}
-			var retryEvents []FaultEvent
-			store.faults = FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
-				retryEvents = append(retryEvents, event)
-				return nil
+		for depth := range 4 {
+			t.Run(fmt.Sprintf("%s_%s_depth_%d", point.boundary, point.phase, depth), func(t *testing.T) {
+				key := testRenditionKey(t)
+				store := openTestStore(t, t.TempDir(), Options{Faults: faultAtDepth(point.boundary, point.phase, depth, fault)})
+				if _, err := store.BeginRendition(context.Background(), key, testAttempt(t)); !errors.Is(err, fault) {
+					t.Fatalf("first BeginRendition() error = %v", err)
+				}
+				var retryEvents []FaultEvent
+				store.faults = FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+					retryEvents = append(retryEvents, event)
+					return nil
+				})
+				temporary, err := store.BeginRendition(context.Background(), key, testAttempt(t))
+				if err != nil {
+					t.Fatalf("retry BeginRendition() error = %v", err)
+				}
+				if err := temporary.Abort(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				var got []FaultEvent
+				for _, event := range retryEvents {
+					if event.Depth <= depth && (event.Boundary == BoundaryDirectoryCreate || event.Boundary == BoundaryNewDirectorySync || event.Boundary == BoundaryParentDirectorySync) {
+						got = append(got, event)
+					}
+				}
+				var want []FaultEvent
+				for existingDepth := 0; existingDepth <= depth; existingDepth++ {
+					want = append(want,
+						FaultEvent{Boundary: BoundaryNewDirectorySync, Phase: Before, Key: key.String(), Depth: existingDepth},
+						FaultEvent{Boundary: BoundaryNewDirectorySync, Phase: After, Key: key.String(), Depth: existingDepth},
+						FaultEvent{Boundary: BoundaryParentDirectorySync, Phase: Before, Key: key.String(), Depth: existingDepth},
+						FaultEvent{Boundary: BoundaryParentDirectorySync, Phase: After, Key: key.String(), Depth: existingDepth},
+					)
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("retry existing-directory sequence = %v, want %v", got, want)
+				}
 			})
-			temporary, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t))
-			if err != nil {
-				t.Fatalf("retry BeginOriginal() error = %v", err)
-			}
-			if err := temporary.Abort(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			seenChildSync, seenParentSync := false, false
-			for _, event := range retryEvents {
-				seenChildSync = seenChildSync || event.Boundary == BoundaryNewDirectorySync
-				seenParentSync = seenParentSync || event.Boundary == BoundaryParentDirectorySync
-			}
-			if !seenChildSync || !seenParentSync {
-				t.Fatalf("retry did not resync existing directory: %v", retryEvents)
-			}
-		})
+		}
 	}
 }
 
@@ -424,6 +439,82 @@ func TestCancellationBeforeFilesystemMutation(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
 		t.Fatalf("cancelled BeginOriginal() entries = %v, %v", entries, err)
+	}
+}
+
+func TestCancellationImmediatelyAfterTempCreateCleansDurably(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root, Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	originalOpen := store.ops.openat
+	store.ops.openat = func(fd int, name string, flags int, mode uint32) (int, error) {
+		opened, err := originalOpen(fd, name, flags, mode)
+		if err == nil && flags&unix.O_CREAT != 0 {
+			cancel()
+		}
+		return opened, err
+	}
+	key := testOriginalKey(t)
+	if _, err := store.BeginOriginal(ctx, key, testAttempt(t)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("BeginOriginal(canceled after create) error = %v", err)
+	}
+	directories, finalName := splitKey(key.String())
+	tempName := "." + finalName + "." + testAttempt(t).String() + ".tmp"
+	if _, err := os.Stat(filepath.Join(append([]string{root}, append(directories, tempName)...)...)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled temp still exists: %v", err)
+	}
+	temporary, err := store.BeginOriginal(context.Background(), key, testAttempt(t))
+	if err != nil {
+		t.Fatalf("same attempt remained collided: %v", err)
+	}
+	if err := temporary.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanceledTempCleanupSyncFailureReportsUncertainty(t *testing.T) {
+	store := openTestStore(t, t.TempDir(), Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	originalOpen := store.ops.openat
+	failCleanupSync := false
+	store.ops.openat = func(fd int, name string, flags int, mode uint32) (int, error) {
+		opened, err := originalOpen(fd, name, flags, mode)
+		if err == nil && flags&unix.O_CREAT != 0 {
+			failCleanupSync = true
+			cancel()
+		}
+		return opened, err
+	}
+	originalSync := store.ops.fsync
+	store.ops.fsync = func(fd int) error {
+		if failCleanupSync {
+			return syscall.EROFS
+		}
+		return originalSync(fd)
+	}
+	_, err := store.BeginOriginal(ctx, testOriginalKey(t), testAttempt(t))
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrOutcomeUncertain) ||
+		!errors.Is(err, ErrDurability) || !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("BeginOriginal(canceled cleanup EROFS) error = %v", err)
+	}
+}
+
+func TestCanceledTempCleanupUnlinkFailureReportsDurabilityUncertainty(t *testing.T) {
+	store := openTestStore(t, t.TempDir(), Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	originalOpen := store.ops.openat
+	store.ops.openat = func(fd int, name string, flags int, mode uint32) (int, error) {
+		opened, err := originalOpen(fd, name, flags, mode)
+		if err == nil && flags&unix.O_CREAT != 0 {
+			cancel()
+		}
+		return opened, err
+	}
+	store.ops.unlinkat = func(int, string, int) error { return syscall.EROFS }
+	_, err := store.BeginOriginal(ctx, testOriginalKey(t), testAttempt(t))
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrOutcomeUncertain) ||
+		!errors.Is(err, ErrDurability) || !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("BeginOriginal(canceled cleanup unlink EROFS) error = %v", err)
 	}
 }
 
@@ -538,6 +629,72 @@ func TestValidationAndReadOnlyValidator(t *testing.T) {
 	}})
 	if err != nil {
 		t.Fatalf("read-only validator Publish() error = %v", err)
+	}
+}
+
+func TestValidationHashStopsOnCancellationBeforeRename(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root, Options{})
+	temporary, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Write(make([]byte, 1024*1024)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	originalRead := store.ops.read
+	readCalls, bytesRead := 0, 0
+	store.ops.read = func(fd int, value []byte) (int, error) {
+		count, err := originalRead(fd, value)
+		readCalls++
+		bytesRead += count
+		if count > 0 {
+			cancel()
+		}
+		return count, err
+	}
+	renameCalled := false
+	originalRename := store.ops.renameat2
+	store.ops.renameat2 = func(oldFD int, oldName string, newFD int, newName string, flags uint) error {
+		renameCalled = true
+		return originalRename(oldFD, oldName, newFD, newName, flags)
+	}
+	if _, err := temporary.Publish(ctx, Validation{ExpectedSize: 1024 * 1024}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Publish(canceled validation) error = %v", err)
+	}
+	if renameCalled {
+		t.Fatal("canceled validation reached rename")
+	}
+	if readCalls != 1 || bytesRead <= 0 || bytesRead >= 1024*1024 {
+		t.Fatalf("canceled hash reads = %d calls, %d bytes", readCalls, bytesRead)
+	}
+	assertFinalMissing(t, root, testOriginalKey(t).String())
+	if err := temporary.Abort(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidationHashRetriesInterruptedRead(t *testing.T) {
+	store := openTestStore(t, t.TempDir(), Options{})
+	temporary, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Write([]byte("bytes")); err != nil {
+		t.Fatal(err)
+	}
+	originalRead := store.ops.read
+	interrupted := false
+	store.ops.read = func(fd int, value []byte) (int, error) {
+		if !interrupted {
+			interrupted = true
+			return 0, syscall.EINTR
+		}
+		return originalRead(fd, value)
+	}
+	if _, err := temporary.Publish(context.Background(), Validation{ExpectedSize: 5}); err != nil {
+		t.Fatalf("Publish(after EINTR) error = %v", err)
 	}
 }
 
@@ -837,6 +994,97 @@ func TestPublishFaultSemantics(t *testing.T) {
 	})
 }
 
+func TestFinalDeleteAndAbortSyncClassification(t *testing.T) {
+	fault := errors.New("after durable sync")
+
+	t.Run("publish syscall EROFS", func(t *testing.T) {
+		store := openTestStore(t, t.TempDir(), Options{})
+		temporary, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = temporary.Write([]byte("bytes"))
+		originalSync := store.ops.fsync
+		store.ops.fsync = func(fd int) error {
+			if fd == temporary.parentFD {
+				return syscall.EROFS
+			}
+			return originalSync(fd)
+		}
+		_, err = temporary.Publish(context.Background(), Validation{ExpectedSize: 5})
+		var publishError *PublishError
+		if !errors.As(err, &publishError) || !publishError.Published || !publishError.Uncertain ||
+			!errors.Is(err, ErrReadOnly) || !errors.Is(err, ErrDurability) || !errors.Is(err, ErrOutcomeUncertain) {
+			t.Fatalf("Publish(EROFS) = %#v, %v", publishError, err)
+		}
+	})
+
+	t.Run("publish after sync is durable", func(t *testing.T) {
+		store := openTestStore(t, t.TempDir(), Options{Faults: faultAt(BoundaryFinalDirectorySync, After, fault)})
+		temporary, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = temporary.Write([]byte("bytes"))
+		_, err = temporary.Publish(context.Background(), Validation{ExpectedSize: 5})
+		var publishError *PublishError
+		if !errors.As(err, &publishError) || !publishError.Published || publishError.Uncertain || !errors.Is(err, fault) ||
+			errors.Is(err, ErrDurability) || errors.Is(err, ErrOutcomeUncertain) {
+			t.Fatalf("Publish(after sync) = %#v, %v", publishError, err)
+		}
+	})
+
+	for _, operation := range []string{"delete", "abort"} {
+		t.Run(operation+" syscall EROFS", func(t *testing.T) {
+			store := openTestStore(t, t.TempDir(), Options{})
+			key := testOriginalKey(t)
+			var err error
+			var temporary *Temp
+			if operation == "delete" {
+				publishTestObject(t, store, key, []byte("bytes"))
+			} else {
+				temporary, err = store.BeginOriginal(context.Background(), key, testAttempt(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			store.ops.fsync = func(int) error { return syscall.EROFS }
+			if operation == "delete" {
+				_, err = store.DeleteOriginal(context.Background(), key)
+			} else {
+				err = temporary.Abort(context.Background())
+			}
+			if !errors.Is(err, ErrReadOnly) || !errors.Is(err, ErrDurability) || !errors.Is(err, ErrOutcomeUncertain) {
+				t.Fatalf("%s(EROFS) error = %v", operation, err)
+			}
+		})
+
+		t.Run(operation+" after sync is durable", func(t *testing.T) {
+			store := openTestStore(t, t.TempDir(), Options{})
+			key := testOriginalKey(t)
+			var err error
+			var temporary *Temp
+			if operation == "delete" {
+				publishTestObject(t, store, key, []byte("bytes"))
+			} else {
+				temporary, err = store.BeginOriginal(context.Background(), key, testAttempt(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			store.faults = faultAt(BoundaryDeleteDirectorySync, After, fault)
+			if operation == "delete" {
+				_, err = store.DeleteOriginal(context.Background(), key)
+			} else {
+				err = temporary.Abort(context.Background())
+			}
+			if !errors.Is(err, fault) || errors.Is(err, ErrDurability) || errors.Is(err, ErrOutcomeUncertain) {
+				t.Fatalf("%s(after sync) error = %v", operation, err)
+			}
+		})
+	}
+}
+
 func TestDeleteFaultsReportConvergentOutcomes(t *testing.T) {
 	fault := errors.New("delete crash boundary")
 	for _, test := range []struct {
@@ -1115,6 +1363,15 @@ func assertFinalMissing(t *testing.T, root, key string) {
 func faultAt(boundary Boundary, phase Phase, fault error) FaultInjector {
 	return FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
 		if event.Boundary == boundary && event.Phase == phase {
+			return fault
+		}
+		return nil
+	})
+}
+
+func faultAtDepth(boundary Boundary, phase Phase, depth int, fault error) FaultInjector {
+	return FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+		if event.Boundary == boundary && event.Phase == phase && event.Depth == depth {
 			return fault
 		}
 		return nil
