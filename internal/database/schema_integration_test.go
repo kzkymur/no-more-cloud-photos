@@ -69,6 +69,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 
 		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source) VALUES ($1,'image',now(),'unknown')`, newUUIDv4(t))
 		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source,taken_at_timezone) VALUES ($1,'image',now(),'embedded_offset','UTC')`, newUUIDv4(t))
+		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source,taken_at_timezone) VALUES ($1,'image',now(),'default_timezone','Not/A_Real_Zone')`, newUUIDv4(t))
 		expectExecError(t, pool, `UPDATE media SET purge_after=now() WHERE id=$1`, mediaOne)
 		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at_source) VALUES ('00000000-0000-0000-0000-000000000000','image','unknown')`)
 
@@ -245,7 +246,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		insertMedia(t, pool, mediaID)
 		insertMedia(t, pool, otherMediaID)
 		originalID := insertOriginal(t, pool, mediaID, "c", "first")
-		insertOriginal(t, pool, otherMediaID, "d", "second")
+		otherOriginalID := insertOriginal(t, pool, otherMediaID, "d", "second")
+		expectExecError(t, pool, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, newUUIDv4(t), otherOriginalID, mediaID)
+		expectExecError(t, pool, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,$3,'queued',3)`, newUUIDv4(t), originalID, mediaID)
 
 		expectTxCommitError(t, pool, func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, newUUIDv4(t), originalID, mediaID)
@@ -276,7 +279,10 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("begin publication: %v", err)
 		}
 		if _, err = tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts,started_at,finished_at) VALUES ($1,'transform',$2,$3,'succeeded',3,now(),now())`, jobID, originalID, mediaID); err == nil {
-			_, err = tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'succeeded')`, targetID, jobID, profileID)
+			_, err = tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profileID)
+		}
+		if err == nil {
+			_, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID)
 		}
 		if err == nil {
 			_, err = tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height) VALUES ($1,$2,$3,'ignored',true,$4,'image/avif',10,$5,1,1)`, renditionID, mediaID, targetID, "renditions/cc/one/target/output.avif", strings.Repeat("e", 64))

@@ -137,6 +137,27 @@ CREATE TABLE media (
     CONSTRAINT media_delete_deadline_check CHECK (deleted_at IS NOT NULL OR purge_after IS NULL)
 );
 
+CREATE FUNCTION nmcp_validate_media_timezone()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.taken_at_source = 'default_timezone' AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_timezone_names
+        WHERE name = NEW.taken_at_timezone
+    ) THEN
+        RAISE EXCEPTION 'unknown captured PostgreSQL timezone name: %', NEW.taken_at_timezone
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER media_timezone_validate
+BEFORE INSERT OR UPDATE OF taken_at_source, taken_at_timezone ON media
+FOR EACH ROW EXECUTE FUNCTION nmcp_validate_media_timezone();
+
 CREATE INDEX media_list_order_idx
 ON media (taken_at DESC NULLS LAST, id DESC);
 CREATE INDEX media_due_purge_idx
@@ -285,6 +306,52 @@ CREATE TABLE jobs (
     )
 );
 
+CREATE FUNCTION nmcp_validate_job_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    original_media_id nmcp_uuid_v4;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        IF NEW.id IS DISTINCT FROM OLD.id
+           OR NEW.type IS DISTINCT FROM OLD.type
+           OR NEW.media_id_snapshot IS DISTINCT FROM OLD.media_id_snapshot
+           OR (OLD.original_id IS NULL AND NEW.original_id IS NOT NULL)
+           OR (OLD.original_id IS NOT NULL AND NEW.original_id IS NOT NULL
+               AND NEW.original_id IS DISTINCT FROM OLD.original_id) THEN
+            RAISE EXCEPTION 'job identity and input snapshot are immutable'
+                USING ERRCODE = '23514';
+        END IF;
+    END IF;
+
+    IF NEW.type = 'purge' THEN
+        IF NEW.original_id IS NOT NULL THEN
+            RAISE EXCEPTION 'purge job cannot reference an original'
+                USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.original_id IS NULL THEN
+        IF TG_OP = 'INSERT' THEN
+            RAISE EXCEPTION 'new transform job requires an original'
+                USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    SELECT media_id INTO original_media_id FROM originals WHERE id = NEW.original_id;
+    IF original_media_id IS NULL OR original_media_id <> NEW.media_id_snapshot THEN
+        RAISE EXCEPTION 'transform job original does not match media snapshot'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER jobs_identity_validate
+BEFORE INSERT OR UPDATE OF id, type, original_id, media_id_snapshot ON jobs
+FOR EACH ROW EXECUTE FUNCTION nmcp_validate_job_identity();
+
 CREATE INDEX jobs_original_id_idx ON jobs (original_id);
 CREATE INDEX jobs_list_idx ON jobs (created_at DESC, id DESC);
 CREATE INDEX jobs_status_list_idx ON jobs (status, created_at DESC, id DESC);
@@ -309,6 +376,41 @@ CREATE TABLE job_targets (
         AND (status = 'failed' OR error_code IS NULL)
     )
 );
+
+CREATE FUNCTION nmcp_validate_job_target_lifecycle()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'pending' OR NEW.attempts <> 0 OR NEW.error_code IS NOT NULL THEN
+            RAISE EXCEPTION 'job targets must be inserted pending without attempts or errors'
+                USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.id IS DISTINCT FROM OLD.id
+       OR NEW.job_id IS DISTINCT FROM OLD.job_id
+       OR NEW.profile_id IS DISTINCT FROM OLD.profile_id
+       OR NEW.attempts < OLD.attempts THEN
+        RAISE EXCEPTION 'job target identity is immutable and attempts cannot decrease'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NOT (
+        NEW.status = OLD.status
+        OR (OLD.status = 'pending' AND NEW.status IN ('succeeded', 'failed'))
+        OR (OLD.status = 'failed' AND NEW.status = 'pending')
+    ) THEN
+        RAISE EXCEPTION 'invalid job target transition: % to %', OLD.status, NEW.status
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER job_targets_lifecycle
+BEFORE INSERT OR UPDATE ON job_targets
+FOR EACH ROW EXECUTE FUNCTION nmcp_validate_job_target_lifecycle();
 
 CREATE INDEX job_targets_job_id_idx ON job_targets (job_id);
 CREATE INDEX job_targets_profile_id_idx ON job_targets (profile_id);
