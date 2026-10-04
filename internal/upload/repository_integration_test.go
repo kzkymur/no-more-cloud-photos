@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,7 +51,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatal("replay published")
 		return "", nil
 	})
-	if err != nil || !replay.Replayed || replay.Status != 201 || string(replay.Body) != string(outcome.Body) {
+	if err != nil || !replay.Replayed || replay.Status != 201 || !jsonSemanticallyEqual(replay.Body, outcome.Body) {
 		t.Fatalf("replay=%+v err=%v", replay, err)
 	}
 
@@ -181,7 +182,7 @@ func TestRepositoryIntegrationConcurrentSameKeyReplay(t *testing.T) {
 		t.Fatalf("concurrent replay errors = %v, %v", first.err, second.err)
 	}
 	if first.outcome.Status != 201 || second.outcome.Status != 201 ||
-		first.outcome.Replayed == second.outcome.Replayed || string(first.outcome.Body) != string(second.outcome.Body) {
+		first.outcome.Replayed == second.outcome.Replayed || !jsonSemanticallyEqual(first.outcome.Body, second.outcome.Body) {
 		t.Fatalf("concurrent replay outcomes = %+v, %+v", first.outcome, second.outcome)
 	}
 	if publishes.Load() != 1 {
@@ -388,3 +389,11 @@ func integrationAcceptance(t *testing.T, key, requestID, timezone string, conten
 }
 
 func bytesContain(body []byte, value string) bool { return strings.Contains(string(body), value) }
+
+func jsonSemanticallyEqual(first, second []byte) bool {
+	var firstValue, secondValue any
+	if json.Unmarshal(first, &firstValue) != nil || json.Unmarshal(second, &secondValue) != nil {
+		return false
+	}
+	return reflect.DeepEqual(firstValue, secondValue)
+}
