@@ -78,7 +78,8 @@ func LoadAPIFrom(getenv Getenv) (APIConfig, error) {
 	if err != nil {
 		return APIConfig{}, err
 	}
-	if err := validateFileBaseURL(fileBaseURL); err != nil {
+	fileBaseURL, err = normalizeFileBaseURL(fileBaseURL)
+	if err != nil {
 		return APIConfig{}, err
 	}
 	cursorKey, err := required(getenv, cursorHMACKeyEnv)
@@ -224,15 +225,38 @@ func validateStorageRoot(root string) error {
 	return nil
 }
 
-func validateFileBaseURL(raw string) error {
+func normalizeFileBaseURL(raw string) (string, error) {
+	if strings.TrimSpace(raw) != raw {
+		return "", fmt.Errorf("%s must be an absolute HTTPS files-root URL", fileBaseURLEnv)
+	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.Opaque != "" {
-		return fmt.Errorf("%s must be an absolute HTTPS URL", fileBaseURLEnv)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.Hostname() == "" || u.Opaque != "" {
+		return "", fmt.Errorf("%s must be an absolute HTTPS files-root URL", fileBaseURLEnv)
 	}
-	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		return fmt.Errorf("%s must not contain user information, a query, or a fragment", fileBaseURLEnv)
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(raw, "#") {
+		return "", fmt.Errorf("%s must not contain user information, a query, or a fragment", fileBaseURLEnv)
 	}
-	return nil
+	canonicalEscapedPath := (&url.URL{Path: u.Path}).EscapedPath()
+	if u.Path == "" || u.Path == "/" || u.EscapedPath() != canonicalEscapedPath || strings.Contains(u.Path, "\\") || strings.HasSuffix(u.Path, "//") {
+		return "", fmt.Errorf("%s must have an unambiguous non-root files path", fileBaseURLEnv)
+	}
+	for _, character := range u.Path {
+		if character < 0x20 || character == 0x7f {
+			return "", fmt.Errorf("%s must not contain control characters", fileBaseURLEnv)
+		}
+	}
+	trimmed := strings.TrimSuffix(u.Path, "/")
+	if strings.Contains(trimmed, "//") {
+		return "", fmt.Errorf("%s must have an unambiguous non-root files path", fileBaseURLEnv)
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(trimmed, "/"), "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return "", fmt.Errorf("%s must not contain empty or dot path segments", fileBaseURLEnv)
+		}
+	}
+	u.Path = trimmed + "/"
+	u.RawPath = ""
+	return u.String(), nil
 }
 
 func validateListenAddr(addr string) error {
