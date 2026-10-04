@@ -79,7 +79,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatal("duplicate replay published")
 		return "", nil
 	})
-	if err != nil || !duplicateReplay.Replayed || !bytesContain(duplicateReplay.Body, `"request_id":"duplicate-request"`) ||
+	if err != nil || !duplicateReplay.Replayed || errorRequestID(duplicateReplay.Body) != "duplicate-request" ||
 		bytesContain(duplicateReplay.Body, "current-replay-request") {
 		t.Fatalf("duplicate replay=%+v err=%v", duplicateReplay, err)
 	}
@@ -396,4 +396,12 @@ func jsonSemanticallyEqual(first, second []byte) bool {
 		return false
 	}
 	return reflect.DeepEqual(firstValue, secondValue)
+}
+
+func errorRequestID(body []byte) string {
+	var response errorResponse
+	if json.Unmarshal(body, &response) != nil {
+		return ""
+	}
+	return response.Error.RequestID
 }
