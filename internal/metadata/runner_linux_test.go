@@ -144,9 +144,11 @@ func TestBoundedRunnerReapsSessionEscapees(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {
 			for index := 0; index < 100; index++ {
-				if _, err := os.Stat(pidFile); err == nil {
-					cancel()
-					return
+				if data, err := os.ReadFile(pidFile); err == nil {
+					if _, parseErr := strconv.Atoi(string(data)); parseErr == nil {
+						cancel()
+						return
+					}
 				}
 				time.Sleep(time.Millisecond)
 			}
