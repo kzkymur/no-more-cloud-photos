@@ -485,8 +485,18 @@ func boundedMapString(values map[string]string, key string) string {
 }
 
 func sanitizeString(value string) string {
-	if !utf8.ValidString(value) || len(value) > 4096 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+	if !utf8.ValidString(value) || len(value) > 4096 || strings.IndexFunc(value, unsafeMetadataRune) >= 0 {
 		return ""
 	}
 	return value
+}
+
+func unsafeMetadataRune(value rune) bool {
+	if unicode.IsControl(value) {
+		return true
+	}
+	// Preserve the join controls used by ordinary Arabic/Indic text while
+	// rejecting bidi overrides, isolates, zero-width/BOM and other invisible
+	// format controls that can disguise stored/API metadata.
+	return unicode.Is(unicode.Cf, value) && value != '\u200c' && value != '\u200d'
 }

@@ -160,6 +160,46 @@ func TestDetectRejectsVendorNameWithoutRawTagConjunction(t *testing.T) {
 	}
 }
 
+func TestDetectRequiresDNGVersionInIFD0(t *testing.T) {
+	t.Parallel()
+	for name, pointerTag := range map[string]uint16{
+		"SubIFD": 0x014a,
+		"Exif":   0x8769,
+		"GPS":    0x8825,
+	} {
+		data := nestedDNGTIFFFixture(pointerTag)
+		if _, err := Detect(bytes.NewReader(data), int64(len(data))); !errors.Is(err, ErrUnsupportedMediaType) {
+			t.Errorf("DNGVersion in %s IFD error = %v, want unsupported", name, err)
+		}
+	}
+}
+
+func TestDetectJPEGMarkerFillBytes(t *testing.T) {
+	t.Parallel()
+	valid := [][]byte{
+		{0xff, 0xd8, 0xff, 0xff, 0xd9},
+		{0xff, 0xd8, 0xff, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xff, 0xd9},
+	}
+	for i, data := range valid {
+		got, err := Detect(bytes.NewReader(data), int64(len(data)))
+		if err != nil || got.Format.MIMEType != "image/jpeg" {
+			t.Errorf("valid case %d = (%+v, %v), want image/jpeg", i, got, err)
+		}
+	}
+
+	invalid := map[string][]byte{
+		"truncated fill":      {0xff, 0xd8, 0xff, 0xff},
+		"stuffed zero":        {0xff, 0xd8, 0xff, 0xff, 0x00},
+		"repeated SOI":        {0xff, 0xd8, 0xff, 0xff, 0xd8},
+		"segment past bounds": {0xff, 0xd8, 0xff, 0xff, 0xe0, 0x00, 0x04, 0x00},
+	}
+	for name, data := range invalid {
+		if _, err := Detect(bytes.NewReader(data), int64(len(data))); !errors.Is(err, ErrInvalidMedia) {
+			t.Errorf("%s error = %v, want invalid media", name, err)
+		}
+	}
+}
+
 func TestDetectRejectsContradictoryEvidence(t *testing.T) {
 	t.Parallel()
 	tests := [][]byte{
@@ -355,6 +395,38 @@ func TestDetectBMFFRequiresSpecificRegisteredEvidence(t *testing.T) {
 	}
 }
 
+func TestDetectLegacyQuickTimeExtendedSizeChildren(t *testing.T) {
+	t.Parallel()
+	handler := bmffBox("hdlr", append(make([]byte, 4), []byte("mhlr")...))
+	track := bmffExtendedBox("trak", handler)
+	validPayload := append(bmffExtendedBox("mvhd", make([]byte, 20)), track...)
+	valid := bmffBox("moov", validPayload)
+	got, err := Detect(bytes.NewReader(valid), int64(len(valid)))
+	if err != nil || got.Format.MIMEType != "video/quicktime" {
+		t.Fatalf("extended-size legacy QuickTime = (%+v, %v), want video/quicktime", got, err)
+	}
+
+	shortHeader := bmffBox("moov", []byte{0, 0, 0, 1, 'm', 'v', 'h', 'd'})
+	overflowChild := make([]byte, 16)
+	binary.BigEndian.PutUint32(overflowChild[:4], 1)
+	copy(overflowChild[4:8], "mvhd")
+	binary.BigEndian.PutUint64(overflowChild[8:16], ^uint64(0))
+	for name, data := range map[string][]byte{
+		"truncated extended header": shortHeader,
+		"extended size overflow":    bmffBox("moov", overflowChild),
+	} {
+		if _, err := Detect(bytes.NewReader(data), int64(len(data))); !errors.Is(err, ErrInvalidMedia) {
+			t.Errorf("%s error = %v, want invalid media", name, err)
+		}
+	}
+
+	shortMovieHeaderPayload := append(bmffExtendedBox("mvhd", make([]byte, 12)), track...)
+	shortMovieHeader := bmffBox("moov", shortMovieHeaderPayload)
+	if _, err := Detect(bytes.NewReader(shortMovieHeader), int64(len(shortMovieHeader))); !errors.Is(err, ErrUnsupportedMediaType) {
+		t.Errorf("short extended mvhd error = %v, want unsupported", err)
+	}
+}
+
 func TestDetectBMFFStillHEVCBrandsAndBaseCompatibility(t *testing.T) {
 	t.Parallel()
 	for _, brand := range []string{"heim", "heis"} {
@@ -547,6 +619,31 @@ func bmffBox(typ string, payload []byte) []byte {
 	binary.BigEndian.PutUint32(data[:4], uint32(len(data)))
 	copy(data[4:8], typ)
 	copy(data[8:], payload)
+	return data
+}
+
+func bmffExtendedBox(typ string, payload []byte) []byte {
+	data := make([]byte, 16+len(payload))
+	binary.BigEndian.PutUint32(data[:4], 1)
+	copy(data[4:8], typ)
+	binary.BigEndian.PutUint64(data[8:16], uint64(len(data)))
+	copy(data[16:], payload)
+	return data
+}
+
+func nestedDNGTIFFFixture(pointerTag uint16) []byte {
+	data := make([]byte, 44)
+	copy(data, []byte{'I', 'I', 42, 0, 8, 0, 0, 0})
+	binary.LittleEndian.PutUint16(data[8:10], 1)
+	binary.LittleEndian.PutUint16(data[10:12], pointerTag)
+	binary.LittleEndian.PutUint16(data[12:14], 4)
+	binary.LittleEndian.PutUint32(data[14:18], 1)
+	binary.LittleEndian.PutUint32(data[18:22], 26)
+	binary.LittleEndian.PutUint16(data[26:28], 1)
+	binary.LittleEndian.PutUint16(data[28:30], 0xc612)
+	binary.LittleEndian.PutUint16(data[30:32], 1)
+	binary.LittleEndian.PutUint32(data[32:36], 4)
+	copy(data[36:40], []byte{1, 6, 0, 0})
 	return data
 }
 

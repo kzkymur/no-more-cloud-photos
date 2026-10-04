@@ -6,6 +6,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -117,6 +120,166 @@ func TestRealExifToolReferenceFixtures(t *testing.T) {
 	}
 }
 
+func TestRealExifToolGeneratedCaptureFixtures(t *testing.T) {
+	if os.Getenv("TEST_METADATA_TOOLS") != "1" {
+		t.Skip("TEST_METADATA_TOOLS is not enabled")
+	}
+	exiftool := os.Getenv("TEST_EXIFTOOL_PATH")
+	if exiftool == "" {
+		exiftool = "/usr/bin/exiftool"
+	}
+	prober := newTestProber(t, exiftool, "/usr/bin/ffprobe", DefaultPolicy())
+
+	tests := []struct {
+		name          string
+		tags          []string
+		timezone      string
+		wantTime      *time.Time
+		wantSource    string
+		wantSelected  string
+		wantEXIFJSON  string
+		assertCapture func(*testing.T, Capture)
+	}{
+		{
+			name: "matching valid offset",
+			tags: []string{
+				"-EXIF:DateTimeOriginal=2024:01:02 03:04:05",
+				"-EXIF:OffsetTimeOriginal=+09:30",
+			},
+			timezone:     "America/New_York",
+			wantTime:     timePointer(time.Date(2024, 1, 1, 17, 34, 5, 0, time.UTC)),
+			wantSource:   TakenAtEmbeddedOffset,
+			wantSelected: "DateTimeOriginal",
+			wantEXIFJSON: `{"date_time_raw":"2024:01:02 03:04:05","date_time_offset_raw":"+09:30"}`,
+			assertCapture: func(t *testing.T, capture Capture) {
+				if capture.Timezone != nil || capture.Selected == nil || !capture.Selected.OffsetPresent || !capture.Selected.OffsetOK || capture.Selected.Offset != "+09:30" {
+					t.Fatalf("capture = %#v", capture)
+				}
+			},
+		},
+		{
+			name:         "offset absent snapshot timezone",
+			tags:         []string{"-EXIF:DateTimeOriginal=2024:01:02 03:04:05"},
+			timezone:     "Asia/Tokyo",
+			wantTime:     timePointer(time.Date(2024, 1, 1, 18, 4, 5, 0, time.UTC)),
+			wantSource:   TakenAtDefaultTimezone,
+			wantSelected: "DateTimeOriginal",
+			wantEXIFJSON: `{"date_time_raw":"2024:01:02 03:04:05"}`,
+			assertCapture: func(t *testing.T, capture Capture) {
+				if capture.Timezone == nil || *capture.Timezone != "Asia/Tokyo" || capture.Selected == nil || capture.Selected.OffsetPresent {
+					t.Fatalf("capture = %#v", capture)
+				}
+			},
+		},
+		{
+			name: "malformed matching offset falls through paired candidate",
+			tags: []string{
+				"-m",
+				"-EXIF:DateTimeOriginal=2024:01:02 03:04:05",
+				"-EXIF:OffsetTimeOriginal=+99:00",
+				"-EXIF:CreateDate=2024:01:02 04:05:06",
+				"-EXIF:OffsetTimeDigitized=+09:00",
+			},
+			timezone:     "UTC",
+			wantTime:     timePointer(time.Date(2024, 1, 1, 19, 5, 6, 0, time.UTC)),
+			wantSource:   TakenAtEmbeddedOffset,
+			wantSelected: "DateTimeDigitized",
+			wantEXIFJSON: `{"date_time_raw":"2024:01:02 04:05:06","date_time_offset_raw":"+09:00"}`,
+			assertCapture: func(t *testing.T, capture Capture) {
+				if len(capture.Candidates) != 3 || capture.Candidates[0].Offset != "+99:00" || !capture.Candidates[0].OffsetPresent || capture.Candidates[0].OffsetOK || capture.Candidates[0].Discarded != discardInvalidOffset {
+					t.Fatalf("first candidate = %#v", capture.Candidates)
+				}
+				if capture.SelectedIndex == nil || *capture.SelectedIndex != 1 || capture.Selected == nil || capture.Selected.Offset != "+09:00" {
+					t.Fatalf("selected capture = %#v", capture)
+				}
+			},
+		},
+		{
+			name:         "EXIF absent",
+			timezone:     "UTC",
+			wantSource:   TakenAtUnknown,
+			wantEXIFJSON: `{}`,
+			assertCapture: func(t *testing.T, capture Capture) {
+				if capture.TakenAt != nil || capture.Selected != nil || capture.SelectedIndex != nil || capture.Timezone != nil || len(capture.Candidates) != 3 {
+					t.Fatalf("capture = %#v", capture)
+				}
+				for _, candidate := range capture.Candidates {
+					if candidate.Discarded != discardMissingDateTime {
+						t.Fatalf("candidate = %#v", candidate)
+					}
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := writeStandardJPEG(t, "capture.jpg")
+			if len(test.tags) > 0 {
+				arguments := []string{"-config", "", "-overwrite_original"}
+				arguments = append(arguments, test.tags...)
+				arguments = append(arguments, path)
+				command := exec.Command(exiftool, arguments...)
+				command.Env = []string{"LC_ALL=C", "LANG=C", "TZ=UTC"}
+				if output, err := command.CombinedOutput(); err != nil {
+					t.Fatalf("author EXIF: %v: %s", err, output)
+				}
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := prober.ProbeFile(context.Background(), path, test.timezone)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Width != 1 || result.Height != 1 || result.Derived.ProbeVersion != "13.36" || result.Derived.Capture.Source != test.wantSource {
+				t.Fatalf("result = %#v", result)
+			}
+			if test.wantTime != nil && (result.Derived.Capture.TakenAt == nil || !result.Derived.Capture.TakenAt.Equal(*test.wantTime)) {
+				t.Fatalf("taken_at = %v, want %v", result.Derived.Capture.TakenAt, test.wantTime)
+			}
+			if test.wantSelected != "" && (result.Derived.Capture.Selected == nil || result.Derived.Capture.Selected.Name != test.wantSelected) {
+				t.Fatalf("selected = %#v", result.Derived.Capture.Selected)
+			}
+			test.assertCapture(t, result.Derived.Capture)
+			exifJSON, err := result.EXIFJSON()
+			if err != nil || string(exifJSON) != test.wantEXIFJSON {
+				t.Fatalf("EXIF JSON = %q, %v; want %q", exifJSON, err, test.wantEXIFJSON)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sha256.Sum256(before) != sha256.Sum256(after) {
+				t.Fatal("probe modified generated JPEG")
+			}
+		})
+	}
+}
+
+func writeStandardJPEG(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image := image.NewGray(image.Rect(0, 0, 1, 1))
+	image.SetGray(0, 0, color.Gray{Y: 128})
+	encodeErr := jpeg.Encode(file, image, &jpeg.Options{Quality: 90})
+	closeErr := file.Close()
+	if encodeErr != nil {
+		t.Fatal(encodeErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	return path
+}
+
+func timePointer(value time.Time) *time.Time { return &value }
+
 func TestProberStillNormalizesAllowlistAndCapture(t *testing.T) {
 	input := writeMedia(t, "input.jpg", []byte{0xff, 0xd8, 0xff, 0xd9})
 	exiftool := writeExecutable(t, "exiftool", `#!/bin/sh
@@ -178,6 +341,24 @@ func TestProbeDecodersRejectInvalidUTF8(t *testing.T) {
 	}
 	if _, err := decodeFFProbe(invalid); !errors.Is(err, ErrProbeFailed) {
 		t.Fatalf("decodeFFProbe error = %v", err)
+	}
+}
+
+func TestSanitizeStringRejectsFormatAndBidiControls(t *testing.T) {
+	for _, value := range []string{
+		"safe\u202ecod.exe",      // right-to-left override
+		"safe\u2066hidden\u2069", // directional isolate
+		"safe\u200bhidden",       // zero-width space
+		"safe\ufeffhidden",       // byte-order mark
+	} {
+		if got := sanitizeString(value); got != "" {
+			t.Errorf("sanitizeString(%q) = %q, want rejection", value, got)
+		}
+	}
+	for _, value := range []string{"日本語カメラ", "كاميرا", "क्\u200dष"} {
+		if got := sanitizeString(value); got != value {
+			t.Errorf("sanitizeString(%q) = %q", value, got)
+		}
 	}
 }
 

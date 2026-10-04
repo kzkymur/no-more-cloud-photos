@@ -69,6 +69,16 @@ func TestBoundedRunnerHonorsCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestBoundedRunnerCancellationPrecedesOutputLimit(t *testing.T) {
+	runner := testRunner(2*time.Second, 32)
+	script := writeExecutable(t, "cancel-overflow", "#!/bin/sh\nwhile :; do printf 0123456789abcdef; done\n")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := runner.run(ctx, script); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want caller cancellation", err)
+	}
+}
+
 func TestBoundedRunnerKillsResidualGroupAfterParentExit(t *testing.T) {
 	runner := testRunner(2*time.Second, 1024)
 	script := writeExecutable(t, "residual", "#!/bin/sh\nsleep 30 >/dev/null 2>&1 &\nprintf '%s' \"$!\"\nexit 0\n")
@@ -95,6 +105,106 @@ func TestBoundedRunnerKillsResidualGroupAfterParentExit(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("residual child %d remains after runner return", pid)
+}
+
+func TestBoundedRunnerReapsSessionEscapees(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
+		runner := testRunner(100*time.Millisecond, 1024)
+		pidFile := filepath.Join(t.TempDir(), "pid")
+		script := writeExecutable(t, "escape-timeout", "#!/bin/sh\nsetsid sh -c 'sleep 30' &\nprintf '%s' \"$!\" > \"$1\"\nwait\n")
+		started := time.Now()
+		_, err := runner.run(context.Background(), script, pidFile)
+		if !errors.Is(err, ErrProbeTimeout) {
+			t.Fatalf("run error = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("100ms timeout returned after %s", elapsed)
+		}
+		assertProcessReaped(t, readPID(t, pidFile))
+	})
+
+	t.Run("normal parent exit", func(t *testing.T) {
+		runner := testRunner(2*time.Second, 1024)
+		pidFile := filepath.Join(t.TempDir(), "pid")
+		script := writeExecutable(t, "escape-success", "#!/bin/sh\nsetsid sh -c 'sleep 30' &\nprintf '%s' \"$!\" > \"$1\"\nexit 0\n")
+		started := time.Now()
+		if _, err := runner.run(context.Background(), script, pidFile); err != nil {
+			t.Fatal(err)
+		}
+		if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+			t.Fatalf("normal cleanup returned after %s", elapsed)
+		}
+		assertProcessReaped(t, readPID(t, pidFile))
+	})
+
+	t.Run("caller cancellation", func(t *testing.T) {
+		runner := testRunner(2*time.Second, 1024)
+		pidFile := filepath.Join(t.TempDir(), "pid")
+		script := writeExecutable(t, "escape-cancel", "#!/bin/sh\nsetsid sh -c 'sleep 30' &\nprintf '%s' \"$!\" > \"$1\"\nwait\n")
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			for index := 0; index < 100; index++ {
+				if _, err := os.Stat(pidFile); err == nil {
+					cancel()
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+		}()
+		if _, err := runner.run(ctx, script, pidFile); !errors.Is(err, context.Canceled) {
+			t.Fatalf("run error = %v", err)
+		}
+		assertProcessReaped(t, readPID(t, pidFile))
+	})
+
+	t.Run("output limit", func(t *testing.T) {
+		runner := testRunner(2*time.Second, 32)
+		pidFile := filepath.Join(t.TempDir(), "pid")
+		script := writeExecutable(t, "escape-output", "#!/bin/sh\nsetsid sh -c 'while :; do printf 0123456789abcdef; done' &\nprintf '%s' \"$!\" > \"$1\"\nwait\n")
+		if _, err := runner.run(context.Background(), script, pidFile); !errors.Is(err, ErrProbeOutputLimit) {
+			t.Fatalf("run error = %v", err)
+		}
+		assertProcessReaped(t, readPID(t, pidFile))
+	})
+
+	t.Run("double fork session escape", func(t *testing.T) {
+		runner := testRunner(100*time.Millisecond, 1024)
+		directory := t.TempDir()
+		topPIDFile := filepath.Join(directory, "top-pid")
+		leafPIDFile := filepath.Join(directory, "leaf-pid")
+		script := writeExecutable(t, "escape-double-fork", "#!/bin/sh\nsetsid sh -c 'sleep 30 & printf %s \"$!\" > \"$1\"; wait' helper \"$2\" &\nprintf '%s' \"$!\" > \"$1\"\nwait\n")
+		if _, err := runner.run(context.Background(), script, topPIDFile, leafPIDFile); !errors.Is(err, ErrProbeTimeout) {
+			t.Fatalf("run error = %v", err)
+		}
+		assertProcessReaped(t, readPID(t, topPIDFile))
+		assertProcessReaped(t, readPID(t, leafPIDFile))
+	})
+}
+
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(data))
+	if err != nil {
+		t.Fatalf("PID %q: %v", data, err)
+	}
+	return pid
+}
+
+func assertProcessReaped(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("escaped descendant %d still exists", pid)
 }
 
 func testRunner(timeout time.Duration, outputLimit int64) boundedRunner {

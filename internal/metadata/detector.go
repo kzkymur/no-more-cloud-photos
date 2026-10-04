@@ -121,18 +121,30 @@ func detectJPEG(reader io.ReaderAt, size int64) (Detection, error) {
 	}
 	offset := int64(2)
 	for segment := 0; segment < maxJPEGSegments && offset < size && offset < maxInspectBytes; segment++ {
-		marker, err := readAt(reader, size, offset, 2)
+		prefix, err := readAt(reader, size, offset, 1)
 		if err != nil {
 			return Detection{}, err
 		}
-		if marker[0] != 0xff || marker[1] == 0x00 || marker[1] == 0xff || marker[1] == 0xd8 {
+		if prefix[0] != 0xff {
 			return Detection{}, invalid("invalid JPEG marker")
 		}
-		offset += 2
-		if marker[1] == 0xd9 {
+		marker := byte(0xff)
+		for marker == 0xff {
+			offset++
+			code, err := readAt(reader, size, offset, 1)
+			if err != nil {
+				return Detection{}, err
+			}
+			marker = code[0]
+		}
+		if marker == 0x00 || marker == 0xd8 {
+			return Detection{}, invalid("invalid JPEG marker")
+		}
+		offset++
+		if marker == 0xd9 {
 			return detection("image/jpeg", "jpeg-marker-stream")
 		}
-		if marker[1] >= 0xd0 && marker[1] <= 0xd7 {
+		if marker >= 0xd0 && marker <= 0xd7 {
 			continue
 		}
 		lengthBytes, err := readAt(reader, size, offset, 2)
@@ -144,7 +156,7 @@ func detectJPEG(reader io.ReaderAt, size int64) (Detection, error) {
 			return Detection{}, invalid("invalid JPEG segment length")
 		}
 		offset += length
-		if marker[1] == 0xda {
+		if marker == 0xda {
 			return detection("image/jpeg", "jpeg-marker-stream")
 		}
 	}
@@ -313,6 +325,7 @@ func detectTIFF(reader io.ReaderAt, size int64, header []byte) (Detection, error
 
 type tiffIFDPointer struct {
 	offset uint64
+	ifd0   bool
 }
 
 func validateTIFFIFDs(reader io.ReaderAt, size int64, order binary.ByteOrder, evidence *tiffEvidence, roots ...uint64) error {
@@ -321,14 +334,14 @@ func validateTIFFIFDs(reader io.ReaderAt, size int64, order binary.ByteOrder, ev
 	}
 	queue := make([]tiffIFDPointer, 0, len(roots))
 	scheduled := make(map[uint64]struct{}, len(roots))
-	for _, root := range roots {
+	for i, root := range roots {
 		if root == 0 {
 			return invalid("zero TIFF first IFD offset")
 		}
 		if _, ok := scheduled[root]; ok {
 			continue
 		}
-		queue = append(queue, tiffIFDPointer{offset: root})
+		queue = append(queue, tiffIFDPointer{offset: root, ifd0: i == 0})
 		scheduled[root] = struct{}{}
 	}
 	seen := make(map[uint64]struct{})
@@ -436,7 +449,9 @@ func validateTIFFIFDs(reader io.ReaderAt, size int64, order binary.ByteOrder, ev
 			case 0x828d, 0x828e: // CFARepeatPatternDim, CFAPattern
 				evidence.cfa = (typ == 1 || typ == 3 || typ == 7) && valueCount > 0
 			case 0xc612: // DNGVersion
-				evidence.dng = typ == 1 && valueCount == 4 && len(value) == 4 && value[0] != 0
+				if pointer.ifd0 {
+					evidence.dng = typ == 1 && valueCount == 4 && len(value) == 4 && value[0] != 0
+				}
 			}
 		}
 		next := uint64(order.Uint32(ifd[len(ifd)-4:]))
@@ -605,17 +620,27 @@ func detectLegacyQuickTime(reader io.ReaderAt, size, offset int64, boxSize, head
 		if children >= 64 || len(payload)-childOffset < 8 {
 			return Detection{}, invalid("invalid legacy QuickTime child boxes")
 		}
-		childSize := int(binary.BigEndian.Uint32(payload[childOffset : childOffset+4]))
-		if childSize < 8 || childSize > len(payload)-childOffset {
+		childSize := uint64(binary.BigEndian.Uint32(payload[childOffset : childOffset+4]))
+		childHeaderSize := uint64(8)
+		if childSize == 1 {
+			if len(payload)-childOffset < 16 {
+				return Detection{}, invalid("invalid legacy QuickTime child box size")
+			}
+			childSize = binary.BigEndian.Uint64(payload[childOffset+8 : childOffset+16])
+			childHeaderSize = 16
+		} else if childSize == 0 {
+			childSize = uint64(len(payload) - childOffset)
+		}
+		if childSize < childHeaderSize || childSize > uint64(len(payload)-childOffset) {
 			return Detection{}, invalid("invalid legacy QuickTime child box size")
 		}
 		switch string(payload[childOffset+4 : childOffset+8]) {
 		case "mvhd":
-			hasMovieHeader = childSize >= 28
+			hasMovieHeader = childSize >= childHeaderSize+20
 		case "trak":
 			hasTrack = true
 		}
-		childOffset += childSize
+		childOffset += int(childSize)
 	}
 	legacyHandler, validChildren := findLegacyQuickTimeHandler(payload, 0)
 	if !validChildren {

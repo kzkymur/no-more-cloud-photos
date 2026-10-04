@@ -162,9 +162,15 @@ are invoked without a shell through trusted absolute paths. Their environment
 is replaced with `LC_ALL=C`, `LANG=C`, and `TZ=UTC`; ExifTool is additionally
 started with configuration loading disabled.
 Each probe inherits a 1 GiB `RLIMIT_AS` through `prlimit`, has a 60 second wall
-deadline, caps stdout and stderr independently at 1 MiB, and is placed in a
-process group that is killed and reaped on timeout, cancellation, or output
-overflow. This limit is neither a sandbox nor an RSS guarantee. Tool output,
+deadline, and caps stdout and stderr independently at 1 MiB. A short-lived copy
+of the current Core executable supervises each probe as a Linux child
+subreaper. It kills the initial process group, repeatedly kills session/group
+escapees adopted from the probe tree, and reaps until `ECHILD` on timeout,
+cancellation, output overflow, and normal direct-child exit. A bounded cleanup
+failure is reported as a probe failure. This containment is designed for the
+trusted, same-UID pinned tools; it is not a defense against uninterruptible
+kernel sleep, privilege/namespace escape, or a hostile fork bomb. The address
+space limit is neither a sandbox nor an RSS guarantee. Tool output,
 absolute input paths, stderr, and environment data are never copied into API or
 stored metadata.
 

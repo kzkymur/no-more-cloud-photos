@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -24,6 +25,8 @@ type commandOutput struct {
 	stdout []byte
 	stderr []byte
 }
+
+const supervisorReturnGrace = 2 * time.Second
 
 // limitedBuffer keeps at most limit bytes while continuing to consume the
 // child's pipe. The first overflow wakes the runner so it can kill the entire
@@ -72,12 +75,24 @@ func (r boundedRunner) runWithFiles(ctx context.Context, executable string, file
 	runCtx, cancel := context.WithTimeout(ctx, r.policy.Timeout)
 	defer cancel()
 
-	limitArgument := "--as=" + strconv.FormatUint(r.policy.AddressSpaceBytes, 10)
-	args := append([]string{limitArgument, "--", executable}, arguments...)
-	cmd := exec.Command(r.prlimit, args...)
+	controlRead, controlWrite, err := os.Pipe()
+	if err != nil {
+		return commandOutput{}, fmt.Errorf("%w: prepare supervisor control", ErrProbeFailed)
+	}
+	defer controlRead.Close()
+	defer controlWrite.Close()
+	args := []string{
+		probeSupervisorArgument,
+		r.prlimit,
+		strconv.FormatUint(r.policy.AddressSpaceBytes, 10),
+		strconv.Itoa(len(files)),
+		executable,
+	}
+	args = append(args, arguments...)
+	cmd := exec.Command("/proc/self/exe", args...)
 	cmd.Env = []string{"LC_ALL=C", "LANG=C", "TZ=UTC"}
-	cmd.ExtraFiles = files
-	cmd.SysProcAttr = &unix.SysProcAttr{Setpgid: true, Pdeathsig: unix.SIGKILL}
+	cmd.ExtraFiles = append([]*os.File{controlRead}, files...)
+	cmd.SysProcAttr = &unix.SysProcAttr{Setpgid: true}
 	exceededSignal := make(chan struct{}, 1)
 	stdout := &limitedBuffer{limit: r.policy.OutputBytes, signal: exceededSignal}
 	stderr := &limitedBuffer{limit: r.policy.OutputBytes, signal: exceededSignal}
@@ -86,11 +101,10 @@ func (r boundedRunner) runWithFiles(ctx context.Context, executable string, file
 	if err := cmd.Start(); err != nil {
 		return commandOutput{}, fmt.Errorf("%w: start", ErrProbeFailed)
 	}
+	_ = controlRead.Close()
 
-	killGroup := func() {
-		if cmd.Process != nil {
-			_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
-		}
+	requestCleanup := func() {
+		_ = controlWrite.Close()
 	}
 	waitResult := make(chan error, 1)
 	go func() { waitResult <- cmd.Wait() }()
@@ -98,20 +112,31 @@ func (r boundedRunner) runWithFiles(ctx context.Context, executable string, file
 	var waitErr error
 	select {
 	case waitErr = <-waitResult:
-		// A trusted probe should not outlive its direct process, but kill any
-		// residual member before returning on every terminal path.
-		killGroup()
+		requestCleanup()
 	case <-runCtx.Done():
-		killGroup()
-		waitErr = <-waitResult
-		if ctx.Err() != nil {
-			return commandOutput{}, ctx.Err()
+		requestCleanup()
+		var completed bool
+		waitErr, completed = waitForSupervisor(waitResult, supervisorReturnGrace)
+		if !completed {
+			_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+			return commandOutput{}, fmt.Errorf("%w: supervisor cleanup timeout", ErrProbeFailed)
 		}
-		return commandOutput{}, ErrProbeTimeout
 	case <-exceededSignal:
-		killGroup()
-		waitErr = <-waitResult
-		return commandOutput{}, ErrProbeOutputLimit
+		requestCleanup()
+		var completed bool
+		waitErr, completed = waitForSupervisor(waitResult, supervisorReturnGrace)
+		if !completed {
+			_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+			return commandOutput{}, fmt.Errorf("%w: supervisor cleanup timeout", ErrProbeFailed)
+		}
+	}
+	// Classify after cleanup using a stable precedence rather than the random
+	// arm chosen when terminal signals become ready together.
+	if ctx.Err() != nil {
+		return commandOutput{}, ctx.Err()
+	}
+	if runCtx.Err() != nil {
+		return commandOutput{}, ErrProbeTimeout
 	}
 	if stdout.exceeded.Load() || stderr.exceeded.Load() {
 		return commandOutput{}, ErrProbeOutputLimit
@@ -120,4 +145,15 @@ func (r boundedRunner) runWithFiles(ctx context.Context, executable string, file
 		return commandOutput{}, fmt.Errorf("%w: non-zero exit", ErrProbeFailed)
 	}
 	return commandOutput{stdout: stdout.bytes(), stderr: stderr.bytes()}, nil
+}
+
+func waitForSupervisor(waitResult <-chan error, grace time.Duration) (error, bool) {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case err := <-waitResult:
+		return err, true
+	case <-timer.C:
+		return nil, false
+	}
 }
