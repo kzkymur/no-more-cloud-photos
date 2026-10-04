@@ -117,6 +117,13 @@ INSERT INTO system_config (
     db_backup_retention_days
 ) VALUES (1, NULL, NULL, 'Asia/Tokyo', 24, 30);
 
+CREATE TRIGGER system_config_no_delete
+BEFORE DELETE ON system_config
+FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER system_config_no_truncate
+BEFORE TRUNCATE ON system_config
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
+
 CREATE TABLE media (
     id nmcp_uuid_v4 PRIMARY KEY,
     media_type text NOT NULL CHECK (media_type <> '' AND media_type = lower(media_type)),
@@ -182,9 +189,32 @@ CREATE TABLE originals (
         CHECK (jsonb_typeof(exif_json) = 'object'),
     CONSTRAINT originals_dimensions_check CHECK (
         (width IS NULL AND height IS NULL)
-        OR (width > 0 AND height > 0)
+        OR (width IS NOT NULL AND height IS NOT NULL AND width > 0 AND height > 0)
     )
 );
+
+CREATE FUNCTION nmcp_guard_original_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM media WHERE id = OLD.media_id) THEN
+        RAISE EXCEPTION 'originals may be deleted only by Media cascade'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER originals_immutable_update
+BEFORE UPDATE ON originals
+FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER originals_media_owned_delete
+BEFORE DELETE ON originals
+FOR EACH ROW EXECUTE FUNCTION nmcp_guard_original_delete();
+CREATE TRIGGER originals_no_truncate
+BEFORE TRUNCATE ON originals
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 
 CREATE TABLE profiles (
     id nmcp_uuid_v4 PRIMARY KEY,
@@ -270,6 +300,12 @@ $$;
 CREATE TRIGGER profiles_lifecycle
 BEFORE INSERT OR UPDATE ON profiles
 FOR EACH ROW EXECUTE FUNCTION nmcp_profile_lifecycle();
+CREATE TRIGGER profiles_no_delete
+BEFORE DELETE ON profiles
+FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER profiles_no_truncate
+BEFORE TRUNCATE ON profiles
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 
 CREATE TABLE jobs (
     id nmcp_uuid_v4 PRIMARY KEY,
@@ -298,6 +334,10 @@ CREATE TABLE jobs (
         (status IN ('succeeded', 'failed', 'cancelled') AND finished_at IS NOT NULL)
         OR (status IN ('queued', 'running') AND finished_at IS NULL)
     ),
+    CONSTRAINT jobs_execution_check CHECK (
+        (status IN ('succeeded', 'failed') AND started_at IS NOT NULL)
+        OR (status NOT IN ('succeeded', 'failed'))
+    ),
     CONSTRAINT jobs_error_check CHECK ((error_code IS NULL) = (error_message IS NULL)),
     CONSTRAINT jobs_cancel_check CHECK (
         (status = 'cancelled' AND type = 'purge' AND cancelled_at IS NOT NULL
@@ -321,6 +361,11 @@ BEGIN
            OR (OLD.original_id IS NOT NULL AND NEW.original_id IS NOT NULL
                AND NEW.original_id IS DISTINCT FROM OLD.original_id) THEN
             RAISE EXCEPTION 'job identity and input snapshot are immutable'
+                USING ERRCODE = '23514';
+        END IF;
+        IF OLD.original_id IS NOT NULL AND NEW.original_id IS NULL
+           AND EXISTS (SELECT 1 FROM originals WHERE id = OLD.original_id) THEN
+            RAISE EXCEPTION 'job original may become null only through Original deletion'
                 USING ERRCODE = '23514';
         END IF;
     END IF;
@@ -351,6 +396,86 @@ $$;
 CREATE TRIGGER jobs_identity_validate
 BEFORE INSERT OR UPDATE OF id, type, original_id, media_id_snapshot ON jobs
 FOR EACH ROW EXECUTE FUNCTION nmcp_validate_job_identity();
+
+CREATE FUNCTION nmcp_validate_job_lifecycle()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'queued' OR NEW.attempts <> 0 OR NEW.started_at IS NOT NULL
+           OR NEW.finished_at IS NOT NULL OR NEW.lease_token IS NOT NULL
+           OR NEW.lease_expires_at IS NOT NULL OR NEW.error_code IS NOT NULL
+           OR NEW.cancelled_at IS NOT NULL OR NEW.cancel_reason IS NOT NULL THEN
+            RAISE EXCEPTION 'jobs must be inserted as pristine queued rows'
+                USING ERRCODE = '23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF OLD.original_id IS NOT NULL AND NEW.original_id IS NULL
+       AND (pg_catalog.to_jsonb(NEW) - 'original_id') = (pg_catalog.to_jsonb(OLD) - 'original_id') THEN
+        RETURN NEW;
+    END IF;
+    IF OLD.status IN ('succeeded', 'cancelled') THEN
+        RAISE EXCEPTION 'terminal job is immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NEW.attempts < OLD.attempts OR NEW.max_attempts < OLD.max_attempts THEN
+        RAISE EXCEPTION 'job attempts and maximum attempts cannot decrease'
+            USING ERRCODE = '23514';
+    END IF;
+    IF OLD.started_at IS NOT NULL AND NEW.started_at IS DISTINCT FROM OLD.started_at THEN
+        RAISE EXCEPTION 'job started_at is set once and never cleared'
+            USING ERRCODE = '23514';
+    END IF;
+    IF OLD.started_at IS NULL AND NEW.started_at IS NOT NULL AND NEW.status <> 'running' THEN
+        RAISE EXCEPTION 'job started_at may first be set only while claiming the job'
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF OLD.status = 'queued' AND NEW.status = 'running' THEN
+        IF NEW.attempts <> OLD.attempts + 1 OR NEW.started_at IS NULL THEN
+            RAISE EXCEPTION 'claim must increment attempts and set started_at'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF OLD.status = 'queued' AND NEW.status = 'cancelled' THEN
+        IF OLD.type <> 'purge' OR OLD.started_at IS NOT NULL OR NEW.attempts <> OLD.attempts THEN
+            RAISE EXCEPTION 'only a never-started queued purge may be cancelled'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF OLD.status = 'running' AND NEW.status IN ('queued', 'succeeded', 'failed') THEN
+        IF NEW.attempts <> OLD.attempts THEN
+            RAISE EXCEPTION 'completion or backoff cannot change attempts'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF OLD.status = 'failed' AND NEW.status = 'queued' THEN
+        IF NEW.attempts <> OLD.attempts THEN
+            RAISE EXCEPTION 'admin retry preserves attempts'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF OLD.status = NEW.status AND OLD.status IN ('queued', 'running') THEN
+        IF NEW.attempts <> OLD.attempts THEN
+            RAISE EXCEPTION 'attempts change only during queued-to-running claim'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSE
+        RAISE EXCEPTION 'invalid job transition: % to %', OLD.status, NEW.status
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER jobs_lifecycle
+BEFORE INSERT OR UPDATE ON jobs
+FOR EACH ROW EXECUTE FUNCTION nmcp_validate_job_lifecycle();
+CREATE TRIGGER jobs_no_delete
+BEFORE DELETE ON jobs
+FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER jobs_no_truncate
+BEFORE TRUNCATE ON jobs
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 
 CREATE INDEX jobs_original_id_idx ON jobs (original_id);
 CREATE INDEX jobs_list_idx ON jobs (created_at DESC, id DESC);
@@ -396,6 +521,10 @@ BEGIN
         RAISE EXCEPTION 'job target identity is immutable and attempts cannot decrease'
             USING ERRCODE = '23514';
     END IF;
+    IF OLD.status = 'succeeded' THEN
+        RAISE EXCEPTION 'succeeded job target is immutable'
+            USING ERRCODE = '23514';
+    END IF;
     IF NOT (
         NEW.status = OLD.status
         OR (OLD.status = 'pending' AND NEW.status IN ('succeeded', 'failed'))
@@ -411,6 +540,12 @@ $$;
 CREATE TRIGGER job_targets_lifecycle
 BEFORE INSERT OR UPDATE ON job_targets
 FOR EACH ROW EXECUTE FUNCTION nmcp_validate_job_target_lifecycle();
+CREATE TRIGGER job_targets_no_delete
+BEFORE DELETE ON job_targets
+FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER job_targets_no_truncate
+BEFORE TRUNCATE ON job_targets
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 
 CREATE INDEX job_targets_job_id_idx ON job_targets (job_id);
 CREATE INDEX job_targets_profile_id_idx ON job_targets (profile_id);
@@ -473,7 +608,7 @@ CREATE TABLE renditions (
     created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
     CONSTRAINT renditions_dimensions_check CHECK (
         (width IS NULL AND height IS NULL)
-        OR (width > 0 AND height > 0)
+        OR (width IS NOT NULL AND height IS NOT NULL AND width > 0 AND height > 0)
     ),
     CONSTRAINT renditions_current_deadline_check CHECK (NOT is_current OR purge_after IS NULL)
 );
@@ -491,18 +626,20 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     expected_media_id nmcp_uuid_v4;
+    expected_media_snapshot nmcp_uuid_v4;
     expected_profile_key text;
     job_type text;
 BEGIN
-    SELECT o.media_id, p.key, j.type
-    INTO expected_media_id, expected_profile_key, job_type
+    SELECT o.media_id, j.media_id_snapshot, p.key, j.type
+    INTO expected_media_id, expected_media_snapshot, expected_profile_key, job_type
     FROM job_targets AS jt
     JOIN jobs AS j ON j.id = jt.job_id
     JOIN originals AS o ON o.id = j.original_id
     JOIN profiles AS p ON p.id = jt.profile_id
     WHERE jt.id = NEW.job_target_id;
 
-    IF expected_media_id IS NULL OR job_type <> 'transform' OR expected_media_id <> NEW.media_id THEN
+    IF expected_media_id IS NULL OR job_type <> 'transform'
+       OR expected_media_id <> NEW.media_id OR expected_media_snapshot <> NEW.media_id THEN
         RAISE EXCEPTION 'rendition target provenance does not match media'
             USING ERRCODE = '23514';
     END IF;
@@ -584,12 +721,39 @@ CREATE TABLE idempotency_requests (
 CREATE TRIGGER idempotency_requests_immutable
 BEFORE UPDATE OR DELETE ON idempotency_requests
 FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER idempotency_requests_no_truncate
+BEFORE TRUNCATE ON idempotency_requests
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 
 CREATE TABLE change_feed_state (
     id smallint PRIMARY KEY CHECK (id = 1),
     last_position bigint NOT NULL CHECK (last_position >= 0)
 );
 INSERT INTO change_feed_state (id, last_position) VALUES (1, 0);
+
+CREATE FUNCTION nmcp_guard_change_feed_state()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'change_feed_state singleton cannot be deleted'
+            USING ERRCODE = '23514';
+    END IF;
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW.last_position < OLD.last_position THEN
+        RAISE EXCEPTION 'change feed position cannot move backwards'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER change_feed_state_monotonic
+BEFORE UPDATE OR DELETE ON change_feed_state
+FOR EACH ROW EXECUTE FUNCTION nmcp_guard_change_feed_state();
+CREATE TRIGGER change_feed_state_no_truncate
+BEFORE TRUNCATE ON change_feed_state
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 
 CREATE TABLE change_events (
     id nmcp_uuid_v4 NOT NULL UNIQUE,
@@ -601,7 +765,7 @@ CREATE TABLE change_events (
     occurred_at timestamptz NOT NULL DEFAULT statement_timestamp(),
     CONSTRAINT change_events_shape_check CHECK (
         (event_type = 'media_upsert' AND reason IN ('upload', 'rendition_current', 'restore')
-         AND jsonb_typeof(payload) = 'object')
+         AND payload IS NOT NULL AND jsonb_typeof(payload) = 'object')
         OR (event_type = 'media_deleted' AND reason = 'logical_delete' AND payload IS NULL)
         OR (event_type = 'media_purged' AND reason = 'physical_purge' AND payload IS NULL)
     )
@@ -610,6 +774,9 @@ CREATE TABLE change_events (
 CREATE TRIGGER change_events_immutable
 BEFORE UPDATE OR DELETE ON change_events
 FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER change_events_no_truncate
+BEFORE TRUNCATE ON change_events
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 
 CREATE TABLE backup_runs (
     id nmcp_uuid_v4 PRIMARY KEY,
@@ -663,6 +830,13 @@ CREATE TABLE maintenance_state (
 );
 INSERT INTO maintenance_state (id, mode) VALUES (1, 'normal');
 
+CREATE TRIGGER maintenance_state_no_delete
+BEFORE DELETE ON maintenance_state
+FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER maintenance_state_no_truncate
+BEFORE TRUNCATE ON maintenance_state
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
+
 CREATE TABLE admin_audit (
     id nmcp_uuid_v4 PRIMARY KEY,
     command text NOT NULL CHECK (command <> ''),
@@ -682,6 +856,9 @@ CREATE TABLE admin_audit (
 CREATE TRIGGER admin_audit_immutable
 BEFORE UPDATE OR DELETE ON admin_audit
 FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER admin_audit_no_truncate
+BEFORE TRUNCATE ON admin_audit
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 
 CREATE TABLE admin_batches (
     id nmcp_uuid_v4 PRIMARY KEY,
@@ -726,3 +903,44 @@ CREATE TABLE reconciliation_reports (
 CREATE TRIGGER reconciliation_reports_immutable
 BEFORE UPDATE OR DELETE ON reconciliation_reports
 FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER reconciliation_reports_no_truncate
+BEFORE TRUNCATE ON reconciliation_reports
+FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
+
+-- Capture the migration target schema in every function's stored configuration.
+-- Listing pg_temp last prevents temporary relation shadowing while keeping these
+-- functions compatible with isolated-schema tests and non-public deployments.
+DO $nmcp_secure_functions$
+DECLARE
+    target_schema text := current_schema();
+    function_signature text;
+BEGIN
+    FOREACH function_signature IN ARRAY ARRAY[
+        'nmcp_is_uuid_v4(uuid)',
+        'nmcp_is_sha256(text)',
+        'nmcp_is_relative_path(text)',
+        'nmcp_is_mime_type(text)',
+        'nmcp_valid_mime_types(text[])',
+        'nmcp_valid_relative_paths(text[])',
+        'nmcp_reject_mutation()',
+        'nmcp_validate_system_config()',
+        'nmcp_validate_media_timezone()',
+        'nmcp_guard_original_delete()',
+        'nmcp_profile_lifecycle()',
+        'nmcp_validate_job_identity()',
+        'nmcp_validate_job_lifecycle()',
+        'nmcp_validate_job_target_lifecycle()',
+        'nmcp_check_job_target_cardinality()',
+        'nmcp_validate_rendition_provenance()',
+        'nmcp_check_target_rendition()',
+        'nmcp_guard_change_feed_state()'
+    ] LOOP
+        EXECUTE format(
+            'ALTER FUNCTION %I.%s SET search_path TO %I, pg_catalog, pg_temp',
+            target_schema,
+            function_signature,
+            target_schema
+        );
+    END LOOP;
+END;
+$nmcp_secure_functions$;

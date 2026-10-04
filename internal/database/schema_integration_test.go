@@ -54,6 +54,15 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `UPDATE system_config SET default_timezone='Not/A_Real_Zone' WHERE id=1`)
 		expectExecError(t, pool, `UPDATE system_config SET deleted_media_retention_days=-1 WHERE id=1`)
 		expectExecError(t, pool, `UPDATE system_config SET db_backup_interval_hours=0 WHERE id=1`)
+		expectExecError(t, pool, `DELETE FROM system_config WHERE id=1`)
+		expectExecError(t, pool, `TRUNCATE system_config`)
+		expectExecError(t, pool, `DELETE FROM maintenance_state WHERE id=1`)
+		if _, err := pool.Exec(ctx, `UPDATE change_feed_state SET last_position=5 WHERE id=1`); err != nil {
+			t.Fatalf("advance change feed position: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE change_feed_state SET last_position=4 WHERE id=1`)
+		expectExecError(t, pool, `DELETE FROM change_feed_state WHERE id=1`)
+		expectExecError(t, pool, `TRUNCATE change_feed_state`)
 		if _, err := pool.Exec(ctx, `UPDATE system_config SET default_timezone='UTC', deleted_media_retention_days=0 WHERE id=1`); err != nil {
 			t.Fatalf("valid config update: %v", err)
 		}
@@ -85,6 +94,12 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `
 			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes,width,height)
 			VALUES ($1,$2,$3,$4,'IMAGE/JPEG',1,1,NULL)`, newUUIDv4(t), mediaTwo, strings.Repeat("B", 64), "/absolute")
+		expectExecError(t, pool, `
+			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes,width,height)
+			VALUES ($1,$2,$3,$4,'image/jpeg',1,1,NULL)`, newUUIDv4(t), mediaTwo, strings.Repeat("b", 64), "originals/bb/dimensions/original.jpg")
+		expectExecError(t, pool, `UPDATE originals SET media_id=$1 WHERE media_id=$2`, mediaTwo, mediaOne)
+		expectExecError(t, pool, `DELETE FROM originals WHERE media_id=$1`, mediaOne)
+		expectExecError(t, pool, `TRUNCATE originals CASCADE`)
 
 		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(), purge_after=now() WHERE id=$1`, mediaOne); err != nil {
 			t.Fatalf("logically delete media: %v", err)
@@ -137,6 +152,28 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		if activeVersion != 3 {
 			t.Fatalf("active version = %d, want 3", activeVersion)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='retired' WHERE id=$1`, profileThree); err != nil {
+			t.Fatalf("retire v3 before shadow regression: %v", err)
+		}
+		expectExecError(t, pool, `DELETE FROM profiles WHERE id=$1`, profileThree)
+		expectExecError(t, pool, `TRUNCATE profiles CASCADE`)
+
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("acquire temp-shadow connection: %v", err)
+		}
+		defer conn.Release()
+		var schemaName string
+		if err := conn.QueryRow(ctx, `SELECT current_schema()`).Scan(&schemaName); err != nil {
+			t.Fatalf("read isolated schema name: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `CREATE TEMP TABLE profiles (id uuid, key text, version integer, status text, activated_at timestamptz)`); err != nil {
+			t.Fatalf("create shadow profiles table: %v", err)
+		}
+		realProfiles := pgx.Identifier{schemaName, "profiles"}.Sanitize()
+		if _, err := conn.Exec(ctx, `UPDATE `+realProfiles+` SET status='active' WHERE id=$1`, profileTwo); err == nil {
+			t.Fatal("temporary profiles shadow bypassed monotonic activation")
 		}
 
 		concurrentTwo := insertDraftProfile(t, pool, "concurrent", 2)
@@ -263,13 +300,39 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			_, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, newUUIDv4(t), purgeID, profileID)
 			return err
 		})
-		expectExecError(t, pool, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,finished_at) VALUES ($1,'purge',$2,'failed',3,now())`, newUUIDv4(t), mediaID)
+		expectExecError(t, pool, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, newUUIDv4(t), mediaID)
 		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='cancelled', finished_at=now(), cancelled_at=now(), cancel_reason='media_restored' WHERE id=$1`, purgeID); err != nil {
 			t.Fatalf("cancel purge: %v", err)
 		}
 		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, newUUIDv4(t), mediaID); err != nil {
 			t.Fatalf("new purge after cancellation: %v", err)
 		}
+
+		lifecycleJobID := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, lifecycleJobID, otherMediaID); err != nil {
+			t.Fatalf("insert lifecycle purge: %v", err)
+		}
+		expectExecError(t, pool, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,attempts,started_at,finished_at) VALUES ($1,'purge',$2,'succeeded',3,1,now(),now())`, newUUIDv4(t), otherMediaID)
+		leaseOne := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running', attempts=1, lease_token=$2, lease_expires_at=now()+interval '1 minute', started_at=now() WHERE id=$1`, lifecycleJobID, leaseOne); err != nil {
+			t.Fatalf("claim lifecycle purge: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE jobs SET status='cancelled', started_at=NULL, lease_token=NULL, lease_expires_at=NULL, finished_at=now(), cancelled_at=now(), cancel_reason='media_restored' WHERE id=$1`, lifecycleJobID)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='queued', lease_token=NULL, lease_expires_at=NULL WHERE id=$1`, lifecycleJobID); err != nil {
+			t.Fatalf("backoff lifecycle purge: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE jobs SET status='cancelled', finished_at=now(), cancelled_at=now(), cancel_reason='media_restored' WHERE id=$1`, lifecycleJobID)
+		expectExecError(t, pool, `UPDATE jobs SET attempts=0 WHERE id=$1`, lifecycleJobID)
+		expectExecError(t, pool, `UPDATE jobs SET max_attempts=2 WHERE id=$1`, lifecycleJobID)
+		leaseTwo := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running', attempts=2, lease_token=$2, lease_expires_at=now()+interval '1 minute' WHERE id=$1`, lifecycleJobID, leaseTwo); err != nil {
+			t.Fatalf("reclaim lifecycle purge: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='succeeded', lease_token=NULL, lease_expires_at=NULL, finished_at=now() WHERE id=$1`, lifecycleJobID); err != nil {
+			t.Fatalf("finish lifecycle purge: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE jobs SET status='queued', finished_at=NULL WHERE id=$1`, lifecycleJobID)
+		expectExecError(t, pool, `DELETE FROM jobs WHERE id=$1`, lifecycleJobID)
 
 		jobID := newUUIDv4(t)
 		targetID := newUUIDv4(t)
@@ -278,14 +341,20 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if err != nil {
 			t.Fatalf("begin publication: %v", err)
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts,started_at,finished_at) VALUES ($1,'transform',$2,$3,'succeeded',3,now(),now())`, jobID, originalID, mediaID); err == nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err == nil {
 			_, err = tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profileID)
+		}
+		if err == nil {
+			_, err = tx.Exec(ctx, `UPDATE jobs SET status='running', attempts=1, lease_token=$2, lease_expires_at=now()+interval '1 minute', started_at=now() WHERE id=$1`, jobID, newUUIDv4(t))
 		}
 		if err == nil {
 			_, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID)
 		}
 		if err == nil {
 			_, err = tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height) VALUES ($1,$2,$3,'ignored',true,$4,'image/avif',10,$5,1,1)`, renditionID, mediaID, targetID, "renditions/cc/one/target/output.avif", strings.Repeat("e", 64))
+		}
+		if err == nil {
+			_, err = tx.Exec(ctx, `UPDATE jobs SET status='succeeded', lease_token=NULL, lease_expires_at=NULL, finished_at=now() WHERE id=$1`, jobID)
 		}
 		if err != nil {
 			_ = tx.Rollback(ctx)
@@ -300,6 +369,48 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("derived rendition profile key = %q, err=%v", profileKey, err)
 		}
 		expectExecError(t, pool, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256) VALUES ($1,$2,$3,'standard',false,$4,'image/avif',1,$5)`, newUUIDv4(t), otherMediaID, targetID, "renditions/dd/bad/target/output.avif", strings.Repeat("f", 64))
+		expectExecError(t, pool, `UPDATE job_targets SET status='failed', error_code='late', error_message='late edit' WHERE id=$1`, targetID)
+		expectExecError(t, pool, `DELETE FROM job_targets WHERE id=$1`, targetID)
+
+		dimensionTarget := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		expectTxCommitError(t, pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, dimensionTarget); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height) VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',1,$5,1,NULL)`,
+				newUUIDv4(t), mediaID, dimensionTarget, "renditions/cc/one/dimension/output.avif", strings.Repeat("7", 64))
+			return err
+		})
+
+		secondProfileID := insertDraftProfile(t, pool, "thumbnail", 1)
+		deleteJobID := newUUIDv4(t)
+		deleteTargets := []string{newUUIDv4(t), newUUIDv4(t)}
+		deleteTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin delete-race fixture: %v", err)
+		}
+		if _, err = deleteTx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, deleteJobID, originalID, mediaID); err == nil {
+			_, err = deleteTx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$3,$4,'pending'),($2,$3,$5,'pending')`, deleteTargets[0], deleteTargets[1], deleteJobID, profileID, secondProfileID)
+		}
+		if err != nil {
+			_ = deleteTx.Rollback(ctx)
+			t.Fatalf("create delete-race fixture: %v", err)
+		}
+		if err := deleteTx.Commit(ctx); err != nil {
+			t.Fatalf("commit delete-race fixture: %v", err)
+		}
+		deleteStart := make(chan struct{})
+		deleteResults := make(chan error, 2)
+		for _, deleteTarget := range deleteTargets {
+			go func(target string) {
+				<-deleteStart
+				_, err := pool.Exec(ctx, `DELETE FROM job_targets WHERE id=$1`, target)
+				deleteResults <- err
+			}(deleteTarget)
+		}
+		close(deleteStart)
+		assertConcurrentFailures(t, deleteResults, 2)
+		expectExecError(t, pool, `DELETE FROM jobs WHERE id=$1`, deleteJobID)
 
 		if _, err := pool.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID); err != nil {
 			t.Fatalf("physically purge media: %v", err)
@@ -349,6 +460,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("insert change event: %v", err)
 		}
 		expectExecError(t, pool, `INSERT INTO change_events (id,position,event_type,reason,media_id,payload) VALUES ($1,2,'media_deleted','logical_delete',$2,'{}')`, newUUIDv4(t), mediaID)
+		expectExecError(t, pool, `INSERT INTO change_events (id,position,event_type,reason,media_id,payload) VALUES ($1,2,'media_upsert','upload',$2,NULL)`, newUUIDv4(t), mediaID)
 		expectExecError(t, pool, `DELETE FROM change_events WHERE id=$1`, eventID)
 
 		expectExecError(t, pool, `INSERT INTO backup_runs (id,status,config_snapshot,finished_at) VALUES ($1,'succeeded','{}',now())`, newUUIDv4(t))
@@ -365,17 +477,47 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 	t.Run("required indexes are present and usable", func(t *testing.T) {
 		pool := migratedIntegrationPool(t, databaseURL)
 		ctx := context.Background()
-		required := []string{
-			"media_list_order_idx", "media_due_purge_idx", "profiles_one_active_key_idx",
-			"jobs_dequeue_idx", "jobs_list_idx", "jobs_status_list_idx", "jobs_media_list_idx",
-			"jobs_one_active_purge_idx", "job_targets_job_id_idx", "job_targets_profile_id_idx",
-			"renditions_media_id_idx", "renditions_job_target_id_idx", "renditions_one_current_key_idx",
-			"renditions_cleanup_idx", "backup_runs_succeeded_idx", "admin_batches_resume_idx",
+		type indexExpectation struct {
+			name      string
+			columns   string
+			predicate []string
 		}
-		for _, name := range required {
-			var definition string
-			if err := pool.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1`, name).Scan(&definition); err != nil {
-				t.Errorf("required index %s: %v", name, err)
+		required := []indexExpectation{
+			{name: "media_list_order_idx", columns: "(taken_at DESC NULLS LAST, id DESC)"},
+			{name: "media_due_purge_idx", columns: "(purge_after, id)", predicate: []string{"deleted_at IS NOT NULL", "purge_after IS NOT NULL"}},
+			{name: "profiles_one_active_key_idx", columns: "(key)", predicate: []string{"status = 'active'::text"}},
+			{name: "jobs_dequeue_idx", columns: "(available_at, created_at, id)", predicate: []string{"status = 'queued'::text"}},
+			{name: "jobs_list_idx", columns: "(created_at DESC, id DESC)"},
+			{name: "jobs_status_list_idx", columns: "(status, created_at DESC, id DESC)"},
+			{name: "jobs_media_list_idx", columns: "(media_id_snapshot, created_at DESC, id DESC)"},
+			{name: "jobs_one_active_purge_idx", columns: "(media_id_snapshot)", predicate: []string{"type = 'purge'::text", "status = ANY", "'queued'::text", "'running'::text", "'failed'::text"}},
+			{name: "job_targets_job_id_idx", columns: "(job_id)"},
+			{name: "job_targets_profile_id_idx", columns: "(profile_id)"},
+			{name: "renditions_media_id_idx", columns: "(media_id)"},
+			{name: "renditions_job_target_id_idx", columns: "(job_target_id)"},
+			{name: "renditions_one_current_key_idx", columns: "(media_id, profile_key)", predicate: []string{"is_current"}},
+			{name: "renditions_cleanup_idx", columns: "(purge_after, media_id, id)", predicate: []string{"NOT is_current", "purge_after IS NOT NULL"}},
+			{name: "backup_runs_succeeded_idx", columns: "(finished_at DESC, id DESC)", predicate: []string{"status = 'succeeded'::text"}},
+			{name: "admin_batches_resume_idx", columns: "(status, updated_at, id)"},
+		}
+		for _, expected := range required {
+			var definition, predicate string
+			if err := pool.QueryRow(ctx, `
+				SELECT pg_get_indexdef(i.indexrelid), COALESCE(pg_get_expr(i.indpred, i.indrelid), '')
+				FROM pg_index AS i
+				JOIN pg_class AS c ON c.oid=i.indexrelid
+				JOIN pg_namespace AS n ON n.oid=c.relnamespace
+				WHERE n.nspname=current_schema() AND c.relname=$1`, expected.name).Scan(&definition, &predicate); err != nil {
+				t.Errorf("required index %s: %v", expected.name, err)
+				continue
+			}
+			if !strings.Contains(definition, expected.columns) {
+				t.Errorf("index %s definition = %q, want columns/order %q", expected.name, definition, expected.columns)
+			}
+			for _, fragment := range expected.predicate {
+				if !strings.Contains(predicate, fragment) {
+					t.Errorf("index %s predicate = %q, want fragment %q", expected.name, predicate, fragment)
+				}
 			}
 		}
 		conn, err := pool.Acquire(ctx)
@@ -507,6 +649,9 @@ func insertPendingTransform(t *testing.T, pool *pgxpool.Pool, mediaID, originalI
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("commit transform fixture: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running', attempts=1, lease_token=$2, lease_expires_at=now()+interval '1 minute', started_at=now() WHERE id=$1`, jobID, newUUIDv4(t)); err != nil {
+		t.Fatalf("claim transform fixture: %v", err)
+	}
 	return targetID
 }
 
@@ -523,6 +668,15 @@ func assertOneConcurrentWinner(t *testing.T, results <-chan error) {
 	}
 	if successes != 1 || failures != 1 {
 		t.Fatalf("concurrent results = %d success, %d failure; want one each", successes, failures)
+	}
+}
+
+func assertConcurrentFailures(t *testing.T, results <-chan error, count int) {
+	t.Helper()
+	for index := 0; index < count; index++ {
+		if err := awaitResult(t, results); err == nil {
+			t.Fatalf("concurrent operation %d unexpectedly succeeded", index)
+		}
 	}
 }
 
