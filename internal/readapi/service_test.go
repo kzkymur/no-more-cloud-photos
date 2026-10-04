@@ -128,7 +128,7 @@ func TestBuildRenditionRejectsNullableAndProvenanceInconsistency(t *testing.T) {
 }
 
 func TestDatabaseErrorClassification(t *testing.T) {
-	for _, code := range []string{"08006", "40001", "53000", "53100", "53200", "53300", "53400", "55P03", "57014", "57P01", "57P02", "57P03"} {
+	for _, code := range []string{"08006", "40001", "53000", "53100", "53200", "53300", "53400", "55P03", "57014", "57P01", "57P02", "57P03", "57P04", "57P05"} {
 		err := classifyDatabaseError(&pgconn.PgError{Code: code})
 		if !IsKind(err, KindDatabaseUnavailable) {
 			t.Errorf("SQLSTATE %s classified as %#v", code, err)

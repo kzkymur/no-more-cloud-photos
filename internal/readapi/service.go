@@ -710,7 +710,7 @@ func classifyDatabaseError(err error) error {
 	}
 	var pgError *pgconn.PgError
 	if errors.As(err, &pgError) {
-		if strings.HasPrefix(pgError.Code, "08") || strings.HasPrefix(pgError.Code, "40") || strings.HasPrefix(pgError.Code, "53") || pgError.Code == "55P03" || pgError.Code == "57014" || pgError.Code == "57P01" || pgError.Code == "57P02" || pgError.Code == "57P03" {
+		if strings.HasPrefix(pgError.Code, "08") || strings.HasPrefix(pgError.Code, "40") || strings.HasPrefix(pgError.Code, "53") || pgError.Code == "55P03" || pgError.Code == "57014" || strings.HasPrefix(pgError.Code, "57P0") {
 			return NewDatabaseUnavailableError(err)
 		}
 	}

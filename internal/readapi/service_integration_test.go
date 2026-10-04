@@ -276,7 +276,8 @@ func TestReadServiceIntegration(t *testing.T) {
 		oldStandardRenditionID := integrationUUID(2203)
 		insertIntegrationRenditionForProfile(t, pool, media[0], integrationUUID(4203), integrationUUID(3203), oldStandardRenditionID, standardV1, "standard", base.Add(5*time.Hour+time.Minute), true)
 
-		if _, err := pool.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER profiles_definition_validate`); err != nil {
+		certifyIntegrationProfiles(t, pool)
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, customV1); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, standardV1); err != nil {
@@ -285,8 +286,15 @@ func TestReadServiceIntegration(t *testing.T) {
 		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, standardV2); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pool.Exec(ctx, `ALTER TABLE profiles ENABLE TRIGGER profiles_definition_validate`); err != nil {
+		var customStatus, standardV1Status, standardV2Status string
+		if err := pool.QueryRow(ctx, `SELECT
+			(SELECT status FROM profiles WHERE id=$1),
+			(SELECT status FROM profiles WHERE id=$2),
+			(SELECT status FROM profiles WHERE id=$3)`, customV1, standardV1, standardV2).Scan(&customStatus, &standardV1Status, &standardV2Status); err != nil {
 			t.Fatal(err)
+		}
+		if customStatus != "active" || standardV1Status != "retired" || standardV2Status != "active" {
+			t.Fatalf("production lifecycle statuses = custom:%s standard-v1:%s standard-v2:%s", customStatus, standardV1Status, standardV2Status)
 		}
 		standardRequest := NewMediaListRequest()
 		standardPage, err := service.ListMedia(ctx, standardRequest)
@@ -413,6 +421,39 @@ func integrationExplain(t *testing.T, pool *pgxpool.Pool, query string, argument
 		t.Fatal(err)
 	}
 	return plan.String()
+}
+
+func certifyIntegrationProfiles(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(), `
+		WITH candidates AS (
+			SELECT capability.processor,capability.parameters_schema_version,
+			       capability.input_mime_type,capability.source_mode,output.output_kind
+			FROM profile_processor_capabilities AS capability
+			CROSS JOIN LATERAL unnest(
+				CASE capability.source_mode
+				WHEN 'still' THEN ARRAY['still-avif']::text[]
+				WHEN 'probe-animation' THEN ARRAY['still-avif','animation-webp']::text[]
+				WHEN 'video' THEN ARRAY['still-avif','video-av1']::text[]
+				END
+			) AS output(output_kind)
+		), numbered AS (
+			SELECT candidates.*,row_number() OVER (ORDER BY input_mime_type,output_kind) AS ordinal
+			FROM candidates
+		)
+		INSERT INTO profile_processor_certifications (
+			id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+			max_long_edge,minimum_setting,maximum_setting,evidence
+		)
+		SELECT ('90000000-0000-4000-8000-' || lpad(to_hex(ordinal),12,'0'))::uuid,
+		       processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+		       100000,CASE WHEN output_kind='video-av1' THEN 0 ELSE 1 END,
+		       CASE WHEN output_kind='video-av1' THEN 63 ELSE 100 END,
+		       'read API integration certification fixture'
+		FROM numbered`)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func readIntegrationPool(t *testing.T) *pgxpool.Pool {

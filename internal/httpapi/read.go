@@ -2,11 +2,13 @@ package httpapi
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/readapi"
 )
@@ -67,12 +69,12 @@ func matchReadRoute(path string) (readRoute, bool) {
 }
 
 func (h *handler) read(w http.ResponseWriter, r *http.Request, requestID string, route readRoute) {
-	if readRequestHasBody(r) {
+	if readRequestHasBody(w, r) {
 		closeUploadConnection(w, r)
 		h.writeReadError(w, requestID, readapi.NewInvalidRequest(map[string]string{"body": "invalid"}))
 		return
 	}
-	if !acceptsJSON(r.Header.Get("Accept")) {
+	if !acceptsJSON(acceptHeader(r)) {
 		writeError(w, http.StatusNotAcceptable, "not_acceptable", "JSON response is not acceptable", requestID)
 		return
 	}
@@ -122,21 +124,31 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request, requestID string,
 	writeJSON(w, http.StatusOK, response)
 }
 
-func readRequestHasBody(r *http.Request) bool {
+func readRequestHasBody(w http.ResponseWriter, r *http.Request) bool {
 	if requestDeclaresBody(r) {
 		return true
 	}
 	if r.Body == nil || r.Body == http.NoBody {
 		return false
 	}
-	// An incoming HTTP/2 request can carry DATA without Content-Length or
-	// Transfer-Encoding. Never probe or drain a potentially live stream here:
-	// net/http represents a truly absent body as http.NoBody.
+	// HTTP/2 represents both an END_STREAM request and an unknown-length DATA
+	// stream with ContentLength -1 and an internal Body wrapper. Probe one byte
+	// under an immediate read deadline: EOF proves absence, while data or a
+	// stream that might later produce data is rejected without an unbounded
+	// drain/wait. Clear the deadline only for the proven-empty reusable stream.
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now())
+	var one [1]byte
+	count, err := r.Body.Read(one[:])
+	if count == 0 && errors.Is(err, io.EOF) {
+		_ = controller.SetReadDeadline(time.Time{})
+		return false
+	}
 	return true
 }
 
 func requestDeclaresBody(r *http.Request) bool {
-	return r.ContentLength > 0 || len(r.TransferEncoding) != 0
+	return r.ContentLength != 0 || len(r.TransferEncoding) != 0
 }
 
 func closeIfDeclaredBody(w http.ResponseWriter, r *http.Request) {

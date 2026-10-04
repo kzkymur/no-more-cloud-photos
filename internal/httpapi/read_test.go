@@ -198,6 +198,19 @@ func TestReadListQueries(t *testing.T) {
 	}
 }
 
+func TestReadAcceptNegotiationCombinesRepeatedFieldLines(t *testing.T) {
+	reads := &recordingReadService{}
+	request := httptest.NewRequest(http.MethodGet, "/media", nil)
+	request.Header["Accept"] = []string{"text/plain", "application/json"}
+	request.Header.Set("X-Request-ID", "read-repeated-accept")
+	response := httptest.NewRecorder()
+	NewHandler(Dependencies{Reads: reads}).ServeHTTP(response, request)
+	assertResponse(t, response, http.StatusOK, "read-repeated-accept")
+	if !reflect.DeepEqual(reads.calls, []string{"ListMedia"}) {
+		t.Fatalf("read calls = %v", reads.calls)
+	}
+}
+
 func TestReadQueriesAreStrict(t *testing.T) {
 	tests := []struct {
 		path   string
@@ -302,7 +315,7 @@ func TestReadRejectsAnyPotentialBodyWithoutProbing(t *testing.T) {
 	reads := &recordingReadService{}
 	request := httptest.NewRequest(http.MethodGet, "/profiles", nil)
 	request.Body = io.NopCloser(strings.NewReader("ignored actual body"))
-	request.ContentLength = 0
+	request.ContentLength = -1
 	request.GetBody = func() (io.ReadCloser, error) {
 		return io.NopCloser(strings.NewReader("x")), nil
 	}
@@ -378,6 +391,26 @@ func TestReadHTTP2BodyWithoutContentLengthIsRejectedBeforeService(t *testing.T) 
 	server.StartTLS()
 	t.Cleanup(server.Close)
 
+	emptyRequest, err := http.NewRequest(http.MethodGet, server.URL+"/media", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyRequest.Header.Set("X-Request-ID", "http2-empty")
+	emptyResponse, err := server.Client().Do(emptyRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, emptyReadErr := io.Copy(io.Discard, emptyResponse.Body)
+	if err := errors.Join(emptyReadErr, emptyResponse.Body.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if emptyResponse.ProtoMajor != 2 || emptyResponse.StatusCode != http.StatusOK {
+		t.Fatalf("empty HTTP/2 protocol/status = %s/%d, want HTTP/2 200", emptyResponse.Proto, emptyResponse.StatusCode)
+	}
+	if !reflect.DeepEqual(reads.calls, []string{"ListMedia"}) {
+		t.Fatalf("empty HTTP/2 calls = %v", reads.calls)
+	}
+
 	request, err := http.NewRequest(http.MethodGet, server.URL+"/media", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -402,8 +435,8 @@ func TestReadHTTP2BodyWithoutContentLengthIsRejectedBeforeService(t *testing.T) 
 	if response.StatusCode != http.StatusBadRequest || time.Since(started) > 2*time.Second {
 		t.Fatalf("status/elapsed = %d/%v; body=%s", response.StatusCode, time.Since(started), body)
 	}
-	if len(reads.calls) != 0 {
-		t.Fatalf("service called for HTTP/2 body: %v", reads.calls)
+	if !reflect.DeepEqual(reads.calls, []string{"ListMedia"}) {
+		t.Fatalf("service called for non-empty HTTP/2 body: %v", reads.calls)
 	}
 }
 
