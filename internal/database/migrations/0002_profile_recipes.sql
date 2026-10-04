@@ -191,7 +191,7 @@ STRICT
 RETURN COALESCE(nmcp_jsonb_exact_keys(value, ARRAY['format','quality','bit_depth']), false)
    AND value->>'format' IS NOT DISTINCT FROM 'avif'
    AND COALESCE(nmcp_jsonb_integer_between(value->'quality', 1, 100), false)
-   AND value->'bit_depth' IS NOT DISTINCT FROM '8'::jsonb;
+   AND COALESCE(nmcp_jsonb_integer_between(value->'bit_depth', 8, 8), false);
 
 CREATE FUNCTION nmcp_valid_animation_output(value jsonb)
 RETURNS boolean
@@ -201,7 +201,7 @@ STRICT
 RETURN COALESCE(nmcp_jsonb_exact_keys(value, ARRAY['format','quality','bit_depth']), false)
    AND value->>'format' IS NOT DISTINCT FROM 'animated-webp'
    AND COALESCE(nmcp_jsonb_integer_between(value->'quality', 1, 100), false)
-   AND value->'bit_depth' IS NOT DISTINCT FROM '8'::jsonb;
+   AND COALESCE(nmcp_jsonb_integer_between(value->'bit_depth', 8, 8), false);
 
 CREATE FUNCTION nmcp_valid_video_output(value jsonb)
 RETURNS boolean
@@ -214,10 +214,10 @@ RETURN COALESCE(nmcp_jsonb_exact_keys(value, ARRAY[
    AND value->>'container' IS NOT DISTINCT FROM 'mp4'
    AND value->>'video_codec' IS NOT DISTINCT FROM 'av1'
    AND COALESCE(nmcp_jsonb_integer_between(value->'crf', 0, 63), false)
-   AND value->'bit_depth' IS NOT DISTINCT FROM '10'::jsonb
+   AND COALESCE(nmcp_jsonb_integer_between(value->'bit_depth', 10, 10), false)
    AND value->>'chroma' IS NOT DISTINCT FROM '4:2:0'
    AND value->>'audio_codec' IS NOT DISTINCT FROM 'aac'
-   AND value->'audio_bitrate_kbps' IS NOT DISTINCT FROM '128'::jsonb;
+   AND COALESCE(nmcp_jsonb_integer_between(value->'audio_bitrate_kbps', 128, 128), false);
 
 CREATE FUNCTION nmcp_valid_profile_recipe(recipe jsonb)
 RETURNS boolean

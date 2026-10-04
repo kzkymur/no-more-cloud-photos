@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -110,8 +111,8 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			}
 			expectExecError(t, pool, insert, definition.ID, key, mimeTypes, processorName, schemaVersion, parameters)
 		}
-		expectBothReject("bad-wildcard", []string{"image/*"}, "nmcp-media", 1, valid)
-		expectBothReject("bad-unknown-mime", []string{"image/x-unknown"}, "nmcp-media", 1, valid)
+		expectBothReject("bad-wildcard", []string{"image/*"}, "nmcp-media", 1, testProfileParametersForRecipe(t, "image/*", "image/jpeg"))
+		expectBothReject("bad-unknown-mime", []string{"image/x-unknown"}, "nmcp-media", 1, testProfileParametersForRecipe(t, "image/x-unknown", "image/jpeg"))
 		expectBothReject("bad-processor", []string{"image/jpeg"}, "unknown", 1, valid)
 		expectBothReject("bad-schema", []string{"image/jpeg"}, "nmcp-media", 2, valid)
 
@@ -156,6 +157,99 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			mutate(parameters)
 			expectBothReject("bad-"+name, []string{"image/jpeg"}, "nmcp-media", 1, mustJSON(t, parameters))
 		}
+
+		gif := testProfileParametersForRecipe(t, "image/gif", "image/gif")
+		parameters = decodeJSONMap(t, gif)
+		parameters["recipes"].(map[string]any)["image/gif"].(map[string]any)["animation_timing"] = "discard"
+		expectBothReject("bad-animation-combination", []string{"image/gif"}, "nmcp-media", 1, mustJSON(t, parameters))
+
+		video := testProfileParametersForRecipe(t, "video/mp4", "video/mp4")
+		parameters = decodeJSONMap(t, video)
+		parameters["recipes"].(map[string]any)["video/mp4"].(map[string]any)["audio"] = "none"
+		expectBothReject("bad-video-combination", []string{"video/mp4"}, "nmcp-media", 1, mustJSON(t, parameters))
+		expectBothReject("bad-case-variant-field", []string{"image/jpeg"}, "nmcp-media", 1, replaceJSONOnce(t, valid, `"quality":60`, `"quality":60,"Quality":60`))
+		validObject := decodeJSONMap(t, valid)
+		validRecipes := mustJSON(t, validObject["recipes"])
+		duplicateRecipes := []byte(`{"evidence_status":"provisional-unverified","recipes":` + string(validRecipes) + `,"recipes":{}}`)
+		expectBothReject("bad-duplicate-recipes-last-empty", []string{"image/jpeg"}, "nmcp-media", 1, duplicateRecipes)
+
+		for _, test := range []struct {
+			key, mimeType string
+			parameters    []byte
+		}{
+			{key: "bad-still-decimal-bit-depth", mimeType: "image/jpeg", parameters: replaceJSONOnce(t, valid, `"bit_depth":8`, `"bit_depth":8.0`)},
+			{key: "bad-animation-decimal-bit-depth", mimeType: "image/gif", parameters: replaceJSONOnce(t, gif, `"animation_output":{"format":"animated-webp","quality":80,"bit_depth":8}`, `"animation_output":{"format":"animated-webp","quality":80,"bit_depth":8.0}`)},
+			{key: "bad-video-decimal-bit-depth", mimeType: "video/mp4", parameters: replaceJSONOnce(t, video, `"bit_depth":10`, `"bit_depth":10.0`)},
+			{key: "bad-video-decimal-audio-bitrate", mimeType: "video/mp4", parameters: replaceJSONOnce(t, video, `"audio_bitrate_kbps":128`, `"audio_bitrate_kbps":128.0`)},
+			{key: "bad-overflow-numeric-exponent", mimeType: "video/mp4", parameters: replaceJSONOnce(t, video, `"crf":32`, `"crf":0e1073741824`)},
+		} {
+			expectBothReject(test.key, []string{test.mimeType}, "nmcp-media", 1, test.parameters)
+		}
+
+		exponentParameters := replaceJSONOnce(t, valid, `"bit_depth":8`, `"bit_depth":8e0`)
+		exponentDefinition := profile.Definition{
+			ID: newUUIDv4(t), Key: "jsonb-exponent", Version: 1,
+			InputMIMETypes: []string{"image/jpeg"}, Processor: "nmcp-media",
+			ParametersSchemaVersion: 1, Parameters: exponentParameters,
+		}
+		if err := profile.ValidateDraft(exponentDefinition); err != nil {
+			t.Fatalf("Go rejected integer exponent accepted by jsonb: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,$2,$3,'draft',$4,$5,$6,$7::jsonb)`, exponentDefinition.ID, exponentDefinition.Key,
+			exponentDefinition.Version, exponentDefinition.InputMIMETypes, exponentDefinition.Processor,
+			exponentDefinition.ParametersSchemaVersion, exponentDefinition.Parameters); err != nil {
+			t.Fatalf("PostgreSQL rejected jsonb-canonical integer exponent: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, exponentDefinition.ID); err != nil {
+			t.Fatalf("activate jsonb-canonical integer exponent profile: %v", err)
+		}
+
+		boundaryExponentParameters := replaceJSONOnce(t, video, `"crf":32`, `"crf":0e1073741823`)
+		boundaryExponentDefinition := profile.Definition{
+			ID: newUUIDv4(t), Key: "max-numeric-exponent", Version: 1,
+			InputMIMETypes: []string{"video/mp4"}, Processor: "nmcp-media",
+			ParametersSchemaVersion: 1, Parameters: boundaryExponentParameters,
+		}
+		if err := profile.ValidateDraft(boundaryExponentDefinition); err != nil {
+			t.Fatalf("Go rejected maximum PostgreSQL numeric exponent: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,$2,$3,'draft',$4,$5,$6,$7::jsonb)`, boundaryExponentDefinition.ID, boundaryExponentDefinition.Key,
+			boundaryExponentDefinition.Version, boundaryExponentDefinition.InputMIMETypes, boundaryExponentDefinition.Processor,
+			boundaryExponentDefinition.ParametersSchemaVersion, boundaryExponentDefinition.Parameters); err != nil {
+			t.Fatalf("PostgreSQL rejected maximum numeric exponent: %v", err)
+		}
+
+		maxVersionDefinition := profile.Definition{
+			ID: newUUIDv4(t), Key: "max-version", Version: math.MaxInt32,
+			InputMIMETypes: []string{"image/jpeg"}, Processor: "nmcp-media",
+			ParametersSchemaVersion: 1, Parameters: valid,
+		}
+		if err := profile.ValidateDraft(maxVersionDefinition); err != nil {
+			t.Fatalf("Go rejected PostgreSQL integer maximum version: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,$2,$3,'draft',$4,$5,$6,$7::jsonb)`, maxVersionDefinition.ID, maxVersionDefinition.Key,
+			maxVersionDefinition.Version, maxVersionDefinition.InputMIMETypes, maxVersionDefinition.Processor,
+			maxVersionDefinition.ParametersSchemaVersion, maxVersionDefinition.Parameters); err != nil {
+			t.Fatalf("PostgreSQL rejected maximum integer version: %v", err)
+		}
+		overflowVersionDefinition := maxVersionDefinition
+		overflowVersionDefinition.ID = newUUIDv4(t)
+		overflowVersionDefinition.Key = "overflow-version"
+		overflowVersionDefinition.Version = math.MaxInt32 + 1
+		if err := profile.ValidateDraft(overflowVersionDefinition); err == nil {
+			t.Fatal("Go accepted version beyond PostgreSQL integer range")
+		}
+		expectExecError(t, pool, `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,$2,$3,'draft',$4,$5,$6,$7::jsonb)`, overflowVersionDefinition.ID, overflowVersionDefinition.Key,
+			int64(overflowVersionDefinition.Version), overflowVersionDefinition.InputMIMETypes, overflowVersionDefinition.Processor,
+			overflowVersionDefinition.ParametersSchemaVersion, overflowVersionDefinition.Parameters)
 	})
 
 	t.Run("profile certification is an immutable option envelope", func(t *testing.T) {
@@ -215,6 +309,49 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 				id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
 				max_long_edge,minimum_setting,maximum_setting,evidence
 			) VALUES ($1,'nmcp-media',1,'image/jpeg','still','still-avif',4096,1,100,E'\x0B')`, newUUIDv4(t))
+	})
+
+	t.Run("animation and video activation require recipe-specific certifications", func(t *testing.T) {
+		pool := migratedIntegrationPool(t, databaseURL)
+		ctx := context.Background()
+		insertProfile := func(key, mimeType string) string {
+			t.Helper()
+			id := newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+				VALUES ($1,$2,1,'draft',ARRAY[$3],'nmcp-media',1,$4::jsonb)`,
+				id, key, mimeType, testProfileParametersForRecipe(t, mimeType, mimeType)); err != nil {
+				t.Fatalf("insert %s profile: %v", mimeType, err)
+			}
+			return id
+		}
+		certify := func(mimeType, sourceMode, outputKind string, minimum, maximum int) {
+			t.Helper()
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO profile_processor_certifications (
+					id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,
+					max_long_edge,minimum_setting,maximum_setting,evidence
+				) VALUES ($1,'nmcp-media',1,$2,$3,$4,4096,$5,$6,'isolated recipe-specific PostgreSQL fixture')`,
+				newUUIDv4(t), mimeType, sourceMode, outputKind, minimum, maximum); err != nil {
+				t.Fatalf("certify %s/%s: %v", mimeType, outputKind, err)
+			}
+		}
+
+		gifID := insertProfile("gif-certification", "image/gif")
+		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, gifID)
+		certify("image/gif", "probe-animation", "animation-webp", 1, 100)
+		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, gifID)
+		certify("image/gif", "probe-animation", "still-avif", 1, 100)
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, gifID); err != nil {
+			t.Fatalf("activate fully certified animation profile: %v", err)
+		}
+
+		videoID := insertProfile("video-certification", "video/mp4")
+		expectExecError(t, pool, `UPDATE profiles SET status='active' WHERE id=$1`, videoID)
+		certify("video/mp4", "video", "video-av1", 0, 63)
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, videoID); err != nil {
+			t.Fatalf("activate certified video profile: %v", err)
+		}
 	})
 
 	t.Run("media original uniqueness and checks", func(t *testing.T) {
@@ -789,9 +926,26 @@ func insertDraftProfile(t *testing.T, pool *pgxpool.Pool, key string, version in
 
 func testProfileParameters(t *testing.T) []byte {
 	t.Helper()
+	return testProfileParametersForRecipe(t, "image/jpeg", "image/jpeg")
+}
+
+func testProfileParametersForRecipe(t *testing.T, recipeKey, sourceMIMEType string) []byte {
+	t.Helper()
 	parameters := profile.StandardV1Parameters()
-	parameters.Recipes = map[string]profile.Recipe{"image/jpeg": parameters.Recipes["image/jpeg"]}
+	recipe, ok := parameters.Recipes[sourceMIMEType]
+	if !ok {
+		t.Fatalf("missing standard recipe fixture for %s", sourceMIMEType)
+	}
+	parameters.Recipes = map[string]profile.Recipe{recipeKey: recipe}
 	return mustJSON(t, parameters)
+}
+
+func replaceJSONOnce(t *testing.T, value []byte, old, replacement string) []byte {
+	t.Helper()
+	if strings.Count(string(value), old) != 1 {
+		t.Fatalf("JSON fixture contains %q %d times, want exactly once: %s", old, strings.Count(string(value), old), value)
+	}
+	return []byte(strings.Replace(string(value), old, replacement, 1))
 }
 
 func mustJSON(t *testing.T, value any) []byte {

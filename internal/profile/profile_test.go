@@ -114,6 +114,18 @@ func TestCustomKeyUsesSameValidation(t *testing.T) {
 	}
 }
 
+func TestDefinitionVersionMatchesPostgreSQLIntegerRange(t *testing.T) {
+	definition := StandardV1()
+	definition.Version = math.MaxInt32
+	if err := ValidateDraft(definition); err != nil {
+		t.Fatalf("ValidateDraft(max int32) error = %v", err)
+	}
+	definition.Version = math.MaxInt32 + 1
+	if err := ValidateDraft(definition); err == nil {
+		t.Fatal("ValidateDraft(max int32 + 1) error = nil")
+	}
+}
+
 func TestDefinitionValidationRejectsInvalidMetadataAndMIMEs(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -179,6 +191,53 @@ func TestStrictJSONRejectsUnknownMissingAndTrailingData(t *testing.T) {
 		if _, err := DecodeParameters([]byte(raw)); err == nil {
 			t.Errorf("case %d: DecodeParameters() error = nil", index)
 		}
+	}
+}
+
+func TestStrictJSONMatchesJSONBExponentCanonicalization(t *testing.T) {
+	definition, parameters := mutableStandard(t)
+	parameters.Recipes = map[string]Recipe{"image/jpeg": parameters.Recipes["image/jpeg"]}
+	definition.InputMIMETypes = []string{"image/jpeg"}
+	encoded := string(encodeForTest(t, parameters))
+	encoded = strings.Replace(encoded, `"max_long_edge":1920`, `"max_long_edge":192e1`, 1)
+	encoded = strings.Replace(encoded, `"quality":60`, `"quality":6e1`, 1)
+	encoded = strings.Replace(encoded, `"bit_depth":8`, `"bit_depth":8e0`, 1)
+	definition.Parameters = []byte(encoded)
+	if err := ValidateDraft(definition); err != nil {
+		t.Fatalf("ValidateDraft(jsonb-canonical exponent integers) error = %v", err)
+	}
+}
+
+func TestStrictJSONRejectsCaseVariantUnknownField(t *testing.T) {
+	definition, parameters := mutableStandard(t)
+	parameters.Recipes = map[string]Recipe{"image/jpeg": parameters.Recipes["image/jpeg"]}
+	definition.InputMIMETypes = []string{"image/jpeg"}
+	encoded := strings.Replace(string(encodeForTest(t, parameters)), `"quality":60`, `"quality":60,"Quality":60`, 1)
+	definition.Parameters = []byte(encoded)
+	if err := ValidateDraft(definition); err == nil {
+		t.Fatal("ValidateDraft(case-variant unknown field) error = nil")
+	}
+}
+
+func TestStrictJSONUsesJSONBLastDuplicateRecipesValue(t *testing.T) {
+	recipe, err := json.Marshal(StandardV1Parameters().Recipes["image/jpeg"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := StandardV1()
+	definition.InputMIMETypes = []string{"image/jpeg"}
+	definition.Parameters = []byte(`{"evidence_status":"provisional-unverified","recipes":{"image/jpeg":` + string(recipe) + `},"recipes":{}}`)
+	if err := ValidateDraft(definition); err == nil {
+		t.Fatal("ValidateDraft(duplicate recipes with empty last value) error = nil")
+	}
+}
+
+func TestStrictJSONRejectsExponentBeyondPostgreSQLNumericRange(t *testing.T) {
+	if _, err := decodeJSONBInteger(json.RawMessage(`0e1073741823`)); err != nil {
+		t.Fatalf("decodeJSONBInteger(max PostgreSQL exponent) error = %v", err)
+	}
+	if _, err := decodeJSONBInteger(json.RawMessage(`0e1073741824`)); err == nil {
+		t.Fatal("decodeJSONBInteger(over PostgreSQL exponent) error = nil")
 	}
 }
 

@@ -41,8 +41,8 @@ func validateDefinition(definition Definition, registry Registry, activation boo
 	if !keyPattern.MatchString(definition.Key) {
 		return Parameters{}, fmt.Errorf("key must match %s", keyPattern)
 	}
-	if definition.Version < 1 {
-		return Parameters{}, fmt.Errorf("version must be at least 1")
+	if definition.Version < 1 || definition.Version > math.MaxInt32 {
+		return Parameters{}, fmt.Errorf("version must be between 1 and %d", math.MaxInt32)
 	}
 	if definition.Processor != Processor {
 		return Parameters{}, fmt.Errorf("unknown processor %q", definition.Processor)

@@ -106,6 +106,27 @@ func TestMigratorIntegration(t *testing.T) {
 		assertProfileMigrationRolledBack(t, pool, 1)
 	})
 
+	t.Run("profile migration rejects decimal-form fixed integers", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:1]).Up(context.Background()); err != nil {
+			t.Fatalf("apply version one: %v", err)
+		}
+		decimalBitDepth := replaceJSONOnce(t, testProfileParameters(t), `"bit_depth":8`, `"bit_depth":8.0`)
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'legacy-decimal',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, newUUIDv4(t), decimalBitDepth); err != nil {
+			t.Fatalf("insert decimal-form legacy profile under version one: %v", err)
+		}
+		if err := full.Up(context.Background()); err == nil {
+			t.Fatal("profile migration accepted decimal-form fixed integer")
+		}
+		assertProfileMigrationRolledBack(t, pool, 1)
+	})
+
 	t.Run("profile migration rejects uncertified legacy active profile", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
 		full, err := NewMigrator(pool)
