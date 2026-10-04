@@ -202,9 +202,10 @@ func TestReadServiceIntegration(t *testing.T) {
 	t.Run("job lookups preserve UUID indexes", func(t *testing.T) {
 		const bulkMediaID = "82000000-0000-4000-8000-000000000001"
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,available_at,created_at,updated_at)
+			INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,available_at,started_at,finished_at,created_at,updated_at)
 			SELECT ('81000000-0000-4000-8000-' || lpad(to_hex(value),12,'0'))::uuid,
-			       'purge',$1::uuid,'queued',3,$2::timestamptz + value * interval '1 microsecond',
+			       'purge',$1::uuid,'succeeded',3,$2::timestamptz + value * interval '1 microsecond',
+			       $2::timestamptz + value * interval '1 microsecond',$2::timestamptz + value * interval '1 microsecond',
 			       $2::timestamptz + value * interval '1 microsecond',$2::timestamptz + value * interval '1 microsecond'
 			FROM generate_series(1,2048) AS value`, bulkMediaID, base.Add(4*time.Hour)); err != nil {
 			t.Fatal(err)
@@ -237,6 +238,73 @@ func TestReadServiceIntegration(t *testing.T) {
 			if profile.InputMIMETypes == nil || len(profile.InputMIMETypes) == 0 || len(profile.Parameters) == 0 || profile.Parameters[0] != '{' {
 				t.Fatalf("profile projection = %#v", profile)
 			}
+		}
+	})
+
+	t.Run("custom profile old current and duplicate-current diagnostics", func(t *testing.T) {
+		const (
+			standardV1 = "60000000-0000-4000-8000-000000000001"
+			standardV2 = "60000000-0000-4000-8000-000000000011"
+			customV1   = "60000000-0000-4000-8000-000000000012"
+		)
+		if _, err := pool.Exec(ctx, `INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			SELECT $1,'standard',2,'draft',input_mime_types,processor,parameters_schema_version,parameters
+			FROM profiles WHERE id=$2`, standardV2, standardV1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			SELECT $1,'custom',1,'draft',input_mime_types,processor,parameters_schema_version,parameters
+			FROM profiles WHERE id=$2`, customV1, standardV1); err != nil {
+			t.Fatal(err)
+		}
+		customRenditionID := integrationUUID(2201)
+		insertIntegrationRenditionForProfile(t, pool, media[1], integrationUUID(4201), integrationUUID(3201), customRenditionID, customV1, "custom", base.Add(5*time.Hour), true)
+		customRequest := NewMediaListRequest()
+		customRequest.Profile = "custom"
+		customPage, err := service.ListMedia(ctx, customRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var customFound bool
+		for _, item := range customPage.Items {
+			if item.ID == media[1].ID {
+				customFound = item.Rendition != nil && item.Rendition.ID == customRenditionID && item.Rendition.Profile.Key == "custom"
+			}
+		}
+		if !customFound {
+			t.Fatalf("custom profile current missing from page: %#v", customPage.Items)
+		}
+
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, standardV1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, standardV2); err != nil {
+			t.Fatal(err)
+		}
+		standardRequest := NewMediaListRequest()
+		standardPage, err := service.ListMedia(ctx, standardRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var oldCurrentFound bool
+		for _, item := range standardPage.Items {
+			if item.ID == media[0].ID && item.Rendition != nil {
+				oldCurrentFound = item.Rendition.Profile.ID == standardV1 && item.Rendition.Profile.Version == 1
+			}
+		}
+		if !oldCurrentFound {
+			t.Fatalf("standard v1 current disappeared after v2 activation: %#v", standardPage.Items)
+		}
+
+		if _, err := pool.Exec(ctx, `DROP INDEX renditions_one_current_key_idx`); err != nil {
+			t.Fatal(err)
+		}
+		insertIntegrationRenditionForProfile(t, pool, media[0], integrationUUID(4202), integrationUUID(3202), integrationUUID(2202), standardV2, "standard", base.Add(6*time.Hour), true)
+		if _, err := service.ListMedia(ctx, standardRequest); !IsKind(err, KindInvariant) {
+			t.Fatalf("duplicate current list error = %#v, want invariant", err)
+		}
+		if _, err := service.GetCurrentRendition(ctx, media[0].ID, "standard"); !IsKind(err, KindInvariant) {
+			t.Fatalf("duplicate current route error = %#v, want invariant", err)
 		}
 	})
 }
@@ -273,6 +341,10 @@ func insertIntegrationMedia(t *testing.T, pool *pgxpool.Pool, media integrationM
 }
 
 func insertIntegrationRendition(t *testing.T, pool *pgxpool.Pool, media integrationMedia, jobID, targetID, renditionID string, now time.Time) {
+	insertIntegrationRenditionForProfile(t, pool, media, jobID, targetID, renditionID, "60000000-0000-4000-8000-000000000001", "standard", now, true)
+}
+
+func insertIntegrationRenditionForProfile(t *testing.T, pool *pgxpool.Pool, media integrationMedia, jobID, targetID, renditionID, profileID, profileKey string, now time.Time, current bool) {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := pool.Begin(ctx)
@@ -280,7 +352,6 @@ func insertIntegrationRendition(t *testing.T, pool *pgxpool.Pool, media integrat
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	profileID := "60000000-0000-4000-8000-000000000001"
 	leaseID := integrationUUID(9001)
 	path := "renditions/" + media.OriginalID[:2] + "/" + media.OriginalID + "/" + targetID + "/" + renditionID + ".avif"
 	statements := []struct {
@@ -291,7 +362,7 @@ func insertIntegrationRendition(t *testing.T, pool *pgxpool.Pool, media integrat
 		{`INSERT INTO job_targets (id,job_id,profile_id,status,updated_at) VALUES ($1,$2,$3,'pending',$4)`, []any{targetID, jobID, profileID, now}},
 		{`UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=$3,started_at=$4,updated_at=$4 WHERE id=$1`, []any{jobID, leaseID, now.Add(time.Minute), now}},
 		{`UPDATE job_targets SET status='succeeded',attempts=1,updated_at=$2 WHERE id=$1`, []any{targetID, now}},
-		{`INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,created_at) VALUES ($1,$2,$3,'standard',true,$4,'image/avif',21,$5,$6)`, []any{renditionID, media.ID, targetID, path, integrationDigest(renditionID), now}},
+		{`INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,created_at) VALUES ($1,$2,$3,$4,$5,$6,'image/avif',21,$7,$8)`, []any{renditionID, media.ID, targetID, profileKey, current, path, integrationDigest(renditionID), now}},
 		{`UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=$2,updated_at=$2 WHERE id=$1`, []any{jobID, now}},
 	}
 	for _, statement := range statements {
