@@ -105,8 +105,8 @@ CREATE TABLE profile_processor_certifications (
     minimum_setting integer NOT NULL,
     maximum_setting integer NOT NULL CHECK (maximum_setting >= minimum_setting),
     evidence text NOT NULL CHECK (
-        btrim(evidence, E' \t\n\r\f\v') <> ''
-        AND btrim(evidence, E' \t\n\r\f\v') <> 'provisional-unverified'
+        btrim(evidence, E' \t\n\r\f\x0B') <> ''
+        AND btrim(evidence, E' \t\n\r\f\x0B') <> 'provisional-unverified'
     ),
     certified_at timestamptz NOT NULL DEFAULT statement_timestamp(),
     FOREIGN KEY (processor, parameters_schema_version, input_mime_type, source_mode)
