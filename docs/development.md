@@ -38,6 +38,7 @@ go test ./...
 go test -race ./...
 TEST_DATABASE_URL='postgres://...' go test -v -count=1 -run '^TestMigratorIntegration$' ./internal/database
 TEST_DATABASE_URL='postgres://...' go test -v -count=1 -run '^TestReadServiceIntegration$' ./internal/readapi
+TEST_DATABASE_URL='postgres://...' go test -v -count=1 -run '^TestReadHTTPPostgreSQLIntegration$' ./internal/httpapi
 ```
 
 `nmcp-admin migrate status` is read-only. It exits `4` when migrations are
