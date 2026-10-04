@@ -47,6 +47,8 @@ jobs:
         run: go build ./cmd/core-api ./cmd/core-worker ./cmd/nmcp-admin
       - name: Unit and local integration tests
         run: go test -count=1 ./...
+      - name: Explicit Linux storage durability evidence
+        run: go test -v -count=1 ./internal/storage
       - name: Race tests
         run: go test -race -count=1 ./...
       - name: Explicit PostgreSQL migration integration evidence

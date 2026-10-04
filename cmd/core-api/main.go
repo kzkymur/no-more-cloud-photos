@@ -16,6 +16,7 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/httpapi"
 	"github.com/kzkymur/no-more-cloud-photos/internal/lifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func main() {
@@ -51,10 +52,15 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	store, err := storage.Open(cfg.StorageRoot, storage.Options{})
+	if err != nil {
+		return fmt.Errorf("open storage: %w", err)
+	}
+	defer store.Close()
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewHandler(httpapi.Dependencies{Database: pool, Migrations: migrator, StorageRoot: cfg.StorageRoot}),
+		Handler:           httpapi.NewHandler(httpapi.Dependencies{Database: pool, Migrations: migrator, Storage: store}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,

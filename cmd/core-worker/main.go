@@ -12,6 +12,7 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/config"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func main() {
@@ -55,9 +56,13 @@ func run(ctx context.Context) error {
 	if !status.Ready() {
 		return fmt.Errorf("database migrations are not current")
 	}
-	info, err := os.Lstat(cfg.StorageRoot)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("storage root is unavailable")
+	store, err := storage.Open(cfg.StorageRoot, storage.Options{})
+	if err != nil {
+		return fmt.Errorf("storage root is unavailable: %w", err)
+	}
+	defer store.Close()
+	if err := store.Probe(ctx); err != nil {
+		return fmt.Errorf("storage root is unavailable: %w", err)
 	}
 	logger.LogAttrs(ctx, slog.LevelInfo, "core Worker ready", cfg.LogAttrs()...)
 	<-ctx.Done()

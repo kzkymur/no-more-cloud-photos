@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
+	corestorage "github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 type fakeDatabase struct {
@@ -31,6 +32,16 @@ type fakeMigrations struct {
 	calls  int
 }
 
+type fakeStorage struct {
+	err   error
+	calls int
+}
+
+func (f *fakeStorage) Probe(context.Context) error {
+	f.calls++
+	return f.err
+}
+
 func (f *fakeMigrations) Status(context.Context) (database.Status, error) {
 	f.calls++
 	return f.status, f.err
@@ -41,13 +52,18 @@ func readyHandler(t *testing.T) (http.Handler, *fakeDatabase, *fakeMigrations, s
 	db := &fakeDatabase{}
 	migrations := &fakeMigrations{}
 	root := t.TempDir()
-	return NewHandler(Dependencies{Database: db, Migrations: migrations, StorageRoot: root}), db, migrations, root
+	store, err := corestorage.Open(root, corestorage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return NewHandler(Dependencies{Database: db, Migrations: migrations, Storage: store}), db, migrations, root
 }
 
 func TestHealth(t *testing.T) {
 	db := &fakeDatabase{err: errors.New("must not be called")}
 	migrations := &fakeMigrations{err: errors.New("must not be called")}
-	h := NewHandler(Dependencies{Database: db, Migrations: migrations, StorageRoot: "/missing"})
+	h := NewHandler(Dependencies{Database: db, Migrations: migrations, Storage: &fakeStorage{err: errors.New("must not be called")}})
 
 	response := serve(h, http.MethodGet, "/healthz", "health-request")
 
@@ -79,13 +95,13 @@ func TestReadyDependencyFailures(t *testing.T) {
 		{
 			name: "missing database",
 			dependencies: func(t *testing.T) Dependencies {
-				return Dependencies{Migrations: &fakeMigrations{}, StorageRoot: t.TempDir()}
+				return Dependencies{Migrations: &fakeMigrations{}, Storage: &fakeStorage{}}
 			},
 		},
 		{
 			name: "missing migration checker",
 			dependencies: func(t *testing.T) Dependencies {
-				return Dependencies{Database: &fakeDatabase{}, StorageRoot: t.TempDir()}
+				return Dependencies{Database: &fakeDatabase{}, Storage: &fakeStorage{}}
 			},
 		},
 		{
@@ -97,52 +113,43 @@ func TestReadyDependencyFailures(t *testing.T) {
 		{
 			name: "database ping",
 			dependencies: func(t *testing.T) Dependencies {
-				return Dependencies{Database: &fakeDatabase{err: errors.New("password=secret host=private")}, Migrations: &fakeMigrations{}, StorageRoot: t.TempDir()}
+				return Dependencies{Database: &fakeDatabase{err: errors.New("password=secret host=private")}, Migrations: &fakeMigrations{}, Storage: &fakeStorage{}}
 			},
 		},
 		{
 			name: "migration status error",
 			dependencies: func(t *testing.T) Dependencies {
-				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{err: errors.New("migration SQL secret")}, StorageRoot: t.TempDir()}
+				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{err: errors.New("migration SQL secret")}, Storage: &fakeStorage{}}
 			},
 		},
 		{
 			name: "pending migrations",
 			dependencies: func(t *testing.T) Dependencies {
-				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{status: database.Status{Pending: true}}, StorageRoot: t.TempDir()}
+				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{status: database.Status{Pending: true}}, Storage: &fakeStorage{}}
 			},
 		},
 		{
 			name: "migration drift",
 			dependencies: func(t *testing.T) Dependencies {
-				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{status: database.Status{Drift: true, DriftReason: "sensitive SQL"}}, StorageRoot: t.TempDir()}
+				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{status: database.Status{Drift: true, DriftReason: "sensitive SQL"}}, Storage: &fakeStorage{}}
 			},
 		},
 		{
 			name: "missing storage root",
 			dependencies: func(t *testing.T) Dependencies {
-				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{}, StorageRoot: filepath.Join(t.TempDir(), "missing")}
+				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{}, Storage: &fakeStorage{err: os.ErrNotExist}}
 			},
 		},
 		{
 			name: "storage root is file",
 			dependencies: func(t *testing.T) Dependencies {
-				root := filepath.Join(t.TempDir(), "file")
-				if err := os.WriteFile(root, []byte("not a directory"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{}, StorageRoot: root}
+				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{}, Storage: &fakeStorage{err: os.ErrInvalid}}
 			},
 		},
 		{
 			name: "storage root is symlink",
 			dependencies: func(t *testing.T) Dependencies {
-				directory := t.TempDir()
-				root := filepath.Join(t.TempDir(), "root")
-				if err := os.Symlink(directory, root); err != nil {
-					t.Fatal(err)
-				}
-				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{}, StorageRoot: root}
+				return Dependencies{Database: &fakeDatabase{}, Migrations: &fakeMigrations{}, Storage: &fakeStorage{err: corestorage.ErrSymlink}}
 			},
 		},
 	}
