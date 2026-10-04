@@ -320,7 +320,7 @@ These routes expose no build secrets or dependency addresses.
 
 ## 9. File Server contract
 
-`file_url` is `https://<configured-file-host>/files/<file-key>`. The host is configured, never inferred from an untrusted request header. File keys are exactly:
+`file_url` is `NMCP_FILE_BASE_URL + <file-key>`. `NMCP_FILE_BASE_URL` is the configured absolute HTTPS File Server files root (for example, `https://photos.example.ts.net/files/`) and Core normalizes its trailing slash. Core does not add a `/files` segment: an origin-only URL such as `https://photos.example.ts.net` is invalid configuration. The URL is never inferred from an untrusted request header. File keys are exactly:
 
 ```text
 originals/{shard}/{original_id}/original.{ext}

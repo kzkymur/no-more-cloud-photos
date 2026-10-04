@@ -37,6 +37,7 @@ go vet ./...
 go test ./...
 go test -race ./...
 TEST_DATABASE_URL='postgres://...' go test -v -count=1 -run '^TestMigratorIntegration$' ./internal/database
+TEST_DATABASE_URL='postgres://...' go test -v -count=1 -run '^TestReadServiceIntegration$' ./internal/readapi
 ```
 
 `nmcp-admin migrate status` is read-only. It exits `4` when migrations are
@@ -65,7 +66,7 @@ transactional migrations, non-transactional execution, and recovery.
 |---|---:|---:|---:|---|
 | `NMCP_DATABASE_URL` | required | required | required | PostgreSQL DSN; secret, never logged. |
 | `NMCP_STORAGE_ROOT` | required | required | - | Absolute clean path; never logged. |
-| `NMCP_FILE_BASE_URL` | required | - | - | Absolute HTTPS URL without credentials, query, or fragment. |
+| `NMCP_FILE_BASE_URL` | required | - | - | Absolute HTTPS File Server files root with a non-root path, e.g. `https://photos.example.ts.net/files`; trailing slash is normalized. Core appends the canonical storage key directly and never inserts `/files`. No credentials, query, fragment, dot/empty segments, or encoded path ambiguity. |
 | `NMCP_CURSOR_HMAC_KEY` | required | - | - | At least 32 bytes; secret, never logged. |
 | `NMCP_API_ADDR` | optional | - | - | `127.0.0.1:8080`; explicit host and valid port. |
 | `NMCP_LOG_LEVEL` | optional | optional | optional | `info`; one of `debug`, `info`, `warn`, `error`. |
@@ -78,6 +79,22 @@ uses exclusive create, write, file sync, no-replace rename, directory sync,
 unlink, and deletion-directory sync beneath the pinned non-symlink root. Worker
 startup uses the same probe. Dependency failures return only the stable
 `unavailable` error and do not expose DSNs, paths, or SQL details.
+
+For example, with `NMCP_FILE_BASE_URL=https://photos.example.ts.net/files`,
+the stored key `originals/ab/<original-id>/original.jpg` is returned as
+`https://photos.example.ts.net/files/originals/ab/<original-id>/original.jpg`.
+The corresponding Nginx URI namespaces map to the storage namespaces without
+another `files` component:
+
+```nginx
+# URI-to-storage-root mapping only; issue #20 owns the complete hardened config.
+location /files/originals/  { alias /var/lib/nmcp/media/originals/; }
+location /files/renditions/ { alias /var/lib/nmcp/media/renditions/; }
+```
+
+The production configuration must additionally implement the method, Range,
+cache, directory, traversal, malformed-escape, and symlink rules in the File
+Server contract; the abbreviated mapping above is not a deployable substitute.
 
 ## Storage durability boundary
 
