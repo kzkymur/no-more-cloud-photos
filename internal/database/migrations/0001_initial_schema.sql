@@ -36,29 +36,29 @@ STRICT
 RETURN value = lower(value)
    AND value ~ '^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$';
 
-CREATE FUNCTION nmcp_valid_mime_types(values text[])
+CREATE FUNCTION nmcp_valid_mime_types(mime_values text[])
 RETURNS boolean
 LANGUAGE sql
 IMMUTABLE
 STRICT
-RETURN cardinality(values) > 0
-   AND array_position(values, NULL) IS NULL
+RETURN cardinality(mime_values) > 0
+   AND array_position(mime_values, NULL) IS NULL
    AND NOT EXISTS (
-       SELECT 1 FROM unnest(values) AS mime(value)
+       SELECT 1 FROM unnest(mime_values) AS mime(value)
        WHERE NOT nmcp_is_mime_type(mime.value)
    )
-   AND cardinality(values) = (
-       SELECT count(DISTINCT mime.value) FROM unnest(values) AS mime(value)
+   AND cardinality(mime_values) = (
+       SELECT count(DISTINCT mime.value) FROM unnest(mime_values) AS mime(value)
    );
 
-CREATE FUNCTION nmcp_valid_relative_paths(values text[])
+CREATE FUNCTION nmcp_valid_relative_paths(path_values text[])
 RETURNS boolean
 LANGUAGE sql
 IMMUTABLE
 STRICT
-RETURN array_position(values, NULL) IS NULL
+RETURN array_position(path_values, NULL) IS NULL
    AND NOT EXISTS (
-       SELECT 1 FROM unnest(values) AS path(value)
+       SELECT 1 FROM unnest(path_values) AS path(value)
        WHERE NOT nmcp_is_relative_path(path.value)
    );
 
