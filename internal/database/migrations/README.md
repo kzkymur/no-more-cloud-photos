@@ -22,5 +22,8 @@ rerun after an interrupted attempt. The migrator rejects explicit transaction
 control in every migration and rejects transaction-off files without that
 explicit idempotence marker.
 
-Issue #4 owns the initial schema, so this directory intentionally contains no SQL
-migrations yet.
+`0001_initial_schema.sql` is the transactional, forward-only Core metadata
+baseline. It creates the relational invariants and singleton configuration/feed/
+maintenance seeds. It deliberately creates no profile rows: complete bundled
+profile recipes are owned by issue #6, after processor/schema capability
+validation exists.

@@ -34,8 +34,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 0 || !status.Ready() {
-			t.Fatalf("Status() = %+v, want ready version zero", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 1 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version one", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -54,7 +54,19 @@ func TestMigratorIntegration(t *testing.T) {
 		if !historyExists {
 			t.Fatal("Up() did not create schema_migrations")
 		}
+		status, err = migrator.Status(context.Background())
+		if err != nil {
+			t.Fatalf("Status() after Up error = %v", err)
+		}
+		if status.CurrentVersion != 1 || status.ExpectedVersion != 1 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version one", status)
+		}
+		if err := migrator.Up(context.Background()); err != nil {
+			t.Fatalf("second Up() error = %v", err)
+		}
 	})
+
+	runInitialSchemaIntegrationTests(t, databaseURL)
 
 	t.Run("concurrent Up calls serialize", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
