@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
+	"github.com/kzkymur/no-more-cloud-photos/internal/readapi"
 	"github.com/kzkymur/no-more-cloud-photos/internal/upload"
 )
 
@@ -51,12 +52,25 @@ type UploadAcceptor interface {
 	Accept(context.Context, upload.Request) (upload.Outcome, error)
 }
 
+// ReadService is the read capability required by the HTTP API.
+type ReadService interface {
+	ListMedia(context.Context, readapi.MediaListRequest) (readapi.MediaPage, error)
+	GetMedia(context.Context, string) (readapi.MediaDetail, error)
+	GetOriginal(context.Context, string) (readapi.Original, error)
+	GetCurrentRendition(context.Context, string, string) (readapi.Rendition, error)
+	GetRendition(context.Context, string) (readapi.Rendition, error)
+	ListJobs(context.Context, readapi.JobListRequest) (readapi.JobPage, error)
+	GetJob(context.Context, string) (readapi.Job, error)
+	ListProfiles(context.Context, readapi.ProfileListRequest) (readapi.ProfilePage, error)
+}
+
 // Dependencies contains the services used by the HTTP API.
 type Dependencies struct {
 	Database   DatabasePinger
 	Migrations MigrationChecker
 	Storage    StorageProber
 	Upload     UploadAcceptor
+	Reads      ReadService
 }
 
 type handler struct {
@@ -121,9 +135,21 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.ready(w, r, requestID)
 	case "/media":
-		if r.Method != http.MethodPost {
+		if r.URL.RawPath != "" {
+			closeIfDeclaredBody(w, r)
+			writeError(w, http.StatusNotFound, "not_found", "route not found", requestID)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			h.read(w, r, requestID, readRoute{kind: readMediaList})
+			return
+		case http.MethodPost:
+		case http.MethodHead:
+			fallthrough
+		default:
 			closeUploadConnection(w, r)
-			h.methodNotAllowed(w, requestID, http.MethodPost)
+			h.methodNotAllowed(w, requestID, http.MethodGet+", "+http.MethodPost)
 			return
 		}
 		if !acceptsJSON(r.Header.Get("Accept")) {
@@ -133,6 +159,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.upload(w, r, requestID)
 	default:
+		if route, ok := matchReadRoute(r.URL.Path); ok && r.URL.RawPath == "" {
+			if r.Method != http.MethodGet {
+				closeUploadConnection(w, r)
+				h.methodNotAllowed(w, requestID, http.MethodGet)
+				return
+			}
+			h.read(w, r, requestID, route)
+			return
+		}
+		closeIfDeclaredBody(w, r)
 		writeError(w, http.StatusNotFound, "not_found", "route not found", requestID)
 	}
 }

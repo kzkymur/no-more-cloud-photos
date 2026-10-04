@@ -593,10 +593,10 @@ func TestUploadFailureUsesServiceBodyWithoutCause(t *testing.T) {
 func TestUploadMethodsAndNegotiation(t *testing.T) {
 	acceptor := &fakeUploadAcceptor{}
 	h := NewHandler(Dependencies{Upload: acceptor})
-	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodHead} {
+	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodHead} {
 		response := serve(h, method, "/media", "method-request")
 		assertResponse(t, response, http.StatusMethodNotAllowed, "method-request")
-		if response.Header().Get("Allow") != http.MethodPost {
+		if response.Header().Get("Allow") != http.MethodGet+", "+http.MethodPost {
 			t.Fatalf("Allow = %q", response.Header().Get("Allow"))
 		}
 	}
