@@ -199,6 +199,32 @@ func TestReadServiceIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("job lookups preserve UUID indexes", func(t *testing.T) {
+		const bulkMediaID = "82000000-0000-4000-8000-000000000001"
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,available_at,created_at,updated_at)
+			SELECT ('81000000-0000-4000-8000-' || lpad(to_hex(value),12,'0'))::uuid,
+			       'purge',$1::uuid,'queued',3,$2::timestamptz + value * interval '1 microsecond',
+			       $2::timestamptz + value * interval '1 microsecond',$2::timestamptz + value * interval '1 microsecond'
+			FROM generate_series(1,2048) AS value`, bulkMediaID, base.Add(4*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `ANALYZE jobs`); err != nil {
+			t.Fatal(err)
+		}
+
+		idPlan := integrationExplain(t, pool, jobHeadersSQL,
+			"81000000-0000-4000-8000-000000000001", "", nil, false, nil, nil, 1)
+		if !strings.Contains(idPlan, "jobs_pkey") {
+			t.Fatalf("job ID plan does not use jobs_pkey:\n%s", idPlan)
+		}
+		mediaPlan := integrationExplain(t, pool, jobHeadersSQL,
+			nil, "", bulkMediaID, false, nil, nil, 13)
+		if !strings.Contains(mediaPlan, "jobs_media_list_idx") {
+			t.Fatalf("job media plan does not use jobs_media_list_idx:\n%s", mediaPlan)
+		}
+	})
+
 	t.Run("profiles preserve arrays raw JSON and ordering", func(t *testing.T) {
 		page, err := service.ListProfiles(ctx, ProfileListRequest{Status: ProfileDraft})
 		if err != nil {
@@ -288,6 +314,28 @@ func integrationDigest(value string) string {
 }
 
 func timePointer(value time.Time) *time.Time { return &value }
+
+func integrationExplain(t *testing.T, pool *pgxpool.Pool, query string, arguments ...any) string {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), "EXPLAIN (COSTS OFF) "+query, arguments...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(line)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return plan.String()
+}
 
 func readIntegrationPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()

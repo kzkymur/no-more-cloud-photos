@@ -437,7 +437,7 @@ type jobQuery struct {
 }
 
 func (s *Service) jobHeaders(ctx context.Context, tx pgx.Tx, query jobQuery) ([]Job, error) {
-	rows, err := tx.Query(ctx, jobHeadersSQL, query.ID, query.Status, query.MediaID, query.HasCursor, nullableTime(query.HasCursor, query.CreatedAt), nullableCursorID(query.HasCursor, query.CursorID), query.Limit)
+	rows, err := tx.Query(ctx, jobHeadersSQL, nullableUUID(query.ID), query.Status, nullableUUID(query.MediaID), query.HasCursor, nullableTime(query.HasCursor, query.CreatedAt), nullableCursorID(query.HasCursor, query.CursorID), query.Limit)
 	if err != nil {
 		return nil, classifyDatabaseError(err)
 	}
@@ -470,6 +470,13 @@ func (s *Service) jobHeaders(ctx context.Context, tx pgx.Tx, query jobQuery) ([]
 
 func nullableTime(ok bool, value time.Time) any {
 	if !ok {
+		return nil
+	}
+	return value
+}
+
+func nullableUUID(value string) any {
+	if value == "" {
 		return nil
 	}
 	return value
@@ -756,7 +763,7 @@ const jobHeadersSQL = `
 	SELECT j.id::text,j.type,j.status,j.media_id_snapshot::text,j.original_id::text,j.attempts,j.max_attempts,
 	       j.available_at,j.started_at,j.finished_at,j.error_code,j.error_message,j.cancelled_at,j.cancel_reason,j.created_at,j.updated_at
 	FROM jobs j
-	WHERE ($1::text='' OR j.id::text=$1) AND ($2::text='' OR j.status=$2) AND ($3::text='' OR j.media_id_snapshot::text=$3)
+	WHERE ($1::uuid IS NULL OR j.id=$1::uuid) AND ($2::text='' OR j.status=$2) AND ($3::uuid IS NULL OR j.media_id_snapshot=$3::uuid)
 	  AND ` + jobsCursorPredicate + `
 	ORDER BY j.created_at DESC,j.id DESC LIMIT $7`
 
