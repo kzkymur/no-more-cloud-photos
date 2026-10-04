@@ -77,17 +77,17 @@ func normalizeFileBaseURL(value string) (string, error) {
 	return parsed.String(), nil
 }
 
-func (s *Service) originalURL(relativePath string) (string, error) {
+func (s *Service) originalURL(relativePath, expectedOriginalID string) (string, error) {
 	key, err := storage.ParseOriginalKey(relativePath)
-	if err != nil {
+	if err != nil || key.OriginalID().String() != expectedOriginalID {
 		return "", NewInvariantError(errors.New("stored original key is invalid"))
 	}
 	return s.fileBaseURL + key.String(), nil
 }
 
-func (s *Service) renditionURL(relativePath string) (string, error) {
+func (s *Service) renditionURL(relativePath, expectedOriginalID, expectedTargetID, expectedRenditionID string) (string, error) {
 	key, err := storage.ParseRenditionKey(relativePath)
-	if err != nil {
+	if err != nil || key.OriginalID().String() != expectedOriginalID || key.JobTargetID().String() != expectedTargetID || key.RenditionID().String() != expectedRenditionID {
 		return "", NewInvariantError(errors.New("stored rendition key is invalid"))
 	}
 	return s.fileBaseURL + key.String(), nil
@@ -154,7 +154,7 @@ func (s *Service) scanMediaRows(rows pgx.Rows, expectedProfile string) ([]MediaS
 		if err := rows.Scan(
 			&item.ID, &item.MIMEType, &item.OriginalFilename, &item.SizeBytes, &item.Width, &item.Height, &item.DurationMS,
 			&item.TakenAt, &item.TakenAtSource, &item.TakenAtTimezone, &item.CreatedAt, &item.DeletedAt, &item.PurgeAfter,
-			&rendition.ID, &rendition.MediaID, &rendition.JobTargetID, &rendition.ProfileKey, &rendition.ProfileID,
+			&rendition.ID, &rendition.MediaID, &rendition.JobTargetID, &rendition.OriginalID, &rendition.ProfileKey, &rendition.ProfileID,
 			&rendition.JoinedProfileKey, &rendition.ProfileVersion, &rendition.MIMEType, &rendition.SizeBytes,
 			&rendition.Width, &rendition.Height, &rendition.DurationMS, &rendition.SHA256, &rendition.RelativePath, &rendition.CreatedAt,
 		); err != nil {
@@ -248,7 +248,7 @@ func (s *Service) GetOriginal(ctx context.Context, mediaID string) (Original, er
 	if storedMediaID == nil || mimeType == nil || size == nil || sha == nil || relativePath == nil || created == nil || !IsUUIDv4(*id) || !IsUUIDv4(*storedMediaID) || *storedMediaID != mediaID || *size < 0 || !validSHA256(*sha) {
 		return Original{}, NewInvariantError(errors.New("inconsistent original row"))
 	}
-	fileURL, err := s.originalURL(*relativePath)
+	fileURL, err := s.originalURL(*relativePath, *id)
 	if err != nil {
 		return Original{}, err
 	}
@@ -585,20 +585,20 @@ func (s *Service) withReadTransaction(ctx context.Context, operation func(pgx.Tx
 }
 
 type nullableRendition struct {
-	ID, MediaID, JobTargetID, ProfileKey, ProfileID, JoinedProfileKey *string
-	ProfileVersion                                                    *int
-	MIMEType                                                          *string
-	SizeBytes                                                         *int64
-	Width, Height                                                     *int
-	DurationMS                                                        *int64
-	SHA256, RelativePath                                              *string
-	CreatedAt                                                         *time.Time
+	ID, MediaID, JobTargetID, OriginalID, ProfileKey, ProfileID, JoinedProfileKey *string
+	ProfileVersion                                                                *int
+	MIMEType                                                                      *string
+	SizeBytes                                                                     *int64
+	Width, Height                                                                 *int
+	DurationMS                                                                    *int64
+	SHA256, RelativePath                                                          *string
+	CreatedAt                                                                     *time.Time
 }
 
 type rowScanner interface{ Scan(...any) error }
 
 func scanNullableRendition(scanner rowScanner, row *nullableRendition) error {
-	return scanner.Scan(&row.ID, &row.MediaID, &row.JobTargetID, &row.ProfileKey, &row.ProfileID, &row.JoinedProfileKey,
+	return scanner.Scan(&row.ID, &row.MediaID, &row.JobTargetID, &row.OriginalID, &row.ProfileKey, &row.ProfileID, &row.JoinedProfileKey,
 		&row.ProfileVersion, &row.MIMEType, &row.SizeBytes, &row.Width, &row.Height, &row.DurationMS,
 		&row.SHA256, &row.RelativePath, &row.CreatedAt)
 }
@@ -610,13 +610,13 @@ func (s *Service) buildRendition(row nullableRendition, expectedMediaID, expecte
 		}
 		return nil, nil
 	}
-	if row.MediaID == nil || row.JobTargetID == nil || row.ProfileKey == nil || row.ProfileID == nil || row.JoinedProfileKey == nil || row.ProfileVersion == nil || row.MIMEType == nil || row.SizeBytes == nil || row.SHA256 == nil || row.RelativePath == nil || row.CreatedAt == nil {
+	if row.MediaID == nil || row.JobTargetID == nil || row.OriginalID == nil || row.ProfileKey == nil || row.ProfileID == nil || row.JoinedProfileKey == nil || row.ProfileVersion == nil || row.MIMEType == nil || row.SizeBytes == nil || row.SHA256 == nil || row.RelativePath == nil || row.CreatedAt == nil {
 		return nil, NewInvariantError(errors.New("partially null rendition row"))
 	}
-	if !IsUUIDv4(*row.ID) || !IsUUIDv4(*row.MediaID) || !IsUUIDv4(*row.JobTargetID) || !IsUUIDv4(*row.ProfileID) || !validProfileKey(*row.ProfileKey) || *row.ProfileVersion < 1 || *row.ProfileKey != *row.JoinedProfileKey || *row.SizeBytes < 0 || !validSHA256(*row.SHA256) || (row.Width == nil) != (row.Height == nil) || (row.DurationMS != nil && *row.DurationMS < 0) || (expectedMediaID != "" && *row.MediaID != expectedMediaID) || (expectedProfileKey != "" && *row.ProfileKey != expectedProfileKey) {
+	if !IsUUIDv4(*row.ID) || !IsUUIDv4(*row.MediaID) || !IsUUIDv4(*row.JobTargetID) || !IsUUIDv4(*row.OriginalID) || !IsUUIDv4(*row.ProfileID) || !validProfileKey(*row.ProfileKey) || *row.ProfileVersion < 1 || *row.ProfileKey != *row.JoinedProfileKey || *row.SizeBytes < 0 || !validSHA256(*row.SHA256) || (row.Width == nil) != (row.Height == nil) || (row.DurationMS != nil && *row.DurationMS < 0) || (expectedMediaID != "" && *row.MediaID != expectedMediaID) || (expectedProfileKey != "" && *row.ProfileKey != expectedProfileKey) {
 		return nil, NewInvariantError(errors.New("inconsistent rendition provenance"))
 	}
-	fileURL, err := s.renditionURL(*row.RelativePath)
+	fileURL, err := s.renditionURL(*row.RelativePath, *row.OriginalID, *row.JobTargetID, *row.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -630,7 +630,7 @@ func (s *Service) buildRendition(row nullableRendition, expectedMediaID, expecte
 }
 
 func (row nullableRendition) anyPresent() bool {
-	return row.MediaID != nil || row.JobTargetID != nil || row.ProfileKey != nil || row.ProfileID != nil || row.JoinedProfileKey != nil || row.ProfileVersion != nil || row.MIMEType != nil || row.SizeBytes != nil || row.Width != nil || row.Height != nil || row.DurationMS != nil || row.SHA256 != nil || row.RelativePath != nil || row.CreatedAt != nil
+	return row.MediaID != nil || row.JobTargetID != nil || row.OriginalID != nil || row.ProfileKey != nil || row.ProfileID != nil || row.JoinedProfileKey != nil || row.ProfileVersion != nil || row.MIMEType != nil || row.SizeBytes != nil || row.Width != nil || row.Height != nil || row.DurationMS != nil || row.SHA256 != nil || row.RelativePath != nil || row.CreatedAt != nil
 }
 
 func normalizeMediaSummary(item *MediaSummary) {
@@ -710,7 +710,7 @@ func classifyDatabaseError(err error) error {
 	}
 	var pgError *pgconn.PgError
 	if errors.As(err, &pgError) {
-		if strings.HasPrefix(pgError.Code, "08") || strings.HasPrefix(pgError.Code, "40") || pgError.Code == "55P03" || pgError.Code == "57014" {
+		if strings.HasPrefix(pgError.Code, "08") || strings.HasPrefix(pgError.Code, "40") || strings.HasPrefix(pgError.Code, "53") || pgError.Code == "55P03" || pgError.Code == "57014" || pgError.Code == "57P01" || pgError.Code == "57P02" || pgError.Code == "57P03" {
 			return NewDatabaseUnavailableError(err)
 		}
 	}
@@ -722,7 +722,7 @@ const mediaProjection = `
 	m.taken_at,m.taken_at_source,m.taken_at_timezone,m.created_at,m.deleted_at,m.purge_after`
 
 const nullableRenditionProjection = `
-	r.id::text,r.media_id::text,r.job_target_id::text,r.profile_key,p.id::text,p.key,p.version,
+	r.id::text,r.media_id::text,r.job_target_id::text,j.original_id::text,r.profile_key,p.id::text,p.key,p.version,
 	r.mime_type,r.size_bytes,r.width,r.height,r.duration_ms,r.sha256,r.relative_path,r.created_at`
 
 const mediaListSQL = `
@@ -731,6 +731,7 @@ const mediaListSQL = `
 	JOIN originals o ON o.media_id=m.id
 	LEFT JOIN renditions r ON r.media_id=m.id AND r.profile_key=$1 AND r.is_current
 	LEFT JOIN job_targets jt ON jt.id=r.job_target_id
+	LEFT JOIN jobs j ON j.id=jt.job_id
 	LEFT JOIN profiles p ON p.id=jt.profile_id
 	WHERE ($2::text='include' OR ($2::text='exclude' AND m.deleted_at IS NULL) OR ($2::text='only' AND m.deleted_at IS NOT NULL))
 	  AND ` + mediaCursorPredicate + `
@@ -746,17 +747,18 @@ const currentRenditionSQL = `
 	FROM media m
 	LEFT JOIN renditions r ON r.media_id=m.id AND r.profile_key=$2 AND r.is_current
 	LEFT JOIN job_targets jt ON jt.id=r.job_target_id
+	LEFT JOIN jobs j ON j.id=jt.job_id
 	LEFT JOIN profiles p ON p.id=jt.profile_id
 	WHERE m.id=$1`
 
 const renditionByIDSQL = `
 	SELECT ` + nullableRenditionProjection + `
-	FROM renditions r LEFT JOIN job_targets jt ON jt.id=r.job_target_id LEFT JOIN profiles p ON p.id=jt.profile_id
+	FROM renditions r LEFT JOIN job_targets jt ON jt.id=r.job_target_id LEFT JOIN jobs j ON j.id=jt.job_id LEFT JOIN profiles p ON p.id=jt.profile_id
 	WHERE r.id=$1`
 
 const allCurrentRenditionsSQL = `
 	SELECT ` + nullableRenditionProjection + `
-	FROM renditions r LEFT JOIN job_targets jt ON jt.id=r.job_target_id LEFT JOIN profiles p ON p.id=jt.profile_id
+	FROM renditions r LEFT JOIN job_targets jt ON jt.id=r.job_target_id LEFT JOIN jobs j ON j.id=jt.job_id LEFT JOIN profiles p ON p.id=jt.profile_id
 	WHERE r.media_id=$1 AND r.is_current ORDER BY r.profile_key ASC`
 
 const jobHeadersSQL = `

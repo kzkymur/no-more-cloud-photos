@@ -43,7 +43,7 @@ func TestNormalizeFileBaseURL(t *testing.T) {
 func TestFileURLUsesConfiguredRootAndCanonicalTypedKey(t *testing.T) {
 	service := &Service{fileBaseURL: "https://files.example/prefix/files/"}
 	originalKey := "originals/10/10000000-0000-4000-8000-000000000005/original.jpg"
-	got, err := service.originalURL(originalKey)
+	got, err := service.originalURL(originalKey, testIDs[4])
 	if err != nil || got != "https://files.example/prefix/files/"+originalKey {
 		t.Fatalf("originalURL() = %q, %v", got, err)
 	}
@@ -52,11 +52,14 @@ func TestFileURLUsesConfiguredRootAndCanonicalTypedKey(t *testing.T) {
 	}
 
 	for _, key := range []string{"/etc/passwd", "originals/../../secret", "originals%2fsecret", "originals/10/not-an-id/original.jpg"} {
-		if _, err := service.originalURL(key); !IsKind(err, KindInvariant) {
+		if _, err := service.originalURL(key, testIDs[4]); !IsKind(err, KindInvariant) {
 			t.Errorf("originalURL(%q) error = %#v, want invariant", key, err)
 		}
 	}
-	if _, err := service.renditionURL("/var/lib/nmcp/output.avif"); !IsKind(err, KindInvariant) {
+	if _, err := service.originalURL(originalKey, testIDs[0]); !IsKind(err, KindInvariant) {
+		t.Fatalf("valid key for another original error = %#v, want invariant", err)
+	}
+	if _, err := service.renditionURL("/var/lib/nmcp/output.avif", testIDs[4], testIDs[3], testIDs[1]); !IsKind(err, KindInvariant) {
 		t.Fatalf("absolute rendition path error = %#v, want invariant", err)
 	}
 }
@@ -91,7 +94,7 @@ func TestBuildRenditionRejectsNullableAndProvenanceInconsistency(t *testing.T) {
 	sha := sixtyFourZeroes
 	path := "renditions/10/10000000-0000-4000-8000-000000000005/00000000-0000-4000-b000-000000000004/00000000-0000-4000-9000-000000000002.avif"
 	valid := nullableRendition{
-		ID: &testIDs[1], MediaID: &testIDs[0], JobTargetID: &testIDs[3], ProfileKey: &profileKey,
+		ID: &testIDs[1], MediaID: &testIDs[0], JobTargetID: &testIDs[3], OriginalID: &testIDs[4], ProfileKey: &profileKey,
 		ProfileID: &testIDs[2], JoinedProfileKey: &profileKey, ProfileVersion: &version, MIMEType: &mimeType,
 		SizeBytes: &size, SHA256: &sha, RelativePath: &path, CreatedAt: &now,
 	}
@@ -116,10 +119,16 @@ func TestBuildRenditionRejectsNullableAndProvenanceInconsistency(t *testing.T) {
 	if _, err := service.buildRendition(invalidPath, "", ""); !IsKind(err, KindInvariant) {
 		t.Fatalf("path error = %#v, want invariant", err)
 	}
+	wrongObjectPath := valid
+	otherRenditionPath := "renditions/10/10000000-0000-4000-8000-000000000005/00000000-0000-4000-b000-000000000004/00000000-0000-4000-8000-000000000001.avif"
+	wrongObjectPath.RelativePath = &otherRenditionPath
+	if _, err := service.buildRendition(wrongObjectPath, "", ""); !IsKind(err, KindInvariant) {
+		t.Fatalf("valid key for another rendition error = %#v, want invariant", err)
+	}
 }
 
 func TestDatabaseErrorClassification(t *testing.T) {
-	for _, code := range []string{"08006", "40001", "55P03", "57014"} {
+	for _, code := range []string{"08006", "40001", "53000", "53100", "53200", "53300", "53400", "55P03", "57014", "57P01", "57P02", "57P03"} {
 		err := classifyDatabaseError(&pgconn.PgError{Code: code})
 		if !IsKind(err, KindDatabaseUnavailable) {
 			t.Errorf("SQLSTATE %s classified as %#v", code, err)
