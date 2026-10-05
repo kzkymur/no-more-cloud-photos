@@ -33,6 +33,8 @@ func TestNativeAnimationHelper(t *testing.T) {
 	webpFixture := requiredTestPath(t, "TEST_ANIMATION_WEBP_PATH")
 	reference := requiredTestPath(t, "TEST_ANIMATION_WEBP_REFERENCE_PATH")
 	avifReference := requiredTestPath(t, "TEST_STILL_AVIF_REFERENCE_PATH")
+	gifBackground := requiredTestPath(t, "TEST_ANIMATION_GIF_BACKGROUND_PATH")
+	gifPrevious := requiredTestPath(t, "TEST_ANIMATION_GIF_PREVIOUS_PATH")
 	processor, err := New(Config{Helper: helper, Prlimit: "/usr/bin/prlimit", SRGBICC: icc,
 		SRGBICCSHA256: "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"})
 	if err != nil {
@@ -177,7 +179,7 @@ func TestNativeAnimationHelper(t *testing.T) {
 	if _, err := processor.Transform(context.Background(), Request{Input: gif, Output: gifOutput, MIMEType: "image/gif", Recipe: standardRecipe()}); err != nil {
 		t.Fatal(err)
 	}
-	assertReferenceWebP(t, reference, gifOutput.Name(), referenceWebP{Width: 1, Height: 1, Frames: 1, TotalPlays: 1, DurationsMS: []int{100}, TimestampsMS: []int{100}})
+	assertReferenceWebP(t, reference, gifOutput.Name(), referenceWebP{Width: 1, Height: 1, Frames: 1, TotalPlays: 1, DurationsMS: []int{100}, TransparentPixels: []uint64{1}, AlphaSums: []uint64{0}, TimestampsMS: []int{100}})
 	staticWebP, err := os.Open(gifOutput.Name())
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +241,33 @@ func TestNativeAnimationHelper(t *testing.T) {
 			t.Fatalf("corrupt %s error = %v", mimeType, err)
 		}
 	}
+	for name, test := range map[string]struct {
+		path               string
+		transparent, alpha []uint64
+	}{
+		"background disposal": {path: gifBackground, transparent: []uint64{0, 0, 1}, alpha: []uint64{765, 765, 510}},
+		"previous disposal":   {path: gifPrevious, transparent: []uint64{0, 0, 0}, alpha: []uint64{765, 765, 765}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			file, err := os.Open(test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			got, err := processor.Inspect(context.Background(), InspectRequest{Input: file, MIMEType: "image/gif"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got.FrameDurationsMS, []int{40, 100, 250}) || got.TotalPlays != 1 {
+				t.Fatalf("GIF inspection = %+v", got)
+			}
+			output := createOutput(t, name+".webp")
+			if _, err := processor.Transform(context.Background(), Request{Input: file, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()}); err != nil {
+				t.Fatal(err)
+			}
+			assertReferenceWebP(t, reference, output.Name(), referenceWebP{Width: 3, Height: 1, Frames: 3, TotalPlays: 1, DurationsMS: []int{40, 100, 250}, TransparentPixels: test.transparent, AlphaSums: test.alpha, TimestampsMS: []int{40, 140, 390}})
+		})
+	}
 }
 
 func assertReferenceWebP(t *testing.T, executable, path string, want referenceWebP) {
@@ -257,7 +286,7 @@ func assertReferenceWebP(t *testing.T, executable, path string, want referenceWe
 	if !slices.Equal(got.TimestampsMS, want.TimestampsMS) {
 		t.Fatalf("reference timestamps = %v, want %v", got.TimestampsMS, want.TimestampsMS)
 	}
-	if len(got.TransparentPixels) != got.Frames || !slices.ContainsFunc(got.TransparentPixels, func(value uint64) bool { return value > 0 }) {
+	if len(got.TransparentPixels) != got.Frames {
 		t.Fatalf("reference alpha = %+v", got.TransparentPixels)
 	}
 	if want.TransparentPixels != nil && (!slices.Equal(got.TransparentPixels, want.TransparentPixels) || !slices.Equal(got.AlphaSums, want.AlphaSums)) {

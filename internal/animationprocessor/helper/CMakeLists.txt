@@ -48,6 +48,12 @@ if(NMCP_BUILD_HELPER)
     target_link_libraries(nmcp-animation-fixture-generator PRIVATE PkgConfig::WEBP)
     set_target_properties(nmcp-animation-fixture-generator PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+    add_executable(nmcp-gif-fixture-generator tests/gif_fixture_generator.cpp)
+    target_compile_features(nmcp-gif-fixture-generator PRIVATE cxx_std_20)
+    target_compile_options(nmcp-gif-fixture-generator PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    target_link_libraries(nmcp-gif-fixture-generator PRIVATE Giflib::Gif)
+    set_target_properties(nmcp-gif-fixture-generator PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
     add_executable(nmcp-webp-reference tests/webp_reference.cpp)
     target_compile_features(nmcp-webp-reference PRIVATE cxx_std_20)
     target_compile_options(nmcp-webp-reference PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
