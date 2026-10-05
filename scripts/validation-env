@@ -63,9 +63,10 @@ write_fixture() {
     original=/var/lib/nmcp/media/originals/00/00000000-0000-4000-8000-000000000000
     rendition=/var/lib/nmcp/media/renditions/00/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111
     symlink=/var/lib/nmcp/media/originals/33/33333333-3333-4333-8333-333333333333
+    rendition_symlink=/var/lib/nmcp/media/renditions/44/44444444-4444-4444-8444-444444444444/55555555-5555-4555-8555-555555555555
     wrong_original=/var/lib/nmcp/media/originals/ff/00000000-0000-4000-8000-000000000000
     wrong_rendition=/var/lib/nmcp/media/renditions/ff/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111
-    mkdir -p "$original" "$rendition" "$symlink" "$wrong_original" "$wrong_rendition" /var/lib/nmcp/media/backups
+    mkdir -p "$original" "$rendition" "$symlink" "$rendition_symlink" "$wrong_original" "$wrong_rendition" /var/lib/nmcp/media/backups
     printf "0123456789abcdef" >"$original/original.jpg"
     printf "rendition-webp!" >"$rendition/22222222-2222-4222-8222-222222222222.webp"
     printf "wrong-original" >"$wrong_original/original.jpg"
@@ -73,6 +74,8 @@ write_fixture() {
     printf "private-sentinel" >/var/lib/nmcp/media/backups/secret.dump
     rm -f "$symlink/original.jpg"
     ln -s /etc/passwd "$symlink/original.jpg"
+    rm -f "$rendition_symlink/66666666-6666-4666-8666-666666666666.webp"
+    ln -s /etc/passwd "$rendition_symlink/66666666-6666-4666-8666-666666666666.webp"
     chmod 0600 "$original/original.jpg" "$rendition/22222222-2222-4222-8222-222222222222.webp" \
       "$wrong_original/original.jpg" "$wrong_rendition/22222222-2222-4222-8222-222222222222.webp" \
       /var/lib/nmcp/media/backups/secret.dump
@@ -83,6 +86,19 @@ start_environment() {
   prepare_storage
   compose up --build --detach --wait
   write_fixture
+}
+
+write_retention_markers() {
+  compose exec -T api sh -eu -c 'printf "%s" "$1" >/var/lib/nmcp/media/backups/retained.marker; chmod 0600 /var/lib/nmcp/media/backups/retained.marker' sh "$retention_token"
+  compose exec -T postgres psql --username nmcp --dbname nmcp --set ON_ERROR_STOP=1 --set "marker=$retention_token" --command \
+    "CREATE TABLE validation_retention_marker (value text PRIMARY KEY); INSERT INTO validation_retention_marker VALUES (:'marker');"
+}
+
+assert_retention_markers() {
+  compose exec -T api sh -eu -c '[ "$(cat /var/lib/nmcp/media/backups/retained.marker)" = "$1" ]' sh "$retention_token"
+  value=$(compose exec -T postgres psql --username nmcp --dbname nmcp --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+    "SELECT value FROM validation_retention_marker;")
+  [ "$value" = "$retention_token" ] || { echo "error: database retention marker was not preserved" >&2; exit 1; }
 }
 
 expect_status() {
@@ -161,6 +177,7 @@ check() (
     [ "$(cat /var/lib/nmcp/media/renditions/00/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp)" = rendition-webp! ]
     [ "$(cat /var/lib/nmcp/media/backups/secret.dump)" = private-sentinel ]
     [ -L /var/lib/nmcp/media/originals/33/33333333-3333-4333-8333-333333333333/original.jpg ]
+    [ -L /var/lib/nmcp/media/renditions/44/44444444-4444-4444-8444-444444444444/55555555-5555-4555-8555-555555555555/66666666-6666-4666-8666-666666666666.webp ]
     [ -f /var/lib/nmcp/media/originals/ff/00000000-0000-4000-8000-000000000000/original.jpg ]
     [ -f /var/lib/nmcp/media/renditions/ff/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp ]
   '
@@ -177,12 +194,14 @@ check() (
   fetch 200 "$tmp/rendition" "$tmp/rendition-headers" "$rendition"
   [ "$(cat "$tmp/rendition")" = rendition-webp! ]
   assert_header '^content-type: image/webp' "$tmp/rendition-headers"
+  assert_header '^accept-ranges: bytes' "$tmp/rendition-headers"
   assert_header '^cache-control: private, max-age=31536000, immutable' "$tmp/rendition-headers"
+  assert_header '^x-content-type-options: nosniff' "$tmp/rendition-headers"
 
-  python3 - "$files_port" <<'PY'
+  python3 - "$files_port" "/files/originals/00/00000000-0000-4000-8000-000000000000/original.jpg" 16 image/jpeg <<'PY'
 import socket, ssl, sys
 port = int(sys.argv[1])
-path = "/files/originals/00/00000000-0000-4000-8000-000000000000/original.jpg"
+path, size, mime = sys.argv[2:]
 ctx = ssl._create_unverified_context()
 with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
     with ctx.wrap_socket(raw, server_hostname="localhost") as conn:
@@ -195,8 +214,34 @@ with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
             response += chunk
 headers, body = response.split(b"\r\n\r\n", 1)
 assert headers.startswith(b"HTTP/1.1 200"), headers
-assert b"Content-Length: 16\r\n" in headers + b"\r\n", headers
-assert b"Content-Type: image/jpeg\r\n" in headers + b"\r\n", headers
+assert f"Content-Length: {size}\r\n".encode() in headers + b"\r\n", headers
+assert f"Content-Type: {mime}\r\n".encode() in headers + b"\r\n", headers
+assert b"Accept-Ranges: bytes\r\n" in headers + b"\r\n", headers
+assert b"Cache-Control: private, max-age=31536000, immutable\r\n" in headers + b"\r\n", headers
+assert b"X-Content-Type-Options: nosniff\r\n" in headers + b"\r\n", headers
+assert body == b"", body
+PY
+  python3 - "$files_port" "/files/renditions/00/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp" 15 image/webp <<'PY'
+import socket, ssl, sys
+port = int(sys.argv[1])
+path, size, mime = sys.argv[2:]
+ctx = ssl._create_unverified_context()
+with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+    with ctx.wrap_socket(raw, server_hostname="localhost") as conn:
+        conn.sendall(f"HEAD {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode())
+        response = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+headers, body = response.split(b"\r\n\r\n", 1)
+assert headers.startswith(b"HTTP/1.1 200"), headers
+assert f"Content-Length: {size}\r\n".encode() in headers + b"\r\n", headers
+assert f"Content-Type: {mime}\r\n".encode() in headers + b"\r\n", headers
+assert b"Accept-Ranges: bytes\r\n" in headers + b"\r\n", headers
+assert b"Cache-Control: private, max-age=31536000, immutable\r\n" in headers + b"\r\n", headers
+assert b"X-Content-Type-Options: nosniff\r\n" in headers + b"\r\n", headers
 assert body == b"", body
 PY
 
@@ -210,10 +255,11 @@ PY
   [ "$(cat "$tmp/body")" = cdef ]
   assert_header '^content-range: bytes 12-15/16' "$tmp/headers"
   fetch 206 "$tmp/multi" "$tmp/multi-headers" --range 0-1,4-5 "$original"
-  python3 - "$tmp/multi-headers" "$tmp/multi" <<'PY'
+  python3 - "$tmp/multi-headers" "$tmp/multi" 16 01 45 <<'PY'
 import re, sys
 headers = open(sys.argv[1], "rb").read()
 body = open(sys.argv[2], "rb").read()
+total, first, second = (value.encode() for value in sys.argv[3:])
 match = re.search(br"(?im)^content-type: multipart/byteranges; boundary=([^\r\n]+)", headers)
 assert match, headers
 boundary = b"--" + match.group(1)
@@ -225,22 +271,71 @@ for part in parts[1:-1]:
     part_headers, payload = part[2:-2].split(b"\r\n\r\n", 1)
     content_range = re.search(br"(?im)^Content-Range: ([^\r\n]+)", part_headers).group(1)
     actual.append((content_range, payload))
-assert actual == [(b"bytes 0-1/16", b"01"), (b"bytes 4-5/16", b"45")], actual
+assert actual == [(b"bytes 0-1/" + total, first), (b"bytes 4-5/" + total, second)], actual
 PY
 
   fetch 416 "$tmp/body" "$tmp/headers" --range 99-100 "$original"
   assert_header '^content-range: bytes \*/16' "$tmp/headers"
+  assert_header '^accept-ranges: bytes' "$tmp/headers"
+  assert_header '^x-content-type-options: nosniff' "$tmp/headers"
+
+  fetch 206 "$tmp/body" "$tmp/headers" --range 2-5 "$rendition"
+  [ "$(cat "$tmp/body")" = ndit ]
+  assert_header '^content-range: bytes 2-5/15' "$tmp/headers"
+  assert_header '^accept-ranges: bytes' "$tmp/headers"
+  assert_header '^x-content-type-options: nosniff' "$tmp/headers"
+  fetch 206 "$tmp/body" "$tmp/headers" --range 4- "$rendition"
+  [ "$(cat "$tmp/body")" = ition-webp! ]
+  assert_header '^content-range: bytes 4-14/15' "$tmp/headers"
+  fetch 206 "$tmp/body" "$tmp/headers" --range -4 "$rendition"
+  [ "$(cat "$tmp/body")" = ebp! ]
+  assert_header '^content-range: bytes 11-14/15' "$tmp/headers"
+  fetch 206 "$tmp/rendition-multi" "$tmp/rendition-multi-headers" --range 0-1,4-5 "$rendition"
+  python3 - "$tmp/rendition-multi-headers" "$tmp/rendition-multi" 15 re it <<'PY'
+import re, sys
+headers = open(sys.argv[1], "rb").read()
+body = open(sys.argv[2], "rb").read()
+total, first, second = (value.encode() for value in sys.argv[3:])
+match = re.search(br"(?im)^content-type: multipart/byteranges; boundary=([^\r\n]+)", headers)
+assert match, headers
+boundary = b"--" + match.group(1)
+parts = body.split(boundary)
+assert parts[0] == b"\r\n" and parts[-1] == b"--\r\n", parts
+actual = []
+for part in parts[1:-1]:
+    assert part.startswith(b"\r\n") and part.endswith(b"\r\n"), part
+    part_headers, payload = part[2:-2].split(b"\r\n\r\n", 1)
+    content_range = re.search(br"(?im)^Content-Range: ([^\r\n]+)", part_headers).group(1)
+    actual.append((content_range, payload))
+assert actual == [(b"bytes 0-1/" + total, first), (b"bytes 4-5/" + total, second)], actual
+PY
+  fetch 416 "$tmp/body" "$tmp/headers" --range 99-100 "$rendition"
+  assert_header '^content-range: bytes \*/15' "$tmp/headers"
+  assert_header '^accept-ranges: bytes' "$tmp/headers"
+  assert_header '^x-content-type-options: nosniff' "$tmp/headers"
+
   expect_status 405 --request POST "$original"
   expect_status 404 "$base/files/backups/secret.dump"
   expect_status 404 "$base/files/originals/ff/00000000-0000-4000-8000-000000000000/original.jpg"
   expect_status 404 "$base/files/renditions/ff/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp"
   symlink_status=$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/33/33333333-3333-4333-8333-333333333333/original.jpg")
   case "$symlink_status" in 400|403|404) ;; *) echo "error: canonical symlink escape returned HTTP $symlink_status" >&2; exit 1 ;; esac
+  rendition_symlink_status=$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' "$base/files/renditions/44/44444444-4444-4444-8444-444444444444/55555555-5555-4555-8555-555555555555/66666666-6666-4666-8666-666666666666.webp")
+  case "$rendition_symlink_status" in 400|403|404) ;; *) echo "error: canonical rendition symlink escape returned HTTP $rendition_symlink_status" >&2; exit 1 ;; esac
+
+  fetch 400 "$tmp/attack" "$tmp/attack-headers" --path-as-is "$base/files/originals/ignored/../00/00000000-0000-4000-8000-000000000000/original.jpg"
+  [ "$(cat "$tmp/attack")" != "0123456789abcdef" ]
+  fetch 400 "$tmp/attack" "$tmp/attack-headers" --path-as-is "$base/files/renditions/ignored/../00/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp"
+  [ "$(cat "$tmp/attack")" != "rendition-webp!" ]
+  fetch 400 "$tmp/attack" "$tmp/attack-headers" --path-as-is "$base/files/originals%2f00/00000000-0000-4000-8000-000000000000/original.jpg"
+  [ "$(cat "$tmp/attack")" != "0123456789abcdef" ]
+  fetch 400 "$tmp/attack" "$tmp/attack-headers" --path-as-is "$base/files/renditions%2f00/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp"
+  [ "$(cat "$tmp/attack")" != "rendition-webp!" ]
 
   directory_status=$(curl --insecure --silent --output "$tmp/directory" --write-out '%{http_code}' "$base/files/originals/")
   [ "$directory_status" != 200 ] || { echo "error: directory listing is enabled" >&2; exit 1; }
   ! grep -qi '<title>Index of' "$tmp/directory"
-  expect_status 404 --path-as-is "$base/files/originals/../backups/secret.dump"
+  expect_status 400 --path-as-is "$base/files/originals/../backups/secret.dump"
   escaped_status=$(curl --insecure --path-as-is --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/%2e%2e/backups/secret.dump")
   case "$escaped_status" in 400|404) ;; *) echo "error: encoded traversal returned HTTP $escaped_status" >&2; exit 1 ;; esac
   malformed_status=$(curl --insecure --path-as-is --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/%zz")
@@ -302,6 +397,7 @@ case "${1:-}" in
     peer_project="${project}-peer"
     guard_project="${project}-guard-$$"
     guard_volume="${guard_project}_foreign"
+    retention_token="retained-$owner-$$"
     cleanup_all() {
       NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=${NMCP_ISOLATION_API_PORT:-28080} NMCP_FILES_PORT=${NMCP_ISOLATION_FILES_PORT:-28443} "$script" reset || true
       docker volume rm "$guard_volume" >/dev/null 2>&1 || true
@@ -311,8 +407,10 @@ case "${1:-}" in
     cleanup
     start_environment
     check
+    write_retention_markers
     compose down --remove-orphans
     start_environment
+    assert_retention_markers
     check
     verify_isolation
     ;;

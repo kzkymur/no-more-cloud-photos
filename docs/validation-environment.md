@@ -52,15 +52,18 @@ containers and named volumes; CI also has an independent `if: always()` reset.
 Docker's ordinary image/build cache is retained.
 
 `verify` proves clean and retained-volume lifecycles (`reset; up; down; up;
-check; reset`), two simultaneously running project identities, continued
+check; reset`) using unique media-file and PostgreSQL markers that startup does
+not recreate, two simultaneously running project identities, continued
 operation of one after resetting the other, and fail-closed foreign-owner
 rejection. `check` proves API/Worker process state and graceful exit/restart,
 Nginx configuration validity, exact Original and Rendition bodies/MIME,
 body-free HEAD, exact closed/open-ended/suffix Range bodies and Content-Range,
-multipart Range framing, unsatisfiable Range (`416`), non-GET rejection (`405`),
-private immutable cache and nosniff headers, directory-listing and traversal
-denial, canonical shard equality, canonical-name symlink denial, and an existing
-non-public backup sentinel. It also asserts that Nginx has only its isolated
+multipart Range framing, unsatisfiable Range (`416`), Accept-Ranges, private
+immutable cache, and nosniff independently for both Nginx storage locations.
+It also proves non-GET rejection (`405`), directory-listing denial, raw dot
+segment and encoded-separator rejection against existing control objects,
+canonical shard equality, canonical-name Original and Rendition symlink denial,
+and an existing non-public backup sentinel. It asserts that Nginx has only its isolated
 network, shares no network with PostgreSQL, and receives exactly two read-only
 Original/Rendition subpath mounts. It also records the live PostgreSQL, Nginx,
 ExifTool, FFprobe, and `prlimit`
