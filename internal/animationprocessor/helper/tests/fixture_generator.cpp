@@ -13,7 +13,8 @@ int main(int argc, char **argv) {
   if (!mux) return 1;
   WebPMuxAnimParams animation{.bgcolor = 0, .loop_count = 4};
   if (WebPMuxSetAnimationParams(mux, &animation) != WEBP_MUX_OK) return 1;
-  const std::array<int, 3> durations = {40, 100, 250};
+  // The zero middle duration is normalized by the production helper to 100 ms.
+  const std::array<int, 3> durations = {40, 0, 250};
   const std::array<std::array<std::uint8_t, 4>, 3> colors = {{{255, 0, 0, 255}, {0, 255, 0, 128}, {0, 0, 255, 255}}};
   for (std::size_t index = 0; index < colors.size(); ++index) {
     std::array<std::uint8_t, 16> rgba{};

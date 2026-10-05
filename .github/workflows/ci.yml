@@ -125,6 +125,31 @@ jobs:
             "${RUNNER_TEMP}/generated-heif-fixtures/collection-primary-second.avif" >> "${GITHUB_ENV}"
           printf 'LD_LIBRARY_PATH=%s\n' \
             "${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64" >> "${GITHUB_ENV}"
+      - name: Build pinned native animation helper and fixtures
+        run: |
+          chmod +x internal/animationprocessor/helper/build-pinned-codecs.sh
+          internal/animationprocessor/helper/build-pinned-codecs.sh \
+            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/animation-toolchain-work"
+          export PKG_CONFIG_PATH="${RUNNER_TEMP}/still-toolchain/lib/pkgconfig:${RUNNER_TEMP}/still-toolchain/lib64/pkgconfig"
+          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
+          cmake -S internal/animationprocessor/helper \
+            -B "${RUNNER_TEMP}/animation-helper-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/still-toolchain"
+          cmake --build "${RUNNER_TEMP}/animation-helper-build" --parallel 2
+          ctest --test-dir "${RUNNER_TEMP}/animation-helper-build" --output-on-failure
+          "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-animation-fixture-generator" \
+            "${RUNNER_TEMP}/animation-variable.webp"
+          capabilities=$("${RUNNER_TEMP}/animation-helper-build/bin/nmcp-animation-helper" \
+            capabilities --protocol 1 --threads 1 \
+            --srgb-icc "${RUNNER_TEMP}/sRGB2014.icc")
+          printf '%s\n' "${capabilities}"
+          CAPABILITIES="${capabilities}" python3 -c \
+            'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libwebp"]=="1.6.0" and v["giflib"]=="5.2.2" and v["libheif"]=="1.23.5" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14", v'
+          printf 'TEST_ANIMATION_HELPER_PATH=%s\nTEST_ANIMATION_WEBP_PATH=%s\nTEST_ANIMATION_WEBP_REFERENCE_PATH=%s\n' \
+            "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-animation-helper" \
+            "${RUNNER_TEMP}/animation-variable.webp" \
+            "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-webp-reference" >> "${GITHUB_ENV}"
       - name: Verify modules
         run: go mod verify
       - name: Check formatting
@@ -150,6 +175,10 @@ jobs:
           TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
           TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
         run: go test -v -count=1 ./internal/stillprocessor
+      - name: Explicit native animation codec evidence
+        env:
+          TEST_ANIMATION_HELPER: "1"
+        run: go test -v -count=1 ./internal/animationprocessor
       - name: Explicit Linux storage durability evidence
         run: go test -v -count=1 ./internal/storage
       - name: Race tests
