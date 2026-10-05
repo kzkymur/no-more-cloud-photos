@@ -1,5 +1,6 @@
 // Project-owned source. See ../LICENSE.md.
 #include "nmcp/image_pipeline.h"
+#include "nmcp/hdr.h"
 
 #include <aom/aom_codec.h>
 #include <fcntl.h>
@@ -163,8 +164,10 @@ Raster raster_from_vips(VipsPtr image, std::string decoder, std::span<const std:
     raster.rgba[output + 3] = bands == 4 ? pixels[input + 3] : 255;
   }
   raster.audit = {.decoder = std::move(decoder),
-                  .input_color = source_icc.empty() ? "assumed-srgb" : "embedded-icc",
-                  .alpha = raster.alpha ? "preserved" : "opaque",
+                   .input_color = source_icc.empty() ? "assumed-srgb" : "embedded-icc",
+                   .input_primaries = source_icc.empty() ? "srgb" : "profile-defined",
+                   .input_transfer = source_icc.empty() ? "srgb" : "profile-defined",
+                   .alpha = raster.alpha ? "preserved" : "opaque",
                   .chroma = raster.alpha ? "4:4:4" : "4:2:0",
                   .source_width = raster.width, .source_height = raster.height};
   if (!source_icc.empty()) apply_icc(raster, source_icc, target_icc);
@@ -243,7 +246,8 @@ Raster decode_bmp(const TransformArgs &args) {
     }
   }
   raster.audit = {.decoder = bits == 24 ? "nmcp-bmp-bi-rgb-24" : "nmcp-bmp-bi-rgb-32",
-                  .input_color = "assumed-srgb", .alpha = "opaque", .chroma = "4:2:0",
+                  .input_color = "assumed-srgb", .input_primaries = "srgb", .input_transfer = "srgb",
+                  .alpha = "opaque", .chroma = "4:2:0",
                   .source_width = width, .source_height = height};
   return raster;
 }
@@ -289,6 +293,7 @@ Raster decode_raw(const TransformArgs &args) {
     raster.rgba[output + 3] = 255;
   }
   raster.audit = {.decoder = raw_decoder(args.input_mime), .input_color = "raw-camera-matrix",
+                  .input_primaries = "camera-matrix", .input_transfer = "libraw-srgb",
                   .raw_processing = "camera-wb-camera-matrix-16bit-no-auto-bright", .alpha = "opaque", .chroma = "4:2:0",
                   .source_width = raster.width, .source_height = raster.height};
   return raster;
@@ -310,16 +315,37 @@ Raster decode_heif(const TransformArgs &args, std::span<const std::byte> target_
     if (size == 0 || size > 16U << 20) throw Failure("decode_failed");
     source_icc.resize(size);
     check_heif(heif_image_handle_get_raw_color_profile(handle.get(), source_icc.data()));
-  } else if (profile_type == heif_color_profile_type_nclx) {
-    // NCLX SDR transfer normalization and BT.2446 HDR are intentionally not approximated.
+  }
+  heif_color_profile_nclx *raw_nclx = nullptr;
+  const auto nclx_error = heif_image_handle_get_nclx_color_profile(handle.get(), &raw_nclx);
+  std::unique_ptr<heif_color_profile_nclx, decltype(&heif_nclx_color_profile_free)> nclx(
+      nclx_error.code == heif_error_Ok ? raw_nclx : nullptr, heif_nclx_color_profile_free);
+  if (nclx_error.code != heif_error_Ok && nclx_error.code != heif_error_Color_profile_does_not_exist) {
+    throw Failure("decode_failed");
+  }
+  const bool pq = nclx && nclx->transfer_characteristics == heif_transfer_characteristic_ITU_R_BT_2100_0_PQ;
+  const bool hlg = nclx && nclx->transfer_characteristics == heif_transfer_characteristic_ITU_R_BT_2100_0_HLG;
+  const bool hdr = pq || hlg;
+  if (hdr && (!source_icc.empty() || nclx->color_primaries != heif_color_primaries_ITU_R_BT_2020_2_and_2100_0 ||
+              nclx->matrix_coefficients != heif_matrix_coefficients_ITU_R_BT_2020_2_non_constant_luminance)) {
     throw Failure("unsupported_input");
   }
+  const bool nclx_sdr = nclx && !hdr && nclx->color_primaries == heif_color_primaries_ITU_R_BT_709_5 &&
+      (nclx->transfer_characteristics == heif_transfer_characteristic_ITU_R_BT_709_5 ||
+       nclx->transfer_characteristics == heif_transfer_characteristic_IEC_61966_2_1) &&
+      (nclx->matrix_coefficients == heif_matrix_coefficients_ITU_R_BT_709_5 ||
+       nclx->matrix_coefficients == heif_matrix_coefficients_RGB_GBR);
+  if (nclx && !hdr && !nclx_sdr && source_icc.empty()) throw Failure("unsupported_input");
+
   heif_decoding_options *options = heif_decoding_options_alloc();
   if (!options) throw Failure("resource_limit");
   options->ignore_transformations = 0;
+  options->strict_decoding = 1;
   heif_image *raw_image = nullptr;
-  const auto decode_error = heif_decode_image(handle.get(), &raw_image, heif_colorspace_RGB,
-                                               heif_chroma_interleaved_RGBA, options);
+  const bool alpha = heif_image_handle_has_alpha_channel(handle.get()) != 0;
+  const auto chroma = hdr ? (alpha ? heif_chroma_interleaved_RRGGBBAA_BE : heif_chroma_interleaved_RRGGBB_BE)
+                          : (alpha ? heif_chroma_interleaved_RGBA : heif_chroma_interleaved_RGB);
+  const auto decode_error = heif_decode_image(handle.get(), &raw_image, heif_colorspace_RGB, chroma, options);
   heif_decoding_options_free(options);
   check_heif(decode_error);
   std::unique_ptr<heif_image, decltype(&heif_image_release)> image(raw_image, heif_image_release);
@@ -329,17 +355,61 @@ Raster decode_heif(const TransformArgs &args, std::span<const std::byte> target_
   const auto stride = static_cast<std::size_t>(stride_value);
   const int width = heif_image_get_width(image.get(), heif_channel_interleaved);
   const int height = heif_image_get_height(image.get(), heif_channel_interleaved);
-  if (!pixels || stride < static_cast<std::size_t>(width) * 4) throw Failure("decode_failed");
-  Raster raster{.width = width, .height = height, .alpha = heif_image_handle_has_alpha_channel(handle.get()) != 0};
+  const int channels = alpha ? 4 : 3;
+  const int bytes_per_channel = hdr ? 2 : 1;
+  if (!pixels || stride < static_cast<std::size_t>(width) * static_cast<unsigned>(channels * bytes_per_channel)) {
+    throw Failure("decode_failed");
+  }
+  Raster raster{.width = width, .height = height, .alpha = alpha};
   raster.rgba.resize(checked_size(width, height, 4));
-  for (int row = 0; row < height; ++row) {
-    std::memcpy(raster.rgba.data() + static_cast<std::size_t>(row) * width * 4,
-                pixels + static_cast<std::size_t>(row) * stride, static_cast<std::size_t>(width) * 4);
+  if (hdr) {
+    const int bits = heif_image_handle_get_luma_bits_per_pixel(handle.get());
+    if (bits < 10 || bits > 16) throw Failure("unsupported_input");
+    const double maximum = static_cast<double>((std::uint64_t{1} << bits) - 1U);
+    for (int row = 0; row < height; ++row) {
+      const auto *source = pixels + static_cast<std::size_t>(row) * stride;
+      for (int column = 0; column < width; ++column) {
+        const auto input = static_cast<std::size_t>(column) * static_cast<unsigned>(channels) * 2U;
+        const auto sample = [source, input, maximum](int channel) {
+          const auto offset = input + static_cast<std::size_t>(channel) * 2U;
+          const auto value = static_cast<unsigned>(source[offset]) << 8U | source[offset + 1];
+          return std::clamp(static_cast<double>(value) / maximum, 0.0, 1.0);
+        };
+        const auto mapped = tone_map_bt2446a(sample(0), sample(1), sample(2), pq ? HdrTransfer::pq : HdrTransfer::hlg);
+        const auto output = (static_cast<std::size_t>(row) * width + column) * 4U;
+        raster.rgba[output] = mapped[0];
+        raster.rgba[output + 1] = mapped[1];
+        raster.rgba[output + 2] = mapped[2];
+        raster.rgba[output + 3] = alpha ? static_cast<std::uint8_t>(std::lround(sample(3) * 255.0)) : 255;
+      }
+    }
+  } else {
+    for (int row = 0; row < height; ++row) {
+      const auto *source = pixels + static_cast<std::size_t>(row) * stride;
+      for (int column = 0; column < width; ++column) {
+        const auto input = static_cast<std::size_t>(column) * static_cast<unsigned>(channels);
+        const auto output = (static_cast<std::size_t>(row) * width + column) * 4U;
+        raster.rgba[output] = source[input];
+        raster.rgba[output + 1] = source[input + 1];
+        raster.rgba[output + 2] = source[input + 2];
+        raster.rgba[output + 3] = alpha ? source[input + 3] : 255;
+      }
+    }
   }
   raster.audit = {.decoder = args.input_mime == "image/heic" ? "libheif-heic" : "libheif-heif",
-                  .input_color = source_icc.empty() ? "assumed-srgb" : "embedded-icc",
-                  .alpha = raster.alpha ? "preserved" : "opaque", .chroma = raster.alpha ? "4:4:4" : "4:2:0",
-                  .source_width = width, .source_height = height};
+                   .input_color = hdr ? (pq ? "nclx-pq" : "nclx-hlg") :
+                       (!source_icc.empty() ? "embedded-icc" : (nclx_sdr ? "nclx-sdr" : "assumed-srgb")),
+                   .input_primaries = hdr ? "bt2020" : (!source_icc.empty() ? "profile-defined" : (nclx_sdr ? "bt709" : "srgb")),
+                   .input_transfer = hdr ? (pq ? "pq" : "hlg") : (!source_icc.empty() ? "profile-defined" :
+                       (nclx_sdr && nclx->transfer_characteristics == heif_transfer_characteristic_ITU_R_BT_709_5 ? "bt709" : "srgb")),
+                   .input_range = (hdr || (nclx_sdr && source_icc.empty())) ?
+                       (nclx->full_range_flag ? "full" : "limited") : "not-applicable",
+                   .hdr_disposition = hdr ? "tone-mapped" : "sdr",
+                   .tone_map = hdr ? "bt2446a-method-a" : "not-needed",
+                   .target_nits = hdr ? 100 : 0, .hdr_peak_nits = hdr ? 1000 : 0,
+                   .hlg_reference_nits = hlg ? 1000 : 0,
+                   .alpha = raster.alpha ? "preserved" : "opaque", .chroma = raster.alpha ? "4:4:4" : "4:2:0",
+                   .source_width = width, .source_height = height};
   if (!source_icc.empty()) apply_icc(raster, source_icc, target_icc);
   return raster;
 }
@@ -463,7 +533,7 @@ void encode_avif(const Raster &raster, const TransformArgs &args, std::span<cons
   heif_writer writer{.writer_api_version = 1, .write = write_heif};
   const auto error = heif_context_write(context.get(), &writer, &state);
   const bool failed = error.code != heif_error_Ok || state.failed || state.written == 0;
-  if (failed) (void)::ftruncate(descriptor, 0);
+  if (failed && ::ftruncate(descriptor, 0) != 0) state.failed = true;
   const bool close_failed = ::close(descriptor) != 0;
   if (failed || close_failed) {
     throw Failure(state.exceeded ? "output_too_large" : "encode_failed");
@@ -520,8 +590,8 @@ std::vector<std::string> decoder_mime_types() {
   result.emplace_back("image/dng");
   const heif_decoder_descriptor *hevc[1]{};
   const heif_decoder_descriptor *av1[1]{};
-  const bool has_hevc = heif_get_decoder_descriptors(heif_compression_HEVC, nullptr, hevc, 1) == 1;
-  const bool has_av1 = heif_get_decoder_descriptors(heif_compression_AV1, nullptr, av1, 1) == 1;
+  const bool has_hevc = heif_get_decoder_descriptors(heif_compression_HEVC, hevc, 1) == 1;
+  const bool has_av1 = heif_get_decoder_descriptors(heif_compression_AV1, av1, 1) == 1;
   if (has_hevc) result.emplace_back("image/heic");
   if (has_hevc || has_av1) result.emplace_back("image/heif");
   if (vips_type_find("VipsOperation", "jpegload") != 0) result.emplace_back("image/jpeg");
@@ -589,10 +659,15 @@ std::string transform_json(const TransformArgs &args) {
          << ",\"threads\":1,\"audit\":{\"decoder\":" << json_string(audit.decoder)
          << ",\"encoder\":\"aom\",\"tool_version\":" << json_string(kHelperVersion)
          << ",\"library_versions\":" << json_versions(versions) << ",\"icc_sha256\":" << json_string(sha256_hex(icc))
-         << ",\"orientation\":\"applied\",\"source_width\":" << audit.source_width
-         << ",\"source_height\":" << audit.source_height << ",\"input_color\":" << json_string(audit.input_color)
-         << ",\"output_color\":\"srgb\",\"output_transfer\":\"srgb\",\"hdr_disposition\":\"sdr\""
-         << ",\"tone_map\":\"not-needed\",\"target_nits\":0,\"raw_processing\":" << json_string(audit.raw_processing)
+          << ",\"orientation\":\"applied\",\"source_width\":" << audit.source_width
+          << ",\"source_height\":" << audit.source_height << ",\"input_color\":" << json_string(audit.input_color)
+          << ",\"input_primaries\":" << json_string(audit.input_primaries)
+          << ",\"input_transfer\":" << json_string(audit.input_transfer)
+          << ",\"input_range\":" << json_string(audit.input_range)
+          << ",\"output_color\":\"srgb\",\"output_transfer\":\"srgb\",\"hdr_disposition\":" << json_string(audit.hdr_disposition)
+          << ",\"tone_map\":" << json_string(audit.tone_map) << ",\"target_nits\":" << audit.target_nits
+          << ",\"hdr_peak_nits\":" << audit.hdr_peak_nits << ",\"hlg_reference_nits\":" << audit.hlg_reference_nits
+          << ",\"raw_processing\":" << json_string(audit.raw_processing)
          << ",\"alpha\":" << json_string(audit.alpha)
          << ",\"metadata\":\"strip-after-normalization-keep-color-tags\",\"chroma\":" << json_string(audit.chroma)
          << "}}}";

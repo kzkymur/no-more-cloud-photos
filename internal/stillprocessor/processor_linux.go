@@ -116,24 +116,29 @@ type Result struct {
 }
 
 type Audit struct {
-	Decoder         string
-	Encoder         string
-	ToolVersion     string
-	LibraryVersions map[string]string
-	ICCSHA256       string
-	Orientation     string
-	SourceWidth     int
-	SourceHeight    int
-	InputColor      string
-	OutputColor     string
-	OutputTransfer  string
-	HDRDisposition  string
-	ToneMap         string
-	TargetNits      int
-	RawProcessing   string
-	Alpha           string
-	Metadata        string
-	Chroma          string
+	Decoder          string
+	Encoder          string
+	ToolVersion      string
+	LibraryVersions  map[string]string
+	ICCSHA256        string
+	Orientation      string
+	SourceWidth      int
+	SourceHeight     int
+	InputColor       string
+	InputPrimaries   string
+	InputTransfer    string
+	InputRange       string
+	OutputColor      string
+	OutputTransfer   string
+	HDRDisposition   string
+	ToneMap          string
+	TargetNits       int
+	HDRPeakNits      int
+	HLGReferenceNits int
+	RawProcessing    string
+	Alpha            string
+	Metadata         string
+	Chroma           string
 }
 
 func New(config Config) (*Processor, error) {
@@ -273,24 +278,29 @@ func (p *Processor) Transform(ctx context.Context, request Request) (Result, err
 		MaxLongEdge:     wire.MaxLongEdge,
 		Threads:         wire.Threads,
 		Audit: Audit{
-			Decoder:         wire.Audit.Decoder,
-			Encoder:         wire.Audit.Encoder,
-			ToolVersion:     wire.Audit.ToolVersion,
-			LibraryVersions: cloneMap(wire.Audit.LibraryVersions),
-			ICCSHA256:       wire.Audit.ICCSHA256,
-			Orientation:     wire.Audit.Orientation,
-			SourceWidth:     wire.Audit.SourceWidth,
-			SourceHeight:    wire.Audit.SourceHeight,
-			InputColor:      wire.Audit.InputColor,
-			OutputColor:     wire.Audit.OutputColor,
-			OutputTransfer:  wire.Audit.OutputTransfer,
-			HDRDisposition:  wire.Audit.HDRDisposition,
-			ToneMap:         wire.Audit.ToneMap,
-			TargetNits:      wire.Audit.TargetNits,
-			RawProcessing:   wire.Audit.RawProcessing,
-			Alpha:           wire.Audit.Alpha,
-			Metadata:        wire.Audit.Metadata,
-			Chroma:          wire.Audit.Chroma,
+			Decoder:          wire.Audit.Decoder,
+			Encoder:          wire.Audit.Encoder,
+			ToolVersion:      wire.Audit.ToolVersion,
+			LibraryVersions:  cloneMap(wire.Audit.LibraryVersions),
+			ICCSHA256:        wire.Audit.ICCSHA256,
+			Orientation:      wire.Audit.Orientation,
+			SourceWidth:      wire.Audit.SourceWidth,
+			SourceHeight:     wire.Audit.SourceHeight,
+			InputColor:       wire.Audit.InputColor,
+			InputPrimaries:   wire.Audit.InputPrimaries,
+			InputTransfer:    wire.Audit.InputTransfer,
+			InputRange:       wire.Audit.InputRange,
+			OutputColor:      wire.Audit.OutputColor,
+			OutputTransfer:   wire.Audit.OutputTransfer,
+			HDRDisposition:   wire.Audit.HDRDisposition,
+			ToneMap:          wire.Audit.ToneMap,
+			TargetNits:       wire.Audit.TargetNits,
+			HDRPeakNits:      wire.Audit.HDRPeakNits,
+			HLGReferenceNits: wire.Audit.HLGReferenceNits,
+			RawProcessing:    wire.Audit.RawProcessing,
+			Alpha:            wire.Audit.Alpha,
+			Metadata:         wire.Audit.Metadata,
+			Chroma:           wire.Audit.Chroma,
 		},
 	}, nil
 }
@@ -330,24 +340,29 @@ type transformResult struct {
 }
 
 type auditWire struct {
-	Decoder         string            `json:"decoder"`
-	Encoder         string            `json:"encoder"`
-	ToolVersion     string            `json:"tool_version"`
-	LibraryVersions map[string]string `json:"library_versions"`
-	ICCSHA256       string            `json:"icc_sha256"`
-	Orientation     string            `json:"orientation"`
-	SourceWidth     int               `json:"source_width"`
-	SourceHeight    int               `json:"source_height"`
-	InputColor      string            `json:"input_color"`
-	OutputColor     string            `json:"output_color"`
-	OutputTransfer  string            `json:"output_transfer"`
-	HDRDisposition  string            `json:"hdr_disposition"`
-	ToneMap         string            `json:"tone_map"`
-	TargetNits      int               `json:"target_nits"`
-	RawProcessing   string            `json:"raw_processing"`
-	Alpha           string            `json:"alpha"`
-	Metadata        string            `json:"metadata"`
-	Chroma          string            `json:"chroma"`
+	Decoder          string            `json:"decoder"`
+	Encoder          string            `json:"encoder"`
+	ToolVersion      string            `json:"tool_version"`
+	LibraryVersions  map[string]string `json:"library_versions"`
+	ICCSHA256        string            `json:"icc_sha256"`
+	Orientation      string            `json:"orientation"`
+	SourceWidth      int               `json:"source_width"`
+	SourceHeight     int               `json:"source_height"`
+	InputColor       string            `json:"input_color"`
+	InputPrimaries   string            `json:"input_primaries"`
+	InputTransfer    string            `json:"input_transfer"`
+	InputRange       string            `json:"input_range"`
+	OutputColor      string            `json:"output_color"`
+	OutputTransfer   string            `json:"output_transfer"`
+	HDRDisposition   string            `json:"hdr_disposition"`
+	ToneMap          string            `json:"tone_map"`
+	TargetNits       int               `json:"target_nits"`
+	HDRPeakNits      int               `json:"hdr_peak_nits"`
+	HLGReferenceNits int               `json:"hlg_reference_nits"`
+	RawProcessing    string            `json:"raw_processing"`
+	Alpha            string            `json:"alpha"`
+	Metadata         string            `json:"metadata"`
+	Chroma           string            `json:"chroma"`
 }
 
 func normalizePolicy(policy Policy) (Policy, error) {
@@ -464,7 +479,7 @@ func validateTransformResult(result transformResult, mimeType string, recipe pro
 	if !validDecoder(mimeType, a.Decoder) || a.Encoder != "aom" || !safeString(a.ToolVersion) || validateVersionMap(a.LibraryVersions) != nil ||
 		a.ICCSHA256 != expectedICC || a.Orientation != "applied" || a.SourceWidth <= 0 || a.SourceWidth > MaxSourceDimension ||
 		a.SourceHeight <= 0 || a.SourceHeight > MaxSourceDimension ||
-		!oneOf(a.InputColor, "embedded-icc", "assumed-srgb", "raw-camera-matrix", "nclx-pq", "nclx-hlg") ||
+		!oneOf(a.InputColor, "embedded-icc", "assumed-srgb", "raw-camera-matrix", "nclx-sdr", "nclx-pq", "nclx-hlg") ||
 		a.OutputColor != "srgb" || a.OutputTransfer != "srgb" ||
 		!oneOf(a.HDRDisposition, "sdr", "tone-mapped") || !oneOf(a.ToneMap, "not-needed", "bt2446a-method-a") ||
 		!oneOf(a.Alpha, "opaque", "preserved") || a.Metadata != "strip-after-normalization-keep-color-tags" ||
@@ -472,10 +487,16 @@ func validateTransformResult(result transformResult, mimeType string, recipe pro
 		return ErrProcess
 	}
 	if a.HDRDisposition == "tone-mapped" {
-		if a.ToneMap != "bt2446a-method-a" || a.TargetNits != 100 || !oneOf(a.InputColor, "nclx-pq", "nclx-hlg") {
+		if a.ToneMap != "bt2446a-method-a" || a.TargetNits != 100 || a.HDRPeakNits != 1000 ||
+			a.InputPrimaries != "bt2020" || !oneOf(a.InputRange, "full", "limited") ||
+			!oneOf(a.InputColor, "nclx-pq", "nclx-hlg") {
 			return ErrProcess
 		}
-	} else if a.ToneMap != "not-needed" || a.TargetNits != 0 {
+		if (a.InputColor == "nclx-pq" && (a.InputTransfer != "pq" || a.HLGReferenceNits != 0)) ||
+			(a.InputColor == "nclx-hlg" && (a.InputTransfer != "hlg" || a.HLGReferenceNits != 1000)) {
+			return ErrProcess
+		}
+	} else if a.ToneMap != "not-needed" || a.TargetNits != 0 || a.HDRPeakNits != 0 || a.HLGReferenceNits != 0 {
 		return ErrProcess
 	}
 	if oneOf(a.InputColor, "nclx-pq", "nclx-hlg") != (a.HDRDisposition == "tone-mapped") {
@@ -483,6 +504,15 @@ func validateTransformResult(result transformResult, mimeType string, recipe pro
 	}
 	if oneOf(a.InputColor, "nclx-pq", "nclx-hlg") && !oneOf(mimeType, "image/heic", "image/heif") {
 		return ErrProcess
+	}
+	if a.HDRDisposition == "sdr" {
+		validSDRColor := (a.InputColor == "embedded-icc" && a.InputPrimaries == "profile-defined" && a.InputTransfer == "profile-defined" && a.InputRange == "not-applicable") ||
+			(a.InputColor == "assumed-srgb" && a.InputPrimaries == "srgb" && a.InputTransfer == "srgb" && a.InputRange == "not-applicable") ||
+			(a.InputColor == "raw-camera-matrix" && a.InputPrimaries == "camera-matrix" && a.InputTransfer == "libraw-srgb" && a.InputRange == "not-applicable") ||
+			(a.InputColor == "nclx-sdr" && a.InputPrimaries == "bt709" && oneOf(a.InputTransfer, "bt709", "srgb") && oneOf(a.InputRange, "full", "limited") && oneOf(mimeType, "image/heic", "image/heif"))
+		if !validSDRColor {
+			return ErrProcess
+		}
 	}
 	raw := isRawMIME(mimeType)
 	if (raw && (a.RawProcessing != "camera-wb-camera-matrix-16bit-no-auto-bright" || a.InputColor != "raw-camera-matrix")) ||
@@ -587,7 +617,8 @@ func validateJSONShape(data []byte, kind protocolJSONKind) error {
 	var audit map[string]json.RawMessage
 	if err := json.Unmarshal(result["audit"], &audit); err != nil || !exactFields(audit,
 		"decoder", "encoder", "tool_version", "library_versions", "icc_sha256", "orientation", "source_width", "source_height", "input_color",
-		"output_color", "output_transfer", "hdr_disposition", "tone_map", "target_nits", "raw_processing", "alpha", "metadata", "chroma") {
+		"input_primaries", "input_transfer", "input_range", "output_color", "output_transfer", "hdr_disposition", "tone_map", "target_nits",
+		"hdr_peak_nits", "hlg_reference_nits", "raw_processing", "alpha", "metadata", "chroma") {
 		return ErrProcess
 	}
 	return nil

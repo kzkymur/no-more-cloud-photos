@@ -12,6 +12,14 @@ namespace nmcp {
 struct Audit {
   std::string decoder;
   std::string input_color;
+  std::string input_primaries;
+  std::string input_transfer;
+  std::string input_range{"not-applicable"};
+  std::string hdr_disposition{"sdr"};
+  std::string tone_map{"not-needed"};
+  int target_nits{};
+  int hdr_peak_nits{};
+  int hlg_reference_nits{};
   std::string raw_processing{"not-applicable"};
   std::string alpha;
   std::string chroma;

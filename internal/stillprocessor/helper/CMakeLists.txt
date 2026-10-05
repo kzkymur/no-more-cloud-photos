@@ -3,7 +3,7 @@ project(nmcp_still_helper VERSION 1.0.0 LANGUAGES CXX)
 
 include(CTest)
 
-add_library(nmcp_still_core STATIC src/core.cpp)
+add_library(nmcp_still_core STATIC src/core.cpp src/hdr.cpp)
 target_include_directories(nmcp_still_core PUBLIC include)
 target_compile_features(nmcp_still_core PUBLIC cxx_std_20)
 target_compile_options(nmcp_still_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)

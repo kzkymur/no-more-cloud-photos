@@ -21,7 +21,7 @@ const testICCDigest = "01ac75c95d4774800a94e69c0a5f65b669ba9a62e66bded7421f42c34
 
 const capabilitySuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"helper_version":"helper-1.2.3","library_versions":{"libvips":"8.18.7","libheif":"1.23.5","libraw":"0.22.2","libaom":"3.8.2","lcms2":"2.14"},"decoder_mime_types":["image/jpeg","image/webp"],"avif_encoder":"aom","icc_sha256":"` + testICCDigest + `","threads":1}}`
 
-const transformSuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"output_mime":"image/avif","width":1200,"height":800,"quality":60,"bit_depth":8,"max_long_edge":1920,"threads":1,"audit":{"decoder":"libvips-jpeg","encoder":"aom","tool_version":"helper-1.2.3","library_versions":{"libvips":"8.18.7","libheif":"1.23.5","libraw":"0.22.2","libaom":"3.8.2","lcms2":"2.14"},"icc_sha256":"` + testICCDigest + `","orientation":"applied","source_width":1200,"source_height":800,"input_color":"assumed-srgb","output_color":"srgb","output_transfer":"srgb","hdr_disposition":"sdr","tone_map":"not-needed","target_nits":0,"raw_processing":"not-applicable","alpha":"opaque","metadata":"strip-after-normalization-keep-color-tags","chroma":"4:2:0"}}}`
+const transformSuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"output_mime":"image/avif","width":1200,"height":800,"quality":60,"bit_depth":8,"max_long_edge":1920,"threads":1,"audit":{"decoder":"libvips-jpeg","encoder":"aom","tool_version":"helper-1.2.3","library_versions":{"libvips":"8.18.7","libheif":"1.23.5","libraw":"0.22.2","libaom":"3.8.2","lcms2":"2.14"},"icc_sha256":"` + testICCDigest + `","orientation":"applied","source_width":1200,"source_height":800,"input_color":"assumed-srgb","input_primaries":"srgb","input_transfer":"srgb","input_range":"not-applicable","output_color":"srgb","output_transfer":"srgb","hdr_disposition":"sdr","tone_map":"not-needed","target_nits":0,"hdr_peak_nits":0,"hlg_reference_nits":0,"raw_processing":"not-applicable","alpha":"opaque","metadata":"strip-after-normalization-keep-color-tags","chroma":"4:2:0"}}}`
 
 func TestCapabilities(t *testing.T) {
 	helper := writeExecutable(t, "capabilities", "#!/bin/sh\n"+
@@ -254,13 +254,19 @@ func TestHDRAndRAWAuditSuccess(t *testing.T) {
 	hdr := strings.NewReplacer(
 		`"decoder":"libvips-jpeg"`, `"decoder":"libheif-heif"`,
 		`"input_color":"assumed-srgb"`, `"input_color":"nclx-pq"`,
+		`"input_primaries":"srgb"`, `"input_primaries":"bt2020"`,
+		`"input_transfer":"srgb"`, `"input_transfer":"pq"`,
+		`"input_range":"not-applicable"`, `"input_range":"limited"`,
 		`"hdr_disposition":"sdr"`, `"hdr_disposition":"tone-mapped"`,
 		`"tone_map":"not-needed"`, `"tone_map":"bt2446a-method-a"`,
 		`"target_nits":0`, `"target_nits":100`,
+		`"hdr_peak_nits":0`, `"hdr_peak_nits":1000`,
 	).Replace(transformSuccess)
 	raw := strings.NewReplacer(
 		`"decoder":"libvips-jpeg"`, `"decoder":"libraw-dng"`,
 		`"input_color":"assumed-srgb"`, `"input_color":"raw-camera-matrix"`,
+		`"input_primaries":"srgb"`, `"input_primaries":"camera-matrix"`,
+		`"input_transfer":"srgb"`, `"input_transfer":"libraw-srgb"`,
 		`"raw_processing":"not-applicable"`, `"raw_processing":"camera-wb-camera-matrix-16bit-no-auto-bright"`,
 	).Replace(transformSuccess)
 	for name, test := range map[string]struct {

@@ -1,8 +1,10 @@
 // Project-owned source. See ../LICENSE.md.
 #include "nmcp/core.h"
+#include "nmcp/hdr.h"
 
 #include <array>
 #include <cstdlib>
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -69,4 +71,13 @@ int main() {
   require(nmcp::validate_bmp(bmp) == 32, "BMP 32");
   bmp[30] = std::byte{1};
   require_failure([&] { nmcp::validate_bmp(bmp); }, "unsupported_input");
+
+  struct HdrVector { double nits; double srgb; };
+  constexpr std::array<HdrVector, 7> hdr_vectors = {{{0.0, 0.0}, {1.0, 0.048892323},
+      {10.0, 0.194152207}, {100.0, 0.513379004}, {203.0, 0.669632071},
+      {600.0, 0.908119245}, {1000.0, 1.0}}};
+  for (const auto vector : hdr_vectors) {
+    require(std::abs(nmcp::bt2446a_achromatic_srgb(vector.nits) - vector.srgb) < 1.0e-8,
+            "BT.2446A achromatic reference");
+  }
 }

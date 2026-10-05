@@ -35,16 +35,24 @@ writes are bounded before reaching the caller-owned output.
 
 ## HDR boundary
 
-HDR is deliberately not claimed. HEIF NCLX inputs, including BT.2020 PQ and
-HLG, return `unsupported_input`. Correct BT.2446 Method A needs a normative,
-reviewable implementation, explicit mastering/display assumptions, and numeric
-reference vectors. Treating an absent/partial NCLX description as HDR or using
-an arbitrary display peak would be ambiguous, so this helper does neither.
+The only accepted HDR envelope is HEIC/HEIF tagged with BT.2020 primaries,
+BT.2020 non-constant-luminance matrix coefficients, explicit full/limited
+range, and either PQ or HLG transfer. The fixed policy is a 1000-nit reference
+HDR display to 100-nit SDR using ITU-R BT.2446 Method A. HLG uses the BT.2100
+1000-nit system gamma 1.2 assumption. The implementation converts the decoded
+BT.2020 RGB signal through the Method A luma/chroma mapping and then converts
+primaries in linear light to BT.709/sRGB. Its achromatic curve is checked
+against independent numeric reference vectors in `core_test.cpp`.
+
+Contradictory ICC+HDR signaling, other primaries/matrices/transfers, and
+ambiguous HDR are `unsupported_input`. Gain maps and Dolby Vision are not
+claimed. Real PQ and HLG fixture/pixel evidence remains mandatory before the
+capability can be certified; the numeric unit vectors alone are not that proof.
 
 ## Verification status
 
 The dependency-free tests cover strict CLI parsing, limits, resize edge cases,
-BMP restrictions, stable errors/JSON escaping, and SHA-256. Codec integration
+BMP restrictions, BT.2446A numeric vectors, stable errors/JSON escaping, and SHA-256. Codec integration
 requires the deployment versions of all five libraries and real fixture tests;
 see the repository's production certification boundary before enabling it.
 
