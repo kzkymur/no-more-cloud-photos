@@ -1,6 +1,6 @@
 //go:build linux
 
-package metadata
+package processrunner
 
 import (
 	"errors"
@@ -17,38 +17,38 @@ import (
 )
 
 const (
-	probeSupervisorArgument = "__nmcp_internal_probe_supervisor_v1"
-	supervisorCleanupLimit  = time.Second
+	supervisorArgument     = "__nmcp_internal_process_supervisor_v1"
+	supervisorCleanupLimit = time.Second
 )
 
-// A short-lived copy of the current Core executable is the dedicated Linux
-// subreaper. The long-lived API/Worker process never adopts unrelated children.
+// The re-executed Core binary is a dedicated, short-lived subreaper. The
+// long-lived API or Worker therefore never adopts unrelated descendants.
 func init() {
-	if len(os.Args) > 1 && os.Args[1] == probeSupervisorArgument {
-		os.Exit(runProbeSupervisor(os.Args[2:]))
+	if len(os.Args) > 1 && os.Args[1] == supervisorArgument {
+		os.Exit(runSupervisor(os.Args[2:]))
 	}
 }
 
-func runProbeSupervisor(arguments []string) int {
+func runSupervisor(arguments []string) int {
 	if len(arguments) < 4 {
 		return 125
 	}
 	prlimitPath, addressLimit, fileCountText, executable := arguments[0], arguments[1], arguments[2], arguments[3]
 	fileCount, err := strconv.Atoi(fileCountText)
-	if err != nil || fileCount < 0 || fileCount > 8 || !filepath.IsAbs(prlimitPath) || !filepath.IsAbs(executable) {
+	if err != nil || fileCount < 0 || fileCount > maxExtraFiles || !filepath.IsAbs(prlimitPath) || !filepath.IsAbs(executable) {
 		return 125
 	}
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 		return 125
 	}
-	control := os.NewFile(3, "probe-supervisor-control")
+	control := os.NewFile(3, "process-supervisor-control")
 	if control == nil {
 		return 125
 	}
 	defer control.Close()
 	files := make([]*os.File, 0, fileCount)
 	for index := 0; index < fileCount; index++ {
-		file := os.NewFile(uintptr(4+index), "probe-input")
+		file := os.NewFile(uintptr(4+index), "process-input")
 		if file == nil {
 			return 125
 		}
