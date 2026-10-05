@@ -34,8 +34,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 3 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version three", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 4 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version four", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -58,11 +58,61 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 3 || status.ExpectedVersion != 3 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version three", status)
+		if status.CurrentVersion != 4 || status.ExpectedVersion != 4 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version four", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
+		}
+	})
+
+	t.Run("job lease invariant upgrade accepts valid history and rejects stranded queue", func(t *testing.T) {
+		ctx := context.Background()
+		prepareVersionThree := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
+			t.Helper()
+			pool := integrationPool(t, databaseURL)
+			full, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := newMigrator(pool, full.migrations[:3]).Up(ctx); err != nil {
+				t.Fatalf("apply versions one through three: %v", err)
+			}
+			return pool, full
+		}
+		insertExhausted := func(t *testing.T, pool *pgxpool.Pool, finalStatus string) string {
+			t.Helper()
+			jobID := newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',1)`, jobID, newUUIDv4(t)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, jobID, newUUIDv4(t)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE jobs SET status=$2,lease_token=NULL,lease_expires_at=NULL,finished_at=CASE WHEN $2='failed' THEN clock_timestamp() ELSE NULL END WHERE id=$1`, jobID, finalStatus); err != nil {
+				t.Fatal(err)
+			}
+			return jobID
+		}
+
+		validPool, validMigrator := prepareVersionThree(t)
+		validID := insertExhausted(t, validPool, "failed")
+		if err := validMigrator.Up(ctx); err != nil {
+			t.Fatalf("upgrade valid version-three history: %v", err)
+		}
+		var validStatus string
+		if err := validPool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, validID).Scan(&validStatus); err != nil || validStatus != "failed" {
+			t.Fatalf("valid history changed: status=%q err=%v", validStatus, err)
+		}
+
+		invalidPool, invalidMigrator := prepareVersionThree(t)
+		invalidID := insertExhausted(t, invalidPool, "queued")
+		if err := invalidMigrator.Up(ctx); err == nil {
+			t.Fatal("upgrade accepted stranded exhausted queued job")
+		}
+		var invalidStatus string
+		if err := invalidPool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, invalidID).Scan(&invalidStatus); err != nil || invalidStatus != "queued" {
+			t.Fatalf("failed upgrade rewrote history: status=%q err=%v", invalidStatus, err)
 		}
 	})
 
