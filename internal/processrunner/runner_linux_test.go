@@ -69,6 +69,28 @@ func TestRunnerTimeoutCancellationAndOutputLimit(t *testing.T) {
 	}
 }
 
+func TestRunnerFileSizeLimit(t *testing.T) {
+	output, err := os.Create(filepath.Join(t.TempDir(), "output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = output.Close() })
+	runner, err := New("/usr/bin/prlimit", Limits{
+		Timeout: time.Second, AddressSpaceBytes: 1 << 30, FileSizeBytes: 4, OutputBytesPerStream: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := writeTestExecutable(t, "file-overflow", "#!/bin/sh\nprintf 12345 >&3\n")
+	if _, err := runner.Run(context.Background(), Command{Executable: script, Files: []*os.File{output}}); !errors.Is(err, ErrFileSizeLimit) {
+		t.Fatalf("file-size-limit error = %v", err)
+	}
+	info, err := output.Stat()
+	if err != nil || info.Size() > 4 {
+		t.Fatalf("bounded file size = %d, %v", info.Size(), err)
+	}
+}
+
 func TestRunnerReapsDoubleForkSessionEscape(t *testing.T) {
 	runner := newTestRunner(t, 100*time.Millisecond, 1024)
 	directory := t.TempDir()
