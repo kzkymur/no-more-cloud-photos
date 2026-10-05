@@ -90,12 +90,14 @@ func TestFailureCodesHaveOnlyFixedSafeMessages(t *testing.T) {
 }
 
 func TestValidateTypes(t *testing.T) {
-	got, err := validateTypes([]Type{TypeTransform, TypeTransform, TypePurge})
-	if err != nil || len(got) != 2 || got[0] != "transform" || got[1] != "purge" {
+	got, err := validateTypes([]Type{TypeTransform, TypeTransform})
+	if err != nil || len(got) != 1 || got[0] != "transform" {
 		t.Fatalf("validateTypes = %#v, %v", got, err)
 	}
-	if _, err := validateTypes([]Type{"unsupported"}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("unsupported type error = %v", err)
+	for _, unsupported := range []Type{TypePurge, "unsupported"} {
+		if _, err := validateTypes([]Type{unsupported}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("unsupported type %q error = %v", unsupported, err)
+		}
 	}
 }
 

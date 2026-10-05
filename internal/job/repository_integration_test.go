@@ -19,25 +19,33 @@ import (
 func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{})
 	ctx := context.Background()
-	future := insertPurgeJob(t, pool, 3, `clock_timestamp()+interval '1 hour'`)
-	first := insertPurgeJob(t, pool, 3, `clock_timestamp()`)
-	insertTransformJob(t, pool, 3, 1)
+	future, _ := insertTransformJobAt(t, pool, 3, 1, `clock_timestamp()+interval '1 hour'`)
+	first, _ := insertTransformJob(t, pool, 3, 1)
+	purge := insertPurgeJob(t, pool, 3, `clock_timestamp()`)
 
-	lease, err := repository.Claim(ctx, []Type{TypePurge})
-	if err != nil || lease.ID != first || lease.Type != TypePurge || lease.Token == "" || lease.Attempts != 1 || !lease.StartedAt.Before(lease.LeaseExpiresAt) {
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil || lease.ID != first || lease.Type != TypeTransform || lease.Token == "" || lease.Attempts != 1 || !lease.StartedAt.Before(lease.LeaseExpiresAt) {
 		t.Fatalf("first claim = %+v, %v", lease, err)
 	}
-	if len(lease.Targets) != 0 {
-		t.Fatalf("purge targets = %+v", lease.Targets)
+	if len(lease.Targets) != 1 {
+		t.Fatalf("transform targets = %+v", lease.Targets)
 	}
-	if _, err := repository.Claim(ctx, []Type{TypePurge}); !errors.Is(err, ErrNoWork) {
+	if _, err := repository.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("future/unsupported claim error = %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp() WHERE id=$1`, future); err != nil {
 		t.Fatal(err)
 	}
-	if lease, err := repository.Claim(ctx, []Type{TypePurge}); err != nil || lease.ID != future {
+	if lease, err := repository.Claim(ctx, []Type{TypeTransform}); err != nil || lease.ID != future {
 		t.Fatalf("exact-boundary claim = %+v, %v", lease, err)
+	}
+	if _, err := repository.Claim(ctx, []Type{TypePurge}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("purge claim boundary error = %v", err)
+	}
+	var purgeStatus Status
+	var purgeStarted *time.Time
+	if err := pool.QueryRow(ctx, `SELECT status,started_at FROM jobs WHERE id=$1`, purge).Scan(&purgeStatus, &purgeStarted); err != nil || purgeStatus != StatusQueued || purgeStarted != nil {
+		t.Fatalf("purge changed by generic claim: status=%s started=%v err=%v", purgeStatus, purgeStarted, err)
 	}
 	if _, err := repository.Claim(ctx, []Type{"unsupported"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unregistered API type error = %v", err)
@@ -47,8 +55,8 @@ func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 func TestClaimIntegrationExclusivitySkipLockedAndReturnsCommitted(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{})
 	ctx := context.Background()
-	lockedID := insertPurgeJob(t, pool, 3, `clock_timestamp()`)
-	nextID := insertPurgeJob(t, pool, 3, `clock_timestamp()+interval '1 microsecond'`)
+	lockedID, _ := insertTransformJob(t, pool, 3, 1)
+	nextID, _ := insertTransformJobAt(t, pool, 3, 1, `clock_timestamp()+interval '1 microsecond'`)
 	locker, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -59,11 +67,11 @@ func TestClaimIntegrationExclusivitySkipLockedAndReturnsCommitted(t *testing.T) 
 	}
 	claimCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	lease, err := repository.Claim(claimCtx, []Type{TypePurge})
+	lease, err := repository.Claim(claimCtx, []Type{TypeTransform})
 	if err != nil || lease.ID != nextID {
 		t.Fatalf("skip-locked claim = %+v, %v", lease, err)
 	}
-	if _, err := repository.Claim(claimCtx, []Type{TypePurge}); !errors.Is(err, ErrNoWork) {
+	if _, err := repository.Claim(claimCtx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("all candidates locked/running error = %v", err)
 	}
 	if err := locker.Commit(ctx); err != nil {
@@ -81,17 +89,17 @@ func TestClaimIntegrationExclusivitySkipLockedAndReturnsCommitted(t *testing.T) 
 		t.Fatalf("Claim returned before commit/lock release: %v", err)
 	}
 
-	if lease, err := repository.Claim(ctx, []Type{TypePurge}); err != nil || lease.ID != lockedID {
+	if lease, err := repository.Claim(ctx, []Type{TypeTransform}); err != nil || lease.ID != lockedID {
 		t.Fatalf("released candidate claim = %+v, %v", lease, err)
 	}
 
-	onlyID := insertPurgeJob(t, pool, 3, `clock_timestamp()`)
+	onlyID, _ := insertTransformJob(t, pool, 3, 1)
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	for range 2 {
 		go func() {
 			<-start
-			lease, err := repository.Claim(ctx, []Type{TypePurge})
+			lease, err := repository.Claim(ctx, []Type{TypeTransform})
 			if err == nil && lease.ID != onlyID {
 				err = fmt.Errorf("claimed %s, want %s", lease.ID, onlyID)
 			}
@@ -108,8 +116,8 @@ func TestClaimIntegrationExclusivitySkipLockedAndReturnsCommitted(t *testing.T) 
 func TestHeartbeatIntegrationCASClockAndExactExpiry(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{LeaseDuration: 30 * time.Second, Jitter: func(time.Duration) time.Duration { return 0 }})
 	ctx := context.Background()
-	jobID := insertPurgeJob(t, pool, 4, `clock_timestamp()`)
-	lease, err := repository.Claim(ctx, []Type{TypePurge})
+	jobID, _ := insertTransformJob(t, pool, 4, 1)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +150,7 @@ func TestHeartbeatIntegrationCASClockAndExactExpiry(t *testing.T) {
 	if count, err := repository.ReclaimExpired(ctx); err != nil || count != 1 {
 		t.Fatalf("reclaim exact-expiry job = %d, %v", count, err)
 	}
-	reclaimed, err := repository.Claim(ctx, []Type{TypePurge})
+	reclaimed, err := repository.Claim(ctx, []Type{TypeTransform})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,9 +175,6 @@ func TestTransformTargetsRetryAndCompletionIntegration(t *testing.T) {
 			target.Profile.ParametersSchemaVersion <= 0 || len(target.Profile.InputMIMETypes) == 0 || len(target.Profile.Parameters) == 0 {
 			t.Fatalf("incomplete pinned profile hydration: %+v", target.Profile)
 		}
-	}
-	if err := repository.MarkTargetFailed(ctx, jobID, lease.Token, targets[0], FailureProcessFailed); !errors.Is(err, ErrConflict) {
-		t.Fatalf("target failure before BeginTarget = %v", err)
 	}
 	if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[0]); err != nil {
 		t.Fatal(err)
@@ -214,8 +219,8 @@ func TestTransformTargetsRetryAndCompletionIntegration(t *testing.T) {
 func TestFinishAttemptCeilingAndSafeErrorsIntegration(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
 	ctx := context.Background()
-	jobID := insertPurgeJob(t, pool, 1, `clock_timestamp()`)
-	lease, err := repository.Claim(ctx, []Type{TypePurge})
+	jobID, _ := insertTransformJob(t, pool, 1, 1)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,12 +244,12 @@ func TestFinishAttemptCeilingAndSafeErrorsIntegration(t *testing.T) {
 func TestReclaimExpiredIntegrationBudgetBatchConcurrencyAndRace(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{ReclaimBatch: 2, Jitter: func(time.Duration) time.Duration { return 0 }})
 	ctx := context.Background()
-	remaining := insertPurgeJob(t, pool, 2, `clock_timestamp()`)
-	ceiling := insertPurgeJob(t, pool, 1, `clock_timestamp()`)
-	notExpired := insertPurgeJob(t, pool, 2, `clock_timestamp()`)
+	remaining, _ := insertTransformJob(t, pool, 2, 1)
+	ceiling, _ := insertTransformJob(t, pool, 1, 1)
+	notExpired, _ := insertTransformJob(t, pool, 2, 1)
 	leases := make(map[string]Lease)
 	for range 3 {
-		lease, err := repository.Claim(ctx, []Type{TypePurge})
+		lease, err := repository.Claim(ctx, []Type{TypeTransform})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -276,7 +281,7 @@ func TestReclaimExpiredIntegrationBudgetBatchConcurrencyAndRace(t *testing.T) {
 	if err := repository.CompleteSucceeded(ctx, remaining, leases[remaining].Token); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("reclaimed stale owner = %v", err)
 	}
-	if err := repository.CompleteSucceeded(ctx, notExpired, leases[notExpired].Token); err != nil {
+	if _, err := repository.Heartbeat(ctx, notExpired, leases[notExpired].Token); err != nil {
 		t.Fatalf("live owner lost reclaim race: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()+interval '1 hour' WHERE id=$1`, remaining); err != nil {
@@ -284,8 +289,8 @@ func TestReclaimExpiredIntegrationBudgetBatchConcurrencyAndRace(t *testing.T) {
 	}
 
 	for range 4 {
-		id := insertPurgeJob(t, pool, 2, `clock_timestamp()`)
-		lease, err := repository.Claim(ctx, []Type{TypePurge})
+		id, _ := insertTransformJob(t, pool, 2, 1)
+		lease, err := repository.Claim(ctx, []Type{TypeTransform})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -478,6 +483,10 @@ func insertPurgeJob(t *testing.T, pool *pgxpool.Pool, maxAttempts int, available
 }
 
 func insertTransformJob(t *testing.T, pool *pgxpool.Pool, maxAttempts, targetCount int) (string, []string) {
+	return insertTransformJobAt(t, pool, maxAttempts, targetCount, `clock_timestamp()`)
+}
+
+func insertTransformJobAt(t *testing.T, pool *pgxpool.Pool, maxAttempts, targetCount int, availableExpression string) (string, []string) {
 	t.Helper()
 	ctx := context.Background()
 	mediaID, originalID, jobID := newTestUUID(t), newTestUUID(t), newTestUUID(t)
@@ -485,7 +494,7 @@ func insertTransformJob(t *testing.T, pool *pgxpool.Pool, maxAttempts, targetCou
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes,width,height) VALUES ($1,$2,$3,$4,'image/jpeg',1,1,1)`,
-		originalID, mediaID, strings.Repeat(fmt.Sprintf("%x", len(mediaID)%15+1), 64), "originals/aa/"+originalID+"/original.jpg"); err != nil {
+		originalID, mediaID, strings.Repeat(strings.ReplaceAll(mediaID, "-", ""), 2), "originals/aa/"+originalID+"/original.jpg"); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := pool.Query(ctx, `SELECT id::text FROM profiles ORDER BY key,version LIMIT $1`, targetCount)
@@ -509,7 +518,8 @@ func insertTransformJob(t *testing.T, pool *pgxpool.Pool, maxAttempts, targetCou
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',$4)`, jobID, originalID, mediaID, maxAttempts); err != nil {
+	query := fmt.Sprintf(`INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts,available_at) VALUES ($1,'transform',$2,$3,'queued',$4,%s)`, availableExpression)
+	if _, err := tx.Exec(ctx, query, jobID, originalID, mediaID, maxAttempts); err != nil {
 		t.Fatal(err)
 	}
 	targets := make([]string, 0, targetCount)

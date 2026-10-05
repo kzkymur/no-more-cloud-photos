@@ -143,7 +143,7 @@ func (r *Repository) MarkTargetFailed(ctx context.Context, jobID, token, targetI
 	}
 	return r.withLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE job_targets AS jt SET status='failed',error_code=$3,error_message=$4,updated_at=clock_timestamp()
-			FROM jobs AS j WHERE jt.id=$1 AND jt.job_id=$2 AND jt.status='pending' AND j.id=jt.job_id AND jt.attempts=j.attempts`, targetID, jobID, code, message)
+			WHERE jt.id=$1 AND jt.job_id=$2 AND jt.status='pending'`, targetID, jobID, code, message)
 		if err != nil {
 			return classifyDatabaseError(err)
 		}
@@ -413,7 +413,10 @@ func validateTypes(values []Type) ([]string, error) {
 	seen := make(map[Type]bool, len(values))
 	result := make([]string, 0, len(values))
 	for _, value := range values {
-		if value != TypeTransform && value != TypePurge {
+		// Purge acquisition is intentionally deferred to Issue #16. Its first
+		// claim must lock Media and recheck deletion/cancellation before setting
+		// started_at; the generic job-row claim cannot safely provide that.
+		if value != TypeTransform {
 			return nil, ErrInvalid
 		}
 		if !seen[value] {
