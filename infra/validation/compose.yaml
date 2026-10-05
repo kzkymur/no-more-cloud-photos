@@ -1,4 +1,5 @@
-name: nmcp-validation
+x-validation-labels: &validation-labels
+  com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER:?scripts/validation-env must set NMCP_VALIDATION_OWNER}"
 
 services:
   postgres:
@@ -14,15 +15,19 @@ services:
       retries: 30
     volumes:
       - database:/var/lib/postgresql/data
+    networks: [backend]
+    labels: *validation-labels
 
   storage-init:
     build:
       context: ../..
       dockerfile: infra/validation/core.Dockerfile
     user: "0:0"
-    command: ["sh", "-eu", "-c", "chown 10001:10001 /var/lib/nmcp/media && chmod 0700 /var/lib/nmcp/media"]
+    command: ["sh", "-eu", "-c", "mkdir -p /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/backups /var/lib/nmcp/media/quarantine /var/lib/nmcp/media/tmp && chown -R 10001:10001 /var/lib/nmcp/media && chmod 0700 /var/lib/nmcp/media /var/lib/nmcp/media/*"]
     volumes:
       - media:/var/lib/nmcp/media
+    network_mode: none
+    labels: *validation-labels
 
   migrate:
     build:
@@ -36,6 +41,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks: [backend]
+    labels: *validation-labels
 
   api:
     build:
@@ -45,7 +52,7 @@ services:
     environment:
       <<: *common-environment
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
-      NMCP_FILE_BASE_URL: https://127.0.0.1:18443/files
+      NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
       NMCP_CURSOR_HMAC_KEY: validation-only-cursor-key-32-bytes-minimum
       NMCP_API_ADDR: 0.0.0.0:8080
     depends_on:
@@ -59,9 +66,12 @@ services:
       timeout: 3s
       retries: 30
     ports:
-      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:${NMCP_API_PORT:-18080}:8080"
+    stop_grace_period: 20s
     volumes:
       - media:/var/lib/nmcp/media
+    networks: [backend]
+    labels: *validation-labels
 
   worker:
     build:
@@ -79,6 +89,8 @@ services:
     stop_grace_period: 15s
     volumes:
       - media:/var/lib/nmcp/media
+    networks: [backend]
+    labels: *validation-labels
 
   files:
     build:
@@ -93,15 +105,38 @@ services:
       timeout: 3s
       retries: 30
     ports:
-      - "127.0.0.1:18443:8443"
+      - "127.0.0.1:${NMCP_FILES_PORT:-18443}:8443"
     read_only: true
     tmpfs:
       - /var/cache/nginx:size=16m,mode=0700
       - /var/run:size=1m,mode=0700
       - /tmp:size=4m,uid=10001,gid=10001,mode=0700
     volumes:
-      - media:/var/lib/nmcp/media:ro
+      - type: volume
+        source: media
+        target: /srv/nmcp/originals
+        read_only: true
+        volume:
+          subpath: originals
+      - type: volume
+        source: media
+        target: /srv/nmcp/renditions
+        read_only: true
+        volume:
+          subpath: renditions
+    networks: [files-edge]
+    labels: *validation-labels
 
 volumes:
   database:
+    labels: *validation-labels
   media:
+    labels: *validation-labels
+
+networks:
+  backend:
+    internal: true
+    labels: *validation-labels
+  files-edge:
+    internal: true
+    labels: *validation-labels

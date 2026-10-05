@@ -2,27 +2,87 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+script="$root/scripts/validation-env"
 compose_file="$root/infra/validation/compose.yaml"
-project=nmcp-validation
+owner=$(printf '%s' "$root" | sha256sum | cut -c1-64)
+owner_short=$(printf '%s' "$owner" | cut -c1-12)
+project=${NMCP_VALIDATION_PROJECT:-nmcp-validation-$owner_short}
+api_port=${NMCP_API_PORT:-18080}
+files_port=${NMCP_FILES_PORT:-18443}
+export NMCP_VALIDATION_OWNER=$owner NMCP_API_PORT=$api_port NMCP_FILES_PORT=$files_port
+
+case "$project" in
+  ""|[!a-z0-9]*|*[!a-z0-9_-]*)
+    echo "error: invalid NMCP_VALIDATION_PROJECT: $project" >&2
+    exit 2
+    ;;
+esac
 
 compose() {
   docker compose --project-name "$project" --file "$compose_file" "$@"
 }
 
 require_tools() {
-  command -v docker >/dev/null 2>&1 || { echo "error: docker is required" >&2; exit 1; }
+  for tool in docker curl python3 sha256sum; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool is required" >&2; exit 1; }
+  done
   docker compose version >/dev/null 2>&1 || { echo "error: docker compose v2 is required" >&2; exit 1; }
-  command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
+}
+
+assert_owned() {
+  for type in container volume network; do
+    case "$type" in
+      container) resources=$(docker container ls --all --quiet --filter "label=com.docker.compose.project=$project") ;;
+      volume) resources=$(docker volume ls --quiet --filter "label=com.docker.compose.project=$project") ;;
+      network) resources=$(docker network ls --quiet --filter "label=com.docker.compose.project=$project") ;;
+    esac
+    for resource in $resources; do
+      case "$type" in
+        container) actual=$(docker container inspect --format '{{ index .Config.Labels "com.nmcp.validation.owner" }}' "$resource") ;;
+        *) actual=$(docker "$type" inspect --format '{{ index .Labels "com.nmcp.validation.owner" }}' "$resource") ;;
+      esac
+      if [ "$actual" != "$owner" ]; then
+        echo "error: refusing to operate on $type $resource for project $project: owner mismatch" >&2
+        exit 1
+      fi
+    done
+  done
+}
+
+cleanup() {
+  assert_owned
+  compose down --volumes --remove-orphans
+}
+
+prepare_storage() {
+  compose run --rm --no-deps storage-init
 }
 
 write_fixture() {
   compose run --rm --no-deps --entrypoint sh api -eu -c '
-    path=/var/lib/nmcp/media/originals/00/00000000-0000-4000-8000-000000000000
-    mkdir -p "$path"
-    printf "0123456789abcdef" >"$path/original.jpg"
-    chmod 0600 "$path/original.jpg"
-    ln -s /etc/passwd "$path/escape.jpg"
+    original=/var/lib/nmcp/media/originals/00/00000000-0000-4000-8000-000000000000
+    rendition=/var/lib/nmcp/media/renditions/00/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111
+    symlink=/var/lib/nmcp/media/originals/33/33333333-3333-4333-8333-333333333333
+    wrong_original=/var/lib/nmcp/media/originals/ff/00000000-0000-4000-8000-000000000000
+    wrong_rendition=/var/lib/nmcp/media/renditions/ff/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111
+    mkdir -p "$original" "$rendition" "$symlink" "$wrong_original" "$wrong_rendition" /var/lib/nmcp/media/backups
+    printf "0123456789abcdef" >"$original/original.jpg"
+    printf "rendition-webp!" >"$rendition/22222222-2222-4222-8222-222222222222.webp"
+    printf "wrong-original" >"$wrong_original/original.jpg"
+    printf "wrong-rendition" >"$wrong_rendition/22222222-2222-4222-8222-222222222222.webp"
+    printf "private-sentinel" >/var/lib/nmcp/media/backups/secret.dump
+    rm -f "$symlink/original.jpg"
+    ln -s /etc/passwd "$symlink/original.jpg"
+    chmod 0600 "$original/original.jpg" "$rendition/22222222-2222-4222-8222-222222222222.webp" \
+      "$wrong_original/original.jpg" "$wrong_rendition/22222222-2222-4222-8222-222222222222.webp" \
+      /var/lib/nmcp/media/backups/secret.dump
   '
+}
+
+start_environment() {
+  prepare_storage
+  compose up --build --detach --wait
+  write_fixture
 }
 
 expect_status() {
@@ -35,58 +95,171 @@ expect_status() {
   fi
 }
 
+fetch() {
+  expected=$1
+  output=$2
+  headers=$3
+  shift 3
+  actual=$(curl --insecure --silent --show-error --dump-header "$headers" --output "$output" --write-out '%{http_code}' "$@")
+  [ "$actual" = "$expected" ] || { echo "error: expected HTTP $expected, got $actual" >&2; exit 1; }
+}
+
+assert_header() {
+  pattern=$1
+  file=$2
+  grep -Eiq "$pattern" "$file" || { echo "error: missing response header matching $pattern" >&2; exit 1; }
+}
+
+assert_running() {
+  service=$1
+  id=$(compose ps --quiet "$service")
+  [ -n "$id" ] || { echo "error: $service container is absent" >&2; exit 1; }
+  [ "$(docker inspect --format '{{.State.Running}}' "$id")" = true ] || { echo "error: $service is not running" >&2; exit 1; }
+}
+
+check_processes_and_isolation() {
+  assert_running api
+  assert_running worker
+  assert_running files
+  assert_running postgres
+
+  files_id=$(compose ps --quiet files)
+  postgres_id=$(compose ps --quiet postgres)
+  files_networks=$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$files_id")
+  postgres_networks=$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$postgres_id")
+  [ "$(printf '%s\n' "$files_networks" | grep -c .)" = 1 ]
+  [ "$(printf '%s\n' "$postgres_networks" | grep -c .)" = 1 ]
+  [ "$files_networks" != "$postgres_networks" ] || { echo "error: File Server shares the PostgreSQL network" >&2; exit 1; }
+
+  mounts=$(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Destination .RW}}{{end}}{{end}}' "$files_id")
+  [ "$(printf '%s\n' "$mounts" | grep -c .)" = 2 ] || { echo "error: File Server has unexpected volume mounts" >&2; exit 1; }
+  printf '%s\n' "$mounts" | grep -qx '/srv/nmcp/originals false'
+  printf '%s\n' "$mounts" | grep -qx '/srv/nmcp/renditions false'
+  ! printf '%s\n' "$mounts" | grep -q '/var/lib/nmcp/media'
+
+  api_id=$(compose ps --quiet api)
+  worker_id=$(compose ps --quiet worker)
+  compose stop api worker
+  for id in "$api_id" "$worker_id"; do
+    [ "$(docker inspect --format '{{.State.Running}}' "$id")" = false ]
+    [ "$(docker inspect --format '{{.State.ExitCode}}' "$id")" = 0 ] || { echo "error: process did not shut down cleanly: $id" >&2; exit 1; }
+  done
+  compose start api worker
+  compose up --detach --wait api worker
+  assert_running worker
+}
+
 check() (
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-  base=https://127.0.0.1:18443
-  object="$base/files/originals/00/00000000-0000-4000-8000-000000000000/original.jpg"
+  base="https://127.0.0.1:$files_port"
+  original="$base/files/originals/00/00000000-0000-4000-8000-000000000000/original.jpg"
+  rendition="$base/files/renditions/00/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp"
 
-  expect_status 200 http://127.0.0.1:18080/healthz
-  expect_status 200 http://127.0.0.1:18080/readyz
-  expect_status 200 "$object"
-  expect_status 200 --head "$object"
-  expect_status 206 --range 2-5 "$object"
-  expect_status 206 --range -4 "$object"
-  expect_status 206 --range 4- "$object"
-  expect_status 206 --range 0-1,4-5 "$object"
-  expect_status 416 --range 99-100 "$object"
-  expect_status 405 --request POST "$object"
+  compose exec -T api sh -eu -c '
+    [ "$(cat /var/lib/nmcp/media/originals/00/00000000-0000-4000-8000-000000000000/original.jpg)" = 0123456789abcdef ]
+    [ "$(cat /var/lib/nmcp/media/renditions/00/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp)" = rendition-webp! ]
+    [ "$(cat /var/lib/nmcp/media/backups/secret.dump)" = private-sentinel ]
+    [ -L /var/lib/nmcp/media/originals/33/33333333-3333-4333-8333-333333333333/original.jpg ]
+    [ -f /var/lib/nmcp/media/originals/ff/00000000-0000-4000-8000-000000000000/original.jpg ]
+    [ -f /var/lib/nmcp/media/renditions/ff/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp ]
+  '
+
+  expect_status 200 "http://127.0.0.1:$api_port/healthz"
+  expect_status 200 "http://127.0.0.1:$api_port/readyz"
+  fetch 200 "$tmp/body" "$tmp/headers" "$original"
+  [ "$(cat "$tmp/body")" = 0123456789abcdef ]
+  assert_header '^content-type: image/jpeg' "$tmp/headers"
+  assert_header '^accept-ranges: bytes' "$tmp/headers"
+  assert_header '^cache-control: private, max-age=31536000, immutable' "$tmp/headers"
+  assert_header '^x-content-type-options: nosniff' "$tmp/headers"
+
+  fetch 200 "$tmp/rendition" "$tmp/rendition-headers" "$rendition"
+  [ "$(cat "$tmp/rendition")" = rendition-webp! ]
+  assert_header '^content-type: image/webp' "$tmp/rendition-headers"
+  assert_header '^cache-control: private, max-age=31536000, immutable' "$tmp/rendition-headers"
+
+  python3 - "$files_port" <<'PY'
+import socket, ssl, sys
+port = int(sys.argv[1])
+path = "/files/originals/00/00000000-0000-4000-8000-000000000000/original.jpg"
+ctx = ssl._create_unverified_context()
+with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+    with ctx.wrap_socket(raw, server_hostname="localhost") as conn:
+        conn.sendall(f"HEAD {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n".encode())
+        response = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+headers, body = response.split(b"\r\n\r\n", 1)
+assert headers.startswith(b"HTTP/1.1 200"), headers
+assert b"Content-Length: 16\r\n" in headers + b"\r\n", headers
+assert b"Content-Type: image/jpeg\r\n" in headers + b"\r\n", headers
+assert body == b"", body
+PY
+
+  fetch 206 "$tmp/body" "$tmp/headers" --range 2-5 "$original"
+  [ "$(cat "$tmp/body")" = 2345 ]
+  assert_header '^content-range: bytes 2-5/16' "$tmp/headers"
+  fetch 206 "$tmp/body" "$tmp/headers" --range 4- "$original"
+  [ "$(cat "$tmp/body")" = 456789abcdef ]
+  assert_header '^content-range: bytes 4-15/16' "$tmp/headers"
+  fetch 206 "$tmp/body" "$tmp/headers" --range -4 "$original"
+  [ "$(cat "$tmp/body")" = cdef ]
+  assert_header '^content-range: bytes 12-15/16' "$tmp/headers"
+  fetch 206 "$tmp/multi" "$tmp/multi-headers" --range 0-1,4-5 "$original"
+  python3 - "$tmp/multi-headers" "$tmp/multi" <<'PY'
+import re, sys
+headers = open(sys.argv[1], "rb").read()
+body = open(sys.argv[2], "rb").read()
+match = re.search(br"(?im)^content-type: multipart/byteranges; boundary=([^\r\n]+)", headers)
+assert match, headers
+boundary = b"--" + match.group(1)
+parts = body.split(boundary)
+assert parts[0] == b"" and parts[-1] == b"--\r\n", parts
+actual = []
+for part in parts[1:-1]:
+    assert part.startswith(b"\r\n") and part.endswith(b"\r\n"), part
+    part_headers, payload = part[2:-2].split(b"\r\n\r\n", 1)
+    content_range = re.search(br"(?im)^Content-Range: ([^\r\n]+)", part_headers).group(1)
+    actual.append((content_range, payload))
+assert actual == [(b"bytes 0-1/16", b"01"), (b"bytes 4-5/16", b"45")], actual
+PY
+
+  fetch 416 "$tmp/body" "$tmp/headers" --range 99-100 "$original"
+  assert_header '^content-range: bytes \*/16' "$tmp/headers"
+  expect_status 405 --request POST "$original"
   expect_status 404 "$base/files/backups/secret.dump"
-  expect_status 404 "$base/files/originals/00/00000000-0000-4000-8000-000000000000/missing.jpg"
-  symlink_status=$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/00/00000000-0000-4000-8000-000000000000/escape.jpg")
-  case "$symlink_status" in 400|403|404) ;; *) echo "error: symlink escape returned HTTP $symlink_status" >&2; exit 1 ;; esac
-
-  curl --insecure --silent --show-error --dump-header "$tmp/headers" --output "$tmp/body" "$object"
-  grep -iq '^accept-ranges: bytes' "$tmp/headers"
-  grep -iq '^cache-control: private, max-age=31536000, immutable' "$tmp/headers"
-  grep -iq '^x-content-type-options: nosniff' "$tmp/headers"
-  [ "$(wc -c <"$tmp/body" | tr -d ' ')" = 16 ]
+  expect_status 404 "$base/files/originals/ff/00000000-0000-4000-8000-000000000000/original.jpg"
+  expect_status 404 "$base/files/renditions/ff/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp"
+  symlink_status=$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/33/33333333-3333-4333-8333-333333333333/original.jpg")
+  case "$symlink_status" in 400|403|404) ;; *) echo "error: canonical symlink escape returned HTTP $symlink_status" >&2; exit 1 ;; esac
 
   directory_status=$(curl --insecure --silent --output "$tmp/directory" --write-out '%{http_code}' "$base/files/originals/")
   [ "$directory_status" != 200 ] || { echo "error: directory listing is enabled" >&2; exit 1; }
   ! grep -qi '<title>Index of' "$tmp/directory"
-
   expect_status 404 --path-as-is "$base/files/originals/../backups/secret.dump"
   escaped_status=$(curl --insecure --path-as-is --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/%2e%2e/backups/secret.dump")
   case "$escaped_status" in 400|404) ;; *) echo "error: encoded traversal returned HTTP $escaped_status" >&2; exit 1 ;; esac
   malformed_status=$(curl --insecure --path-as-is --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/%zz")
   [ "$malformed_status" = 400 ] || { echo "error: malformed escape returned HTTP $malformed_status" >&2; exit 1; }
 
+  check_processes_and_isolation
   compose exec -T files nginx -t
-  compose exec -T api sh -eu -c 'exiftool -ver; ffprobe -version; prlimit --version; dpkg-query --show ca-certificates curl ffmpeg libimage-exiftool-perl util-linux'
-  capabilities=$(compose exec -T api /opt/nmcp/bin/nmcp-still-helper capabilities \
-    --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
+  compose exec -T api sh -eu -c 'exiftool -ver; ffprobe -version; prlimit --version; dpkg-query --show ca-certificates curl ffmpeg libde265-0 libexif12 libimage-exiftool-perl libwebpdemux2 util-linux'
+  capabilities=$(compose exec -T api /opt/nmcp/bin/nmcp-still-helper capabilities --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
   printf '%s\n' "$capabilities"
-  for expected in \
-    '"libvips":"8.18.7"' '"libheif":"1.23.5"' '"libraw":"0.22.2-Release"' \
-    '"libaom":"v3.8.2"' '"lcms2":"2.14"'
-  do
+  for expected in '"libvips":"8.18.7"' '"libheif":"1.23.5"' '"libraw":"0.22.2-Release"' '"libaom":"v3.8.2"' '"lcms2":"2.14"'; do
     printf '%s' "$capabilities" | grep -F "$expected" >/dev/null
   done
   compose exec -T api sh -eu -c '
-    printf "sRGB2014.icc  "; sha256sum /opt/nmcp/share/sRGB2014.icc
+    printf "%s  %s\n" 384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a /opt/nmcp/share/sRGB2014.icc | sha256sum --check
     du -sh /opt/nmcp/still-toolchain
-    ldd /opt/nmcp/bin/nmcp-still-helper
+    closure=$(ldd /opt/nmcp/bin/nmcp-still-helper)
+    printf "%s\n" "$closure"
+    ! printf "%s\n" "$closure" | grep -F "not found"
   '
   image_id=$(compose images -q api)
   docker image inspect "$image_id" --format 'core_image_bytes={{.Size}}'
@@ -95,27 +268,59 @@ check() (
   echo "validation environment checks passed"
 )
 
+verify_isolation() {
+  peer_project="${project}-peer"
+  peer_api_port=${NMCP_ISOLATION_API_PORT:-28080}
+  peer_files_port=${NMCP_ISOLATION_FILES_PORT:-28443}
+  NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" up
+  NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" check
+  NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" reset
+  check
+
+  docker volume create --label "com.docker.compose.project=$guard_project" --label com.nmcp.validation.owner=foreign "$guard_volume" >/dev/null
+  if NMCP_VALIDATION_PROJECT=$guard_project "$script" reset; then
+    echo "error: ownership guard accepted a foreign resource" >&2
+    exit 1
+  fi
+  docker volume rm "$guard_volume" >/dev/null
+}
+
 require_tools
+assert_owned
 case "${1:-}" in
   up)
-    compose up --build --detach --wait
-    write_fixture
+    complete=false
+    trap 'if [ "$complete" != true ]; then cleanup; fi' EXIT HUP INT TERM
+    start_environment
+    complete=true
+    trap - EXIT HUP INT TERM
     ;;
   check)
     check
     ;;
   verify)
-    trap 'compose down --volumes --remove-orphans' EXIT HUP INT TERM
-    compose down --volumes --remove-orphans
-    compose up --build --detach --wait
-    write_fixture
+    peer_project="${project}-peer"
+    guard_project="${project}-guard-$$"
+    guard_volume="${guard_project}_foreign"
+    cleanup_all() {
+      NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=${NMCP_ISOLATION_API_PORT:-28080} NMCP_FILES_PORT=${NMCP_ISOLATION_FILES_PORT:-28443} "$script" reset || true
+      docker volume rm "$guard_volume" >/dev/null 2>&1 || true
+      cleanup || true
+    }
+    trap cleanup_all EXIT HUP INT TERM
+    cleanup
+    start_environment
     check
+    compose down --remove-orphans
+    start_environment
+    check
+    verify_isolation
     ;;
   down)
     compose down --remove-orphans
     ;;
   reset)
-    compose down --volumes --remove-orphans
+    cleanup
     ;;
   logs)
     compose logs --no-color

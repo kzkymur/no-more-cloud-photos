@@ -13,7 +13,7 @@ owned by issue #20.
 | Core API | `127.0.0.1:18080` | container UID/GID 10001; read/write media and database |
 | Core Worker | not published | container UID/GID 10001; read/write media and database |
 | PostgreSQL | Compose network only | validation-only database/password; database volume is not shared |
-| Nginx | `https://127.0.0.1:18443` | worker UID/GID 10001; media volume is mounted read-only |
+| Nginx | `https://127.0.0.1:18443` | worker UID/GID 10001; only Original/Rendition volume subpaths are mounted read-only; isolated network |
 
 Only `media/originals` and `media/renditions` are mapped below `/files`.
 PostgreSQL data, TLS keys, temporary files, backup, and quarantine roots are not
@@ -29,31 +29,46 @@ the service manager and service identity, not in the repository or arguments.
 
 ## Commands
 
-Docker Engine, Docker Compose v2, and `curl` are required on a Linux host.
+Docker Engine, Docker Compose v2, `curl`, `python3`, and `sha256sum` are required
+on a Linux host.
 
 ```text
 scripts/validation-env up       # build, migrate, start, and install a known file fixture
 scripts/validation-env check    # probes the already-running environment
 scripts/validation-env logs     # diagnostics without credentials printed by the apps
 scripts/validation-env down     # stop; retain named database/media volumes
-scripts/validation-env reset    # stop and remove only nmcp-validation named volumes
+scripts/validation-env reset    # stop and remove only this checkout's owned volumes
 scripts/validation-env verify   # clean start, checks, version evidence, guaranteed cleanup
 ```
 
-`reset` and `verify` use the fixed Compose project name `nmcp-validation` and
-remove only that project's named volumes. They do not traverse or delete host
-paths. A failed build keeps Docker's ordinary image/build cache but removes the
-validation containers and named data volumes when `verify` exits.
+The default Compose project name includes a hash of the checkout's canonical
+path. `NMCP_VALIDATION_PROJECT` may explicitly override it, but every container,
+network, and volume also carries the full checkout-owner hash. Every command
+fails closed before operating on a same-named resource with a missing or
+different owner label. Thus another checkout cannot be stopped or reset even if
+an operator gives both the same override. Cleanup does not traverse or delete
+host paths. A failed standalone `up` and every `verify` exit remove owned
+containers and named volumes; CI also has an independent `if: always()` reset.
+Docker's ordinary image/build cache is retained.
 
-`check` proves API health/readiness, Nginx configuration validity, GET/HEAD,
-closed/open-ended/suffix Range (`206`), unsatisfiable Range (`416`), non-GET
-rejection (`405`), private immutable cache and nosniff headers, directory-listing
-denial, traversal denial, missing objects, and non-public backup namespace. It
-also records the live PostgreSQL, Nginx, ExifTool, FFprobe, and `prlimit`
+`verify` proves clean and retained-volume lifecycles (`reset; up; down; up;
+check; reset`), two simultaneously running project identities, continued
+operation of one after resetting the other, and fail-closed foreign-owner
+rejection. `check` proves API/Worker process state and graceful exit/restart,
+Nginx configuration validity, exact Original and Rendition bodies/MIME,
+body-free HEAD, exact closed/open-ended/suffix Range bodies and Content-Range,
+multipart Range framing, unsatisfiable Range (`416`), non-GET rejection (`405`),
+private immutable cache and nosniff headers, directory-listing and traversal
+denial, canonical shard equality, canonical-name symlink denial, and an existing
+non-public backup sentinel. It also asserts that Nginx has only its isolated
+network, shares no network with PostgreSQL, and receives exactly two read-only
+Original/Rendition subpath mounts. It also records the live PostgreSQL, Nginx,
+ExifTool, FFprobe, and `prlimit`
 versions. It builds the merged issue #11 source-pinned native still toolchain
 through its single canonical build script, runs `nmcp-still-helper capabilities`,
-checks the exact library versions and sRGB ICC digest, and records its dynamic
-dependency closure, installed size, and final Core image size. Environment
+checks the exact library versions and sRGB ICC digest, rejects an unresolved
+dynamic dependency, and records the closure, installed size, runtime package
+versions, and final Core image size. Environment
 startup is not a claim that upload/transform/lifecycle,
 codec quality, backup/restore, failure injection, or complete issue #21 E2E has
 passed.
@@ -69,6 +84,9 @@ and absolute tool paths. The native still-image source SHAs, build flags, and
 versions remain owned by issue #11's
 `internal/stillprocessor/helper/build-pinned-toolchain.sh`; the validation image
 calls that script rather than duplicating or changing its codec contract.
+Dockerfile-specific allowlists limit the build contexts to Go/native-helper
+sources or Nginx configuration; repository secrets, dumps, media, documentation,
+and unrelated untracked files are not sent to the builder.
 
 ## Production contract handed to issue #20
 

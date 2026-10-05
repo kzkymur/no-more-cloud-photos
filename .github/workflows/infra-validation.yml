@@ -21,3 +21,6 @@ jobs:
           docker compose version
       - name: Build and verify isolated Core environment
         run: scripts/validation-env verify
+      - name: Always remove validation resources
+        if: always()
+        run: scripts/validation-env reset
