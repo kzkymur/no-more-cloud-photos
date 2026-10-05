@@ -55,6 +55,7 @@ func TestRealStillHelper(t *testing.T) {
 	pq := readGeneratedFixture(t, "TEST_STILL_PQ_PATH")
 	hlg := readGeneratedFixture(t, "TEST_STILL_HLG_PATH")
 	iccNCLX := readGeneratedFixture(t, "TEST_STILL_ICC_NCLX_PATH")
+	invalidICC := readGeneratedFixture(t, "TEST_STILL_INVALID_ICC_PATH")
 
 	for _, test := range []struct {
 		name, mime, alpha, inputColor, toneMap, rawProcessing string
@@ -143,6 +144,17 @@ func TestRealStillHelper(t *testing.T) {
 		})
 		if !errors.Is(err, ErrDecode) {
 			t.Fatalf("corrupt RAW error = %v", err)
+		}
+	})
+
+	t.Run("invalid embedded ICC fails closed", func(t *testing.T) {
+		input, output := testFiles(t, invalidICC)
+		_, err := processor.Transform(context.Background(), Request{
+			Input: input, Output: output, MIMEType: "image/heif",
+			Recipe: profile.StandardV1Parameters().Recipes["image/heif"],
+		})
+		if !errors.Is(err, ErrDecode) {
+			t.Fatalf("invalid ICC error = %v", err)
 		}
 	})
 }

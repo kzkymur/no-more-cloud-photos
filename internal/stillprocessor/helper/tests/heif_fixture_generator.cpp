@@ -92,4 +92,6 @@ int main(int argc, char **argv) {
   encode(directory / "pq.avif", heif_transfer_characteristic_ITU_R_BT_2100_0_PQ, {});
   encode(directory / "hlg.avif", heif_transfer_characteristic_ITU_R_BT_2100_0_HLG, {});
   encode(directory / "icc-nclx.avif", heif_transfer_characteristic_IEC_61966_2_1, icc);
+  encode(directory / "invalid-icc.avif", heif_transfer_characteristic_IEC_61966_2_1,
+         {'n', 'o', 't', '-', 'a', 'n', '-', 'i', 'c', 'c'});
 }
