@@ -88,8 +88,8 @@ func TestRealStillHelper(t *testing.T) {
 			input: pq, inputColor: "nclx-pq", toneMap: "bt2446a-method-a", referencePixel: []int{127, 127, 127}},
 		{name: "real HLG NCLX reference pixel", mime: "image/heif", alpha: "opaque", width: 32, height: 32,
 			input: hlg, inputColor: "nclx-hlg", toneMap: "bt2446a-method-a", referencePixel: []int{100, 100, 100}},
-		{name: "ICC and NCLX single normalization", mime: "image/heif", alpha: "opaque", width: 32, height: 32,
-			input: iccNCLX, inputColor: "embedded-icc", toneMap: "not-needed", referencePixel: []int{64, 128, 192}},
+		{name: "wide-gamut ICC and NCLX single normalization", mime: "image/heif", alpha: "opaque", width: 32, height: 32,
+			input: iccNCLX, inputColor: "embedded-icc", toneMap: "not-needed", referencePixel: []int{215, 93, 31}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			inputPath := filepath.Join(t.TempDir(), "input")

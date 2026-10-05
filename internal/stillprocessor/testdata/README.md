@@ -29,8 +29,9 @@ AVIF-container HEIF fixtures for:
   reference output is sRGB `(127,127,127)`;
 - BT.2020/HLG code value 512/1023, whose independently calculated BT.2100 OOTF
   plus BT.2446A reference output is sRGB `(100,100,100)`;
-- sRGB ICC plus sRGB NCLX `(64,128,192)`, proving NCLX decode and exactly one
-  ICC normalization rather than two color conversions;
+- project-generated Display P3 ICC plus Display P3 NCLX `(200,100,50)`, whose
+  independent matrix reference is sRGB `(215,93,31)`, proving NCLX passthrough
+  followed by exactly one ICC normalization rather than two gamut conversions;
 - deliberately malformed embedded ICC bytes, which must fail closed as a
   decode error rather than being ignored.
 

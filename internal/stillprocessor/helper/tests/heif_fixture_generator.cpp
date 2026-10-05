@@ -1,6 +1,8 @@
 // Project-owned source. See ../LICENSE.md.
 #include <libheif/heif.h>
+#include <lcms2.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -26,8 +28,31 @@ std::vector<std::uint8_t> read_file(const char *path) {
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+std::vector<std::uint8_t> display_p3_icc() {
+  std::unique_ptr<std::remove_pointer_t<cmsHPROFILE>, decltype(&cmsCloseProfile)> srgb(
+      cmsCreate_sRGBProfile(), cmsCloseProfile);
+  if (!srgb) std::exit(1);
+  cmsCIExyY white{0.3127, 0.3290, 1.0};
+  cmsCIExyYTRIPLE primaries{{0.680, 0.320, 1.0}, {0.265, 0.690, 1.0}, {0.150, 0.060, 1.0}};
+  cmsToneCurve *curves[3] = {
+      static_cast<cmsToneCurve *>(cmsReadTag(srgb.get(), cmsSigRedTRCTag)),
+      static_cast<cmsToneCurve *>(cmsReadTag(srgb.get(), cmsSigGreenTRCTag)),
+      static_cast<cmsToneCurve *>(cmsReadTag(srgb.get(), cmsSigBlueTRCTag))};
+  if (!curves[0] || !curves[1] || !curves[2]) std::exit(1);
+  std::unique_ptr<std::remove_pointer_t<cmsHPROFILE>, decltype(&cmsCloseProfile)> profile(
+      cmsCreateRGBProfile(&white, &primaries, curves), cmsCloseProfile);
+  if (!profile) std::exit(1);
+  cmsUInt32Number size = 0;
+  if (!cmsSaveProfileToMem(profile.get(), nullptr, &size) || size == 0) std::exit(1);
+  std::vector<std::uint8_t> result(size);
+  if (!cmsSaveProfileToMem(profile.get(), result.data(), &size)) std::exit(1);
+  result.resize(size);
+  return result;
+}
+
 void encode(const std::filesystem::path &path, heif_transfer_characteristics transfer,
-            const std::vector<std::uint8_t> &icc) {
+            const std::vector<std::uint8_t> &icc,
+            std::array<std::uint8_t, 3> sdr_rgb = {64, 128, 192}, bool display_p3 = false) {
   constexpr int size = 32;
   const bool hdr = transfer == heif_transfer_characteristic_ITU_R_BT_2100_0_PQ ||
                    transfer == heif_transfer_characteristic_ITU_R_BT_2100_0_HLG;
@@ -51,16 +76,17 @@ void encode(const std::filesystem::path &path, heif_transfer_characteristics tra
         }
       } else {
         const auto offset = static_cast<std::size_t>(x * 3);
-        row[offset] = 64;
-        row[offset + 1] = 128;
-        row[offset + 2] = 192;
+        row[offset] = sdr_rgb[0];
+        row[offset + 1] = sdr_rgb[1];
+        row[offset + 2] = sdr_rgb[2];
       }
     }
   }
 
   std::unique_ptr<heif_color_profile_nclx, decltype(&heif_nclx_color_profile_free)> nclx(
       heif_nclx_color_profile_alloc(), heif_nclx_color_profile_free);
-  nclx->color_primaries = hdr ? heif_color_primaries_ITU_R_BT_2020_2_and_2100_0 : heif_color_primaries_ITU_R_BT_709_5;
+  nclx->color_primaries = hdr ? heif_color_primaries_ITU_R_BT_2020_2_and_2100_0 :
+      (display_p3 ? heif_color_primaries_SMPTE_EG_432_1 : heif_color_primaries_ITU_R_BT_709_5);
   nclx->transfer_characteristics = transfer;
   nclx->matrix_coefficients = hdr ? heif_matrix_coefficients_ITU_R_BT_2020_2_non_constant_luminance
                                   : heif_matrix_coefficients_RGB_GBR;
@@ -93,10 +119,16 @@ int main(int argc, char **argv) {
   if (argc != 3) return 2;
   const std::filesystem::path directory(argv[1]);
   std::filesystem::create_directories(directory);
-  const auto icc = read_file(argv[2]);
+  const auto srgb_icc = read_file(argv[2]);
+  const auto p3_icc = display_p3_icc();
   encode(directory / "pq.avif", heif_transfer_characteristic_ITU_R_BT_2100_0_PQ, {});
   encode(directory / "hlg.avif", heif_transfer_characteristic_ITU_R_BT_2100_0_HLG, {});
-  encode(directory / "icc-nclx.avif", heif_transfer_characteristic_IEC_61966_2_1, icc);
+  encode(directory / "icc-nclx.avif", heif_transfer_characteristic_IEC_61966_2_1, p3_icc,
+         {200, 100, 50}, true);
   encode(directory / "invalid-icc.avif", heif_transfer_characteristic_IEC_61966_2_1,
          {'n', 'o', 't', '-', 'a', 'n', '-', 'i', 'c', 'c'});
+
+  // Keep the command-line sRGB profile in the fixture generator's input
+  // contract and reject accidental empty/wrong-file invocations.
+  if (srgb_icc.size() < 128) return 1;
 }
