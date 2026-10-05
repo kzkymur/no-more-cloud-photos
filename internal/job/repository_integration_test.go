@@ -214,6 +214,197 @@ func TestHeartbeatIntegrationCASClockAndExactExpiry(t *testing.T) {
 	}
 }
 
+func TestTargetMutationRevalidatesLeaseAfterBlockedWorkIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{LeaseDuration: time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	jobID, targets := insertTransformJob(t, pool, 3, 1)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(context.Background())
+	if _, err := blocker.Exec(ctx, `SELECT id FROM job_targets WHERE id=$1 FOR UPDATE`, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- repository.BeginTarget(ctx, jobID, lease.Token, targets[0]) }()
+	var mutationPID int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		err := pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity
+			WHERE pid<>pg_backend_pid() AND state='active' AND query LIKE 'UPDATE job_targets AS jt SET attempts=%'
+			ORDER BY query_start DESC LIMIT 1`).Scan(&mutationPID)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if mutationPID == 0 {
+		t.Fatal("blocked target mutation was not observed")
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		var expired bool
+		if err := pool.QueryRow(ctx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, jobID).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lease did not expire while target mutation was blocked")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("post-work expiry mutation error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("blocked target mutation did not return: %v", ctx.Err())
+	}
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT attempts FROM job_targets WHERE id=$1`, targets[0]).Scan(&attempts); err != nil || attempts != 0 {
+		t.Fatalf("expired target mutation committed attempts=%d err=%v", attempts, err)
+	}
+}
+
+func TestTerminalTransitionRevalidatesAfterLeaseExpiresDuringWorkIntegration(t *testing.T) {
+	jitterStarted := make(chan struct{})
+	releaseJitter := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseJitter) })
+	pool, repository := integrationRepository(t, Options{
+		LeaseDuration: time.Second,
+		Jitter: func(time.Duration) time.Duration {
+			close(jitterStarted)
+			<-releaseJitter
+			return 0
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	jobID, _ := insertTransformJob(t, pool, 3, 1)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- repository.FinishAttempt(ctx, jobID, lease.Token, FailureProcessFailed) }()
+	select {
+	case <-jitterStarted:
+	case <-ctx.Done():
+		t.Fatalf("terminal transition did not reach blocked work: %v", ctx.Err())
+	}
+	for {
+		var expired bool
+		if err := pool.QueryRow(ctx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, jobID).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired {
+			break
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("lease did not expire during terminal work: %v", ctx.Err())
+		}
+	}
+	releaseOnce.Do(func() { close(releaseJitter) })
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("post-work terminal expiry error = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("terminal transition did not return: %v", ctx.Err())
+	}
+	var status Status
+	var retainedToken string
+	var errorCode *string
+	if err := pool.QueryRow(ctx, `SELECT status,lease_token::text,error_code FROM jobs WHERE id=$1`, jobID).Scan(&status, &retainedToken, &errorCode); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusRunning || retainedToken != lease.Token || errorCode != nil {
+		t.Fatalf("expired terminal transition committed: status=%s token=%s error=%v", status, retainedToken, errorCode)
+	}
+}
+
+func TestCompleteSucceededRejectsExpiredTransformAndPurgeIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx := context.Background()
+	jobID, targets := insertTransformJob(t, pool, 3, 1)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	publishTargetFixture(t, pool, targets[0])
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CompleteSucceeded(ctx, jobID, lease.Token); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("expired transform completion = %v", err)
+	}
+	var transformStatus Status
+	if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, jobID).Scan(&transformStatus); err != nil || transformStatus != StatusRunning {
+		t.Fatalf("expired transform status = %s, %v", transformStatus, err)
+	}
+
+	purgeID := newTestUUID(t)
+	purgeMediaID := newTestUUID(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after)
+		VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp())`, purgeMediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts)
+		VALUES ($1,'purge',$2,'queued',3)`, purgeID, purgeMediaID); err != nil {
+		t.Fatal(err)
+	}
+	var deletedBefore, purgeBefore time.Time
+	if err := pool.QueryRow(ctx, `SELECT deleted_at,purge_after FROM media WHERE id=$1`, purgeMediaID).Scan(&deletedBefore, &purgeBefore); err != nil {
+		t.Fatal(err)
+	}
+	purgeToken := newTestUUID(t)
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,
+		lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, purgeID, purgeToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CompleteSucceeded(ctx, purgeID, purgeToken); !errors.Is(err, ErrConflict) {
+		t.Fatalf("generic purge completion = %v", err)
+	}
+	var purgeStatus Status
+	var retainedToken string
+	var finished *time.Time
+	if err := pool.QueryRow(ctx, `SELECT status,lease_token::text,finished_at FROM jobs WHERE id=$1`, purgeID).Scan(&purgeStatus, &retainedToken, &finished); err != nil {
+		t.Fatal(err)
+	}
+	if purgeStatus != StatusRunning || retainedToken != purgeToken || finished != nil {
+		t.Fatalf("purge changed by generic completion: status=%s token=%s finished=%v", purgeStatus, retainedToken, finished)
+	}
+	var deletedAfter, purgeAfter time.Time
+	if err := pool.QueryRow(ctx, `SELECT deleted_at,purge_after FROM media WHERE id=$1`, purgeMediaID).Scan(&deletedAfter, &purgeAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !deletedAfter.Equal(deletedBefore) || !purgeAfter.Equal(purgeBefore) {
+		t.Fatalf("purge completion changed Media: deleted %s→%s purge %s→%s", deletedBefore, deletedAfter, purgeBefore, purgeAfter)
+	}
+}
+
 func TestTransformTargetsRetryAndCompletionIntegration(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
 	ctx := context.Background()

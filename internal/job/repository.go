@@ -159,7 +159,7 @@ func (r *Repository) FinishAttempt(ctx context.Context, jobID, token string, cod
 	if !ok {
 		return ErrInvalid
 	}
-	return r.withLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
+	return r.transitionLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
 		var attempts int
 		if err := tx.QueryRow(ctx, `SELECT attempts FROM jobs WHERE id=$1`, jobID).Scan(&attempts); err != nil {
 			return classifyDatabaseError(err)
@@ -168,33 +168,48 @@ func (r *Repository) FinishAttempt(ctx context.Context, jobID, token string, cod
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE jobs SET status=CASE WHEN attempts<max_attempts THEN 'queued' ELSE 'failed' END,
+		tag, err := tx.Exec(ctx, `UPDATE jobs SET status=CASE WHEN attempts<max_attempts THEN 'queued' ELSE 'failed' END,
 			available_at=CASE WHEN attempts<max_attempts THEN clock_timestamp()+$2::interval ELSE available_at END,
 			lease_token=NULL,lease_expires_at=NULL,error_code=$3,error_message=$4,
 			finished_at=CASE WHEN attempts<max_attempts THEN NULL ELSE clock_timestamp() END,updated_at=clock_timestamp()
-			WHERE id=$1`, jobID, intervalText(delay), code, message)
-		return classifyDatabaseError(err)
+			WHERE id=$1 AND status='running' AND lease_token=$5 AND lease_expires_at>clock_timestamp()`,
+			jobID, intervalText(delay), code, message, token)
+		if err != nil {
+			return classifyDatabaseError(err)
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrLeaseLost
+		}
+		return nil
 	})
 }
 
 func (r *Repository) CompleteSucceeded(ctx context.Context, jobID, token string) error {
-	return r.withLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
+	return r.transitionLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
 		var jobType Type
 		if err := tx.QueryRow(ctx, `SELECT type FROM jobs WHERE id=$1`, jobID).Scan(&jobType); err != nil {
 			return classifyDatabaseError(err)
 		}
-		if jobType == TypeTransform {
-			var incomplete bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM job_targets WHERE job_id=$1 AND status<>'succeeded')`, jobID).Scan(&incomplete); err != nil {
-				return classifyDatabaseError(err)
-			}
-			if incomplete {
-				return ErrConflict
-			}
+		if jobType != TypeTransform {
+			return ErrConflict
 		}
-		_, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,
-			finished_at=clock_timestamp(),error_code=NULL,error_message=NULL,updated_at=clock_timestamp() WHERE id=$1`, jobID)
-		return classifyDatabaseError(err)
+		var incomplete bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM job_targets WHERE job_id=$1 AND status<>'succeeded')`, jobID).Scan(&incomplete); err != nil {
+			return classifyDatabaseError(err)
+		}
+		if incomplete {
+			return ErrConflict
+		}
+		tag, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,
+			finished_at=clock_timestamp(),error_code=NULL,error_message=NULL,updated_at=clock_timestamp()
+			WHERE id=$1 AND status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()`, jobID, token)
+		if err != nil {
+			return classifyDatabaseError(err)
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrLeaseLost
+		}
+		return nil
 	})
 }
 
@@ -305,6 +320,18 @@ func insertAdminRetryAudit(ctx context.Context, tx pgx.Tx, jobID string, audit A
 }
 
 func (r *Repository) withLiveLease(ctx context.Context, jobID, token string, fn func(pgx.Tx) error) error {
+	return r.withLockedLiveLease(ctx, jobID, token, true, fn)
+}
+
+// transitionLiveLease is reserved for callbacks whose final statement changes
+// the Job out of running and therefore cannot retain the token for a post-work
+// check. Such a callback must put the same live-lease predicate directly on
+// that final UPDATE and return ErrLeaseLost when it affects no row.
+func (r *Repository) transitionLiveLease(ctx context.Context, jobID, token string, fn func(pgx.Tx) error) error {
+	return r.withLockedLiveLease(ctx, jobID, token, false, fn)
+}
+
+func (r *Repository) withLockedLiveLease(ctx context.Context, jobID, token string, revalidate bool, fn func(pgx.Tx) error) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return classifyDatabaseError(err)
@@ -321,6 +348,16 @@ func (r *Repository) withLiveLease(ctx context.Context, jobID, token string, fn 
 	}
 	if err := fn(tx); err != nil {
 		return err
+	}
+	if revalidate {
+		err = tx.QueryRow(ctx, `SELECT status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()
+			FROM jobs WHERE id=$1`, jobID, token).Scan(&live)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && !live {
+			return ErrLeaseLost
+		}
+		if err != nil {
+			return classifyDatabaseError(err)
+		}
 	}
 	return classifyDatabaseError(tx.Commit(ctx))
 }

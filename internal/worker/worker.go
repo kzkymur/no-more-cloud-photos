@@ -171,6 +171,9 @@ func (w *Worker) reclaim(ctx context.Context) error {
 }
 
 func (w *Worker) runLease(parent context.Context, lease job.Lease) error {
+	if parent.Err() != nil {
+		return w.releaseOnShutdown(lease)
+	}
 	executor := w.executors[lease.Type]
 	if executor == nil {
 		// A claim result outside the exact registration set is an invariant
@@ -307,8 +310,11 @@ func withDefaults(options Options) Options {
 
 func validOptions(options Options) bool {
 	return options.PollInterval > 0 && options.HeartbeatInterval > 0 && options.HeartbeatInterval <= MaximumHeartbeatInterval && options.DatabaseTimeout > 0 &&
-		options.ShutdownReleaseTimeout > 0 && options.ExecutionLimits.Threads > 0 && options.ExecutionLimits.OutputBytesPerStream > 0 &&
-		options.ExecutionLimits.StillTimeoutCeiling > 0 && options.ExecutionLimits.AnimationTimeoutCeiling > 0 && options.ExecutionLimits.VideoTimeoutCeiling > 0
+		options.ShutdownReleaseTimeout > 0 && options.ExecutionLimits.Threads > 0 && options.ExecutionLimits.Threads <= DefaultThreads &&
+		options.ExecutionLimits.OutputBytesPerStream > 0 && options.ExecutionLimits.OutputBytesPerStream <= DefaultOutputBytesPerStream &&
+		options.ExecutionLimits.StillTimeoutCeiling > 0 && options.ExecutionLimits.StillTimeoutCeiling <= DefaultStillTimeoutCeiling &&
+		options.ExecutionLimits.AnimationTimeoutCeiling > 0 && options.ExecutionLimits.AnimationTimeoutCeiling <= DefaultAnimationTimeoutCeiling &&
+		options.ExecutionLimits.VideoTimeoutCeiling > 0 && options.ExecutionLimits.VideoTimeoutCeiling <= DefaultVideoTimeoutCeiling
 }
 
 func resetTimer(timer *time.Timer, duration time.Duration) {

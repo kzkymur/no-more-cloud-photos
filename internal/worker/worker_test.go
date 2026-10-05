@@ -91,6 +91,17 @@ func TestNewDefaultsLimitsAndRejectsPurgeRegistration(t *testing.T) {
 	if _, err := New(repository, nil, Options{HeartbeatInterval: MaximumHeartbeatInterval + time.Nanosecond}, nil); !errors.Is(err, job.ErrInvalid) {
 		t.Fatalf("unsafe heartbeat interval error = %v", err)
 	}
+	for _, limits := range []ExecutionLimits{
+		{Threads: DefaultThreads + 1},
+		{OutputBytesPerStream: DefaultOutputBytesPerStream + 1},
+		{StillTimeoutCeiling: DefaultStillTimeoutCeiling + time.Nanosecond},
+		{AnimationTimeoutCeiling: DefaultAnimationTimeoutCeiling + time.Nanosecond},
+		{VideoTimeoutCeiling: DefaultVideoTimeoutCeiling + time.Nanosecond},
+	} {
+		if _, err := New(repository, nil, Options{ExecutionLimits: limits}, nil); !errors.Is(err, job.ErrInvalid) {
+			t.Errorf("unsafe execution limits %+v error = %v", limits, err)
+		}
+	}
 }
 
 func TestRunLeaseMapsProcessFailuresToDurableCodes(t *testing.T) {
@@ -182,6 +193,26 @@ func TestRunLeaseShutdownCancelsAndRequeuesWithIndependentBudget(t *testing.T) {
 	}
 	if repository.finishContexts[0] != nil {
 		t.Fatalf("shutdown release inherited cancelled context: %v", repository.finishContexts[0])
+	}
+}
+
+func TestAlreadyCancelledLeaseIsReleasedWithoutStartingExecutor(t *testing.T) {
+	repository := &fakeRepository{}
+	var calls int
+	worker := testWorker(t, repository, executorFunc(func(context.Context, job.Lease, ExecutionLimits) error {
+		calls++
+		return nil
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := worker.runLease(ctx, testLease()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("executor calls after cancellation = %d", calls)
+	}
+	if len(repository.finishCodes) != 1 || repository.finishCodes[0] != job.FailureWorkerShutdown || repository.finishContexts[0] != nil {
+		t.Fatalf("cancelled claim release = codes:%v contexts:%v", repository.finishCodes, repository.finishContexts)
 	}
 }
 
