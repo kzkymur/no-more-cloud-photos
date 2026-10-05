@@ -1,10 +1,12 @@
 package job
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -289,6 +291,167 @@ func TestFinishAttemptCeilingAndSafeErrorsIntegration(t *testing.T) {
 	if status != StatusFailed || code != string(FailureProcessOutputLimit) || message != safeFailureMessages[FailureProcessOutputLimit] || finished == nil || strings.Contains(message, "secret") {
 		t.Fatalf("durable failure = %s %q %q %v", status, code, message, finished)
 	}
+}
+
+func TestRetryBackoffPersistsDatabaseAvailabilityBoundaryIntegration(t *testing.T) {
+	delay := 200 * time.Millisecond
+	pool, repository := integrationRepository(t, Options{Jitter: func(maximum time.Duration) time.Duration {
+		if delay > maximum {
+			return maximum
+		}
+		return delay
+	}})
+	ctx := context.Background()
+	jobID, _ := insertTransformJob(t, pool, 2, 1)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.FinishAttempt(ctx, jobID, lease.Token, FailureProcessFailed); err != nil {
+		t.Fatal(err)
+	}
+	var remaining float64
+	if err := pool.QueryRow(ctx, `SELECT EXTRACT(epoch FROM available_at-clock_timestamp()) FROM jobs WHERE id=$1`, jobID).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining <= 0 || remaining > delay.Seconds()+0.1 {
+		t.Fatalf("persisted retry delay = %f seconds", remaining)
+	}
+	if _, err := repository.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("claim before backoff boundary = %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		var available bool
+		if err := pool.QueryRow(ctx, `SELECT available_at<=clock_timestamp() FROM jobs WHERE id=$1`, jobID).Scan(&available); err != nil {
+			t.Fatal(err)
+		}
+		if available {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retry did not become available at database-clock boundary")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if retry, err := repository.Claim(ctx, []Type{TypeTransform}); err != nil || retry.ID != jobID || retry.Attempts != 2 {
+		t.Fatalf("claim after backoff boundary = %+v, %v", retry, err)
+	}
+}
+
+func TestWorkerSIGKILLNaturalExpiryReclaimIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
+	ctx := context.Background()
+	jobID, _ := insertTransformJob(t, pool, 3, 1)
+	var schema string
+	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := t.TempDir() + "/claimed"
+	command := exec.Command(os.Args[0], "-test.run=^TestJobClaimProcessHelper$")
+	command.Env = append(os.Environ(),
+		"NMCP_JOB_HELPER=1",
+		"NMCP_JOB_HELPER_SCHEMA="+schema,
+		"NMCP_JOB_HELPER_READY="+readyPath,
+	)
+	var helperOutput bytes.Buffer
+	command.Stdout = &helperOutput
+	command.Stderr = &helperOutput
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+			t.Fatalf("claim helper did not become ready: %s", helperOutput.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var firstToken string
+	var firstAttempts int
+	if err := pool.QueryRow(ctx, `SELECT lease_token::text,attempts FROM jobs WHERE id=$1 AND status='running'`, jobID).Scan(&firstToken, &firstAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if firstAttempts != 1 {
+		t.Fatalf("first process attempts = %d", firstAttempts)
+	}
+	if err := command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("SIGKILLed claim helper exited successfully")
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		var expired bool
+		if err := pool.QueryRow(ctx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, jobID).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("naturally expiring lease did not reach database-clock boundary")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if count, err := repository.ReclaimExpired(ctx); err != nil || count != 1 {
+		t.Fatalf("reclaim SIGKILLed owner = %d, %v", count, err)
+	}
+	var status Status
+	var code string
+	if err := pool.QueryRow(ctx, `SELECT status,error_code FROM jobs WHERE id=$1`, jobID).Scan(&status, &code); err != nil || status != StatusQueued || code != string(FailureLeaseExpired) {
+		t.Fatalf("reclaimed state = %s %q, %v", status, code, err)
+	}
+	retry, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil || retry.ID != jobID || retry.Attempts != 2 || retry.Token == firstToken {
+		t.Fatalf("replacement lease = %+v, %v", retry, err)
+	}
+	if _, err := repository.Heartbeat(ctx, jobID, firstToken); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("SIGKILLed owner's token remained live: %v", err)
+	}
+}
+
+func TestJobClaimProcessHelper(t *testing.T) {
+	if os.Getenv("NMCP_JOB_HELPER") != "1" {
+		t.Skip("claim subprocess helper")
+	}
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	schema := os.Getenv("NMCP_JOB_HELPER_SCHEMA")
+	readyPath := os.Getenv("NMCP_JOB_HELPER_READY")
+	if databaseURL == "" || schema == "" || readyPath == "" {
+		t.Fatal("incomplete claim helper environment")
+	}
+	ctx := context.Background()
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.AfterConnect = func(ctx context.Context, connection *pgx.Conn) error {
+		_, err := connection.Exec(ctx, `SELECT pg_catalog.set_config('search_path',$1,false)`, schema+",pg_catalog,pg_temp")
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	repository, err := NewRepository(pool, Options{LeaseDuration: 150 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Claim(ctx, []Type{TypeTransform}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readyPath, []byte("claimed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Second)
 }
 
 func TestReclaimExpiredIntegrationBudgetBatchConcurrencyAndRace(t *testing.T) {
