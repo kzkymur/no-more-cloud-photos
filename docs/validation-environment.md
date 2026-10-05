@@ -50,7 +50,11 @@ closed/open-ended/suffix Range (`206`), unsatisfiable Range (`416`), non-GET
 rejection (`405`), private immutable cache and nosniff headers, directory-listing
 denial, traversal denial, missing objects, and non-public backup namespace. It
 also records the live PostgreSQL, Nginx, ExifTool, FFprobe, and `prlimit`
-versions. Environment startup is not a claim that upload/transform/lifecycle,
+versions. It builds the merged issue #11 source-pinned native still toolchain
+through its single canonical build script, runs `nmcp-still-helper capabilities`,
+checks the exact library versions and sRGB ICC digest, and records its dynamic
+dependency closure, installed size, and final Core image size. Environment
+startup is not a claim that upload/transform/lifecycle,
 codec quality, backup/restore, failure injection, or complete issue #21 E2E has
 passed.
 
@@ -61,8 +65,10 @@ The validation inputs are Go `1.27.1`, Ubuntu `24.04`, PostgreSQL
 multi-platform manifest digest. Ubuntu/APK package patch versions are resolved
 at image build time and printed by `verify` for diagnosis. This is not a
 production package lock: issue #20 must pin production package versions/digests
-and absolute tool paths. The native still-image toolchain remains owned by issue
-#11/PR #35 and is not duplicated or changed here.
+and absolute tool paths. The native still-image source SHAs, build flags, and
+versions remain owned by issue #11's
+`internal/stillprocessor/helper/build-pinned-toolchain.sh`; the validation image
+calls that script rather than duplicating or changing its codec contract.
 
 ## Production contract handed to issue #20
 

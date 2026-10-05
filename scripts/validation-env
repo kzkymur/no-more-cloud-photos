@@ -74,6 +74,22 @@ check() (
 
   compose exec -T files nginx -t
   compose exec -T api sh -eu -c 'exiftool -ver; ffprobe -version; prlimit --version; dpkg-query --show ca-certificates curl ffmpeg libimage-exiftool-perl util-linux'
+  capabilities=$(compose exec -T api /opt/nmcp/bin/nmcp-still-helper capabilities \
+    --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
+  printf '%s\n' "$capabilities"
+  for expected in \
+    '"libvips":"8.18.7"' '"libheif":"1.23.5"' '"libraw":"0.22.2-Release"' \
+    '"libaom":"v3.8.2"' '"lcms2":"2.14"'
+  do
+    printf '%s' "$capabilities" | grep -F "$expected" >/dev/null
+  done
+  compose exec -T api sh -eu -c '
+    printf "sRGB2014.icc  "; sha256sum /opt/nmcp/share/sRGB2014.icc
+    du -sh /opt/nmcp/still-toolchain
+    ldd /opt/nmcp/bin/nmcp-still-helper
+  '
+  image_id=$(compose images -q api)
+  docker image inspect "$image_id" --format 'core_image_bytes={{.Size}}'
   compose exec -T postgres postgres --version
   compose exec -T files nginx -v
   echo "validation environment checks passed"
