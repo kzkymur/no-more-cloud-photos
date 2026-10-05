@@ -76,6 +76,9 @@ jobs:
           "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
             capabilities --protocol 1 --threads 1 \
             --srgb-icc "${RUNNER_TEMP}/sRGB2014.icc"
+          printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_ICC_PATH=%s\n' \
+            "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
+            "${RUNNER_TEMP}/sRGB2014.icc" >> "${GITHUB_ENV}"
       - name: Verify modules
         run: go mod verify
       - name: Check formatting
@@ -95,6 +98,11 @@ jobs:
           TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
           TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
         run: go test -v -count=1 ./internal/mediaformat ./internal/metadata
+      - name: Explicit native still codec evidence
+        env:
+          TEST_STILL_HELPER: "1"
+          TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
+        run: go test -v -count=1 ./internal/stillprocessor
       - name: Explicit Linux storage durability evidence
         run: go test -v -count=1 ./internal/storage
       - name: Race tests
