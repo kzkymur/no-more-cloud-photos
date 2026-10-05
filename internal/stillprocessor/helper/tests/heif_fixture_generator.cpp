@@ -76,8 +76,13 @@ void encode(const std::filesystem::path &path, heif_transfer_characteristics tra
   check(heif_encoder_set_lossless(encoder.get(), 1));
   check(heif_encoder_set_parameter_integer(encoder.get(), "threads", 1));
   check(heif_encoder_set_parameter_string(encoder.get(), "chroma", "444"));
+  std::unique_ptr<heif_encoding_options, decltype(&heif_encoding_options_free)> options(
+      heif_encoding_options_alloc(), heif_encoding_options_free);
+  if (!options) std::exit(1);
+  options->output_nclx_profile = nclx.get();
+  options->save_two_colr_boxes_when_ICC_and_nclx_available = icc.empty() ? 0 : 1;
   heif_image_handle *raw_handle = nullptr;
-  check(heif_context_encode_image(context.get(), image.get(), encoder.get(), nullptr, &raw_handle));
+  check(heif_context_encode_image(context.get(), image.get(), encoder.get(), options.get(), &raw_handle));
   std::unique_ptr<heif_image_handle, decltype(&heif_image_handle_release)> handle(raw_handle, heif_image_handle_release);
   check(heif_context_write_to_file(context.get(), path.c_str()));
 }

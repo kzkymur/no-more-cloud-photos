@@ -304,7 +304,10 @@ Raster decode_heif(const TransformArgs &args, std::span<const std::byte> target_
   if (!context) throw Failure("resource_limit");
   heif_context_set_max_decoding_threads(context.get(), 1);
   check_heif(heif_context_read_from_file(context.get(), args.input.c_str(), nullptr));
-  if (heif_context_get_number_of_top_level_images(context.get()) != 1) throw Failure("animated_input");
+  // A HEIF image collection may contain several independent top-level stills;
+  // that is not a timed animation. Decode the file's explicitly designated
+  // primary image. Timed sequences do not become primary image items here.
+  if (heif_context_get_number_of_top_level_images(context.get()) < 1) throw Failure("decode_failed");
   heif_image_handle *raw_handle = nullptr;
   check_heif(heif_context_get_primary_image_handle(context.get(), &raw_handle));
   std::unique_ptr<heif_image_handle, decltype(&heif_image_handle_release)> handle(raw_handle, heif_image_handle_release);
