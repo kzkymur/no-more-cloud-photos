@@ -90,8 +90,8 @@ start_environment() {
 
 write_retention_markers() {
   compose exec -T api sh -eu -c 'printf "%s" "$1" >/var/lib/nmcp/media/backups/retained.marker; chmod 0600 /var/lib/nmcp/media/backups/retained.marker' sh "$retention_token"
-  compose exec -T postgres psql --username nmcp --dbname nmcp --set ON_ERROR_STOP=1 --set "marker=$retention_token" --command \
-    "CREATE TABLE validation_retention_marker (value text PRIMARY KEY); INSERT INTO validation_retention_marker VALUES (:'marker');"
+  compose exec -T postgres psql --username nmcp --dbname nmcp --set ON_ERROR_STOP=1 --command \
+    "CREATE TABLE validation_retention_marker (value text PRIMARY KEY); INSERT INTO validation_retention_marker VALUES ('$retention_token');"
 }
 
 assert_retention_markers() {
