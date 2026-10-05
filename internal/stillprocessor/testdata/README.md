@@ -20,3 +20,32 @@ are separate and are not evidence for camera or third-party codec coverage.
 The BMP reserved byte is deliberately zero and must remain opaque. These prove
 real decoder/encoder behavior and boundary geometry, but not external-file
 provenance or camera support.
+
+`nmcp-heif-fixture-generator` is project-owned test code linked to the same
+pinned libheif and AOM build as the helper. It produces deterministic 32x32
+AVIF-container HEIF fixtures for:
+
+- BT.2020/PQ code value 512/1023, whose independently calculated BT.2446A
+  reference output is sRGB `(127,127,127)`;
+- BT.2020/HLG code value 512/1023, whose independently calculated BT.2100 OOTF
+  plus BT.2446A reference output is sRGB `(100,100,100)`;
+- sRGB ICC plus sRGB NCLX `(64,128,192)`, proving NCLX decode and exactly one
+  ICC normalization rather than two color conversions;
+- deliberately malformed embedded ICC bytes, which must fail closed as a
+  decode error rather than being ignored.
+
+The AVIF output is decoded independently with pinned FFmpeg and compared at a
+center reference pixel with per-channel tolerance 24 to allow the required
+quality-60 output encoding. These generated files prove controlled color-path
+behavior, not provenance of a camera HDR capture.
+
+## Failure and resource evidence
+
+The native integration test truncates the hash-verified real DNG to 512 bytes
+and requires a stable decode failure. Unit tests separately prove a bounded
+process timeout, cancellation, stderr overflow, generated-file size limit,
+4 GiB address-space ceiling configuration, and secret/path redaction. The real
+A410 RAW exceeds the 1920 standard edge and proves bounded downscale without
+upscale or crop. A generated 1000x777 JPEG separately proves the 640-edge,
+quality-50 thumbnail path and odd rounded height 497. Physical exhaustion of
+the full 4 GiB ceiling is intentionally not performed in CI.

@@ -64,9 +64,13 @@ func TestRealStillHelper(t *testing.T) {
 		orientation6                                          bool
 		referencePixel                                        []int
 		largeRAW                                              bool
+		thumbnail                                             bool
+		quality                                               int
 	}{
 		{name: "JPEG odd opaque", mime: "image/jpeg", alpha: "opaque", width: 5, height: 3,
 			input: encodeJPEG(t, 5, 3)},
+		{name: "JPEG thumbnail 640 edge", mime: "image/jpeg", alpha: "opaque", width: 640, height: 497,
+			input: encodeJPEG(t, 1000, 777), thumbnail: true, quality: 50},
 		{name: "PNG odd alpha", mime: "image/png", alpha: "preserved", width: 3, height: 5,
 			input: encodePNG(t, 3, 5, true)},
 		{name: "PNG one pixel axis", mime: "image/png", alpha: "preserved", width: 1, height: 7,
@@ -102,9 +106,13 @@ func TestRealStillHelper(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			recipe := profile.StandardV1Parameters().Recipes[test.mime]
+			if test.thumbnail {
+				recipe = profile.ThumbnailV1Parameters().Recipes[test.mime]
+			}
 			result, err := processor.Transform(context.Background(), Request{
 				Input: input, Output: output, MIMEType: test.mime,
-				Recipe: profile.StandardV1Parameters().Recipes[test.mime],
+				Recipe: recipe,
 			})
 			if err != nil {
 				_ = output.Close()
@@ -125,6 +133,9 @@ func TestRealStillHelper(t *testing.T) {
 			}
 			if test.largeRAW && (result.Width != 1920 || result.Audit.SourceWidth <= result.Width || result.Audit.SourceHeight <= result.Height) {
 				t.Fatalf("large RAW resize = %+v", result)
+			}
+			if test.quality != 0 && (result.Quality != test.quality || result.MaxLongEdge != 640 || result.BitDepth != 8) {
+				t.Fatalf("thumbnail encoding = %+v", result)
 			}
 			probeAVIF(t, ffprobe, outputPath, result.Width, result.Height)
 			if test.orientation6 {
