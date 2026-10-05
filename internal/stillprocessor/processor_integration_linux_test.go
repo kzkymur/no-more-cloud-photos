@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -50,16 +51,18 @@ func TestRealStillHelper(t *testing.T) {
 	heic := readFixture(t, "TEST_STILL_HEIC_PATH", "7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2")
 	webp := readFixture(t, "TEST_STILL_WEBP_PATH", "0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9")
 	orientation6 := readFixture(t, "TEST_STILL_ORIENTATION6_PATH", "9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124")
+	rawDNG := readFixture(t, "TEST_STILL_RAW_PATH", "f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38")
 	pq := readGeneratedFixture(t, "TEST_STILL_PQ_PATH")
 	hlg := readGeneratedFixture(t, "TEST_STILL_HLG_PATH")
 	iccNCLX := readGeneratedFixture(t, "TEST_STILL_ICC_NCLX_PATH")
 
 	for _, test := range []struct {
-		name, mime, alpha, inputColor, toneMap string
-		width, height                          int
-		input                                  []byte
-		orientation6                           bool
-		referencePixel                         []int
+		name, mime, alpha, inputColor, toneMap, rawProcessing string
+		width, height                                         int
+		input                                                 []byte
+		orientation6                                          bool
+		referencePixel                                        []int
+		largeRAW                                              bool
 	}{
 		{name: "JPEG odd opaque", mime: "image/jpeg", alpha: "opaque", width: 5, height: 3,
 			input: encodeJPEG(t, 5, 3)},
@@ -73,6 +76,9 @@ func TestRealStillHelper(t *testing.T) {
 		{name: "Google gallery static WebP", mime: "image/webp", alpha: "opaque", input: webp},
 		{name: "real Exif orientation 6", mime: "image/jpeg", alpha: "opaque", width: 1800, height: 1200,
 			input: orientation6, orientation6: true},
+		{name: "real camera RAW", mime: "image/dng", alpha: "opaque", input: rawDNG,
+			inputColor: "raw-camera-matrix", toneMap: "not-needed",
+			rawProcessing: "camera-wb-camera-matrix-16bit-no-auto-bright", largeRAW: true},
 		{name: "real PQ NCLX reference pixel", mime: "image/heif", alpha: "opaque", width: 32, height: 32,
 			input: pq, inputColor: "nclx-pq", toneMap: "bt2446a-method-a", referencePixel: []int{127, 127, 127}},
 		{name: "real HLG NCLX reference pixel", mime: "image/heif", alpha: "opaque", width: 32, height: 32,
@@ -113,6 +119,12 @@ func TestRealStillHelper(t *testing.T) {
 			if test.inputColor != "" && (result.Audit.InputColor != test.inputColor || result.Audit.ToneMap != test.toneMap) {
 				t.Fatalf("color audit = %+v", result.Audit)
 			}
+			if test.rawProcessing != "" && result.Audit.RawProcessing != test.rawProcessing {
+				t.Fatalf("RAW audit = %+v", result.Audit)
+			}
+			if test.largeRAW && (result.Width != 1920 || result.Audit.SourceWidth <= result.Width || result.Audit.SourceHeight <= result.Height) {
+				t.Fatalf("large RAW resize = %+v", result)
+			}
 			probeAVIF(t, ffprobe, outputPath, result.Width, result.Height)
 			if test.orientation6 {
 				assertOrientation6Pixels(t, ffmpeg, test.input, outputPath, result.Width, result.Height)
@@ -122,6 +134,17 @@ func TestRealStillHelper(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("corrupt real RAW fails closed", func(t *testing.T) {
+		input, output := testFiles(t, rawDNG[:512])
+		_, err := processor.Transform(context.Background(), Request{
+			Input: input, Output: output, MIMEType: "image/dng",
+			Recipe: profile.StandardV1Parameters().Recipes["image/dng"],
+		})
+		if !errors.Is(err, ErrDecode) {
+			t.Fatalf("corrupt RAW error = %v", err)
+		}
+	})
 }
 
 func assertReferencePixel(t *testing.T, ffmpeg, outputPath string, width, height int, expected []int) {

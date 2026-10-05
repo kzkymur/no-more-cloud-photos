@@ -80,6 +80,12 @@ jobs:
           printf '%s  %s\n' \
             9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124 \
             "${RUNNER_TEMP}/orientation-6.jpg" | sha256sum --check
+          curl --fail --location --silent --show-error \
+            'https://raw.pixls.us/data/Canon/Canon%20PowerShot%20A410/CANON_A410_CHDK_CRW_0741.DNG' \
+            --output "${RUNNER_TEMP}/canon-a410.dng"
+          printf '%s  %s\n' \
+            f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38 \
+            "${RUNNER_TEMP}/canon-a410.dng" | sha256sum --check
           chmod +x internal/stillprocessor/helper/build-pinned-toolchain.sh
           internal/stillprocessor/helper/build-pinned-toolchain.sh \
             "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/still-toolchain-work"
@@ -103,11 +109,12 @@ jobs:
           printf '%s\n' "${capabilities}"
           CAPABILITIES="${capabilities}" python3 -c \
             'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libvips"]=="8.18.7" and v["libheif"]=="1.23.5" and v["libraw"]=="0.22.2-Release" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14", v'
-          printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_ICC_PATH=%s\nTEST_STILL_HEIC_PATH=%s\nTEST_STILL_WEBP_PATH=%s\nTEST_STILL_ORIENTATION6_PATH=%s\nTEST_STILL_PQ_PATH=%s\nTEST_STILL_HLG_PATH=%s\nTEST_STILL_ICC_NCLX_PATH=%s\n' \
+          printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_ICC_PATH=%s\nTEST_STILL_HEIC_PATH=%s\nTEST_STILL_WEBP_PATH=%s\nTEST_STILL_ORIENTATION6_PATH=%s\nTEST_STILL_RAW_PATH=%s\nTEST_STILL_PQ_PATH=%s\nTEST_STILL_HLG_PATH=%s\nTEST_STILL_ICC_NCLX_PATH=%s\n' \
             "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
             "${RUNNER_TEMP}/sRGB2014.icc" "${heic_fixture}" \
             "${RUNNER_TEMP}/static-gallery-4.webp" \
             "${RUNNER_TEMP}/orientation-6.jpg" \
+            "${RUNNER_TEMP}/canon-a410.dng" \
             "${RUNNER_TEMP}/generated-heif-fixtures/pq.avif" \
             "${RUNNER_TEMP}/generated-heif-fixtures/hlg.avif" \
             "${RUNNER_TEMP}/generated-heif-fixtures/icc-nclx.avif" >> "${GITHUB_ENV}"
