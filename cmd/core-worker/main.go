@@ -11,8 +11,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/config"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
+	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/worker"
 )
 
 func main() {
@@ -64,8 +66,21 @@ func run(ctx context.Context) error {
 	if err := store.Probe(ctx); err != nil {
 		return fmt.Errorf("storage root is unavailable: %w", err)
 	}
+	repository, err := job.NewRepository(pool, job.Options{})
+	if err != nil {
+		return fmt.Errorf("configure job repository: %w", err)
+	}
+	// Processor executors are registered by issues #11-#14 after their runtime
+	// capability checks and atomic publication path exist. An empty registry
+	// still reclaims expired leases but cannot claim or no-op-complete work.
+	jobWorker, err := worker.New(repository, nil, worker.Options{}, logger)
+	if err != nil {
+		return fmt.Errorf("configure job worker: %w", err)
+	}
 	logger.LogAttrs(ctx, slog.LevelInfo, "core Worker ready", cfg.LogAttrs()...)
-	<-ctx.Done()
+	if err := jobWorker.Run(ctx); err != nil {
+		return fmt.Errorf("run job worker: %w", err)
+	}
 	logger.Info("core Worker stopped")
 	return nil
 }

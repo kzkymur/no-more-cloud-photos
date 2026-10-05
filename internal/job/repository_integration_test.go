@@ -138,6 +138,56 @@ func TestHeartbeatIntegrationCASClockAndExactExpiry(t *testing.T) {
 	if deltaSeconds < 28 || deltaSeconds > 31 || expiry.IsZero() {
 		t.Fatalf("heartbeat extension from DB clock = %f seconds, expiry %s", deltaSeconds, expiry)
 	}
+	var beforeDisconnect time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id=$1`, jobID).Scan(&beforeDisconnect); err != nil {
+		t.Fatal(err)
+	}
+	locker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := locker.Exec(ctx, `SELECT id FROM jobs WHERE id=$1 FOR UPDATE`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	heartbeatResult := make(chan error, 1)
+	go func() {
+		_, err := repository.Heartbeat(ctx, jobID, lease.Token)
+		heartbeatResult <- err
+	}()
+	var heartbeatPID int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		err := pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity
+			WHERE pid<>pg_backend_pid() AND state='active' AND query LIKE 'UPDATE jobs SET lease_expires_at=clock_timestamp()+%'
+			ORDER BY query_start DESC LIMIT 1`).Scan(&heartbeatPID)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if heartbeatPID == 0 {
+		t.Fatal("blocked heartbeat backend was not observed")
+	}
+	var terminated bool
+	if err := pool.QueryRow(ctx, `SELECT pg_terminate_backend($1)`, heartbeatPID).Scan(&terminated); err != nil || !terminated {
+		t.Fatalf("terminate heartbeat backend = %v, %v", terminated, err)
+	}
+	if err := <-heartbeatResult; !errors.Is(err, ErrDatabaseUnavailable) {
+		t.Fatalf("disconnected heartbeat error = %v", err)
+	}
+	if err := locker.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var afterDisconnect time.Time
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at FROM jobs WHERE id=$1`, jobID).Scan(&afterDisconnect); err != nil {
+		t.Fatal(err)
+	}
+	if !afterDisconnect.Equal(beforeDisconnect) {
+		t.Fatalf("disconnected heartbeat changed expiry: before=%s after=%s", beforeDisconnect, afterDisconnect)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, jobID); err != nil {
 		t.Fatal(err)
 	}
