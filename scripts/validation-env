@@ -218,7 +218,7 @@ match = re.search(br"(?im)^content-type: multipart/byteranges; boundary=([^\r\n]
 assert match, headers
 boundary = b"--" + match.group(1)
 parts = body.split(boundary)
-assert parts[0] == b"" and parts[-1] == b"--\r\n", parts
+assert parts[0] == b"\r\n" and parts[-1] == b"--\r\n", parts
 actual = []
 for part in parts[1:-1]:
     assert part.startswith(b"\r\n") and part.endswith(b"\r\n"), part
