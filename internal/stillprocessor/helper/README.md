@@ -13,6 +13,13 @@ ctest --test-dir build/still-helper --output-on-failure
 For machines without the image dependencies, the pure protocol/geometry/hash
 tests can be built with `-DNMCP_BUILD_HELPER=OFF`.
 
+CI and production builds first run `build-pinned-toolchain.sh` with an absolute
+install prefix and scratch directory. It verifies every direct source archive
+against `toolchain.lock` and builds libaom 3.8.2, lcms2 2.14, LibRaw 0.22.2,
+libheif 1.23.5, and libvips 8.18.7 using the recorded reduced feature set.
+System packages supply only the transitive build closure; pinning that complete
+closure and the deployment image is the explicit issue #20 boundary.
+
 ## Closed behavior
 
 The CLI flag order and cardinality are fixed by `internal/stillprocessor`

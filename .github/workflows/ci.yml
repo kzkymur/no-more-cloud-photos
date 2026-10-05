@@ -11,7 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
@@ -59,26 +59,37 @@ jobs:
       - name: Build native still-image helper smoke target
         run: |
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build pkg-config libvips-dev libheif-dev libraw-dev \
-            libaom-dev liblcms2-dev libheif-plugin-aomenc libheif-plugin-aomdec \
-            libheif-plugin-libde265
+            autoconf automake cmake libtool make meson ninja-build pkg-config \
+            libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev \
+            libde265-dev zlib1g-dev
           curl --fail --location --silent --show-error \
             https://registry.color.org/rgb-registry/profiles/sRGB2014.icc \
             --output "${RUNNER_TEMP}/sRGB2014.icc"
           printf '%s  %s\n' \
             384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a \
             "${RUNNER_TEMP}/sRGB2014.icc" | sha256sum --check
+          chmod +x internal/stillprocessor/helper/build-pinned-toolchain.sh
+          internal/stillprocessor/helper/build-pinned-toolchain.sh \
+            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/still-toolchain-work"
+          export PKG_CONFIG_PATH="${RUNNER_TEMP}/still-toolchain/lib/pkgconfig:${RUNNER_TEMP}/still-toolchain/lib64/pkgconfig"
+          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
           cmake -S internal/stillprocessor/helper \
             -B "${RUNNER_TEMP}/still-helper-build" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/still-toolchain"
           cmake --build "${RUNNER_TEMP}/still-helper-build" --parallel 2
           ctest --test-dir "${RUNNER_TEMP}/still-helper-build" --output-on-failure
-          "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
+          capabilities=$("${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
             capabilities --protocol 1 --threads 1 \
-            --srgb-icc "${RUNNER_TEMP}/sRGB2014.icc"
+            --srgb-icc "${RUNNER_TEMP}/sRGB2014.icc")
+          printf '%s\n' "${capabilities}"
+          CAPABILITIES="${capabilities}" python3 -c \
+            'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libvips"]=="8.18.7" and v["libheif"]=="1.23.5" and v["libraw"]=="0.22.2" and v["libaom"]=="3.8.2" and v["lcms2"]=="2.14", v'
           printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_ICC_PATH=%s\n' \
             "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
             "${RUNNER_TEMP}/sRGB2014.icc" >> "${GITHUB_ENV}"
+          printf 'LD_LIBRARY_PATH=%s\n' \
+            "${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64" >> "${GITHUB_ENV}"
       - name: Verify modules
         run: go mod verify
       - name: Check formatting

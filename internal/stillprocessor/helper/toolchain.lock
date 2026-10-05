@@ -2,6 +2,16 @@
 # used by the CI compile smoke are not the production pin; the transitive
 # apt/OCI closure is owned by issue #20.
 
+libaom 3.8.2 (annotated tag commit 615b5f541e4434aebd993036bc97ebc1a77ebc25)
+url https://aomedia.googlesource.com/aom/+archive/615b5f541e4434aebd993036bc97ebc1a77ebc25.tar.gz
+sha256 d17dfcf2b2caf23a0fcbdcaf3253f7cbcc2c9206389e9a96bf96f831d28269bc
+license BSD-2-Clause
+
+lcms2 2.14
+url https://github.com/mm2/Little-CMS/releases/download/lcms2.14/lcms2-2.14.tar.gz
+sha256 28474ea6f6591c4d4cee972123587001a4e6e353412a41b3e9e82219818d5740
+license MIT
+
 libvips 8.18.7
 url https://github.com/libvips/libvips/releases/download/v8.18.7/vips-8.18.7.tar.xz
 sha256 5baaead3b0bb20ffdb9e9ff09aa9fda08620923df77b63b436654cb5e0b3bf94
