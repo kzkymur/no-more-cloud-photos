@@ -180,13 +180,16 @@ Raster decode_vips(const TransformArgs &args, std::span<const std::byte> target_
   int result = -1;
   if (args.input_mime == "image/jpeg") {
     decoder = "libvips-jpeg";
-    result = vips_jpegload(args.input.c_str(), &raw, "access", VIPS_ACCESS_SEQUENTIAL, nullptr);
+    // Exif rotations by 90/270 degrees require non-sequential source access.
+    // The helper is already bounded by RLIMIT_AS, so do not trade correctness
+    // for the sequential loader hint here.
+    result = vips_jpegload(args.input.c_str(), &raw, "access", VIPS_ACCESS_RANDOM, nullptr);
   } else if (args.input_mime == "image/png") {
     decoder = "libvips-png";
-    result = vips_pngload(args.input.c_str(), &raw, "access", VIPS_ACCESS_SEQUENTIAL, nullptr);
+    result = vips_pngload(args.input.c_str(), &raw, "access", VIPS_ACCESS_RANDOM, nullptr);
   } else if (args.input_mime == "image/webp") {
     decoder = "libvips-webp";
-    result = vips_webpload(args.input.c_str(), &raw, "access", VIPS_ACCESS_SEQUENTIAL, nullptr);
+    result = vips_webpload(args.input.c_str(), &raw, "access", VIPS_ACCESS_RANDOM, nullptr);
   } else {
     throw Failure("unsupported_input");
   }
