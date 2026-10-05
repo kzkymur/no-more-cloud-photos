@@ -554,17 +554,12 @@ void encode_avif(const Raster &raster, const TransformArgs &args, std::span<cons
   check_heif(heif_encoder_set_lossy_quality(encoder.get(), args.quality), "encode_failed");
   check_heif(heif_encoder_set_parameter_integer(encoder.get(), "threads", 1), "encode_failed");
   check_heif(heif_encoder_set_parameter_string(encoder.get(), "chroma", raster.alpha ? "444" : "420"), "encode_failed");
-  // AVIF alpha is an explicit auxiliary plane. An RGBA interleaved plane alone
-  // can be accepted while the encoder silently emits an opaque image.
-  const auto chroma = heif_chroma_interleaved_RGB;
-  constexpr int channels = 3;
+  const auto chroma = raster.alpha ? heif_chroma_interleaved_RGBA : heif_chroma_interleaved_RGB;
+  const int channels = raster.alpha ? 4 : 3;
   heif_image *raw_image = nullptr;
   check_heif(heif_image_create(raster.width, raster.height, heif_colorspace_RGB, chroma, &raw_image), "encode_failed");
   std::unique_ptr<heif_image, decltype(&heif_image_release)> image(raw_image, heif_image_release);
   check_heif(heif_image_add_plane(image.get(), heif_channel_interleaved, raster.width, raster.height, 8), "encode_failed");
-  if (raster.alpha) {
-    check_heif(heif_image_add_plane(image.get(), heif_channel_Alpha, raster.width, raster.height, 8), "encode_failed");
-  }
   int stride_value = 0;
   auto *pixels = heif_image_get_plane(image.get(), heif_channel_interleaved, &stride_value);
   if (stride_value < 0) throw Failure("encode_failed");
@@ -576,20 +571,6 @@ void encode_avif(const Raster &raster, const TransformArgs &args, std::span<cons
     for (int column = 0; column < raster.width; ++column) {
       std::memcpy(destination + static_cast<std::size_t>(column) * channels,
                   source + static_cast<std::size_t>(column) * 4, static_cast<std::size_t>(channels));
-    }
-  }
-  if (raster.alpha) {
-    int alpha_stride_value = 0;
-    auto *alpha_pixels = heif_image_get_plane(image.get(), heif_channel_Alpha, &alpha_stride_value);
-    if (alpha_stride_value < 0) throw Failure("encode_failed");
-    const auto alpha_stride = static_cast<std::size_t>(alpha_stride_value);
-    if (!alpha_pixels || alpha_stride < static_cast<std::size_t>(raster.width)) throw Failure("encode_failed");
-    for (int row = 0; row < raster.height; ++row) {
-      auto *destination = alpha_pixels + static_cast<std::size_t>(row) * alpha_stride;
-      const auto *source = raster.rgba.data() + static_cast<std::size_t>(row) * raster.width * 4U;
-      for (int column = 0; column < raster.width; ++column) {
-        destination[column] = source[static_cast<std::size_t>(column) * 4U + 3U];
-      }
     }
   }
   check_heif(heif_image_set_raw_color_profile(image.get(), "prof", icc.data(), icc.size()), "encode_failed");

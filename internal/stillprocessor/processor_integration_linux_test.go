@@ -20,7 +20,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
@@ -35,6 +34,7 @@ func TestRealStillHelper(t *testing.T) {
 	ffprobe := requiredTestPath(t, "TEST_FFPROBE_PATH")
 	ffmpeg := requiredTestPath(t, "TEST_FFMPEG_PATH")
 	rawReference := requiredTestPath(t, "TEST_STILL_RAW_REFERENCE_PATH")
+	avifReference := requiredTestPath(t, "TEST_STILL_AVIF_REFERENCE_PATH")
 	iccBytes, err := os.ReadFile(icc)
 	if err != nil {
 		t.Fatal(err)
@@ -176,8 +176,7 @@ func TestRealStillHelper(t *testing.T) {
 				assertReferencePixel(t, ffmpeg, outputPath, result.Width, result.Height, test.referencePixel)
 			}
 			if test.alphaReference {
-				assertAVIF444(t, ffprobe, outputPath)
-				assertAlphaResizePixels(t, ffmpeg, outputPath, result.Width, result.Height)
+				assertAlphaResizePixels(t, avifReference, outputPath, result.Width, result.Height)
 			}
 			if test.rawReference {
 				assertRAWReference(t, rawReference, ffmpeg, inputPath, outputPath, result.Width, result.Height)
@@ -258,9 +257,16 @@ func decodeAVIFPixels(t *testing.T, ffmpeg, outputPath, pixelFormat string, chan
 	return decoded
 }
 
-func assertAlphaResizePixels(t *testing.T, ffmpeg, outputPath string, width, height int) {
+func assertAlphaResizePixels(t *testing.T, reference, outputPath string, width, height int) {
 	t.Helper()
-	decoded := decodeAVIFPixels(t, ffmpeg, outputPath, "rgba", 4)
+	decodedPath := filepath.Join(t.TempDir(), "decoded.rgba")
+	if output, err := exec.Command(reference, outputPath, decodedPath).CombinedOutput(); err != nil {
+		t.Fatalf("independent AVIF alpha/4:4:4 decode: %v: %s", err, output)
+	}
+	decoded, err := os.ReadFile(decodedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(decoded) != width*height*4 {
 		t.Fatalf("decoded RGBA bytes = %d, want %d", len(decoded), width*height*4)
 	}
@@ -292,18 +298,6 @@ func assertAlphaResizePixels(t *testing.T, ffmpeg, outputPath string, width, hei
 	}
 	if !transition {
 		t.Fatal("alpha resize did not expose a semitransparent boundary pixel")
-	}
-}
-
-func assertAVIF444(t *testing.T, ffprobe, outputPath string) {
-	t.Helper()
-	output, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=pix_fmt", "-of", "default=nw=1:nk=1", outputPath).Output()
-	if err != nil {
-		t.Fatalf("ffprobe alpha chroma: %v", err)
-	}
-	format := strings.TrimSpace(string(output))
-	if !strings.Contains(format, "444") && !strings.HasPrefix(format, "gbr") {
-		t.Fatalf("alpha AVIF pixel format = %q, want 4:4:4", format)
 	}
 }
 
