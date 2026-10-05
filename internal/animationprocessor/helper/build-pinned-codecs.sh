@@ -37,18 +37,21 @@ cmake -S "$work/source/libwebp-1.6.0" -B "$work/build/libwebp" -G Ninja \
   -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_EXTRAS=OFF \
   -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF \
   -DWEBP_BUILD_LIBWEBPMUX=ON -DWEBP_BUILD_VWEBP=OFF \
-  -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF
+  -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF \
+  -DWEBP_BUILD_WEBP_JS=OFF -DWEBP_BUILD_FUZZTEST=OFF \
+  -DWEBP_ENABLE_SIMD=ON -DWEBP_USE_THREAD=ON -DWEBP_NEAR_LOSSLESS=ON \
+  -DWEBP_ENABLE_SWAP_16BIT_CSP=OFF -DWEBP_ENABLE_WUNUSED_RESULT=ON
 cmake --build "$work/build/libwebp" --parallel 2
 cmake --install "$work/build/libwebp"
 
 (
   cd "$work/source/giflib-5.2.2"
   make -j2 libgif.so
-  install -Dm755 libgif.so.7.2.0 "$prefix/lib/libgif.so.7.2.0"
+  install -Dm755 libgif.so "$prefix/lib/libgif.so.7.2.0"
   ln -sfn libgif.so.7.2.0 "$prefix/lib/libgif.so.7"
   ln -sfn libgif.so.7 "$prefix/lib/libgif.so"
   install -Dm644 gif_lib.h "$prefix/include/gif_lib.h"
 )
 
-PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig" \
   pkg-config --modversion libwebp libwebpdemux libwebpmux

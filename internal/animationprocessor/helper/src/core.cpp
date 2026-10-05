@@ -152,7 +152,9 @@ Inspection make_inspection(std::string classification, int width, int height,
         frame.width > width - frame.x || frame.height > height - frame.y) {
       throw Failure("decode_failed");
     }
-    const auto pixels = static_cast<std::uint64_t>(frame.width) * static_cast<std::uint64_t>(frame.height);
+    // Both codecs produce a fully composited canvas for every frame. Account
+    // that actual decoded surface rather than only a compressed sub-rectangle.
+    const auto pixels = canvas;
     if (pixels > limits.decoded_pixels - result.decoded_pixels) throw Failure("resource_limit");
     result.decoded_pixels += pixels;
     int duration = frame.duration_ms;
@@ -174,7 +176,7 @@ Inspection make_inspection(std::string classification, int width, int height,
 int gif_total_plays(bool present, unsigned repetitions) {
   if (!present) return 1;
   if (repetitions == 0) return 0;
-  if (repetitions >= 65535U) throw Failure("resource_limit");
+  if (repetitions >= 65535U) throw Failure("unsupported_input");
   return static_cast<int>(repetitions + 1U);
 }
 

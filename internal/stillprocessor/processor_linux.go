@@ -417,7 +417,7 @@ func validateRequest(request Request) error {
 	}
 	r := request.Recipe
 	if r.SourceMode != expectedMode || r.MaxLongEdge <= 0 || r.MaxLongEdge > 1920 || r.AllowUpscale ||
-		r.Crop != "none" || r.DimensionRule != "preserve-aspect-no-crop-no-upscale-even-round-down" || r.Orientation != "apply" ||
+		r.Crop != "none" || r.DimensionRule != "preserve-aspect-no-crop-no-upscale-round-nearest" || r.Orientation != "apply" ||
 		r.Color != "normalize-srgb-tone-map-hdr" || r.Metadata != "strip-after-normalization-keep-color-tags" || r.Alpha != "preserve" ||
 		r.Audio != "none" || r.StreamSelection != "not-applicable" || r.StillOutput == nil || r.VideoOutput != nil {
 		return ErrInvalid

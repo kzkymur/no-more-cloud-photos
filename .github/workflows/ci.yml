@@ -135,7 +135,7 @@ jobs:
           cmake -S internal/animationprocessor/helper \
             -B "${RUNNER_TEMP}/animation-helper-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/still-toolchain"
+            -DNMCP_PINNED_PREFIX="${RUNNER_TEMP}/still-toolchain"
           cmake --build "${RUNNER_TEMP}/animation-helper-build" --parallel 2
           ctest --test-dir "${RUNNER_TEMP}/animation-helper-build" --output-on-failure
           "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-animation-fixture-generator" \
@@ -145,7 +145,7 @@ jobs:
             --srgb-icc "${RUNNER_TEMP}/sRGB2014.icc")
           printf '%s\n' "${capabilities}"
           CAPABILITIES="${capabilities}" python3 -c \
-            'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libwebp"]=="1.6.0" and v["giflib"]=="5.2.2" and v["libheif"]=="1.23.5" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14", v'
+            'import json,os; r=json.loads(os.environ["CAPABILITIES"])["result"]; v=r["library_versions"]; assert v["libwebp"]==v["libwebp-demux"]==v["libwebp-mux"]=="1.6.0" and v["giflib"]=="5.2.2" and v["libheif"]=="1.23.5" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14" and r["build_manifest"]=="giflib=5.2.2;libwebp=1.6.0;simd=on;threads=on;near-lossless=on", r'
           printf 'TEST_ANIMATION_HELPER_PATH=%s\nTEST_ANIMATION_WEBP_PATH=%s\nTEST_ANIMATION_WEBP_REFERENCE_PATH=%s\n' \
             "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-animation-helper" \
             "${RUNNER_TEMP}/animation-variable.webp" \

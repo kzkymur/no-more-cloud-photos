@@ -45,19 +45,35 @@ int main(int argc, char **argv) {
   std::uint8_t *rgba = nullptr;
   int timestamp = 0;
   std::uint32_t decoded = 0;
+  std::vector<std::uint64_t> alpha_sums;
+  std::vector<int> timestamps;
   while (WebPAnimDecoderHasMoreFrames(decoder)) {
     if (!WebPAnimDecoderGetNext(decoder, &rgba, &timestamp) || !rgba) return 1;
     std::uint64_t transparent = 0;
+    std::uint64_t alpha_sum = 0;
     for (std::size_t offset = 3; offset < static_cast<std::size_t>(width) * height * 4U; offset += 4) {
       if (rgba[offset] != 255) ++transparent;
+      alpha_sum += rgba[offset];
     }
     if (!first) std::cout << ',';
     first = false;
     std::cout << transparent;
+    alpha_sums.push_back(alpha_sum);
+    timestamps.push_back(timestamp);
     ++decoded;
   }
   WebPAnimDecoderDelete(decoder);
   if (decoded != count) return 1;
+  std::cout << "],\"alpha_sums\":[";
+  for (std::size_t index = 0; index < alpha_sums.size(); ++index) {
+    if (index != 0) std::cout << ',';
+    std::cout << alpha_sums[index];
+  }
+  std::cout << "],\"timestamps_ms\":[";
+  for (std::size_t index = 0; index < timestamps.size(); ++index) {
+    if (index != 0) std::cout << ',';
+    std::cout << timestamps[index];
+  }
   std::cout << "]}";
   return 0;
 }

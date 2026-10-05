@@ -41,3 +41,11 @@ conflicts. The shipped `0001` state contains zero profiles and exposes no profil
 creation API, so such rows indicate unsupported manual database mutation; repair
 uses a reviewed forward migration or tested backup restore rather than silently
 adopting or rewriting immutable provenance.
+
+`0005_profile_dimension_rule.sql` is a pre-activation correction for the two
+bundled version-1 drafts. It changes still and probe-animation geometry to the
+implemented round-nearest rule while leaving video even-round-down. Its
+preflight requires the exact untouched draft seeds and no references; missing,
+divergent, active, custom, or already-referenced definitions roll the migration
+back instead of weakening immutable profile provenance. `0002` remains
+unchanged so applied migration checksums retain their meaning.

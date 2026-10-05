@@ -9,6 +9,7 @@
 #include <gif_lib.h>
 #include <lcms2.h>
 #include <libheif/heif.h>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <sys/stat.h>
@@ -21,6 +22,9 @@
 
 namespace nmcp_animation {
 namespace {
+
+constexpr std::string_view kBuildManifest =
+    "giflib=5.2.2;libwebp=1.6.0;simd=on;threads=on;near-lossless=on";
 
 using ProfilePtr = std::unique_ptr<void, decltype(&cmsCloseProfile)>;
 using TransformPtr = std::unique_ptr<void, decltype(&cmsDeleteTransform)>;
@@ -135,9 +139,7 @@ Animation decode_gif(const std::string &path, const Limits &limits, bool pixels_
   bool loop_present = false;
   bool control_present = false;
   unsigned repetitions = 0;
-  std::array<std::vector<std::byte>, 256> icc_parts;
-  unsigned icc_part_count = 0;
-  std::size_t icc_size = 0;
+  std::vector<std::byte> gif_icc;
   int previous_disposal = DISPOSAL_UNSPECIFIED;
   int previous_x = 0, previous_y = 0, previous_width = 0, previous_height = 0;
   Image restore;
@@ -169,17 +171,10 @@ Animation decode_gif(const std::string &path, const Limits &limits, bool pixels_
           if (loop_present) throw Failure("unsupported_input");
           loop_present = true;
           repetitions = static_cast<unsigned>(block[2]) | (static_cast<unsigned>(block[3]) << 8U);
-        } else if (code == APPLICATION_EXT_FUNC_CODE && application == "ICCRGBG1012" && size >= 2) {
-          const unsigned sequence = block[1];
-          const unsigned total = block[2];
-          if (sequence == 0 || total == 0 || sequence > total || (icc_part_count != 0 && total != icc_part_count) ||
-              !icc_parts[sequence].empty() || static_cast<std::size_t>(size - 2) > (16U << 20U) - icc_size) {
-            throw Failure("unsupported_input");
-          }
-          icc_part_count = total;
-          const auto *begin = reinterpret_cast<const std::byte *>(block + 3);
-          icc_parts[sequence].assign(begin, begin + size - 2);
-          icc_size += static_cast<std::size_t>(size - 2);
+        } else if (code == APPLICATION_EXT_FUNC_CODE && application == "ICCRGBG1012") {
+          if (static_cast<std::size_t>(size) > (16U << 20U) - gif_icc.size()) throw Failure("resource_limit");
+          const auto *begin = reinterpret_cast<const std::byte *>(block + 1);
+          gif_icc.insert(gif_icc.end(), begin, begin + size);
         }
         first = false;
         if (DGifGetExtensionNext(gif.get(), &block) == GIF_ERROR) throw Failure("decode_failed");
@@ -243,12 +238,7 @@ Animation decode_gif(const std::string &path, const Limits &limits, bool pixels_
   result.inspection = make_inspection("animation", gif->SWidth, gif->SHeight, infos,
                                       gif_total_plays(loop_present, repetitions), limits);
   result.frames = std::move(frames);
-  if (icc_part_count != 0) {
-    for (unsigned part = 1; part <= icc_part_count; ++part) {
-      if (icc_parts[part].empty()) throw Failure("unsupported_input");
-      result.embedded_icc.insert(result.embedded_icc.end(), icc_parts[part].begin(), icc_parts[part].end());
-    }
-  }
+  result.embedded_icc = std::move(gif_icc);
   validate_embedded_profile(result.embedded_icc);
   result.decoder = "giflib-gif";
   return result;
@@ -298,9 +288,15 @@ Animation decode_webp(const std::string &path, const Limits &limits, bool pixels
   std::uint8_t *rgba = nullptr;
   int timestamp = 0;
   std::size_t decoded_count = 0;
+  int expected_timestamp = 0;
   bool composited_alpha = false;
   while (WebPAnimDecoderHasMoreFrames(decoder.get())) {
     if (!WebPAnimDecoderGetNext(decoder.get(), &rgba, &timestamp) || rgba == nullptr) throw Failure("decode_failed");
+    if (decoded_count >= infos.size() || infos[decoded_count].duration_ms > std::numeric_limits<int>::max() - expected_timestamp) {
+      throw Failure("decode_failed");
+    }
+    expected_timestamp += infos[decoded_count].duration_ms;
+    if (timestamp != expected_timestamp) throw Failure("decode_failed");
     ++decoded_count;
     if (!composited_alpha) {
       const std::size_t bytes_count = static_cast<std::size_t>(width) * height * 4U;
@@ -468,7 +464,9 @@ std::string audit_json(const Animation &animation, std::string_view encoder,
 
 std::map<std::string, std::string> library_versions() {
   return {{"giflib", std::to_string(GIFLIB_MAJOR) + "." + std::to_string(GIFLIB_MINOR) + "." + std::to_string(GIFLIB_RELEASE)},
-          {"libwebp", webp_version(WebPGetDecoderVersion())}, {"libheif", heif_get_version()},
+          {"libwebp", webp_version(WebPGetDecoderVersion())},
+          {"libwebp-demux", webp_version(WebPGetDemuxVersion())},
+          {"libwebp-mux", webp_version(WebPGetMuxVersion())}, {"libheif", heif_get_version()},
           {"libaom", aom_codec_version_str()}, {"lcms2", lcms_version()}};
 }
 
@@ -480,7 +478,8 @@ std::string capabilities_json(const CapabilityArgs &args) {
   return "{\"protocol\":1,\"ok\":true,\"error_code\":\"\",\"result\":{\"helper_version\":" +
          json_string(kHelperVersion) + ",\"library_versions\":" + json_versions(library_versions()) +
          ",\"decoder_mime_types\":[\"image/gif\",\"image/webp\"],\"encoders\":[\"animated-webp\",\"avif\"]" +
-         ",\"icc_sha256\":" + json_string(sha256_hex(icc)) + ",\"threads\":" + std::to_string(args.threads) + "}}";
+         ",\"icc_sha256\":" + json_string(sha256_hex(icc)) + ",\"threads\":" + std::to_string(args.threads) +
+         ",\"build_manifest\":" + json_string(kBuildManifest) + "}}";
 }
 
 std::string inspect_json(const InspectArgs &args) {

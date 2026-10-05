@@ -5,6 +5,7 @@ package animationprocessor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,8 @@ type referenceWebP struct {
 	TotalPlays        int      `json:"total_plays"`
 	DurationsMS       []int    `json:"durations_ms"`
 	TransparentPixels []uint64 `json:"transparent_pixels"`
+	AlphaSums         []uint64 `json:"alpha_sums"`
+	TimestampsMS      []int    `json:"timestamps_ms"`
 }
 
 func TestNativeAnimationHelper(t *testing.T) {
@@ -65,7 +68,7 @@ func TestNativeAnimationHelper(t *testing.T) {
 	if result.OutputMIME != "image/webp" || result.Width != 6 || result.Height != 2 || result.Source.TotalPlays != 4 {
 		t.Fatalf("standard result = %+v", result)
 	}
-	assertReferenceWebP(t, reference, standardOutput.Name(), referenceWebP{Width: 6, Height: 2, Frames: 3, TotalPlays: 4, DurationsMS: []int{40, 100, 250}})
+	assertReferenceWebP(t, reference, standardOutput.Name(), referenceWebP{Width: 6, Height: 2, Frames: 3, TotalPlays: 4, DurationsMS: []int{40, 100, 250}, TransparentPixels: []uint64{8, 8, 4}, AlphaSums: []uint64{1020, 1532, 2040}, TimestampsMS: []int{40, 140, 390}})
 
 	thumbnailOutput := createOutput(t, "thumbnail.avif")
 	if _, err := input.Seek(0, 0); err != nil {
@@ -97,6 +100,63 @@ func TestNativeAnimationHelper(t *testing.T) {
 		t.Fatal("thumbnail independent decode lost alpha")
 	}
 
+	for name, test := range map[string]struct {
+		policy Policy
+		want   error
+	}{
+		"frames exact":       {policy: Policy{Frames: 3}},
+		"frames plus one":    {policy: Policy{Frames: 2}, want: ErrResourcePolicy},
+		"duration exact":     {policy: Policy{DurationMS: 390}},
+		"duration plus one":  {policy: Policy{DurationMS: 389}, want: ErrResourcePolicy},
+		"dimension exact":    {policy: Policy{Dimension: 6}},
+		"dimension plus one": {policy: Policy{Dimension: 5}, want: ErrResourcePolicy},
+		"canvas exact":       {policy: Policy{CanvasPixels: 12}},
+		"canvas plus one":    {policy: Policy{CanvasPixels: 11}, want: ErrResourcePolicy},
+		"decoded exact":      {policy: Policy{CumulativeDecodedPixels: 36}},
+		"decoded plus one":   {policy: Policy{CumulativeDecodedPixels: 35}, want: ErrResourcePolicy},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bounded, err := New(Config{Helper: helper, Prlimit: "/usr/bin/prlimit", SRGBICC: icc, SRGBICCSHA256: "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a", Policy: test.policy})
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.Open(webpFixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			_, err = bounded.Inspect(context.Background(), InspectRequest{Input: file, MIMEType: "image/webp"})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Inspect() error = %v, want %v", err, test.want)
+			}
+		})
+	}
+	standardInfo, err := standardOutput.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, maximum := range map[string]int64{"output exact": standardInfo.Size(), "output plus one": standardInfo.Size() - 1} {
+		t.Run(name, func(t *testing.T) {
+			bounded, err := New(Config{Helper: helper, Prlimit: "/usr/bin/prlimit", SRGBICC: icc, SRGBICCSHA256: "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a", Policy: Policy{GeneratedOutputMaxBytes: maximum}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.Open(webpFixture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			output := createOutput(t, name+".webp")
+			_, err = bounded.Transform(context.Background(), Request{Input: file, Output: output, MIMEType: "image/webp", Recipe: standardRecipe()})
+			if name == "output exact" && err != nil {
+				t.Fatal(err)
+			}
+			if name == "output plus one" && !errors.Is(err, ErrResourcePolicy) {
+				t.Fatalf("Transform() error = %v", err)
+			}
+		})
+	}
+
 	gifPath := filepath.Join(t.TempDir(), "single-transparent.gif")
 	if err := os.WriteFile(gifPath, singleTransparentGIF, 0o600); err != nil {
 		t.Fatal(err)
@@ -117,7 +177,68 @@ func TestNativeAnimationHelper(t *testing.T) {
 	if _, err := processor.Transform(context.Background(), Request{Input: gif, Output: gifOutput, MIMEType: "image/gif", Recipe: standardRecipe()}); err != nil {
 		t.Fatal(err)
 	}
-	assertReferenceWebP(t, reference, gifOutput.Name(), referenceWebP{Width: 1, Height: 1, Frames: 1, TotalPlays: 1, DurationsMS: []int{100}})
+	assertReferenceWebP(t, reference, gifOutput.Name(), referenceWebP{Width: 1, Height: 1, Frames: 1, TotalPlays: 1, DurationsMS: []int{100}, TimestampsMS: []int{100}})
+	staticWebP, err := os.Open(gifOutput.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer staticWebP.Close()
+	staticInspection, err := processor.Inspect(context.Background(), InspectRequest{Input: staticWebP, MIMEType: "image/webp"})
+	if err != nil || staticInspection.Classification != ClassificationStatic {
+		t.Fatalf("single-frame WebP = %+v, %v", staticInspection, err)
+	}
+	if _, err := processor.Transform(context.Background(), Request{Input: staticWebP, Output: createOutput(t, "static-rejected.webp"), MIMEType: "image/webp", Recipe: standardRecipe()}); !errors.Is(err, ErrStaticInput) {
+		t.Fatalf("static Transform() error = %v", err)
+	}
+
+	for name, test := range map[string]struct {
+		repetitions  uint16
+		present      bool
+		delay        uint16
+		wantPlays    int
+		wantDuration int
+		want         error
+	}{
+		"absent loop":          {delay: 7, wantPlays: 1, wantDuration: 70},
+		"infinite loop":        {present: true, repetitions: 0, wantPlays: 0, wantDuration: 100},
+		"finite loop":          {present: true, repetitions: 3, wantPlays: 4, wantDuration: 100},
+		"maximum loop":         {present: true, repetitions: 65534, wantPlays: 65535, wantDuration: 100},
+		"unrepresentable loop": {present: true, repetitions: 65535, want: ErrUnsupportedInput},
+	} {
+		t.Run(name, func(t *testing.T) {
+			bytes := gifWithLoopAndDelay(test.present, test.repetitions, test.delay)
+			path := filepath.Join(t.TempDir(), "loop.gif")
+			if err := os.WriteFile(path, bytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			got, err := processor.Inspect(context.Background(), InspectRequest{Input: file, MIMEType: "image/gif"})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Inspect() error = %v, want %v", err, test.want)
+			}
+			if test.want == nil && (got.TotalPlays != test.wantPlays || int(got.DurationMS) != test.wantDuration) {
+				t.Fatalf("Inspect() = %+v", got)
+			}
+		})
+	}
+	for _, mimeType := range []string{"image/gif", "image/webp"} {
+		path := filepath.Join(t.TempDir(), "corrupt")
+		if err := os.WriteFile(path, []byte("truncated"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if _, err := processor.Inspect(context.Background(), InspectRequest{Input: file, MIMEType: mimeType}); !errors.Is(err, ErrDecode) {
+			t.Fatalf("corrupt %s error = %v", mimeType, err)
+		}
+	}
 }
 
 func assertReferenceWebP(t *testing.T, executable, path string, want referenceWebP) {
@@ -133,8 +254,14 @@ func assertReferenceWebP(t *testing.T, executable, path string, want referenceWe
 	if got.Width != want.Width || got.Height != want.Height || got.Frames != want.Frames || got.TotalPlays != want.TotalPlays || !slices.Equal(got.DurationsMS, want.DurationsMS) {
 		t.Fatalf("reference = %+v, want %+v", got, want)
 	}
+	if !slices.Equal(got.TimestampsMS, want.TimestampsMS) {
+		t.Fatalf("reference timestamps = %v, want %v", got.TimestampsMS, want.TimestampsMS)
+	}
 	if len(got.TransparentPixels) != got.Frames || !slices.ContainsFunc(got.TransparentPixels, func(value uint64) bool { return value > 0 }) {
 		t.Fatalf("reference alpha = %+v", got.TransparentPixels)
+	}
+	if want.TransparentPixels != nil && (!slices.Equal(got.TransparentPixels, want.TransparentPixels) || !slices.Equal(got.AlphaSums, want.AlphaSums)) {
+		t.Fatalf("reference alpha = pixels %v sums %v, want pixels %v sums %v", got.TransparentPixels, got.AlphaSums, want.TransparentPixels, want.AlphaSums)
 	}
 }
 
@@ -160,4 +287,23 @@ var singleTransparentGIF = []byte{
 	'G', 'I', 'F', '8', '9', 'a', 1, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 255, 255, 255,
 	0x21, 0xf9, 4, 1, 0, 0, 0, 0, 0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0,
 	2, 2, 0x44, 1, 0, 0x3b,
+}
+
+func gifWithLoopAndDelay(present bool, repetitions, delay uint16) []byte {
+	result := append([]byte(nil), singleTransparentGIF...)
+	for index := 0; index+7 < len(result); index++ {
+		if result[index] == 0x21 && result[index+1] == 0xf9 && result[index+2] == 4 {
+			result[index+4], result[index+5] = byte(delay), byte(delay>>8)
+			break
+		}
+	}
+	if !present {
+		return result
+	}
+	extension := []byte{0x21, 0xff, 0x0b, 'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0', 0x03, 0x01, byte(repetitions), byte(repetitions >> 8), 0x00}
+	withLoop := make([]byte, 0, len(result)+len(extension))
+	withLoop = append(withLoop, result[:19]...)
+	withLoop = append(withLoop, extension...)
+	withLoop = append(withLoop, result[19:]...)
+	return withLoop
 }

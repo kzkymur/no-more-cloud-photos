@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 )
 
 func TestMigratorIntegration(t *testing.T) {
@@ -34,8 +36,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 4 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version four", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 5 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version five", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -58,11 +60,84 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 4 || status.ExpectedVersion != 4 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version four", status)
+		if status.CurrentVersion != 5 || status.ExpectedVersion != 5 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version five", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
+		}
+	})
+
+	t.Run("profile dimension correction upgrades only untouched unreferenced bundled drafts", func(t *testing.T) {
+		ctx := context.Background()
+		prepareVersionFour := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
+			t.Helper()
+			pool := integrationPool(t, databaseURL)
+			full, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := newMigrator(pool, full.migrations[:4]).Up(ctx); err != nil {
+				t.Fatalf("apply versions one through four: %v", err)
+			}
+			return pool, full
+		}
+		assertRule := func(t *testing.T, pool *pgxpool.Pool, mimeType, want string) {
+			t.Helper()
+			var rules []string
+			if err := pool.QueryRow(ctx, `SELECT array_agg(parameters->'recipes'->$1->>'dimension_rule' ORDER BY key) FROM profiles`, mimeType).Scan(&rules); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(rules, []string{want, want}) {
+				t.Fatalf("%s rules = %v, want %q", mimeType, rules, want)
+			}
+		}
+
+		validPool, validMigrator := prepareVersionFour(t)
+		assertRule(t, validPool, "image/jpeg", "preserve-aspect-no-crop-no-upscale-even-round-down")
+		if err := validMigrator.Up(ctx); err != nil {
+			t.Fatalf("upgrade untouched bundled drafts: %v", err)
+		}
+		assertRule(t, validPool, "image/jpeg", "preserve-aspect-no-crop-no-upscale-round-nearest")
+		assertRule(t, validPool, "image/gif", "preserve-aspect-no-crop-no-upscale-round-nearest")
+		assertRule(t, validPool, "video/mp4", "preserve-aspect-no-crop-no-upscale-even-round-down")
+
+		for name, damage := range map[string]func(*testing.T, *pgxpool.Pool){
+			"divergent": func(t *testing.T, pool *pgxpool.Pool) {
+				if _, err := pool.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER USER; UPDATE profiles SET parameters=jsonb_set(parameters,'{evidence_status}','"changed"') WHERE key='standard'; ALTER TABLE profiles ENABLE TRIGGER USER`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			"active": func(t *testing.T, pool *pgxpool.Pool) {
+				if _, err := pool.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER USER; UPDATE profiles SET status='active',activated_at=clock_timestamp() WHERE key='standard'; ALTER TABLE profiles ENABLE TRIGGER USER`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			"missing": func(t *testing.T, pool *pgxpool.Pool) {
+				if _, err := pool.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER USER; DELETE FROM profiles WHERE key='standard'; ALTER TABLE profiles ENABLE TRIGGER USER`); err != nil {
+					t.Fatal(err)
+				}
+			},
+			"referenced": func(t *testing.T, pool *pgxpool.Pool) {
+				if _, err := pool.Exec(ctx, `INSERT INTO admin_batches (id,identity_key,operation,status,profile_id,config_snapshot,high_water,checkpoint) VALUES ($1,$2,'regenerate','running',$3,'{}','{}','{}')`, newUUIDv4(t), "dimension-migration-reference-"+newUUIDv4(t), profile.StandardV1ID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				pool, migrator := prepareVersionFour(t)
+				damage(t, pool)
+				if err := migrator.Up(ctx); err == nil {
+					t.Fatalf("migration accepted %s bundled profile", name)
+				}
+				status, err := migrator.Status(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status.CurrentVersion != 4 || !status.Pending {
+					t.Fatalf("failed migration status = %+v", status)
+				}
+			})
 		}
 	})
 

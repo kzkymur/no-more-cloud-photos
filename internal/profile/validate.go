@@ -112,7 +112,11 @@ func validateRecipe(mimeType string, recipe Recipe) error {
 	if recipe.AllowUpscale {
 		return invalid("allow_upscale must be false")
 	}
-	if recipe.Crop != "none" || recipe.DimensionRule != "preserve-aspect-no-crop-no-upscale-even-round-down" || recipe.Orientation != "apply" || recipe.Metadata != "strip-after-normalization-keep-color-tags" || recipe.Alpha != "preserve" {
+	expectedDimensionRule := "preserve-aspect-no-crop-no-upscale-round-nearest"
+	if recipe.SourceMode == SourceVideo {
+		expectedDimensionRule = "preserve-aspect-no-crop-no-upscale-even-round-down"
+	}
+	if recipe.Crop != "none" || recipe.DimensionRule != expectedDimensionRule || recipe.Orientation != "apply" || recipe.Metadata != "strip-after-normalization-keep-color-tags" || recipe.Alpha != "preserve" {
 		return invalid("common normalization values are invalid")
 	}
 	if err := validateStillOutput(recipe.StillOutput); err != nil {

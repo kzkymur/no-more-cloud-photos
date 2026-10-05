@@ -68,7 +68,11 @@ func TestBundledExactRecipeValues(t *testing.T) {
 			t.Errorf("%s max edges = %d/%d", mimeType, s.MaxLongEdge, th.MaxLongEdge)
 		}
 		for name, recipe := range map[string]Recipe{"standard": s, "thumbnail": th} {
-			if recipe.DimensionRule != "preserve-aspect-no-crop-no-upscale-even-round-down" || recipe.Metadata != "strip-after-normalization-keep-color-tags" {
+			expectedDimensionRule := "preserve-aspect-no-crop-no-upscale-round-nearest"
+			if recipe.SourceMode == SourceVideo {
+				expectedDimensionRule = "preserve-aspect-no-crop-no-upscale-even-round-down"
+			}
+			if recipe.DimensionRule != expectedDimensionRule || recipe.Metadata != "strip-after-normalization-keep-color-tags" {
 				t.Errorf("%s %s normalization fields = %#v", mimeType, name, recipe)
 			}
 		}

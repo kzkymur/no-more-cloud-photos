@@ -27,6 +27,7 @@ import (
 
 const (
 	ProtocolVersion = 1
+	BuildManifest   = "giflib=5.2.2;libwebp=1.6.0;simd=on;threads=on;near-lossless=on"
 
 	MaxTimeout                 = 2 * time.Hour
 	MaxAddressSpaceBytes       = uint64(4 << 30)
@@ -116,6 +117,7 @@ type Capabilities struct {
 	Encoders         []string
 	ICCSHA256        string
 	Threads          int
+	BuildManifest    string
 }
 
 type Inspection struct {
@@ -198,7 +200,10 @@ func (p *Processor) Capabilities(ctx context.Context) (Capabilities, error) {
 		return Capabilities{}, ErrCapability
 	}
 	r := response.Result
-	return Capabilities{response.Protocol, r.HelperVersion, cloneMap(r.LibraryVersions), slices.Clone(r.DecoderMIMETypes), slices.Clone(r.Encoders), r.ICCSHA256, r.Threads}, nil
+	return Capabilities{ProtocolVersion: response.Protocol, HelperVersion: r.HelperVersion,
+		LibraryVersions: cloneMap(r.LibraryVersions), DecoderMIMETypes: slices.Clone(r.DecoderMIMETypes),
+		Encoders: slices.Clone(r.Encoders), ICCSHA256: r.ICCSHA256, Threads: r.Threads,
+		BuildManifest: r.BuildManifest}, nil
 }
 
 func (p *Processor) Inspect(ctx context.Context, request InspectRequest) (Inspection, error) {
@@ -229,10 +234,22 @@ func (p *Processor) Inspect(ctx context.Context, request InspectRequest) (Inspec
 	return cloneInspection(*response.Result), nil
 }
 
-func (p *Processor) Transform(ctx context.Context, request Request) (Result, error) {
+func (p *Processor) Transform(ctx context.Context, request Request) (result Result, returnErr error) {
 	if p == nil || p.runner == nil || ctx == nil || validateRequest(request) != nil {
 		return Result{}, ErrInvalid
 	}
+	defer func() {
+		if returnErr == nil {
+			return
+		}
+		if request.Output.Truncate(0) != nil {
+			returnErr = ErrResourcePolicy
+			return
+		}
+		if _, err := request.Output.Seek(0, io.SeekStart); err != nil {
+			returnErr = ErrResourcePolicy
+		}
+	}()
 	input, err := reopenInput(request.Input)
 	if err != nil {
 		return Result{}, ErrInvalid
@@ -274,6 +291,9 @@ func (p *Processor) Transform(ctx context.Context, request Request) (Result, err
 		return Result{}, ErrResourcePolicy
 	}
 	r := response.Result
+	if validateOutputSignature(request.Output, r.OutputMIME) != nil {
+		return Result{}, ErrProcess
+	}
 	extension := "webp"
 	if r.OutputMIME == "image/avif" {
 		extension = "avif"
@@ -282,6 +302,19 @@ func (p *Processor) Transform(ctx context.Context, request Request) (Result, err
 		r.Audit.Decoder, r.Audit.Encoder, r.Audit.ToolVersion, cloneMap(r.Audit.LibraryVersions), r.Audit.ICCSHA256,
 		r.Audit.Composition, r.Audit.TimingNormalization, r.Audit.LoopNormalization, r.Audit.InputColor, r.Audit.OutputColor, r.Audit.Alpha, r.Audit.Metadata,
 	}}, nil
+}
+
+func validateOutputSignature(file *os.File, mimeType string) error {
+	var header [12]byte
+	if _, err := io.ReadFull(file, header[:]); err != nil {
+		return ErrProcess
+	}
+	valid := mimeType == "image/webp" && string(header[0:4]) == "RIFF" && string(header[8:12]) == "WEBP"
+	valid = valid || (mimeType == "image/avif" && string(header[4:8]) == "ftyp" && (string(header[8:12]) == "avif" || string(header[8:12]) == "avis"))
+	if _, err := file.Seek(0, io.SeekStart); err != nil || !valid {
+		return ErrProcess
+	}
+	return nil
 }
 
 func (p *Processor) limitArguments() []string {
@@ -306,6 +339,7 @@ type capabilityWire struct {
 	Encoders         []string          `json:"encoders"`
 	ICCSHA256        string            `json:"icc_sha256"`
 	Threads          int               `json:"threads"`
+	BuildManifest    string            `json:"build_manifest"`
 }
 type inspectionResponse struct {
 	Protocol  int         `json:"protocol"`
@@ -411,7 +445,7 @@ func validateRequest(r Request) error {
 	}
 	recipe := r.Recipe
 	if recipe.SourceMode != profile.SourceProbeAnimation || recipe.MaxLongEdge <= 0 || recipe.MaxLongEdge > 1920 || recipe.AllowUpscale || recipe.Crop != "none" ||
-		recipe.DimensionRule != "preserve-aspect-no-crop-no-upscale-even-round-down" || recipe.Orientation != "apply" || recipe.Color != "normalize-srgb-tone-map-hdr" ||
+		recipe.DimensionRule != "preserve-aspect-no-crop-no-upscale-round-nearest" || recipe.Orientation != "apply" || recipe.Color != "normalize-srgb-tone-map-hdr" ||
 		recipe.Metadata != "strip-after-normalization-keep-color-tags" || recipe.Alpha != "preserve" || recipe.Audio != "none" || recipe.StreamSelection != "not-applicable" || recipe.VideoOutput != nil || recipe.StillOutput == nil ||
 		recipe.StillOutput.Format != "avif" || recipe.StillOutput.Quality < 1 || recipe.StillOutput.Quality > 100 || recipe.StillOutput.BitDepth != 8 {
 		return ErrInvalid
@@ -432,7 +466,7 @@ func recipeOutput(r profile.Recipe) (int, int, string) {
 }
 
 func validateCapability(c capabilityWire, digest string) error {
-	if !safeString(c.HelperVersion) || c.ICCSHA256 != digest || c.Threads != 1 || !slices.Equal(c.DecoderMIMETypes, []string{"image/gif", "image/webp"}) || !slices.Equal(c.Encoders, []string{"animated-webp", "avif"}) || validateVersionMap(c.LibraryVersions) != nil {
+	if !safeString(c.HelperVersion) || c.ICCSHA256 != digest || c.Threads != 1 || c.BuildManifest != BuildManifest || !slices.Equal(c.DecoderMIMETypes, []string{"image/gif", "image/webp"}) || !slices.Equal(c.Encoders, []string{"animated-webp", "avif"}) || validateVersionMap(c.LibraryVersions) != nil {
 		return ErrCapability
 	}
 	return nil
@@ -487,16 +521,12 @@ func validateTransform(r transformWire, request Request, p Policy, digest string
 }
 
 func validateVersionMap(v map[string]string) error {
-	if len(v) == 0 || len(v) > 16 {
+	expected := map[string]string{"giflib": "5.2.2", "libwebp": "1.6.0", "libwebp-demux": "1.6.0", "libwebp-mux": "1.6.0", "libheif": "1.23.5", "libaom": "v3.8.2", "lcms2": "2.14"}
+	if len(v) != len(expected) {
 		return ErrProcess
 	}
 	for name, version := range v {
-		if !safeString(name) || !safeString(version) {
-			return ErrProcess
-		}
-	}
-	for _, name := range []string{"giflib", "libwebp", "libheif", "libaom", "lcms2"} {
-		if _, ok := v[name]; !ok {
+		if !safeString(name) || !safeString(version) || expected[name] != version {
 			return ErrProcess
 		}
 	}

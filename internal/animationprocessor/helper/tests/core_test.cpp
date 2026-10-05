@@ -79,12 +79,13 @@ int main() {
   const std::array<FrameInfo, 3> frames = {{{0, 0, 3, 2, 40, false}, {1, 0, 2, 2, 0, true}, {0, 0, 3, 2, 250, false}}};
   const Inspection result = make_inspection("animation", 3, 2, frames, 4, limits());
   check(result.duration_ms == 390 && result.frame_durations_ms[1] == 100 &&
-        result.zero_duration_frame_indices == std::vector<int>{1} && result.decoded_pixels == 16,
-        "duration normalization and source rectangle accounting");
+        result.zero_duration_frame_indices == std::vector<int>{1} && result.decoded_pixels == 18,
+        "duration normalization and composited canvas accounting");
   check(gif_total_plays(false, 99) == 1 && gif_total_plays(true, 0) == 0 && gif_total_plays(true, 3) == 4,
         "GIF total-play normalization");
-  fails_with([&] { auto small = limits(); small.decoded_pixels = 15; (void)make_inspection("animation", 3, 2, frames, 4, small); },
-             "resource_limit", "decoded source rectangle ceiling");
+  fails_with([&] { auto small = limits(); small.decoded_pixels = 17; (void)make_inspection("animation", 3, 2, frames, 4, small); },
+              "resource_limit", "decoded composited canvas ceiling");
+  fails_with([] { (void)gif_total_plays(true, 65535); }, "unsupported_input", "unrepresentable GIF total plays");
   fails_with([&] { auto small = limits(); small.duration_ms = 389; (void)make_inspection("animation", 3, 2, frames, 4, small); },
              "resource_limit", "duration ceiling");
   fails_with([&] { auto small = limits(); small.canvas_pixels = 5; (void)make_inspection("animation", 3, 2, frames, 4, small); },

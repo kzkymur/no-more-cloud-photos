@@ -18,12 +18,14 @@ import (
 )
 
 const testICCDigest = "01ac75c95d4774800a94e69c0a5f65b669ba9a62e66bded7421f42c3445bc700"
-const versionsJSON = `{"giflib":"5.2.2","libwebp":"1.6.0","libheif":"1.23.5","libaom":"v3.8.2","lcms2":"2.14"}`
-const capabilitySuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"helper_version":"animation-helper-1","library_versions":` + versionsJSON + `,"decoder_mime_types":["image/gif","image/webp"],"encoders":["animated-webp","avif"],"icc_sha256":"` + testICCDigest + `","threads":1}}`
+const versionsJSON = `{"giflib":"5.2.2","libwebp":"1.6.0","libwebp-demux":"1.6.0","libwebp-mux":"1.6.0","libheif":"1.23.5","libaom":"v3.8.2","lcms2":"2.14"}`
+const capabilitySuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"helper_version":"animation-helper-1","library_versions":` + versionsJSON + `,"decoder_mime_types":["image/gif","image/webp"],"encoders":["animated-webp","avif"],"icc_sha256":"` + testICCDigest + `","threads":1,"build_manifest":"` + BuildManifest + `"}}`
 const animationInspection = `{"classification":"animation","width":3,"height":2,"frame_count":3,"frame_durations_ms":[40,100,250],"duration_ms":390,"total_plays":4,"has_alpha":true,"zero_duration_frame_indices":[1],"decoded_pixels":18}`
 const staticInspection = `{"classification":"static","width":3,"height":2,"frame_count":1,"frame_durations_ms":[100],"duration_ms":100,"total_plays":1,"has_alpha":false,"zero_duration_frame_indices":[0],"decoded_pixels":6}`
 const inspectSuccess = `{"protocol":1,"ok":true,"error_code":"","result":` + animationInspection + `}`
 const transformSuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"output_mime":"image/webp","width":3,"height":2,"quality":80,"bit_depth":8,"max_long_edge":1920,"threads":1,"source":` + animationInspection + `,"audit":{"decoder":"giflib-gif","encoder":"libwebp","tool_version":"animation-helper-1","library_versions":` + versionsJSON + `,"icc_sha256":"` + testICCDigest + `","composition":"composited-rgba","timing_normalization":"zero-duration-to-100ms","loop_normalization":"total-play-count","input_color":"assumed-srgb","output_color":"srgb","alpha":"preserved","metadata":"strip-after-normalization-keep-color-tags"}}}`
+const fakeWebP = "RIFF0000WEBP"
+const fakeAVIF = "0000ftypavif"
 
 func TestCapabilities(t *testing.T) {
 	helper := writeExecutable(t, "capabilities", "#!/bin/sh\n"+
@@ -35,6 +37,21 @@ func TestCapabilities(t *testing.T) {
 	}
 	if got.ProtocolVersion != 1 || got.HelperVersion != "animation-helper-1" || got.LibraryVersions["libwebp"] != "1.6.0" || len(got.Encoders) != 2 {
 		t.Fatalf("Capabilities() = %+v", got)
+	}
+}
+
+func TestCapabilitiesRejectSubstitutedBuild(t *testing.T) {
+	for name, document := range map[string]string{
+		"manifest":    strings.Replace(capabilitySuccess, BuildManifest, "untrusted", 1),
+		"version":     strings.Replace(capabilitySuccess, `"libwebp":"1.6.0"`, `"libwebp":"1.5.0"`, 1),
+		"missing mux": strings.Replace(capabilitySuccess, `,"libwebp-mux":"1.6.0"`, ``, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := newProcessor(t, jsonHelper(t, document, ""), Policy{}).Capabilities(context.Background())
+			if !errors.Is(err, ErrCapability) {
+				t.Fatalf("Capabilities() error = %v", err)
+			}
+		})
 	}
 }
 
@@ -69,7 +86,7 @@ func TestTransformUsesExactArgumentsAndDescriptors(t *testing.T) {
 		"[ \"$1\" = transform ] && [ \"$3\" = 1 ] && [ \"$5\" = /proc/self/fd/3 ] && [ \"$7\" = /proc/self/fd/4 ] || exit 21\n"+
 		"[ \"$9\" = image/gif ] && [ \"${11}\" = animated-webp ] && [ \"${13}\" = 1920 ] && [ \"${15}\" = 80 ] && [ \"${17}\" = 8 ] && [ \"${19}\" = 1 ] && [ \"${21}\" = /proc/self/fd/5 ] || exit 22\n"+
 		"[ \"${23}\" = 1000 ] && [ \"${25}\" = 3600000 ] && [ \"${27}\" = 100000 ] && [ \"${29}\" = 1000000000 ] && [ \"${31}\" = 1000000000 ] && [ \"${33}\" = 268435456 ] || exit 23\n"+
-		"[ \"$(cat <&3)\" = original-bytes ] || exit 24\nprintf webp-bytes >&4 || exit 25\nprintf '%s' '"+transformSuccess+"'\n")
+		"[ \"$(cat <&3)\" = original-bytes ] || exit 24\nprintf RIFF0000WEBP >&4 || exit 25\nprintf '%s' '"+transformSuccess+"'\n")
 	input, output := testFiles(t, []byte("original-bytes"))
 	got, err := newProcessor(t, helper, Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()})
 	if err != nil {
@@ -85,7 +102,7 @@ func TestTransformUsesExactArgumentsAndDescriptors(t *testing.T) {
 
 func TestThumbnailResult(t *testing.T) {
 	document := strings.NewReplacer(`"output_mime":"image/webp"`, `"output_mime":"image/avif"`, `"quality":80`, `"quality":50`, `"max_long_edge":1920`, `"max_long_edge":640`, `"encoder":"libwebp"`, `"encoder":"aom"`).Replace(transformSuccess)
-	helper := jsonHelper(t, document, "avif")
+	helper := jsonHelper(t, document, fakeAVIF)
 	input, output := testFiles(t, []byte("input"))
 	got, err := newProcessor(t, helper, Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: thumbnailRecipe()})
 	if err != nil {
@@ -222,6 +239,33 @@ func TestHelperAndProcessErrors(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+}
+
+func TestTransformFailureClearsPartialOutput(t *testing.T) {
+	helper := writeExecutable(t, "partial", "#!/bin/sh\nprintf partial-output >&4\nexit 9\n")
+	processor := newProcessor(t, helper, Policy{})
+	input, output := testFiles(t, []byte("input"))
+	if _, err := processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()}); !errors.Is(err, ErrProcess) {
+		t.Fatalf("Transform() error = %v", err)
+	}
+	info, err := output.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("failed output size = %d", info.Size())
+	}
+	if offset, err := output.Seek(0, io.SeekCurrent); err != nil || offset != 0 {
+		t.Fatalf("failed output offset = %d, %v", offset, err)
+	}
+}
+
+func TestTransformRejectsInvalidOutputSignature(t *testing.T) {
+	helper := jsonHelper(t, transformSuccess, "not-a-webp!")
+	err := transformError(t, newProcessor(t, helper, Policy{}), context.Background())
+	if !errors.Is(err, ErrProcess) {
+		t.Fatalf("Transform() error = %v", err)
+	}
 }
 
 func TestResizeGeometryPreservesOddAndOnePixel(t *testing.T) {
