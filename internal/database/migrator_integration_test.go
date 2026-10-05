@@ -139,6 +139,40 @@ func TestMigratorIntegration(t *testing.T) {
 				}
 			})
 		}
+
+		t.Run("waits for earlier activation writer before preflight", func(t *testing.T) {
+			pool, migrator := prepareVersionFour(t)
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER USER; UPDATE profiles SET status='active',activated_at=clock_timestamp() WHERE key='standard'; ALTER TABLE profiles ENABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() { result <- migrator.Up(ctx) }()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				var waiting bool
+				if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation='profiles'::regclass AND mode='AccessExclusiveLock' AND NOT granted)`).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("migration did not wait for earlier profile writer")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-result; err == nil {
+				t.Fatal("migration accepted profile activated by earlier writer")
+			}
+		})
 	})
 
 	t.Run("job lease invariant upgrade accepts valid history and rejects stranded queue", func(t *testing.T) {

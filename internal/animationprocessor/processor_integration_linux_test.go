@@ -22,6 +22,7 @@ type referenceWebP struct {
 	TransparentPixels []uint64 `json:"transparent_pixels"`
 	AlphaSums         []uint64 `json:"alpha_sums"`
 	TimestampsMS      []int    `json:"timestamps_ms"`
+	RGBSums           []uint64 `json:"rgb_sums"`
 }
 
 func TestNativeAnimationHelper(t *testing.T) {
@@ -265,12 +266,21 @@ func TestNativeAnimationHelper(t *testing.T) {
 			if _, err := processor.Transform(context.Background(), Request{Input: file, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()}); err != nil {
 				t.Fatal(err)
 			}
-			assertReferenceWebP(t, reference, output.Name(), referenceWebP{Width: 3, Height: 1, Frames: 3, TotalPlays: 1, DurationsMS: []int{40, 100, 250}, TransparentPixels: test.transparent, AlphaSums: test.alpha, TimestampsMS: []int{40, 140, 390}})
+			decoded := assertReferenceWebP(t, reference, output.Name(), referenceWebP{Width: 3, Height: 1, Frames: 3, TotalPlays: 1, DurationsMS: []int{40, 100, 250}, TransparentPixels: test.transparent, AlphaSums: test.alpha, TimestampsMS: []int{40, 140, 390}})
+			if len(decoded.RGBSums) != 9 {
+				t.Fatalf("reference RGB sums = %v", decoded.RGBSums)
+			}
+			if name == "previous disposal" && decoded.RGBSums[6] <= decoded.RGBSums[7]+200 {
+				t.Fatalf("restore-to-previous did not restore red canvas: RGB sums %v", decoded.RGBSums[6:9])
+			}
+			if name == "background disposal" && (decoded.RGBSums[6] <= decoded.RGBSums[7]+100 || decoded.RGBSums[8] <= decoded.RGBSums[7]+100) {
+				t.Fatalf("background disposal composition RGB sums = %v", decoded.RGBSums[6:9])
+			}
 		})
 	}
 }
 
-func assertReferenceWebP(t *testing.T, executable, path string, want referenceWebP) {
+func assertReferenceWebP(t *testing.T, executable, path string, want referenceWebP) referenceWebP {
 	t.Helper()
 	output, err := exec.Command(executable, path).Output()
 	if err != nil {
@@ -292,6 +302,7 @@ func assertReferenceWebP(t *testing.T, executable, path string, want referenceWe
 	if want.TransparentPixels != nil && (!slices.Equal(got.TransparentPixels, want.TransparentPixels) || !slices.Equal(got.AlphaSums, want.AlphaSums)) {
 		t.Fatalf("reference alpha = pixels %v sums %v, want pixels %v sums %v", got.TransparentPixels, got.AlphaSums, want.TransparentPixels, want.AlphaSums)
 	}
+	return got
 }
 
 func requiredTestPath(t *testing.T, name string) string {

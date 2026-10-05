@@ -1,4 +1,5 @@
 // Independent output probe using libwebp demux metadata and composited decoder timestamps.
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -47,19 +48,23 @@ int main(int argc, char **argv) {
   std::uint32_t decoded = 0;
   std::vector<std::uint64_t> alpha_sums;
   std::vector<int> timestamps;
+  std::vector<std::uint64_t> rgb_sums;
   while (WebPAnimDecoderHasMoreFrames(decoder)) {
     if (!WebPAnimDecoderGetNext(decoder, &rgba, &timestamp) || !rgba) return 1;
     std::uint64_t transparent = 0;
     std::uint64_t alpha_sum = 0;
-    for (std::size_t offset = 3; offset < static_cast<std::size_t>(width) * height * 4U; offset += 4) {
-      if (rgba[offset] != 255) ++transparent;
-      alpha_sum += rgba[offset];
+    std::array<std::uint64_t, 3> rgb_sum{};
+    for (std::size_t offset = 0; offset < static_cast<std::size_t>(width) * height * 4U; offset += 4) {
+      if (rgba[offset + 3] != 255) ++transparent;
+      alpha_sum += rgba[offset + 3];
+      for (std::size_t channel = 0; channel < rgb_sum.size(); ++channel) rgb_sum[channel] += rgba[offset + channel];
     }
     if (!first) std::cout << ',';
     first = false;
     std::cout << transparent;
     alpha_sums.push_back(alpha_sum);
     timestamps.push_back(timestamp);
+    rgb_sums.insert(rgb_sums.end(), rgb_sum.begin(), rgb_sum.end());
     ++decoded;
   }
   WebPAnimDecoderDelete(decoder);
@@ -73,6 +78,11 @@ int main(int argc, char **argv) {
   for (std::size_t index = 0; index < timestamps.size(); ++index) {
     if (index != 0) std::cout << ',';
     std::cout << timestamps[index];
+  }
+  std::cout << "],\"rgb_sums\":[";
+  for (std::size_t index = 0; index < rgb_sums.size(); ++index) {
+    if (index != 0) std::cout << ',';
+    std::cout << rgb_sums[index];
   }
   std::cout << "]}";
   return 0;

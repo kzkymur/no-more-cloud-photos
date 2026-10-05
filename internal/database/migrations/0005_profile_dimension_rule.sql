@@ -74,6 +74,11 @@ BEGIN
 END;
 $$;
 
+-- Serialize the preflight with activation/update and with FK writers, which
+-- must take a lock on the referenced profiles table. Earlier writers finish
+-- before validation; later writers wait until this transaction commits.
+LOCK TABLE profiles IN ACCESS EXCLUSIVE MODE;
+
 DO $$
 DECLARE bundled record;
 BEGIN
