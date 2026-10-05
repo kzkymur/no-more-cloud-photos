@@ -47,7 +47,7 @@ FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LD_LIBRARY_PATH=/opt/nmcp/still-toolchain/lib:/opt/nmcp/still-toolchain/lib64
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg libimage-exiftool-perl util-linux \
+ && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg libexif12 libimage-exiftool-perl util-linux \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --gid 10001 nmcp \
  && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin nmcp
