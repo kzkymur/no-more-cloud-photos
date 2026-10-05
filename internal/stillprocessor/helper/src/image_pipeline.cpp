@@ -341,6 +341,12 @@ Raster decode_heif(const TransformArgs &args, std::span<const std::byte> target_
   if (!options) throw Failure("resource_limit");
   options->ignore_transformations = 0;
   options->strict_decoding = 1;
+  // Keep source NCLX semantics. The libheif default converts an unspecified
+  // output profile to sRGB, which would make us interpret already-converted
+  // pixels as PQ/HLG below. Codec threading is independent of tile threading.
+  options->output_image_nclx_profile = nullptr;
+  options->output_image_nclx_profile_passthrough = 1;
+  options->num_codec_threads = 1;
   heif_image *raw_image = nullptr;
   const bool alpha = heif_image_handle_has_alpha_channel(handle.get()) != 0;
   const auto chroma = hdr ? (alpha ? heif_chroma_interleaved_RRGGBBAA_BE : heif_chroma_interleaved_RRGGBB_BE)

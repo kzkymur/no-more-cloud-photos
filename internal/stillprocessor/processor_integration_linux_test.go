@@ -50,12 +50,16 @@ func TestRealStillHelper(t *testing.T) {
 	heic := readFixture(t, "TEST_STILL_HEIC_PATH", "7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2")
 	webp := readFixture(t, "TEST_STILL_WEBP_PATH", "0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9")
 	orientation6 := readFixture(t, "TEST_STILL_ORIENTATION6_PATH", "9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124")
+	pq := readGeneratedFixture(t, "TEST_STILL_PQ_PATH")
+	hlg := readGeneratedFixture(t, "TEST_STILL_HLG_PATH")
+	iccNCLX := readGeneratedFixture(t, "TEST_STILL_ICC_NCLX_PATH")
 
 	for _, test := range []struct {
-		name, mime, alpha string
-		width, height     int
-		input             []byte
-		orientation6      bool
+		name, mime, alpha, inputColor, toneMap string
+		width, height                          int
+		input                                  []byte
+		orientation6                           bool
+		referencePixel                         []int
 	}{
 		{name: "JPEG odd opaque", mime: "image/jpeg", alpha: "opaque", width: 5, height: 3,
 			input: encodeJPEG(t, 5, 3)},
@@ -69,6 +73,12 @@ func TestRealStillHelper(t *testing.T) {
 		{name: "Google gallery static WebP", mime: "image/webp", alpha: "opaque", input: webp},
 		{name: "real Exif orientation 6", mime: "image/jpeg", alpha: "opaque", width: 1800, height: 1200,
 			input: orientation6, orientation6: true},
+		{name: "real PQ NCLX reference pixel", mime: "image/heif", alpha: "opaque", width: 32, height: 32,
+			input: pq, inputColor: "nclx-pq", toneMap: "bt2446a-method-a", referencePixel: []int{127, 127, 127}},
+		{name: "real HLG NCLX reference pixel", mime: "image/heif", alpha: "opaque", width: 32, height: 32,
+			input: hlg, inputColor: "nclx-hlg", toneMap: "bt2446a-method-a", referencePixel: []int{100, 100, 100}},
+		{name: "ICC and NCLX single normalization", mime: "image/heif", alpha: "opaque", width: 32, height: 32,
+			input: iccNCLX, inputColor: "embedded-icc", toneMap: "not-needed", referencePixel: []int{64, 128, 192}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			inputPath := filepath.Join(t.TempDir(), "input")
@@ -100,11 +110,38 @@ func TestRealStillHelper(t *testing.T) {
 				(test.width != 0 && (result.Width != test.width || result.Height != test.height)) {
 				t.Fatalf("result = %+v", result)
 			}
+			if test.inputColor != "" && (result.Audit.InputColor != test.inputColor || result.Audit.ToneMap != test.toneMap) {
+				t.Fatalf("color audit = %+v", result.Audit)
+			}
 			probeAVIF(t, ffprobe, outputPath, result.Width, result.Height)
 			if test.orientation6 {
 				assertOrientation6Pixels(t, ffmpeg, test.input, outputPath, result.Width, result.Height)
 			}
+			if test.referencePixel != nil {
+				assertReferencePixel(t, ffmpeg, outputPath, result.Width, result.Height, test.referencePixel)
+			}
 		})
+	}
+}
+
+func assertReferencePixel(t *testing.T, ffmpeg, outputPath string, width, height int, expected []int) {
+	t.Helper()
+	decoded, err := exec.Command(ffmpeg, "-v", "error", "-i", outputPath, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1").Output()
+	if err != nil {
+		t.Fatalf("ffmpeg decode: %v", err)
+	}
+	offset := ((height/2)*width + width/2) * 3
+	if len(decoded) < offset+3 {
+		t.Fatalf("decoded bytes = %d", len(decoded))
+	}
+	for channel := range 3 {
+		difference := int(decoded[offset+channel]) - expected[channel]
+		if difference < 0 {
+			difference = -difference
+		}
+		if difference > 24 {
+			t.Fatalf("reference pixel channel %d = %d, want %d (+/-24)", channel, decoded[offset+channel], expected[channel])
+		}
 	}
 }
 
@@ -147,6 +184,15 @@ func readFixture(t *testing.T, environment, expectedSHA256 string) []byte {
 	}
 	if actual := fmt.Sprintf("%x", sha256.Sum256(data)); actual != expectedSHA256 {
 		t.Fatalf("%s SHA-256 = %s", environment, actual)
+	}
+	return data
+}
+
+func readGeneratedFixture(t *testing.T, environment string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(requiredTestPath(t, environment))
+	if err != nil {
+		t.Fatal(err)
 	}
 	return data
 }

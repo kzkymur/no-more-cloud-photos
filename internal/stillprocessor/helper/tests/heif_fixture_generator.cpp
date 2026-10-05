@@ -1,0 +1,95 @@
+// Project-owned source. See ../LICENSE.md.
+#include <libheif/heif.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace {
+
+void check(heif_error error) {
+  if (error.code != heif_error_Ok) {
+    std::cerr << (error.message ? error.message : "libheif error") << '\n';
+    std::exit(1);
+  }
+}
+
+std::vector<std::uint8_t> read_file(const char *path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) std::exit(1);
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+void encode(const std::filesystem::path &path, heif_transfer_characteristics transfer,
+            const std::vector<std::uint8_t> &icc) {
+  constexpr int size = 32;
+  const bool hdr = transfer == heif_transfer_characteristic_ITU_R_BT_2100_0_PQ ||
+                   transfer == heif_transfer_characteristic_ITU_R_BT_2100_0_HLG;
+  std::unique_ptr<heif_context, decltype(&heif_context_free)> context(heif_context_alloc(), heif_context_free);
+  heif_image *raw_image = nullptr;
+  const auto chroma = hdr ? heif_chroma_interleaved_RRGGBB_BE : heif_chroma_interleaved_RGB;
+  check(heif_image_create(size, size, heif_colorspace_RGB, chroma, &raw_image));
+  std::unique_ptr<heif_image, decltype(&heif_image_release)> image(raw_image, heif_image_release);
+  check(heif_image_add_plane(image.get(), heif_channel_interleaved, size, size, hdr ? 10 : 8));
+  int stride = 0;
+  auto *pixels = heif_image_get_plane(image.get(), heif_channel_interleaved, &stride);
+  if (!pixels || stride <= 0) std::exit(1);
+  for (int y = 0; y < size; ++y) {
+    auto *row = pixels + static_cast<std::size_t>(y) * static_cast<unsigned>(stride);
+    for (int x = 0; x < size; ++x) {
+      if (hdr) {
+        for (int channel = 0; channel < 3; ++channel) {
+          const auto offset = static_cast<std::size_t>(x * 6 + channel * 2);
+          row[offset] = 0x02;
+          row[offset + 1] = 0x00;  // code value 512 / 1023
+        }
+      } else {
+        const auto offset = static_cast<std::size_t>(x * 3);
+        row[offset] = 64;
+        row[offset + 1] = 128;
+        row[offset + 2] = 192;
+      }
+    }
+  }
+
+  std::unique_ptr<heif_color_profile_nclx, decltype(&heif_nclx_color_profile_free)> nclx(
+      heif_nclx_color_profile_alloc(), heif_nclx_color_profile_free);
+  nclx->color_primaries = hdr ? heif_color_primaries_ITU_R_BT_2020_2_and_2100_0 : heif_color_primaries_ITU_R_BT_709_5;
+  nclx->transfer_characteristics = transfer;
+  nclx->matrix_coefficients = hdr ? heif_matrix_coefficients_ITU_R_BT_2020_2_non_constant_luminance
+                                  : heif_matrix_coefficients_RGB_GBR;
+  nclx->full_range_flag = 1;
+  check(heif_image_set_nclx_color_profile(image.get(), nclx.get()));
+  if (!icc.empty()) check(heif_image_set_raw_color_profile(image.get(), "prof", icc.data(), icc.size()));
+
+  const heif_encoder_descriptor *descriptors[4]{};
+  if (heif_get_encoder_descriptors(heif_compression_AV1, "aom", descriptors, 4) <= 0) std::exit(1);
+  heif_encoder *raw_encoder = nullptr;
+  check(heif_context_get_encoder(context.get(), descriptors[0], &raw_encoder));
+  std::unique_ptr<heif_encoder, decltype(&heif_encoder_release)> encoder(raw_encoder, heif_encoder_release);
+  check(heif_encoder_set_lossless(encoder.get(), 1));
+  check(heif_encoder_set_parameter_integer(encoder.get(), "threads", 1));
+  check(heif_encoder_set_parameter_string(encoder.get(), "chroma", "444"));
+  heif_image_handle *raw_handle = nullptr;
+  check(heif_context_encode_image(context.get(), image.get(), encoder.get(), nullptr, &raw_handle));
+  std::unique_ptr<heif_image_handle, decltype(&heif_image_handle_release)> handle(raw_handle, heif_image_handle_release);
+  check(heif_context_write_to_file(context.get(), path.c_str()));
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+  if (argc != 3) return 2;
+  const std::filesystem::path directory(argv[1]);
+  std::filesystem::create_directories(directory);
+  const auto icc = read_file(argv[2]);
+  encode(directory / "pq.avif", heif_transfer_characteristic_ITU_R_BT_2100_0_PQ, {});
+  encode(directory / "hlg.avif", heif_transfer_characteristic_ITU_R_BT_2100_0_HLG, {});
+  encode(directory / "icc-nclx.avif", heif_transfer_characteristic_IEC_61966_2_1, icc);
+}

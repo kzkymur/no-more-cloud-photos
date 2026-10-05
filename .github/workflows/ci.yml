@@ -95,17 +95,22 @@ jobs:
             -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/still-toolchain"
           cmake --build "${RUNNER_TEMP}/still-helper-build" --parallel 2
           ctest --test-dir "${RUNNER_TEMP}/still-helper-build" --output-on-failure
+          "${RUNNER_TEMP}/still-helper-build/bin/nmcp-heif-fixture-generator" \
+            "${RUNNER_TEMP}/generated-heif-fixtures" "${RUNNER_TEMP}/sRGB2014.icc"
           capabilities=$("${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
             capabilities --protocol 1 --threads 1 \
             --srgb-icc "${RUNNER_TEMP}/sRGB2014.icc")
           printf '%s\n' "${capabilities}"
           CAPABILITIES="${capabilities}" python3 -c \
-            'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libvips"]=="8.18.7" and v["libheif"]=="1.23.5" and v["libraw"]=="0.22.2" and v["libaom"]=="3.8.2" and v["lcms2"]=="2.14", v'
-          printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_ICC_PATH=%s\nTEST_STILL_HEIC_PATH=%s\nTEST_STILL_WEBP_PATH=%s\nTEST_STILL_ORIENTATION6_PATH=%s\n' \
+            'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libvips"]=="8.18.7" and v["libheif"]=="1.23.5" and v["libraw"]=="0.22.2-Release" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14", v'
+          printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_ICC_PATH=%s\nTEST_STILL_HEIC_PATH=%s\nTEST_STILL_WEBP_PATH=%s\nTEST_STILL_ORIENTATION6_PATH=%s\nTEST_STILL_PQ_PATH=%s\nTEST_STILL_HLG_PATH=%s\nTEST_STILL_ICC_NCLX_PATH=%s\n' \
             "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
             "${RUNNER_TEMP}/sRGB2014.icc" "${heic_fixture}" \
             "${RUNNER_TEMP}/static-gallery-4.webp" \
-            "${RUNNER_TEMP}/orientation-6.jpg" >> "${GITHUB_ENV}"
+            "${RUNNER_TEMP}/orientation-6.jpg" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/pq.avif" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/hlg.avif" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/icc-nclx.avif" >> "${GITHUB_ENV}"
           printf 'LD_LIBRARY_PATH=%s\n' \
             "${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64" >> "${GITHUB_ENV}"
       - name: Verify modules

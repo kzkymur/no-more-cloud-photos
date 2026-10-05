@@ -35,4 +35,13 @@ if(NMCP_BUILD_HELPER)
     PkgConfig::LCMS2)
   set_target_properties(nmcp-still-helper PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+  if(BUILD_TESTING)
+    add_executable(nmcp-heif-fixture-generator tests/heif_fixture_generator.cpp)
+    target_compile_features(nmcp-heif-fixture-generator PRIVATE cxx_std_20)
+    target_compile_options(nmcp-heif-fixture-generator PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    target_link_libraries(nmcp-heif-fixture-generator PRIVATE PkgConfig::HEIF)
+    set_target_properties(nmcp-heif-fixture-generator PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  endif()
 endif()
