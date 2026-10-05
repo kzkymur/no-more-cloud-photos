@@ -118,6 +118,14 @@ func TestMigratorIntegration(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
+			"unexpected custom": func(t *testing.T, pool *pgxpool.Pool) {
+				if _, err := pool.Exec(ctx, `
+					INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+					SELECT $1,'custom',1,'draft',input_mime_types,processor,parameters_schema_version,parameters
+					FROM profiles WHERE key='standard'`, newUUIDv4(t)); err != nil {
+					t.Fatal(err)
+				}
+			},
 			"referenced": func(t *testing.T, pool *pgxpool.Pool) {
 				if _, err := pool.Exec(ctx, `INSERT INTO admin_batches (id,identity_key,operation,status,profile_id,config_snapshot,high_water,checkpoint) VALUES ($1,$2,'regenerate','running',$3,'{}','{}','{}')`, newUUIDv4(t), "dimension-migration-reference-"+newUUIDv4(t), profile.StandardV1ID); err != nil {
 					t.Fatal(err)
@@ -564,12 +572,15 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatalf("apply version one: %v", err)
 		}
 		customID := newUUIDv4(t)
+		legacyParameters := replaceJSONOnce(t, testProfileParameters(t),
+			"preserve-aspect-no-crop-no-upscale-round-nearest",
+			"preserve-aspect-no-crop-no-upscale-even-round-down")
 		if _, err := pool.Exec(context.Background(), `
 			INSERT INTO profiles (id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
-			VALUES ($1,'custom',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, customID, testProfileParameters(t)); err != nil {
+			VALUES ($1,'custom',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, customID, legacyParameters); err != nil {
 			t.Fatalf("insert compatible custom draft: %v", err)
 		}
-		if err := full.Up(context.Background()); err != nil {
+		if err := newMigrator(pool, full.migrations[:2]).Up(context.Background()); err != nil {
 			t.Fatalf("upgrade compatible custom draft: %v", err)
 		}
 		var count int
