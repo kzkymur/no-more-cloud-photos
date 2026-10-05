@@ -297,7 +297,7 @@ func TestResizeGeometry(t *testing.T) {
 	}{
 		"exact scaled":     {3000, 2000, 1920, 1280, true},
 		"one pixel short":  {3000, 2000, 1920, 1279, false},
-		"rounded floor":    {3000, 2001, 1920, 1280, true},
+		"rounded floor":    {3000, 2001, 1920, 1280, false},
 		"rounded ceil":     {3000, 2001, 1920, 1281, true},
 		"one pixel source": {1, 1, 1, 1, true},
 		"upscale":          {100, 100, 200, 200, false},

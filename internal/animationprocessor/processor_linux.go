@@ -673,9 +673,8 @@ func validResize(sw, sh, ow, oh, edge int) bool {
 		short, out = sw, ow
 	}
 	numerator := int64(short) * int64(edge)
-	floor := int(numerator / int64(long))
-	ceil := int((numerator + int64(long) - 1) / int64(long))
-	return out == max(1, floor) || out == max(1, ceil)
+	expected := max(1, int((numerator+int64(long)/2)/int64(long)))
+	return out == expected
 }
 
 var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)

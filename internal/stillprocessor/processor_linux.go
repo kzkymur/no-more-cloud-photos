@@ -799,9 +799,8 @@ func validResize(sourceWidth, sourceHeight, outputWidth, outputHeight, maxLongEd
 		sourceShort, outputShort = sourceWidth, outputWidth
 	}
 	numerator := sourceShort * maxLongEdge
-	floor := numerator / sourceLong
-	ceil := (numerator + sourceLong - 1) / sourceLong
-	return outputShort == floor || outputShort == ceil
+	expected := max(1, (numerator+sourceLong/2)/sourceLong)
+	return outputShort == expected
 }
 
 func validDecoder(mimeType, decoder string) bool {
