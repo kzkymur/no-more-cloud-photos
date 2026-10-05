@@ -28,6 +28,7 @@ func TestRealStillHelper(t *testing.T) {
 	helper := requiredTestPath(t, "TEST_STILL_HELPER_PATH")
 	icc := requiredTestPath(t, "TEST_STILL_ICC_PATH")
 	ffprobe := requiredTestPath(t, "TEST_FFPROBE_PATH")
+	ffmpeg := requiredTestPath(t, "TEST_FFMPEG_PATH")
 	iccBytes, err := os.ReadFile(icc)
 	if err != nil {
 		t.Fatal(err)
@@ -46,11 +47,15 @@ func TestRealStillHelper(t *testing.T) {
 	if capabilities.AVIFEncoder != "aom" || capabilities.Threads != 1 {
 		t.Fatalf("capabilities = %+v", capabilities)
 	}
+	heic := readFixture(t, "TEST_STILL_HEIC_PATH", "7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2")
+	webp := readFixture(t, "TEST_STILL_WEBP_PATH", "0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9")
+	orientation6 := readFixture(t, "TEST_STILL_ORIENTATION6_PATH", "9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124")
 
 	for _, test := range []struct {
 		name, mime, alpha string
 		width, height     int
 		input             []byte
+		orientation6      bool
 	}{
 		{name: "JPEG odd opaque", mime: "image/jpeg", alpha: "opaque", width: 5, height: 3,
 			input: encodeJPEG(t, 5, 3)},
@@ -60,6 +65,10 @@ func TestRealStillHelper(t *testing.T) {
 			input: encodePNG(t, 1, 7, true)},
 		{name: "BMP32 reserved byte opaque", mime: "image/bmp", alpha: "opaque", width: 3, height: 2,
 			input: encodeBMP32(3, 2)},
+		{name: "libheif real HEIC", mime: "image/heic", alpha: "opaque", input: heic},
+		{name: "Google gallery static WebP", mime: "image/webp", alpha: "opaque", input: webp},
+		{name: "real Exif orientation 6", mime: "image/jpeg", alpha: "opaque", width: 1800, height: 1200,
+			input: orientation6, orientation6: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			inputPath := filepath.Join(t.TempDir(), "input")
@@ -87,12 +96,59 @@ func TestRealStillHelper(t *testing.T) {
 			if err := output.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if result.Width != test.width || result.Height != test.height || result.Audit.Alpha != test.alpha {
+			if result.Width <= 0 || result.Height <= 0 || result.Audit.Alpha != test.alpha ||
+				(test.width != 0 && (result.Width != test.width || result.Height != test.height)) {
 				t.Fatalf("result = %+v", result)
 			}
-			probeAVIF(t, ffprobe, outputPath, test.width, test.height)
+			probeAVIF(t, ffprobe, outputPath, result.Width, result.Height)
+			if test.orientation6 {
+				assertOrientation6Pixels(t, ffmpeg, test.input, outputPath, result.Width, result.Height)
+			}
 		})
 	}
+}
+
+func assertOrientation6Pixels(t *testing.T, ffmpeg string, sourceJPEG []byte, outputPath string, width, height int) {
+	t.Helper()
+	source, err := jpeg.Decode(bytes.NewReader(sourceJPEG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(ffmpeg, "-v", "error", "-i", outputPath, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1")
+	decoded, err := command.Output()
+	if err != nil {
+		t.Fatalf("ffmpeg decode: %v", err)
+	}
+	if len(decoded) != width*height*3 {
+		t.Fatalf("decoded bytes = %d", len(decoded))
+	}
+	for _, point := range [][2]int{{width / 4, height / 4}, {width / 2, height / 2}, {3 * width / 4, 3 * height / 4}} {
+		x, y := point[0], point[1]
+		r, g, b, _ := source.At(y, source.Bounds().Dy()-1-x).RGBA()
+		offset := (y*width + x) * 3
+		expected := []int{int(r >> 8), int(g >> 8), int(b >> 8)}
+		for channel := range 3 {
+			difference := int(decoded[offset+channel]) - expected[channel]
+			if difference < 0 {
+				difference = -difference
+			}
+			if difference > 60 {
+				t.Fatalf("orientation pixel (%d,%d) channel %d difference = %d", x, y, channel, difference)
+			}
+		}
+	}
+}
+
+func readFixture(t *testing.T, environment, expectedSHA256 string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(requiredTestPath(t, environment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual := fmt.Sprintf("%x", sha256.Sum256(data)); actual != expectedSHA256 {
+		t.Fatalf("%s SHA-256 = %s", environment, actual)
+	}
+	return data
 }
 
 func requiredTestPath(t *testing.T, name string) string {
