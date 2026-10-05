@@ -1,0 +1,111 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+compose_file="$root/infra/validation/compose.yaml"
+project=nmcp-validation
+
+compose() {
+  docker compose --project-name "$project" --file "$compose_file" "$@"
+}
+
+require_tools() {
+  command -v docker >/dev/null 2>&1 || { echo "error: docker is required" >&2; exit 1; }
+  docker compose version >/dev/null 2>&1 || { echo "error: docker compose v2 is required" >&2; exit 1; }
+  command -v curl >/dev/null 2>&1 || { echo "error: curl is required" >&2; exit 1; }
+}
+
+write_fixture() {
+  compose run --rm --no-deps --entrypoint sh api -eu -c '
+    path=/var/lib/nmcp/media/originals/00/00000000-0000-4000-8000-000000000000
+    mkdir -p "$path"
+    printf "0123456789abcdef" >"$path/original.jpg"
+    chmod 0600 "$path/original.jpg"
+    ln -s /etc/passwd "$path/escape.jpg"
+  '
+}
+
+expect_status() {
+  expected=$1
+  shift
+  actual=$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' "$@")
+  if [ "$actual" != "$expected" ]; then
+    echo "error: expected HTTP $expected, got $actual: curl $*" >&2
+    exit 1
+  fi
+}
+
+check() (
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  base=https://127.0.0.1:18443
+  object="$base/files/originals/00/00000000-0000-4000-8000-000000000000/original.jpg"
+
+  expect_status 200 http://127.0.0.1:18080/healthz
+  expect_status 200 http://127.0.0.1:18080/readyz
+  expect_status 200 "$object"
+  expect_status 200 --head "$object"
+  expect_status 206 --range 2-5 "$object"
+  expect_status 206 --range -4 "$object"
+  expect_status 206 --range 4- "$object"
+  expect_status 206 --range 0-1,4-5 "$object"
+  expect_status 416 --range 99-100 "$object"
+  expect_status 405 --request POST "$object"
+  expect_status 404 "$base/files/backups/secret.dump"
+  expect_status 404 "$base/files/originals/00/00000000-0000-4000-8000-000000000000/missing.jpg"
+  symlink_status=$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/00/00000000-0000-4000-8000-000000000000/escape.jpg")
+  case "$symlink_status" in 400|403|404) ;; *) echo "error: symlink escape returned HTTP $symlink_status" >&2; exit 1 ;; esac
+
+  curl --insecure --silent --show-error --dump-header "$tmp/headers" --output "$tmp/body" "$object"
+  grep -iq '^accept-ranges: bytes' "$tmp/headers"
+  grep -iq '^cache-control: private, max-age=31536000, immutable' "$tmp/headers"
+  grep -iq '^x-content-type-options: nosniff' "$tmp/headers"
+  [ "$(wc -c <"$tmp/body" | tr -d ' ')" = 16 ]
+
+  directory_status=$(curl --insecure --silent --output "$tmp/directory" --write-out '%{http_code}' "$base/files/originals/")
+  [ "$directory_status" != 200 ] || { echo "error: directory listing is enabled" >&2; exit 1; }
+  ! grep -qi '<title>Index of' "$tmp/directory"
+
+  expect_status 404 --path-as-is "$base/files/originals/../backups/secret.dump"
+  escaped_status=$(curl --insecure --path-as-is --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/%2e%2e/backups/secret.dump")
+  case "$escaped_status" in 400|404) ;; *) echo "error: encoded traversal returned HTTP $escaped_status" >&2; exit 1 ;; esac
+  malformed_status=$(curl --insecure --path-as-is --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/%zz")
+  [ "$malformed_status" = 400 ] || { echo "error: malformed escape returned HTTP $malformed_status" >&2; exit 1; }
+
+  compose exec -T files nginx -t
+  compose exec -T api sh -eu -c 'exiftool -ver; ffprobe -version; prlimit --version; dpkg-query --show ca-certificates curl ffmpeg libimage-exiftool-perl util-linux'
+  compose exec -T postgres postgres --version
+  compose exec -T files nginx -v
+  echo "validation environment checks passed"
+)
+
+require_tools
+case "${1:-}" in
+  up)
+    compose up --build --detach --wait
+    write_fixture
+    ;;
+  check)
+    check
+    ;;
+  verify)
+    trap 'compose down --volumes --remove-orphans' EXIT HUP INT TERM
+    compose down --volumes --remove-orphans
+    compose up --build --detach --wait
+    write_fixture
+    check
+    ;;
+  down)
+    compose down --remove-orphans
+    ;;
+  reset)
+    compose down --volumes --remove-orphans
+    ;;
+  logs)
+    compose logs --no-color
+    ;;
+  *)
+    echo "usage: scripts/validation-env {up|check|verify|down|reset|logs}" >&2
+    exit 2
+    ;;
+esac
