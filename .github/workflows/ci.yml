@@ -56,6 +56,26 @@ jobs:
           .tools/exiftool-13.36/exiftool -ver
           .tools/ffmpeg-6.0.1-amd64-static/ffprobe -version
           prlimit --version
+      - name: Build native still-image helper smoke target
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config libvips-dev libheif-dev libraw-dev \
+            libaom-dev liblcms2-dev libheif-plugin-aomenc libheif-plugin-aomdec \
+            libheif-plugin-libde265
+          curl --fail --location --silent --show-error \
+            https://registry.color.org/rgb-registry/profiles/sRGB2014.icc \
+            --output "${RUNNER_TEMP}/sRGB2014.icc"
+          printf '%s  %s\n' \
+            384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a \
+            "${RUNNER_TEMP}/sRGB2014.icc" | sha256sum --check
+          cmake -S internal/stillprocessor/helper \
+            -B "${RUNNER_TEMP}/still-helper-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build "${RUNNER_TEMP}/still-helper-build" --parallel 2
+          ctest --test-dir "${RUNNER_TEMP}/still-helper-build" --output-on-failure
+          "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
+            capabilities --protocol 1 --threads 1 \
+            --srgb-icc "${RUNNER_TEMP}/sRGB2014.icc"
       - name: Verify modules
         run: go mod verify
       - name: Check formatting

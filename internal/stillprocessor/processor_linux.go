@@ -775,7 +775,7 @@ func validResize(sourceWidth, sourceHeight, outputWidth, outputHeight, maxLongEd
 
 func validDecoder(mimeType, decoder string) bool {
 	allowed := map[string][]string{
-		"image/bmp":             {"libvips-bmp-bi-rgb-24", "libvips-bmp-bi-rgb-32"},
+		"image/bmp":             {"nmcp-bmp-bi-rgb-24", "nmcp-bmp-bi-rgb-32"},
 		"image/dng":             {"libraw-dng"},
 		"image/heic":            {"libheif-heic"},
 		"image/heif":            {"libheif-heif"},
