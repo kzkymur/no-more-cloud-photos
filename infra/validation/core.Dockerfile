@@ -18,7 +18,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       autoconf automake build-essential ca-certificates cmake curl git libtool \
       meson nasm ninja-build pkg-config xz-utils \
-      libde265-dev libexif-dev libglib2.0-dev libjpeg-turbo8-dev libpng-dev \
+      libde265-dev libexif-dev libexpat1-dev libglib2.0-dev libjpeg-turbo8-dev libpng-dev \
       libwebp-dev zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
