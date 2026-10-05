@@ -178,7 +178,7 @@ func TestNativeAnimationHelper(t *testing.T) {
 	}
 	gifOutput := createOutput(t, "single.webp")
 	if _, err := processor.Transform(context.Background(), Request{Input: gif, Output: gifOutput, MIMEType: "image/gif", Recipe: standardRecipe()}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("transform single-frame transparent GIF while preserving ANMF timing: %v", err)
 	}
 	assertReferenceWebP(t, reference, gifOutput.Name(), referenceWebP{Width: 1, Height: 1, Frames: 1, TotalPlays: 1, DurationsMS: []int{100}, TransparentPixels: []uint64{1}, AlphaSums: []uint64{0}, TimestampsMS: []int{100}})
 	staticWebP, err := os.Open(gifOutput.Name())

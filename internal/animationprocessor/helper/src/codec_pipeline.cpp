@@ -326,6 +326,16 @@ std::vector<std::uint8_t> encode_webp(const Animation &animation, int quality,
                                       std::uint64_t maximum) {
   std::unique_ptr<WebPMux, WebPMuxCloser> mux(WebPMuxNew());
   if (!mux) throw Failure("encode_failed");
+  const bool single_frame = animation.frames.size() == 1;
+  // libwebp's WebPMuxAssemble deliberately collapses a full-canvas, one-frame
+  // animation to a still image and discards its ANIM/ANMF timing. Assemble
+  // against a one-pixel-wider provisional canvas to retain those chunks, then
+  // restore the declared canvas width below. The final demux validation proves
+  // that the resulting one-frame animation is structurally valid and retains
+  // the source duration and loop count.
+  if (single_frame && WebPMuxSetCanvasSize(mux.get(), width + 1, height) != WEBP_MUX_OK) {
+    throw Failure("encode_failed");
+  }
   WebPMuxAnimParams params{.bgcolor = 0, .loop_count = animation.inspection.total_plays};
   if (WebPMuxSetAnimationParams(mux.get(), &params) != WEBP_MUX_OK) throw Failure("encode_failed");
   WebPData profile{reinterpret_cast<const std::uint8_t *>(icc.data()), icc.size()};
@@ -367,6 +377,18 @@ std::vector<std::uint8_t> encode_webp(const Animation &animation, int quality,
   }
   std::vector<std::uint8_t> result(output.bytes, output.bytes + output.size);
   WebPDataClear(&output);
+  if (single_frame) {
+    // RIFF header (12), VP8X tag+size (8), flags (4), then the 24-bit
+    // little-endian canvas width minus one. WebPMux always emits VP8X first for
+    // an animation; reject rather than patch an unexpected layout.
+    if (result.size() < 30 || std::memcmp(result.data() + 12, "VP8X", 4) != 0) {
+      throw Failure("encode_failed");
+    }
+    const auto encoded_width = static_cast<std::uint32_t>(width - 1);
+    result[24] = static_cast<std::uint8_t>(encoded_width);
+    result[25] = static_cast<std::uint8_t>(encoded_width >> 8U);
+    result[26] = static_cast<std::uint8_t>(encoded_width >> 16U);
+  }
   WebPData check_data{result.data(), result.size()};
   std::unique_ptr<WebPDemuxer, WebPDemuxCloser> check(WebPDemux(&check_data));
   if (!check || WebPDemuxGetI(check.get(), WEBP_FF_CANVAS_WIDTH) != static_cast<std::uint32_t>(width) ||
