@@ -70,7 +70,7 @@ services:
     stop_grace_period: 20s
     volumes:
       - media:/var/lib/nmcp/media
-    networks: [backend]
+    networks: [backend, api-edge]
     labels: *validation-labels
 
   worker:
@@ -138,5 +138,6 @@ networks:
     internal: true
     labels: *validation-labels
   files-edge:
-    internal: true
+    labels: *validation-labels
+  api-edge:
     labels: *validation-labels
