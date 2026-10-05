@@ -27,9 +27,13 @@ protocol v1. The helper emits one exact JSON envelope on stdout and never puts
 codec diagnostics, input paths, or library error strings in JSON. Input MIME is
 explicitly dispatched; no generic loader or MIME sniff fallback exists.
 
-Advertised inputs are JPEG, PNG, static WebP, HEIC, HEIF, BMP restricted to
-uncompressed BI_RGB 24/32-bit, and the eight RAW MIME types in the Go registry.
-WebP page count and HEIF top-level image count must both be exactly one.
+Advertised inputs are JPEG, 8/16-bit PNG, static WebP, HEIC, HEIF, BMP restricted
+to uncompressed BI_RGB 24/32-bit, and DNG. The other seven RAW MIME types in the
+Go candidate registry fail closed until exact pinned real-fixture output evidence
+exists. WebP page count must be exactly one. A HEIF still collection may contain
+multiple independent top-level images; the helper intentionally transforms only
+the explicitly designated primary image. Timed sequences are not treated as
+collections or silently converted here.
 
 Embedded RGB ICC profiles are opened by lcms2 and converted to the supplied,
 wrapper-hash-pinned sRGB profile. Invalid/non-RGB profiles fail closed. Untagged
@@ -39,6 +43,11 @@ output before the final 8-bit AVIF quantization. Orientation is applied before
 the no-crop, no-upscale resize. Alpha inputs use AVIF 4:4:4; opaque inputs use
 4:2:0. libheif is required to select its AOM encoder, with one thread, and all
 writes are bounded before reaching the caller-owned output.
+
+For 16-bit PNG, embedded ICC conversion is performed at 16-bit precision before
+fixed full-range `(sample + 128) / 257` quantization. It is never implemented as
+an unscaled ushort-to-uchar cast. The codec evidence includes a real tagged
+16-bit gradient so clipping or conversion/quantization reordering is observable.
 
 ## HDR boundary
 

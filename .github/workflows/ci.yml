@@ -109,16 +109,19 @@ jobs:
           printf '%s\n' "${capabilities}"
           CAPABILITIES="${capabilities}" python3 -c \
             'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libvips"]=="8.18.7" and v["libheif"]=="1.23.5" and v["libraw"]=="0.22.2-Release" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14", v'
-          printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_ICC_PATH=%s\nTEST_STILL_HEIC_PATH=%s\nTEST_STILL_WEBP_PATH=%s\nTEST_STILL_ORIENTATION6_PATH=%s\nTEST_STILL_RAW_PATH=%s\nTEST_STILL_PQ_PATH=%s\nTEST_STILL_HLG_PATH=%s\nTEST_STILL_ICC_NCLX_PATH=%s\nTEST_STILL_INVALID_ICC_PATH=%s\n' \
+          printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_RAW_REFERENCE_PATH=%s\nTEST_STILL_ICC_PATH=%s\nTEST_STILL_P3_ICC_PATH=%s\nTEST_STILL_HEIC_PATH=%s\nTEST_STILL_WEBP_PATH=%s\nTEST_STILL_ORIENTATION6_PATH=%s\nTEST_STILL_RAW_PATH=%s\nTEST_STILL_PQ_PATH=%s\nTEST_STILL_HLG_PATH=%s\nTEST_STILL_ICC_NCLX_PATH=%s\nTEST_STILL_INVALID_ICC_PATH=%s\nTEST_STILL_HEIF_COLLECTION_PATH=%s\n' \
             "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
-            "${RUNNER_TEMP}/sRGB2014.icc" "${heic_fixture}" \
+            "${RUNNER_TEMP}/still-helper-build/bin/nmcp-raw-reference" \
+            "${RUNNER_TEMP}/sRGB2014.icc" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/display-p3.icc" "${heic_fixture}" \
             "${RUNNER_TEMP}/static-gallery-4.webp" \
             "${RUNNER_TEMP}/orientation-6.jpg" \
             "${RUNNER_TEMP}/canon-a410.dng" \
             "${RUNNER_TEMP}/generated-heif-fixtures/pq.avif" \
             "${RUNNER_TEMP}/generated-heif-fixtures/hlg.avif" \
             "${RUNNER_TEMP}/generated-heif-fixtures/icc-nclx.avif" \
-            "${RUNNER_TEMP}/generated-heif-fixtures/invalid-icc.avif" >> "${GITHUB_ENV}"
+            "${RUNNER_TEMP}/generated-heif-fixtures/invalid-icc.avif" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/collection-primary-second.avif" >> "${GITHUB_ENV}"
           printf 'LD_LIBRARY_PATH=%s\n' \
             "${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64" >> "${GITHUB_ENV}"
       - name: Verify modules

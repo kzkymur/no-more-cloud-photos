@@ -43,5 +43,12 @@ if(NMCP_BUILD_HELPER)
     target_link_libraries(nmcp-heif-fixture-generator PRIVATE PkgConfig::HEIF PkgConfig::LCMS2)
     set_target_properties(nmcp-heif-fixture-generator PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    add_executable(nmcp-raw-reference tests/raw_reference.cpp)
+    target_compile_features(nmcp-raw-reference PRIVATE cxx_std_20)
+    target_compile_options(nmcp-raw-reference PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    target_link_libraries(nmcp-raw-reference PRIVATE PkgConfig::LIBRAW PkgConfig::VIPS)
+    set_target_properties(nmcp-raw-reference PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   endif()
 endif()

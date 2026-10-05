@@ -130,6 +130,23 @@ void apply_icc(Raster &raster, std::span<const std::byte> source, std::span<cons
   cmsDeleteTransform(transform);
 }
 
+void apply_icc_16(std::span<std::uint16_t> rgba, std::span<const std::byte> source,
+                  std::span<const std::byte> target, std::size_t pixels) {
+  ProfilePtr source_profile(cmsOpenProfileFromMem(source.data(), static_cast<cmsUInt32Number>(source.size())), cmsCloseProfile);
+  ProfilePtr target_profile(cmsOpenProfileFromMem(target.data(), static_cast<cmsUInt32Number>(target.size())), cmsCloseProfile);
+  if (!source_profile || !target_profile || cmsGetColorSpace(source_profile.get()) != cmsSigRgbData ||
+      cmsGetColorSpace(target_profile.get()) != cmsSigRgbData || rgba.size() != pixels * 4U ||
+      pixels > std::numeric_limits<cmsUInt32Number>::max()) {
+    throw Failure("decode_failed");
+  }
+  cmsHTRANSFORM transform = cmsCreateTransform(source_profile.get(), TYPE_RGBA_16, target_profile.get(), TYPE_RGBA_16,
+                                                INTENT_RELATIVE_COLORIMETRIC,
+                                                cmsFLAGS_COPY_ALPHA | cmsFLAGS_BLACKPOINTCOMPENSATION);
+  if (transform == nullptr) throw Failure("processing_failed");
+  cmsDoTransform(transform, rgba.data(), rgba.data(), static_cast<cmsUInt32Number>(pixels));
+  cmsDeleteTransform(transform);
+}
+
 VipsPtr autorotate(VipsPtr input) {
   VipsImage *rotated = nullptr;
   if (vips_autorot(input.get(), &rotated, nullptr) != 0) throw Failure("decode_failed");
@@ -139,29 +156,54 @@ VipsPtr autorotate(VipsPtr input) {
 Raster raster_from_vips(VipsPtr image, std::string decoder, std::span<const std::byte> target_icc) {
   auto source_icc = embedded_icc(image.get());
   image = autorotate(std::move(image));
+  const auto source_format = vips_image_get_format(image.get());
+  if (source_format != VIPS_FORMAT_UCHAR && source_format != VIPS_FORMAT_USHORT) throw Failure("unsupported_input");
   VipsImage *colour = nullptr;
-  if (vips_colourspace(image.get(), &colour, VIPS_INTERPRETATION_sRGB, nullptr) != 0) throw Failure("decode_failed");
+  const auto interpretation = source_format == VIPS_FORMAT_USHORT ? VIPS_INTERPRETATION_RGB16 : VIPS_INTERPRETATION_sRGB;
+  if (vips_colourspace(image.get(), &colour, interpretation, nullptr) != 0) throw Failure("decode_failed");
   VipsPtr normalized(colour, g_object_unref);
-  VipsImage *cast = nullptr;
-  if (vips_cast(normalized.get(), &cast, VIPS_FORMAT_UCHAR, nullptr) != 0) throw Failure("decode_failed");
-  VipsPtr bytes(cast, g_object_unref);
-  const int bands = vips_image_get_bands(bytes.get());
+  const auto format = vips_image_get_format(normalized.get());
+  if (format != VIPS_FORMAT_UCHAR && format != VIPS_FORMAT_USHORT) throw Failure("unsupported_input");
+  const int bands = vips_image_get_bands(normalized.get());
   if (bands != 3 && bands != 4) throw Failure("decode_failed");
   size_t memory_size = 0;
-  void *memory = vips_image_write_to_memory(bytes.get(), &memory_size);
-  if (memory == nullptr || memory_size != checked_size(bytes->Xsize, bytes->Ysize, bands)) {
+  void *memory = vips_image_write_to_memory(normalized.get(), &memory_size);
+  const int bytes_per_sample = format == VIPS_FORMAT_USHORT ? 2 : 1;
+  if (memory == nullptr || memory_size != checked_size(normalized->Xsize, normalized->Ysize, bands, bytes_per_sample)) {
     g_free(memory);
     throw Failure("decode_failed");
   }
   std::unique_ptr<void, decltype(&g_free)> owned(memory, g_free);
-  Raster raster{.width = bytes->Xsize, .height = bytes->Ysize, .alpha = bands == 4};
+  Raster raster{.width = normalized->Xsize, .height = normalized->Ysize, .alpha = bands == 4};
   raster.rgba.resize(checked_size(raster.width, raster.height, 4));
-  const auto *pixels = static_cast<const std::uint8_t *>(memory);
-  for (std::size_t input = 0, output = 0; input < memory_size; input += static_cast<std::size_t>(bands), output += 4) {
-    raster.rgba[output] = pixels[input];
-    raster.rgba[output + 1] = pixels[input + 1];
-    raster.rgba[output + 2] = pixels[input + 2];
-    raster.rgba[output + 3] = bands == 4 ? pixels[input + 3] : 255;
+  const auto pixel_count = checked_size(raster.width, raster.height, 1);
+  if (format == VIPS_FORMAT_USHORT) {
+    const auto *pixels = static_cast<const std::uint16_t *>(memory);
+    std::vector<std::uint16_t> rgba16(checked_size(raster.width, raster.height, 4));
+    for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+      const auto input = pixel * static_cast<std::size_t>(bands);
+      const auto output = pixel * 4U;
+      rgba16[output] = pixels[input];
+      rgba16[output + 1] = pixels[input + 1];
+      rgba16[output + 2] = pixels[input + 2];
+      rgba16[output + 3] = bands == 4 ? pixels[input + 3] : 65535U;
+    }
+    // Color conversion must precede the irreversible 16-to-8-bit quantization.
+    if (!source_icc.empty()) apply_icc_16(rgba16, source_icc, target_icc, pixel_count);
+    for (std::size_t sample = 0; sample < rgba16.size(); ++sample) {
+      raster.rgba[sample] = static_cast<std::uint8_t>((static_cast<unsigned>(rgba16[sample]) + 128U) / 257U);
+    }
+  } else {
+    const auto *pixels = static_cast<const std::uint8_t *>(memory);
+    for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+      const auto input = pixel * static_cast<std::size_t>(bands);
+      const auto output = pixel * 4U;
+      raster.rgba[output] = pixels[input];
+      raster.rgba[output + 1] = pixels[input + 1];
+      raster.rgba[output + 2] = pixels[input + 2];
+      raster.rgba[output + 3] = bands == 4 ? pixels[input + 3] : 255;
+    }
+    if (!source_icc.empty()) apply_icc(raster, source_icc, target_icc);
   }
   raster.audit = {.decoder = std::move(decoder),
                    .input_color = source_icc.empty() ? "assumed-srgb" : "embedded-icc",
@@ -170,7 +212,6 @@ Raster raster_from_vips(VipsPtr image, std::string decoder, std::span<const std:
                    .alpha = raster.alpha ? "preserved" : "opaque",
                   .chroma = raster.alpha ? "4:4:4" : "4:2:0",
                   .source_width = raster.width, .source_height = raster.height};
-  if (!source_icc.empty()) apply_icc(raster, source_icc, target_icc);
   return raster;
 }
 
@@ -256,9 +297,9 @@ Raster decode_bmp(const TransformArgs &args) {
 }
 
 bool raw_mime(std::string_view mime) {
-  static constexpr std::array<std::string_view, 8> values = {"image/dng", "image/x-canon-cr2", "image/x-canon-cr3",
-      "image/x-fuji-raf", "image/x-nikon-nef", "image/x-olympus-orf", "image/x-panasonic-rw2", "image/x-sony-arw"};
-  return std::find(values.begin(), values.end(), mime) != values.end();
+  // Capability claims are evidence-backed. Other registry RAW types remain
+  // candidates but are rejected until an exact pinned real fixture proves them.
+  return mime == "image/dng";
 }
 
 std::string raw_decoder(std::string_view mime) {
@@ -598,7 +639,7 @@ std::map<std::string, std::string> library_versions() {
 std::vector<std::string> decoder_mime_types() {
   std::vector<std::string> result;
   result.emplace_back("image/bmp");
-  // LibRaw's linked decoder set owns the same eight-format closed dispatch.
+  // Only DNG has exact-fixture output evidence in this release.
   result.emplace_back("image/dng");
   const heif_decoder_descriptor *hevc[1]{};
   const heif_decoder_descriptor *av1[1]{};
@@ -609,8 +650,6 @@ std::vector<std::string> decoder_mime_types() {
   if (vips_type_find("VipsOperation", "jpegload") != 0) result.emplace_back("image/jpeg");
   if (vips_type_find("VipsOperation", "pngload") != 0) result.emplace_back("image/png");
   if (vips_type_find("VipsOperation", "webpload") != 0) result.emplace_back("image/webp");
-  result.insert(result.end(), {"image/x-canon-cr2", "image/x-canon-cr3", "image/x-fuji-raf", "image/x-nikon-nef",
-                               "image/x-olympus-orf", "image/x-panasonic-rw2", "image/x-sony-arw"});
   std::sort(result.begin(), result.end());
   return result;
 }
