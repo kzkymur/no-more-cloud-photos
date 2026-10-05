@@ -3,8 +3,9 @@
 # apt/OCI closure is owned by issue #20.
 
 libaom 3.8.2 (annotated tag commit 615b5f541e4434aebd993036bc97ebc1a77ebc25)
-url https://aomedia.googlesource.com/aom/+archive/615b5f541e4434aebd993036bc97ebc1a77ebc25.tar.gz
-sha256 d17dfcf2b2caf23a0fcbdcaf3253f7cbcc2c9206389e9a96bf96f831d28269bc
+git https://aomedia.googlesource.com/aom
+commit 615b5f541e4434aebd993036bc97ebc1a77ebc25
+git-archive-tar-sha256 eb0bfa625cd17849be2e17ffd38bf8e1dc67b7c7787e7152250a4075d05f245f
 license BSD-2-Clause
 
 lcms2 2.14

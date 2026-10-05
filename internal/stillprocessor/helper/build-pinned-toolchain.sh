@@ -19,9 +19,6 @@ download() {
   printf '%s  %s\n' "$digest" "$target" | sha256sum --check
 }
 
-download aom-3.8.2.tar.gz \
-  https://aomedia.googlesource.com/aom/+archive/615b5f541e4434aebd993036bc97ebc1a77ebc25.tar.gz \
-  d17dfcf2b2caf23a0fcbdcaf3253f7cbcc2c9206389e9a96bf96f831d28269bc
 download lcms2-2.14.tar.gz \
   https://github.com/mm2/Little-CMS/releases/download/lcms2.14/lcms2-2.14.tar.gz \
   28474ea6f6591c4d4cee972123587001a4e6e353412a41b3e9e82219818d5740
@@ -38,7 +35,13 @@ download vips-8.18.7.tar.xz \
 rm -rf "$work/source/aom" "$work/source/lcms2-2.14" "$work/source/LibRaw-0.22.2" \
   "$work/source/libheif-1.23.5" "$work/source/vips-8.18.7"
 mkdir -p "$work/source/aom"
-tar -xzf "$work/downloads/aom-3.8.2.tar.gz" -C "$work/source/aom"
+git -C "$work/source/aom" init --quiet
+git -C "$work/source/aom" remote add origin https://aomedia.googlesource.com/aom
+git -C "$work/source/aom" fetch --quiet --depth=1 origin 615b5f541e4434aebd993036bc97ebc1a77ebc25
+git -C "$work/source/aom" checkout --quiet --detach FETCH_HEAD
+test "$(git -C "$work/source/aom" rev-parse HEAD)" = 615b5f541e4434aebd993036bc97ebc1a77ebc25
+test "$(git -C "$work/source/aom" archive --format=tar HEAD | sha256sum | cut -d' ' -f1)" = \
+  eb0bfa625cd17849be2e17ffd38bf8e1dc67b7c7787e7152250a4075d05f245f
 tar -xzf "$work/downloads/lcms2-2.14.tar.gz" -C "$work/source"
 tar -xzf "$work/downloads/LibRaw-0.22.2.tar.gz" -C "$work/source"
 tar -xzf "$work/downloads/libheif-1.23.5.tar.gz" -C "$work/source"
