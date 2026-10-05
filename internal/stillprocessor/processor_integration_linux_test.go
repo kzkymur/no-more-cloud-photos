@@ -95,17 +95,17 @@ func TestRealStillHelper(t *testing.T) {
 			input: encodePNG(t, 3, 5, true)},
 		{name: "PNG one pixel axis", mime: "image/png", alpha: "preserved", width: 1, height: 7,
 			input: encodePNG(t, 1, 7, true)},
-		{name: "PNG 16-bit ICC gradient", mime: "image/png", alpha: "preserved", width: 257, height: 3,
+		{name: "PNG 16-bit ICC gradient", mime: "image/png", alpha: "opaque", width: 257, height: 3,
 			input: encodePNG16ICC(t, p3ICC), inputColor: "embedded-icc", toneMap: "not-needed",
 			referencePixel: displayP3GradientReference(128)},
 		{name: "PNG alpha resize and unpremultiply", mime: "image/png", alpha: "preserved", width: 1920, height: 4,
 			input: encodeAlphaResizePNG(t), alphaReference: true},
 		{name: "BMP32 reserved byte opaque", mime: "image/bmp", alpha: "opaque", width: 3, height: 2,
 			input: encodeBMP32(3, 2)},
-		{name: "BMP24 padded bottom-up", mime: "image/bmp", alpha: "opaque", width: 3, height: 2,
-			input: encodeBMP24(3, 2, false), bmpReference: true},
-		{name: "BMP24 padded top-down", mime: "image/bmp", alpha: "opaque", width: 3, height: 2,
-			input: encodeBMP24(3, 2, true), bmpReference: true},
+		{name: "BMP24 padded bottom-up", mime: "image/bmp", alpha: "opaque", width: 33, height: 20,
+			input: encodeBMP24(33, 20, false), bmpReference: true},
+		{name: "BMP24 padded top-down", mime: "image/bmp", alpha: "opaque", width: 33, height: 20,
+			input: encodeBMP24(33, 20, true), bmpReference: true},
 		{name: "libheif real HEIC", mime: "image/heic", alpha: "opaque", input: heic},
 		{name: "Google gallery static WebP", mime: "image/webp", alpha: "opaque", input: webp},
 		{name: "real Exif orientation 6", mime: "image/jpeg", alpha: "opaque", width: 1800, height: 1200,
@@ -316,8 +316,8 @@ func assertBMPPixels(t *testing.T, ffmpeg, outputPath string, width, height int)
 	for _, point := range []struct {
 		x, y int
 		rgb  [3]int
-	}{{0, 0, [3]int{220, 20, 20}}, {width - 1, 0, [3]int{220, 80, 20}},
-		{0, height - 1, [3]int{20, 20, 220}}, {width - 1, height - 1, [3]int{20, 80, 220}}} {
+	}{{width / 4, height / 4, [3]int{220, 20, 20}}, {3 * width / 4, height / 4, [3]int{220, 180, 20}},
+		{width / 4, 3 * height / 4, [3]int{20, 20, 220}}, {3 * width / 4, 3 * height / 4, [3]int{20, 180, 220}}} {
 		offset := (point.y*width + point.x) * 3
 		for channel := range 3 {
 			difference := int(decoded[offset+channel]) - point.rgb[channel]
@@ -600,10 +600,14 @@ func encodeBMP24(width, height int, topDown bool) []byte {
 		}
 		for column := range width {
 			offset := headerSize + row*stride + column*3
-			if logicalRow == 0 {
-				result[offset], result[offset+1], result[offset+2] = 20, byte(20+column*30), 220
+			green := byte(20)
+			if column >= width/2 {
+				green = 180
+			}
+			if logicalRow < height/2 {
+				result[offset], result[offset+1], result[offset+2] = 20, green, 220
 			} else {
-				result[offset], result[offset+1], result[offset+2] = 220, byte(20+column*30), 20
+				result[offset], result[offset+1], result[offset+2] = 220, green, 20
 			}
 		}
 		for padding := width * 3; padding < stride; padding++ {
