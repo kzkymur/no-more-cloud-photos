@@ -634,6 +634,39 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `UPDATE jobs SET status='queued', finished_at=NULL WHERE id=$1`, lifecycleJobID)
 		expectExecError(t, pool, `DELETE FROM jobs WHERE id=$1`, lifecycleJobID)
 
+		budgetJobID := newUUIDv4(t)
+		budgetMediaID := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',1)`, budgetJobID, budgetMediaID); err != nil {
+			t.Fatalf("insert attempt-budget job: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running', attempts=1, lease_token=$2, lease_expires_at=now()+interval '1 minute', started_at=now() WHERE id=$1`, budgetJobID, newUUIDv4(t)); err != nil {
+			t.Fatalf("claim attempt-budget job: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE jobs SET status='queued', lease_token=NULL, lease_expires_at=NULL, available_at=now() WHERE id=$1`, budgetJobID)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='failed', lease_token=NULL, lease_expires_at=NULL, finished_at=now(), error_code='attempt_failed', error_message='sanitized' WHERE id=$1`, budgetJobID); err != nil {
+			t.Fatalf("fail exhausted job: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE jobs SET status='queued', finished_at=NULL, error_code=NULL, error_message=NULL, available_at=now() WHERE id=$1`, budgetJobID)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='queued', max_attempts=GREATEST(max_attempts,attempts+3), finished_at=NULL, error_code=NULL, error_message=NULL, available_at=now() WHERE id=$1`, budgetJobID); err != nil {
+			t.Fatalf("admin retry with ceiling increase: %v", err)
+		}
+		var budgetStatus string
+		var budgetAttempts, budgetMax int
+		var budgetClaimable bool
+		if err := pool.QueryRow(ctx, `SELECT status,attempts,max_attempts,available_at<=clock_timestamp() FROM jobs WHERE id=$1`, budgetJobID).Scan(&budgetStatus, &budgetAttempts, &budgetMax, &budgetClaimable); err != nil {
+			t.Fatalf("read attempt-budget job: %v", err)
+		}
+		if budgetStatus != "queued" || budgetAttempts != 1 || budgetMax != 4 || !budgetClaimable {
+			t.Fatalf("retry state = %s attempts=%d max=%d claimable=%v", budgetStatus, budgetAttempts, budgetMax, budgetClaimable)
+		}
+		var expiredLeaseIndex string
+		if err := pool.QueryRow(ctx, `SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indexrelid='jobs_expired_lease_idx'::regclass`).Scan(&expiredLeaseIndex); err != nil {
+			t.Fatalf("read expired lease index: %v", err)
+		}
+		if !strings.Contains(expiredLeaseIndex, "lease_expires_at") || !strings.Contains(expiredLeaseIndex, "WHERE (status = 'running'::text)") {
+			t.Fatalf("expired lease index definition = %q", expiredLeaseIndex)
+		}
+
 		jobID := newUUIDv4(t)
 		targetID := newUUIDv4(t)
 		renditionID := newUUIDv4(t)

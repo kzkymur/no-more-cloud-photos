@@ -81,6 +81,8 @@ jobs:
         run: go test -race -count=1 ./...
       - name: Explicit PostgreSQL migration integration evidence
         run: go test -v -count=1 -run '^TestMigratorIntegration$' ./internal/database
+      - name: Explicit job lease, Worker, and process supervision evidence
+        run: go test -v -count=1 ./internal/job ./internal/worker ./internal/processrunner
       - name: Explicit upload PostgreSQL integration evidence
         run: go test -v -count=1 -run '^TestRepositoryIntegration' ./internal/upload
       - name: Explicit read PostgreSQL integration evidence

@@ -37,6 +37,7 @@ go vet ./...
 go test ./...
 go test -race ./...
 TEST_DATABASE_URL='postgres://...' go test -v -count=1 -run '^TestMigratorIntegration$' ./internal/database
+TEST_DATABASE_URL='postgres://...' go test -v -count=1 ./internal/job ./internal/worker ./internal/processrunner
 TEST_DATABASE_URL='postgres://...' go test -v -count=1 -run '^TestReadServiceIntegration$' ./internal/readapi
 TEST_DATABASE_URL='postgres://...' go test -v -count=1 -run '^TestReadHTTPPostgreSQLIntegration$' ./internal/httpapi
 ```
@@ -126,8 +127,50 @@ every owner must finish `Publish` or call `Abort`. API draining and Worker
 shutdown complete owned operations before closing the Store.
 
 API and Worker handle SIGINT/SIGTERM. The API stops intake and drains HTTP
-requests within the configured timeout; the Worker stops accepting future work
-(the job loop is added in issue #10) and closes its database pool.
+requests within the configured timeout. The Worker stops claiming, cancels and
+reaps the active process tree, and uses an independent bounded 10 second
+database context to requeue only a still-live lease with `worker_shutdown`
+before closing dependencies. A lost or exactly expired token never writes an
+error or state.
+
+## Job lease and process boundary
+
+`internal/job` claims only registered transform work in a short PostgreSQL
+transaction using `FOR UPDATE SKIP LOCKED`, database-clock availability, a new
+UUIDv4 token, a two-minute lease, and an incremented attempt. Tool execution
+holds no database transaction. Heartbeats run every 30 seconds and every state
+mutation compares Job ID, running state, token, and an expiry strictly greater
+than `clock_timestamp()`; equality is expired. Reclaim processes at most 50
+expired rows per transaction and records only the fixed safe `lease_expired`
+summary. Recoverable failures use full jitter over an exponential five-second
+base capped at 15 minutes. An exhausted row becomes failed, and the database
+constraint prohibits `queued` when `attempts >= max_attempts`.
+
+Ordinary retry keeps successful targets terminal and requeues only failed
+targets. Failed-job administrative retry preserves attempts and successful
+targets, atomically raises the ceiling by a positive additional budget, makes
+the row immediately claimable, and records both successful and rejected
+concurrent commands in immutable audit history. Error messages stored on Jobs
+are fixed summaries; child stderr, paths, DSNs, and secrets are never stored.
+
+Generic #10 claim deliberately rejects purge. Purge first start must lock Media,
+recheck deletion/cancellation, and atomically set `started_at` with its lease;
+issue #16 adds that operation with the restore lock order. Until #11-#14 register
+a capability-checked transform executor and atomic publication path, the
+production Worker has an empty executor registry: it may reclaim expired leases
+but cannot claim or silently no-op-complete a job.
+
+`internal/processrunner` is the shared Linux containment layer for metadata and
+Worker tools. It accepts only a clean absolute executable plus an argument
+array, replaces the environment, applies the inherited address-space limit,
+and caps stdout/stderr independently. A short-lived `/proc/self/exe` subreaper
+kills the initial process group and adopted `setsid`/double-fork descendants,
+then reaps to `ECHILD` on success, timeout, cancellation, or output overflow.
+The initial Worker contract exposes one required processor thread and safety
+timeout ceilings of 30 minutes for still/RAW, two hours for animation, and 24
+hours for video. Registered processors must translate the thread value into
+their tool-specific trusted argument array and may only shorten the family
+ceiling. Exact recipes and runtime capability checks remain #11-#13 work.
 
 ## Profile recipe boundary
 
