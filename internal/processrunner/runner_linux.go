@@ -21,10 +21,11 @@ import (
 )
 
 var (
-	ErrInvalid     = errors.New("invalid process runner input")
-	ErrTimeout     = errors.New("process timed out")
-	ErrOutputLimit = errors.New("process output limit exceeded")
-	ErrFailed      = errors.New("process failed")
+	ErrInvalid       = errors.New("invalid process runner input")
+	ErrTimeout       = errors.New("process timed out")
+	ErrOutputLimit   = errors.New("process output limit exceeded")
+	ErrFileSizeLimit = errors.New("process file size limit exceeded")
+	ErrFailed        = errors.New("process failed")
 )
 
 const (
@@ -35,6 +36,7 @@ const (
 type Limits struct {
 	Timeout              time.Duration
 	AddressSpaceBytes    uint64
+	FileSizeBytes        uint64
 	OutputBytesPerStream int64
 }
 
@@ -83,6 +85,7 @@ func (r *Runner) Run(ctx context.Context, command Command) (Output, error) {
 		supervisorArgument,
 		r.prlimit,
 		strconv.FormatUint(r.limits.AddressSpaceBytes, 10),
+		strconv.FormatUint(r.limits.FileSizeBytes, 10),
 		strconv.Itoa(len(command.Files)),
 		command.Executable,
 	}
@@ -138,6 +141,10 @@ func (r *Runner) Run(ctx context.Context, command Command) (Output, error) {
 		return Output{}, ErrOutputLimit
 	}
 	if waitErr != nil {
+		var exitError *exec.ExitError
+		if errors.As(waitErr, &exitError) && exitError.ExitCode() == supervisorFileSizeExitCode {
+			return Output{}, ErrFileSizeLimit
+		}
 		return Output{}, fmt.Errorf("%w: non-zero exit", ErrFailed)
 	}
 	return Output{Stdout: stdout.bytes(), Stderr: stderr.bytes()}, nil

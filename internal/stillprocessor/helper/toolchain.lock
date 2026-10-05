@@ -1,0 +1,34 @@
+# Direct source inputs verified for the production build. The Ubuntu packages
+# used by the CI compile smoke are not the production pin; the transitive
+# apt/OCI closure is owned by issue #20.
+
+libaom 3.8.2 (annotated tag commit 615b5f541e4434aebd993036bc97ebc1a77ebc25)
+git https://aomedia.googlesource.com/aom
+commit 615b5f541e4434aebd993036bc97ebc1a77ebc25
+git-archive-tar-sha256 eb0bfa625cd17849be2e17ffd38bf8e1dc67b7c7787e7152250a4075d05f245f
+license BSD-2-Clause
+
+lcms2 2.14
+url https://github.com/mm2/Little-CMS/releases/download/lcms2.14/lcms2-2.14.tar.gz
+sha256 28474ea6f6591c4d4cee972123587001a4e6e353412a41b3e9e82219818d5740
+license MIT
+
+libvips 8.18.7
+url https://github.com/libvips/libvips/releases/download/v8.18.7/vips-8.18.7.tar.xz
+sha256 5baaead3b0bb20ffdb9e9ff09aa9fda08620923df77b63b436654cb5e0b3bf94
+license LGPL-2.1-or-later
+
+libheif 1.23.5
+url https://github.com/strukturag/libheif/releases/download/v1.23.5/libheif-1.23.5.tar.gz
+sha256 fd9036064c4432f0550d15072ddf34956a248279ee9aeaff0fba3fa0f77d8f1a
+license LGPL-3.0-or-later
+
+LibRaw 0.22.2
+url https://www.libraw.org/data/LibRaw-0.22.2.tar.gz
+sha256 de86b035655accff8d4010f1a221fdf50d353cb7b1422ba26f14a0db92612cfa
+license LGPL-2.1-only OR CDDL-1.0
+
+sRGB2014.icc 2015-02 revision
+url https://registry.color.org/rgb-registry/profiles/sRGB2014.icc
+sha256 384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
+license ICC-profile-terms (redistribution permitted unchanged with copyright notice)

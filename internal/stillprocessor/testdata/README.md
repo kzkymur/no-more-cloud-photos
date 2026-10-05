@@ -1,0 +1,58 @@
+# Still processor fixture provenance
+
+Real external codec fixtures are downloaded or extracted in CI, verified before
+use, and never substituted by MIME detection alone. Generated raster fixtures
+are separate and are not evidence for camera or third-party codec coverage.
+
+## External fixtures
+
+| Evidence | Source | SHA-256 | License / attribution | Proven envelope |
+| --- | --- | --- | --- | --- |
+| HEIC | `examples/example.heic` from the verified libheif 1.23.5 source archive, https://github.com/strukturag/libheif/releases/download/v1.23.5/libheif-1.23.5.tar.gz | `7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2` | libheif project example, LGPL-3.0-or-later; source archive and notices retained by the pinned build | one primary HEIC accepted by libheif, transformed to decodable AV1 AVIF; not proof of every HEIC/HEIF variant |
+| static WebP | https://www.gstatic.com/webp/gallery/4.webp | `0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9` | “A Wild Cherry (Prunus avium) in flower”, Benjamin Gimmel, CC BY-SA 3.0; Google WebP Gallery credits: https://developers.google.com/speed/webp/gallery1 | static lossy WebP decoded by the exact libvips/libwebp build and transformed to decodable AV1 AVIF; animation remains issue #12 |
+| Exif orientation 6 JPEG | https://raw.githubusercontent.com/recurser/exif-orientation-examples/219294e144531b0c01247913cb58b6f5531b5081/Landscape_6.jpg | `9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124` | MIT, Ian Arellano / `recurser/exif-orientation-examples`, commit `219294e144531b0c01247913cb58b6f5531b5081` | orientation is applied to pixels before resize: 1200x1800 stored pixels become 1800x1200, with independently rotated JPEG reference pixels compared to decoded AVIF within per-channel tolerance 60 |
+| Canon PowerShot A410 DNG | https://raw.pixls.us/data/Canon/Canon%20PowerShot%20A410/CANON_A410_CHDK_CRW_0741.DNG | `f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38` | CC0 public-domain dedication declared by raw.pixls.us contributors; repository: https://raw.pixls.us/ | real camera RAW decoded by pinned LibRaw with camera WB, camera matrix, 16-bit processing, and auto-bright disabled; decoded AVIF grid pixels are compared with a separately compiled reference path spelling out those settings, so removing a production setting fails evidence. This proves DNG only; CR2/CR3/RAF/NEF/ORF/RW2/ARW are not advertised. |
+
+## Project-generated raster fixtures
+
+`processor_integration_linux_test.go` generates odd-sized JPEG, alpha PNG,
+1-pixel-axis PNG, an ICC-tagged 16-bit PNG gradient, and BI_RGB BMP bytes from
+project-owned test patterns. The 16-bit reference pixels prove full-range
+scaling and ICC-before-quantization. A 2000-pixel alpha pattern is independently
+decoded as RGBA after resize to prove alpha 4:4:4 and the premultiply/resize/
+unpremultiply path. BMP evidence covers 32-bit reserved-byte opacity plus
+24-bit padded bottom-up and top-down rows; truncated and overflow-dimension
+inputs fail closed. These prove real decoder/encoder behavior and boundary
+geometry, but not external-file provenance or camera support.
+
+`nmcp-heif-fixture-generator` is project-owned test code linked to the same
+pinned libheif and AOM build as the helper. It produces deterministic 32x32
+AVIF-container HEIF fixtures for:
+
+- BT.2020/PQ code value 512/1023, whose independently calculated BT.2446A
+  reference output is sRGB `(127,127,127)`;
+- BT.2020/HLG code value 512/1023, whose independently calculated BT.2100 OOTF
+  plus BT.2446A reference output is sRGB `(100,100,100)`;
+- project-generated Display P3 ICC plus Display P3 NCLX `(200,100,50)`, whose
+  independent matrix reference is sRGB `(215,93,31)`, proving NCLX passthrough
+  followed by exactly one ICC normalization rather than two gamut conversions;
+- deliberately malformed embedded ICC bytes, which must fail closed as a
+  decode error rather than being ignored.
+- a two-item top-level HEIF collection whose second, green image is explicitly
+  designated primary; decoded output pixels prove intentional primary selection.
+
+The AVIF output is decoded independently with pinned FFmpeg and compared at a
+center reference pixel with per-channel tolerance 24 to allow the required
+quality-60 output encoding. These generated files prove controlled color-path
+behavior, not provenance of a camera HDR capture.
+
+## Failure and resource evidence
+
+The native integration test truncates the hash-verified real DNG to 512 bytes
+and requires a stable decode failure. Unit tests separately prove a bounded
+process timeout, cancellation, stderr overflow, generated-file size limit,
+4 GiB address-space ceiling configuration, and secret/path redaction. The real
+A410 RAW exceeds the 1920 standard edge and proves bounded downscale without
+upscale or crop. A generated 1000x777 JPEG separately proves the 640-edge,
+quality-50 thumbnail path and odd rounded height 497. Physical exhaustion of
+the full 4 GiB ceiling is intentionally not performed in CI.

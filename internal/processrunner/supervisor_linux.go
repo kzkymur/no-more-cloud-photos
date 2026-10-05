@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	supervisorArgument     = "__nmcp_internal_process_supervisor_v1"
-	supervisorCleanupLimit = time.Second
+	supervisorArgument         = "__nmcp_internal_process_supervisor_v1"
+	supervisorCleanupLimit     = time.Second
+	supervisorFileSizeExitCode = 122
 )
 
 // The re-executed Core binary is a dedicated, short-lived subreaper. The
@@ -30,12 +31,16 @@ func init() {
 }
 
 func runSupervisor(arguments []string) int {
-	if len(arguments) < 4 {
+	if len(arguments) < 5 {
 		return 125
 	}
-	prlimitPath, addressLimit, fileCountText, executable := arguments[0], arguments[1], arguments[2], arguments[3]
+	prlimitPath, addressLimit, fileSizeLimit, fileCountText, executable := arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]
 	fileCount, err := strconv.Atoi(fileCountText)
 	if err != nil || fileCount < 0 || fileCount > maxExtraFiles || !filepath.IsAbs(prlimitPath) || !filepath.IsAbs(executable) {
+		return 125
+	}
+	fileSizeBytes, err := strconv.ParseUint(fileSizeLimit, 10, 64)
+	if err != nil {
 		return 125
 	}
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
@@ -56,7 +61,12 @@ func runSupervisor(arguments []string) int {
 		files = append(files, file)
 	}
 
-	toolArguments := append([]string{"--as=" + addressLimit, "--", executable}, arguments[4:]...)
+	toolArguments := []string{"--as=" + addressLimit}
+	if fileSizeBytes > 0 {
+		toolArguments = append(toolArguments, "--fsize="+fileSizeLimit)
+	}
+	toolArguments = append(toolArguments, "--", executable)
+	toolArguments = append(toolArguments, arguments[5:]...)
 	command := exec.Command(prlimitPath, toolArguments...)
 	command.Env = []string{"LC_ALL=C", "LANG=C", "TZ=UTC"}
 	command.ExtraFiles = files
@@ -88,6 +98,13 @@ func runSupervisor(arguments []string) int {
 		return 125
 	}
 	if waitErr != nil {
+		var exitError *exec.ExitError
+		if errors.As(waitErr, &exitError) {
+			if status, ok := exitError.Sys().(syscall.WaitStatus); ok &&
+				(status.Signal() == syscall.SIGXFSZ || status.ExitStatus() == 128+int(syscall.SIGXFSZ)) {
+				return supervisorFileSizeExitCode
+			}
+		}
 		return 1
 	}
 	return 0

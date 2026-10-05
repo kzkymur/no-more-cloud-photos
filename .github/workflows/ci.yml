@@ -11,7 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
@@ -56,6 +56,75 @@ jobs:
           .tools/exiftool-13.36/exiftool -ver
           .tools/ffmpeg-6.0.1-amd64-static/ffprobe -version
           prlimit --version
+      - name: Build native still-image helper smoke target
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake cmake libtool make meson nasm ninja-build pkg-config \
+            libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev \
+            libde265-dev zlib1g-dev
+          curl --fail --location --silent --show-error \
+            https://registry.color.org/rgb-registry/profiles/sRGB2014.icc \
+            --output "${RUNNER_TEMP}/sRGB2014.icc"
+          printf '%s  %s\n' \
+            384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a \
+            "${RUNNER_TEMP}/sRGB2014.icc" | sha256sum --check
+          curl --fail --location --silent --show-error \
+            https://www.gstatic.com/webp/gallery/4.webp \
+            --output "${RUNNER_TEMP}/static-gallery-4.webp"
+          printf '%s  %s\n' \
+            0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9 \
+            "${RUNNER_TEMP}/static-gallery-4.webp" | sha256sum --check
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/recurser/exif-orientation-examples/219294e144531b0c01247913cb58b6f5531b5081/Landscape_6.jpg \
+            --output "${RUNNER_TEMP}/orientation-6.jpg"
+          printf '%s  %s\n' \
+            9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124 \
+            "${RUNNER_TEMP}/orientation-6.jpg" | sha256sum --check
+          curl --fail --location --silent --show-error \
+            'https://raw.pixls.us/data/Canon/Canon%20PowerShot%20A410/CANON_A410_CHDK_CRW_0741.DNG' \
+            --output "${RUNNER_TEMP}/canon-a410.dng"
+          printf '%s  %s\n' \
+            f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38 \
+            "${RUNNER_TEMP}/canon-a410.dng" | sha256sum --check
+          chmod +x internal/stillprocessor/helper/build-pinned-toolchain.sh
+          internal/stillprocessor/helper/build-pinned-toolchain.sh \
+            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/still-toolchain-work"
+          heic_fixture="${RUNNER_TEMP}/still-toolchain-work/source/libheif-1.23.5/examples/example.heic"
+          printf '%s  %s\n' \
+            7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2 \
+            "${heic_fixture}" | sha256sum --check
+          export PKG_CONFIG_PATH="${RUNNER_TEMP}/still-toolchain/lib/pkgconfig:${RUNNER_TEMP}/still-toolchain/lib64/pkgconfig"
+          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
+          cmake -S internal/stillprocessor/helper \
+            -B "${RUNNER_TEMP}/still-helper-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/still-toolchain"
+          cmake --build "${RUNNER_TEMP}/still-helper-build" --parallel 2
+          ctest --test-dir "${RUNNER_TEMP}/still-helper-build" --output-on-failure
+          "${RUNNER_TEMP}/still-helper-build/bin/nmcp-heif-fixture-generator" \
+            "${RUNNER_TEMP}/generated-heif-fixtures" "${RUNNER_TEMP}/sRGB2014.icc"
+          capabilities=$("${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
+            capabilities --protocol 1 --threads 1 \
+            --srgb-icc "${RUNNER_TEMP}/sRGB2014.icc")
+          printf '%s\n' "${capabilities}"
+          CAPABILITIES="${capabilities}" python3 -c \
+            'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libvips"]=="8.18.7" and v["libheif"]=="1.23.5" and v["libraw"]=="0.22.2-Release" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14", v'
+          printf 'TEST_STILL_HELPER_PATH=%s\nTEST_STILL_RAW_REFERENCE_PATH=%s\nTEST_STILL_AVIF_REFERENCE_PATH=%s\nTEST_STILL_ICC_PATH=%s\nTEST_STILL_P3_ICC_PATH=%s\nTEST_STILL_HEIC_PATH=%s\nTEST_STILL_WEBP_PATH=%s\nTEST_STILL_ORIENTATION6_PATH=%s\nTEST_STILL_RAW_PATH=%s\nTEST_STILL_PQ_PATH=%s\nTEST_STILL_HLG_PATH=%s\nTEST_STILL_ICC_NCLX_PATH=%s\nTEST_STILL_INVALID_ICC_PATH=%s\nTEST_STILL_HEIF_COLLECTION_PATH=%s\n' \
+            "${RUNNER_TEMP}/still-helper-build/bin/nmcp-still-helper" \
+            "${RUNNER_TEMP}/still-helper-build/bin/nmcp-raw-reference" \
+            "${RUNNER_TEMP}/still-helper-build/bin/nmcp-avif-reference" \
+            "${RUNNER_TEMP}/sRGB2014.icc" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/display-p3.icc" "${heic_fixture}" \
+            "${RUNNER_TEMP}/static-gallery-4.webp" \
+            "${RUNNER_TEMP}/orientation-6.jpg" \
+            "${RUNNER_TEMP}/canon-a410.dng" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/pq.avif" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/hlg.avif" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/icc-nclx.avif" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/invalid-icc.avif" \
+            "${RUNNER_TEMP}/generated-heif-fixtures/collection-primary-second.avif" >> "${GITHUB_ENV}"
+          printf 'LD_LIBRARY_PATH=%s\n' \
+            "${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64" >> "${GITHUB_ENV}"
       - name: Verify modules
         run: go mod verify
       - name: Check formatting
@@ -75,6 +144,12 @@ jobs:
           TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
           TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
         run: go test -v -count=1 ./internal/mediaformat ./internal/metadata
+      - name: Explicit native still codec evidence
+        env:
+          TEST_STILL_HELPER: "1"
+          TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
+          TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
+        run: go test -v -count=1 ./internal/stillprocessor
       - name: Explicit Linux storage durability evidence
         run: go test -v -count=1 ./internal/storage
       - name: Race tests
