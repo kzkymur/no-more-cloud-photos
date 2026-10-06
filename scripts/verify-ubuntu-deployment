@@ -86,6 +86,13 @@ def main() -> int:
         "ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration" in migrate_unit,
         "systemd migration bypasses the deployment serializer",
     )
+    require("RemainAfterExit=yes" in migrate_unit, "successful migration is not retained for dependent starts")
+    for dependent in ("nmcp-api.service", "nmcp-worker.service"):
+        dependent_text = text(units / dependent)
+        require(
+            "Requires=nmcp-migrate.service" in dependent_text and "After=nmcp-migrate.service" in dependent_text,
+            f"{dependent} lost its production migration dependency edge",
+        )
     require(
         "f /run/lock/nmcp-deploy.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
         "shared migration lock ownership/mode is missing",

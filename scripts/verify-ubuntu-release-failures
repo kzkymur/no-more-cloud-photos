@@ -3,7 +3,7 @@ set -euo pipefail
 [[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-release-failures: must run as root\n' >&2; exit 1; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 work=$(/usr/bin/mktemp -d /var/tmp/nmcp-release-failures.XXXXXX)
-units=(nmcp-api.service nmcp-worker.service nmcp-files.service nmcp-migrate.service nmcp.target postgresql@nmcp-test.service)
+units=(nmcp-api.service nmcp-worker.service nmcp-files.service nmcp-migrate.service nmcp.target nmcp.slice postgresql@nmcp-test.service)
 cleanup() {
   /usr/bin/systemctl stop "${units[@]}" >/dev/null 2>&1 || true
   for unit in "${units[@]}"; do /usr/bin/rm -f -- "/run/systemd/system/$unit"; done
@@ -17,9 +17,12 @@ for path in /opt/nmcp /etc/nmcp /var/lib/nmcp/deployment /usr/local/libexec/nmcp
 done
 /usr/bin/install -d -o root -g root -m 0755 /opt/nmcp/releases /usr/local/libexec/nmcp
 /usr/bin/install -d -o root -g root -m 0700 /etc/nmcp /var/lib/nmcp/deployment
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 /var/lib/nmcp/media
 /usr/bin/install -o root -g root -m 0600 /dev/null /run/lock/nmcp-deploy.lock
 /usr/bin/printf 'postgresql@nmcp-test.service\n' > /etc/nmcp/postgresql-unit
 /usr/bin/printf 'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable\nNMCP_LOG_LEVEL=info\nNMCP_SHUTDOWN_TIMEOUT=30s\n' > /etc/nmcp/admin.env
+/usr/bin/cp /etc/nmcp/admin.env /etc/nmcp/api.env
+/usr/bin/cp /etc/nmcp/admin.env /etc/nmcp/worker.env
 /usr/bin/chmod 0600 /etc/nmcp/*
 /usr/bin/install -m 0755 "$repo/scripts/run-ubuntu-migration" /usr/local/libexec/nmcp/run-ubuntu-migration
 cat > /usr/local/libexec/nmcp/check-ubuntu-services <<EOF
@@ -29,12 +32,22 @@ exit 1
 EOF
 /usr/bin/chmod 0755 /usr/local/libexec/nmcp/check-ubuntu-services
 make_release() {
-  local root=/opt/nmcp/releases/$1
+  local id=$1 root=/opt/nmcp/releases/$1
   /usr/bin/install -d -o root -g root -m 0755 "$root/bin"
   for binary in core-api core-worker nmcp-admin; do
     /usr/bin/printf '#!/bin/sh\nexit 0\n' > "$root/bin/$binary"
     /usr/bin/chmod 0755 "$root/bin/$binary"
   done
+  for binary in core-api core-worker; do
+    /usr/bin/printf '#!/bin/sh\nexec /usr/bin/sleep infinity\n' > "$root/bin/$binary"
+    /usr/bin/chmod 0755 "$root/bin/$binary"
+  done
+  cat > "$root/bin/nmcp-admin" <<EOF
+#!/bin/sh
+if test "\${1:-}" = migrate && test "\${2:-}" = up; then printf '%s\n' '$id' >> '$work/migrations'; fi
+exit 0
+EOF
+  /usr/bin/chmod 0755 "$root/bin/nmcp-admin"
   (cd "$root" && /usr/bin/sha256sum bin/* > MANIFEST.sha256)
   /usr/bin/chmod 0644 "$root/MANIFEST.sha256"
 }
@@ -49,11 +62,16 @@ make_release candidate
 cat > /run/systemd/system/nmcp-migrate.service <<EOF
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 User=root
 EnvironmentFile=/etc/nmcp/admin.env
 ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration
 EOF
-for unit in nmcp-api.service nmcp-worker.service nmcp-files.service postgresql@nmcp-test.service; do
+/usr/bin/install -o root -g root -m 0644 "$repo/infra/ubuntu/systemd/nmcp.slice" /run/systemd/system/nmcp.slice
+for unit in nmcp-api.service nmcp-worker.service; do
+  /usr/bin/install -o root -g root -m 0644 "$repo/infra/ubuntu/systemd/$unit" "/run/systemd/system/$unit"
+done
+for unit in nmcp-files.service postgresql@nmcp-test.service; do
   cat > "/run/systemd/system/$unit" <<'EOF'
 [Service]
 ExecStart=/usr/bin/sleep infinity
@@ -81,6 +99,7 @@ fi
 if "$repo/scripts/install-ubuntu-release" activate startfail; then
   printf 'service startup failure unexpectedly activated release\n' >&2; exit 1
 fi
+[[ $(/usr/bin/wc -l < "$work/migrations") -eq 1 ]]
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   ! /usr/bin/systemctl is-active --quiet "$unit" || { printf 'partial startup remained live: %s\n' "$unit" >&2; exit 1; }
 done
@@ -95,6 +114,7 @@ EOF
 if "$repo/scripts/install-ubuntu-release" activate candidate; then
   printf 'failed readiness gate unexpectedly activated release\n' >&2; exit 1
 fi
+[[ $(/usr/bin/wc -l < "$work/migrations") -eq 2 ]]
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   ! /usr/bin/systemctl is-active --quiet "$unit" || { printf 'partial service remained live: %s\n' "$unit" >&2; exit 1; }
 done
@@ -106,6 +126,7 @@ done
 if "$repo/scripts/install-ubuntu-release" rollback old; then
   printf 'failed rollback gate unexpectedly succeeded\n' >&2; exit 1
 fi
+[[ $(/usr/bin/wc -l < "$work/migrations") -eq 4 ]]
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/candidate ]]
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   /usr/bin/systemctl is-active --quiet "$unit" || { printf 'prior live service state was not restored: %s\n' "$unit" >&2; exit 1; }

@@ -67,6 +67,19 @@ for unit in nmcp-check-api.service nmcp-check.target postgresql@nmcp-check.servi
 done
 cat > /run/systemd/system/nmcp-check-worker.service <<'EOF'
 [Service]
+Type=notify
+ExecStart=/usr/bin/sleep 30
+TimeoutStartSec=30
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl stop nmcp-check-worker.service
+/usr/bin/systemctl start --no-block nmcp-check-worker.service
+if "${check[@]}" >/dev/null 2>&1; then
+  printf 'activating Worker incorrectly passed whole-service gate\n' >&2; exit 1
+fi
+/usr/bin/systemctl stop nmcp-check-worker.service
+cat > /run/systemd/system/nmcp-check-worker.service <<'EOF'
+[Service]
 Type=oneshot
 ExecStart=/usr/bin/false
 EOF

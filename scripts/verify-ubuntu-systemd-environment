@@ -28,12 +28,12 @@ EOF
   --tailnet-hostname host.example.ts.net --files-listen 100.64.0.10:9443
 /usr/bin/systemd-run --quiet --wait --collect --unit=nmcp-env-parser-test \
   --property="EnvironmentFile=$work/api.env" \
-  /usr/bin/python3 -c 'import os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text("\n".join(f"{k}={os.environ[k]}" for k in sorted(os.environ) if k.startswith("NMCP_"))+"\n")' \
+  /usr/bin/python3 -c 'import json,os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({k:v for k,v in os.environ.items() if k.startswith("NMCP_")},sort_keys=True))' \
   "$work/effective"
 /usr/bin/python3 - "$work/api.env" "$work/effective" <<'PY'
-import pathlib, sys
-expected = sorted(pathlib.Path(sys.argv[1]).read_text().splitlines())
-actual = pathlib.Path(sys.argv[2]).read_text().splitlines()
+import json, pathlib, sys
+expected = dict(line.split("=", 1) for line in pathlib.Path(sys.argv[1]).read_text().split("\n") if line)
+actual = json.loads(pathlib.Path(sys.argv[2]).read_text())
 if expected != actual:
     raise SystemExit(f"systemd EnvironmentFile values differ: {expected!r} != {actual!r}")
 PY

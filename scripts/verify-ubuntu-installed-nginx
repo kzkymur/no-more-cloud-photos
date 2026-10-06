@@ -21,7 +21,8 @@ cleanup() {
   /usr/sbin/update-ca-certificates >/dev/null 2>&1 || true
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
   /usr/bin/rm -rf -- /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp \
-    /usr/local/libexec/nmcp "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" "$work"
+    /usr/local/libexec/nmcp "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" \
+    "/root/nmcp-tls-renew-persistent.$$" "$work"
 }
 trap cleanup EXIT
 
@@ -135,6 +136,15 @@ if ! /usr/bin/systemctl start nmcp-api.service nmcp-files.service; then
 fi
 /usr/bin/systemctl is-active --quiet nmcp-files.service
 
+# Host asset installation must fail before mutation when the credential-bearing
+# File Server is live; reinstall otherwise creates disk/served TLS divergence.
+if "$repo_root/scripts/install-ubuntu-host" --config-dir /nonexistent \
+  --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
+  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@none.service \
+  --tls-cert /nonexistent/cert.pem --tls-key /nonexistent/key.pem >/dev/null 2>&1; then
+  printf 'live host reinstall was accepted\n' >&2; exit 1
+fi
+
 base=https://$test_ip:$files_port
 trusted_base=https://host.example.ts.net:$files_port
 fingerprint() {
@@ -194,6 +204,17 @@ if /usr/local/libexec/nmcp/renew-ubuntu-tls \
 fi
 [[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
 
+# Model SIGKILL after publishing a new symlink but before restart. The durable
+# expiry check must detect that disk and the active LoadCredential snapshot differ.
+/usr/bin/ln -s -- "$old_tls" /etc/nmcp/tls-current.interrupted
+/usr/bin/mv -Tf -- /etc/nmcp/tls-current.interrupted /etc/nmcp/tls-current
+if /usr/local/libexec/nmcp/check-ubuntu-tls-expiry >/dev/null 2>&1; then
+  printf 'interrupted TLS publication was not detected\n' >&2; exit 1
+fi
+/usr/bin/ln -s -- "$new_tls" /etc/nmcp/tls-current.interrupted
+/usr/bin/mv -Tf -- /etc/nmcp/tls-current.interrupted /etc/nmcp/tls-current
+/usr/local/libexec/nmcp/check-ubuntu-tls-expiry >/dev/null
+
 # A failed candidate restart must restore both the prior generation and the
 # certificate actually served by the recovery restart.
 failure_input=/root/nmcp-tls-renew-failure.$$
@@ -215,4 +236,27 @@ fi
 /usr/bin/systemctl is-active --quiet nmcp-files.service
 [[ $(fingerprint) == "$new_fingerprint" ]]
 /usr/bin/rm -rf -- "$failure_input"
+
+# If both candidate and recovery restarts fail, renewal must retain the previous
+# disk link but explicitly report failure without claiming service restoration.
+persistent_input=/root/nmcp-tls-renew-persistent.$$
+/usr/bin/install -d -o root -g root -m 0700 "$persistent_input"
+issue_certificate "$persistent_input" 4
+/usr/bin/chown root:root "$persistent_input"/*.pem
+/usr/bin/chmod 0600 "$persistent_input"/*.pem
+cat > /run/systemd/system/nmcp-files.service.d/99-fail-once.conf <<'EOF'
+[Service]
+ExecStartPre=/usr/bin/false
+EOF
+/usr/bin/systemctl daemon-reload
+if /usr/local/libexec/nmcp/renew-ubuntu-tls "$persistent_input/cert.pem" "$persistent_input/key.pem"; then
+  printf 'persistent Nginx restart failure was accepted\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
+! /usr/bin/systemctl is-active --quiet nmcp-files.service
+/usr/bin/rm -f /run/systemd/system/nmcp-files.service.d/99-fail-once.conf
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl restart nmcp-files.service
+[[ $(fingerprint) == "$new_fingerprint" ]]
+/usr/bin/rm -rf -- "$persistent_input"
 printf 'Installed-path nmcp Nginx service and full HTTP matrix passed\n'

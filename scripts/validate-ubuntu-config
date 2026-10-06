@@ -30,7 +30,11 @@ def fail(message: str) -> None:
 
 def parse_env(path: pathlib.Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    contents = path.read_bytes()
+    if any(byte < 0x20 and byte != 0x0A for byte in contents) or 0x7F in contents:
+        fail(f"{path.name}: control characters outside LF are forbidden")
+    text = contents.decode("utf-8")
+    for number, raw in enumerate(text.split("\n"), 1):
         if not raw or raw.startswith("#"):
             continue
         match = ASSIGNMENT.fullmatch(raw)
@@ -86,6 +90,8 @@ def main() -> int:
     if len(database_urls) != 1:
         fail("all processes must use the same NMCP_DATABASE_URL")
     database_text = next(iter(database_urls))
+    if database_text.count("@") != 1:
+        fail("NMCP_DATABASE_URL must contain exactly one authority delimiter")
     database = urllib.parse.urlsplit(database_text)
     try:
         database_port = database.port
@@ -97,6 +103,7 @@ def main() -> int:
     if (
         database.scheme not in ("postgres", "postgresql")
         or database.hostname not in ("127.0.0.1", "::1")
+        or "," in database.netloc
         or "%" in (database.hostname or "")
         or database_port != 5432
         or database.path != "/nmcp"

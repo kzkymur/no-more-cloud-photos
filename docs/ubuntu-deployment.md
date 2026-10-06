@@ -84,6 +84,8 @@ as a DSN option, and rejects query routing overrides, fragments, wildcard API
 binds, or a mismatched files-root URL. Environment values use a deliberately
 literal subset: quotes, backslashes, and whitespace are rejected so validation
 and systemd `EnvironmentFile=` cannot interpret different effective values.
+Only LF is accepted as a physical line delimiter; all other control characters
+are rejected. PostgreSQL authority permits exactly one raw `@` and no host list.
 
 Render Nginx only with real Tailnet values:
 
@@ -120,7 +122,10 @@ All stage/activate/rollback/host/TLS mutations and every direct or
 dependency-triggered `nmcp-migrate.service` execution share one deployment lock.
 The installer retains the lock across link, migration, service-state, and
 evidence mutations and delegates only its exact active-release migration to the
-systemd singleton. Staging requires an exact manifest and fixed runtime-safe modes,
+systemd singleton. Delegation is bound to the live kernel lock owner PID/start
+identity, consumed atomically, and invalid after owner death or PID reuse.
+Successful oneshot migration remains active so production API/Worker dependency
+starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.
 Activation stops the target, moves the active symlink atomically, starts the
 concrete PostgreSQL dependency and migration, and records success only after API
@@ -184,7 +189,7 @@ machine: a local request is not evidence of a non-Tailnet denial.
 ## TLS renewal and expiry
 
 `nmcp-tls-expiry.timer` checks daily and fails if the active certificate is not
-currently valid (with at most five minutes of clock skew), lacks a DNS SAN or a
+currently valid, lacks a DNS SAN or a
 trusted server chain for the recorded hostname, or expires within seven days; monitor failed
 units/journal through the host's normal alerting. Obtain a new Tailnet
 certificate/key using the approved mechanism into trusted root-only paths, then:
@@ -198,7 +203,11 @@ Renewal validates current validity, SAN/hostname, trusted chain, key pair,
 ownership/path, and seven-day lifetime; writes
 one immutable generation; atomically switches `tls-current`; and **restarts**
 Nginx so systemd `LoadCredential` is refreshed. If restart fails, it restores
-the previous generation and attempts to restart it. A config reload alone does
+the previous generation and attempts to restart it; failure of that recovery
+restart is reported without claiming availability. The expiry check also compares
+the active systemd credential snapshot fingerprint with `tls-current`, detecting
+an interrupted publish-before-restart window. Host reinstall refuses while the
+File Server is active. A config reload alone does
 not refresh systemd credentials. Retain the prior generation until verification
 and remove old generations only in a separately reviewed housekeeping step.
 

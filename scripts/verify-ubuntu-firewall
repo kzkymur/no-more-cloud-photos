@@ -55,11 +55,8 @@ def main() -> int:
         # and one protocol. Profiles, ranges, service names, and all-port rules
         # are not provably disjoint from the protected listeners.
         positional = re.fullmatch(r"ufw allow (\d+)/(tcp|udp)", line, re.IGNORECASE)
-        explicit = re.search(r"\bport (\d+) proto (tcp|udp)$", line, re.IGNORECASE)
         if positional:
             port = int(positional.group(1))
-        elif explicit and ":" not in line and "," not in line:
-            port = int(explicit.group(1))
         else:
             raise ValueError(f"unbounded or unparseable UFW allow rule: {line}")
         if port in protected:

@@ -22,8 +22,8 @@ PY
 not_before=$(/usr/bin/openssl x509 -in "$work/leaf.pem" -noout -startdate | /usr/bin/cut -d= -f2-)
 not_before_epoch=$(/usr/bin/date --date="$not_before" +%s)
 now=$(/usr/bin/date +%s)
-((not_before_epoch <= now + 300)) || {
-  printf 'TLS certificate is not yet valid (beyond five-minute clock skew)\n' >&2
+((not_before_epoch <= now)) || {
+  printf 'TLS certificate is not yet valid\n' >&2
   exit 1
 }
 /usr/bin/openssl x509 -in "$work/leaf.pem" -noout -checkend 604800 >/dev/null || {

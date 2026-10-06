@@ -7,4 +7,14 @@ hostname_file=/etc/nmcp/tailnet-hostname
 hostname=$(<"$hostname_file")
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 "$script_dir/verify-ubuntu-tls-certificate" "$cert" "$hostname"
+if /usr/bin/systemctl is-active --quiet nmcp-files.service; then
+  served=/run/credentials/nmcp-files.service/tls-cert.pem
+  [[ -r $served ]] || { printf 'active NMCP File Server credential snapshot is unreadable\n' >&2; exit 1; }
+  disk_fingerprint=$(/usr/bin/openssl x509 -in "$cert" -noout -fingerprint -sha256)
+  served_fingerprint=$(/usr/bin/openssl x509 -in "$served" -noout -fingerprint -sha256)
+  [[ $disk_fingerprint == "$served_fingerprint" ]] || {
+    printf 'active NMCP File Server serves a stale TLS credential generation\n' >&2
+    exit 1
+  }
+fi
 printf 'NMCP TLS certificate covers %s and is valid beyond seven days\n' "$hostname"

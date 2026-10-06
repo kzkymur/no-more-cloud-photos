@@ -6,6 +6,7 @@ Before=nmcp-api.service nmcp-worker.service
 
 [Service]
 Type=oneshot
+RemainAfterExit=yes
 User=root
 Group=root
 Slice=nmcp.slice

@@ -41,8 +41,12 @@ old_target=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
 if ! /usr/bin/systemctl restart nmcp-files.service || ! /usr/bin/systemctl is-active --quiet nmcp-files.service; then
   /usr/bin/ln -s -- "$old_target" "$temporary_link"
   /usr/bin/mv -Tf -- "$temporary_link" /etc/nmcp/tls-current
-  /usr/bin/systemctl restart nmcp-files.service || true
-  printf 'renew-ubuntu-tls: Nginx restart failed; previous TLS generation restored\n' >&2
+  if ! /usr/bin/systemctl restart nmcp-files.service \
+    || ! /usr/bin/systemctl is-active --quiet nmcp-files.service; then
+    printf 'renew-ubuntu-tls: previous TLS link restored, but Nginx recovery restart failed\n' >&2
+    exit 1
+  fi
+  printf 'renew-ubuntu-tls: candidate restart failed; previous TLS generation restored and restarted\n' >&2
   exit 1
 fi
 "$script_dir/check-ubuntu-tls-expiry"

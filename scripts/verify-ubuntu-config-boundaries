@@ -53,6 +53,7 @@ for unsafe_url in \
   'postgres://nmcp:secret@127.0.0.1:5432/nmcp?host=203.0.113.10' \
   'postgres://nmcp:secret@127.0.0.1:5432/nmcp?hostaddr=203.0.113.10' \
   'postgres://nmcp:secret@127.0.0.1:5432/nmcp?service=remote' \
+  'postgres://nmcp:secret@203.0.113.10,@127.0.0.1:5432/nmcp?sslmode=disable' \
   'postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable#remote'; do
   write_valid
   /usr/bin/python3 - "$work" "$unsafe_url" <<'PY'
@@ -77,4 +78,11 @@ import pathlib, sys
 path = pathlib.Path(sys.argv[1]); path.write_text(path.read_text().replace("NMCP_LOG_LEVEL=info", "NMCP_LOG_LEVEL=in\\fo"))
 PY
 if "${validate[@]}" >/dev/null 2>&1; then printf 'backslash environment syntax was accepted\n' >&2; exit 1; fi
+
+write_valid
+/usr/bin/python3 - "$work/api.env" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1]); path.write_bytes(path.read_bytes().replace(b"NMCP_LOG_LEVEL=info", b"NMCP_LOG_LEVEL=info\v#hidden"))
+PY
+if "${validate[@]}" >/dev/null 2>&1; then printf 'vertical-tab environment syntax was accepted\n' >&2; exit 1; fi
 printf 'Ubuntu environment boundary counterexamples passed\n'

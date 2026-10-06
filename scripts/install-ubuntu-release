@@ -23,11 +23,10 @@ release_root=/opt/nmcp/releases
 release_path=$release_root/$release_id
 current=/opt/nmcp/current
 evidence=/var/lib/nmcp/deployment
-exec 9>/run/lock/nmcp-deploy.lock
-/usr/bin/flock --exclusive --nonblock 9 || {
-  printf 'install-ubuntu-release: another NMCP deployment operation is active\n' >&2
-  exit 1
-}
+if [[ ${NMCP_DEPLOY_LOCKED:-} != 1 ]]; then
+  exec /usr/bin/flock --exclusive --nonblock /run/lock/nmcp-deploy.lock \
+    /usr/bin/env NMCP_DEPLOY_LOCKED=1 "$0" "$@"
+fi
 
 verify_release() {
   local directory=$1
@@ -138,7 +137,15 @@ stop_services() {
 run_migration() {
   local token=/run/nmcp-migrate-delegation temporary
   temporary=$token.new.$$
-  /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
+  local owner_start
+  owner_start=$(/usr/bin/python3 - "$PPID" <<'PY'
+import pathlib, sys
+text = pathlib.Path(f"/proc/{sys.argv[1]}/stat").read_text()
+print(text.rsplit(") ", 1)[1].split()[19])
+PY
+)
+  /usr/bin/printf '%s\t%s\t%s\n' \
+    "$(/usr/bin/readlink -f -- "$current")" "$PPID" "$owner_start" > "$temporary"
   /usr/bin/chown root:root "$temporary"
   /usr/bin/chmod 0600 "$temporary"
   /usr/bin/mv -f -- "$temporary" "$token"
