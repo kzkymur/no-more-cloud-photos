@@ -189,7 +189,7 @@ done
 /usr/bin/grep -q 'active=candidate.*attempted=old.*state=rollback-activation-failed' \
   /var/lib/nmcp/deployment/active-release
 
-# The non-forking installer owns the primary lock itself. Kill it only after
+# The installer owns the primary lock on its own FD. Kill it only after
 # the transient child has received the same execution-lease open description.
 cat > /opt/nmcp/releases/ownerdeath/bin/nmcp-admin <<EOF
 #!/bin/sh

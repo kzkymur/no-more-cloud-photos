@@ -24,22 +24,11 @@ release_root=/opt/nmcp/releases
 release_path=$release_root/$release_id
 current=/opt/nmcp/current
 evidence=/var/lib/nmcp/deployment
-if [[ ${NMCP_DEPLOY_LOCKED:-} != 1 ]]; then
-  exec /usr/bin/flock --exclusive --nonblock --no-fork /run/lock/nmcp-deploy.lock \
-    /usr/bin/env NMCP_DEPLOY_LOCKED=1 "$0" "$@"
-fi
-/usr/bin/python3 - /run/lock/nmcp-deploy.lock "$$" <<'PY'
-import os, pathlib, sys
-lock, owner = sys.argv[1:]
-st = os.stat(lock)
-key = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):x}:{st.st_ino}"
-if not any(
-    len(fields := line.split()) >= 6 and fields[1] == "FLOCK"
-    and fields[4] == owner and fields[5] == key
-    for line in pathlib.Path("/proc/locks").read_text().splitlines()
-):
-    raise SystemExit("install-ubuntu-release: caller does not own the deployment lock")
-PY
+exec 9>/run/lock/nmcp-deploy.lock
+/usr/bin/flock --exclusive --nonblock 9 || {
+  printf 'install-ubuntu-release: another NMCP deployment operation is active\n' >&2
+  exit 1
+}
 exec 8>/run/lock/nmcp-migration-execution.lock
 /usr/bin/flock --exclusive --nonblock 8 || {
   printf 'install-ubuntu-release: an orphaned migration execution is still active\n' >&2
@@ -160,7 +149,7 @@ run_admin() {
   handoff=/run/nmcp-migration-handoff.$$.$admin_sequence
   unit=nmcp-deploy-admin-$$-$admin_sequence
   /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock send "$handoff" \
-    /run/lock/nmcp-migration-execution.lock 8 &
+    /run/lock/nmcp-migration-execution.lock 8 9>&- &
   broker=$!
   for attempt in {1..100}; do
     [[ -S $handoff ]] && break
@@ -186,7 +175,8 @@ run_admin() {
     -- /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock receive "$handoff" \
     /run/lock/nmcp-migration-execution.lock \
     /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
-    "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json || status=$?
+    "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json \
+    8>&- 9>&- || status=$?
   if ((status != 0)); then /usr/bin/kill "$broker" 2>/dev/null || true; fi
   if ! wait "$broker"; then status=1; fi
   /usr/bin/rm -f -- "$handoff"

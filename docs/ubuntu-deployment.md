@@ -125,7 +125,7 @@ are refused before any asset changes.
 
 All stage/activate/rollback/host/TLS mutations and every direct or
 dependency-triggered `nmcp-migrate.service` execution share the deployment
-serializer. The non-forking installer process itself retains the primary lock
+serializer. The installer process itself opens and retains the primary lock FD
 across link, exact-release migration,
 service-state, and evidence mutations. It then publishes root-only completion
 evidence; the systemd singleton consumes that evidence without doing database
