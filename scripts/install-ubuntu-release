@@ -39,6 +39,12 @@ if not any(
 ):
     raise SystemExit("install-ubuntu-release: caller does not own the deployment lock")
 PY
+exec 8>/run/lock/nmcp-migration-execution.lock
+/usr/bin/flock --exclusive --nonblock 8 || {
+  printf 'install-ubuntu-release: an orphaned migration execution is still active\n' >&2
+  exit 1
+}
+/usr/bin/flock --unlock 8
 
 verify_release() {
   local directory=$1
@@ -151,11 +157,13 @@ run_migration() {
   migration_release=$(/usr/bin/readlink -f -- "$current")
   temporary=$token.new.$$
   /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="nmcp-deploy-migrate-$$" \
-    --uid=nmcp --gid=nmcp --property=Slice=nmcp.slice \
+    --property=Slice=nmcp.slice \
     --property=EnvironmentFile=/etc/nmcp/admin.env \
     --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
     --property=ProtectSystem=strict --property=ProtectHome=yes \
-    -- "$migration_release/bin/nmcp-admin" migrate up --json || return 1
+    -- /usr/bin/flock --exclusive /run/lock/nmcp-migration-execution.lock \
+    /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+    "$migration_release/bin/nmcp-admin" migrate up --json || return 1
   /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
   /usr/bin/chown root:root "$temporary"
   /usr/bin/chmod 0600 "$temporary"

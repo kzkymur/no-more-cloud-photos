@@ -97,6 +97,10 @@ def main() -> int:
         "f /run/lock/nmcp-deploy.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
         "shared migration lock ownership/mode is missing",
     )
+    require(
+        "f /run/lock/nmcp-migration-execution.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "owner-death migration execution lease is missing",
+    )
     require("User=root" in migrate_unit, "migration serializer must own the root-only lock")
     require(
         "setpriv --reuid=nmcp --regid=nmcp" in text(ROOT / "scripts" / "run-ubuntu-migration"),

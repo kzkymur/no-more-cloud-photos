@@ -148,6 +148,19 @@ jobs:
             exit 1
           fi
           chmod 0755 /tmp/nmcp-release/bin/core-api
+          sudo systemd-run --quiet --unit=nmcp-orphan-migration \
+            /usr/bin/flock /run/lock/nmcp-migration-execution.lock \
+            /bin/sh -c 'touch /tmp/nmcp-orphan-migration-held; sleep 3'
+          for attempt in {1..30}; do
+            test -e /tmp/nmcp-orphan-migration-held && break
+            test "$attempt" -lt 30 || exit 1
+            sleep 0.1
+          done
+          if sudo scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID-orphan-migration"; then
+            echo 'new deployment overlapped an ownerless migration execution' >&2
+            exit 1
+          fi
+          sudo systemctl wait nmcp-orphan-migration.service
           sudo flock /run/lock/nmcp-deploy.lock -c 'touch /tmp/nmcp-deploy-lock-held; sleep 3' &
           lock_pid=$!
           for attempt in {1..30}; do
@@ -177,8 +190,9 @@ jobs:
           sudo rm -rf -- "/opt/nmcp/releases/$RELEASE_ID" \
             "/opt/nmcp/releases/$RELEASE_ID-bad-mode" \
             "/opt/nmcp/releases/$RELEASE_ID-locked" \
+            "/opt/nmcp/releases/$RELEASE_ID-orphan-migration" \
             "/opt/nmcp/releases/$RELEASE_ID-spoofed" /tmp/nmcp-release
-          sudo rm -f /tmp/nmcp-deploy-lock-held
+          sudo rm -f /tmp/nmcp-deploy-lock-held /tmp/nmcp-orphan-migration-held
 
       - name: Remove test Tailnet address
         if: always()

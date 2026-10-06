@@ -47,6 +47,12 @@ exec 9>/run/lock/nmcp-deploy.lock
   printf 'install-ubuntu-host: another NMCP deployment operation is active\n' >&2
   exit 1
 }
+exec 8>/run/lock/nmcp-migration-execution.lock
+/usr/bin/flock --exclusive --nonblock 8 || {
+  printf 'install-ubuntu-host: an orphaned migration execution is still active\n' >&2
+  exit 1
+}
+/usr/bin/flock --unlock 8
 read -r files_load files_active files_sub < <(
   /usr/bin/systemctl show nmcp-files.service \
     --property=LoadState --property=ActiveState --property=SubState --value \

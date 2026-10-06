@@ -130,7 +130,10 @@ service-state, and evidence mutations. It then publishes root-only completion
 evidence; the systemd singleton consumes that evidence without doing database
 work while the installer owns the lock. Ordinary direct/dependency-triggered
 migrations acquire and retain the lock themselves and snapshot the exact release
-path before execution. Successful oneshot migration remains active so production
+path before execution. A separate root-only execution lease is held by the
+transient migration itself, so owner death releases the primary lock but still
+blocks every new host/release/TLS mutation until the exact binary exits.
+Successful oneshot migration remains active so production
 API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.
 Activation stops the target, moves the active symlink atomically, starts the
