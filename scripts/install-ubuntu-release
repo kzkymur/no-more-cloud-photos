@@ -136,7 +136,8 @@ stop_services() {
 }
 
 run_migration() {
-  local token=/run/nmcp-migrate-delegation temporary=$token.new.$$
+  local token=/run/nmcp-migrate-delegation temporary
+  temporary=$token.new.$$
   /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
   /usr/bin/chown root:root "$temporary"
   /usr/bin/chmod 0644 "$temporary"

@@ -28,7 +28,8 @@ EOF
   --tailnet-hostname host.example.ts.net --files-listen 100.64.0.10:9443
 /usr/bin/systemd-run --quiet --wait --collect --unit=nmcp-env-parser-test \
   --property="EnvironmentFile=$work/api.env" \
-  /usr/bin/python3 -c 'import os,pathlib; pathlib.Path("'$work'/effective").write_text("\n".join(f"{k}={os.environ[k]}" for k in sorted(os.environ) if k.startswith("NMCP_"))+"\n")'
+  /usr/bin/python3 -c 'import os,pathlib,sys; pathlib.Path(sys.argv[1]).write_text("\n".join(f"{k}={os.environ[k]}" for k in sorted(os.environ) if k.startswith("NMCP_"))+"\n")' \
+  "$work/effective"
 /usr/bin/python3 - "$work/api.env" "$work/effective" <<'PY'
 import pathlib, sys
 expected = sorted(pathlib.Path(sys.argv[1]).read_text().splitlines())
