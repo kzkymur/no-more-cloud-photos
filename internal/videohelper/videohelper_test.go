@@ -175,6 +175,10 @@ func TestCapabilitiesRequirePinnedSiblingFeatures(t *testing.T) {
 	runner := &fakeRunner{runs: [][]byte{
 		[]byte("ffprobe version 9.0.2"),
 		[]byte("ffmpeg version 9.0.2"),
+		[]byte("--disable-autodetect --disable-network --disable-gpl --disable-nonfree --enable-libsvtav1 --enable-libzimg --enable-libaom"),
+		[]byte(" h264 hevc aac av1"),
+		[]byte(" mov,"),
+		[]byte(" mp4 avif"),
 		[]byte("libsvtav1 libaom-av1 aac"),
 		[]byte("zscale tonemap"),
 	}}
@@ -189,6 +193,10 @@ func TestCapabilitiesRequirePinnedSiblingFeatures(t *testing.T) {
 	runner.runs = [][]byte{
 		[]byte("ffprobe version 9.0.2"),
 		[]byte("ffmpeg version 9.0.2"),
+		[]byte("--disable-autodetect --disable-network --disable-gpl --disable-nonfree --enable-libsvtav1 --enable-libzimg --enable-libaom"),
+		[]byte(" h264 hevc aac av1"),
+		[]byte(" mov,"),
+		[]byte(" mp4 avif"),
 		[]byte("libaom-av1 aac"),
 		[]byte("zscale tonemap"),
 	}

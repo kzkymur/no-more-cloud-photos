@@ -5,9 +5,10 @@ package videohelper
 import "time"
 
 const (
-	protocolVersion = 1
-	helperVersion   = "nmcp-video-helper/1"
-	buildManifest   = "ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1"
+	protocolVersion   = 1
+	helperVersion     = "nmcp-video-helper/1"
+	buildManifest     = "ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1"
+	toolchainManifest = "ffmpeg=9.0.2\nffmpeg_sha256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e\nsvt_av1=4.2.0\nsvt_av1_sha256=c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740\nzimg=3.0.6\nzimg_sha256=be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577\nlibaom=v3.8.2\nconfigure=shared,no-autodetect,no-network,no-gpl,no-nonfree,libsvtav1,libzimg,libaom\n"
 
 	maxStreams       = 32
 	maxDimension     = 16_384
@@ -56,6 +57,8 @@ type inspection struct {
 	ColorRange              string   `json:"color_range"`
 	HDR                     bool     `json:"hdr"`
 	SourcePeakNits          int      `json:"source_peak_nits"`
+	MasteringMaxNits        int      `json:"mastering_max_nits"`
+	MaxCLLNits              int      `json:"max_cll_nits"`
 	AudioCodec              string   `json:"audio_codec"`
 	AudioChannels           int      `json:"audio_channels"`
 	AudioChannelLayout      string   `json:"audio_channel_layout"`

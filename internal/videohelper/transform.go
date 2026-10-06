@@ -42,7 +42,7 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 	}
 	videoFilter := filterGraph(source, width, height, r.bitDepth, r.kind)
 	audioRate, audioFilter := outputAudio(source)
-	args := []string{"-v", "error", "-nostdin", "-y", "-noautorotate", "-i", r.input, "-map", "0:" + strconv.Itoa(source.VideoStreamIndex), "-vf", videoFilter, "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "1"}
+	args := []string{"-v", "error", "-nostdin", "-y", "-noautorotate", "-threads", "1", "-i", r.input, "-map", "0:" + strconv.Itoa(source.VideoStreamIndex), "-vf", videoFilter, "-map_metadata", "-1", "-map_chapters", "-1", "-threads:v", "1"}
 	if r.kind == "mp4-av1" {
 		args = append(args, "-c:v", "libsvtav1", "-crf", "32", "-preset", "6", "-svtav1-params", "lp=1", "-fps_mode:v", "passthrough", "-enc_time_base:v", source.TimeBase.NumeratorString()+"/"+source.TimeBase.DenominatorString(), "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv")
 		if source.AudioPresent {
@@ -151,7 +151,7 @@ func filterGraph(source inspection, width, height, bitDepth int, kind string) st
 		parts = append(parts,
 			"zscale=transfer=linear:npl="+strconv.Itoa(source.SourcePeakNits),
 			"format=gbrpf32le", "tonemap=hable:desat=0:peak="+strconv.Itoa(source.SourcePeakNits),
-			"zscale=primaries=bt709:transfer="+outputTransfer+":matrix=bt709:range=limited")
+			"zscale=primaries=bt709:transfer="+outputTransfer+":matrix=bt709:range=limited:npl=100")
 	} else {
 		parts = append(parts, "zscale=primaries=bt709:transfer="+outputTransfer+":matrix=bt709:range=limited")
 	}
@@ -200,15 +200,16 @@ func (r rational) NumeratorString() string   { return strconv.FormatInt(r.Numera
 func (r rational) DenominatorString() string { return strconv.FormatInt(r.Denominator, 10) }
 
 type outputProbe struct {
-	document probeDocument
-	video    probeStream
-	audio    *probeStream
-	pts      []int64
-	timeBase rational
+	document      probeDocument
+	video         probeStream
+	audio         *probeStream
+	pts           []int64
+	timeBase      rational
+	durationTicks int64
 }
 
 func (e *engine) probeOutput(path, kind string, limit limits) (*outputProbe, error) {
-	stdout, _, err := e.run.run(e.ffprobe, []string{"-v", "error", "-show_format", "-show_streams", "-of", "json", path}, 1<<20)
+	stdout, _, err := e.run.run(e.ffprobe, []string{"-v", "error", "-threads", "1", "-show_format", "-show_streams", "-of", "json", path}, 1<<20)
 	if err != nil {
 		return nil, fail("decode_failed")
 	}
@@ -233,7 +234,7 @@ func (e *engine) probeOutput(path, kind string, limit limits) (*outputProbe, err
 	if err != nil {
 		return nil, err
 	}
-	result := &outputProbe{document: document, video: video, pts: facts.pts, timeBase: timeBase}
+	result := &outputProbe{document: document, video: video, pts: facts.pts, timeBase: timeBase, durationTicks: facts.durationTicks}
 	if index, found := selectStream(document.Streams, "audio"); found {
 		audio, _ := streamByIndex(document.Streams, index)
 		result.audio = &audio
@@ -265,21 +266,26 @@ func (e *engine) verify(r request, out io.Writer) error {
 			}
 		}
 	}
-	decodeArgs := []string{"-v", "error", "-xerror", "-nostdin", "-noautorotate", "-i", r.output, "-map", "0:" + strconv.Itoa(output.video.Index)}
+	decodeArgs := []string{"-v", "error", "-xerror", "-nostdin", "-noautorotate", "-threads", "1", "-i", r.output, "-map", "0:" + strconv.Itoa(output.video.Index), "-threads:v", "1"}
 	if output.audio != nil {
-		decodeArgs = append(decodeArgs, "-map", "0:"+strconv.Itoa(output.audio.Index))
+		decodeArgs = append(decodeArgs, "-map", "0:"+strconv.Itoa(output.audio.Index), "-threads:a", "1")
 	}
 	decodeArgs = append(decodeArgs, "-f", "null", "-")
 	if _, _, err := e.run.run(e.ffmpeg, decodeArgs, 1<<20); err != nil {
 		return fail("decode_failed")
 	}
 	maxError := 0
+	maxDurationError := 0
 	if r.kind == "mp4-av1" {
 		if output.pts[0] != 0 || len(output.pts) != len(sourceProbe.pts) {
 			return fail("decode_failed")
 		}
 		maxError, err = timingErrorTicks(sourceProbe.pts, source.TimeBase, output.pts, output.timeBase)
 		if err != nil || maxError > 1 {
+			return fail("decode_failed")
+		}
+		maxDurationError, err = durationErrorTicks(sourceProbe.durationTicks, source.TimeBase, output.durationTicks, output.timeBase)
+		if err != nil || maxDurationError > 1 {
 			return fail("decode_failed")
 		}
 	} else if len(output.pts) != 1 {
@@ -290,34 +296,37 @@ func (e *engine) verify(r request, out io.Writer) error {
 		return fail("decode_failed")
 	}
 	result := struct {
-		Kind                string     `json:"kind"`
-		Container           string     `json:"container"`
-		Width               int        `json:"width"`
-		Height              int        `json:"height"`
-		SampleAspectRatio   rational   `json:"sample_aspect_ratio"`
-		VideoCodec          string     `json:"video_codec"`
-		BitDepth            int        `json:"bit_depth"`
-		Chroma              string     `json:"chroma"`
-		FrameCount          int        `json:"frame_count"`
-		PTSDeltaSHA256      string     `json:"pts_delta_sha256"`
-		MaxTimingErrorTicks int        `json:"max_timing_error_ticks"`
-		RotationDegrees     int        `json:"rotation_degrees"`
-		HasDisplayMatrix    bool       `json:"has_display_matrix"`
-		HasRotateMetadata   bool       `json:"has_rotate_metadata"`
-		ColorPrimaries      string     `json:"color_primaries"`
-		ColorTransfer       string     `json:"color_transfer"`
-		ColorMatrix         string     `json:"color_matrix"`
-		ColorRange          string     `json:"color_range"`
-		AudioPresent        bool       `json:"audio_present"`
-		AudioCodec          string     `json:"audio_codec"`
-		AudioProfile        string     `json:"audio_profile"`
-		FullyDecodedVideo   bool       `json:"fully_decoded_video"`
-		FullyDecodedAudio   bool       `json:"fully_decoded_audio"`
-		Source              inspection `json:"source"`
+		Kind                  string     `json:"kind"`
+		Container             string     `json:"container"`
+		Width                 int        `json:"width"`
+		Height                int        `json:"height"`
+		SampleAspectRatio     rational   `json:"sample_aspect_ratio"`
+		VideoCodec            string     `json:"video_codec"`
+		BitDepth              int        `json:"bit_depth"`
+		Chroma                string     `json:"chroma"`
+		FrameCount            int        `json:"frame_count"`
+		PTSDeltaSHA256        string     `json:"pts_delta_sha256"`
+		MaxTimingErrorTicks   int        `json:"max_timing_error_ticks"`
+		OutputDurationUS      int64      `json:"output_duration_us"`
+		MaxDurationErrorTicks int        `json:"max_duration_error_ticks"`
+		RotationDegrees       int        `json:"rotation_degrees"`
+		HasDisplayMatrix      bool       `json:"has_display_matrix"`
+		HasRotateMetadata     bool       `json:"has_rotate_metadata"`
+		ColorPrimaries        string     `json:"color_primaries"`
+		ColorTransfer         string     `json:"color_transfer"`
+		ColorMatrix           string     `json:"color_matrix"`
+		ColorRange            string     `json:"color_range"`
+		AudioPresent          bool       `json:"audio_present"`
+		AudioCodec            string     `json:"audio_codec"`
+		AudioProfile          string     `json:"audio_profile"`
+		FullyDecodedVideo     bool       `json:"fully_decoded_video"`
+		FullyDecodedAudio     bool       `json:"fully_decoded_audio"`
+		Source                inspection `json:"source"`
 	}{
 		Kind: r.kind, Container: map[bool]string{true: "mp4", false: "avif"}[r.kind == "mp4-av1"], Width: output.video.Width, Height: output.video.Height,
 		SampleAspectRatio: mustRationalDefault(output.video.SampleAspect, rational{1, 1}), VideoCodec: output.video.CodecName, BitDepth: pixelBitDepth(output.video), Chroma: pixelChroma(output.video.PixFmt),
-		FrameCount: len(output.pts), PTSDeltaSHA256: source.PTSDeltaSHA256, MaxTimingErrorTicks: maxError, RotationDegrees: rotation,
+		FrameCount: len(output.pts), PTSDeltaSHA256: hashDeltas(output.pts), MaxTimingErrorTicks: maxError,
+		OutputDurationUS: durationMicrosUnchecked(output.durationTicks, output.timeBase), MaxDurationErrorTicks: maxDurationError, RotationDegrees: rotation,
 		HasDisplayMatrix: hasDisplayMatrix(output.video), HasRotateMetadata: output.video.Tags["rotate"] != "",
 		ColorPrimaries: output.video.ColorPrimaries, ColorTransfer: output.video.ColorTransfer, ColorMatrix: output.video.ColorSpace, ColorRange: normalizeRange(output.video.ColorRange),
 		AudioPresent: output.audio != nil, AudioCodec: "none", AudioProfile: "none", FullyDecodedVideo: true, FullyDecodedAudio: output.audio != nil, Source: source,
@@ -382,6 +391,37 @@ func timingErrorTicks(source []int64, sourceBase rational, output []int64, outpu
 		return 0, errors.New("timing overflow")
 	}
 	return int(maximum), nil
+}
+
+func durationErrorTicks(sourceTicks int64, sourceBase rational, outputTicks int64, outputBase rational) (int, error) {
+	if sourceTicks <= 0 || outputTicks <= 0 {
+		return 0, errors.New("invalid duration")
+	}
+	sourceDuration := new(big.Rat).Mul(new(big.Rat).SetInt64(sourceTicks), new(big.Rat).SetFrac(big.NewInt(sourceBase.Numerator), big.NewInt(sourceBase.Denominator)))
+	outputDuration := new(big.Rat).Mul(new(big.Rat).SetInt64(outputTicks), new(big.Rat).SetFrac(big.NewInt(outputBase.Numerator), big.NewInt(outputBase.Denominator)))
+	difference := new(big.Rat).Sub(sourceDuration, outputDuration)
+	if difference.Sign() < 0 {
+		difference.Neg(difference)
+	}
+	ticks := new(big.Rat).Quo(difference, new(big.Rat).SetFrac(big.NewInt(outputBase.Numerator), big.NewInt(outputBase.Denominator)))
+	ceiling := new(big.Int).Quo(ticks.Num(), ticks.Denom())
+	if new(big.Int).Mod(ticks.Num(), ticks.Denom()).Sign() != 0 {
+		ceiling.Add(ceiling, big.NewInt(1))
+	}
+	if !ceiling.IsInt64() || ceiling.Int64() > math.MaxInt {
+		return 0, errors.New("duration overflow")
+	}
+	return int(ceiling.Int64()), nil
+}
+
+func durationMicrosUnchecked(ticks int64, base rational) int64 {
+	value := new(big.Int).Mul(big.NewInt(ticks), big.NewInt(base.Numerator))
+	value.Mul(value, big.NewInt(1_000_000))
+	value.Quo(value, big.NewInt(base.Denominator))
+	if !value.IsInt64() {
+		return 0
+	}
+	return value.Int64()
 }
 
 func mustRationalDefault(value string, fallback rational) rational {

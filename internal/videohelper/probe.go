@@ -52,19 +52,20 @@ type probeStream struct {
 }
 
 type mediaProbe struct {
-	inspection inspection
-	document   probeDocument
-	video      probeStream
-	audio      *probeStream
-	rotation   string
-	pts        []int64
+	inspection    inspection
+	document      probeDocument
+	video         probeStream
+	audio         *probeStream
+	rotation      string
+	pts           []int64
+	durationTicks int64
 }
 
 func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaProbe, error) {
 	if !oneOf(mime, "video/mp4", "video/quicktime") {
 		return inspection{}, nil, fail("unsupported_input")
 	}
-	stdout, _, err := e.run.run(e.ffprobe, []string{"-v", "error", "-show_format", "-show_streams", "-of", "json", path}, 1<<20)
+	stdout, _, err := e.run.run(e.ffprobe, []string{"-v", "error", "-threads", "1", "-show_format", "-show_streams", "-of", "json", path}, 1<<20)
 	if err != nil {
 		return inspection{}, nil, fail("decode_failed")
 	}
@@ -115,7 +116,7 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 	if err != nil || timeBase.Numerator <= 0 {
 		return inspection{}, nil, fail("unsupported_input")
 	}
-	primaries, transfer, matrix, colorRange, hdr, peak, err := classifyColor(video)
+	primaries, transfer, matrix, colorRange, hdr, peak, mastering, maxCLL, err := classifyColor(video)
 	if err != nil {
 		return inspection{}, nil, err
 	}
@@ -128,7 +129,7 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 		VideoCodec: video.CodecName, CodedWidth: video.Width, CodedHeight: video.Height, DisplayWidth: displayWidth, DisplayHeight: displayHeight,
 		SampleAspectRatio: sar, RotationDegrees: rotation, FrameCount: len(facts.pts), DurationUS: facts.durationUS,
 		EffectiveFPS: facts.fps, TimeBase: timeBase, FirstPTS: facts.pts[0], LastPTS: facts.pts[len(facts.pts)-1], PTSDeltaSHA256: hashDeltas(facts.pts),
-		ColorPrimaries: primaries, ColorTransfer: transfer, ColorMatrix: matrix, ColorRange: colorRange, HDR: hdr, SourcePeakNits: peak,
+		ColorPrimaries: primaries, ColorTransfer: transfer, ColorMatrix: matrix, ColorRange: colorRange, HDR: hdr, SourcePeakNits: peak, MasteringMaxNits: mastering, MaxCLLNits: maxCLL,
 		AudioCodec: "none", AudioChannelLayout: "none", CumulativeDecodedPixels: facts.decodedPixels,
 	}
 	var selectedAudio *probeStream
@@ -139,23 +140,24 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 			return inspection{}, nil, fail("unsupported_input")
 		}
 		i.AudioStreamIndex, i.AudioCodec, i.AudioChannels, i.AudioChannelLayout, i.AudioSampleRate = audioIndex, audio.CodecName, audio.Channels, audio.ChannelLayout, rate
-		if _, _, decodeErr := e.run.run(e.ffmpeg, []string{"-v", "error", "-xerror", "-nostdin", "-i", path, "-map", "0:" + strconv.Itoa(audioIndex), "-vn", "-f", "null", "-"}, 1<<20); decodeErr != nil {
+		if _, _, decodeErr := e.run.run(e.ffmpeg, []string{"-v", "error", "-xerror", "-nostdin", "-threads", "1", "-i", path, "-map", "0:" + strconv.Itoa(audioIndex), "-vn", "-threads:a", "1", "-f", "null", "-"}, 1<<20); decodeErr != nil {
 			return inspection{}, nil, fail("unsupported_input")
 		}
 		selectedAudio = &audio
 	}
-	return i, &mediaProbe{inspection: i, document: document, video: video, audio: selectedAudio, rotation: rotationSource, pts: facts.pts}, nil
+	return i, &mediaProbe{inspection: i, document: document, video: video, audio: selectedAudio, rotation: rotationSource, pts: facts.pts, durationTicks: facts.durationTicks}, nil
 }
 
 type frameAccounting struct {
 	pts           []int64
 	durationUS    int64
+	durationTicks int64
 	fps           rational
 	decodedPixels uint64
 }
 
 func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBase rational, limit limits) (frameAccounting, error) {
-	args := []string{"-v", "error", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,best_effort_timestamp,pkt_duration,width,height", "-of", "compact=p=0:nk=0", path}
+	args := []string{"-v", "error", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,best_effort_timestamp,pkt_duration,width,height", "-of", "compact=p=0:nk=0", path}
 	var result frameAccounting
 	var lastDuration int64
 	var lastDelta int64
@@ -227,6 +229,7 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 		return frameAccounting{}, fail("resource_limit")
 	}
 	result.durationUS = durationUS
+	result.durationTicks = durationTicks
 	result.fps, ok = effectiveFrameRate(len(result.pts), durationTicks, timeBase)
 	if !ok {
 		return frameAccounting{}, fail("resource_limit")
@@ -275,12 +278,15 @@ func streamRotation(stream probeStream) (int, string, error) {
 	matrix, matrixPresent := 0, false
 	for _, side := range stream.SideDataList {
 		if value, ok := side["rotation"]; ok {
+			if matrixPresent {
+				return 0, "", fail("unsupported_input")
+			}
 			n, err := interfaceInt(value)
 			if err != nil {
 				return 0, "", fail("unsupported_input")
 			}
 			var valid bool
-			matrix, valid = normalizeRotation(n)
+			matrix, valid = normalizeMatrixRotation(n)
 			if !valid {
 				return 0, "", fail("unsupported_input")
 			}
@@ -294,7 +300,7 @@ func streamRotation(stream probeStream) (int, string, error) {
 			return 0, "", fail("unsupported_input")
 		}
 		var valid bool
-		tag, valid = normalizeRotation(n)
+		tag, valid = exactRotation(n)
 		if !valid {
 			return 0, "", fail("unsupported_input")
 		}
@@ -312,7 +318,10 @@ func streamRotation(stream probeStream) (int, string, error) {
 	return 0, "none", nil
 }
 
-func normalizeRotation(value int) (int, bool) {
+func normalizeMatrixRotation(value int) (int, bool) {
+	if value < -270 || value > 270 {
+		return 0, false
+	}
 	value %= 360
 	if value < 0 {
 		value += 360
@@ -320,41 +329,55 @@ func normalizeRotation(value int) (int, bool) {
 	return value, value == 0 || value == 90 || value == 180 || value == 270
 }
 
-func classifyColor(stream probeStream) (string, string, string, string, bool, int, error) {
+func exactRotation(value int) (int, bool) {
+	return value, value == 0 || value == 90 || value == 180 || value == 270
+}
+
+func classifyColor(stream probeStream) (string, string, string, string, bool, int, int, int, error) {
 	primaries := stream.ColorPrimaries
 	transfer := stream.ColorTransfer
 	matrix := stream.ColorSpace
 	rangeName := map[string]string{"tv": "limited", "mpeg": "limited", "pc": "full", "jpeg": "full"}[stream.ColorRange]
 	if rangeName == "" {
-		return "", "", "", "", false, 0, fail("unsupported_input")
+		return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 	}
 	if transfer == "smpte2084" || transfer == "arib-std-b67" {
 		if primaries != "bt2020" || !oneOf(matrix, "bt2020nc", "bt2020c") {
-			return "", "", "", "", false, 0, fail("unsupported_input")
+			return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 		}
 		if transfer == "arib-std-b67" {
-			return primaries, transfer, matrix, rangeName, true, 1000, nil
+			return primaries, transfer, matrix, rangeName, true, 1000, 0, 0, nil
 		}
-		mastering, cll := 0, 0
+		mastering, cll, masteringCount, cllCount := 0, 0, 0, 0
 		for _, side := range stream.SideDataList {
 			if value, ok := side["max_luminance"]; ok {
-				mastering, _ = parseNits(value)
+				masteringCount++
+				parsed, parseErr := parseNits(value)
+				if parseErr != nil || masteringCount != 1 {
+					return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
+				}
+				mastering = parsed
 			}
 			if value, ok := side["max_content"]; ok {
-				cll, _ = interfaceInt(value)
+				cllCount++
+				parsed, parseErr := interfaceInt(value)
+				if parseErr != nil || cllCount != 1 {
+					return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
+				}
+				cll = parsed
 			}
 		}
-		if mastering <= 0 || cll <= 0 || cll > mastering {
-			return "", "", "", "", false, 0, fail("unsupported_input")
+		if masteringCount != 1 || cllCount != 1 || mastering <= 0 || cll <= 0 || cll > mastering {
+			return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 		}
-		return primaries, transfer, matrix, rangeName, true, cll, nil
+		return primaries, transfer, matrix, rangeName, true, mastering, mastering, cll, nil
 	}
 	bt709 := primaries == "bt709" && matrix == "bt709"
 	bt2020 := primaries == "bt2020" && oneOf(matrix, "bt2020nc", "bt2020c")
 	if transfer != "bt709" || !bt709 && !bt2020 {
-		return "", "", "", "", false, 0, fail("unsupported_input")
+		return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 	}
-	return primaries, transfer, matrix, rangeName, false, 0, nil
+	return primaries, transfer, matrix, rangeName, false, 0, 0, 0, nil
 }
 
 func parseNits(value interface{}) (int, error) {

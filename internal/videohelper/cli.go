@@ -16,9 +16,10 @@ import (
 )
 
 type engine struct {
-	ffprobe string
-	ffmpeg  string
-	run     commandRunner
+	ffprobe  string
+	ffmpeg   string
+	run      commandRunner
+	manifest string
 }
 
 func Main(args []string, stdout, stderr io.Writer) int {
@@ -57,7 +58,12 @@ func newEngine() (*engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &engine{ffprobe: ffprobe, ffmpeg: ffmpeg, run: osCommandRunner{}}, nil
+	prefix := filepath.Dir(dir)
+	manifestBytes, err := os.ReadFile(filepath.Join(prefix, "share", "nmcp", "video-toolchain.manifest"))
+	if err != nil || string(manifestBytes) != toolchainManifest {
+		return nil, fail("capability_failed")
+	}
+	return &engine{ffprobe: ffprobe, ffmpeg: ffmpeg, run: osCommandRunner{}, manifest: string(manifestBytes)}, nil
 }
 
 func siblingExecutable(dir, name string) (string, error) {
@@ -232,7 +238,7 @@ func decimalInt(s string) (int, error) {
 
 func (e *engine) capabilities(r request, out io.Writer) error {
 	digest, err := digestFile(r.icc)
-	if err != nil || e.checkTools() != nil {
+	if err != nil || e.manifest != "" && e.manifest != toolchainManifest || e.checkTools() != nil {
 		return fail("capability_failed")
 	}
 	result := struct {
@@ -276,15 +282,19 @@ func (e *engine) checkTools() error {
 	}{
 		{e.ffprobe, []string{"-version"}, []string{"ffprobe version 9.0.2"}},
 		{e.ffmpeg, []string{"-version"}, []string{"ffmpeg version 9.0.2"}},
+		{e.ffmpeg, []string{"-buildconf"}, []string{"--disable-autodetect", "--disable-network", "--disable-gpl", "--disable-nonfree", "--enable-libsvtav1", "--enable-libzimg", "--enable-libaom"}},
+		{e.ffmpeg, []string{"-hide_banner", "-decoders"}, []string{" h264", " hevc", " aac", " av1"}},
+		{e.ffmpeg, []string{"-hide_banner", "-demuxers"}, []string{" mov,"}},
+		{e.ffmpeg, []string{"-hide_banner", "-muxers"}, []string{" mp4", " avif"}},
 		{e.ffmpeg, []string{"-hide_banner", "-encoders"}, []string{"libsvtav1", "libaom-av1", " aac"}},
 		{e.ffmpeg, []string{"-hide_banner", "-filters"}, []string{"zscale", "tonemap"}},
 	}
 	for _, check := range checks {
-		stdout, _, err := e.run.run(check.path, check.args, 4<<20)
+		stdout, stderr, err := e.run.run(check.path, check.args, 1<<20)
 		if err != nil {
 			return err
 		}
-		text := string(stdout)
+		text := string(stdout) + string(stderr)
 		for _, want := range check.want {
 			if !strings.Contains(text, want) {
 				return fmt.Errorf("missing capability")

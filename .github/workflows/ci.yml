@@ -182,6 +182,10 @@ jobs:
               assert line and prefix in line, (library,line,text)
           PY
           generator="${GITHUB_WORKSPACE}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg"
+          timeout 1m "${generator}" -version
+          timeout 1m "${generator}" -buildconf
+          timeout 1m "${generator}" -hide_banner -encoders 2>&1 | grep -E 'libx264|libx265'
+          timeout 1m "${generator}" -hide_banner -decoders 2>&1 | grep -E ' av1| aac'
           fixtures="${RUNNER_TEMP}/video-fixtures"
           mkdir -p "${fixtures}"
           timeout 2m "${generator}" -v error -y -threads 1 \
@@ -214,25 +218,35 @@ jobs:
             -f lavfi -i 'color=blue:size=64x48:rate=25:duration=0.16' \
             -f lavfi -i 'sine=frequency=440:sample_rate=44100:duration=0.16' \
             -f lavfi -i 'sine=frequency=880:sample_rate=48000:duration=0.16' \
-            -map 0:v -map 1:v -map 2:a -map 3:a -c:v libx264 -preset ultrafast \
-            -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
-            -color_range tv -c:a aac -shortest -disposition:v:0 0 -disposition:v:1 default \
+            -map 0:v -map 1:v -map 2:a -map 3:a -c:v:0 mjpeg -q:v:0 3 -frames:v:0 1 \
+            -c:v:1 libx264 -preset:v:1 ultrafast -pix_fmt:v:1 yuv420p \
+            -color_primaries:v:1 bt709 -color_trc:v:1 bt709 -colorspace:v:1 bt709 \
+            -color_range:v:1 tv -c:a aac -shortest -disposition:v:0 attached_pic -disposition:v:1 default \
             -disposition:a:0 0 -disposition:a:1 default "${fixtures}/multistream.mp4"
+          timeout 2m "${generator}" -v error -y -threads 1 \
+            -f lavfi -i 'testsrc2=size=80x50:rate=25:duration=0.16' \
+            -f lavfi -i 'sine=frequency=660:sample_rate=192000:duration=0.16' -shortest \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv420p -color_primaries bt709 \
+            -color_trc bt709 -colorspace bt709 -color_range tv -c:a pcm_s16le \
+            "${fixtures}/audio-resample.mov"
           timeout 2m "${generator}" -v error -y -threads 1 \
             -f lavfi -i 'testsrc=size=160x90:rate=25:duration=0.2' -frames:v 3 \
             -vf 'setpts=N*N/(25*TB),setsar=2/1' -fps_mode vfr -an -c:v libx264 \
             -preset ultrafast -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 \
             -colorspace bt709 -color_range tv "${fixtures}/vfr-sar.mp4"
           for fixture in "${fixtures}"/*.mp4 "${fixtures}"/*.mov; do
+            sha256sum "${fixture}"
             timeout 1m "${GITHUB_WORKSPACE}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe" \
-              -v error -show_streams -show_format "${fixture}" >/dev/null
+              -v error -show_streams -show_format "${fixture}"
             timeout 1m "${generator}" -v error -xerror -i "${fixture}" -f null -
+            timeout 1m "${generator}" -v error -i "${fixture}" -map 0:v -f framehash -
           done
-          printf 'TEST_VIDEO_HELPER_PATH=%s\nTEST_VIDEO_PRLIMIT_PATH=%s\nTEST_VIDEO_ICC_PATH=%s\nTEST_VIDEO_AVC_PATH=%s\nTEST_VIDEO_HEVC_ROTATED_PATH=%s\nTEST_VIDEO_PQ_PATH=%s\nTEST_VIDEO_HLG_PATH=%s\nTEST_VIDEO_MULTISTREAM_PATH=%s\nTEST_VIDEO_VFR_PATH=%s\n' \
+          printf 'TEST_VIDEO_HELPER_PATH=%s\nTEST_VIDEO_PRLIMIT_PATH=%s\nTEST_VIDEO_ICC_PATH=%s\nTEST_VIDEO_AVC_PATH=%s\nTEST_VIDEO_HEVC_ROTATED_PATH=%s\nTEST_VIDEO_PQ_PATH=%s\nTEST_VIDEO_HLG_PATH=%s\nTEST_VIDEO_MULTISTREAM_PATH=%s\nTEST_VIDEO_VFR_PATH=%s\nTEST_VIDEO_RESAMPLE_PATH=%s\n' \
             "${video_helper}" "$(command -v prlimit)" "${RUNNER_TEMP}/sRGB2014.icc" \
             "${fixtures}/avc-odd-audio.mp4" "${fixtures}/hevc-rotated.mov" \
             "${fixtures}/hevc-pq.mp4" "${fixtures}/hevc-hlg.mp4" \
-            "${fixtures}/multistream.mp4" "${fixtures}/vfr-sar.mp4" >> "${GITHUB_ENV}"
+            "${fixtures}/multistream.mp4" "${fixtures}/vfr-sar.mp4" \
+            "${fixtures}/audio-resample.mov" >> "${GITHUB_ENV}"
       - name: Verify modules
         run: go mod verify
       - name: Check formatting

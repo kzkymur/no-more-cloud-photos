@@ -35,7 +35,7 @@ type Config struct {
 type Processor struct {
 	helper, srgbICC, iccSHA256 string
 	policy                     Policy
-	runner                     *processrunner.Runner
+	runner, thumbnailRunner    *processrunner.Runner
 }
 
 type InspectRequest struct {
@@ -95,6 +95,8 @@ type Inspection struct {
 	ColorRange              string   `json:"color_range"`
 	HDR                     bool     `json:"hdr"`
 	SourcePeakNits          int      `json:"source_peak_nits"`
+	MasteringMaxNits        int      `json:"mastering_max_nits"`
+	MaxCLLNits              int      `json:"max_cll_nits"`
 	AudioCodec              string   `json:"audio_codec"`
 	AudioChannels           int      `json:"audio_channels"`
 	AudioChannelLayout      string   `json:"audio_channel_layout"`
@@ -156,7 +158,14 @@ func New(config Config) (*Processor, error) {
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	return &Processor{helper: config.Helper, srgbICC: config.SRGBICC, iccSHA256: config.SRGBICCSHA256, policy: policy, runner: runner}, nil
+	thumbnailRunner, err := processrunner.New(config.Prlimit, processrunner.Limits{
+		Timeout: policy.Timeout, AddressSpaceBytes: policy.AddressSpaceBytes,
+		FileSizeBytes: uint64(policy.ThumbnailOutputMaxBytes), OutputBytesPerStream: policy.LogBytesPerStream,
+	})
+	if err != nil {
+		return nil, ErrInvalid
+	}
+	return &Processor{helper: config.Helper, srgbICC: config.SRGBICC, iccSHA256: config.SRGBICCSHA256, policy: policy, runner: runner, thumbnailRunner: thumbnailRunner}, nil
 }
 
 func (p *Processor) Capabilities(ctx context.Context) (Capabilities, error) {
@@ -251,7 +260,11 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		"--input-mime", request.MIMEType, "--output-kind", kind, "--max-long-edge", strconv.Itoa(request.Recipe.MaxLongEdge),
 		"--quality", strconv.Itoa(quality), "--bit-depth", strconv.Itoa(bitDepth), "--threads", "1", "--srgb-icc", "/proc/self/fd/5"}
 	arguments = append(arguments, p.limitArguments()...)
-	out, err := p.runner.Run(operation, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{input, request.Output, icc}})
+	operationRunner := p.runner
+	if kind == "first-frame-avif" {
+		operationRunner = p.thumbnailRunner
+	}
+	out, err := operationRunner.Run(operation, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{input, request.Output, icc}})
 	if err != nil {
 		return Result{}, mapOperationError(err, ctx, operation)
 	}
@@ -279,7 +292,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	if _, err := request.Output.Seek(0, io.SeekStart); err != nil {
 		return Result{}, ErrResourcePolicy
 	}
-	if err := p.verifyOutput(operation, request, response.Result); err != nil {
+	if err := p.verifyOutput(operation, operationRunner, request, response.Result); err != nil {
 		return Result{}, mapOperationError(err, ctx, operation)
 	}
 	r := response.Result
@@ -290,7 +303,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	return Result{r.Kind, r.OutputMIME, extension, r.Width, r.Height, r.MaxLongEdge, r.Threads, r.CRF, r.Quality, r.BitDepth, r.Chroma, r.AudioPresent, r.AudioCodec, r.AudioBitrateKbps, r.Source, publicAudit(r.Audit)}, nil
 }
 
-func (p *Processor) verifyOutput(ctx context.Context, request Request, transformed *transformWire) error {
+func (p *Processor) verifyOutput(ctx context.Context, runner *processrunner.Runner, request Request, transformed *transformWire) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -306,7 +319,7 @@ func (p *Processor) verifyOutput(ctx context.Context, request Request, transform
 	defer output.Close()
 	arguments := append([]string{"verify-output", "--protocol", "1", "--source", "/proc/self/fd/3", "--output", "/proc/self/fd/4",
 		"--source-mime", request.MIMEType, "--output-kind", transformed.Kind}, p.limitArguments()...)
-	result, err := p.runner.Run(ctx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{source, output}})
+	result, err := runner.Run(ctx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{source, output}})
 	if err != nil {
 		return err
 	}
@@ -319,7 +332,7 @@ func (p *Processor) verifyOutput(ctx context.Context, request Request, transform
 		return ErrProcess
 	}
 	if transformed.Kind == "mp4-av1" {
-		if got.Container != "mp4" || got.SampleAspectRatio != (Rational{1, 1}) || got.BitDepth != 10 || got.Chroma != "4:2:0" || got.FrameCount != transformed.Source.FrameCount || got.PTSDeltaSHA256 != transformed.Source.PTSDeltaSHA256 || got.MaxTimingErrorTicks < 0 || got.MaxTimingErrorTicks > 1 || got.AudioPresent != transformed.AudioPresent || got.AudioPresent && (!got.FullyDecodedAudio || got.AudioCodec != "aac" || got.AudioProfile != "LC") || got.ColorPrimaries != "bt709" || got.ColorTransfer != "bt709" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
+		if got.Container != "mp4" || got.SampleAspectRatio != (Rational{1, 1}) || got.BitDepth != 10 || got.Chroma != "4:2:0" || got.FrameCount != transformed.Source.FrameCount || !sha256Pattern.MatchString(got.PTSDeltaSHA256) || got.MaxTimingErrorTicks < 0 || got.MaxTimingErrorTicks > 1 || got.OutputDurationUS <= 0 || got.MaxDurationErrorTicks < 0 || got.MaxDurationErrorTicks > 1 || got.AudioPresent != transformed.AudioPresent || got.AudioPresent && (!got.FullyDecodedAudio || got.AudioCodec != "aac" || got.AudioProfile != "LC") || got.ColorPrimaries != "bt709" || got.ColorTransfer != "bt709" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
 			return ErrProcess
 		}
 	} else if got.Container != "avif" || got.FrameCount != 1 || got.AudioPresent || got.FullyDecodedAudio || got.ColorPrimaries != "bt709" || got.ColorTransfer != "iec61966-2-1" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
@@ -398,10 +411,10 @@ func recipeOutput(r profile.Recipe) (string, int, int) {
 func validateInspection(i Inspection, p Policy) error {
 	if i.TotalStreams <= 0 || i.TotalStreams > p.Streams || i.VideoStreamIndex < 0 || !safeString(i.VideoCodec) ||
 		i.CodedWidth <= 0 || i.CodedHeight <= 0 || i.DisplayWidth <= 0 || i.DisplayHeight <= 0 || i.CodedWidth > p.Dimension || i.CodedHeight > p.Dimension || i.DisplayWidth > p.Dimension || i.DisplayHeight > p.Dimension ||
-		!checkedProductWithin(uint64(i.CodedWidth), uint64(i.CodedHeight), p.PixelsPerFrame) || !validRational(i.SampleAspectRatio) || !oneOfInt(i.RotationDegrees, 0, 90, 180, 270) || i.FrameCount <= 0 || i.FrameCount > p.Frames || i.DurationUS <= 0 || i.DurationUS > p.Duration.Microseconds() || !validRational(i.EffectiveFPS) || rationalGreater(i.EffectiveFPS.Numerator, i.EffectiveFPS.Denominator, p.EffectiveFPSNumerator, p.EffectiveFPSDenominator) || !validRational(i.TimeBase) || i.FirstPTS > i.LastPTS || !sha256Pattern.MatchString(i.PTSDeltaSHA256) || !safeColor(i) || i.CumulativeDecodedPixels == 0 || i.CumulativeDecodedPixels > p.CumulativeDecodedPixels {
+		!checkedProductWithin(uint64(i.CodedWidth), uint64(i.CodedHeight), p.PixelsPerFrame) || !validPositiveRational(i.SampleAspectRatio) || !oneOfInt(i.RotationDegrees, 0, 90, 180, 270) || i.FrameCount <= 0 || i.FrameCount > p.Frames || i.DurationUS <= 0 || i.DurationUS > p.Duration.Microseconds() || !validPositiveRational(i.EffectiveFPS) || rationalGreater(i.EffectiveFPS.Numerator, i.EffectiveFPS.Denominator, p.EffectiveFPSNumerator, p.EffectiveFPSDenominator) || !validPositiveRational(i.TimeBase) || i.FirstPTS > i.LastPTS || !sha256Pattern.MatchString(i.PTSDeltaSHA256) || !safeColor(i) || i.CumulativeDecodedPixels == 0 || i.CumulativeDecodedPixels > p.CumulativeDecodedPixels {
 		return ErrProcess
 	}
-	if i.HDR != oneOf(i.ColorTransfer, "smpte2084", "arib-std-b67") || i.HDR && (i.ColorPrimaries != "bt2020" || !oneOf(i.ColorMatrix, "bt2020nc", "bt2020c") || i.SourcePeakNits <= 0) || !i.HDR && i.SourcePeakNits != 0 {
+	if i.HDR != oneOf(i.ColorTransfer, "smpte2084", "arib-std-b67") || i.HDR && (i.ColorPrimaries != "bt2020" || !oneOf(i.ColorMatrix, "bt2020nc", "bt2020c") || i.SourcePeakNits <= 0) || i.ColorTransfer == "smpte2084" && (i.MasteringMaxNits <= 0 || i.MaxCLLNits <= 0 || i.MaxCLLNits > i.MasteringMaxNits || i.SourcePeakNits != i.MasteringMaxNits) || i.ColorTransfer == "arib-std-b67" && (i.SourcePeakNits != 1000 || i.MasteringMaxNits != 0 || i.MaxCLLNits != 0) || !i.HDR && (i.SourcePeakNits != 0 || i.MasteringMaxNits != 0 || i.MaxCLLNits != 0) {
 		return ErrProcess
 	}
 	if i.AudioPresent {
@@ -443,7 +456,19 @@ func validateTransform(r transformWire, request Request, p Policy, digest string
 	if kind == "mp4-av1" {
 		geometry, videoEncoder, muxer, outputColor, outputTransfer = "display-aspect-square-pixel-even-floor-no-upscale", "libsvtav1", "mp4", "bt709-sdr-100nit", "bt709"
 	}
-	if a.BuildManifest != BuildManifest || validateVersionMap(a.LibraryVersions) != nil || a.ICCSHA256 != digest || a.SelectedVideoStream != r.Source.VideoStreamIndex || a.SelectedAudioStream != r.Source.AudioStreamIndex || a.StreamSelection != "default-first-then-index" || a.RotationDegreesApplied != r.Source.RotationDegrees || a.Orientation != "identity" || a.Geometry != geometry || a.Timing != "preserve-presentation-order-vfr-rebase-zero" || !safeString(a.VideoFilterGraph) || !safeString(a.AudioFilterGraph) || a.VideoEncoder != videoEncoder || a.Muxer != muxer || a.OutputColor != outputColor || a.OutputPrimaries != "bt709" || a.OutputTransfer != outputTransfer || a.OutputMatrix != "bt709" || a.OutputRange != "limited" || a.Metadata != "strip-after-normalization-keep-color-tags" {
+	expectedAudioRate, expectedAudioFilter := auditAudio(r.Source, kind)
+	expectedAudioDecoder, expectedAudioEncoder := "none", "none"
+	if r.Source.AudioPresent {
+		expectedAudioDecoder = r.Source.AudioCodec
+	}
+	if kind == "mp4-av1" && r.Source.AudioPresent {
+		expectedAudioEncoder = "aac"
+	}
+	expectedOutputLayout := "none"
+	if kind == "mp4-av1" && r.Source.AudioPresent {
+		expectedOutputLayout = r.Source.AudioChannelLayout
+	}
+	if a.ToolVersion != "nmcp-video-helper/1" || a.BuildManifest != BuildManifest || validateVersionMap(a.LibraryVersions) != nil || a.ICCSHA256 != digest || a.Demuxer != "mov" || a.VideoDecoder != r.Source.VideoCodec || a.AudioDecoder != expectedAudioDecoder || a.SelectedVideoStream != r.Source.VideoStreamIndex || a.SelectedAudioStream != r.Source.AudioStreamIndex || a.StreamSelection != "default-first-then-index" || !oneOf(a.RotationSource, "none", "display-matrix", "rotate-tag", "display-matrix+rotate") || a.RotationDegreesApplied != r.Source.RotationDegrees || a.Orientation != "identity" || a.Geometry != geometry || a.Timing != "preserve-presentation-order-vfr-rebase-zero" || a.VideoFilterGraph != auditVideoFilter(r.Source, r.Width, r.Height, r.BitDepth, kind) || a.AudioFilterGraph != expectedAudioFilter || a.VideoEncoder != videoEncoder || a.AudioEncoder != expectedAudioEncoder || a.Muxer != muxer || a.InputColor != auditInputColor(r.Source) || a.OutputColor != outputColor || a.OutputPrimaries != "bt709" || a.OutputTransfer != outputTransfer || a.OutputMatrix != "bt709" || a.OutputRange != "limited" || a.InputAudioLayout != r.Source.AudioChannelLayout || a.OutputAudioLayout != expectedOutputLayout || a.InputAudioSampleRate != r.Source.AudioSampleRate || a.OutputAudioSampleRate != expectedAudioRate || a.Metadata != "strip-after-normalization-keep-color-tags" {
 		return ErrProcess
 	}
 	if r.Source.HDR {
@@ -454,6 +479,49 @@ func validateTransform(r transformWire, request Request, p Policy, digest string
 		return ErrProcess
 	}
 	return nil
+}
+
+func auditVideoFilter(source Inspection, width, height, bitDepth int, kind string) string {
+	parts := []string{}
+	switch source.RotationDegrees {
+	case 90:
+		parts = append(parts, "transpose=clock")
+	case 180:
+		parts = append(parts, "hflip", "vflip")
+	case 270:
+		parts = append(parts, "transpose=cclock")
+	}
+	transfer := "bt709"
+	if kind == "first-frame-avif" {
+		transfer = "iec61966-2-1"
+	}
+	if source.HDR {
+		peak := strconv.Itoa(source.SourcePeakNits)
+		parts = append(parts, "zscale=transfer=linear:npl="+peak, "format=gbrpf32le", "tonemap=hable:desat=0:peak="+peak, "zscale=primaries=bt709:transfer="+transfer+":matrix=bt709:range=limited:npl=100")
+	} else {
+		parts = append(parts, "zscale=primaries=bt709:transfer="+transfer+":matrix=bt709:range=limited")
+	}
+	format := "format=yuv420p"
+	if bitDepth == 10 {
+		format = "format=yuv420p10le"
+	}
+	parts = append(parts, "scale="+strconv.Itoa(width)+":"+strconv.Itoa(height)+":flags=lanczos", "setsar=1", format, "setpts=PTS-STARTPTS")
+	return strings.Join(parts, ",")
+}
+
+func auditAudio(source Inspection, kind string) (int, string) {
+	if kind != "mp4-av1" || !source.AudioPresent {
+		return 0, "none"
+	}
+	supported := map[int]bool{7350: true, 8000: true, 11025: true, 12000: true, 16000: true, 22050: true, 24000: true, 32000: true, 44100: true, 48000: true, 64000: true, 88200: true, 96000: true}
+	if supported[source.AudioSampleRate] {
+		return source.AudioSampleRate, "asetpts=PTS-STARTPTS"
+	}
+	return 48000, "aresample=48000,asetpts=PTS-STARTPTS"
+}
+
+func auditInputColor(source Inspection) string {
+	return source.ColorPrimaries + "/" + source.ColorTransfer + "/" + source.ColorMatrix + "/" + source.ColorRange
 }
 
 func validateCapability(r capabilityWire, digest string) error {
@@ -476,8 +544,8 @@ func validateVersionMap(v map[string]string) error {
 	return nil
 }
 
-func validRational(r Rational) bool       { return r.Numerator >= 0 && r.Denominator > 0 }
-func oneOfInt(v int, allowed ...int) bool { return slices.Contains(allowed, v) }
+func validPositiveRational(r Rational) bool { return r.Numerator > 0 && r.Denominator > 0 }
+func oneOfInt(v int, allowed ...int) bool   { return slices.Contains(allowed, v) }
 
 var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
@@ -788,28 +856,30 @@ type verificationResponse struct {
 	Result    *verificationWire `json:"result"`
 }
 type verificationWire struct {
-	Kind                string     `json:"kind"`
-	Container           string     `json:"container"`
-	Width               int        `json:"width"`
-	Height              int        `json:"height"`
-	SampleAspectRatio   Rational   `json:"sample_aspect_ratio"`
-	VideoCodec          string     `json:"video_codec"`
-	BitDepth            int        `json:"bit_depth"`
-	Chroma              string     `json:"chroma"`
-	FrameCount          int        `json:"frame_count"`
-	PTSDeltaSHA256      string     `json:"pts_delta_sha256"`
-	MaxTimingErrorTicks int        `json:"max_timing_error_ticks"`
-	RotationDegrees     int        `json:"rotation_degrees"`
-	HasDisplayMatrix    bool       `json:"has_display_matrix"`
-	HasRotateMetadata   bool       `json:"has_rotate_metadata"`
-	ColorPrimaries      string     `json:"color_primaries"`
-	ColorTransfer       string     `json:"color_transfer"`
-	ColorMatrix         string     `json:"color_matrix"`
-	ColorRange          string     `json:"color_range"`
-	AudioPresent        bool       `json:"audio_present"`
-	AudioCodec          string     `json:"audio_codec"`
-	AudioProfile        string     `json:"audio_profile"`
-	FullyDecodedVideo   bool       `json:"fully_decoded_video"`
-	FullyDecodedAudio   bool       `json:"fully_decoded_audio"`
-	Source              Inspection `json:"source"`
+	Kind                  string     `json:"kind"`
+	Container             string     `json:"container"`
+	Width                 int        `json:"width"`
+	Height                int        `json:"height"`
+	SampleAspectRatio     Rational   `json:"sample_aspect_ratio"`
+	VideoCodec            string     `json:"video_codec"`
+	BitDepth              int        `json:"bit_depth"`
+	Chroma                string     `json:"chroma"`
+	FrameCount            int        `json:"frame_count"`
+	PTSDeltaSHA256        string     `json:"pts_delta_sha256"`
+	MaxTimingErrorTicks   int        `json:"max_timing_error_ticks"`
+	OutputDurationUS      int64      `json:"output_duration_us"`
+	MaxDurationErrorTicks int        `json:"max_duration_error_ticks"`
+	RotationDegrees       int        `json:"rotation_degrees"`
+	HasDisplayMatrix      bool       `json:"has_display_matrix"`
+	HasRotateMetadata     bool       `json:"has_rotate_metadata"`
+	ColorPrimaries        string     `json:"color_primaries"`
+	ColorTransfer         string     `json:"color_transfer"`
+	ColorMatrix           string     `json:"color_matrix"`
+	ColorRange            string     `json:"color_range"`
+	AudioPresent          bool       `json:"audio_present"`
+	AudioCodec            string     `json:"audio_codec"`
+	AudioProfile          string     `json:"audio_profile"`
+	FullyDecodedVideo     bool       `json:"fully_decoded_video"`
+	FullyDecodedAudio     bool       `json:"fully_decoded_audio"`
+	Source                Inspection `json:"source"`
 }

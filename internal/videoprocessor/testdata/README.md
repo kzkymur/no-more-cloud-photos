@@ -2,9 +2,11 @@
 
 Issue #13 fixtures are generated at CI time from project-owned deterministic
 color, orientation, timing, and audio patterns. No unexplained binary media is
-stored in this directory. Generation uses the source-pinned FFmpeg toolchain
-described by `../helper/toolchain.lock`; decoded source-frame hashes and the
-generation commands are logged before processor execution.
+stored in this directory. Generation and cross-version verification use the
+hash-pinned third-party FFmpeg 6.0.1 build recorded in `fixture-tool.lock`;
+its version/build configuration and required codecs are logged by CI. This GPL
+build is CI-only and distinct from the production LGPL pinned FFmpeg 9.0.2
+closure in `../helper/toolchain.lock`.
 
 The acceptance matrix contains short fixtures for:
 
@@ -16,7 +18,7 @@ The acceptance matrix contains short fixtures for:
 - default and non-default video/audio streams with an attached picture, proving
   default-disposition then absolute-index selection;
 - VFR presentation deltas, non-square SAR, small/no-upscale geometry, and
-  supported versus deterministically resampled audio rates.
+  supported rates plus 192 kHz PCM deterministically resampled to 48 kHz AAC.
 
 Before processing, pinned ffprobe and full null-decode commands assert the
 fixture streams, codecs, timing, rotation, color and audio facts. After

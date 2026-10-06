@@ -59,6 +59,7 @@ cmake --install "$work/build/svt-av1"
       --prefix="$prefix" --libdir="$prefix/lib" --shlibdir="$prefix/lib" \
       --enable-shared --disable-static --disable-autodetect --disable-doc \
       --disable-debug --disable-network --disable-avdevice --disable-ffplay \
+      --disable-gpl --disable-nonfree \
       --enable-libsvtav1 --enable-libzimg --enable-libaom \
       --extra-cflags="-I$prefix/include" --extra-ldflags="-L$prefix/lib -Wl,-rpath,$prefix/lib" \
       --extra-libs='-lpthread -lm'
@@ -66,8 +67,22 @@ cmake --install "$work/build/svt-av1"
   make install
 )
 
-PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig" \
-  pkg-config --modversion zimg SvtAv1Enc aom
+pkg_env=(env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig")
+[[ "$("${pkg_env[@]}" pkg-config --modversion zimg)" == 3.0.6 ]]
+[[ "$("${pkg_env[@]}" pkg-config --modversion SvtAv1Enc)" == 4.2.0 ]]
+[[ "$("${pkg_env[@]}" pkg-config --modversion aom)" == 3.8.2 ]]
+mkdir -p "$prefix/share/nmcp"
+cat >"$prefix/share/nmcp/video-toolchain.manifest" <<'EOF'
+ffmpeg=9.0.2
+ffmpeg_sha256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
+svt_av1=4.2.0
+svt_av1_sha256=c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740
+zimg=3.0.6
+zimg_sha256=be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577
+libaom=v3.8.2
+configure=shared,no-autodetect,no-network,no-gpl,no-nonfree,libsvtav1,libzimg,libaom
+EOF
 LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64" "$prefix/bin/ffmpeg" -version
+LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64" "$prefix/bin/ffmpeg" -buildconf 2>&1 | grep -F -- '--disable-nonfree'
 LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64" "$prefix/bin/ffmpeg" -hide_banner -encoders 2>&1 | grep -F libsvtav1
 LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64" "$prefix/bin/ffmpeg" -hide_banner -filters 2>&1 | grep -E '(^| )zscale( |$)'
