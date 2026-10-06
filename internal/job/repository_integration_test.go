@@ -353,7 +353,6 @@ func TestCompleteSucceededRejectsExpiredTransformAndPurgeIntegration(t *testing.
 	if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[0]); err != nil {
 		t.Fatal(err)
 	}
-	publishTargetFixture(t, pool, targets[0])
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, jobID); err != nil {
 		t.Fatal(err)
 	}
@@ -450,9 +449,6 @@ func TestTransformTargetsRetryAndCompletionIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	publishTargetFixture(t, pool, targets[1])
-	if err := repository.CompleteSucceeded(ctx, jobID, retry.Token); err != nil {
-		t.Fatal(err)
-	}
 	var status Status
 	if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, jobID).Scan(&status); err != nil || status != StatusSucceeded {
 		t.Fatalf("completed status = %s, %v", status, err)
@@ -940,9 +936,9 @@ func insertTransformJobAt(t *testing.T, pool *pgxpool.Pool, maxAttempts, targetC
 	return jobID, targets
 }
 
-// publishTargetFixture establishes the cross-table invariant owned by the
-// later publication issue without exposing a repository operation that could
-// mark a target succeeded before its rendition is durable and referenced.
+// publishTargetFixture establishes the publication cross-table invariants
+// without exposing a repository operation that could mark a target succeeded
+// before its rendition is durable and referenced.
 func publishTargetFixture(t *testing.T, pool *pgxpool.Pool, targetID string) {
 	t.Helper()
 	ctx := context.Background()
@@ -956,10 +952,19 @@ func publishTargetFixture(t *testing.T, pool *pgxpool.Pool, targetID string) {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO renditions
-		(id,media_id,job_target_id,profile_key,is_current,purge_after,relative_path,mime_type,width,height,size_bytes,sha256)
-		SELECT $1,j.media_id_snapshot,jt.id,'fixture',false,clock_timestamp()+interval '1 day',$2,'image/avif',1,1,1,$3
+		(id,media_id,job_target_id,profile_key,is_current,purge_after,relative_path,mime_type,width,height,size_bytes,sha256,processor_audit)
+		SELECT $1,j.media_id_snapshot,jt.id,'fixture',false,clock_timestamp()+interval '1 day',$2,'image/avif',1,1,1,$3,'{"fixture":"job-repository"}'
 		FROM job_targets jt JOIN jobs j ON j.id=jt.job_id WHERE jt.id=$4`,
 		renditionID, "renditions/fixture/"+renditionID+".avif", strings.Repeat("a", 64), targetID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,
+		finished_at=clock_timestamp(),error_code=NULL,error_message=NULL,updated_at=clock_timestamp()
+		WHERE id=(SELECT job_id FROM job_targets WHERE id=$1)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM job_targets
+		      WHERE job_id=(SELECT job_id FROM job_targets WHERE id=$1) AND status<>'succeeded'
+		  )`, targetID); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {

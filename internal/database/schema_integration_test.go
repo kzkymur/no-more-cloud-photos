@@ -548,8 +548,12 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 					_, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID)
 				}
 				if err == nil {
-					_, err = tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256) VALUES ($1,$2,$3,'ignored',true,$4,'image/avif',1,$5)`,
+					_, err = tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,processor_audit) VALUES ($1,$2,$3,'ignored',true,$4,'image/avif',1,$5,'{"fixture":"current-race"}')`,
 						renditionIDs[index], mediaID, targetID, fmt.Sprintf("renditions/88/concurrent/target-%d/output.avif", index), strings.Repeat(fmt.Sprintf("%x", index+6), 64))
+				}
+				if err == nil {
+					_, err = tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=now()
+						WHERE id=(SELECT job_id FROM job_targets WHERE id=$1)`, targetID)
 				}
 				if err == nil {
 					err = tx.Commit(ctx)
@@ -684,7 +688,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			_, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID)
 		}
 		if err == nil {
-			_, err = tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height) VALUES ($1,$2,$3,'ignored',true,$4,'image/avif',10,$5,1,1)`, renditionID, mediaID, targetID, "renditions/cc/one/target/output.avif", strings.Repeat("e", 64))
+			_, err = tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height,processor_audit) VALUES ($1,$2,$3,'ignored',true,$4,'image/avif',10,$5,1,1,'{"fixture":"publication"}')`, renditionID, mediaID, targetID, "renditions/cc/one/target/output.avif", strings.Repeat("e", 64))
 		}
 		if err == nil {
 			_, err = tx.Exec(ctx, `UPDATE jobs SET status='succeeded', lease_token=NULL, lease_expires_at=NULL, finished_at=now() WHERE id=$1`, jobID)
@@ -701,21 +705,198 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if err := pool.QueryRow(ctx, `SELECT profile_key FROM renditions WHERE id=$1`, renditionID).Scan(&profileKey); err != nil || profileKey != "history-standard" {
 			t.Fatalf("derived rendition profile key = %q, err=%v", profileKey, err)
 		}
-		expectExecError(t, pool, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256) VALUES ($1,$2,$3,'standard',false,$4,'image/avif',1,$5)`, newUUIDv4(t), otherMediaID, targetID, "renditions/dd/bad/target/output.avif", strings.Repeat("f", 64))
+		var processorAudit string
+		if err := pool.QueryRow(ctx, `SELECT processor_audit::text FROM renditions WHERE id=$1`, renditionID).Scan(&processorAudit); err != nil || processorAudit != `{"fixture": "publication"}` {
+			t.Fatalf("processor audit = %q, err=%v", processorAudit, err)
+		}
+		var auditNullable string
+		var auditDefault *string
+		if err := pool.QueryRow(ctx, `SELECT is_nullable,column_default FROM information_schema.columns
+			WHERE table_schema=current_schema() AND table_name='renditions' AND column_name='processor_audit'`).Scan(&auditNullable, &auditDefault); err != nil {
+			t.Fatal(err)
+		}
+		if auditNullable != "NO" || auditDefault != nil {
+			t.Fatalf("processor audit schema = nullable %q default %v", auditNullable, auditDefault)
+		}
+		expectExecError(t, pool, `UPDATE renditions SET processor_audit='{"tampered":true}' WHERE id=$1`, renditionID)
+		expectExecError(t, pool, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,processor_audit) VALUES ($1,$2,$3,'standard',false,$4,'image/avif',1,$5,'{}')`, newUUIDv4(t), otherMediaID, targetID, "renditions/dd/bad/target/output.avif", strings.Repeat("f", 64))
 		expectExecError(t, pool, `UPDATE job_targets SET status='failed', error_code='late', error_message='late edit' WHERE id=$1`, targetID)
 		expectExecError(t, pool, `DELETE FROM job_targets WHERE id=$1`, targetID)
+
+		pendingAggregateTarget := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		expectTxCommitError(t, pool, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=now()
+				WHERE id=(SELECT job_id FROM job_targets WHERE id=$1)`, pendingAggregateTarget)
+			return err
+		})
+
+		for name, auditExpression := range map[string]string{
+			"missing":    "NULL",
+			"non-object": "'[]'::jsonb",
+			"oversized":  "jsonb_build_object('evidence',repeat('x',1048577))",
+		} {
+			t.Run("processor audit "+name, func(t *testing.T) {
+				auditTarget := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+				expectTxCommitError(t, pool, func(tx pgx.Tx) error {
+					if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, auditTarget); err != nil {
+						return err
+					}
+					_, err := tx.Exec(ctx, `INSERT INTO renditions
+						(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,processor_audit)
+						VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',1,$5,`+auditExpression+`)`,
+						newUUIDv4(t), mediaID, auditTarget, "renditions/cc/audit-"+auditTarget+"/output.avif", strings.Repeat("6", 64))
+					return err
+				})
+			})
+		}
+
+		lastTarget := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		expectTxCommitError(t, pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, lastTarget); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO renditions
+				(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,processor_audit)
+				VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',1,$5,'{"fixture":"missing-job-completion"}')`,
+				newUUIDv4(t), mediaID, lastTarget, "renditions/cc/last-"+lastTarget+"/output.avif", strings.Repeat("5", 64))
+			return err
+		})
+
+		secondProfileID := insertDraftProfile(t, pool, "history-thumbnail", 1)
+		partialJobID := newUUIDv4(t)
+		partialTargets := []string{newUUIDv4(t), newUUIDv4(t)}
+		partialTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = partialTx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, partialJobID, originalID, mediaID); err == nil {
+			_, err = partialTx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$3,$4,'pending'),($2,$3,$5,'pending')`, partialTargets[0], partialTargets[1], partialJobID, profileID, secondProfileID)
+		}
+		if err == nil {
+			err = partialTx.Commit(ctx)
+		} else {
+			_ = partialTx.Rollback(ctx)
+		}
+		if err != nil {
+			t.Fatalf("create partial aggregate fixture: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=now()+interval '1 minute',started_at=now() WHERE id=$1`, partialJobID, newUUIDv4(t)); err != nil {
+			t.Fatal(err)
+		}
+		partialPublish, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = partialPublish.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, partialTargets[0]); err == nil {
+			_, err = partialPublish.Exec(ctx, `INSERT INTO renditions
+				(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,processor_audit)
+				VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',1,$5,'{"fixture":"partial"}')`,
+				newUUIDv4(t), mediaID, partialTargets[0], "renditions/cc/partial-"+partialTargets[0]+"/output.avif", strings.Repeat("4", 64))
+		}
+		if err == nil {
+			err = partialPublish.Commit(ctx)
+		} else {
+			_ = partialPublish.Rollback(ctx)
+		}
+		if err != nil {
+			t.Fatalf("commit valid partial running transform: %v", err)
+		}
+
+		concurrentJobID := newUUIDv4(t)
+		concurrentTargets := []string{newUUIDv4(t), newUUIDv4(t)}
+		concurrentTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = concurrentTx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, concurrentJobID, originalID, mediaID); err == nil {
+			_, err = concurrentTx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$3,$4,'pending'),($2,$3,$5,'pending')`, concurrentTargets[0], concurrentTargets[1], concurrentJobID, profileID, secondProfileID)
+		}
+		if err == nil {
+			err = concurrentTx.Commit(ctx)
+		} else {
+			_ = concurrentTx.Rollback(ctx)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=now()+interval '1 minute',started_at=now() WHERE id=$1`, concurrentJobID, newUUIDv4(t)); err != nil {
+			t.Fatal(err)
+		}
+		stageConcurrentTarget := func(tx pgx.Tx, target string, index int) error {
+			if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, target); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO renditions
+				(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,processor_audit)
+				VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',1,$5,'{"fixture":"concurrent-aggregate"}')`,
+				newUUIDv4(t), mediaID, target, fmt.Sprintf("renditions/cc/concurrent-aggregate-%d/output.avif", index), strings.Repeat(fmt.Sprintf("%x", index+2), 64))
+			return err
+		}
+		firstTargetTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := stageConcurrentTarget(firstTargetTx, concurrentTargets[0], 0); err != nil {
+			t.Fatal(err)
+		}
+		secondConn, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer secondConn.Release()
+		var secondPID int32
+		if err := secondConn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&secondPID); err != nil {
+			t.Fatal(err)
+		}
+		secondTargetTx, err := secondConn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondResult := make(chan error, 1)
+		go func() {
+			err := stageConcurrentTarget(secondTargetTx, concurrentTargets[1], 1)
+			if err == nil {
+				err = secondTargetTx.Commit(ctx)
+			} else {
+				_ = secondTargetTx.Rollback(context.Background())
+			}
+			secondResult <- err
+		}()
+		lockDeadline := time.Now().Add(5 * time.Second)
+		for {
+			var waiting bool
+			if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=$1 AND NOT granted)`, secondPID).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting {
+				break
+			}
+			if time.Now().After(lockDeadline) {
+				t.Fatal("concurrent target writer did not wait on the parent job")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := firstTargetTx.Commit(ctx); err != nil {
+			t.Fatalf("commit first partial target: %v", err)
+		}
+		if err := awaitResult(t, secondResult); err == nil {
+			t.Fatal("concurrent last-target writer created an all-succeeded running job")
+		}
+		var concurrentSucceeded int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM job_targets WHERE job_id=$1 AND status='succeeded'`, concurrentJobID).Scan(&concurrentSucceeded); err != nil || concurrentSucceeded != 1 {
+			t.Fatalf("concurrent succeeded targets = %d, err=%v", concurrentSucceeded, err)
+		}
 
 		dimensionTarget := insertPendingTransform(t, pool, mediaID, originalID, profileID)
 		expectTxCommitError(t, pool, func(tx pgx.Tx) error {
 			if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, dimensionTarget); err != nil {
 				return err
 			}
-			_, err := tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height) VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',1,$5,1,NULL)`,
+			_, err := tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height,processor_audit) VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',1,$5,1,NULL,'{}')`,
 				newUUIDv4(t), mediaID, dimensionTarget, "renditions/cc/one/dimension/output.avif", strings.Repeat("7", 64))
 			return err
 		})
 
-		secondProfileID := insertDraftProfile(t, pool, "history-thumbnail", 1)
 		deleteJobID := newUUIDv4(t)
 		deleteTargets := []string{newUUIDv4(t), newUUIDv4(t)}
 		deleteTx, err := pool.Begin(ctx)
