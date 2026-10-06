@@ -8,6 +8,7 @@ import pathlib
 import socket
 import stat
 import sys
+import time
 
 
 def fail(message: str) -> "NoReturn":
@@ -27,7 +28,17 @@ def safe_lock(lock_stat: os.stat_result) -> bool:
     )
 
 
-def send_fd(socket_path: str, lock_path: str, descriptor: int) -> None:
+def process_start(pid: int) -> str | None:
+    try:
+        value = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return value[value.rfind(")") + 2 :].split()[19]
+
+
+def send_fd(
+    socket_path: str, lock_path: str, descriptor: int, owner_pid: int, runner_file: str
+) -> None:
     lock_stat = os.stat(lock_path, follow_symlinks=False)
     if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
         fail("sender descriptor does not name the execution lease")
@@ -37,8 +48,31 @@ def send_fd(socket_path: str, lock_path: str, descriptor: int) -> None:
         listener.bind(socket_path)
         os.chmod(socket_path, 0o600)
         listener.listen(1)
-        listener.settimeout(30)
-        connection, _ = listener.accept()
+        listener.settimeout(0.1)
+        owner_start = process_start(owner_pid)
+        if owner_start is None:
+            fail("dispatch owner is already gone")
+        deadline = time.monotonic() + 3600
+        runner: tuple[int, str] | None = None
+        while True:
+            try:
+                connection, _ = listener.accept()
+                break
+            except TimeoutError:
+                pass
+            if time.monotonic() >= deadline:
+                fail("operation deadline expired before lease transfer")
+            try:
+                fields = pathlib.Path(runner_file).read_text().split()
+                candidate = (int(fields[0]), fields[1])
+                runner = candidate
+            except (FileNotFoundError, IndexError, ValueError):
+                pass
+            if runner is None:
+                if process_start(owner_pid) != owner_start:
+                    fail("dispatch owner died before starting systemd-run")
+            elif process_start(runner[0]) != runner[1]:
+                fail("systemd-run exited before lease transfer")
         with connection:
             rights = array.array("i", [descriptor])
             connection.sendmsg([b"L"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
@@ -48,6 +82,20 @@ def send_fd(socket_path: str, lock_path: str, descriptor: int) -> None:
     finally:
         listener.close()
         pathlib.Path(socket_path).unlink(missing_ok=True)
+        pathlib.Path(runner_file).unlink(missing_ok=True)
+
+
+def record_runner(runner_file: str, pid: int) -> None:
+    start = process_start(pid)
+    if start is None:
+        fail("systemd-run exited before runner registration")
+    descriptor = os.open(
+        runner_file,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w") as target:
+        target.write(f"{pid} {start}\n")
 
 
 def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
@@ -77,9 +125,11 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
     os.execv(command[0], command)
 
 
-if len(sys.argv) >= 5 and sys.argv[1] == "send":
-    send_fd(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+if len(sys.argv) == 7 and sys.argv[1] == "send":
+    send_fd(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
 elif len(sys.argv) >= 5 and sys.argv[1] == "receive":
     receive_fd(sys.argv[2], sys.argv[3], sys.argv[4:])
+elif len(sys.argv) == 4 and sys.argv[1] == "record-runner":
+    record_runner(sys.argv[2], int(sys.argv[3]))
 else:
-    fail("usage: send SOCKET LOCK FD | receive SOCKET LOCK COMMAND [ARG ...]")
+    fail("usage: send SOCKET LOCK FD OWNER_PID RUNNER_FILE | record-runner FILE PID | receive SOCKET LOCK COMMAND [ARG ...]")

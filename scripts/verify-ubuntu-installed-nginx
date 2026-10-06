@@ -80,7 +80,8 @@ fi
 /usr/bin/printf 'host.example.ts.net\n' > /etc/nmcp/tailnet-hostname
 /usr/bin/chmod 0600 /etc/nmcp/tailnet-hostname
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp
-for script in renew-ubuntu-tls capture-trusted-inputs check-ubuntu-tls-expiry verify-ubuntu-tls-certificate; do
+for script in acquire-ubuntu-deployment-locks renew-ubuntu-tls capture-trusted-inputs \
+  check-ubuntu-tls-expiry verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done
 

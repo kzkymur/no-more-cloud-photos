@@ -24,16 +24,11 @@ release_root=/opt/nmcp/releases
 release_path=$release_root/$release_id
 current=/opt/nmcp/current
 evidence=/var/lib/nmcp/deployment
-exec 9>/run/lock/nmcp-deploy.lock
-/usr/bin/flock --exclusive --nonblock 9 || {
-  printf 'install-ubuntu-release: another NMCP deployment operation is active\n' >&2
-  exit 1
-}
-exec 8>/run/lock/nmcp-migration-execution.lock
-/usr/bin/flock --exclusive --nonblock 8 || {
-  printf 'install-ubuntu-release: an orphaned migration execution is still active\n' >&2
-  exit 1
-}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+if [[ ${NMCP_LOCK_MODE:-} != direct ]]; then
+  exec "$script_dir/acquire-ubuntu-deployment-locks" both -- "$0" "$@"
+fi
+"$script_dir/acquire-ubuntu-deployment-locks" verify direct
 
 verify_release() {
   local directory=$1
@@ -144,12 +139,14 @@ stop_services() {
 admin_sequence=0
 run_admin() {
   local admin_release=$1 operation=$2 subcommand=$3
-  local handoff broker status=0 unit
+  local handoff broker runner runner_file status=0 unit
   admin_sequence=$((admin_sequence + 1))
-  handoff=/run/nmcp-migration-handoff.$$.$admin_sequence
+  handoff=/run/nmcp-deploy/migration-handoff.$$.$admin_sequence
+  runner_file=/run/nmcp-deploy/migration-runner.$$.$admin_sequence
   unit=nmcp-deploy-admin-$$-$admin_sequence
   /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock send "$handoff" \
-    /run/lock/nmcp-migration-execution.lock 8 9>&- &
+    /run/nmcp-deploy/migration-execution.lock 8 "$$" \
+    "$runner_file" 9>&- &
   broker=$!
   for attempt in {1..100}; do
     [[ -S $handoff ]] && break
@@ -166,20 +163,36 @@ run_admin() {
     }
     /usr/bin/sleep 0.01
   done
+  if [[ ${NMCP_TEST_PAUSE_BEFORE_ADMIN_DISPATCH:-} == 1 ]]; then
+    /usr/bin/install -o root -g root -m 0600 /dev/null \
+      /run/nmcp-deploy/test-before-admin-dispatch.ready
+    while [[ ! -f /run/nmcp-deploy/test-before-admin-dispatch.go ]]; do
+      /usr/bin/sleep 0.01
+    done
+  fi
   /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="$unit" \
     --property=Slice=nmcp.slice \
     --property="Requires=$postgresql_unit" --property="After=$postgresql_unit" \
     --property=EnvironmentFile=/etc/nmcp/admin.env \
+    --property=TimeoutStartSec=15min --property=RuntimeMaxSec=15min \
     --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
     --property=ProtectSystem=strict --property=ProtectHome=yes \
     -- /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock receive "$handoff" \
-    /run/lock/nmcp-migration-execution.lock \
+    /run/nmcp-deploy/migration-execution.lock \
     /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
     "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json \
-    8>&- 9>&- || status=$?
-  if ((status != 0)); then /usr/bin/kill "$broker" 2>/dev/null || true; fi
+    8>&- 9>&- &
+  runner=$!
+  if ! /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock \
+    record-runner "$runner_file" "$runner"; then
+    /usr/bin/kill "$runner" "$broker" 2>/dev/null || true
+    wait "$runner" 2>/dev/null || true
+    wait "$broker" 2>/dev/null || true
+    return 1
+  fi
+  wait "$runner" || status=$?
   if ! wait "$broker"; then status=1; fi
-  /usr/bin/rm -f -- "$handoff"
+  /usr/bin/rm -f -- "$handoff" "$runner_file"
   return "$status"
 }
 

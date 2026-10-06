@@ -16,6 +16,7 @@ EOF
   exit 2
 }
 
+original_args=("$@")
 config_dir=''
 api_listen=''
 files_listen=''
@@ -43,16 +44,10 @@ done
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd -- "$script_dir/.." && pwd -P)
 
-exec 9>/run/lock/nmcp-deploy.lock
-/usr/bin/flock --exclusive --nonblock 9 || {
-  printf 'install-ubuntu-host: another NMCP deployment operation is active\n' >&2
-  exit 1
-}
-exec 8>/run/lock/nmcp-migration-execution.lock
-/usr/bin/flock --exclusive --nonblock 8 || {
-  printf 'install-ubuntu-host: an orphaned migration execution is still active\n' >&2
-  exit 1
-}
+if [[ ${NMCP_LOCK_MODE:-} != direct ]]; then
+  exec "$script_dir/acquire-ubuntu-deployment-locks" both -- "$0" "${original_args[@]}"
+fi
+"$script_dir/acquire-ubuntu-deployment-locks" verify direct
 read -r files_load files_active files_sub < <(
   /usr/bin/systemctl show nmcp-files.service \
     --property=LoadState --property=ActiveState --property=SubState --value \
@@ -174,7 +169,8 @@ done
   /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp /usr/share/doc/nmcp
 for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
-  capture-trusted-inputs handoff-ubuntu-migration-lock run-ubuntu-migration validate-ubuntu-config \
+  acquire-ubuntu-deployment-locks capture-trusted-inputs handoff-ubuntu-migration-lock \
+  run-ubuntu-migration validate-ubuntu-config \
   verify-ubuntu-firewall verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done

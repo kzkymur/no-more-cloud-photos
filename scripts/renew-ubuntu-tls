@@ -8,12 +8,10 @@ if [[ $# -ne 2 ]]; then
 fi
 [[ $EUID -eq 0 ]] || { printf 'renew-ubuntu-tls: must run as root\n' >&2; exit 1; }
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-exec 9>/run/lock/nmcp-deploy.lock
-/usr/bin/flock --exclusive --nonblock 9 || { printf 'renew-ubuntu-tls: another NMCP deployment operation is active\n' >&2; exit 1; }
-exec 8>/run/lock/nmcp-migration-execution.lock
-/usr/bin/flock --exclusive --nonblock 8 || {
-  printf 'renew-ubuntu-tls: an orphaned migration execution is still active\n' >&2; exit 1;
-}
+if [[ ${NMCP_LOCK_MODE:-} != direct ]]; then
+  exec "$script_dir/acquire-ubuntu-deployment-locks" both -- "$0" "$@"
+fi
+"$script_dir/acquire-ubuntu-deployment-locks" verify direct
 hostname=$(</etc/nmcp/tailnet-hostname)
 active_state=$(/usr/bin/systemctl show nmcp-files.service --property=ActiveState --value)
 sub_state=$(/usr/bin/systemctl show nmcp-files.service --property=SubState --value)

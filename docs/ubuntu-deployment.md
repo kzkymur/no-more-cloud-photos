@@ -125,7 +125,11 @@ are refused before any asset changes.
 
 All stage/activate/rollback/host/TLS mutations and every direct or
 dependency-triggered `nmcp-migrate.service` execution share the deployment
-serializer. The installer process itself opens and retains the primary lock FD
+serializer. Both stable lock inodes live below root:root mode-0700
+`/run/nmcp-deploy`, not the world-writable `/run/lock`. A no-follow dirfd opener
+creates them mode 0600 and rejects symlinks, non-regular files, foreign
+ownership, extra hard links, mode drift, or pathname/inode replacement before
+locking. The installer process itself opens and retains the primary lock FD
 across link, exact-release migration,
 service-state, and evidence mutations. It then publishes root-only completion
 evidence; the systemd singleton consumes that evidence without doing database
@@ -138,6 +142,10 @@ receiver verifies the descriptor and acknowledges ownership before database
 work. Thus installer death before transfer prevents execution, while death after
 transfer leaves the child holding the lease and blocks every new
 host/release/TLS/direct-migration mutation until the exact binary exits.
+The broker tracks the exact `systemd-run` PID/start time rather than expiring
+while PostgreSQL is still starting: it remains valid through the concrete
+database unit's bounded start job and the transient admin deadline, and releases
+automatically if the dispatch owner or runner exits before transfer.
 Successful oneshot migration remains active so production
 API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.

@@ -1,0 +1,144 @@
+#!/usr/bin/python3
+"""Safely establish NMCP deployment locks and exec their owner."""
+
+import fcntl
+import os
+import stat
+import sys
+
+
+RUNTIME = "/run/nmcp-deploy"
+PRIMARY = "deploy.lock"
+EXECUTION = "migration-execution.lock"
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(f"acquire-ubuntu-deployment-locks: {message}")
+
+
+def runtime_fd() -> int:
+    parent = os.stat("/run", follow_symlinks=False)
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_gid != 0:
+        fail("/run is not a trusted root-owned directory")
+    try:
+        os.mkdir(RUNTIME, 0o700)
+    except FileExistsError:
+        pass
+    descriptor = os.open(RUNTIME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    current = os.fstat(descriptor)
+    path = os.stat(RUNTIME, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_uid != 0
+        or current.st_gid != 0
+        or stat.S_IMODE(current.st_mode) != 0o700
+        or (current.st_dev, current.st_ino) != (path.st_dev, path.st_ino)
+    ):
+        fail("runtime directory must be stable root:root mode 0700")
+    return descriptor
+
+
+def lock_fd(directory: int, name: str) -> int:
+    descriptor = os.open(
+        name,
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=directory,
+    )
+    current = os.fstat(descriptor)
+    path = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_uid != 0
+        or current.st_gid != 0
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or current.st_nlink != 1
+        or (current.st_dev, current.st_ino) != (path.st_dev, path.st_ino)
+    ):
+        fail(f"{name} must be a stable root:root mode 0600 single-link regular file")
+    return descriptor
+
+
+def install_fd(source: int, target: int) -> None:
+    temporary = fcntl.fcntl(source, fcntl.F_DUPFD_CLOEXEC, 10)
+    os.dup2(temporary, target, inheritable=True)
+    os.close(temporary)
+
+
+def locked(descriptor: int) -> bool:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def exec_owner(mode: str, command: list[str]) -> None:
+    os.umask(0o077)
+    directory = runtime_fd()
+    primary = lock_fd(directory, PRIMARY)
+    execution = lock_fd(directory, EXECUTION)
+    direct = locked(primary)
+    if mode == "both":
+        if not direct:
+            fail("another NMCP deployment operation is active")
+        if not locked(execution):
+            fail("an orphaned migration execution is still active")
+        lock_mode = "direct"
+    elif mode == "migration":
+        if direct:
+            if not locked(execution):
+                fail("an orphaned migration execution is still active")
+            lock_mode = "direct"
+        else:
+            if locked(execution):
+                fcntl.flock(execution, fcntl.LOCK_UN)
+                fail("deployment owner does not hold the execution lease")
+            lock_mode = "delegated"
+    else:
+        fail("unknown acquisition mode")
+    install_fd(primary, 9)
+    install_fd(execution, 8)
+    os.close(primary)
+    os.close(execution)
+    os.close(directory)
+    environment = os.environ.copy()
+    environment["NMCP_LOCK_MODE"] = lock_mode
+    os.execve(command[0], command, environment)
+
+
+def verify(mode: str) -> None:
+    directory = runtime_fd()
+    expected = ((9, PRIMARY), (8, EXECUTION))
+    for descriptor, name in expected:
+        current = os.fstat(descriptor)
+        path = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_uid != 0
+            or current.st_gid != 0
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or current.st_nlink != 1
+            or (current.st_dev, current.st_ino) != (path.st_dev, path.st_ino)
+        ):
+            fail(f"FD {descriptor} is not the stable {name}")
+    if mode == "direct":
+        if not locked(9) or not locked(8):
+            fail("direct owner does not hold both deployment locks")
+    elif mode == "delegated":
+        if locked(9):
+            fcntl.flock(9, fcntl.LOCK_UN)
+            fail("delegated consumer unexpectedly acquired the primary lock")
+        if locked(8):
+            fcntl.flock(8, fcntl.LOCK_UN)
+            fail("delegated consumer lacks an execution-lease owner")
+    else:
+        fail("unknown verification mode")
+
+
+if len(sys.argv) >= 4 and sys.argv[1] in {"both", "migration"} and sys.argv[2] == "--":
+    exec_owner(sys.argv[1], sys.argv[3:])
+elif len(sys.argv) == 3 and sys.argv[1] == "verify":
+    verify(sys.argv[2])
+else:
+    fail("usage: (both|migration) -- COMMAND [ARG ...] | verify MODE")

@@ -60,6 +60,8 @@ def main() -> int:
         ROOT / "scripts" / "verify-ubuntu-firewall",
         ROOT / "scripts" / "capture-trusted-inputs",
         ROOT / "scripts" / "check-ubuntu-services",
+        ROOT / "scripts" / "acquire-ubuntu-deployment-locks",
+        ROOT / "scripts" / "handoff-ubuntu-migration-lock",
     ]
     for script in python_scripts:
         require(os.access(script, os.X_OK), f"{script.name} is not executable")
@@ -94,11 +96,12 @@ def main() -> int:
             f"{dependent} lost its production migration dependency edge",
         )
     require(
-        "f /run/lock/nmcp-deploy.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "d /run/nmcp-deploy 0700 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf")
+        and "f /run/nmcp-deploy/deploy.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
         "shared migration lock ownership/mode is missing",
     )
     require(
-        "f /run/lock/nmcp-migration-execution.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "f /run/nmcp-deploy/migration-execution.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
         "owner-death migration execution lease is missing",
     )
     host_install = text(ROOT / "scripts" / "install-ubuntu-host")
