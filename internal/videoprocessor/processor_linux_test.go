@@ -187,13 +187,13 @@ func inspectionJSON(i Inspection) string {
 }
 
 func auditJSON(i Inspection, digest string) string {
-	versions := `{"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libheif":"1.23.5","libaom":"v3.8.2"}`
+	versions := `{"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libaom":"v3.8.2"}`
 	return fmt.Sprintf(`{"tool_version":"nmcp-video-helper/1","build_manifest":"%s","library_versions":%s,"icc_sha256":"%s","demuxer":"mov","video_decoder":"h264","audio_decoder":"none","video_encoder":"libsvtav1","audio_encoder":"none","muxer":"mp4","selected_video_stream":%d,"selected_audio_stream":%d,"stream_selection":"default-first-then-index","rotation_source":"none","rotation_degrees_applied":0,"orientation":"identity","geometry":"display-aspect-square-pixel-even-floor-no-upscale","timing":"preserve-presentation-order-vfr-rebase-zero","video_filter_graph":"setsar+scale+format","audio_filter_graph":"none","input_color":"bt709","output_color":"bt709-sdr-100nit","output_primaries":"bt709","output_transfer":"bt709","output_matrix":"bt709","output_range":"limited","hdr_disposition":"sdr-normalized","tone_map":"not-needed","target_nits":100,"source_peak_nits":0,"input_audio_layout":"none","output_audio_layout":"none","input_audio_sample_rate":0,"output_audio_sample_rate":0,"metadata":"strip-after-normalization-keep-color-tags"}`, BuildManifest, versions, digest, i.VideoStreamIndex, i.AudioStreamIndex)
 }
 
 func capabilityJSON(digest string) string {
 	return fmt.Sprintf(`#!/bin/sh
-printf '%%s' '{"protocol":1,"ok":true,"error_code":"","result":{"helper_version":"nmcp-video-helper/1","library_versions":{"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libheif":"1.23.5","libaom":"v3.8.2"},"decoder_mime_types":["video/mp4","video/quicktime"],"output_kinds":["first-frame-avif","mp4-av1"],"video_encoder":"libsvtav1","audio_encoder":"aac-lc","video_muxer":"mp4","tone_map":"zscale+hable","icc_sha256":"%s","threads":1,"build_manifest":"%s"}}'
+printf '%%s' '{"protocol":1,"ok":true,"error_code":"","result":{"helper_version":"nmcp-video-helper/1","library_versions":{"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libaom":"v3.8.2"},"decoder_mime_types":["video/mp4","video/quicktime"],"output_kinds":["first-frame-avif","mp4-av1"],"video_encoder":"libsvtav1","audio_encoder":"aac-lc","video_muxer":"mp4","tone_map":"zscale+hable","icc_sha256":"%s","threads":1,"build_manifest":"%s"}}'
 `, digest, BuildManifest)
 }
 

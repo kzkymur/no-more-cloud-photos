@@ -7,7 +7,7 @@ import "time"
 const (
 	protocolVersion = 1
 	helperVersion   = "nmcp-video-helper/1"
-	buildManifest   = "ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libheif=1.23.5;libaom=v3.8.2;threads=1"
+	buildManifest   = "ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1"
 
 	maxStreams       = 32
 	maxDimension     = 16_384
@@ -23,7 +23,7 @@ const (
 )
 
 var versions = map[string]string{
-	"ffmpeg": "9.0.2", "libsvtav1": "4.2.0", "zimg": "3.0.6", "libheif": "1.23.5", "libaom": "v3.8.2",
+	"ffmpeg": "9.0.2", "libsvtav1": "4.2.0", "zimg": "3.0.6", "libaom": "v3.8.2",
 }
 
 type rational struct {

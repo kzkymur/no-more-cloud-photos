@@ -22,7 +22,7 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 )
 
-const BuildManifest = "ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libheif=1.23.5;libaom=v3.8.2;threads=1"
+const BuildManifest = "ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1"
 
 type Config struct {
 	Helper        string
@@ -464,7 +464,7 @@ func validateCapability(r capabilityWire, digest string) error {
 }
 
 func validateVersionMap(v map[string]string) error {
-	expected := map[string]string{"ffmpeg": "9.0.2", "libsvtav1": "4.2.0", "zimg": "3.0.6", "libheif": "1.23.5", "libaom": "v3.8.2"}
+	expected := map[string]string{"ffmpeg": "9.0.2", "libsvtav1": "4.2.0", "zimg": "3.0.6", "libaom": "v3.8.2"}
 	if len(v) != len(expected) {
 		return ErrProcess
 	}
