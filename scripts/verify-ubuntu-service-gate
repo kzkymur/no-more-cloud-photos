@@ -65,15 +65,13 @@ for unit in nmcp-check-api.service nmcp-check.target postgresql@nmcp-check.servi
   fi
   /usr/bin/systemctl start "$unit"
 done
-/usr/bin/systemctl stop nmcp-check-worker.service
-/usr/bin/systemctl reset-failed nmcp-check-worker.service
-/usr/bin/systemctl start nmcp-check-worker.service
 cat > /run/systemd/system/nmcp-check-worker.service <<'EOF'
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/false
 EOF
 /usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed nmcp-check-worker.service || true
 /usr/bin/systemctl restart nmcp-check-worker.service >/dev/null 2>&1 || true
 if "${check[@]}" >/dev/null 2>&1; then
   printf 'failed Worker incorrectly passed whole-service gate\n' >&2; exit 1
