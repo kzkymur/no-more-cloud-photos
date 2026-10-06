@@ -5,8 +5,10 @@ package transformexecutor
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -22,21 +24,23 @@ import (
 )
 
 const (
-	jobID      = "10000000-0000-4000-8000-000000000001"
-	mediaID    = "20000000-0000-4000-8000-000000000001"
-	originalID = "30000000-0000-4000-8000-000000000001"
-	targetID   = "40000000-0000-4000-8000-000000000001"
-	attemptOne = "50000000-0000-4000-8000-000000000001"
-	attemptTwo = "50000000-0000-4000-8000-000000000002"
-	renderOne  = "70000000-0000-4000-8000-000000000001"
-	renderTwo  = "70000000-0000-4000-8000-000000000002"
+	jobID       = "10000000-0000-4000-8000-000000000001"
+	mediaID     = "20000000-0000-4000-8000-000000000001"
+	originalID  = "30000000-0000-4000-8000-000000000001"
+	targetID    = "40000000-0000-4000-8000-000000000001"
+	attemptOne  = "50000000-0000-4000-8000-000000000001"
+	attemptTwo  = "50000000-0000-4000-8000-000000000002"
+	renderOne   = "70000000-0000-4000-8000-000000000001"
+	renderTwo   = "70000000-0000-4000-8000-000000000002"
+	renderThree = "70000000-0000-4000-8000-000000000003"
 )
 
 type fakeRepository struct {
-	events     *[]string
-	candidates []job.Rendition
-	publishErr error
-	marks      []job.FailureCode
+	events      *[]string
+	candidates  []job.Rendition
+	publishErr  error
+	publishHook func(job.Rendition) error
+	marks       []job.FailureCode
 }
 
 func (repository *fakeRepository) BeginTarget(context.Context, string, string, string) error {
@@ -52,6 +56,9 @@ func (repository *fakeRepository) MarkTargetFailed(_ context.Context, _, _, _ st
 func (repository *fakeRepository) PublishRendition(_ context.Context, candidate job.Rendition) (job.Publication, error) {
 	*repository.events = append(*repository.events, "db-publish")
 	repository.candidates = append(repository.candidates, candidate)
+	if repository.publishHook != nil {
+		return job.Publication{}, repository.publishHook(candidate)
+	}
 	return job.Publication{}, repository.publishErr
 }
 
@@ -275,6 +282,253 @@ func TestExecutorNeverAbortsAfterPublication(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecutorRealStorePublishesDurablyBeforeDatabase(t *testing.T) {
+	root := t.TempDir()
+	var boundaries []storage.FaultEvent
+	store := openExecutorStore(t, root, storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+		boundaries = append(boundaries, event)
+		return nil
+	}))
+	lease := leaseFor(t, "image/jpeg", attemptOne, 1, 0)
+	publishExecutorOriginal(t, store, lease)
+	boundaries = nil
+
+	events := []string{}
+	repository := &fakeRepository{events: &events}
+	repository.publishHook = func(candidate job.Rendition) error {
+		want := []storage.FaultEvent{
+			{Boundary: storage.BoundaryFileSync, Phase: storage.After, Key: candidate.RelativePath},
+			{Boundary: storage.BoundaryRename, Phase: storage.After, Key: candidate.RelativePath},
+			{Boundary: storage.BoundaryFinalDirectorySync, Phase: storage.After, Key: candidate.RelativePath},
+		}
+		position := 0
+		for _, event := range boundaries {
+			if position < len(want) && event == want[position] {
+				position++
+			}
+		}
+		if position != len(want) {
+			t.Fatalf("completed publish boundaries before DB = %v, want ordered %v", boundaries, want)
+		}
+		contents, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(candidate.RelativePath)))
+		if err != nil {
+			t.Fatalf("read durable rendition at DB boundary: %v", err)
+		}
+		digest := sha256.Sum256(contents)
+		if string(contents) != "still" || candidate.SizeBytes != int64(len(contents)) || candidate.SHA256 != hex.EncodeToString(digest[:]) {
+			t.Fatalf("candidate does not describe durable bytes: candidate=%+v bytes=%q", candidate, contents)
+		}
+		return nil
+	}
+	executor := realStoreExecutor(t, repository, store, []string{renderOne})
+	if err := executor.Execute(context.Background(), lease, executionLimits()); err != nil {
+		t.Fatal(err)
+	}
+	if len(repository.candidates) != 1 {
+		t.Fatalf("database publications = %d, want 1", len(repository.candidates))
+	}
+}
+
+func TestExecutorRealStorePublicationFaultsPreserveOrphanRules(t *testing.T) {
+	fault := errors.New("injected publication fault")
+	for _, test := range []struct {
+		name             string
+		boundary         storage.Boundary
+		phase            storage.Phase
+		published        bool
+		uncertain        bool
+		wantPublishError bool
+	}{
+		{name: "before rename", boundary: storage.BoundaryRename, phase: storage.Before},
+		{name: "after rename", boundary: storage.BoundaryRename, phase: storage.After, published: true, uncertain: true, wantPublishError: true},
+		{name: "after directory fsync", boundary: storage.BoundaryFinalDirectorySync, phase: storage.After, published: true, wantPublishError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			armed := false
+			store := openExecutorStore(t, root, storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+				if armed && event.Boundary == test.boundary && event.Phase == test.phase {
+					return fault
+				}
+				return nil
+			}))
+			lease := leaseFor(t, "image/jpeg", attemptOne, 1, 0)
+			publishExecutorOriginal(t, store, lease)
+			armed = true
+			events := []string{}
+			repository := &fakeRepository{events: &events}
+			executor := realStoreExecutor(t, repository, store, []string{renderOne})
+			err := executor.Execute(context.Background(), lease, executionLimits())
+			if !errors.Is(err, fault) {
+				t.Fatalf("Execute() error = %v, want injected fault", err)
+			}
+			var publishError *storage.PublishError
+			if got := errors.As(err, &publishError); got != test.wantPublishError {
+				t.Fatalf("PublishError present = %v, want %v: %v", got, test.wantPublishError, err)
+			}
+			if publishError != nil && (publishError.Published != test.published || publishError.Uncertain != test.uncertain) {
+				t.Fatalf("PublishError = %+v, want published=%v uncertain=%v", publishError, test.published, test.uncertain)
+			}
+			if len(repository.candidates) != 0 {
+				t.Fatalf("database publications = %d, want 0", len(repository.candidates))
+			}
+
+			finalPath, tempPath := renditionPaths(root, renderOne, attemptOne)
+			_, finalErr := os.Stat(finalPath)
+			if test.published && finalErr != nil {
+				t.Fatalf("published final missing: %v", finalErr)
+			}
+			if test.published {
+				contents, err := os.ReadFile(finalPath)
+				if err != nil || string(contents) != "still" {
+					t.Fatalf("published final bytes = %q, %v", contents, err)
+				}
+			}
+			if !test.published && !errors.Is(finalErr, os.ErrNotExist) {
+				t.Fatalf("pre-rename final exists: %v", finalErr)
+			}
+			if _, err := os.Stat(tempPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("temporary file survived executor cleanup: %v", err)
+			}
+		})
+	}
+}
+
+func TestExecutorRealStoreRetryUsesFreshRenditionAndCollisionNeverOverwrites(t *testing.T) {
+	t.Run("fresh retry preserves first orphan", func(t *testing.T) {
+		root := t.TempDir()
+		store := openExecutorStore(t, root, nil)
+		firstLease := leaseFor(t, "image/jpeg", attemptOne, 1, 0)
+		publishExecutorOriginal(t, store, firstLease)
+		events := []string{}
+		databaseFault := errors.New("database publication failed")
+		repository := &fakeRepository{events: &events}
+		repository.publishHook = func(job.Rendition) error {
+			if len(repository.candidates) == 1 {
+				return databaseFault
+			}
+			return nil
+		}
+		executor := realStoreExecutor(t, repository, store, []string{renderOne, renderTwo})
+		if err := executor.Execute(context.Background(), firstLease, executionLimits()); !errors.Is(err, databaseFault) {
+			t.Fatalf("first Execute() error = %v", err)
+		}
+		firstPath, _ := renditionPaths(root, renderOne, attemptOne)
+		firstBytes, err := os.ReadFile(firstPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondLease := leaseFor(t, "image/jpeg", attemptTwo, 2, 1)
+		if err := executor.Execute(context.Background(), secondLease, executionLimits()); err != nil {
+			t.Fatal(err)
+		}
+		secondPath, _ := renditionPaths(root, renderTwo, attemptTwo)
+		secondBytes, err := os.ReadFile(secondPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unchanged, err := os.ReadFile(firstPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if firstPath == secondPath || string(firstBytes) != "still" || string(secondBytes) != "still" || !slices.Equal(unchanged, firstBytes) {
+			t.Fatalf("retry files: first=%q unchanged=%q second=%q", firstBytes, unchanged, secondBytes)
+		}
+		if len(repository.candidates) != 2 || repository.candidates[0].ID == repository.candidates[1].ID {
+			t.Fatalf("publication candidates = %+v", repository.candidates)
+		}
+	})
+
+	t.Run("forced UUID reuse collides without overwrite or DB call", func(t *testing.T) {
+		root := t.TempDir()
+		store := openExecutorStore(t, root, nil)
+		firstLease := leaseFor(t, "image/jpeg", attemptOne, 1, 0)
+		publishExecutorOriginal(t, store, firstLease)
+		events := []string{}
+		repository := &fakeRepository{events: &events}
+		executor := realStoreExecutor(t, repository, store, []string{renderOne, renderOne})
+		if err := executor.Execute(context.Background(), firstLease, executionLimits()); err != nil {
+			t.Fatal(err)
+		}
+		finalPath, _ := renditionPaths(root, renderOne, attemptOne)
+		before, err := os.ReadFile(finalPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := executor.Execute(context.Background(), leaseFor(t, "image/jpeg", attemptTwo, 2, 1), executionLimits()); !errors.Is(err, storage.ErrCollision) {
+			t.Fatalf("UUID reuse error = %v, want ErrCollision", err)
+		}
+		after, err := os.ReadFile(finalPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(after, before) || len(repository.candidates) != 1 {
+			t.Fatalf("collision changed final or called DB: before=%q after=%q calls=%d", before, after, len(repository.candidates))
+		}
+		_, secondTemp := renditionPaths(root, renderOne, attemptTwo)
+		if _, err := os.Stat(secondTemp); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("collision temporary survived: %v", err)
+		}
+	})
+}
+
+func openExecutorStore(t *testing.T, root string, faults storage.FaultInjector) *storage.Store {
+	t.Helper()
+	store, err := storage.Open(root, storage.Options{Faults: faults})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close storage: %v", err)
+		}
+	})
+	return store
+}
+
+func publishExecutorOriginal(t *testing.T, store *storage.Store, lease job.Lease) {
+	t.Helper()
+	key, err := storage.ParseOriginalKey(lease.Original.RelativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, _ := storage.ParseAttemptID("50000000-0000-4000-8000-000000000099")
+	temporary, err := store.BeginOriginal(context.Background(), key, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Write([]byte("original")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Publish(context.Background(), storage.Validation{ExpectedSize: int64(len("original"))}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func realStoreExecutor(t *testing.T, repository Repository, store *storage.Store, ids []string) *Executor {
+	t.Helper()
+	processors := &fakeProcessors{}
+	index := 0
+	executor, err := New(repository, StoreAdapter{Store: store}, processors, animationAdapter{processors}, videoAdapter{processors}, Options{
+		UUID: func() (string, error) {
+			id := ids[index]
+			index++
+			return id, nil
+		},
+		AbortTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return executor
+}
+
+func renditionPaths(root, renditionID, attemptID string) (string, string) {
+	key := filepath.Join(root, "renditions", originalID[:2], originalID, targetID, renditionID+".avif")
+	temporary := filepath.Join(filepath.Dir(key), "."+filepath.Base(key)+"."+attemptID+".tmp")
+	return key, temporary
 }
 
 func fixture(t *testing.T, classification animationprocessor.Classification, storageErr, databaseErr error, ids []string) (*Executor, *fakeRepository, *fakeStorage, *fakeProcessors) {
