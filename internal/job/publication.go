@@ -49,7 +49,7 @@ func (r *Repository) PublishRendition(ctx context.Context, candidate Rendition) 
 	var token *string
 	var leaseLive bool
 	err = tx.QueryRow(ctx, `SELECT j.type,j.status,j.original_id::text,j.media_id_snapshot::text,j.lease_token::text,
-		j.lease_expires_at>clock_timestamp(),jt.status,p.id::text,p.key,p.version,p.status,p.processor,
+		COALESCE(j.lease_expires_at>clock_timestamp(),false),jt.status,p.id::text,p.key,p.version,p.status,p.processor,
 		p.parameters_schema_version,p.input_mime_types,p.parameters
 		FROM jobs j JOIN job_targets jt ON jt.job_id=j.id JOIN profiles p ON p.id=jt.profile_id
 		WHERE j.id=$1 AND jt.id=$2 FOR UPDATE OF j,jt`, candidate.JobID, candidate.TargetID).Scan(
