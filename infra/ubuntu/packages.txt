@@ -8,4 +8,5 @@ libimage-exiftool-perl
 nginx-core
 postgresql
 tzdata
+ufw
 util-linux

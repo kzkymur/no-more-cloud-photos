@@ -4,10 +4,13 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 usage: install-ubuntu-host --config-dir DIR --api-listen IP:PORT \
-  --files-listen IP:PORT --tailnet-hostname NAME --tls-cert FILE --tls-key FILE
+  --files-listen IP:PORT --tailnet-hostname NAME \
+  --postgresql-unit postgresql@VERSION-CLUSTER.service \
+  --tls-cert FILE --tls-key FILE
 
-Installs (but does not start) Ubuntu system assets. DIR must contain admin.env,
-api.env, and worker.env with no example replacement markers.
+Installs (but does not start) Ubuntu system assets. Inputs must be below
+root-owned, non-group/world-writable paths. UFW must already be active with
+default incoming deny and exact Tailnet-interface rules for both TLS ports.
 EOF
   exit 2
 }
@@ -16,6 +19,7 @@ config_dir=''
 api_listen=''
 files_listen=''
 tailnet_hostname=''
+postgresql_unit=''
 tls_cert=''
 tls_key=''
 while (($#)); do
@@ -24,6 +28,7 @@ while (($#)); do
     --api-listen) (($# >= 2)) || usage; api_listen=$2; shift 2 ;;
     --files-listen) (($# >= 2)) || usage; files_listen=$2; shift 2 ;;
     --tailnet-hostname) (($# >= 2)) || usage; tailnet_hostname=$2; shift 2 ;;
+    --postgresql-unit) (($# >= 2)) || usage; postgresql_unit=$2; shift 2 ;;
     --tls-cert) (($# >= 2)) || usage; tls_cert=$2; shift 2 ;;
     --tls-key) (($# >= 2)) || usage; tls_key=$2; shift 2 ;;
     -h|--help) usage ;;
@@ -32,13 +37,18 @@ while (($#)); do
 done
 
 [[ $EUID -eq 0 ]] || { printf 'install-ubuntu-host: must run as root\n' >&2; exit 1; }
-[[ -n $config_dir && -n $api_listen && -n $files_listen && -n $tailnet_hostname && -n $tls_cert && -n $tls_key ]] || usage
-
+[[ -n $config_dir && -n $api_listen && -n $files_listen && -n $tailnet_hostname \
+  && -n $postgresql_unit && -n $tls_cert && -n $tls_key ]] || usage
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd -- "$script_dir/.." && pwd -P)
 
-for command in /usr/sbin/nginx /usr/bin/systemd-analyze /usr/bin/systemd-sysusers \
-  /usr/bin/systemd-tmpfiles /usr/bin/openssl /usr/bin/python3; do
+exec 9>/run/lock/nmcp-deploy.lock
+/usr/bin/flock --exclusive --nonblock 9 || {
+  printf 'install-ubuntu-host: another NMCP deployment operation is active\n' >&2
+  exit 1
+}
+for command in /usr/sbin/nginx /usr/sbin/ufw /usr/bin/systemd-analyze \
+  /usr/bin/systemd-sysusers /usr/bin/systemd-tmpfiles /usr/bin/openssl /usr/bin/python3; do
   [[ -x $command ]] || { printf 'install-ubuntu-host: missing %s\n' "$command" >&2; exit 1; }
 done
 /usr/bin/python3 - <<'PY'
@@ -51,55 +61,87 @@ with open("/etc/os-release", encoding="utf-8") as source:
 if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "24.04":
     raise SystemExit("install-ubuntu-host: only Ubuntu 24.04 is supported")
 PY
-for name in admin.env api.env worker.env; do
-  source_file=$config_dir/$name
-  [[ -f $source_file && ! -L $source_file ]] || {
-    printf 'install-ubuntu-host: missing regular %s\n' "$source_file" >&2
-    exit 1
-  }
-  if /usr/bin/python3 - "$source_file" <<'PY'
-import pathlib, sys
-text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-raise SystemExit(0 if "REPLACE_" in text or "REPLACE_WITH" in text else 1)
+
+[[ $(/usr/bin/systemctl show --property=LoadState --value "$postgresql_unit") == loaded ]] || {
+  printf 'install-ubuntu-host: concrete PostgreSQL unit is not loaded: %s\n' "$postgresql_unit" >&2
+  exit 1
+}
+capture=$(/usr/bin/mktemp -d /run/nmcp-host-input.XXXXXX)
+cleanup() { /usr/bin/rm -rf -- "$capture"; }
+trap cleanup EXIT
+"$script_dir/capture-trusted-inputs" "$capture" \
+  "$config_dir/admin.env" admin.env "$config_dir/api.env" api.env \
+  "$config_dir/worker.env" worker.env "$tls_cert" cert.pem "$tls_key" key.pem
+"$script_dir/validate-ubuntu-config" --config-dir "$capture" \
+  --tailnet-hostname "$tailnet_hostname" --files-listen "$files_listen"
+
+read -r tailnet_ip api_port files_port < <(/usr/bin/python3 - "$api_listen" "$files_listen" <<'PY'
+import ipaddress, sys
+def split(value):
+    if value.startswith("["):
+        end = value.index("]")
+        return str(ipaddress.ip_address(value[1:end])), int(value[end + 2:])
+    host, port = value.rsplit(":", 1)
+    return str(ipaddress.ip_address(host)), int(port)
+api_ip, api_port = split(sys.argv[1])
+files_ip, files_port = split(sys.argv[2])
+if api_ip != files_ip:
+    raise SystemExit("API and File Server listeners must use the same reviewed Tailnet IP")
+print(api_ip, api_port, files_port)
 PY
-  then
-    printf 'install-ubuntu-host: replacement marker remains in %s\n' "$source_file" >&2
-    exit 1
-  fi
-done
-[[ -f $tls_cert && ! -L $tls_cert && -f $tls_key && ! -L $tls_key ]] || {
-  printf 'install-ubuntu-host: TLS inputs must be regular, non-symlink files\n' >&2
-  exit 1
+)
+"$script_dir/verify-ubuntu-firewall" --tailnet-ip "$tailnet_ip" \
+  --api-port "$api_port" --files-port "$files_port"
+
+/usr/bin/openssl x509 -in "$capture/cert.pem" -noout -checkend 604800 >/dev/null || {
+  printf 'install-ubuntu-host: TLS certificate must remain valid for at least seven days\n' >&2; exit 1;
 }
-/usr/bin/openssl x509 -in "$tls_cert" -noout >/dev/null
-/usr/bin/openssl x509 -in "$tls_cert" -noout -checkend 0 >/dev/null || {
-  printf 'install-ubuntu-host: TLS certificate is expired\n' >&2
-  exit 1
+/usr/bin/openssl x509 -in "$capture/cert.pem" -noout -checkhost "$tailnet_hostname" >/dev/null || {
+  printf 'install-ubuntu-host: TLS certificate does not cover %s\n' "$tailnet_hostname" >&2; exit 1;
 }
-/usr/bin/openssl x509 -in "$tls_cert" -noout -checkhost "$tailnet_hostname" >/dev/null || {
-  printf 'install-ubuntu-host: TLS certificate does not cover %s\n' "$tailnet_hostname" >&2
-  exit 1
-}
-cert_public=$(/usr/bin/openssl x509 -in "$tls_cert" -pubkey -noout | /usr/bin/openssl sha256)
-key_public=$(/usr/bin/openssl pkey -in "$tls_key" -pubout | /usr/bin/openssl sha256)
+cert_public=$(/usr/bin/openssl x509 -in "$capture/cert.pem" -pubkey -noout | /usr/bin/openssl sha256)
+key_public=$(/usr/bin/openssl pkey -in "$capture/key.pem" -pubout | /usr/bin/openssl sha256)
 [[ $cert_public == "$key_public" ]] || {
-  printf 'install-ubuntu-host: TLS certificate and key do not match\n' >&2
-  exit 1
+  printf 'install-ubuntu-host: TLS certificate and key do not match\n' >&2; exit 1;
 }
 
-/usr/bin/install -d -o root -g root -m 0700 /etc/nmcp
+/usr/bin/install -d -o root -g root -m 0700 /etc/nmcp /etc/nmcp/tls-releases
 for name in admin.env api.env worker.env; do
-  /usr/bin/install -o root -g root -m 0600 "$config_dir/$name" "/etc/nmcp/$name"
+  /usr/bin/install -o root -g root -m 0600 "$capture/$name" "/etc/nmcp/$name"
 done
-/usr/bin/install -o root -g root -m 0600 "$tls_cert" /etc/nmcp/tls-cert.pem
-/usr/bin/install -o root -g root -m 0600 "$tls_key" /etc/nmcp/tls-key.pem
+/usr/bin/printf '%s\n' "$tailnet_hostname" > /etc/nmcp/tailnet-hostname
+/usr/bin/printf '%s\n' "$postgresql_unit" > /etc/nmcp/postgresql-unit
+/usr/bin/chown root:root /etc/nmcp/tailnet-hostname /etc/nmcp/postgresql-unit
+/usr/bin/chmod 0600 /etc/nmcp/tailnet-hostname /etc/nmcp/postgresql-unit
+
+tls_id=$(/usr/bin/sha256sum "$capture/cert.pem" "$capture/key.pem" | /usr/bin/sha256sum | /usr/bin/cut -d' ' -f1)
+tls_release=/etc/nmcp/tls-releases/$tls_id
+if [[ ! -e $tls_release ]]; then
+  /usr/bin/install -d -o root -g root -m 0700 "$tls_release"
+  /usr/bin/install -o root -g root -m 0600 "$capture/cert.pem" "$tls_release/cert.pem"
+  /usr/bin/install -o root -g root -m 0600 "$capture/key.pem" "$tls_release/key.pem"
+else
+  /usr/bin/cmp --silent "$capture/cert.pem" "$tls_release/cert.pem"
+  /usr/bin/cmp --silent "$capture/key.pem" "$tls_release/key.pem"
+fi
+[[ $(/usr/bin/stat -c '%U:%G:%a' "$tls_release") == root:root:700 \
+  && $(/usr/bin/stat -c '%U:%G:%a' "$tls_release/cert.pem") == root:root:600 \
+  && $(/usr/bin/stat -c '%U:%G:%a' "$tls_release/key.pem") == root:root:600 ]] || {
+  printf 'install-ubuntu-host: TLS generation ownership/mode is unsafe\n' >&2; exit 1;
+}
+tls_link=/etc/nmcp/tls-current.new.$$
+/usr/bin/ln -s -- "$tls_release" "$tls_link"
+/usr/bin/mv -Tf -- "$tls_link" /etc/nmcp/tls-current
+
+# Nginx configuration is non-secret and separately traversable by User=nmcp.
+/usr/bin/install -d -o root -g root -m 0755 /etc/nmcp-nginx
 "$repo_root/scripts/render-ubuntu-nginx" \
   --template "$repo_root/infra/ubuntu/nginx.conf.in" \
-  --output /etc/nmcp/nginx.conf \
+  --output /etc/nmcp-nginx/nginx.conf \
   --api-listen "$api_listen" --files-listen "$files_listen" \
   --tailnet-hostname "$tailnet_hostname"
-/usr/bin/chown root:root /etc/nmcp/nginx.conf
-/usr/bin/chmod 0644 /etc/nmcp/nginx.conf
+/usr/bin/chown root:root /etc/nmcp-nginx/nginx.conf
+/usr/bin/chmod 0644 /etc/nmcp-nginx/nginx.conf
 
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf" /etc/sysusers.d/nmcp.conf
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/tmpfiles.d/nmcp.conf" /etc/tmpfiles.d/nmcp.conf
@@ -107,23 +149,31 @@ done
 /usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/nmcp.conf
 /usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
 
-for unit in nmcp.slice nmcp-migrate.service nmcp-api.service nmcp-worker.service nmcp-files.service nmcp.target; do
+for unit in nmcp.slice nmcp-migrate.service nmcp-api.service nmcp-worker.service \
+  nmcp-files.service nmcp-tls-expiry.service nmcp-tls-expiry.timer nmcp.target; do
   /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/$unit" "/etc/systemd/system/$unit"
 done
-for dropin in postgresql.service.d postgresql@.service.d; do
-  /usr/bin/install -d -o root -g root -m 0755 "/etc/systemd/system/$dropin"
-  /usr/bin/install -o root -g root -m 0644 \
-    "$repo_root/infra/ubuntu/systemd/$dropin/10-nmcp-slice.conf" \
-    "/etc/systemd/system/$dropin/10-nmcp-slice.conf"
+/usr/bin/install -d -o root -g root -m 0755 /etc/systemd/system/nmcp-migrate.service.d
+"$script_dir/render-ubuntu-postgresql-dependency" --unit "$postgresql_unit" \
+  --output /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf
+/usr/bin/install -d -o root -g root -m 0755 /etc/systemd/system/postgresql@.service.d
+/usr/bin/install -o root -g root -m 0644 \
+  "$repo_root/infra/ubuntu/systemd/postgresql@.service.d/10-nmcp-slice.conf" \
+  /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp /usr/share/doc/nmcp
+for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
+  capture-trusted-inputs validate-ubuntu-config verify-ubuntu-firewall; do
+  /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done
-/usr/bin/install -d -o root -g root -m 0755 /usr/share/doc/nmcp
 /usr/bin/install -o root -g root -m 0644 "$repo_root/docs/ubuntu-deployment.md" /usr/share/doc/nmcp/ubuntu-deployment.md
 
 /usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' \
-  ca-certificates curl ffmpeg libimage-exiftool-perl nginx-core postgresql tzdata util-linux \
+  ca-certificates curl ffmpeg libimage-exiftool-perl nginx-core postgresql tzdata ufw util-linux \
   > /var/lib/nmcp/deployment/runtime-packages.txt
 /usr/bin/chown root:root /var/lib/nmcp/deployment/runtime-packages.txt
 /usr/bin/chmod 0600 /var/lib/nmcp/deployment/runtime-packages.txt
 
 /usr/bin/systemctl daemon-reload
+/usr/bin/systemctl enable --now nmcp-tls-expiry.timer
+/usr/local/libexec/nmcp/check-ubuntu-tls-expiry
 printf 'Host assets installed. Stage and activate a release; activation enables nmcp.target.\n'

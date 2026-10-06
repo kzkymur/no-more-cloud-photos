@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily No More Cloud Photos TLS expiry check
+Documentation=file:/usr/share/doc/nmcp/ubuntu-deployment.md
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=yes
+Unit=nmcp-tls-expiry.service
+
+[Install]
+WantedBy=timers.target

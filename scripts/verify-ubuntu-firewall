@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Require an active default-deny UFW boundary with exact Tailnet rules."""
+
+import argparse
+import ipaddress
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+
+def output(command: list[str]) -> str:
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    return subprocess.run(command, check=True, text=True, capture_output=True, env=environment).stdout
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tailnet-ip", required=True)
+    parser.add_argument("--api-port", required=True, type=int)
+    parser.add_argument("--files-port", required=True, type=int)
+    parser.add_argument("--status-file", type=pathlib.Path, help=argparse.SUPPRESS)
+    parser.add_argument("--added-file", type=pathlib.Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    address = str(ipaddress.ip_address(args.tailnet_ip))
+    if not all(1 <= port <= 65535 for port in (args.api_port, args.files_port)):
+        parser.error("ports must be between 1 and 65535")
+    if args.status_file or args.added_file:
+        if not args.status_file or not args.added_file:
+            parser.error("fixture files must be supplied together")
+        status = args.status_file.read_text(encoding="utf-8")
+        added = args.added_file.read_text(encoding="utf-8")
+    else:
+        status = output(["/usr/sbin/ufw", "status", "verbose"])
+        added = output(["/usr/sbin/ufw", "show", "added"])
+    if not re.search(r"(?m)^Status:\s+active\s*$", status):
+        raise ValueError("UFW must be active")
+    if not re.search(r"(?m)^Default:\s+deny \(incoming\)", status):
+        raise ValueError("UFW default incoming policy must be deny")
+    normalized = [" ".join(line.split()) for line in added.splitlines() if line.strip().startswith("ufw ")]
+    expected = {
+        f"ufw allow in on tailscale0 to {address} port {args.api_port} proto tcp",
+        f"ufw allow in on tailscale0 to {address} port {args.files_port} proto tcp",
+    }
+    missing = expected - set(normalized)
+    if missing:
+        raise ValueError(f"missing exact Tailnet-only UFW rules: {sorted(missing)}")
+    for line in normalized:
+        for port in (args.api_port, args.files_port):
+            if re.search(rf"(?:\bport {port}\b|\b{port}/tcp\b)", line) and line not in expected:
+                raise ValueError(f"unexpected broader/conflicting UFW rule for port {port}: {line}")
+    print("Ubuntu firewall active/default-deny/Tailnet-only rules validated")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError) as error:
+        print(f"verify-ubuntu-firewall: {error}", file=sys.stderr)
+        sys.exit(1)

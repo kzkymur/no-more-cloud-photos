@@ -23,6 +23,11 @@ release_root=/opt/nmcp/releases
 release_path=$release_root/$release_id
 current=/opt/nmcp/current
 evidence=/var/lib/nmcp/deployment
+exec 9>/run/lock/nmcp-deploy.lock
+/usr/bin/flock --exclusive --nonblock 9 || {
+  printf 'install-ubuntu-release: another NMCP deployment operation is active\n' >&2
+  exit 1
+}
 
 verify_release() {
   local directory=$1
@@ -31,9 +36,13 @@ import os, pathlib, re, stat, sys
 root = pathlib.Path(sys.argv[1])
 if not root.is_dir() or root.is_symlink():
     raise SystemExit("release must be a non-symlink directory")
+if stat.S_IMODE(root.stat().st_mode) != 0o755:
+    raise SystemExit("release root mode must be 0755")
 manifest = root / "MANIFEST.sha256"
 if not manifest.is_file() or manifest.is_symlink():
     raise SystemExit("MANIFEST.sha256 must be a regular file")
+if stat.S_IMODE(manifest.stat().st_mode) != 0o644:
+    raise SystemExit("MANIFEST.sha256 mode must be 0644")
 listed = []
 for line in manifest.read_text(encoding="ascii").splitlines():
     match = re.fullmatch(r"[0-9a-f]{64}  ([A-Za-z0-9][A-Za-z0-9._/+@-]*)", line)
@@ -52,8 +61,10 @@ for base, directories, files in os.walk(root, followlinks=False):
         mode = candidate.lstat().st_mode
         if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
             raise SystemExit(f"release contains unsupported entry: {candidate.relative_to(root)}")
-        if mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise SystemExit(f"release entry is group/world writable: {candidate.relative_to(root)}")
+        relative = candidate.relative_to(root)
+        expected_mode = 0o755 if stat.S_ISDIR(mode) or relative.parts[0] == "bin" else 0o644
+        if stat.S_IMODE(mode) != expected_mode:
+            raise SystemExit(f"release entry mode must be {expected_mode:04o}: {relative}")
     for name in files:
         relative = pathlib.Path(base, name).relative_to(root).as_posix()
         if relative != "MANIFEST.sha256":
@@ -62,10 +73,46 @@ if sorted(actual) != sorted(listed):
     raise SystemExit("manifest does not exactly cover release files")
 for required in ("bin/core-api", "bin/core-worker", "bin/nmcp-admin"):
     path = root / required
-    if required not in listed or not path.is_file() or not os.access(path, os.X_OK):
+    if required not in listed or not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o755:
         raise SystemExit(f"missing executable {required}")
 PY
   (cd -- "$directory" && /usr/bin/sha256sum --check --strict MANIFEST.sha256)
+}
+
+verify_runtime_access() {
+  local directory=$1
+  /usr/bin/python3 - "$directory" <<'PY'
+import os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+if root.stat().st_uid != 0 or root.stat().st_gid != 0:
+    raise SystemExit("release root is not root:root")
+for base, directories, files in os.walk(root):
+    for name in directories + files:
+        path = pathlib.Path(base, name)
+        if path.lstat().st_uid != 0 or path.lstat().st_gid != 0:
+            raise SystemExit(f"release entry is not root:root: {path.relative_to(root)}")
+PY
+  /usr/sbin/runuser -u nmcp -- /usr/bin/test -x "$directory/bin/core-api"
+  /usr/sbin/runuser -u nmcp -- /usr/bin/test -x "$directory/bin/core-worker"
+  /usr/sbin/runuser -u nmcp -- /usr/bin/test -x "$directory/bin/nmcp-admin"
+  /usr/sbin/runuser -u nmcp -- /usr/bin/test -r "$directory/MANIFEST.sha256"
+}
+
+load_host_contract() {
+  [[ -d $evidence && -f /etc/nmcp/postgresql-unit ]] || {
+    printf 'install-ubuntu-release: host assets are not installed\n' >&2
+    exit 1
+  }
+  postgresql_unit=$(</etc/nmcp/postgresql-unit)
+  [[ $postgresql_unit =~ ^postgresql@[A-Za-z0-9_.-]+\.service$ \
+    && $postgresql_unit != postgresql@.service ]] || {
+    printf 'install-ubuntu-release: invalid concrete PostgreSQL unit contract\n' >&2
+    exit 1
+  }
+  [[ $(/usr/bin/systemctl show --property=LoadState --value "$postgresql_unit") == loaded ]] || {
+    printf 'install-ubuntu-release: concrete PostgreSQL unit is not loaded: %s\n' "$postgresql_unit" >&2
+    exit 1
+  }
 }
 
 atomic_link() {
@@ -88,15 +135,7 @@ activate_services() {
   /usr/bin/systemctl restart nmcp-api.service nmcp-worker.service
   /usr/bin/systemctl restart nmcp-files.service
   /usr/bin/systemctl start nmcp.target
-  for _ in {1..30}; do
-    if /usr/bin/curl --fail --silent --show-error --max-time 2 \
-      -H 'Accept: application/json' http://127.0.0.1:8080/readyz >/dev/null; then
-      return 0
-    fi
-    /usr/bin/sleep 1
-  done
-  printf 'install-ubuntu-release: readiness did not succeed within 30 seconds\n' >&2
-  return 1
+  /usr/local/libexec/nmcp/check-ubuntu-services --postgresql-unit "$postgresql_unit"
 }
 
 case "$action" in
@@ -111,16 +150,17 @@ case "$action" in
     /usr/bin/install -d -o root -g root -m 0755 "$temporary"
     /usr/bin/cp -a -- "$source_dir/." "$temporary/"
     /usr/bin/chown -R root:root "$temporary"
-    /usr/bin/chmod -R go-w "$temporary"
     verify_release "$temporary"
+    verify_runtime_access "$temporary"
     /usr/bin/mv -- "$temporary" "$release_path"
     trap - EXIT
     printf 'Staged %s; run activate explicitly.\n' "$release_id"
     ;;
   activate)
     [[ $# -eq 2 ]] || usage
+    load_host_contract
     verify_release "$release_path"
-    [[ -d $evidence ]] || { printf 'host assets are not installed\n' >&2; exit 1; }
+    verify_runtime_access "$release_path"
     old_target=
     if [[ -L $current ]]; then old_target=$(/usr/bin/readlink -f -- "$current"); fi
     was_active=false
@@ -145,17 +185,9 @@ case "$action" in
       printf 'Service start failed after migration; automatic binary rollback is unsafe.\n' >&2
       exit 1
     fi
-    ready=false
-    for _ in {1..30}; do
-      if /usr/bin/curl --fail --silent --show-error --max-time 2 \
-        -H 'Accept: application/json' http://127.0.0.1:8080/readyz >/dev/null; then
-        ready=true; break
-      fi
-      /usr/bin/sleep 1
-    done
-    if [[ $ready != true ]]; then
+    if ! /usr/local/libexec/nmcp/check-ubuntu-services --postgresql-unit "$postgresql_unit"; then
       record post-migration-readiness-failed
-      printf 'Readiness failed after migration; automatic binary rollback is unsafe.\n' >&2
+      printf 'Whole-service stability failed after migration; automatic binary rollback is unsafe.\n' >&2
       exit 1
     fi
     /usr/bin/systemctl enable nmcp.target
@@ -163,8 +195,10 @@ case "$action" in
     ;;
   rollback)
     [[ $# -eq 2 ]] || usage
+    load_host_contract
     verify_release "$release_path"
-    [[ -d $evidence && -f /etc/nmcp/admin.env ]] || { printf 'host assets are not installed\n' >&2; exit 1; }
+    verify_runtime_access "$release_path"
+    [[ -f /etc/nmcp/admin.env ]] || { printf 'host assets are not installed\n' >&2; exit 1; }
     # The old admin binary must understand the current schema before switching.
     /usr/bin/systemd-run --quiet --wait --collect --unit=nmcp-rollback-check \
       --uid=nmcp --gid=nmcp --property=Slice=nmcp.slice \

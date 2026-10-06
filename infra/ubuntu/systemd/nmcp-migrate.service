@@ -1,8 +1,7 @@
 [Unit]
 Description=No More Cloud Photos database migration
 Documentation=file:/usr/share/doc/nmcp/ubuntu-deployment.md
-Requires=postgresql.service
-After=postgresql.service
+# The installer adds a reviewed concrete postgresql@<cluster>.service drop-in.
 Before=nmcp-api.service nmcp-worker.service
 
 [Service]

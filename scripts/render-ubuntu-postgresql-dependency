@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Render the reviewed concrete PostgreSQL cluster dependency drop-in."""
+
+import argparse
+import os
+import pathlib
+import re
+import tempfile
+
+
+UNIT = re.compile(r"postgresql@[A-Za-z0-9_.-]+\.service\Z")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--unit", required=True)
+    parser.add_argument("--output", type=pathlib.Path, required=True)
+    args = parser.parse_args()
+    if not UNIT.fullmatch(args.unit) or args.unit == "postgresql@.service":
+        parser.error("--unit must name one concrete postgresql@<cluster>.service")
+    content = f"[Unit]\nRequires={args.unit}\nAfter={args.unit}\n"
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{args.output.name}.", dir=args.output.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, args.output)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

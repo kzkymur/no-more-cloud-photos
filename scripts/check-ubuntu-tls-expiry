@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cert=/etc/nmcp/tls-current/cert.pem
+hostname_file=/etc/nmcp/tailnet-hostname
+[[ -r $cert && -r $hostname_file ]] || { printf 'NMCP TLS material is missing\n' >&2; exit 1; }
+hostname=$(<"$hostname_file")
+/usr/bin/openssl x509 -in "$cert" -noout -checkhost "$hostname" >/dev/null
+# Fail early enough for an operator to renew a short-lived Tailnet certificate.
+/usr/bin/openssl x509 -in "$cert" -noout -checkend 604800 >/dev/null || {
+  printf 'NMCP TLS certificate expires within seven days\n' >&2
+  exit 1
+}
+printf 'NMCP TLS certificate covers %s and is valid beyond seven days\n' "$hostname"
