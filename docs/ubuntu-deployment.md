@@ -140,21 +140,25 @@ migrations acquire and retain the lock themselves and snapshot the exact release
 path before execution. The installer also acquires a separate root-only
 execution lease before dispatch and atomically transfers that same locked open
 file description to the transient migration over a root-only Unix socket. The
-receiver verifies the descriptor and acknowledges ownership before database
+tracked wrapper is the sole deadline/cancellation authority: after the receiver
+announces readiness, it rechecks the child and deadline, then sends the FD and a
+monotonic execution authorization in one `sendmsg`. The receiver rejects an
+expired authorization, verifies the descriptor, and acknowledges ownership before database
 work. Thus installer death before transfer prevents execution, while death after
 transfer leaves the child holding the lease and blocks every new
 host/release/TLS/direct-migration mutation until the exact binary exits.
 The concrete database unit must expose a finite `TimeoutStartUSec`. Before it
 can dispatch anything, a tracked runner writes its own PID/start-time record and
-then `exec`s `systemd-run` without changing identity; the broker also pins that
-identity with a pidfd. A tracked lifecycle wrapper imposes a 20-minute total
-operation deadline that includes queued dependency jobs; on expiry it stops the
-exact transient unit and terminates/kills the waiting `systemd-run` client. The
+then launches and reaps the exact `systemd-run` process. Identity validation
+pins the recorded process with a pidfd and revalidates its start time afterward.
+The lifecycle wrapper imposes a 20-minute total operation deadline that includes
+queued dependency jobs and running admin work; on expiry it makes cancellation
+irrevocable, stops the exact transient unit, and does not return until that unit
+has no job, no main PID, and is inactive/failed or gone. The
 transient additionally has a 15-minute runtime deadline and a 30-second stop
-deadline. Thus the broker has no short independent pre-database timer, but queued
-dependency jobs and running admin work are both bounded. It releases
-automatically if the dispatch owner or exact runner exits before transfer, and
-owns cleanup of the runner record through terminal runner exit.
+deadline. A failed or delayed stop therefore retains both deployment locks and
+blocks rollback, link, and service mutation instead of racing live database
+work. The wrapper owns socket and runner-record cleanup through terminal exit.
 Successful oneshot migration remains active so production
 API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.

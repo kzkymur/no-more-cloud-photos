@@ -7,13 +7,16 @@ units=(nmcp-api.service nmcp-worker.service nmcp-files.service nmcp-migrate.serv
 predispatch_pid=
 installer_pid=
 registration_pid=
+cancel_pid=
 cleanup() {
   /usr/bin/touch "$work/ownerdeath-proceed" 2>/dev/null || true
   /usr/bin/touch /run/nmcp-deploy/test-runner-record.go \
-    /run/nmcp-deploy/test-before-admin-dispatch.go 2>/dev/null || true
+    /run/nmcp-deploy/test-before-admin-dispatch.go \
+    /run/nmcp-deploy/test-cancel-stop.go 2>/dev/null || true
   [[ -z $predispatch_pid ]] || /usr/bin/kill "$predispatch_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/kill "$installer_pid" 2>/dev/null || true
   [[ -z $registration_pid ]] || /usr/bin/kill "$registration_pid" 2>/dev/null || true
+  [[ -z $cancel_pid ]] || /usr/bin/kill "$cancel_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$installer_pid-1.service" >/dev/null 2>&1 || true
   [[ -z $registration_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$registration_pid-1.service" >/dev/null 2>&1 || true
   for _attempt in {1..50}; do
@@ -84,6 +87,7 @@ make_release startfail
 make_release candidate
 make_release pgfail
 make_release queuefail
+make_release cancelrace
 make_release predispatch
 make_release ownerdeath
 /usr/bin/printf '#!/bin/sh\nexit 1\n' > /opt/nmcp/releases/migratefail/bin/nmcp-admin
@@ -167,7 +171,9 @@ if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=queuefail' "$work/queuefail.out"; t
   printf 'queued admin binary entered before PostgreSQL readiness\n' >&2; exit 1
 fi
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
-/usr/bin/systemctl stop postgresql@nmcp-test.service
+[[ $(/usr/bin/systemctl show postgresql@nmcp-test.service --property=ActiveState --value) == activating ]] || {
+  printf 'queue proof lost the still-activating PostgreSQL dependency\n' >&2; exit 1;
+}
 if /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q 'nmcp-deploy-admin-'; then
   printf 'queue timeout left a transient systemd job\n' >&2; exit 1
 fi
@@ -182,8 +188,68 @@ for attempt in {1..100}; do
 done
 if compgen -G '/run/nmcp-deploy/migration-handoff.*' >/dev/null \
   || compgen -G '/run/nmcp-deploy/migration-runner.*' >/dev/null; then
-  printf 'queue timeout leaked broker state\n' >&2; exit 1
+  printf 'queue timeout leaked tracked-runner state\n' >&2; exit 1
 fi
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+
+# Force receiver connection after cancellation has become irrevocable.  The
+# delayed exact-unit stop proves that no lease COMMIT, migration entry, rollback,
+# or lock release can occur while the cancelled admin unit is still live.
+cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/bin/sh -c '/usr/bin/touch "$work/cancel-postgresql-started"; while ! test -e "$work/cancel-postgresql-release"; do /usr/bin/sleep 0.01; done; /usr/bin/touch "$work/postgresql-ready"; /usr/bin/systemd-notify --ready; exec /usr/bin/sleep infinity'
+TimeoutStartSec=45s
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
+/usr/bin/rm -f "$work/postgresql-ready" "$work/cancel-postgresql-release" \
+  /run/nmcp-deploy/test-cancel-stop.{ready,go}
+NMCP_TEST_ADMIN_OPERATION_TIMEOUT_SECONDS=2 NMCP_TEST_PAUSE_CANCEL_STOP=1 \
+  "$repo/scripts/install-ubuntu-release" activate cancelrace >"$work/cancelrace.out" 2>&1 &
+cancel_pid=$!
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-cancel-stop.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'cancel race did not reach irrevocable cancellation\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+[[ -e $work/cancel-postgresql-started ]]
+/usr/bin/touch "$work/cancel-postgresql-release"
+for attempt in {1..100}; do
+  [[ -e $work/postgresql-ready ]] && break
+  [[ $attempt -lt 100 ]] || { printf 'receiver dependency did not become ready during cancellation\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+/usr/bin/sleep 0.2
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=cancelrace' "$work/cancelrace.out"; then
+  printf 'cancelled receiver obtained execution authorization\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/cancelrace ]] || {
+  printf 'rollback mutated the current link before exact-unit terminal proof\n' >&2; exit 1;
+}
+/usr/bin/kill -0 "$cancel_pid"
+if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
+  || /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then
+  printf 'cancellation released a deployment lock before exact unit terminal\n' >&2; exit 1
+fi
+/usr/bin/touch /run/nmcp-deploy/test-cancel-stop.go
+if wait "$cancel_pid"; then
+  printf 'cancelled receiver unexpectedly activated release\n' >&2; exit 1
+fi
+cancel_pid=
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=cancelrace' "$work/cancelrace.out"; then
+  printf 'cancelled receiver entered migration after deadline\n' >&2; exit 1
+fi
+cancel_unit=$(compgen -G '/run/systemd/transient/nmcp-deploy-admin-*.service' || true)
+[[ -z $cancel_unit ]] || { printf 'cancelled transient unit was not collected\n' >&2; exit 1; }
+if /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q 'nmcp-deploy-admin-'; then
+  printf 'cancelled transient job survived installer failure\n' >&2; exit 1
+fi
+/usr/bin/systemctl is-active --quiet postgresql@nmcp-test.service
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+/usr/bin/rm -f /run/nmcp-deploy/test-cancel-stop.{ready,go}
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
 Type=notify
@@ -272,8 +338,8 @@ done
 /usr/bin/grep -q 'active=candidate.*attempted=old.*state=rollback-activation-failed' \
   /var/lib/nmcp/deployment/active-release
 
-# Exercise production run_admin's synchronized pre-dispatch phase. The broker
-# must notice owner death and release/clean itself without a manual kill.
+# Exercise production run_admin's synchronized pre-dispatch phase. Installer
+# death must release both locks without ever creating transient handoff state.
 /usr/bin/rm -f /run/nmcp-deploy/test-before-admin-dispatch.{ready,go}
 NMCP_TEST_PAUSE_BEFORE_ADMIN_DISPATCH=1 \
   "$repo/scripts/install-ubuntu-release" activate predispatch >"$work/predispatch.out" 2>&1 &
@@ -284,7 +350,7 @@ for attempt in {1..100}; do
   /usr/bin/sleep 0.05
 done
 if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then
-  printf 'production pre-dispatch broker did not hold the execution lease\n' >&2; exit 1
+  printf 'production pre-dispatch owner did not hold the execution lease\n' >&2; exit 1
 fi
 /usr/bin/kill -KILL "$predispatch_pid"
 wait "$predispatch_pid" 2>/dev/null || true

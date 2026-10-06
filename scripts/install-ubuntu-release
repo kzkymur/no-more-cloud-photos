@@ -146,30 +146,11 @@ stop_services() {
 admin_sequence=0
 run_admin() {
   local admin_release=$1 operation=$2 subcommand=$3
-  local handoff broker operation_timeout runner runner_file status=0 unit
+  local handoff operation_timeout runner runner_file status=0 unit
   admin_sequence=$((admin_sequence + 1))
   handoff=/run/nmcp-deploy/migration-handoff.$$.$admin_sequence
   runner_file=/run/nmcp-deploy/migration-runner.$$.$admin_sequence
   unit=nmcp-deploy-admin-$$-$admin_sequence
-  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock send "$handoff" \
-    /run/nmcp-deploy/migration-execution.lock 8 "$$" \
-    "$runner_file" 9>&- &
-  broker=$!
-  for attempt in {1..100}; do
-    [[ -S $handoff ]] && break
-    if ! /usr/bin/kill -0 "$broker" 2>/dev/null; then
-      wait "$broker" || true
-      printf 'install-ubuntu-release: execution-lease handoff failed before dispatch\n' >&2
-      return 1
-    fi
-    [[ $attempt -lt 100 ]] || {
-      /usr/bin/kill "$broker" 2>/dev/null || true
-      wait "$broker" 2>/dev/null || true
-      printf 'install-ubuntu-release: execution-lease handoff socket was not ready\n' >&2
-      return 1
-    }
-    /usr/bin/sleep 0.01
-  done
   if [[ ${NMCP_TEST_PAUSE_BEFORE_ADMIN_DISPATCH:-} == 1 ]]; then
     /usr/bin/install -o root -g root -m 0600 /dev/null \
       /run/nmcp-deploy/test-before-admin-dispatch.ready
@@ -182,7 +163,8 @@ run_admin() {
     printf 'install-ubuntu-release: invalid transient operation timeout\n' >&2
     return 1
   }
-  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$runner_file" \
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$handoff" \
+    /run/nmcp-deploy/migration-execution.lock 8 "$runner_file" \
     "$unit.service" "$operation_timeout" \
     /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="$unit" \
     --property=Slice=nmcp.slice \
@@ -196,13 +178,12 @@ run_admin() {
     /run/nmcp-deploy/migration-execution.lock \
     /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
     "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json \
-    8>&- 9>&- &
+    9>&- &
   runner=$!
   wait "$runner" || status=$?
   if ((status != 0)); then
-    /usr/bin/systemctl stop "$unit" >/dev/null 2>&1 || true
+    /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock ensure-terminal "$unit.service"
   fi
-  if ! wait "$broker"; then status=1; fi
   /usr/bin/rm -f -- "$handoff" "$runner_file"
   return "$status"
 }

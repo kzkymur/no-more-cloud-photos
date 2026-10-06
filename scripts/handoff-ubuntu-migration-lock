@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Atomically transfer an already-locked deployment FD into a transient unit."""
+"""Authorize one migration lease transfer and track its exact transient unit."""
 
 import array
 import fcntl
@@ -10,6 +10,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 
 
 def fail(message: str) -> "NoReturn":
@@ -46,117 +47,248 @@ def load_runner(runner_file: str) -> tuple[int, str, int] | None:
     if process_start(pid) != start:
         fail("tracked systemd-run identity exited or was replaced")
     pidfd = os.pidfd_open(pid)
-    if process_start(pid) != start:
+    if os.environ.get("NMCP_TEST_REPLACE_RUNNER_AFTER_PIDFD") == "1":
+        ready = pathlib.Path("/run/nmcp-deploy/test-pidfd-open.ready")
+        go = pathlib.Path("/run/nmcp-deploy/test-pidfd-open.go")
+        ready.touch(mode=0o600)
+        while not go.is_file():
+            time.sleep(0.01)
+        post_open_start = "injected-replacement"
+    else:
+        post_open_start = process_start(pid)
+    if post_open_start != start:
+        pathlib.Path("/run/nmcp-deploy/test-pidfd-rejected").touch(mode=0o600)
         os.close(pidfd)
         fail("tracked systemd-run identity changed during pidfd acquisition")
     return pid, start, pidfd
 
 
-def send_fd(
-    socket_path: str, lock_path: str, descriptor: int, owner_pid: int, runner_file: str
+def unit_state(unit: str) -> tuple[str, str, int, bool]:
+    result = subprocess.run(
+        ["/usr/bin/systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    values = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+    jobs_result = subprocess.run(
+        ["/usr/bin/systemctl", "list-jobs", "--no-legend", unit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or jobs_result.returncode != 0:
+        return "unknown", "unknown", 1, True
+    try:
+        main_pid = int(values.get("MainPID", "0") or "0")
+    except ValueError:
+        return "unknown", "unknown", 1, True
+    return (
+        values.get("LoadState", "not-found"),
+        values.get("ActiveState", "inactive"),
+        main_pid,
+        bool(jobs_result.stdout.strip()),
+    )
+
+
+def terminal(unit: str) -> bool:
+    load, active, main_pid, has_job = unit_state(unit)
+    return (
+        (load == "not-found" or active in ("inactive", "failed"))
+        and main_pid == 0
+        and not has_job
+    )
+
+
+def ensure_terminal(unit: str, test_pause: bool = False) -> None:
+    """Do not return while the exact unit could still mutate the database."""
+    if terminal(unit):
+        return
+    if test_pause and os.environ.get("NMCP_TEST_PAUSE_CANCEL_STOP") == "1":
+        ready = pathlib.Path("/run/nmcp-deploy/test-cancel-stop.ready")
+        go = pathlib.Path("/run/nmcp-deploy/test-cancel-stop.go")
+        ready.touch(mode=0o600)
+        while not go.is_file():
+            time.sleep(0.01)
+    while not terminal(unit):
+        try:
+            subprocess.run(
+                ["/usr/bin/systemctl", "stop", unit],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=40,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        if terminal(unit):
+            break
+        subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "kill",
+                "--kill-whom=all",
+                "--signal=KILL",
+                unit,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        subprocess.run(
+            ["/usr/bin/systemctl", "stop", "--no-block", unit],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        time.sleep(0.1)
+
+
+def run_tracked(
+    socket_path: str,
+    lock_path: str,
+    descriptor: int,
+    runner_file: str,
+    unit: str,
+    queue_timeout: int,
+    command: list[str],
 ) -> None:
     lock_stat = os.stat(lock_path, follow_symlinks=False)
     if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
-        fail("sender descriptor does not name the execution lease")
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        fail("runner descriptor does not name the execution lease")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("runner descriptor does not carry the execution lease")
+
+    pid = os.getpid()
+    start = process_start(pid)
+    if start is None:
+        fail("cannot identify tracked runner")
+    record_fd = os.open(
+        runner_file,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    with os.fdopen(record_fd, "w") as target:
+        target.write(f"{pid} {start}\n")
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    child: subprocess.Popen[bytes] | None = None
+    status = 1
+    authorized = False
     try:
         pathlib.Path(socket_path).unlink(missing_ok=True)
         listener.bind(socket_path)
         os.chmod(socket_path, 0o600)
         listener.listen(1)
-        listener.settimeout(0.1)
-        owner_start = process_start(owner_pid)
-        if owner_start is None:
-            fail("dispatch owner is already gone")
-        runner: tuple[int, str, int] | None = None
-        while True:
-            if runner is None:
-                runner = load_runner(runner_file)
-            try:
-                connection, _ = listener.accept()
+        listener.setblocking(False)
+        if os.environ.get("NMCP_TEST_PAUSE_AFTER_RUNNER_RECORD") == "1":
+            pathlib.Path("/run/nmcp-deploy/test-runner-record.ready").touch(mode=0o600)
+            while not pathlib.Path("/run/nmcp-deploy/test-runner-record.go").is_file():
+                time.sleep(0.01)
+
+        # close_fds ensures the transient launcher and admin receive the lease only
+        # through the explicit, authorized SCM_RIGHTS protocol below.
+        child = subprocess.Popen(command, close_fds=True)
+        deadline = time.monotonic() + queue_timeout
+        protocol_failed = False
+        while not authorized and child.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-            except TimeoutError:
-                pass
-            if runner is None:
-                if process_start(owner_pid) != owner_start:
-                    fail("dispatch owner died before starting systemd-run")
-            elif select.select([runner[2]], [], [], 0)[0]:
-                fail("systemd-run exited before lease transfer")
-        if runner is None:
-            runner = load_runner(runner_file)
-        if runner is None:
-            fail("receiver connected before runner identity was registered")
-        with connection:
-            rights = array.array("i", [descriptor])
-            connection.sendmsg([b"L"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
-            connection.settimeout(30)
-            if connection.recv(2) != b"OK":
-                fail("receiver did not confirm the execution lease")
-        os.close(descriptor)
-        while not select.select([runner[2]], [], [], 0.1)[0]:
-            pass
-        os.close(runner[2])
+            readable, _, _ = select.select([listener], [], [], min(remaining, 0.1))
+            if not readable:
+                continue
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(max(0.001, deadline - time.monotonic()))
+                if connection.recv(5) != b"READY":
+                    protocol_failed = True
+                    continue
+                # This process is the sole deadline/cancellation authority.  The
+                # final check and the one atomic FD+COMMIT sendmsg are serialized
+                # in this event loop.  Once cancellation starts there is no code
+                # path that can transfer the lease or authorize execution.
+                deadline_ns = int(deadline * 1_000_000_000)
+                if time.monotonic_ns() >= deadline_ns or child.poll() is not None:
+                    continue
+                rights = array.array("i", [descriptor])
+                connection.sendmsg(
+                    [b"C" + deadline_ns.to_bytes(8, "big")],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+                )
+                authorized = True
+                os.close(descriptor)
+                descriptor = -1
+                connection.settimeout(30)
+                if connection.recv(2) != b"OK":
+                    protocol_failed = True
+
+        if authorized:
+            try:
+                status = child.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                ensure_terminal(unit, test_pause=True)
+                status = 124
+            ensure_terminal(unit)
+            if protocol_failed and status == 0:
+                status = 1
+        elif child.poll() is None:
+            # Cancellation is now irrevocable; listener stays open only during the
+            # test pause so a racing receiver can connect but can never get COMMIT.
+            ensure_terminal(unit, test_pause=True)
+            status = 124
+        else:
+            status = child.wait()
+            ensure_terminal(unit)
+    except (BrokenPipeError, ConnectionError, TimeoutError, socket.timeout):
+        if child is not None and child.poll() is None:
+            ensure_terminal(unit, test_pause=True)
+            status = 124
     finally:
         listener.close()
+        if child is not None and child.poll() is None:
+            ensure_terminal(unit)
+        if child is not None:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+        if descriptor >= 0:
+            os.close(descriptor)
         pathlib.Path(socket_path).unlink(missing_ok=True)
         pathlib.Path(runner_file).unlink(missing_ok=True)
-
-
-def run_tracked(runner_file: str, unit: str, timeout: int, command: list[str]) -> None:
-    pid = os.getpid()
-    start = process_start(pid)
-    if start is None:
-        fail("cannot identify tracked runner")
-    descriptor = os.open(
-        runner_file,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-        0o600,
-    )
-    with os.fdopen(descriptor, "w") as target:
-        target.write(f"{pid} {start}\n")
-    if os.environ.get("NMCP_TEST_PAUSE_AFTER_RUNNER_RECORD") == "1":
-        pathlib.Path("/run/nmcp-deploy/test-runner-record.ready").touch(mode=0o600)
-        while not pathlib.Path("/run/nmcp-deploy/test-runner-record.go").is_file():
-            import time
-
-            time.sleep(0.01)
-    child = subprocess.Popen(command)
-    try:
-        status = child.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            subprocess.run(
-                ["/usr/bin/systemctl", "stop", "--no-block", unit],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=5,
-            )
-        except subprocess.TimeoutExpired:
-            pass
-        child.terminate()
-        try:
-            child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait()
-        status = 124
     raise SystemExit(status if status >= 0 else 128 - status)
 
 
 def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     connection.connect(socket_path)
+    connection.sendall(b"READY")
     size = array.array("i").itemsize
-    message, ancillary, _flags, _address = connection.recvmsg(1, socket.CMSG_SPACE(size))
+    message, ancillary, _flags, _address = connection.recvmsg(9, socket.CMSG_SPACE(size))
     received: list[int] = []
     for level, kind, data in ancillary:
         if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
             values = array.array("i")
             values.frombytes(data[: len(data) - (len(data) % size)])
             received.extend(values)
-    if message != b"L" or len(received) != 1:
-        fail("did not receive exactly one execution-lease descriptor")
+    if len(message) != 9 or message[0:1] != b"C" or len(received) != 1:
+        fail("did not receive one atomically authorized execution lease")
+    deadline_ns = int.from_bytes(message[1:], "big")
+    if time.monotonic_ns() >= deadline_ns:
+        os.close(received[0])
+        fail("execution authorization expired before receipt")
     descriptor = received[0]
     lock_stat = os.stat(lock_path, follow_symlinks=False)
     if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
@@ -171,16 +303,24 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
     os.execv(command[0], command)
 
 
-if len(sys.argv) == 7 and sys.argv[1] == "send":
-    send_fd(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
+if len(sys.argv) >= 9 and sys.argv[1] == "run-tracked":
+    run_tracked(
+        sys.argv[2],
+        sys.argv[3],
+        int(sys.argv[4]),
+        sys.argv[5],
+        sys.argv[6],
+        int(sys.argv[7]),
+        sys.argv[8:],
+    )
 elif len(sys.argv) >= 5 and sys.argv[1] == "receive":
     receive_fd(sys.argv[2], sys.argv[3], sys.argv[4:])
-elif len(sys.argv) >= 6 and sys.argv[1] == "run-tracked":
-    run_tracked(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5:])
 elif len(sys.argv) == 3 and sys.argv[1] == "validate-runner":
     validated = load_runner(sys.argv[2])
     if validated is None:
         fail("runner record is missing")
     os.close(validated[2])
+elif len(sys.argv) == 3 and sys.argv[1] == "ensure-terminal":
+    ensure_terminal(sys.argv[2])
 else:
-    fail("usage: send SOCKET LOCK FD OWNER_PID RUNNER_FILE | run-tracked FILE UNIT TIMEOUT_SECONDS COMMAND [ARG ...] | validate-runner FILE | receive SOCKET LOCK COMMAND [ARG ...]")
+    fail("usage: run-tracked SOCKET LOCK FD FILE UNIT QUEUE_TIMEOUT COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...] | validate-runner FILE | ensure-terminal UNIT")
