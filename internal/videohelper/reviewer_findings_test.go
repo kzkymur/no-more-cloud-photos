@@ -83,9 +83,8 @@ func TestTransformNeutralizesExactSelectedStreamOrientation(t *testing.T) {
 
 func TestPQFrameMetadataIsSelectedAndConsistent(t *testing.T) {
 	metadata := pqProbeJSON(nil)
-	validFrames := frameJSONWithSideData(2, []map[string]interface{}{
-		{"max_luminance": "1000/1"}, {"max_content": float64(600)},
-	})
+	complete := []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(600)}}
+	validFrames := frameJSONWithPerFrameSideData(2, complete, complete)
 	runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{validFrames}}
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
 	got, _, err := e.inspect("input", "video/mp4", maxLimits())
@@ -94,6 +93,22 @@ func TestPQFrameMetadataIsSelectedAndConsistent(t *testing.T) {
 	}
 	if !containsSequence(runner.lastStream, "-select_streams", "2") {
 		t.Fatalf("frame probe not selected-stream-bound: %q", runner.lastStream)
+	}
+	for _, test := range []struct {
+		name       string
+		secondData []map[string]interface{}
+	}{
+		{name: "later absent"},
+		{name: "later mastering only", secondData: []map[string]interface{}{{"max_luminance": "1000/1"}}},
+		{name: "later CLL only", secondData: []map[string]interface{}{{"max_content": float64(600)}}},
+		{name: "later conflict", secondData: []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(500)}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner.runs, runner.streams = [][]byte{metadata}, []string{frameJSONWithPerFrameSideData(2, complete, test.secondData)}
+			if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
+				t.Fatalf("incomplete per-frame HDR accepted: %v", err)
+			}
+		})
 	}
 
 	runner.runs, runner.streams = [][]byte{metadata}, []string{frameJSONWithSideData(1, []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(600)}})}
@@ -113,6 +128,26 @@ func TestPQFrameMetadataIsSelectedAndConsistent(t *testing.T) {
 	runner.runs, runner.streams = [][]byte{metadata}, []string{contradiction}
 	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
 		t.Fatalf("later contradictory frame HDR accepted: %v", err)
+	}
+}
+
+func TestHLGRejectsPartialOrInconsistentFrameMetadata(t *testing.T) {
+	metadata := hdrProbeJSON("arib-std-b67", nil)
+	complete := []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(600)}}
+	runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{frameJSONWithPerFrameSideData(2, nil, nil)}}
+	e := engine{ffprobe: "/p/ffprobe", run: runner}
+	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); err != nil {
+		t.Fatalf("metadata-free HLG rejected: %v", err)
+	}
+	for _, frames := range []string{
+		frameJSONWithPerFrameSideData(2, complete, nil),
+		frameJSONWithPerFrameSideData(2, complete, []map[string]interface{}{{"max_luminance": "1000/1"}}),
+		frameJSONWithPerFrameSideData(2, complete, []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(500)}}),
+	} {
+		runner.runs, runner.streams = [][]byte{metadata}, []string{frames}
+		if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
+			t.Fatalf("inconsistent HLG frame metadata accepted: %v", err)
+		}
 	}
 }
 
@@ -207,10 +242,14 @@ func multistreamProbeJSON(rotation interface{}, rotateTag string) []byte {
 }
 
 func pqProbeJSON(streamSideData []map[string]interface{}) []byte {
+	return hdrProbeJSON("smpte2084", streamSideData)
+}
+
+func hdrProbeJSON(transfer string, streamSideData []map[string]interface{}) []byte {
 	var document map[string]interface{}
 	_ = json.Unmarshal(probeJSON("hevc", "yuv420p10le", 320, 180, false), &document)
 	primary := document["streams"].([]interface{})[0].(map[string]interface{})
-	primary["index"], primary["color_primaries"], primary["color_transfer"], primary["color_space"] = 2, "bt2020", "smpte2084", "bt2020nc"
+	primary["index"], primary["color_primaries"], primary["color_transfer"], primary["color_space"] = 2, "bt2020", transfer, "bt2020nc"
 	primary["side_data_list"] = streamSideData
 	document["streams"] = []interface{}{
 		map[string]interface{}{"index": 0, "codec_type": "video", "disposition": map[string]int{"default": 0, "attached_pic": 1}},
@@ -237,6 +276,18 @@ func frameJSONWithConflictingSideData(streamIndex int) string {
 	frames := []interface{}{
 		map[string]interface{}{"media_type": "video", "stream_index": streamIndex, "pts": 0, "duration": 40, "width": 320, "height": 180, "side_data_list": []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(600)}}},
 		map[string]interface{}{"media_type": "video", "stream_index": streamIndex, "pts": 40, "duration": 40, "width": 320, "height": 180, "side_data_list": []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(500)}}},
+	}
+	encoded, _ := json.Marshal(map[string]interface{}{"frames": frames})
+	return string(encoded)
+}
+
+func frameJSONWithPerFrameSideData(streamIndex int, sideData ...[]map[string]interface{}) string {
+	frames := make([]interface{}, 0, len(sideData))
+	for index, data := range sideData {
+		frames = append(frames, map[string]interface{}{
+			"media_type": "video", "stream_index": streamIndex, "pts": index * 40, "duration": 40,
+			"width": 320, "height": 180, "side_data_list": data,
+		})
 	}
 	encoded, _ := json.Marshal(map[string]interface{}{"frames": frames})
 	return string(encoded)

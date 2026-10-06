@@ -64,6 +64,51 @@ func TestStreamFailsFastOnStderrOverflowAndCleansDescendant(t *testing.T) {
 	}
 }
 
+func TestStreamFirstCauseArbitratesConsumerAndStderrOverflow(t *testing.T) {
+	consumerFailure := fail("unsupported_input")
+	for _, test := range []struct {
+		name          string
+		consumerFirst bool
+		wantCode      string
+	}{
+		{name: "consumer first then stderr overflow", consumerFirst: true, wantCode: "unsupported_input"},
+		{name: "stderr overflow first then consumer", wantCode: "resource_limit"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var first firstStreamFailure
+			stderr := limitedBuffer{remaining: 4, onExceeded: func() { first.record(fail("resource_limit")) }}
+			firstRecorded := make(chan struct{})
+			secondRecorded := make(chan struct{})
+			recordConsumer := func(done chan<- struct{}) {
+				first.record(consumerFailure)
+				close(done)
+			}
+			recordOverflow := func(done chan<- struct{}) {
+				if _, err := stderr.Write([]byte("12345")); err != nil {
+					t.Errorf("stderr write: %v", err)
+				}
+				close(done)
+			}
+			if test.consumerFirst {
+				go recordConsumer(firstRecorded)
+				<-firstRecorded
+				go recordOverflow(secondRecorded)
+			} else {
+				go recordOverflow(firstRecorded)
+				<-firstRecorded
+				go recordConsumer(secondRecorded)
+			}
+			<-secondRecorded
+			if !isCode(first.err, test.wantCode) {
+				t.Fatalf("first error = %v, want %s", first.err, test.wantCode)
+			}
+			if !stderr.exceeded.Load() || stderr.b.Len() != 0 {
+				t.Fatalf("stderr cap state: exceeded=%v length=%d", stderr.exceeded.Load(), stderr.b.Len())
+			}
+		})
+	}
+}
+
 func TestStreamCodecChild(t *testing.T) {
 	switch os.Getenv("VIDEOHELPER_RUNNER_CHILD") {
 	case "":

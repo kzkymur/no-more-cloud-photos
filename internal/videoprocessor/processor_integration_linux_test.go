@@ -114,6 +114,19 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 		})
 	}
 
+	t.Run("PQ later frame metadata absence fails closed", func(t *testing.T) {
+		path := requiredAbsoluteEnv(t, "TEST_VIDEO_PQ_LATER_MISSING_PATH")
+		assertFirstPresentLaterMissingHDR(t, ffprobe, path)
+		input, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer input.Close()
+		if _, err := processor.Inspect(context.Background(), InspectRequest{Input: input, MIMEType: "video/mp4"}); err == nil {
+			t.Fatal("Inspect accepted PQ input with missing later-frame HDR evidence")
+		}
+	})
+
 	for _, test := range []struct {
 		name, env, mime string
 		videoIndex      int
@@ -159,6 +172,41 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertFirstPresentLaterMissingHDR(t *testing.T, ffprobe, path string) {
+	t.Helper()
+	data, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=media_type:frame_side_data=max_luminance,max_content", "-of", "json", path).Output()
+	if err != nil {
+		t.Fatalf("probe HDR frames: %v", err)
+	}
+	var document struct {
+		Frames []struct {
+			SideData []map[string]interface{} `json:"side_data_list"`
+		} `json:"frames"`
+	}
+	if json.Unmarshal(data, &document) != nil || len(document.Frames) < 2 {
+		t.Fatalf("invalid HDR frame fixture: %s", data)
+	}
+	hasPair := func(sideData []map[string]interface{}) bool {
+		mastering, cll := false, false
+		for _, side := range sideData {
+			_, masteringFact := side["max_luminance"]
+			_, cllFact := side["max_content"]
+			mastering = mastering || masteringFact
+			cll = cll || cllFact
+		}
+		return mastering && cll
+	}
+	if !hasPair(document.Frames[0].SideData) {
+		t.Fatalf("first frame lacks complete HDR evidence: %s", data)
+	}
+	for _, frame := range document.Frames[1:] {
+		if !hasPair(frame.SideData) {
+			return
+		}
+	}
+	t.Fatalf("fixture lacks a later frame with missing HDR evidence: %s", data)
 }
 
 func independentInputSelection(t *testing.T, ffprobe, path, codec string, videoIndex, audioIndex int, hdr bool, rotation, wantOrdinaryVideos, wantAttachedPictures int) {

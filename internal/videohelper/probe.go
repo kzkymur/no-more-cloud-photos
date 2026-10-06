@@ -218,12 +218,11 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 			frameHDR, hdrErr := parseHDREvidence(frame.SideDataList)
 			if hdrErr != nil {
 				result.frameHDR.invalid = true
-			} else if frameHDR.present {
-				if result.frameHDR.present && (frameHDR.mastering != result.frameHDR.mastering || frameHDR.cll != result.frameHDR.cll) {
+			} else if len(result.pts) == 0 {
+				result.frameHDR = frameHDR
+			} else {
+				if frameHDR.present != result.frameHDR.present || frameHDR.present && (frameHDR.mastering != result.frameHDR.mastering || frameHDR.cll != result.frameHDR.cll) {
 					result.frameHDR.invalid = true
-				} else {
-					frameHDR.invalid = result.frameHDR.invalid
-					result.frameHDR = frameHDR
 				}
 			}
 			if len(result.pts) == limit.Frames {
@@ -459,10 +458,13 @@ func classifyColor(stream probeStream, frameHDR hdrEvidence) (string, string, st
 			return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 		}
 		if transfer == "arib-std-b67" {
+			if frameHDR.invalid {
+				return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
+			}
 			return primaries, transfer, matrix, rangeName, true, 1000, 0, 0, nil
 		}
 		streamHDR, evidenceErr := parseHDREvidence(stream.SideDataList)
-		if evidenceErr != nil || frameHDR.invalid || !streamHDR.present && !frameHDR.present || streamHDR.present && frameHDR.present && (streamHDR.mastering != frameHDR.mastering || streamHDR.cll != frameHDR.cll) {
+		if evidenceErr != nil || frameHDR.invalid || !frameHDR.present || streamHDR.present && (streamHDR.mastering != frameHDR.mastering || streamHDR.cll != frameHDR.cll) {
 			return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 		}
 		evidence := streamHDR

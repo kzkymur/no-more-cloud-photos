@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
@@ -23,24 +24,41 @@ type commandRunner interface {
 type osCommandRunner struct{}
 
 type limitedBuffer struct {
-	b         bytes.Buffer
-	remaining int64
-	exceeded  atomic.Bool
-	signal    chan<- struct{}
+	b          bytes.Buffer
+	remaining  int64
+	exceeded   atomic.Bool
+	signal     chan<- struct{}
+	onExceeded func()
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
 	if int64(len(p)) > b.remaining {
-		if b.exceeded.CompareAndSwap(false, true) && b.signal != nil {
-			select {
-			case b.signal <- struct{}{}:
-			default:
+		if b.exceeded.CompareAndSwap(false, true) {
+			if b.onExceeded != nil {
+				b.onExceeded()
+			}
+			if b.signal != nil {
+				select {
+				case b.signal <- struct{}{}:
+				default:
+				}
 			}
 		}
 		return len(p), nil
 	}
 	b.remaining -= int64(len(p))
 	return b.b.Write(p)
+}
+
+type firstStreamFailure struct {
+	once sync.Once
+	err  error
+}
+
+func (f *firstStreamFailure) record(err error) {
+	if err != nil {
+		f.once.Do(func() { f.err = err })
+	}
 }
 
 func (osCommandRunner) run(path string, args []string, maxOutput int64) ([]byte, []byte, error) {
@@ -86,13 +104,20 @@ func (osCommandRunner) stream(path string, args []string, consume func(io.Reader
 		return err
 	}
 	exceeded := make(chan struct{}, 1)
-	stderr := limitedBuffer{remaining: 1 << 20, signal: exceeded}
+	var firstFailure firstStreamFailure
+	stderr := limitedBuffer{remaining: 1 << 20, signal: exceeded, onExceeded: func() {
+		firstFailure.record(fail("resource_limit"))
+	}}
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	consumeResult := make(chan error, 1)
-	go func() { consumeResult <- consume(stdout) }()
+	go func() {
+		consumeErr := consume(stdout)
+		firstFailure.record(consumeErr)
+		consumeResult <- consumeErr
+	}()
 
 	var consumeErr error
 	select {
@@ -119,11 +144,8 @@ func (osCommandRunner) stream(path string, args []string, consume func(io.Reader
 	}
 	// Remove descendants that retained codec descriptors after their parent exited.
 	_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
-	if stderr.exceeded.Load() {
-		return fail("resource_limit")
-	}
-	if consumeErr != nil {
-		return consumeErr
+	if firstFailure.err != nil {
+		return firstFailure.err
 	}
 	if waitErr != nil {
 		return errors.New("codec command failed")
