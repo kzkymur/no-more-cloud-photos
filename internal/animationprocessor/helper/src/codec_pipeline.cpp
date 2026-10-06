@@ -363,7 +363,15 @@ std::vector<std::uint8_t> encode_webp(const Animation &animation, int quality,
     if (!WebPPictureInit(&picture)) throw Failure("capability_failed");
     picture.width = width; picture.height = height; picture.use_argb = 1;
     if (mux_budget >= maximum) throw Failure("output_too_large");
-    WebPMemoryWriter writer{.bytes = {}, .maximum = maximum - mux_budget, .exceeded = false};
+    // A standalone frame RIFF has small VP8X/RIFF framing that is stripped by
+    // WebPMux. Permit that bounded transient overhead, then account only the
+    // exact copied ALPH+image chunks before PushFrame. This preserves an exact
+    // final-output boundary without granting every retained frame the full cap.
+    constexpr std::uint64_t kStandaloneFrameOverhead = 64U;
+    const std::uint64_t remaining = maximum - mux_budget;
+    const std::uint64_t writer_limit = remaining > maximum - std::min(maximum, kStandaloneFrameOverhead)
+                                           ? maximum : remaining + kStandaloneFrameOverhead;
+    WebPMemoryWriter writer{.bytes = {}, .maximum = writer_limit, .exceeded = false};
     picture.writer = write_webp;
     picture.custom_ptr = &writer;
     if (!WebPPictureImportRGBA(&picture, resized.rgba.data(), width * 4) || !WebPEncode(&config, &picture)) {
