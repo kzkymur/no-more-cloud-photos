@@ -147,12 +147,14 @@ host/release/TLS/direct-migration mutation until the exact binary exits.
 The concrete database unit must expose a finite `TimeoutStartUSec`. Before it
 can dispatch anything, a tracked runner writes its own PID/start-time record and
 then `exec`s `systemd-run` without changing identity; the broker also pins that
-identity with a pidfd. The transient has a five-minute queue `JobTimeoutSec`, a
-15-minute runtime deadline, and a 30-second stop deadline. Thus the broker has no
-independent pre-database timer, but queued dependency jobs and running admin work
-are both bounded. It releases automatically if the dispatch owner or exact
-runner exits before transfer, and owns cleanup of the runner record through
-terminal runner exit.
+identity with a pidfd. A tracked lifecycle wrapper imposes a 20-minute total
+operation deadline that includes queued dependency jobs; on expiry it stops the
+exact transient unit and terminates/kills the waiting `systemd-run` client. The
+transient additionally has a 15-minute runtime deadline and a 30-second stop
+deadline. Thus the broker has no short independent pre-database timer, but queued
+dependency jobs and running admin work are both bounded. It releases
+automatically if the dispatch owner or exact runner exits before transfer, and
+owns cleanup of the runner record through terminal runner exit.
 Successful oneshot migration remains active so production
 API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.

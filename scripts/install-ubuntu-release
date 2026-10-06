@@ -146,7 +146,7 @@ stop_services() {
 admin_sequence=0
 run_admin() {
   local admin_release=$1 operation=$2 subcommand=$3
-  local handoff broker job_timeout runner runner_file status=0 unit
+  local handoff broker operation_timeout runner runner_file status=0 unit
   admin_sequence=$((admin_sequence + 1))
   handoff=/run/nmcp-deploy/migration-handoff.$$.$admin_sequence
   runner_file=/run/nmcp-deploy/migration-runner.$$.$admin_sequence
@@ -177,14 +177,19 @@ run_admin() {
       /usr/bin/sleep 0.01
     done
   fi
-  job_timeout=${NMCP_TEST_ADMIN_JOB_TIMEOUT:-5min}
+  operation_timeout=${NMCP_TEST_ADMIN_OPERATION_TIMEOUT_SECONDS:-1200}
+  [[ $operation_timeout =~ ^[1-9][0-9]{0,3}$ && $operation_timeout -le 3600 ]] || {
+    printf 'install-ubuntu-release: invalid transient operation timeout\n' >&2
+    return 1
+  }
   /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$runner_file" \
+    "$unit.service" "$operation_timeout" \
     /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="$unit" \
     --property=Slice=nmcp.slice \
     --property="Requires=$postgresql_unit" --property="After=$postgresql_unit" \
     --property=EnvironmentFile=/etc/nmcp/admin.env \
-    --property="JobTimeoutSec=$job_timeout" --property=TimeoutStartSec=15min \
-    --property=TimeoutStopSec=30s --property=RuntimeMaxSec=15min \
+    --property=TimeoutStartSec=15min --property=TimeoutStopSec=30s \
+    --property=RuntimeMaxSec=15min \
     --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
     --property=ProtectSystem=strict --property=ProtectHome=yes \
     -- /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock receive "$handoff" \

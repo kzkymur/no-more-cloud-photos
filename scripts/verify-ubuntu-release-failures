@@ -157,7 +157,7 @@ EOF
 /usr/bin/systemctl daemon-reload
 /usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
 queue_started=$(/usr/bin/date +%s)
-if NMCP_TEST_ADMIN_JOB_TIMEOUT=2s \
+if NMCP_TEST_ADMIN_OPERATION_TIMEOUT_SECONDS=2 \
   "$repo/scripts/install-ubuntu-release" activate queuefail >"$work/queuefail.out" 2>&1; then
   printf 'never-runnable dependency unexpectedly activated release\n' >&2; exit 1
 fi

@@ -8,6 +8,7 @@ import pathlib
 import select
 import socket
 import stat
+import subprocess
 import sys
 
 
@@ -101,7 +102,7 @@ def send_fd(
         pathlib.Path(runner_file).unlink(missing_ok=True)
 
 
-def run_tracked(runner_file: str, command: list[str]) -> None:
+def run_tracked(runner_file: str, unit: str, timeout: int, command: list[str]) -> None:
     pid = os.getpid()
     start = process_start(pid)
     if start is None:
@@ -119,7 +120,25 @@ def run_tracked(runner_file: str, command: list[str]) -> None:
             import time
 
             time.sleep(0.01)
-    os.execv(command[0], command)
+    child = subprocess.Popen(command)
+    try:
+        status = child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(
+            ["/usr/bin/systemctl", "stop", unit],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=30,
+        )
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+        status = 124
+    raise SystemExit(status if status >= 0 else 128 - status)
 
 
 def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
@@ -153,7 +172,7 @@ if len(sys.argv) == 7 and sys.argv[1] == "send":
     send_fd(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
 elif len(sys.argv) >= 5 and sys.argv[1] == "receive":
     receive_fd(sys.argv[2], sys.argv[3], sys.argv[4:])
-elif len(sys.argv) >= 4 and sys.argv[1] == "run-tracked":
-    run_tracked(sys.argv[2], sys.argv[3:])
+elif len(sys.argv) >= 6 and sys.argv[1] == "run-tracked":
+    run_tracked(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5:])
 else:
-    fail("usage: send SOCKET LOCK FD OWNER_PID RUNNER_FILE | run-tracked FILE COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...]")
+    fail("usage: send SOCKET LOCK FD OWNER_PID RUNNER_FILE | run-tracked FILE UNIT TIMEOUT_SECONDS COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...]")
