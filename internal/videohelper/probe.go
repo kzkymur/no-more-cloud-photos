@@ -97,6 +97,9 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 	if err != nil || sar.Numerator <= 0 {
 		return inspection{}, nil, fail("unsupported_input")
 	}
+	if !rationalAxisWithin(video.Width, sar.Numerator, sar.Denominator, limit.Dimension) {
+		return inspection{}, nil, fail("resource_limit")
+	}
 	rotation, rotationSource, err := streamRotation(video)
 	if err != nil {
 		return inspection{}, nil, err
@@ -157,10 +160,9 @@ type frameAccounting struct {
 }
 
 func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBase rational, limit limits) (frameAccounting, error) {
-	args := []string{"-v", "error", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,best_effort_timestamp,pkt_duration,width,height", "-of", "compact=p=0:nk=0", path}
+	args := []string{"-v", "error", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,pts,pkt_duration,width,height", "-of", "compact=p=0:nk=0", path}
 	var result frameAccounting
 	var lastDuration int64
-	var lastDelta int64
 	err := e.run.stream(e.ffprobe, args, func(reader io.Reader) error {
 		scanner := bufio.NewScanner(reader)
 		scanner.Buffer(make([]byte, 4096), 64<<10)
@@ -169,13 +171,13 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 			if fields["media_type"] != "video" {
 				continue
 			}
-			pts, err := strconv.ParseInt(fields["best_effort_timestamp"], 10, 64)
+			pts, err := strconv.ParseInt(fields["pts"], 10, 64)
 			if err != nil || len(result.pts) > 0 && pts <= result.pts[len(result.pts)-1] {
 				return fail("unsupported_input")
 			}
 			if len(result.pts) > 0 {
 				var overflow bool
-				lastDelta, overflow = subtractInt64(pts, result.pts[len(result.pts)-1])
+				_, overflow = subtractInt64(pts, result.pts[len(result.pts)-1])
 				if overflow {
 					return fail("resource_limit")
 				}
@@ -194,7 +196,10 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 			}
 			result.decodedPixels += pixels
 			result.pts = append(result.pts, pts)
-			lastDuration, _ = strconv.ParseInt(fields["pkt_duration"], 10, 64)
+			lastDuration, err = strconv.ParseInt(fields["pkt_duration"], 10, 64)
+			if err != nil || lastDuration <= 0 {
+				return fail("unsupported_input")
+			}
 		}
 		return scanner.Err()
 	})
@@ -203,15 +208,10 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 		if errors.As(err, &protocolErr) {
 			return frameAccounting{}, err
 		}
-		return frameAccounting{}, fail("decode_failed")
+		return frameAccounting{}, fail("unsupported_input")
 	}
 	if len(result.pts) == 0 || lastDuration < 0 {
-		return frameAccounting{}, fail("decode_failed")
-	}
-	if len(result.pts) == 1 && lastDuration == 0 {
-		lastDuration = 1
-	} else if lastDuration <= 0 {
-		lastDuration = lastDelta
+		return frameAccounting{}, fail("unsupported_input")
 	}
 	span, overflow := subtractInt64(result.pts[len(result.pts)-1], result.pts[0])
 	if overflow {
@@ -441,6 +441,15 @@ func scaledAxis(axis int, n, d int64) (int, error) {
 		return 0, errors.New("invalid display axis")
 	}
 	return int(value), nil
+}
+
+func rationalAxisWithin(axis int, n, d int64, limit int) bool {
+	if axis <= 0 || n <= 0 || d <= 0 || limit <= 0 {
+		return false
+	}
+	left := new(big.Int).Mul(big.NewInt(int64(axis)), big.NewInt(n))
+	right := new(big.Int).Mul(big.NewInt(int64(limit)), big.NewInt(d))
+	return left.Cmp(right) <= 0
 }
 
 func hashDeltas(pts []int64) string {

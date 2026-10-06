@@ -116,8 +116,8 @@ func TestGeometryEvenFloorAndNoUpscale(t *testing.T) {
 }
 
 func TestFrameFactsBoundedStreamingAndAccounting(t *testing.T) {
-	frames := "media_type=video|best_effort_timestamp=0|pkt_duration=40|width=2|height=2\n" +
-		"media_type=video|best_effort_timestamp=40|pkt_duration=40|width=2|height=2\n"
+	frames := "media_type=video|pts=0|pkt_duration=40|width=2|height=2\n" +
+		"media_type=video|pts=40|pkt_duration=40|width=2|height=2\n"
 	runner := &fakeRunner{streams: []string{frames}}
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
 	limit := maxLimits()
@@ -147,7 +147,7 @@ func TestDurationAccountingDoesNotFloorPastLimit(t *testing.T) {
 
 func TestInspectUsesProbeAndRejectsAmbiguousColor(t *testing.T) {
 	metadata := probeJSON("h264", "yuv420p", 320, 180, false)
-	frames := "media_type=video|best_effort_timestamp=0|pkt_duration=40|width=320|height=180\nmedia_type=video|best_effort_timestamp=40|pkt_duration=40|width=320|height=180\n"
+	frames := "media_type=video|pts=0|pkt_duration=40|width=320|height=180\nmedia_type=video|pts=40|pkt_duration=40|width=320|height=180\n"
 	runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{frames}}
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
 	got, _, err := e.inspect("input", "video/mp4", maxLimits())
@@ -177,7 +177,7 @@ func TestCapabilitiesRequirePinnedSiblingFeatures(t *testing.T) {
 		[]byte("ffmpeg version 9.0.2"),
 		[]byte("--disable-autodetect --disable-network --disable-gpl --disable-nonfree --enable-libsvtav1 --enable-libzimg --enable-libaom"),
 		[]byte(" h264 hevc aac av1"),
-		[]byte(" mov,"),
+		[]byte(" mov "),
 		[]byte(" mp4 avif"),
 		[]byte("libsvtav1 libaom-av1 aac"),
 		[]byte("zscale tonemap"),
@@ -195,7 +195,7 @@ func TestCapabilitiesRequirePinnedSiblingFeatures(t *testing.T) {
 		[]byte("ffmpeg version 9.0.2"),
 		[]byte("--disable-autodetect --disable-network --disable-gpl --disable-nonfree --enable-libsvtav1 --enable-libzimg --enable-libaom"),
 		[]byte(" h264 hevc aac av1"),
-		[]byte(" mov,"),
+		[]byte(" mov "),
 		[]byte(" mp4 avif"),
 		[]byte("libaom-av1 aac"),
 		[]byte("zscale tonemap"),
@@ -217,7 +217,7 @@ func TestTransformInvokesSVTAV1WithoutH264FallbackAndTruncatesFailure(t *testing
 	}
 	defer output.Close()
 	icc := writeTemp(t, "icc")
-	frames := "media_type=video|best_effort_timestamp=0|pkt_duration=40|width=320|height=180\nmedia_type=video|best_effort_timestamp=40|pkt_duration=40|width=320|height=180\n"
+	frames := "media_type=video|pts=0|pkt_duration=40|width=320|height=180\nmedia_type=video|pts=40|pkt_duration=40|width=320|height=180\n"
 	runner := &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, writeOutput: []byte("mp4")}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
 	r := request{command: "transform", input: input.Name(), output: output.Name(), mime: "video/mp4", kind: "mp4-av1", icc: icc, maxLongEdge: 1920, bitDepth: 10, threads: 1, limits: maxLimits()}
@@ -251,8 +251,8 @@ func TestTimingVerificationAllowsOneTickAndRejectsTwo(t *testing.T) {
 }
 
 func TestVerifyOutputIndependentlyProbesAndFullyDecodes(t *testing.T) {
-	sourceFrames := "media_type=video|best_effort_timestamp=100|pkt_duration=40|width=320|height=180\nmedia_type=video|best_effort_timestamp=140|pkt_duration=40|width=320|height=180\n"
-	outputFrames := "media_type=video|best_effort_timestamp=0|pkt_duration=40|width=320|height=180\nmedia_type=video|best_effort_timestamp=40|pkt_duration=40|width=320|height=180\n"
+	sourceFrames := "media_type=video|pts=100|pkt_duration=40|width=320|height=180\nmedia_type=video|pts=140|pkt_duration=40|width=320|height=180\n"
+	outputFrames := "media_type=video|pts=0|pkt_duration=40|width=320|height=180\nmedia_type=video|pts=40|pkt_duration=40|width=320|height=180\n"
 	outputMetadata := probeJSON("av1", "yuv420p10le", 320, 180, false)
 	var outputDocument map[string]interface{}
 	if err := json.Unmarshal(outputMetadata, &outputDocument); err != nil {

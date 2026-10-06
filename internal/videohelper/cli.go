@@ -284,7 +284,7 @@ func (e *engine) checkTools() error {
 		{e.ffmpeg, []string{"-version"}, []string{"ffmpeg version 9.0.2"}},
 		{e.ffmpeg, []string{"-buildconf"}, []string{"--disable-autodetect", "--disable-network", "--disable-gpl", "--disable-nonfree", "--enable-libsvtav1", "--enable-libzimg", "--enable-libaom"}},
 		{e.ffmpeg, []string{"-hide_banner", "-decoders"}, []string{" h264", " hevc", " aac", " av1"}},
-		{e.ffmpeg, []string{"-hide_banner", "-demuxers"}, []string{" mov,"}},
+		{e.ffmpeg, []string{"-hide_banner", "-demuxers"}, []string{" mov "}},
 		{e.ffmpeg, []string{"-hide_banner", "-muxers"}, []string{" mp4", " avif"}},
 		{e.ffmpeg, []string{"-hide_banner", "-encoders"}, []string{"libsvtav1", "libaom-av1", " aac"}},
 		{e.ffmpeg, []string{"-hide_banner", "-filters"}, []string{"zscale", "tonemap"}},

@@ -8,7 +8,8 @@ has no root license grant; this file does not create one.
 The helper executes the sibling pinned FFmpeg build. That build dynamically
 links FFmpeg (LGPL-2.1-or-later with GPL/nonfree components disabled), SVT-AV1
 (BSD-3-Clause-Clear plus the Alliance for Open Media Patent License), zimg
-(WTFPL-2.0), and libaom (BSD-2-Clause). FFmpeg's native AAC encoder introduces no extra source
+(WTFPL-2.0), and libaom (BSD-2-Clause plus its accompanying Alliance for Open
+Media patent/IP grant). FFmpeg's native AAC encoder introduces no extra source
 dependency. Production packages must retain all upstream notices and complete
 their own copyright and codec-patent review.
 
