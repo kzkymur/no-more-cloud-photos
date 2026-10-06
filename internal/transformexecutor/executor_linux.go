@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -108,7 +109,7 @@ func (executor *Executor) Execute(ctx context.Context, lease job.Lease, limits w
 	if err != nil {
 		return err
 	}
-	var generatedBytes int64
+	generatedBytes := lease.GeneratedBytes
 	for _, target := range lease.Targets {
 		if err := executor.repository.BeginTarget(ctx, lease.ID, lease.Token, target.ID); err != nil {
 			return cancellationCause(ctx, err)
@@ -151,6 +152,7 @@ type transformResult struct {
 }
 
 type processorAudit struct {
+	SchemaVersion       int                               `json:"schema_version"`
 	Family              worker.Family                     `json:"family"`
 	InputClassification animationprocessor.Classification `json:"input_classification,omitempty"`
 	Result              any                               `json:"result"`
@@ -215,12 +217,12 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 			result, err := executor.still.Transform(ctx, stillprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe})
 			processErr = err
 			transformed = transformResult{mimeType: result.OutputMIME, extension: storage.RenditionAVIF, width: result.Width, height: result.Height,
-				audit: processorAudit{Family: worker.FamilyStill, InputClassification: classification, Result: result}}
+				audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyStill, InputClassification: classification, Result: result}}
 		case profile.SourceProbeAnimation:
 			result, err := executor.animation.Transform(ctx, animationprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe})
 			processErr = err
 			transformed = transformResult{mimeType: result.OutputMIME, extension: extension, width: result.Width, height: result.Height,
-				audit: processorAudit{Family: worker.FamilyAnimation, InputClassification: classification, Result: result}}
+				audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyAnimation, InputClassification: classification, Result: result}}
 			if result.OutputMIME == "image/webp" {
 				duration := result.Source.DurationMS
 				transformed.durationMS = &duration
@@ -229,7 +231,7 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 			result, err := executor.video.Transform(ctx, videoprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe, GeneratedBytesBefore: generatedBytes, ExpectedVideoStreamIndex: lease.Original.PrimaryVideoStreamIndex})
 			processErr = err
 			transformed = transformResult{mimeType: result.OutputMIME, extension: extension, width: result.Width, height: result.Height,
-				audit: processorAudit{Family: worker.FamilyVideo, Result: result}}
+				audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyVideo, Result: result}}
 			if result.OutputMIME == "video/mp4" {
 				duration := result.OutputDurationUS / 1000
 				transformed.durationMS = &duration
@@ -258,6 +260,9 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 		return true, 0, err
 	}
 	published = true
+	if info.Size < 0 || generatedBytes > math.MaxInt64-info.Size {
+		return false, info.Size, job.ErrInvariant
+	}
 	width, height := transformed.width, transformed.height
 	_, err = executor.repository.PublishRendition(ctx, job.Rendition{
 		ID: renditionIDText, JobID: lease.ID, LeaseToken: lease.Token, TargetID: target.ID,
@@ -279,7 +284,7 @@ func validateLease(lease job.Lease) (storage.OriginalKey, storage.AttemptID, err
 		(lease.Original.Width != nil && (*lease.Original.Width <= 0 || *lease.Original.Height <= 0)) ||
 		(lease.Original.DurationMS != nil && *lease.Original.DurationMS < 0) ||
 		(video && (lease.Original.PrimaryVideoStreamIndex == nil || *lease.Original.PrimaryVideoStreamIndex < 0)) ||
-		(!video && lease.Original.PrimaryVideoStreamIndex != nil) || lease.Attempts <= 0 ||
+		(!video && lease.Original.PrimaryVideoStreamIndex != nil) || lease.GeneratedBytes < 0 || lease.Attempts <= 0 ||
 		lease.MaxAttempts < lease.Attempts || len(lease.Targets) == 0 {
 		return storage.OriginalKey{}, storage.AttemptID{}, job.ErrInvalid
 	}

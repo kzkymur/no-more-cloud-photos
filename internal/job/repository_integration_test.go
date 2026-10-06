@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	dbmigration "github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 )
 
 func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
@@ -520,7 +522,7 @@ func TestTransformTargetsRetryAndCompletionIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	retry, err := repository.Claim(ctx, []Type{TypeTransform})
-	if err != nil || len(retry.Targets) != 1 || retry.Targets[0].ID != targets[1] || retry.Targets[0].Status != TargetPending || retry.Targets[0].ErrorCode != nil {
+	if err != nil || len(retry.Targets) != 1 || retry.Targets[0].ID != targets[1] || retry.Targets[0].Status != TargetPending || retry.Targets[0].ErrorCode != nil || retry.GeneratedBytes != 1 {
 		t.Fatalf("retry hydration = %+v, %v", retry, err)
 	}
 	if err := repository.BeginTarget(ctx, jobID, retry.Token, targets[1]); err != nil {
@@ -566,6 +568,12 @@ func TestPublishRenditionRejectsInvalidOwnershipAndStateIntegration(t *testing.T
 				t.Fatal(err)
 			}
 		}, want: ErrConflict},
+		{name: "empty processor audit", mutate: func(value *Rendition, _ *pgxpool.Pool) {
+			value.ProcessorAudit = []byte(`{}`)
+		}, want: ErrInvalid},
+		{name: "malformed processor audit", mutate: func(value *Rendition, _ *pgxpool.Pool) {
+			value.ProcessorAudit = []byte(`{"schema_version":1,"family":"still","result":{}}`)
+		}, want: ErrInvalid},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -898,6 +906,177 @@ func TestPublishRenditionRechecksLeaseAfterMediaLockWaitIntegration(t *testing.T
 	}
 	if jobStatus != StatusRunning || targetStatus != TargetPending {
 		t.Fatalf("expired blocked publication changed job=%s target=%s", jobStatus, targetStatus)
+	}
+}
+
+func TestPublishRenditionRechecksLeaseAfterChangeFeedWaitIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{LeaseDuration: 200 * time.Millisecond})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	jobID, targets := insertTransformJob(t, pool, 3, 2)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	locker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Rollback(context.Background())
+	if _, err := locker.Exec(ctx, `SELECT id FROM change_feed_state WHERE id=1 FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	candidate := testRendition(t, lease, targets[0])
+	go func() {
+		_, err := repository.PublishRendition(ctx, candidate)
+		result <- err
+	}()
+	waitForBlockedChangeFeedPublication(t, ctx, pool)
+	for {
+		var expired bool
+		if err := pool.QueryRow(ctx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, jobID).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired {
+			break
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("lease did not expire while publication waited on change feed: %v", ctx.Err())
+		}
+	}
+	if err := locker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("publication after change-feed wait = %v, want ErrLeaseLost", err)
+	}
+	assertPublicationCounts(t, pool, 0, 0, 0)
+	var jobStatus Status
+	var firstStatus, secondStatus TargetStatus
+	var currentCount int
+	if err := pool.QueryRow(ctx, `SELECT j.status,
+		(SELECT status FROM job_targets WHERE id=$2),(SELECT status FROM job_targets WHERE id=$3),
+		(SELECT count(*) FROM renditions WHERE media_id=j.media_id_snapshot AND is_current)
+		FROM jobs j WHERE j.id=$1`, jobID, targets[0], targets[1]).Scan(&jobStatus, &firstStatus, &secondStatus, &currentCount); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != StatusRunning || firstStatus != TargetPending || secondStatus != TargetPending || currentCount != 0 {
+		t.Fatalf("expired feed-blocked publication committed job=%s targets=%s/%s current=%d", jobStatus, firstStatus, secondStatus, currentCount)
+	}
+}
+
+func TestClaimHydratesPartialRetryGeneratedBytesIntegration(t *testing.T) {
+	for _, size := range []int64{videoprocessor.MaxGeneratedOutputBytes, videoprocessor.MaxGeneratedOutputBytes + 1} {
+		t.Run(fmt.Sprintf("%d", size), func(t *testing.T) {
+			pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
+			ctx := context.Background()
+			jobID, targets := insertTransformJob(t, pool, 3, 2)
+			lease, err := repository.Claim(ctx, []Type{TypeTransform})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[0]); err != nil {
+				t.Fatal(err)
+			}
+			candidate := testRendition(t, lease, targets[0])
+			candidate.SizeBytes = size
+			if _, err := repository.PublishRendition(ctx, candidate); err != nil {
+				t.Fatal(err)
+			}
+			if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[1]); err != nil {
+				t.Fatal(err)
+			}
+			if err := repository.MarkTargetFailed(ctx, jobID, lease.Token, targets[1], FailureProcessFailed); err != nil {
+				t.Fatal(err)
+			}
+			if err := repository.FinishAttempt(ctx, jobID, lease.Token, FailureProcessFailed); err != nil {
+				t.Fatal(err)
+			}
+			retry, err := repository.Claim(ctx, []Type{TypeTransform})
+			if err != nil || retry.GeneratedBytes != size || len(retry.Targets) != 1 || retry.Targets[0].ID != targets[1] {
+				t.Fatalf("retry = %+v, %v; want generated bytes %d", retry, err, size)
+			}
+		})
+	}
+}
+
+func TestClaimRejectsGeneratedByteOverflowIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
+	ctx := context.Background()
+	jobID, targets := insertTransformJob(t, pool, 3, 3)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, size := range []int64{math.MaxInt64, 1} {
+		if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[index]); err != nil {
+			t.Fatal(err)
+		}
+		candidate := testRendition(t, lease, targets[index])
+		candidate.SizeBytes = size
+		if _, err := repository.PublishRendition(ctx, candidate); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.MarkTargetFailed(ctx, jobID, lease.Token, targets[2], FailureProcessFailed); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.FinishAttempt(ctx, jobID, lease.Token, FailureProcessFailed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("overflowing generated-byte claim = %v, want ErrInvariant", err)
+	}
+	var status Status
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusQueued || attempts != 1 {
+		t.Fatalf("overflowing hydration committed claim status=%s attempts=%d", status, attempts)
+	}
+}
+
+func TestClaimRejectsSuccessfulTargetWithoutRenditionIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
+	ctx := context.Background()
+	jobID, targets := insertTransformJob(t, pool, 3, 2)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE job_targets DISABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `ALTER TABLE job_targets ENABLE TRIGGER USER`) })
+	if _, err := pool.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE job_targets ENABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.FinishAttempt(ctx, jobID, lease.Token, FailureProcessFailed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("successful target without rendition claim = %v, want ErrInvariant", err)
+	}
+	var status Status
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusQueued || attempts != 1 {
+		t.Fatalf("invalid hydration committed claim status=%s attempts=%d", status, attempts)
 	}
 }
 
@@ -1546,7 +1725,7 @@ func testRendition(t *testing.T, lease Lease, targetID string) Rendition {
 		OriginalID: lease.Original.ID, MediaID: lease.MediaID, ProfileID: profileID,
 		RelativePath: "renditions/" + lease.Original.ID[:2] + "/" + lease.Original.ID + "/" + targetID + "/" + renditionID + ".avif",
 		MIMEType:     "image/avif", Width: &width, Height: &height, SizeBytes: 1,
-		SHA256: strings.Repeat("b", 64), ProcessorAudit: []byte(`{"processor":"integration"}`),
+		SHA256: strings.Repeat("b", 64), ProcessorAudit: []byte(`{"schema_version":1,"family":"still","result":{"processor":"integration"}}`),
 	}
 }
 
@@ -1668,6 +1847,25 @@ func waitForBlockedPublications(t *testing.T, ctx context.Context, pool *pgxpool
 		case <-time.After(10 * time.Millisecond):
 		case <-ctx.Done():
 			t.Fatalf("blocked publications=%d, want at least %d: %v", count, want, ctx.Err())
+		}
+	}
+}
+
+func waitForBlockedChangeFeedPublication(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	for {
+		var blocked bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity
+			WHERE wait_event_type='Lock' AND query LIKE 'UPDATE change_feed_state SET last_position=%')`).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			return
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("publication did not block on change feed: %v", ctx.Err())
 		}
 	}
 }

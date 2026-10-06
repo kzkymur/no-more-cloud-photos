@@ -131,23 +131,6 @@ func (r *Repository) PublishRendition(ctx context.Context, candidate Rendition) 
 		return Publication{}, classifyDatabaseError(err)
 	}
 	jobFinished := !incomplete
-	if jobFinished {
-		tag, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,
-			finished_at=clock_timestamp(),error_code=NULL,error_message=NULL,updated_at=clock_timestamp()
-			WHERE id=$1 AND status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()`, candidate.JobID, candidate.LeaseToken)
-		if err != nil {
-			return Publication{}, classifyDatabaseError(err)
-		}
-		if tag.RowsAffected() != 1 {
-			return Publication{}, ErrLeaseLost
-		}
-	} else if err := tx.QueryRow(ctx, `SELECT status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()
-		FROM jobs WHERE id=$1`, candidate.JobID, candidate.LeaseToken).Scan(&leaseLive); err != nil {
-		return Publication{}, classifyDatabaseError(err)
-	} else if !leaseLive {
-		return Publication{}, ErrLeaseLost
-	}
-
 	if promote {
 		payload, err := r.mediaEventPayload(ctx, tx, candidate.MediaID)
 		if err != nil {
@@ -172,6 +155,25 @@ func (r *Repository) PublishRendition(ctx context.Context, candidate Rendition) 
 		if err := r.checkpoint(ctx, storage.BoundaryBeforeDBCommit, candidate.RelativePath); err != nil {
 			return Publication{}, err
 		}
+	}
+	// The change-feed position and checkpoint can block after the initial lease
+	// check. Keep the terminal CAS, or the partial-attempt recheck, as the last
+	// ownership decision before commit so expired work rolls back atomically.
+	if jobFinished {
+		tag, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,
+			finished_at=clock_timestamp(),error_code=NULL,error_message=NULL,updated_at=clock_timestamp()
+			WHERE id=$1 AND status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()`, candidate.JobID, candidate.LeaseToken)
+		if err != nil {
+			return Publication{}, classifyDatabaseError(err)
+		}
+		if tag.RowsAffected() != 1 {
+			return Publication{}, ErrLeaseLost
+		}
+	} else if err := tx.QueryRow(ctx, `SELECT status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()
+		FROM jobs WHERE id=$1`, candidate.JobID, candidate.LeaseToken).Scan(&leaseLive); err != nil {
+		return Publication{}, classifyDatabaseError(err)
+	} else if !leaseLive {
+		return Publication{}, ErrLeaseLost
 	}
 	if err := commitPublication(ctx, tx); err != nil {
 		return Publication{}, err
@@ -344,7 +346,21 @@ func validRendition(candidate Rendition) bool {
 		validSHA256(candidate.SHA256) && (candidate.Width == nil) == (candidate.Height == nil) &&
 		(candidate.Width == nil || *candidate.Width > 0 && *candidate.Height > 0) &&
 		(candidate.DurationMS == nil || *candidate.DurationMS >= 0) && len(candidate.ProcessorAudit) <= 1<<20 &&
-		jsonObject(candidate.ProcessorAudit) && renditionMIMEMatchesPath(candidate.MIMEType, candidate.RelativePath)
+		validProcessorAudit(candidate.ProcessorAudit) && renditionMIMEMatchesPath(candidate.MIMEType, candidate.RelativePath)
+}
+
+func validProcessorAudit(value json.RawMessage) bool {
+	var audit struct {
+		SchemaVersion int             `json:"schema_version"`
+		Family        string          `json:"family"`
+		Result        json.RawMessage `json:"result"`
+	}
+	var result map[string]json.RawMessage
+	if !jsonObject(value) || json.Unmarshal(value, &audit) != nil || audit.SchemaVersion != 1 ||
+		json.Unmarshal(audit.Result, &result) != nil || len(result) == 0 {
+		return false
+	}
+	return audit.Family == "still" || audit.Family == "animation" || audit.Family == "video"
 }
 
 func renditionMIMEMatchesPath(mimeType, relativePath string) bool {

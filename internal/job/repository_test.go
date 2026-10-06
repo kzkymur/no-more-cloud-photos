@@ -145,7 +145,7 @@ func TestRenditionValidation(t *testing.T) {
 		ID: ids[0], JobID: ids[1], LeaseToken: ids[2], TargetID: ids[3], OriginalID: ids[4], MediaID: ids[5],
 		ProfileID: ids[1], RelativePath: "renditions/" + ids[4][:2] + "/" + ids[4] + "/" + ids[3] + "/" + ids[0] + ".avif",
 		MIMEType: "image/avif", Width: &width, Height: &height, SizeBytes: 1, SHA256: strings.Repeat("a", 64),
-		ProcessorAudit: json.RawMessage(`{"tool":"test"}`),
+		ProcessorAudit: json.RawMessage(`{"schema_version":1,"family":"still","result":{"tool":"test"}}`),
 	}
 	if !validRendition(candidate) {
 		t.Fatal("valid rendition rejected")
@@ -157,6 +157,22 @@ func TestRenditionValidation(t *testing.T) {
 		"negative size":           func(value *Rendition) { value.SizeBytes = -1 },
 		"invalid digest":          func(value *Rendition) { value.SHA256 = "A" + value.SHA256[1:] },
 		"non-object audit":        func(value *Rendition) { value.ProcessorAudit = json.RawMessage(`[]`) },
+		"empty audit":             func(value *Rendition) { value.ProcessorAudit = json.RawMessage(`{}`) },
+		"missing audit schema": func(value *Rendition) {
+			value.ProcessorAudit = json.RawMessage(`{"family":"still","result":{"tool":"test"}}`)
+		},
+		"unknown audit schema": func(value *Rendition) {
+			value.ProcessorAudit = json.RawMessage(`{"schema_version":2,"family":"still","result":{"tool":"test"}}`)
+		},
+		"unknown audit family": func(value *Rendition) {
+			value.ProcessorAudit = json.RawMessage(`{"schema_version":1,"family":"other","result":{"tool":"test"}}`)
+		},
+		"empty audit result": func(value *Rendition) {
+			value.ProcessorAudit = json.RawMessage(`{"schema_version":1,"family":"still","result":{}}`)
+		},
+		"non-object audit result": func(value *Rendition) {
+			value.ProcessorAudit = json.RawMessage(`{"schema_version":1,"family":"still","result":[]}`)
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

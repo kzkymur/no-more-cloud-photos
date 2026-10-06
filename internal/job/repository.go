@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strings"
 	"time"
@@ -109,6 +110,10 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 		return Lease{}, classifyDatabaseError(err)
 	}
 	lease.Targets, err = loadTargets(ctx, tx, lease.ID)
+	if err != nil {
+		return Lease{}, err
+	}
+	lease.GeneratedBytes, err = loadGeneratedBytes(ctx, tx, lease.ID)
 	if err != nil {
 		return Lease{}, err
 	}
@@ -403,6 +408,36 @@ func loadTargets(ctx context.Context, tx pgx.Tx, jobID string) ([]Target, error)
 		return nil, classifyDatabaseError(err)
 	}
 	return targets, nil
+}
+
+func loadGeneratedBytes(ctx context.Context, tx pgx.Tx, jobID string) (int64, error) {
+	rows, err := tx.Query(ctx, `SELECT jt.status,r.size_bytes
+		FROM job_targets jt LEFT JOIN renditions r ON r.job_target_id=jt.id
+		WHERE jt.job_id=$1 ORDER BY jt.id`, jobID)
+	if err != nil {
+		return 0, classifyDatabaseError(err)
+	}
+	defer rows.Close()
+	var total int64
+	for rows.Next() {
+		var status TargetStatus
+		var size *int64
+		if err := rows.Scan(&status, &size); err != nil {
+			return 0, classifyDatabaseError(err)
+		}
+		if status == TargetSucceeded {
+			if size == nil || *size < 0 || total > math.MaxInt64-*size {
+				return 0, ErrInvariant
+			}
+			total += *size
+		} else if size != nil {
+			return 0, ErrInvariant
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, classifyDatabaseError(err)
+	}
+	return total, nil
 }
 
 func loadOriginal(ctx context.Context, tx pgx.Tx, jobType Type, originalID *string, mediaID string) (*Original, error) {

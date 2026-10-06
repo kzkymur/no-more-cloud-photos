@@ -109,6 +109,7 @@ type Lease struct {
 	AvailableAt    time.Time
 	CreatedAt      time.Time
 	Targets        []Target
+	GeneratedBytes int64
 }
 
 type Rendition struct {
