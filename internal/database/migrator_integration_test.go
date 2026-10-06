@@ -92,6 +92,37 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatalf("%s rules = %v, want %q", mimeType, rules, want)
 			}
 		}
+		profileState := func(t *testing.T, pool *pgxpool.Pool) (string, string, string) {
+			t.Helper()
+			var payload, validator, trigger string
+			if err := pool.QueryRow(ctx, `SELECT jsonb_agg(parameters ORDER BY key)::text FROM profiles`).Scan(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT pg_get_functiondef('nmcp_valid_profile_recipe(jsonb)'::regprocedure)`).Scan(&validator); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT tgenabled::text FROM pg_trigger WHERE tgrelid='profiles'::regclass AND tgname='profiles_lifecycle'`).Scan(&trigger); err != nil {
+				t.Fatal(err)
+			}
+			return payload, validator, trigger
+		}
+		insertTransformTarget := func(t *testing.T, tx pgx.Tx) string {
+			t.Helper()
+			mediaID, originalID, jobID, targetID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+			if _, err := tx.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/gif','unknown')`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/gif',1)`, originalID, mediaID, strings.Repeat("d", 64), "originals/00/dimension-"+originalID+"/original.gif"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+				t.Fatal(err)
+			}
+			return targetID
+		}
 
 		validPool, validMigrator := prepareVersionFour(t)
 		assertRule(t, validPool, "image/jpeg", "preserve-aspect-no-crop-no-upscale-even-round-down")
@@ -126,8 +157,19 @@ func TestMigratorIntegration(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			"referenced": func(t *testing.T, pool *pgxpool.Pool) {
+			"admin batch referenced": func(t *testing.T, pool *pgxpool.Pool) {
 				if _, err := pool.Exec(ctx, `INSERT INTO admin_batches (id,identity_key,operation,status,profile_id,config_snapshot,high_water,checkpoint) VALUES ($1,$2,'regenerate','running',$3,'{}','{}','{}')`, newUUIDv4(t), "dimension-migration-reference-"+newUUIDv4(t), profile.StandardV1ID); err != nil {
+					t.Fatal(err)
+				}
+			},
+			"job target referenced": func(t *testing.T, pool *pgxpool.Pool) {
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				insertTransformTarget(t, tx)
+				if err := tx.Commit(ctx); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -135,6 +177,7 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				pool, migrator := prepareVersionFour(t)
 				damage(t, pool)
+				payload, validator, trigger := profileState(t, pool)
 				if err := migrator.Up(ctx); err == nil {
 					t.Fatalf("migration accepted %s bundled profile", name)
 				}
@@ -145,8 +188,30 @@ func TestMigratorIntegration(t *testing.T) {
 				if status.CurrentVersion != 4 || !status.Pending {
 					t.Fatalf("failed migration status = %+v", status)
 				}
+				gotPayload, gotValidator, gotTrigger := profileState(t, pool)
+				if gotPayload != payload || gotValidator != validator || gotTrigger != trigger {
+					t.Fatalf("failed migration changed state: payload=%v validator=%v trigger=%q", gotPayload != payload, gotValidator != validator, gotTrigger)
+				}
 			})
 		}
+
+		t.Run("update failure rolls back validator payload and trigger", func(t *testing.T) {
+			pool, migrator := prepareVersionFour(t)
+			payload, validator, trigger := profileState(t, pool)
+			if _, err := pool.Exec(ctx, `
+				CREATE FUNCTION reject_dimension_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected deferred failure'; END $$;
+				CREATE CONSTRAINT TRIGGER reject_dimension_update AFTER UPDATE ON profiles
+				DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_dimension_update()`); err != nil {
+				t.Fatal(err)
+			}
+			if err := migrator.Up(ctx); err == nil {
+				t.Fatal("migration accepted injected profile update failure")
+			}
+			gotPayload, gotValidator, gotTrigger := profileState(t, pool)
+			if gotPayload != payload || gotValidator != validator || gotTrigger != trigger || gotTrigger != "O" {
+				t.Fatalf("rollback changed state: payload=%v validator=%v trigger=%q", gotPayload != payload, gotValidator != validator, gotTrigger)
+			}
+		})
 
 		t.Run("waits for earlier activation writer before preflight", func(t *testing.T) {
 			pool, migrator := prepareVersionFour(t)
@@ -179,6 +244,47 @@ func TestMigratorIntegration(t *testing.T) {
 			}
 			if err := <-result; err == nil {
 				t.Fatal("migration accepted profile activated by earlier writer")
+			}
+		})
+
+		t.Run("waits for earlier job target FK writer before preflight", func(t *testing.T) {
+			pool, migrator := prepareVersionFour(t)
+			payload, validator, trigger := profileState(t, pool)
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			targetID := insertTransformTarget(t, tx)
+			result := make(chan error, 1)
+			go func() { result <- migrator.Up(ctx) }()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				var waiting bool
+				if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation='profiles'::regclass AND mode='AccessExclusiveLock' AND NOT granted)`).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("migration did not wait for earlier job-target FK writer")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-result; err == nil {
+				t.Fatal("migration accepted reference committed by earlier job-target FK writer")
+			}
+			var references int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM job_targets WHERE id=$1`, targetID).Scan(&references); err != nil || references != 1 {
+				t.Fatalf("committed FK reference count=%d err=%v", references, err)
+			}
+			gotPayload, gotValidator, gotTrigger := profileState(t, pool)
+			if gotPayload != payload || gotValidator != validator || gotTrigger != trigger {
+				t.Fatal("failed concurrent migration changed profile state")
 			}
 		})
 	})

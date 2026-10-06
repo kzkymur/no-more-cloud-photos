@@ -9,6 +9,9 @@ test time; no opaque binary fixture is stored in the repository.
 - `helper/tests/gif_fixture_generator.cpp` creates 3x1 GIFs that differ only in
   middle-frame disposal-to-background versus restore-to-previous behavior.
   Their positive centisecond delays and zero-delay normalization are asserted.
+  It also creates deterministic 64x64 pseudo-random indexed-color GIFs with one
+  and 128 incompressible frames. The single frame fits a 64 KiB output budget;
+  the many-frame form proves copied mux payloads fail at the cumulative budget.
 - `processor_integration_linux_test.go` embeds the byte-level source of a
   project-owned 1x1 transparent GIF and derives finite/infinite/absent and
   unrepresentable loop fixtures by inserting the standard NETSCAPE2.0 block.

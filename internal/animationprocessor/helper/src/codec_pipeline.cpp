@@ -340,6 +340,17 @@ std::vector<std::uint8_t> encode_webp(const Animation &animation, int quality,
   if (WebPMuxSetAnimationParams(mux.get(), &params) != WEBP_MUX_OK) throw Failure("encode_failed");
   WebPData profile{reinterpret_cast<const std::uint8_t *>(icc.data()), icc.size()};
   if (WebPMuxSetChunk(mux.get(), "ICCP", &profile, 1) != WEBP_MUX_OK) throw Failure("encode_failed");
+  const auto chunk_disk_size = [](std::uint64_t payload) {
+    return 8U + payload + (payload & 1U);
+  };
+  // RIFF header, VP8X, ANIM, and ICCP. Per-frame accounting below extracts the
+  // exact ALPH and VP8/VP8L chunk disk sizes from the encoded single-image RIFF
+  // before WebPMux copies them. Thus both retained mux payload and final
+  // assembly are rejected before the frame that would exceed the output cap.
+  std::uint64_t mux_budget = 12U + chunk_disk_size(10U) + chunk_disk_size(6U);
+  const std::uint64_t icc_disk = chunk_disk_size(icc.size());
+  if (mux_budget > maximum || icc_disk > maximum - mux_budget) throw Failure("output_too_large");
+  mux_budget += icc_disk;
   WebPConfig config{};
   if (!WebPConfigInit(&config)) throw Failure("capability_failed");
   config.quality = static_cast<float>(quality);
@@ -351,7 +362,8 @@ std::vector<std::uint8_t> encode_webp(const Animation &animation, int quality,
     WebPPicture picture{};
     if (!WebPPictureInit(&picture)) throw Failure("capability_failed");
     picture.width = width; picture.height = height; picture.use_argb = 1;
-    WebPMemoryWriter writer{.bytes = {}, .maximum = maximum, .exceeded = false};
+    if (mux_budget >= maximum) throw Failure("output_too_large");
+    WebPMemoryWriter writer{.bytes = {}, .maximum = maximum - mux_budget, .exceeded = false};
     picture.writer = write_webp;
     picture.custom_ptr = &writer;
     if (!WebPPictureImportRGBA(&picture, resized.rgba.data(), width * 4) || !WebPEncode(&config, &picture)) {
@@ -359,6 +371,33 @@ std::vector<std::uint8_t> encode_webp(const Animation &animation, int quality,
       throw Failure(writer.exceeded ? "output_too_large" : "encode_failed");
     }
     WebPPictureFree(&picture);
+    if (writer.bytes.size() < 12 || std::memcmp(writer.bytes.data(), "RIFF", 4) != 0 ||
+        std::memcmp(writer.bytes.data() + 8, "WEBP", 4) != 0) throw Failure("encode_failed");
+    const auto read_le32 = [](const std::uint8_t *value) {
+      return static_cast<std::uint32_t>(value[0]) | (static_cast<std::uint32_t>(value[1]) << 8U) |
+             (static_cast<std::uint32_t>(value[2]) << 16U) | (static_cast<std::uint32_t>(value[3]) << 24U);
+    };
+    if (static_cast<std::uint64_t>(read_le32(writer.bytes.data() + 4)) + 8U != writer.bytes.size()) {
+      throw Failure("encode_failed");
+    }
+    std::uint64_t frame_budget = 24U;  // ANMF chunk header plus frame header.
+    std::size_t offset = 12;
+    int images = 0;
+    while (offset < writer.bytes.size()) {
+      if (writer.bytes.size() - offset < 8U) throw Failure("encode_failed");
+      const std::uint32_t payload = read_le32(writer.bytes.data() + offset + 4U);
+      const std::uint64_t disk = chunk_disk_size(payload);
+      if (disk > writer.bytes.size() - offset) throw Failure("encode_failed");
+      const std::string_view tag(reinterpret_cast<const char *>(writer.bytes.data() + offset), 4);
+      if (tag == "ALPH" || tag == "VP8 " || tag == "VP8L") {
+        if (disk > std::numeric_limits<std::uint64_t>::max() - frame_budget) throw Failure("output_too_large");
+        frame_budget += disk;
+        if (tag == "VP8 " || tag == "VP8L") ++images;
+      }
+      offset += static_cast<std::size_t>(disk);
+    }
+    if (offset != writer.bytes.size() || images != 1) throw Failure("encode_failed");
+    if (frame_budget > maximum - mux_budget) throw Failure("output_too_large");
     WebPMuxFrameInfo frame{};
     frame.bitstream = {writer.bytes.data(), writer.bytes.size()};
     frame.duration = animation.inspection.frame_durations_ms[index];
@@ -366,6 +405,7 @@ std::vector<std::uint8_t> encode_webp(const Animation &animation, int quality,
     frame.dispose_method = WEBP_MUX_DISPOSE_NONE;
     frame.blend_method = WEBP_MUX_NO_BLEND;
     if (WebPMuxPushFrame(mux.get(), &frame, 1) != WEBP_MUX_OK) throw Failure("encode_failed");
+    mux_budget += frame_budget;
   }
   WebPData output{};
   WebPDataInit(&output);

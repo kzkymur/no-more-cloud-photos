@@ -24,8 +24,26 @@ const animationInspection = `{"classification":"animation","width":3,"height":2,
 const staticInspection = `{"classification":"static","width":3,"height":2,"frame_count":1,"frame_durations_ms":[100],"duration_ms":100,"total_plays":1,"has_alpha":false,"zero_duration_frame_indices":[0],"decoded_pixels":6}`
 const inspectSuccess = `{"protocol":1,"ok":true,"error_code":"","result":` + animationInspection + `}`
 const transformSuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"output_mime":"image/webp","width":3,"height":2,"quality":80,"bit_depth":8,"max_long_edge":1920,"threads":1,"source":` + animationInspection + `,"audit":{"decoder":"giflib-gif","encoder":"libwebp","tool_version":"animation-helper-1","library_versions":` + versionsJSON + `,"icc_sha256":"` + testICCDigest + `","composition":"composited-rgba","timing_normalization":"zero-duration-to-100ms","loop_normalization":"total-play-count","input_color":"assumed-srgb","output_color":"srgb","alpha":"preserved","metadata":"strip-after-normalization-keep-color-tags"}}}`
-const fakeWebP = "RIFF0000WEBP"
-const fakeAVIF = "0000ftypavif"
+
+var fakeWebP = string([]byte{
+	'R', 'I', 'F', 'F', 86, 0, 0, 0, 'W', 'E', 'B', 'P',
+	'V', 'P', '8', 'X', 10, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	'A', 'N', 'I', 'M', 6, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	'A', 'N', 'M', 'F', 42, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0,
+	'V', 'P', '8', 'L', 17, 0, 0, 0, 47, 0, 0, 0, 0, 7, 208, 255, 254, 247, 191, 255, 129, 136, 232, 127, 0, 0,
+})
+
+var fakeAVIF = string([]byte{
+	0, 0, 0, 20, 'f', 't', 'y', 'p', 'a', 'v', 'i', 'f', 0, 0, 0, 0, 'a', 'v', 'i', 'f',
+	0, 0, 0, 112, 'm', 'e', 't', 'a', 0, 0, 0, 0,
+	0, 0, 0, 32, 'h', 'd', 'l', 'r', 0, 0, 0, 0, 0, 0, 0, 0, 'p', 'i', 'c', 't', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 14, 'p', 'i', 't', 'm', 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 16, 'i', 'l', 'o', 'c', 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 14, 'i', 'i', 'n', 'f', 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 24, 'i', 'p', 'r', 'p', 0, 0, 0, 8, 'i', 'p', 'c', 'o', 0, 0, 0, 8, 'i', 'p', 'm', 'a',
+	0, 0, 0, 9, 'm', 'd', 'a', 't', 0,
+})
 
 func TestCapabilities(t *testing.T) {
 	helper := writeExecutable(t, "capabilities", "#!/bin/sh\n"+
@@ -86,7 +104,7 @@ func TestTransformUsesExactArgumentsAndDescriptors(t *testing.T) {
 		"[ \"$1\" = transform ] && [ \"$3\" = 1 ] && [ \"$5\" = /proc/self/fd/3 ] && [ \"$7\" = /proc/self/fd/4 ] || exit 21\n"+
 		"[ \"$9\" = image/gif ] && [ \"${11}\" = animated-webp ] && [ \"${13}\" = 1920 ] && [ \"${15}\" = 80 ] && [ \"${17}\" = 8 ] && [ \"${19}\" = 1 ] && [ \"${21}\" = /proc/self/fd/5 ] || exit 22\n"+
 		"[ \"${23}\" = 1000 ] && [ \"${25}\" = 3600000 ] && [ \"${27}\" = 100000 ] && [ \"${29}\" = 1000000000 ] && [ \"${31}\" = 1000000000 ] && [ \"${33}\" = 268435456 ] || exit 23\n"+
-		"[ \"$(cat <&3)\" = original-bytes ] || exit 24\nprintf RIFF0000WEBP >&4 || exit 25\nprintf '%s' '"+transformSuccess+"'\n")
+		"[ \"$(cat <&3)\" = original-bytes ] || exit 24\nprintf '%b' '"+shellOctal(fakeWebP)+"' >&4 || exit 25\nprintf '%s' '"+transformSuccess+"'\n")
 	input, output := testFiles(t, []byte("original-bytes"))
 	got, err := newProcessor(t, helper, Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()})
 	if err != nil {
@@ -268,6 +286,55 @@ func TestTransformRejectsInvalidOutputSignature(t *testing.T) {
 	}
 }
 
+func TestTransformRejectsMalformedOutputContainer(t *testing.T) {
+	wrongRIFFSize := []byte(fakeWebP)
+	wrongRIFFSize[4]++
+	missingAnimation := strings.Replace(fakeWebP, "ANIM", "JUNK", 1)
+	truncatedChunk := fakeWebP[:len(fakeWebP)-1]
+	for name, output := range map[string]string{
+		"RIFF declared size": string(wrongRIFFSize),
+		"missing ANIM":       missingAnimation,
+		"truncated chunk":    truncatedChunk,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := transformError(t, newProcessor(t, jsonHelper(t, transformSuccess, output), Policy{}), context.Background()); !errors.Is(err, ErrProcess) {
+				t.Fatalf("Transform() error = %v", err)
+			}
+		})
+	}
+	document := strings.NewReplacer(`"output_mime":"image/webp"`, `"output_mime":"image/avif"`, `"quality":80`, `"quality":50`, `"max_long_edge":1920`, `"max_long_edge":640`, `"encoder":"libwebp"`, `"encoder":"aom"`).Replace(transformSuccess)
+	for name, bytes := range map[string]string{
+		"AVIF truncated box":       fakeAVIF[:len(fakeAVIF)-1],
+		"AVIF missing iprp":        strings.Replace(fakeAVIF, "iprp", "free", 1),
+		"AVIF incompatible brands": strings.ReplaceAll(fakeAVIF, "avif", "xxxx"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			input, output := testFiles(t, []byte("input"))
+			_, err := newProcessor(t, jsonHelper(t, document, bytes), Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: thumbnailRecipe()})
+			if !errors.Is(err, ErrProcess) {
+				t.Fatalf("Transform() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCommandSpecificHelperErrors(t *testing.T) {
+	errorDocument := func(code string) string {
+		return `{"protocol":1,"ok":false,"error_code":"` + code + `","result":null}`
+	}
+	if _, err := newProcessor(t, jsonHelper(t, errorDocument("static_input"), ""), Policy{}).Capabilities(context.Background()); !errors.Is(err, ErrCapability) {
+		t.Fatalf("Capabilities() cross-command error = %v", err)
+	}
+	input, _ := testFiles(t, []byte("input"))
+	if _, err := newProcessor(t, jsonHelper(t, errorDocument("encode_failed"), ""), Policy{}).Inspect(context.Background(), InspectRequest{Input: input, MIMEType: "image/gif"}); !errors.Is(err, ErrProcess) {
+		t.Fatalf("Inspect() cross-command error = %v", err)
+	}
+	input, _ = testFiles(t, []byte("input"))
+	if _, err := newProcessor(t, jsonHelper(t, errorDocument("capability_failed"), ""), Policy{}).Inspect(context.Background(), InspectRequest{Input: input, MIMEType: "image/webp"}); !errors.Is(err, ErrCapability) {
+		t.Fatalf("Inspect() capability error = %v", err)
+	}
+}
+
 func TestResizeGeometryPreservesOddAndOnePixel(t *testing.T) {
 	for _, test := range []struct {
 		sw, sh, ow, oh, edge int
@@ -342,10 +409,18 @@ func jsonHelper(t *testing.T, document, output string) string {
 	t.Helper()
 	body := "#!/bin/sh\n"
 	if output != "" {
-		body += "printf '%s' '" + output + "' >&4\n"
+		body += "printf '%b' '" + shellOctal(output) + "' >&4\n"
 	}
 	body += "printf '%s' '" + document + "'\n"
 	return writeExecutable(t, "json-helper", body)
+}
+
+func shellOctal(value string) string {
+	var result strings.Builder
+	for _, value := range []byte(value) {
+		fmt.Fprintf(&result, `\%03o`, value)
+	}
+	return result.String()
 }
 func transformError(t *testing.T, p *Processor, ctx context.Context) error {
 	t.Helper()

@@ -8,10 +8,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -194,7 +196,7 @@ func (p *Processor) Capabilities(ctx context.Context) (Capabilities, error) {
 		return Capabilities{}, ErrCapability
 	}
 	if !response.OK {
-		return Capabilities{}, mapHelperCode(response.ErrorCode, ErrCapability)
+		return Capabilities{}, mapCapabilityError(response.ErrorCode)
 	}
 	if validateCapability(*response.Result, p.iccSHA256) != nil {
 		return Capabilities{}, ErrCapability
@@ -226,7 +228,7 @@ func (p *Processor) Inspect(ctx context.Context, request InspectRequest) (Inspec
 		return Inspection{}, ErrProcess
 	}
 	if !response.OK {
-		return Inspection{}, mapHelperCode(response.ErrorCode, ErrProcess)
+		return Inspection{}, mapInspectError(response.ErrorCode)
 	}
 	if validateInspection(*response.Result, request.MIMEType, p.policy) != nil {
 		return Inspection{}, ErrProcess
@@ -278,7 +280,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		return Result{}, ErrProcess
 	}
 	if !response.OK {
-		return Result{}, mapHelperCode(response.ErrorCode, ErrProcess)
+		return Result{}, mapTransformError(response.ErrorCode)
 	}
 	if validateTransform(*response.Result, request, p.policy, p.iccSHA256) != nil {
 		return Result{}, ErrProcess
@@ -305,16 +307,240 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 }
 
 func validateOutputSignature(file *os.File, mimeType string) error {
-	var header [12]byte
-	if _, err := io.ReadFull(file, header[:]); err != nil {
+	info, err := file.Stat()
+	if err != nil {
 		return ErrProcess
 	}
-	valid := mimeType == "image/webp" && string(header[0:4]) == "RIFF" && string(header[8:12]) == "WEBP"
-	valid = valid || (mimeType == "image/avif" && string(header[4:8]) == "ftyp" && (string(header[8:12]) == "avif" || string(header[8:12]) == "avis"))
+	valid := (mimeType == "image/webp" && validateWebPContainer(file, info.Size())) ||
+		(mimeType == "image/avif" && validateAVIFContainer(file, info.Size()))
 	if _, err := file.Seek(0, io.SeekStart); err != nil || !valid {
 		return ErrProcess
 	}
 	return nil
+}
+
+func readAt(file *os.File, offset int64, buffer []byte) bool {
+	n, err := file.ReadAt(buffer, offset)
+	return n == len(buffer) && err == nil
+}
+
+func validateWebPContainer(file *os.File, size int64) bool {
+	if size < 12 || size > math.MaxUint32+8 {
+		return false
+	}
+	var header [12]byte
+	if !readAt(file, 0, header[:]) || string(header[:4]) != "RIFF" || string(header[8:]) != "WEBP" || int64(binary.LittleEndian.Uint32(header[4:8]))+8 != size {
+		return false
+	}
+	var vp8x, anim, frames int
+	for offset := int64(12); offset < size; {
+		var chunk [8]byte
+		if size-offset < 8 || !readAt(file, offset, chunk[:]) {
+			return false
+		}
+		payload := int64(binary.LittleEndian.Uint32(chunk[4:]))
+		end := offset + 8 + payload
+		next := end + payload%2
+		if end < offset || next > size {
+			return false
+		}
+		switch string(chunk[:4]) {
+		case "VP8X":
+			var flags [1]byte
+			if vp8x != 0 || payload != 10 || !readAt(file, offset+8, flags[:]) || flags[0]&0x02 == 0 {
+				return false
+			}
+			vp8x++
+		case "ANIM":
+			if anim != 0 || payload != 6 {
+				return false
+			}
+			anim++
+		case "ANMF":
+			if payload < 26 || !validateWebPFrameChunks(file, offset+24, end) {
+				return false
+			}
+			frames++
+		}
+		offset = next
+	}
+	return vp8x == 1 && anim == 1 && frames > 0
+}
+
+func validateWebPFrameChunks(file *os.File, offset, end int64) bool {
+	images := 0
+	for offset < end {
+		var chunk [8]byte
+		if end-offset < 8 || !readAt(file, offset, chunk[:]) {
+			return false
+		}
+		payload := int64(binary.LittleEndian.Uint32(chunk[4:]))
+		dataEnd := offset + 8 + payload
+		next := dataEnd + payload%2
+		if payload == 0 || dataEnd < offset || next > end {
+			return false
+		}
+		switch string(chunk[:4]) {
+		case "VP8 ", "VP8L":
+			images++
+		case "ALPH":
+		default:
+			return false
+		}
+		offset = next
+	}
+	return offset == end && images == 1
+}
+
+func validateAVIFContainer(file *os.File, size int64) bool {
+	if size < 24 {
+		return false
+	}
+	var boxes, ftyp, meta, mdat int
+	for offset := int64(0); offset < size; {
+		var header [16]byte
+		if size-offset < 8 || !readAt(file, offset, header[:8]) {
+			return false
+		}
+		boxSize := int64(binary.BigEndian.Uint32(header[:4]))
+		headerSize := int64(8)
+		if boxSize == 1 {
+			if size-offset < 16 || !readAt(file, offset+8, header[8:]) {
+				return false
+			}
+			value := binary.BigEndian.Uint64(header[8:])
+			if value > math.MaxInt64 {
+				return false
+			}
+			boxSize, headerSize = int64(value), 16
+		}
+		if boxSize < headerSize || boxSize > size-offset {
+			return false
+		}
+		typ := string(header[4:8])
+		if boxes == 0 && typ != "ftyp" {
+			return false
+		}
+		switch typ {
+		case "ftyp":
+			if ftyp != 0 || !validateAVIFBrands(file, offset+headerSize, boxSize-headerSize) {
+				return false
+			}
+			ftyp++
+		case "meta":
+			if !validateAVIFMeta(file, offset+headerSize, boxSize-headerSize) {
+				return false
+			}
+			meta++
+		case "mdat":
+			if boxSize == headerSize {
+				return false
+			}
+			mdat++
+		}
+		boxes++
+		offset += boxSize
+	}
+	return ftyp == 1 && meta > 0 && mdat > 0
+}
+
+func validateAVIFMeta(file *os.File, offset, size int64) bool {
+	if size < 4 {
+		return false
+	}
+	var required uint8
+	for position := offset + 4; position < offset+size; {
+		typ, payloadOffset, payloadSize, next, ok := readBMFFBox(file, position, offset+size)
+		if !ok {
+			return false
+		}
+		switch typ {
+		case "hdlr":
+			var handler [12]byte
+			if payloadSize < 12 || !readAt(file, payloadOffset, handler[:]) || string(handler[8:12]) != "pict" {
+				return false
+			}
+			required |= 1
+		case "pitm":
+			if payloadSize < 6 {
+				return false
+			}
+			required |= 2
+		case "iloc":
+			if payloadSize < 8 {
+				return false
+			}
+			required |= 4
+		case "iinf":
+			if payloadSize < 6 {
+				return false
+			}
+			required |= 8
+		case "iprp":
+			if !validateAVIFProperties(file, payloadOffset, payloadSize) {
+				return false
+			}
+			required |= 16
+		}
+		position = next
+	}
+	return required == 31
+}
+
+func validateAVIFProperties(file *os.File, offset, size int64) bool {
+	var container, associations bool
+	for position := offset; position < offset+size; {
+		typ, _, _, next, ok := readBMFFBox(file, position, offset+size)
+		if !ok {
+			return false
+		}
+		container = container || typ == "ipco"
+		associations = associations || typ == "ipma"
+		position = next
+	}
+	return container && associations
+}
+
+func readBMFFBox(file *os.File, offset, limit int64) (string, int64, int64, int64, bool) {
+	var header [16]byte
+	if limit-offset < 8 || !readAt(file, offset, header[:8]) {
+		return "", 0, 0, 0, false
+	}
+	boxSize := int64(binary.BigEndian.Uint32(header[:4]))
+	headerSize := int64(8)
+	if boxSize == 1 {
+		if limit-offset < 16 || !readAt(file, offset+8, header[8:]) {
+			return "", 0, 0, 0, false
+		}
+		value := binary.BigEndian.Uint64(header[8:])
+		if value > math.MaxInt64 {
+			return "", 0, 0, 0, false
+		}
+		boxSize, headerSize = int64(value), 16
+	}
+	if boxSize < headerSize || boxSize > limit-offset {
+		return "", 0, 0, 0, false
+	}
+	return string(header[4:8]), offset + headerSize, boxSize - headerSize, offset + boxSize, true
+}
+
+func validateAVIFBrands(file *os.File, offset, size int64) bool {
+	if size < 8 || (size-8)%4 != 0 {
+		return false
+	}
+	var brand [4]byte
+	for position := int64(0); position < size; position += 4 {
+		if position == 4 {
+			continue // minor version
+		}
+		if !readAt(file, offset+position, brand[:]) {
+			return false
+		}
+		if string(brand[:]) == "avif" || string(brand[:]) == "avis" {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Processor) limitArguments() []string {
@@ -726,7 +952,33 @@ func mapRunError(err error) error {
 		return ErrProcess
 	}
 }
-func mapHelperCode(code string, fallback error) error {
+func mapCapabilityError(code string) error {
+	switch code {
+	case "capability_failed":
+		return ErrCapability
+	case "resource_limit":
+		return ErrResourcePolicy
+	default:
+		return ErrCapability
+	}
+}
+
+func mapInspectError(code string) error {
+	switch code {
+	case "unsupported_input":
+		return ErrUnsupportedInput
+	case "decode_failed":
+		return ErrDecode
+	case "capability_failed":
+		return ErrCapability
+	case "resource_limit", "policy_violation":
+		return ErrResourcePolicy
+	default:
+		return ErrProcess
+	}
+}
+
+func mapTransformError(code string) error {
 	switch code {
 	case "static_input":
 		return ErrStaticInput
@@ -741,6 +993,6 @@ func mapHelperCode(code string, fallback error) error {
 	case "processing_failed", "encode_failed":
 		return ErrProcess
 	default:
-		return fallback
+		return ErrProcess
 	}
 }

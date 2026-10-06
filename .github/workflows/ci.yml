@@ -148,12 +148,14 @@ jobs:
           printf '%s\n' "${capabilities}"
           CAPABILITIES="${capabilities}" python3 -c \
             'import json,os; r=json.loads(os.environ["CAPABILITIES"])["result"]; v=r["library_versions"]; assert v["libwebp"]==v["libwebp-demux"]==v["libwebp-mux"]=="1.6.0" and v["giflib"]=="5.2.2" and v["libheif"]=="1.23.5" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14" and r["build_manifest"]=="giflib=5.2.2;libwebp=1.6.0;simd=on;threads=on;near-lossless=on", r'
-          printf 'TEST_ANIMATION_HELPER_PATH=%s\nTEST_ANIMATION_WEBP_PATH=%s\nTEST_ANIMATION_WEBP_REFERENCE_PATH=%s\nTEST_ANIMATION_GIF_BACKGROUND_PATH=%s\nTEST_ANIMATION_GIF_PREVIOUS_PATH=%s\n' \
+          printf 'TEST_ANIMATION_HELPER_PATH=%s\nTEST_ANIMATION_WEBP_PATH=%s\nTEST_ANIMATION_WEBP_REFERENCE_PATH=%s\nTEST_ANIMATION_GIF_BACKGROUND_PATH=%s\nTEST_ANIMATION_GIF_PREVIOUS_PATH=%s\nTEST_ANIMATION_GIF_INCOMPRESSIBLE_SINGLE_PATH=%s\nTEST_ANIMATION_GIF_INCOMPRESSIBLE_MANY_PATH=%s\n' \
             "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-animation-helper" \
             "${RUNNER_TEMP}/animation-variable.webp" \
             "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-webp-reference" \
             "${RUNNER_TEMP}/animation-gif-fixtures/dispose-background.gif" \
-            "${RUNNER_TEMP}/animation-gif-fixtures/dispose-previous.gif" >> "${GITHUB_ENV}"
+            "${RUNNER_TEMP}/animation-gif-fixtures/dispose-previous.gif" \
+            "${RUNNER_TEMP}/animation-gif-fixtures/incompressible-single.gif" \
+            "${RUNNER_TEMP}/animation-gif-fixtures/incompressible-many.gif" >> "${GITHUB_ENV}"
       - name: Verify modules
         run: go mod verify
       - name: Check formatting

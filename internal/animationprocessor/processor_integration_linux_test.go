@@ -36,6 +36,8 @@ func TestNativeAnimationHelper(t *testing.T) {
 	avifReference := requiredTestPath(t, "TEST_STILL_AVIF_REFERENCE_PATH")
 	gifBackground := requiredTestPath(t, "TEST_ANIMATION_GIF_BACKGROUND_PATH")
 	gifPrevious := requiredTestPath(t, "TEST_ANIMATION_GIF_PREVIOUS_PATH")
+	gifIncompressibleSingle := requiredTestPath(t, "TEST_ANIMATION_GIF_INCOMPRESSIBLE_SINGLE_PATH")
+	gifIncompressibleMany := requiredTestPath(t, "TEST_ANIMATION_GIF_INCOMPRESSIBLE_MANY_PATH")
 	processor, err := New(Config{Helper: helper, Prlimit: "/usr/bin/prlimit", SRGBICC: icc,
 		SRGBICCSHA256: "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"})
 	if err != nil {
@@ -278,6 +280,30 @@ func TestNativeAnimationHelper(t *testing.T) {
 			}
 		})
 	}
+	t.Run("cumulative mux output budget", func(t *testing.T) {
+		bounded, err := New(Config{Helper: helper, Prlimit: "/usr/bin/prlimit", SRGBICC: icc,
+			SRGBICCSHA256: "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a",
+			Policy:        Policy{GeneratedOutputMaxBytes: 64 << 10}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		single, err := os.Open(gifIncompressibleSingle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer single.Close()
+		if _, err := bounded.Transform(context.Background(), Request{Input: single, Output: createOutput(t, "incompressible-single.webp"), MIMEType: "image/gif", Recipe: standardRecipe()}); err != nil {
+			t.Fatalf("one incompressible frame must fit below the per-output limit: %v", err)
+		}
+		many, err := os.Open(gifIncompressibleMany)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer many.Close()
+		if _, err := bounded.Transform(context.Background(), Request{Input: many, Output: createOutput(t, "incompressible-many.webp"), MIMEType: "image/gif", Recipe: standardRecipe()}); !errors.Is(err, ErrResourcePolicy) {
+			t.Fatalf("cumulative mux limit error = %v, want %v", err, ErrResourcePolicy)
+		}
+	})
 }
 
 func assertReferenceWebP(t *testing.T, executable, path string, want referenceWebP) referenceWebP {
