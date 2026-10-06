@@ -180,6 +180,26 @@ func TestOperationTimeoutUsesPrivateCause(t *testing.T) {
 	}
 }
 
+func TestOperationDeadlinePreservesFirstCause(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	operation, cancelOperation := context.WithTimeoutCause(parent, time.Hour, errOperationTimeout)
+	cancelParent()
+	<-operation.Done()
+	if err := mapOperationError(operation.Err(), parent, operation); !errors.Is(err, context.Canceled) {
+		t.Fatalf("parent-first error=%v", err)
+	}
+	cancelOperation()
+
+	parent, cancelParent = context.WithCancel(context.Background())
+	operation, cancelOperation = context.WithTimeoutCause(parent, time.Nanosecond, errOperationTimeout)
+	<-operation.Done()
+	cancelParent()
+	if err := mapOperationError(operation.Err(), parent, operation); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("operation-first error=%v", err)
+	}
+	cancelOperation()
+}
+
 func TestOperationTimeoutReapsDetachedCodecDescendant(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
 	script := "#!/bin/sh\n/usr/bin/setsid /bin/sh -c 'printf %s $$ > \"" + pidFile + "\"; /bin/sleep 30' &\nwhile [ ! -s \"" + pidFile + "\" ]; do /bin/sleep 0.01; done\n/bin/sleep 30\n"
