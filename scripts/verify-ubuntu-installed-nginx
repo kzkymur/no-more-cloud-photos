@@ -81,7 +81,11 @@ if /usr/sbin/runuser -u nmcp -- /usr/bin/test -r /etc/nmcp/tailnet-hostname; the
   printf 'nmcp unexpectedly read a root-only source credential/config path\n' >&2
   exit 1
 fi
-/usr/bin/systemctl start nmcp-api.service nmcp-files.service
+if ! /usr/bin/systemctl start nmcp-api.service nmcp-files.service; then
+  /usr/bin/systemctl status nmcp-api.service nmcp-files.service --no-pager >&2 || true
+  /usr/bin/journalctl -u nmcp-files.service --no-pager >&2 || true
+  exit 1
+fi
 /usr/bin/systemctl is-active --quiet nmcp-files.service
 
 base=https://$test_ip:$files_port
