@@ -15,16 +15,21 @@ on:
       - "scripts/render-ubuntu-nginx"
       - "scripts/render-ubuntu-postgresql-dependency"
       - "scripts/renew-ubuntu-tls"
+      - "scripts/run-ubuntu-migration"
       - "scripts/validate-ubuntu-config"
       - "scripts/verify-ubuntu-deployment"
       - "scripts/verify-ubuntu-config-boundaries"
       - "scripts/verify-ubuntu-firewall"
       - "scripts/verify-ubuntu-firewall-fixtures"
       - "scripts/verify-ubuntu-installed-nginx"
+      - "scripts/verify-ubuntu-migration-lock"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
       - "scripts/verify-ubuntu-service-gate"
+      - "scripts/verify-ubuntu-release-failures"
+      - "scripts/verify-ubuntu-tls-certificate"
       - "scripts/verify-ubuntu-systemd-mounts"
+      - "scripts/verify-ubuntu-systemd-environment"
       - "scripts/verify-ubuntu-trusted-inputs"
   push:
     branches: [main]
@@ -41,16 +46,21 @@ on:
       - "scripts/render-ubuntu-nginx"
       - "scripts/render-ubuntu-postgresql-dependency"
       - "scripts/renew-ubuntu-tls"
+      - "scripts/run-ubuntu-migration"
       - "scripts/validate-ubuntu-config"
       - "scripts/verify-ubuntu-deployment"
       - "scripts/verify-ubuntu-config-boundaries"
       - "scripts/verify-ubuntu-firewall"
       - "scripts/verify-ubuntu-firewall-fixtures"
       - "scripts/verify-ubuntu-installed-nginx"
+      - "scripts/verify-ubuntu-migration-lock"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
       - "scripts/verify-ubuntu-service-gate"
+      - "scripts/verify-ubuntu-release-failures"
+      - "scripts/verify-ubuntu-tls-certificate"
       - "scripts/verify-ubuntu-systemd-mounts"
+      - "scripts/verify-ubuntu-systemd-environment"
       - "scripts/verify-ubuntu-trusted-inputs"
   workflow_dispatch:
 
@@ -77,10 +87,13 @@ jobs:
         run: |
           shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
             scripts/check-ubuntu-tls-expiry scripts/renew-ubuntu-tls \
+            scripts/run-ubuntu-migration scripts/verify-ubuntu-migration-lock \
             scripts/verify-ubuntu-config-boundaries scripts/verify-ubuntu-firewall-fixtures \
             scripts/verify-ubuntu-installed-nginx scripts/verify-ubuntu-nginx-http \
-            scripts/verify-ubuntu-postgresql-dependency scripts/verify-ubuntu-service-gate \
-            scripts/verify-ubuntu-systemd-mounts scripts/verify-ubuntu-trusted-inputs
+            scripts/verify-ubuntu-postgresql-dependency scripts/verify-ubuntu-release-failures \
+            scripts/verify-ubuntu-service-gate scripts/verify-ubuntu-tls-certificate \
+            scripts/verify-ubuntu-systemd-environment scripts/verify-ubuntu-systemd-mounts \
+            scripts/verify-ubuntu-trusted-inputs
 
       - name: Verify deployment assets
         run: scripts/verify-ubuntu-deployment
@@ -92,6 +105,9 @@ jobs:
 
       - name: Verify privileged input capture counterexamples
         run: sudo scripts/verify-ubuntu-trusted-inputs
+
+      - name: Verify systemd EnvironmentFile effective values
+        run: sudo scripts/verify-ubuntu-systemd-environment
 
       - name: Verify production Nginx HTTP contract
         run: |
@@ -109,6 +125,12 @@ jobs:
 
       - name: Verify whole-service activation failure counterexamples
         run: sudo scripts/verify-ubuntu-service-gate
+
+      - name: Verify migration serialization races
+        run: sudo scripts/verify-ubuntu-migration-lock
+
+      - name: Verify release activation and rollback failure transactions
+        run: sudo scripts/verify-ubuntu-release-failures
 
       - name: Verify immutable release staging
         env:

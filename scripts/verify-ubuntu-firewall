@@ -47,16 +47,23 @@ def main() -> int:
     missing = expected - set(normalized)
     if missing:
         raise ValueError(f"missing exact Tailnet-only UFW rules: {sorted(missing)}")
+    protected = {args.api_port, args.files_port}
     for line in normalized:
-        for port in (args.api_port, args.files_port):
-            tokens = re.findall(r"[A-Za-z0-9_.:/-]+", line.lower())
-            aliases = {str(port), f"{port}/tcp"}
-            if port == 443:
-                aliases.update({"https", "nginx", "full"})
-            if port == 80:
-                aliases.update({"http", "nginx", "full"})
-            if aliases.intersection(tokens) and line not in expected:
-                raise ValueError(f"unexpected broader/conflicting UFW rule for port {port}: {line}")
+        if not line.lower().startswith("ufw allow") or line in expected:
+            continue
+        # Accept other management allows only when they name one numeric port
+        # and one protocol. Profiles, ranges, service names, and all-port rules
+        # are not provably disjoint from the protected listeners.
+        positional = re.fullmatch(r"ufw allow (\d+)/(tcp|udp)", line, re.IGNORECASE)
+        explicit = re.search(r"\bport (\d+) proto (tcp|udp)$", line, re.IGNORECASE)
+        if positional:
+            port = int(positional.group(1))
+        elif explicit and ":" not in line and "," not in line:
+            port = int(explicit.group(1))
+        else:
+            raise ValueError(f"unbounded or unparseable UFW allow rule: {line}")
+        if port in protected:
+            raise ValueError(f"unexpected broader/conflicting UFW rule for port {port}: {line}")
     print("Ubuntu firewall active/default-deny/Tailnet-only rules validated")
     return 0
 

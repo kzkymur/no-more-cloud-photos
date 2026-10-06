@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+lock=/run/lock/nmcp-deploy.lock
+delegation=/run/nmcp-migrate-delegation
+current=/opt/nmcp/current
+exec 9>"$lock"
+if ! /usr/bin/flock --exclusive --nonblock 9; then
+  # A deploy may delegate exactly one migration to this systemd singleton while
+  # retaining the lock across link, evidence, and service-state mutations.
+  [[ -f $delegation && ! -L $delegation \
+    && $(/usr/bin/stat -c '%U:%G:%a' "$delegation") == root:root:644 ]] || {
+    printf 'run-ubuntu-migration: deployment lock is held without a valid delegation\n' >&2
+    exit 1
+  }
+  delegated=$(/usr/bin/cat -- "$delegation")
+  active=$(/usr/bin/readlink -f -- "$current")
+  [[ $delegated == "$active" ]] || {
+    printf 'run-ubuntu-migration: delegation does not match the active release\n' >&2
+    exit 1
+  }
+fi
+exec "$current/bin/nmcp-admin" migrate up --json

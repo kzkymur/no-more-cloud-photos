@@ -15,24 +15,71 @@ cleanup() {
   /usr/bin/systemctl stop nmcp-files.service nmcp-api.service >/dev/null 2>&1 || true
   /usr/bin/rm -f /run/systemd/system/nmcp-files.service /run/systemd/system/nmcp-api.service \
     /run/systemd/system/nmcp.slice
+  /usr/bin/rm -rf /run/systemd/system/nmcp-files.service.d
+  /usr/bin/rm -rf "/run/nmcp-test-restart.$$"
+  /usr/bin/rm -f "/usr/local/share/ca-certificates/nmcp-test-$$.crt"
+  /usr/sbin/update-ca-certificates >/dev/null 2>&1 || true
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
   /usr/bin/rm -rf -- /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp \
-    /usr/local/libexec/nmcp "/root/nmcp-tls-renew.$$" "$work"
+    /usr/local/libexec/nmcp "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" "$work"
 }
 trap cleanup EXIT
 
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf" "$work/nmcp-sysusers.conf"
 /usr/bin/systemd-sysusers "$work/nmcp-sysusers.conf"
 /usr/bin/install -d -o root -g root -m 0700 /etc/nmcp /etc/nmcp/tls-releases/test
-/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net -days 30 \
-  -keyout /etc/nmcp/tls-releases/test/key.pem -out /etc/nmcp/tls-releases/test/cert.pem >/dev/null 2>&1
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=NMCP-Test-CA -days 30 \
+  -addext basicConstraints=critical,CA:TRUE -keyout "$work/ca.key" -out "$work/ca.crt" >/dev/null 2>&1
+/usr/bin/install -o root -g root -m 0644 "$work/ca.crt" "/usr/local/share/ca-certificates/nmcp-test-$$.crt"
+/usr/sbin/update-ca-certificates >/dev/null
+issue_certificate() {
+  local directory=$1 serial=$2
+  /usr/bin/openssl req -new -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net \
+    -addext subjectAltName=DNS:host.example.ts.net \
+    -keyout "$directory/key.pem" -out "$directory/request.pem" >/dev/null 2>&1
+  /usr/bin/openssl x509 -req -in "$directory/request.pem" -CA "$work/ca.crt" -CAkey "$work/ca.key" \
+    -set_serial "$serial" -days 30 -copy_extensions copy -out "$directory/leaf.pem" >/dev/null 2>&1
+  /usr/bin/cp "$directory/leaf.pem" "$directory/cert.pem"
+  /usr/bin/cat "$work/ca.crt" >> "$directory/cert.pem"
+  /usr/bin/rm -f "$directory/request.pem" "$directory/leaf.pem"
+}
+issue_certificate /etc/nmcp/tls-releases/test 1
+/usr/bin/install -d -m 0700 "$work/future" "$work/newcerts"
+: > "$work/index.txt"
+/usr/bin/printf '1000\n' > "$work/serial"
+cat > "$work/ca.cnf" <<EOF
+[ ca ]
+default_ca = local
+[ local ]
+database = $work/index.txt
+new_certs_dir = $work/newcerts
+certificate = $work/ca.crt
+private_key = $work/ca.key
+serial = $work/serial
+default_md = sha256
+policy = policy
+copy_extensions = copy
+[ policy ]
+commonName = supplied
+EOF
+/usr/bin/openssl req -new -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net \
+  -addext subjectAltName=DNS:host.example.ts.net -keyout "$work/future/key.pem" \
+  -out "$work/future/request.pem" >/dev/null 2>&1
+future_start=$(/usr/bin/date --utc --date='+1 day' +%y%m%d%H%M%SZ)
+future_end=$(/usr/bin/date --utc --date='+31 days' +%y%m%d%H%M%SZ)
+/usr/bin/openssl ca -batch -config "$work/ca.cnf" -startdate "$future_start" -enddate "$future_end" \
+  -in "$work/future/request.pem" -out "$work/future/cert.pem" >/dev/null 2>&1
+if "$repo_root/scripts/verify-ubuntu-tls-certificate" "$work/future/cert.pem" \
+  host.example.ts.net "$work/future/key.pem" >/dev/null 2>&1; then
+  printf 'future-notBefore TLS certificate was accepted\n' >&2; exit 1
+fi
 /usr/bin/chown root:root /etc/nmcp/tls-releases/test/*.pem
 /usr/bin/chmod 0600 /etc/nmcp/tls-releases/test/*.pem
 /usr/bin/ln -s /etc/nmcp/tls-releases/test /etc/nmcp/tls-current
 /usr/bin/printf 'host.example.ts.net\n' > /etc/nmcp/tailnet-hostname
 /usr/bin/chmod 0600 /etc/nmcp/tailnet-hostname
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp
-for script in renew-ubuntu-tls capture-trusted-inputs check-ubuntu-tls-expiry; do
+for script in renew-ubuntu-tls capture-trusted-inputs check-ubuntu-tls-expiry verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done
 
@@ -89,11 +136,20 @@ fi
 /usr/bin/systemctl is-active --quiet nmcp-files.service
 
 base=https://$test_ip:$files_port
+trusted_base=https://host.example.ts.net:$files_port
+fingerprint() {
+  /usr/bin/openssl s_client -connect "$test_ip:$files_port" -servername host.example.ts.net \
+    -CAfile "$work/ca.crt" -verify_return_error </dev/null 2>/dev/null \
+    | /usr/bin/openssl x509 -noout -fingerprint -sha256
+}
 for attempt in {1..30}; do
   if /usr/bin/curl --noproxy '*' --insecure --silent --fail --max-time 2 "$base/files-healthz" >/dev/null; then break; fi
   [[ $attempt -lt 30 ]] || { /usr/bin/journalctl -u nmcp-files.service --no-pager >&2; exit 1; }
   /usr/bin/sleep 0.2
 done
+/usr/bin/curl --noproxy '*' --silent --fail --max-time 2 --cacert "$work/ca.crt" \
+  --resolve "host.example.ts.net:$files_port:$test_ip" "$trusted_base/files-healthz" >/dev/null
+old_fingerprint=$(fingerprint)
 "$repo_root/scripts/assert-ubuntu-files-endpoint" --base-url "$base" --insecure \
   --original-path "/files/originals/aa/$original_id/original.jpg" \
   --original-file "$original_dir/original.jpg" --original-mime image/jpeg \
@@ -106,8 +162,7 @@ done
 # LoadCredential, and retain service availability. Reject a mismatched pair.
 renew_input=/root/nmcp-tls-renew.$$
 /usr/bin/install -d -o root -g root -m 0700 "$renew_input"
-/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net -days 30 \
-  -keyout "$renew_input/key.pem" -out "$renew_input/cert.pem" >/dev/null 2>&1
+issue_certificate "$renew_input" 2
 /usr/bin/chown root:root "$renew_input"/*.pem
 /usr/bin/chmod 0600 "$renew_input"/*.pem
 old_tls=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
@@ -115,7 +170,11 @@ old_tls=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
 new_tls=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
 [[ $new_tls != "$old_tls" ]]
 /usr/bin/systemctl is-active --quiet nmcp-files.service
-/usr/bin/curl --noproxy '*' --insecure --silent --fail --max-time 2 "$base/files-healthz" >/dev/null
+/usr/bin/curl --noproxy '*' --silent --fail --max-time 2 --cacert "$work/ca.crt" \
+  --resolve "host.example.ts.net:$files_port:$test_ip" "$trusted_base/files-healthz" >/dev/null
+new_fingerprint=$(fingerprint)
+disk_fingerprint=$(/usr/bin/openssl x509 -in "$new_tls/cert.pem" -noout -fingerprint -sha256)
+[[ $new_fingerprint != "$old_fingerprint" && $new_fingerprint == "$disk_fingerprint" ]]
 /usr/bin/openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
   -out "$renew_input/wrong-key.pem" >/dev/null 2>&1
 /usr/bin/chmod 0600 "$renew_input/wrong-key.pem"
@@ -124,4 +183,26 @@ if /usr/local/libexec/nmcp/renew-ubuntu-tls \
   printf 'mismatched TLS generation was accepted\n' >&2; exit 1
 fi
 [[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
+
+# A failed candidate restart must restore both the prior generation and the
+# certificate actually served by the recovery restart.
+failure_input=/root/nmcp-tls-renew-failure.$$
+/usr/bin/install -d -o root -g root -m 0700 "$failure_input"
+issue_certificate "$failure_input" 3
+/usr/bin/chown root:root "$failure_input"/*.pem
+/usr/bin/chmod 0600 "$failure_input"/*.pem
+/usr/bin/install -d -o root -g root -m 0755 /run/systemd/system/nmcp-files.service.d
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 "/run/nmcp-test-restart.$$"
+cat > /run/systemd/system/nmcp-files.service.d/99-fail-once.conf <<EOF
+[Service]
+ExecStartPre=/bin/sh -c 'if ! test -e /run/nmcp-test-restart.$$/failed; then touch /run/nmcp-test-restart.$$/failed; exit 1; fi'
+EOF
+/usr/bin/systemctl daemon-reload
+if /usr/local/libexec/nmcp/renew-ubuntu-tls "$failure_input/cert.pem" "$failure_input/key.pem"; then
+  printf 'TLS renewal unexpectedly survived a failed candidate restart\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
+/usr/bin/systemctl is-active --quiet nmcp-files.service
+[[ $(fingerprint) == "$new_fingerprint" ]]
+/usr/bin/rm -rf -- "$failure_input"
 printf 'Installed-path nmcp Nginx service and full HTTP matrix passed\n'

@@ -38,4 +38,23 @@ ufw allow in on tailscale0 to 100.64.0.10 port 9443 proto tcp
 ufw allow 9443
 EOF
 if "${check[@]}" >/dev/null 2>&1; then printf 'broader numeric allow was accepted\n' >&2; exit 1; fi
+for broad in \
+  'ufw allow in on tailscale0' \
+  'ufw allow from any' \
+  'ufw allow 8000:9500/tcp' \
+  'ufw allow proto tcp from any to any port 8000:9500' \
+  "ufw allow 'Nginx Full'"; do
+  cat > "$work/added" <<EOF
+ufw allow in on tailscale0 to 100.64.0.10 port 8443 proto tcp
+ufw allow in on tailscale0 to 100.64.0.10 port 9443 proto tcp
+$broad
+EOF
+  if "${check[@]}" >/dev/null 2>&1; then printf 'broad firewall allow was accepted: %s\n' "$broad" >&2; exit 1; fi
+done
+cat > "$work/added" <<'EOF'
+ufw allow in on tailscale0 to 100.64.0.10 port 8443 proto tcp
+ufw allow in on tailscale0 to 100.64.0.10 port 9443 proto tcp
+ufw allow 22/tcp
+EOF
+"${check[@]}"
 printf 'Ubuntu firewall fail-closed fixture counterexamples passed\n'

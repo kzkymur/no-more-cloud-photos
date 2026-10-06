@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  printf 'usage: verify-ubuntu-tls-certificate CERTIFICATE HOSTNAME [PRIVATE_KEY]\n' >&2
+  exit 2
+fi
+certificate=$1 hostname=$2 key=${3:-}
+work=$(/usr/bin/mktemp -d)
+trap '/usr/bin/rm -rf -- "$work"' EXIT
+
+/usr/bin/openssl x509 -in "$certificate" -out "$work/leaf.pem"
+/usr/bin/python3 - "$certificate" "$work/chain.pem" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="ascii")
+blocks = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", text, re.S)
+if not blocks:
+    raise SystemExit("TLS input contains no certificate")
+pathlib.Path(sys.argv[2]).write_text("\n".join(blocks[1:]) + ("\n" if len(blocks) > 1 else ""), encoding="ascii")
+PY
+
+not_before=$(/usr/bin/openssl x509 -in "$work/leaf.pem" -noout -startdate | /usr/bin/cut -d= -f2-)
+not_before_epoch=$(/usr/bin/date --date="$not_before" +%s)
+now=$(/usr/bin/date +%s)
+((not_before_epoch <= now + 300)) || {
+  printf 'TLS certificate is not yet valid (beyond five-minute clock skew)\n' >&2
+  exit 1
+}
+/usr/bin/openssl x509 -in "$work/leaf.pem" -noout -checkend 604800 >/dev/null || {
+  printf 'TLS certificate must remain valid for at least seven days\n' >&2
+  exit 1
+}
+/usr/bin/openssl x509 -in "$work/leaf.pem" -noout -ext subjectAltName 2>/dev/null \
+  | /usr/bin/grep -q 'DNS:' || {
+    printf 'TLS certificate requires a DNS subjectAltName\n' >&2
+    exit 1
+  }
+verify=(/usr/bin/openssl verify -purpose sslserver -verify_hostname "$hostname")
+if [[ -s $work/chain.pem ]]; then verify+=(-untrusted "$work/chain.pem"); fi
+"${verify[@]}" "$work/leaf.pem" >/dev/null
+if [[ -n $key ]]; then
+  cert_public=$(/usr/bin/openssl x509 -in "$work/leaf.pem" -pubkey -noout | /usr/bin/openssl sha256)
+  key_public=$(/usr/bin/openssl pkey -in "$key" -pubout | /usr/bin/openssl sha256)
+  [[ $cert_public == "$key_public" ]] || {
+    printf 'TLS certificate and key do not match\n' >&2
+    exit 1
+  }
+fi

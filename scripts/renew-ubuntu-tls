@@ -18,13 +18,8 @@ cleanup() {
 }
 trap cleanup EXIT
 "$script_dir/capture-trusted-inputs" "$capture" "$1" cert.pem "$2" key.pem
-/usr/bin/openssl x509 -in "$capture/cert.pem" -noout -checkend 604800 >/dev/null || {
-  printf 'renew-ubuntu-tls: certificate must remain valid for at least seven days\n' >&2; exit 1;
-}
-/usr/bin/openssl x509 -in "$capture/cert.pem" -noout -checkhost "$hostname" >/dev/null
-cert_public=$(/usr/bin/openssl x509 -in "$capture/cert.pem" -pubkey -noout | /usr/bin/openssl sha256)
-key_public=$(/usr/bin/openssl pkey -in "$capture/key.pem" -pubout | /usr/bin/openssl sha256)
-[[ $cert_public == "$key_public" ]] || { printf 'renew-ubuntu-tls: certificate and key do not match\n' >&2; exit 1; }
+"$script_dir/verify-ubuntu-tls-certificate" \
+  "$capture/cert.pem" "$hostname" "$capture/key.pem"
 release_id=$(/usr/bin/sha256sum "$capture/cert.pem" "$capture/key.pem" | /usr/bin/sha256sum | /usr/bin/cut -d' ' -f1)
 release=/etc/nmcp/tls-releases/$release_id
 if [[ ! -e $release ]]; then

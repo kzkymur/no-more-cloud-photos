@@ -43,6 +43,11 @@ def main() -> int:
         ROOT / "scripts" / "verify-ubuntu-trusted-inputs",
         ROOT / "scripts" / "renew-ubuntu-tls",
         ROOT / "scripts" / "check-ubuntu-tls-expiry",
+        ROOT / "scripts" / "run-ubuntu-migration",
+        ROOT / "scripts" / "verify-ubuntu-migration-lock",
+        ROOT / "scripts" / "verify-ubuntu-release-failures",
+        ROOT / "scripts" / "verify-ubuntu-tls-certificate",
+        ROOT / "scripts" / "verify-ubuntu-systemd-environment",
     ]
     for script in scripts:
         require(os.access(script, os.X_OK), f"{script.name} is not executable")
@@ -76,6 +81,14 @@ def main() -> int:
     require(timers == {"nmcp-tls-expiry.timer"}, "only independent TLS expiry monitoring may have a timer")
     migrate_unit = text(units / "nmcp-migrate.service")
     require("postgresql.service" not in migrate_unit, "migration still depends on PostgreSQL meta-unit")
+    require(
+        "ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration" in migrate_unit,
+        "systemd migration bypasses the deployment serializer",
+    )
+    require(
+        "f /run/lock/nmcp-deploy.lock 0660 root nmcp" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "shared migration lock ownership/mode is missing",
+    )
 
     files_unit = text(units / "nmcp-files.service")
     for required in (

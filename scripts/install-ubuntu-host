@@ -98,17 +98,8 @@ PY
 "$script_dir/verify-ubuntu-firewall" --tailnet-ip "$tailnet_ip" \
   --api-port "$api_port" --files-port "$files_port"
 
-/usr/bin/openssl x509 -in "$capture/cert.pem" -noout -checkend 604800 >/dev/null || {
-  printf 'install-ubuntu-host: TLS certificate must remain valid for at least seven days\n' >&2; exit 1;
-}
-/usr/bin/openssl x509 -in "$capture/cert.pem" -noout -checkhost "$tailnet_hostname" >/dev/null || {
-  printf 'install-ubuntu-host: TLS certificate does not cover %s\n' "$tailnet_hostname" >&2; exit 1;
-}
-cert_public=$(/usr/bin/openssl x509 -in "$capture/cert.pem" -pubkey -noout | /usr/bin/openssl sha256)
-key_public=$(/usr/bin/openssl pkey -in "$capture/key.pem" -pubout | /usr/bin/openssl sha256)
-[[ $cert_public == "$key_public" ]] || {
-  printf 'install-ubuntu-host: TLS certificate and key do not match\n' >&2; exit 1;
-}
+"$script_dir/verify-ubuntu-tls-certificate" \
+  "$capture/cert.pem" "$tailnet_hostname" "$capture/key.pem"
 
 /usr/bin/install -d -o root -g root -m 0700 /etc/nmcp /etc/nmcp/tls-releases
 for name in admin.env api.env worker.env; do
@@ -167,7 +158,8 @@ done
   /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp /usr/share/doc/nmcp
 for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
-  capture-trusted-inputs validate-ubuntu-config verify-ubuntu-firewall; do
+  capture-trusted-inputs run-ubuntu-migration validate-ubuntu-config \
+  verify-ubuntu-firewall verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done
 /usr/bin/install -o root -g root -m 0644 "$repo_root/docs/ubuntu-deployment.md" /usr/share/doc/nmcp/ubuntu-deployment.md

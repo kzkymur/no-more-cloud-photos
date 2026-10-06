@@ -79,7 +79,11 @@ The three files and TLS inputs must be regular root-owned files below normalized
 root-owned paths with no group/world-writable parent. The installer captures
 them through `O_NOFOLLOW` file descriptors before validation/copy, rejects
 duplicates or extra/missing environment keys, requires all DSNs to match and use
-literal loopback, and rejects wildcard API binds or a mismatched files-root URL.
+literal loopback port 5432 and database `nmcp`, permits only `sslmode=disable`
+as a DSN option, and rejects query routing overrides, fragments, wildcard API
+binds, or a mismatched files-root URL. Environment values use a deliberately
+literal subset: quotes, backslashes, and whitespace are rejected so validation
+and systemd `EnvironmentFile=` cannot interpret different effective values.
 
 Render Nginx only with real Tailnet values:
 
@@ -112,15 +116,20 @@ sudo scripts/install-ubuntu-release stage /root/nmcp-release <RELEASE_ID>
 sudo scripts/install-ubuntu-release activate <RELEASE_ID>
 ```
 
-All stage/activate/rollback/host/TLS mutations share one nonblocking root-owned
-deployment lock. Staging requires an exact manifest and fixed runtime-safe modes,
+All stage/activate/rollback/host/TLS mutations and every direct or
+dependency-triggered `nmcp-migrate.service` execution share one deployment lock.
+The installer retains the lock across link, migration, service-state, and
+evidence mutations and delegates only its exact active-release migration to the
+systemd singleton. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.
 Activation stops the target, moves the active symlink atomically, starts the
 concrete PostgreSQL dependency and migration, and records success only after API
 readiness plus API, Worker, File Server, target, and concrete PostgreSQL remain
 active for five consecutive checks. A failure before a completed migration
-restores the old link. A failure after migration does **not** automatically run
-old code against a potentially new schema.
+restores the old link and records actual active and attempted release identities
+separately. A failure after migration does **not** automatically run old code
+against a potentially new schema, but it stops the target and every individually
+started service so the rejected release cannot remain exposed.
 
 Rollback is fail-closed:
 
@@ -132,7 +141,9 @@ The target release's `nmcp-admin migrate status --json` must report fully
 compatible (exit 0) against the current database before the link changes. Any
 pending/drift/error status refuses rollback; database restoration is a separate,
 explicit disaster-recovery operation. Never delete the last known-good release
-during activation.
+during activation. If compatible rollback activation fails, the installer stops
+all partial services, atomically restores the prior link, and restores its prior
+active/inactive service state; a failed restoration is left fully stopped.
 
 ## Firewall and Tailnet checks
 
@@ -140,7 +151,9 @@ Binding to the concrete Tailnet address is mandatory but does not replace ACLs
 or the host firewall. The installer is deliberately fail-closed on UFW: UFW must
 already be active, its default incoming policy must be deny, and its persisted
 rules must contain exactly the two interface+destination rules below with no
-broader rule for either port. Perform policy changes only from an approved
+all-port, range, service-profile, shorthand, or other rule that can cover either
+port. Other management allows are accepted only when a single disjoint numeric
+port and protocol can be proved. Perform policy changes only from an approved
 console/change window. First inventory and preserve an explicit management/SSH
 allow; do not enable default deny from the only unprotected remote session.
 
@@ -170,8 +183,9 @@ machine: a local request is not evidence of a non-Tailnet denial.
 
 ## TLS renewal and expiry
 
-`nmcp-tls-expiry.timer` checks daily and fails if the active certificate does
-not cover the recorded hostname or expires within seven days; monitor failed
+`nmcp-tls-expiry.timer` checks daily and fails if the active certificate is not
+currently valid (with at most five minutes of clock skew), lacks a DNS SAN or a
+trusted server chain for the recorded hostname, or expires within seven days; monitor failed
 units/journal through the host's normal alerting. Obtain a new Tailnet
 certificate/key using the approved mechanism into trusted root-only paths, then:
 
@@ -180,7 +194,8 @@ sudo /usr/local/libexec/nmcp/renew-ubuntu-tls /root/new-cert.pem /root/new-key.p
 sudo systemctl status nmcp-tls-expiry.service nmcp-files.service
 ```
 
-Renewal validates hostname, pair, ownership/path, and seven-day lifetime; writes
+Renewal validates current validity, SAN/hostname, trusted chain, key pair,
+ownership/path, and seven-day lifetime; writes
 one immutable generation; atomically switches `tls-current`; and **restarts**
 Nginx so systemd `LoadCredential` is refreshed. If restart fails, it restores
 the previous generation and attempts to restart it. A config reload alone does

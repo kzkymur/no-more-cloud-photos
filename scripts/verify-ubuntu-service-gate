@@ -4,7 +4,7 @@ set -euo pipefail
 [[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-service-gate: must run as root\n' >&2; exit 1; }
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 work=$(/usr/bin/mktemp -d /var/tmp/nmcp-service-gate.XXXXXX)
-units=(nmcp-check-api.service nmcp-check-worker.service nmcp-check-files.service postgresql@nmcp-check.service)
+units=(nmcp-check-api.service nmcp-check-worker.service nmcp-check-files.service nmcp-check.target postgresql@nmcp-check.service)
 cleanup() {
   /usr/bin/systemctl stop "${units[@]}" >/dev/null 2>&1 || true
   for unit in "${units[@]}"; do /usr/bin/rm -f -- "/run/systemd/system/$unit"; done
@@ -36,12 +36,17 @@ for unit in nmcp-check-worker.service nmcp-check-files.service postgresql@nmcp-c
 ExecStart=/usr/bin/sleep infinity
 EOF
 done
+cat > /run/systemd/system/nmcp-check.target <<'EOF'
+[Unit]
+Requires=nmcp-check-api.service nmcp-check-worker.service nmcp-check-files.service
+EOF
 /usr/bin/systemctl daemon-reload
 /usr/bin/systemctl start "${units[@]}"
 check=("$script_dir/check-ubuntu-services" --api-url http://127.0.0.1:18081/readyz \
   --consecutive 2 --attempts 5 --interval 0.1 \
   --unit nmcp-check-api.service --unit nmcp-check-worker.service \
-  --unit nmcp-check-files.service --postgresql-unit postgresql@nmcp-check.service)
+  --unit nmcp-check-files.service --unit nmcp-check.target \
+  --postgresql-unit postgresql@nmcp-check.service)
 "${check[@]}"
 /usr/bin/systemctl stop nmcp-check-worker.service
 if "${check[@]}" >/dev/null 2>&1; then
@@ -51,5 +56,26 @@ fi
 /usr/bin/systemctl stop nmcp-check-files.service
 if "${check[@]}" >/dev/null 2>&1; then
   printf 'stopped File Server incorrectly passed whole-service gate\n' >&2; exit 1
+fi
+/usr/bin/systemctl start nmcp-check-files.service
+for unit in nmcp-check-api.service nmcp-check.target postgresql@nmcp-check.service; do
+  /usr/bin/systemctl stop "$unit"
+  if "${check[@]}" >/dev/null 2>&1; then
+    printf 'inactive gate component incorrectly passed: %s\n' "$unit" >&2; exit 1
+  fi
+  /usr/bin/systemctl start "$unit"
+done
+/usr/bin/systemctl stop nmcp-check-worker.service
+/usr/bin/systemctl reset-failed nmcp-check-worker.service
+/usr/bin/systemctl start nmcp-check-worker.service
+cat > /run/systemd/system/nmcp-check-worker.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/false
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl restart nmcp-check-worker.service >/dev/null 2>&1 || true
+if "${check[@]}" >/dev/null 2>&1; then
+  printf 'failed Worker incorrectly passed whole-service gate\n' >&2; exit 1
 fi
 printf 'Whole-service stability gate failure counterexamples passed\n'

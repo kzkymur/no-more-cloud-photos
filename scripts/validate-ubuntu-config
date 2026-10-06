@@ -39,7 +39,11 @@ def parse_env(path: pathlib.Path) -> dict[str, str]:
         key, value = match.groups()
         if key in values:
             fail(f"{path.name}:{number}: duplicate {key}")
-        if not value or value != value.strip() or "\x00" in value:
+        if (
+            not value or value != value.strip() or "\x00" in value
+            or any(character in value for character in ("'", '"', "\\"))
+            or any(character.isspace() for character in value)
+        ):
             fail(f"{path.name}:{number}: {key} has an empty or ambiguous value")
         values[key] = value
     expected = EXPECTED[path.name]
@@ -81,9 +85,27 @@ def main() -> int:
     database_urls = {api["NMCP_DATABASE_URL"], worker["NMCP_DATABASE_URL"], admin["NMCP_DATABASE_URL"]}
     if len(database_urls) != 1:
         fail("all processes must use the same NMCP_DATABASE_URL")
-    database = urllib.parse.urlsplit(next(iter(database_urls)))
-    if database.scheme not in ("postgres", "postgresql") or database.hostname not in ("127.0.0.1", "::1"):
-        fail("NMCP_DATABASE_URL must use PostgreSQL on a literal loopback address")
+    database_text = next(iter(database_urls))
+    database = urllib.parse.urlsplit(database_text)
+    try:
+        database_port = database.port
+        query = urllib.parse.parse_qsl(database.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as error:
+        raise ValueError("NMCP_DATABASE_URL is malformed") from error
+    decoded_user = urllib.parse.unquote(database.username or "")
+    decoded_password = urllib.parse.unquote(database.password or "")
+    if (
+        database.scheme not in ("postgres", "postgresql")
+        or database.hostname not in ("127.0.0.1", "::1")
+        or "%" in (database.hostname or "")
+        or database_port != 5432
+        or database.path != "/nmcp"
+        or not decoded_user or not decoded_password
+        or any(character in decoded_user + decoded_password for character in ("\x00", "\n", "\r"))
+        or database.fragment
+        or query != [("sslmode", "disable")]
+    ):
+        fail("NMCP_DATABASE_URL must use the reviewed local PostgreSQL endpoint and sslmode only")
     if len(api["NMCP_CURSOR_HMAC_KEY"].encode()) < 32:
         fail("NMCP_CURSOR_HMAC_KEY must contain at least 32 bytes")
     combined = "\n".join(item for process in values.values() for item in process.values())

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-systemd-environment: must run as root\n' >&2; exit 1; }
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+work=$(/usr/bin/mktemp -d /var/tmp/nmcp-systemd-env.XXXXXX)
+trap '/usr/bin/rm -rf -- "$work"' EXIT
+cat > "$work/admin.env" <<'EOF'
+NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable
+NMCP_LOG_LEVEL=info
+NMCP_SHUTDOWN_TIMEOUT=30s
+EOF
+cat > "$work/api.env" <<'EOF'
+NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable
+NMCP_STORAGE_ROOT=/var/lib/nmcp/media
+NMCP_FILE_BASE_URL=https://host.example.ts.net:9443/files/
+NMCP_CURSOR_HMAC_KEY=0123456789abcdef0123456789abcdef
+NMCP_API_ADDR=127.0.0.1:8080
+NMCP_LOG_LEVEL=info
+NMCP_SHUTDOWN_TIMEOUT=30s
+EOF
+cat > "$work/worker.env" <<'EOF'
+NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable
+NMCP_STORAGE_ROOT=/var/lib/nmcp/media
+NMCP_LOG_LEVEL=info
+NMCP_SHUTDOWN_TIMEOUT=30s
+EOF
+"$repo/scripts/validate-ubuntu-config" --config-dir "$work" \
+  --tailnet-hostname host.example.ts.net --files-listen 100.64.0.10:9443
+/usr/bin/systemd-run --quiet --wait --collect --unit=nmcp-env-parser-test \
+  --property="EnvironmentFile=$work/api.env" \
+  /usr/bin/python3 -c 'import os,pathlib; pathlib.Path("'$work'/effective").write_text("\n".join(f"{k}={os.environ[k]}" for k in sorted(os.environ) if k.startswith("NMCP_"))+"\n")'
+/usr/bin/python3 - "$work/api.env" "$work/effective" <<'PY'
+import pathlib, sys
+expected = sorted(pathlib.Path(sys.argv[1]).read_text().splitlines())
+actual = pathlib.Path(sys.argv[2]).read_text().splitlines()
+if expected != actual:
+    raise SystemExit(f"systemd EnvironmentFile values differ: {expected!r} != {actual!r}")
+PY
+printf 'Validated environment grammar matches installed systemd values\n'

@@ -122,16 +122,35 @@ atomic_link() {
 }
 
 record() {
-  local state=$1 temporary=$evidence/active-release.new.$$
-  /usr/bin/printf '%s\t%s\t%s\n' "$release_id" "$state" "$(/usr/bin/date --iso-8601=seconds)" > "$temporary"
+  local state=$1 temporary=$evidence/active-release.new.$$ active=none
+  if [[ -L $current ]]; then active=$(/usr/bin/basename -- "$(/usr/bin/readlink -f -- "$current")"); fi
+  /usr/bin/printf 'active=%s\tattempted=%s\tstate=%s\ttime=%s\n' \
+    "$active" "$release_id" "$state" "$(/usr/bin/date --iso-8601=seconds)" > "$temporary"
   /usr/bin/chown root:root "$temporary"
   /usr/bin/chmod 0600 "$temporary"
   /usr/bin/mv -f -- "$temporary" "$evidence/active-release"
 }
 
+stop_services() {
+  /usr/bin/systemctl stop nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service || true
+}
+
+run_migration() {
+  local token=/run/nmcp-migrate-delegation temporary=$token.new.$$
+  /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
+  /usr/bin/chown root:root "$temporary"
+  /usr/bin/chmod 0644 "$temporary"
+  /usr/bin/mv -f -- "$temporary" "$token"
+  if ! /usr/bin/systemctl reset-failed nmcp-migrate.service \
+    || ! /usr/bin/systemctl restart nmcp-migrate.service; then
+    /usr/bin/rm -f -- "$token"
+    return 1
+  fi
+  /usr/bin/rm -f -- "$token"
+}
+
 activate_services() {
-  /usr/bin/systemctl reset-failed nmcp-migrate.service
-  /usr/bin/systemctl restart nmcp-migrate.service
+  run_migration
   /usr/bin/systemctl restart nmcp-api.service nmcp-worker.service
   /usr/bin/systemctl restart nmcp-files.service
   /usr/bin/systemctl start nmcp.target
@@ -167,12 +186,11 @@ case "$action" in
     if /usr/bin/systemctl is-active --quiet nmcp.target; then was_active=true; fi
     /usr/bin/systemctl stop nmcp.target
     atomic_link "$release_path"
-    if ! /usr/bin/systemctl reset-failed nmcp-migrate.service || ! /usr/bin/systemctl restart nmcp-migrate.service; then
+    if ! run_migration; then
+      stop_services
       if [[ -n $old_target ]]; then atomic_link "$old_target"; else /usr/bin/rm -f -- "$current"; fi
       if [[ $was_active == true && -n $old_target ]]; then
-        /usr/bin/systemctl reset-failed nmcp-migrate.service || true
-        /usr/bin/systemctl restart nmcp-migrate.service || true
-        /usr/bin/systemctl start nmcp.target || true
+        if ! activate_services; then stop_services; fi
       fi
       record migration-failed-link-restored
       printf 'Migration failed; the previous release link was restored.\n' >&2
@@ -181,11 +199,13 @@ case "$action" in
     if ! /usr/bin/systemctl restart nmcp-api.service nmcp-worker.service \
       || ! /usr/bin/systemctl restart nmcp-files.service \
       || ! /usr/bin/systemctl start nmcp.target; then
+      stop_services
       record post-migration-service-failed
       printf 'Service start failed after migration; automatic binary rollback is unsafe.\n' >&2
       exit 1
     fi
     if ! /usr/local/libexec/nmcp/check-ubuntu-services --postgresql-unit "$postgresql_unit"; then
+      stop_services
       record post-migration-readiness-failed
       printf 'Whole-service stability failed after migration; automatic binary rollback is unsafe.\n' >&2
       exit 1
@@ -206,10 +226,20 @@ case "$action" in
       --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
       --property=ProtectSystem=strict --property=ProtectHome=yes \
       -- "$release_path/bin/nmcp-admin" migrate status --json
-    /usr/bin/systemctl stop nmcp.target
+    old_target=
+    if [[ -L $current ]]; then old_target=$(/usr/bin/readlink -f -- "$current"); fi
+    was_active=false
+    if /usr/bin/systemctl is-active --quiet nmcp.target; then was_active=true; fi
+    stop_services
     atomic_link "$release_path"
     if ! activate_services; then
+      stop_services
+      if [[ -n $old_target ]]; then atomic_link "$old_target"; else /usr/bin/rm -f -- "$current"; fi
+      if [[ $was_active == true && -n $old_target ]]; then
+        if ! activate_services; then stop_services; fi
+      fi
       record rollback-activation-failed
+      printf 'Rollback activation failed; the prior release link and service state were restored.\n' >&2
       exit 1
     fi
     /usr/bin/systemctl enable nmcp.target

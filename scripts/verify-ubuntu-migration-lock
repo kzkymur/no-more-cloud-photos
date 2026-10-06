@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-migration-lock: must run as root\n' >&2; exit 1; }
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+work=$(/usr/bin/mktemp -d /var/tmp/nmcp-migration-lock.XXXXXX)
+[[ ! -e /opt/nmcp/current ]] || { printf 'test requires no existing NMCP current release\n' >&2; exit 1; }
+cleanup() {
+  /usr/bin/systemctl stop nmcp-lock-dependent.service nmcp-lock-migrate.service >/dev/null 2>&1 || true
+  /usr/bin/rm -f /run/systemd/system/nmcp-lock-dependent.service /run/systemd/system/nmcp-lock-migrate.service \
+    /run/nmcp-migrate-delegation /run/lock/nmcp-deploy.lock
+  /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+  /usr/bin/rm -rf /opt/nmcp/current "$work"
+}
+trap cleanup EXIT
+/usr/bin/install -d -o root -g root -m 0755 /opt/nmcp/current/bin
+cat > /opt/nmcp/current/bin/nmcp-admin <<EOF
+#!/bin/sh
+printf 'entered\n' >> '$work/entries'
+sleep 1
+EOF
+/usr/bin/chown -R root:root /opt/nmcp/current
+/usr/bin/chmod 0755 /opt/nmcp/current/bin/nmcp-admin
+/usr/bin/install -o root -g nmcp -m 0660 /dev/null /run/lock/nmcp-deploy.lock
+
+# Direct migration must not enter while a deployment owns the lock.
+/usr/bin/flock /run/lock/nmcp-deploy.lock -c "sleep 3" & holder=$!
+/usr/bin/sleep 0.2
+if /usr/sbin/runuser -u nmcp -- "$repo/scripts/run-ubuntu-migration"; then
+  printf 'direct migration bypassed deployment lock\n' >&2; exit 1
+fi
+[[ ! -e $work/entries ]]
+wait "$holder"
+
+cat > /run/systemd/system/nmcp-lock-migrate.service <<EOF
+[Service]
+Type=oneshot
+User=nmcp
+ExecStart=$repo/scripts/run-ubuntu-migration
+EOF
+cat > /run/systemd/system/nmcp-lock-dependent.service <<'EOF'
+[Unit]
+Requires=nmcp-lock-migrate.service
+After=nmcp-lock-migrate.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/true
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/flock /run/lock/nmcp-deploy.lock -c "sleep 3" & holder=$!
+/usr/bin/sleep 0.2
+if /usr/bin/systemctl start nmcp-lock-dependent.service; then
+  printf 'dependency-triggered migration bypassed deployment lock\n' >&2; exit 1
+fi
+[[ ! -e $work/entries ]]
+wait "$holder"
+
+# The owning deployment may delegate exactly its current release migration.
+/usr/bin/printf '/opt/nmcp/current\n' > /run/nmcp-migrate-delegation
+/usr/bin/chown root:root /run/nmcp-migrate-delegation
+/usr/bin/chmod 0644 /run/nmcp-migrate-delegation
+/usr/bin/flock /run/lock/nmcp-deploy.lock -c "/usr/sbin/runuser -u nmcp -- '$repo/scripts/run-ubuntu-migration'"
+[[ $(/usr/bin/wc -l < "$work/entries") -eq 1 ]]
+printf 'Direct and dependency migration lock races passed\n'
