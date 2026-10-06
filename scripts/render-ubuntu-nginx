@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Render the production Nginx template with operator-supplied Tailnet values."""
+
+import argparse
+import ipaddress
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+
+TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
+TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+HOSTNAME = re.compile(
+    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
+)
+
+
+def tailnet_listen(value: str) -> str:
+    """Accept only a literal Tailscale address and an explicit TCP port."""
+    try:
+        if value.startswith("["):
+            end = value.index("]")
+            host, port_text = value[1:end], value[end + 1 :]
+            if not port_text.startswith(":"):
+                raise ValueError
+            port_text = port_text[1:]
+        else:
+            host, port_text = value.rsplit(":", 1)
+            if ":" in host:
+                raise ValueError
+        address = ipaddress.ip_address(host)
+        port = int(port_text)
+    except (ValueError, IndexError):
+        raise argparse.ArgumentTypeError("must be a literal IP:port listen address")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    if address not in TAILSCALE_V4 and address not in TAILSCALE_V6:
+        raise argparse.ArgumentTypeError("address must be in a Tailscale CGNAT or ULA range")
+    return value
+
+
+def hostname(value: str) -> str:
+    if not HOSTNAME.fullmatch(value) or "*" in value:
+        raise argparse.ArgumentTypeError("must be one concrete DNS hostname")
+    return value.lower()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--api-listen", type=tailnet_listen, required=True)
+    parser.add_argument("--files-listen", type=tailnet_listen, required=True)
+    parser.add_argument("--tailnet-hostname", type=hostname, required=True)
+    args = parser.parse_args()
+    if args.api_listen == args.files_listen:
+        parser.error("API and File Server listeners must be distinct")
+
+    text = args.template.read_text(encoding="utf-8")
+    replacements = {
+        "@@NMCP_API_TLS_LISTEN@@": args.api_listen,
+        "@@NMCP_FILES_TLS_LISTEN@@": args.files_listen,
+        "@@NMCP_TAILNET_HOSTNAME@@": args.tailnet_hostname,
+    }
+    for token, value in replacements.items():
+        if text.count(token) == 0:
+            parser.error(f"template does not contain {token}")
+        text = text.replace(token, value)
+    if "@@NMCP_" in text:
+        parser.error("template contains an unresolved NMCP token")
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{args.output.name}.", dir=args.output.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, args.output)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, UnicodeError) as error:
+        print(f"render-ubuntu-nginx: {error}", file=sys.stderr)
+        sys.exit(1)

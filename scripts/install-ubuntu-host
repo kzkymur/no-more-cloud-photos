@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: install-ubuntu-host --config-dir DIR --api-listen IP:PORT \
+  --files-listen IP:PORT --tailnet-hostname NAME --tls-cert FILE --tls-key FILE
+
+Installs (but does not start) Ubuntu system assets. DIR must contain admin.env,
+api.env, and worker.env with no example replacement markers.
+EOF
+  exit 2
+}
+
+config_dir= api_listen= files_listen= tailnet_hostname= tls_cert= tls_key=
+while (($#)); do
+  case "$1" in
+    --config-dir) (($# >= 2)) || usage; config_dir=$2; shift 2 ;;
+    --api-listen) (($# >= 2)) || usage; api_listen=$2; shift 2 ;;
+    --files-listen) (($# >= 2)) || usage; files_listen=$2; shift 2 ;;
+    --tailnet-hostname) (($# >= 2)) || usage; tailnet_hostname=$2; shift 2 ;;
+    --tls-cert) (($# >= 2)) || usage; tls_cert=$2; shift 2 ;;
+    --tls-key) (($# >= 2)) || usage; tls_key=$2; shift 2 ;;
+    -h|--help) usage ;;
+    *) usage ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || { printf 'install-ubuntu-host: must run as root\n' >&2; exit 1; }
+[[ -n $config_dir && -n $api_listen && -n $files_listen && -n $tailnet_hostname && -n $tls_cert && -n $tls_key ]] || usage
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd -- "$script_dir/.." && pwd -P)
+
+for command in /usr/sbin/nginx /usr/bin/systemd-analyze /usr/bin/systemd-sysusers \
+  /usr/bin/systemd-tmpfiles /usr/bin/openssl /usr/bin/python3; do
+  [[ -x $command ]] || { printf 'install-ubuntu-host: missing %s\n' "$command" >&2; exit 1; }
+done
+/usr/bin/python3 - <<'PY'
+values = {}
+with open("/etc/os-release", encoding="utf-8") as source:
+    for line in source:
+        if "=" in line:
+            key, value = line.rstrip("\n").split("=", 1)
+            values[key] = value.strip('"')
+if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "24.04":
+    raise SystemExit("install-ubuntu-host: only Ubuntu 24.04 is supported")
+PY
+for name in admin.env api.env worker.env; do
+  source_file=$config_dir/$name
+  [[ -f $source_file && ! -L $source_file ]] || {
+    printf 'install-ubuntu-host: missing regular %s\n' "$source_file" >&2
+    exit 1
+  }
+  if /usr/bin/python3 - "$source_file" <<'PY'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+raise SystemExit(0 if "REPLACE_" in text or "REPLACE_WITH" in text else 1)
+PY
+  then
+    printf 'install-ubuntu-host: replacement marker remains in %s\n' "$source_file" >&2
+    exit 1
+  fi
+done
+[[ -f $tls_cert && ! -L $tls_cert && -f $tls_key && ! -L $tls_key ]] || {
+  printf 'install-ubuntu-host: TLS inputs must be regular, non-symlink files\n' >&2
+  exit 1
+}
+/usr/bin/openssl x509 -in "$tls_cert" -noout >/dev/null
+/usr/bin/openssl x509 -in "$tls_cert" -noout -checkend 0 >/dev/null || {
+  printf 'install-ubuntu-host: TLS certificate is expired\n' >&2
+  exit 1
+}
+/usr/bin/openssl x509 -in "$tls_cert" -noout -checkhost "$tailnet_hostname" >/dev/null || {
+  printf 'install-ubuntu-host: TLS certificate does not cover %s\n' "$tailnet_hostname" >&2
+  exit 1
+}
+cert_public=$(/usr/bin/openssl x509 -in "$tls_cert" -pubkey -noout | /usr/bin/openssl sha256)
+key_public=$(/usr/bin/openssl pkey -in "$tls_key" -pubout | /usr/bin/openssl sha256)
+[[ $cert_public == "$key_public" ]] || {
+  printf 'install-ubuntu-host: TLS certificate and key do not match\n' >&2
+  exit 1
+}
+
+/usr/bin/install -d -o root -g root -m 0700 /etc/nmcp
+for name in admin.env api.env worker.env; do
+  /usr/bin/install -o root -g root -m 0600 "$config_dir/$name" "/etc/nmcp/$name"
+done
+/usr/bin/install -o root -g root -m 0600 "$tls_cert" /etc/nmcp/tls-cert.pem
+/usr/bin/install -o root -g root -m 0600 "$tls_key" /etc/nmcp/tls-key.pem
+"$repo_root/scripts/render-ubuntu-nginx" \
+  --template "$repo_root/infra/ubuntu/nginx.conf.in" \
+  --output /etc/nmcp/nginx.conf \
+  --api-listen "$api_listen" --files-listen "$files_listen" \
+  --tailnet-hostname "$tailnet_hostname"
+/usr/bin/chown root:root /etc/nmcp/nginx.conf
+/usr/bin/chmod 0644 /etc/nmcp/nginx.conf
+
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf" /etc/sysusers.d/nmcp.conf
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/tmpfiles.d/nmcp.conf" /etc/tmpfiles.d/nmcp.conf
+/usr/bin/systemd-sysusers /etc/sysusers.d/nmcp.conf
+/usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/nmcp.conf
+/usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
+
+for unit in nmcp.slice nmcp-migrate.service nmcp-api.service nmcp-worker.service nmcp-files.service nmcp.target; do
+  /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/$unit" "/etc/systemd/system/$unit"
+done
+for dropin in postgresql.service.d postgresql@.service.d; do
+  /usr/bin/install -d -o root -g root -m 0755 "/etc/systemd/system/$dropin"
+  /usr/bin/install -o root -g root -m 0644 \
+    "$repo_root/infra/ubuntu/systemd/$dropin/10-nmcp-slice.conf" \
+    "/etc/systemd/system/$dropin/10-nmcp-slice.conf"
+done
+/usr/bin/install -d -o root -g root -m 0755 /usr/share/doc/nmcp
+/usr/bin/install -o root -g root -m 0644 "$repo_root/docs/ubuntu-deployment.md" /usr/share/doc/nmcp/ubuntu-deployment.md
+
+/usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' \
+  ca-certificates curl ffmpeg libimage-exiftool-perl nginx-core postgresql tzdata util-linux \
+  > /var/lib/nmcp/deployment/runtime-packages.txt
+/usr/bin/chown root:root /var/lib/nmcp/deployment/runtime-packages.txt
+/usr/bin/chmod 0600 /var/lib/nmcp/deployment/runtime-packages.txt
+
+/usr/bin/systemctl daemon-reload
+printf 'Host assets installed. Stage and activate a release; activation enables nmcp.target.\n'

@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  install-ubuntu-release stage RELEASE_DIR RELEASE_ID
+  install-ubuntu-release activate RELEASE_ID
+  install-ubuntu-release rollback RELEASE_ID
+
+RELEASE_DIR must contain MANIFEST.sha256 plus executable bin/core-api,
+bin/core-worker, and bin/nmcp-admin. Release IDs use only letters, digits,
+period, underscore, and hyphen (maximum 64 characters).
+EOF
+  exit 2
+}
+
+[[ $EUID -eq 0 ]] || { printf 'install-ubuntu-release: must run as root\n' >&2; exit 1; }
+action=${1:-}
+release_id=${3:-${2:-}}
+[[ $release_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || usage
+release_root=/opt/nmcp/releases
+release_path=$release_root/$release_id
+current=/opt/nmcp/current
+evidence=/var/lib/nmcp/deployment
+
+verify_release() {
+  local directory=$1
+  /usr/bin/python3 - "$directory" <<'PY'
+import os, pathlib, re, stat, sys
+root = pathlib.Path(sys.argv[1])
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit("release must be a non-symlink directory")
+manifest = root / "MANIFEST.sha256"
+if not manifest.is_file() or manifest.is_symlink():
+    raise SystemExit("MANIFEST.sha256 must be a regular file")
+listed = []
+for line in manifest.read_text(encoding="ascii").splitlines():
+    match = re.fullmatch(r"[0-9a-f]{64}  ([A-Za-z0-9][A-Za-z0-9._/+@-]*)", line)
+    if not match:
+        raise SystemExit("manifest contains a malformed or unsafe entry")
+    path = pathlib.PurePosixPath(match.group(1))
+    if path.is_absolute() or ".." in path.parts or path.name == "MANIFEST.sha256":
+        raise SystemExit("manifest contains an unsafe path")
+    listed.append(path.as_posix())
+if len(listed) != len(set(listed)):
+    raise SystemExit("manifest contains duplicate paths")
+actual = []
+for base, directories, files in os.walk(root, followlinks=False):
+    for name in directories + files:
+        candidate = pathlib.Path(base, name)
+        mode = candidate.lstat().st_mode
+        if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise SystemExit(f"release contains unsupported entry: {candidate.relative_to(root)}")
+        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise SystemExit(f"release entry is group/world writable: {candidate.relative_to(root)}")
+    for name in files:
+        relative = pathlib.Path(base, name).relative_to(root).as_posix()
+        if relative != "MANIFEST.sha256":
+            actual.append(relative)
+if sorted(actual) != sorted(listed):
+    raise SystemExit("manifest does not exactly cover release files")
+for required in ("bin/core-api", "bin/core-worker", "bin/nmcp-admin"):
+    path = root / required
+    if required not in listed or not path.is_file() or not os.access(path, os.X_OK):
+        raise SystemExit(f"missing executable {required}")
+PY
+  (cd -- "$directory" && /usr/bin/sha256sum --check --strict MANIFEST.sha256)
+}
+
+atomic_link() {
+  local destination=$1 temporary=$current.new.$$
+  /usr/bin/ln -s -- "$destination" "$temporary"
+  /usr/bin/mv -Tf -- "$temporary" "$current"
+}
+
+record() {
+  local state=$1 temporary=$evidence/active-release.new.$$
+  /usr/bin/printf '%s\t%s\t%s\n' "$release_id" "$state" "$(/usr/bin/date --iso-8601=seconds)" > "$temporary"
+  /usr/bin/chown root:root "$temporary"
+  /usr/bin/chmod 0600 "$temporary"
+  /usr/bin/mv -f -- "$temporary" "$evidence/active-release"
+}
+
+activate_services() {
+  /usr/bin/systemctl reset-failed nmcp-migrate.service
+  /usr/bin/systemctl restart nmcp-migrate.service
+  /usr/bin/systemctl restart nmcp-api.service nmcp-worker.service
+  /usr/bin/systemctl restart nmcp-files.service
+  /usr/bin/systemctl start nmcp.target
+  local attempt
+  for attempt in {1..30}; do
+    if /usr/bin/curl --fail --silent --show-error --max-time 2 \
+      -H 'Accept: application/json' http://127.0.0.1:8080/readyz >/dev/null; then
+      return 0
+    fi
+    /usr/bin/sleep 1
+  done
+  printf 'install-ubuntu-release: readiness did not succeed within 30 seconds\n' >&2
+  return 1
+}
+
+case "$action" in
+  stage)
+    [[ $# -eq 3 ]] || usage
+    source_dir=$2
+    [[ ! -e $release_path ]] || { printf 'release already exists: %s\n' "$release_path" >&2; exit 1; }
+    verify_release "$source_dir"
+    /usr/bin/install -d -o root -g root -m 0755 /opt/nmcp "$release_root"
+    temporary=$release_root/.$release_id.new.$$
+    trap '/usr/bin/rm -rf -- "$temporary"' EXIT
+    /usr/bin/install -d -o root -g root -m 0755 "$temporary"
+    /usr/bin/cp -a -- "$source_dir/." "$temporary/"
+    /usr/bin/chown -R root:root "$temporary"
+    /usr/bin/chmod -R go-w "$temporary"
+    verify_release "$temporary"
+    /usr/bin/mv -- "$temporary" "$release_path"
+    trap - EXIT
+    printf 'Staged %s; run activate explicitly.\n' "$release_id"
+    ;;
+  activate)
+    [[ $# -eq 2 ]] || usage
+    verify_release "$release_path"
+    [[ -d $evidence ]] || { printf 'host assets are not installed\n' >&2; exit 1; }
+    old_target=
+    if [[ -L $current ]]; then old_target=$(/usr/bin/readlink -f -- "$current"); fi
+    was_active=false
+    if /usr/bin/systemctl is-active --quiet nmcp.target; then was_active=true; fi
+    /usr/bin/systemctl stop nmcp.target
+    atomic_link "$release_path"
+    if ! /usr/bin/systemctl reset-failed nmcp-migrate.service || ! /usr/bin/systemctl restart nmcp-migrate.service; then
+      if [[ -n $old_target ]]; then atomic_link "$old_target"; else /usr/bin/rm -f -- "$current"; fi
+      if [[ $was_active == true && -n $old_target ]]; then
+        /usr/bin/systemctl reset-failed nmcp-migrate.service || true
+        /usr/bin/systemctl restart nmcp-migrate.service || true
+        /usr/bin/systemctl start nmcp.target || true
+      fi
+      record migration-failed-link-restored
+      printf 'Migration failed; the previous release link was restored.\n' >&2
+      exit 1
+    fi
+    if ! /usr/bin/systemctl restart nmcp-api.service nmcp-worker.service \
+      || ! /usr/bin/systemctl restart nmcp-files.service \
+      || ! /usr/bin/systemctl start nmcp.target; then
+      record post-migration-service-failed
+      printf 'Service start failed after migration; automatic binary rollback is unsafe.\n' >&2
+      exit 1
+    fi
+    ready=false
+    for attempt in {1..30}; do
+      if /usr/bin/curl --fail --silent --show-error --max-time 2 \
+        -H 'Accept: application/json' http://127.0.0.1:8080/readyz >/dev/null; then
+        ready=true; break
+      fi
+      /usr/bin/sleep 1
+    done
+    if [[ $ready != true ]]; then
+      record post-migration-readiness-failed
+      printf 'Readiness failed after migration; automatic binary rollback is unsafe.\n' >&2
+      exit 1
+    fi
+    /usr/bin/systemctl enable nmcp.target
+    record active
+    ;;
+  rollback)
+    [[ $# -eq 2 ]] || usage
+    verify_release "$release_path"
+    [[ -d $evidence && -f /etc/nmcp/admin.env ]] || { printf 'host assets are not installed\n' >&2; exit 1; }
+    # The old admin binary must understand the current schema before switching.
+    /usr/bin/systemd-run --quiet --wait --collect --unit=nmcp-rollback-check \
+      --uid=nmcp --gid=nmcp --property=Slice=nmcp.slice \
+      --property=EnvironmentFile=/etc/nmcp/admin.env \
+      --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
+      --property=ProtectSystem=strict --property=ProtectHome=yes \
+      -- "$release_path/bin/nmcp-admin" migrate status --json
+    /usr/bin/systemctl stop nmcp.target
+    atomic_link "$release_path"
+    if ! activate_services; then
+      record rollback-activation-failed
+      exit 1
+    fi
+    /usr/bin/systemctl enable nmcp.target
+    record active-after-compatible-rollback
+    ;;
+  *) usage ;;
+esac
