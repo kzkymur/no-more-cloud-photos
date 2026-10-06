@@ -235,6 +235,7 @@ def run_tracked(
             with connection:
                 if recv_authorized(connection, 5, deadline, owner_pidfd) != b"READY":
                     continue
+                pathlib.Path(socket_path + ".receiver-ready").touch(mode=0o600)
                 deadline_ns = int(deadline * 1_000_000_000)
                 if time.monotonic_ns() >= deadline_ns or child.poll() is not None:
                     continue
@@ -243,6 +244,14 @@ def run_tracked(
                     [b"O" + deadline_ns.to_bytes(8, "big")],
                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
                 )
+                if recv_authorized(connection, 13, deadline, owner_pidfd) != b"OFFER_CHECKED":
+                    continue
+                if pathlib.Path(
+                    "/run/nmcp-deploy/test-pause-after-offer-check.enabled"
+                ).is_file():
+                    pathlib.Path(
+                        "/run/nmcp-deploy/test-receiver-exec-check.ready"
+                    ).touch(mode=0o600)
                 if recv_authorized(connection, 10, deadline, owner_pidfd) != b"EXEC_READY":
                     continue
                 # The wrapper remains the sole authority through the final
@@ -308,7 +317,6 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     connection.connect(socket_path)
     connection.sendall(b"READY")
-    pathlib.Path(socket_path + ".receiver-ready").touch(mode=0o600)
     size = array.array("i").itemsize
     message, ancillary, _flags, _address = connection.recvmsg(9, socket.CMSG_SPACE(size))
     received: list[int] = []
@@ -332,11 +340,11 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
     except BlockingIOError:
         fail("received descriptor does not carry the execution lease")
     os.set_inheritable(descriptor, True)
+    connection.sendall(b"OFFER_CHECKED")
     pause_enabled = pathlib.Path(
         "/run/nmcp-deploy/test-pause-after-offer-check.enabled"
     )
     if pause_enabled.is_file():
-        pathlib.Path("/run/nmcp-deploy/test-receiver-exec-check.ready").touch(mode=0o600)
         while not pathlib.Path(
             "/run/nmcp-deploy/test-receiver-exec-check.go"
         ).is_file():
