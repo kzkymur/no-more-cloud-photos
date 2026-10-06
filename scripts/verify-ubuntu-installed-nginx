@@ -253,7 +253,9 @@ if /usr/local/libexec/nmcp/renew-ubuntu-tls "$persistent_input/cert.pem" "$persi
   printf 'persistent Nginx restart failure was accepted\n' >&2; exit 1
 fi
 [[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
-! /usr/bin/systemctl is-active --quiet nmcp-files.service
+if /usr/bin/systemctl is-active --quiet nmcp-files.service; then
+  printf 'File Server remained active after both restart attempts failed\n' >&2; exit 1
+fi
 /usr/bin/rm -f /run/systemd/system/nmcp-files.service.d/99-fail-once.conf
 /usr/bin/systemctl daemon-reload
 /usr/bin/systemctl restart nmcp-files.service
