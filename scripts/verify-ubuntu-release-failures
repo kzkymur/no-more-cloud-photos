@@ -194,9 +194,9 @@ done
 cat > /opt/nmcp/releases/ownerdeath/bin/nmcp-admin <<EOF
 #!/bin/sh
 if test "\${1:-}" = migrate && test "\${2:-}" = up; then
-  /usr/bin/touch '$work/ownerdeath-entered'
+  printf 'NMCP_OWNERDEATH_ENTERED\n'
   while test ! -e '$work/ownerdeath-proceed'; do /usr/bin/sleep 0.05; done
-  /usr/bin/touch '$work/ownerdeath-finished'
+  printf 'NMCP_OWNERDEATH_FINISHED\n'
 fi
 exit 0
 EOF
@@ -205,7 +205,7 @@ EOF
 "$repo/scripts/install-ubuntu-release" activate ownerdeath >"$work/ownerdeath.out" 2>&1 &
 installer_pid=$!
 for attempt in {1..600}; do
-  [[ -e $work/ownerdeath-entered ]] && break
+  /usr/bin/grep -q 'NMCP_OWNERDEATH_ENTERED' "$work/ownerdeath.out" 2>/dev/null && break
   if ! /usr/bin/kill -0 "$installer_pid" 2>/dev/null; then
     wait "$installer_pid" 2>/dev/null || true
     /usr/bin/cat "$work/ownerdeath.out" >&2
@@ -228,13 +228,15 @@ if /usr/local/libexec/nmcp/run-ubuntu-migration >"$work/direct-overlap.out" 2>&1
   printf 'direct migration overlapped the orphan transient\n' >&2; exit 1
 fi
 /usr/bin/grep -q 'orphaned migration execution is still active' "$work/direct-overlap.out"
-[[ ! -e $work/ownerdeath-finished ]]
+if /usr/bin/grep -q 'NMCP_OWNERDEATH_FINISHED' "$work/ownerdeath.out"; then
+  printf 'owner-death migration finished before release signal\n' >&2; exit 1
+fi
 if /usr/bin/systemctl is-active --quiet nmcp.target; then
   printf 'killed installer continued into service activation\n' >&2; exit 1
 fi
 /usr/bin/touch "$work/ownerdeath-proceed"
 for attempt in {1..100}; do
-  [[ -e $work/ownerdeath-finished ]] && break
+  /usr/bin/grep -q 'NMCP_OWNERDEATH_FINISHED' "$work/ownerdeath.out" 2>/dev/null && break
   [[ $attempt -lt 100 ]] || { printf 'orphan migration did not finish\n' >&2; exit 1; }
   /usr/bin/sleep 0.05
 done
