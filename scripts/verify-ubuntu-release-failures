@@ -360,10 +360,12 @@ for attempt in {1..100}; do
   [[ $attempt -lt 100 ]] || { printf 'terminated transient retained execution lease\n' >&2; exit 1; }
   /usr/bin/sleep 0.05
 done
-if compgen -G "/run/nmcp-deploy/migration-handoff.$installer_pid.*" >/dev/null \
-  || compgen -G "/run/nmcp-deploy/migration-runner.$installer_pid.*" >/dev/null; then
-  printf 'owner-death transient leaked handoff state\n' >&2; exit 1
-fi
+for attempt in {1..100}; do
+  if ! compgen -G "/run/nmcp-deploy/migration-handoff.$installer_pid.*" >/dev/null \
+    && ! compgen -G "/run/nmcp-deploy/migration-runner.$installer_pid.*" >/dev/null; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'owner-death transient leaked handoff state\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
 /usr/local/libexec/nmcp/run-ubuntu-migration >"$work/direct-after-ownerdeath.out" 2>&1
 [[ ! -e /run/nmcp-migration-complete ]]
 printf 'Activation cleanup, rollback restoration, and evidence tests passed\n'
