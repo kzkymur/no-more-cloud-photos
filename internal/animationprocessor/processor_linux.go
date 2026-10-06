@@ -1128,11 +1128,14 @@ func mapRunError(err error) error {
 }
 
 func mapOperationError(err error, parent, operation context.Context) error {
-	if parent.Err() != nil {
-		return parent.Err()
-	}
+	// context.Cause(operation) is immutable once the child completes. Consult it
+	// before re-reading the parent so a later shutdown cancellation cannot
+	// overwrite an operation timeout that already won the race.
 	if operation.Err() != nil && errors.Is(context.Cause(operation), ErrTimeout) {
 		return ErrTimeout
+	}
+	if parent.Err() != nil {
+		return parent.Err()
 	}
 	return mapRunError(err)
 }

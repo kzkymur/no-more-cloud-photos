@@ -275,21 +275,44 @@ func TestHelperAndProcessErrors(t *testing.T) {
 
 func TestTransformUsesSingleOperationTimeoutBudget(t *testing.T) {
 	t.Run("partial transform leaves only remaining verifier budget", func(t *testing.T) {
+		transformStarted := filepath.Join(t.TempDir(), "transform-started")
+		releaseTransform := filepath.Join(t.TempDir(), "release-transform")
 		marker := filepath.Join(t.TempDir(), "verifier-started")
 		helper := writeExecutable(t, "shared-budget", "#!/bin/sh\n"+
 			"if [ \"$1\" = verify-output ]; then printf started > '"+marker+"'; sleep 10; exit; fi\n"+
-			"sleep 2\nprintf '%b' '"+shellOctal(fakeWebP)+"' >&4\nprintf '%s' '"+transformSuccess+"'\n")
-		processor := newProcessor(t, helper, Policy{Timeout: 4 * time.Second})
+			"printf started > '"+transformStarted+"'\nwhile [ ! -f '"+releaseTransform+"' ]; do sleep 0.02; done\n"+
+			"printf '%b' '"+shellOctal(fakeWebP)+"' >&4\nprintf '%s' '"+transformSuccess+"'\n")
+		processor := newProcessor(t, helper, Policy{Timeout: 5 * time.Second})
 		input, output := testFiles(t, []byte("input"))
+		phaseResult := make(chan error, 1)
+		go func() {
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				if _, err := os.Stat(transformStarted); err == nil {
+					time.Sleep(3 * time.Second)
+					phaseResult <- os.WriteFile(releaseTransform, []byte("release"), 0o600)
+					return
+				}
+				if time.Now().After(deadline) {
+					phaseResult <- errors.New("transform phase did not start")
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
 		started := time.Now()
 		_, err := processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()})
 		elapsed := time.Since(started)
 		if !errors.Is(err, ErrTimeout) {
 			t.Fatalf("Transform() error = %v", err)
 		}
-		// Race-instrumented supervisor cleanup can add substantial latency after
-		// the 4s deadline. A fresh verifier budget would exceed 7s here.
-		if elapsed >= 5500*time.Millisecond {
+		if phaseErr := <-phaseResult; phaseErr != nil {
+			t.Fatal(phaseErr)
+		}
+		// Shared deadline + the Runner's maximum 2s cleanup is at most 7s.
+		// A fresh 5s verifier budget cannot expire before about 8s because the
+		// synchronized transform phase consumes 3s first; keep a clear margin.
+		if elapsed >= 7500*time.Millisecond {
 			t.Fatalf("shared operation budget took %v; verifier appears to have received a fresh timeout", elapsed)
 		}
 		if _, err := os.Stat(marker); err != nil {
@@ -317,13 +340,36 @@ func TestTransformUsesSingleOperationTimeoutBudget(t *testing.T) {
 		}
 	})
 
-	t.Run("both stages succeed within one near-boundary budget", func(t *testing.T) {
+	t.Run("both stages succeed within one shared budget", func(t *testing.T) {
 		helper := writeExecutable(t, "shared-budget-success", "#!/bin/sh\n"+
 			"if [ \"$1\" = verify-output ]; then sleep 3; printf '%s' '"+webPVerificationSuccess+"'; exit; fi\n"+
 			"sleep 3\nprintf '%b' '"+shellOctal(fakeWebP)+"' >&4\nprintf '%s' '"+transformSuccess+"'\n")
 		input, output := testFiles(t, []byte("input"))
 		if _, err := newProcessor(t, helper, Policy{Timeout: 9 * time.Second}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()}); err != nil {
 			t.Fatalf("Transform() before shared deadline: %v", err)
+		}
+	})
+}
+
+func TestOperationErrorPreservesFirstCause(t *testing.T) {
+	t.Run("operation timeout before late parent cancellation", func(t *testing.T) {
+		parent, cancelParent := context.WithCancel(context.Background())
+		operation, cancelOperation := context.WithTimeoutCause(parent, 20*time.Millisecond, ErrTimeout)
+		defer cancelOperation()
+		<-operation.Done()
+		cancelParent()
+		if err := mapOperationError(operation.Err(), parent, operation); !errors.Is(err, ErrTimeout) {
+			t.Fatalf("mapOperationError() = %v", err)
+		}
+	})
+	t.Run("parent cancellation before operation timeout", func(t *testing.T) {
+		parent, cancelParent := context.WithCancel(context.Background())
+		operation, cancelOperation := context.WithTimeoutCause(parent, time.Second, ErrTimeout)
+		cancelParent()
+		<-operation.Done()
+		defer cancelOperation()
+		if err := mapOperationError(operation.Err(), parent, operation); !errors.Is(err, context.Canceled) || errors.Is(err, ErrTimeout) {
+			t.Fatalf("mapOperationError() = %v", err)
 		}
 	})
 }
@@ -401,16 +447,18 @@ func TestTransformRejectsIndividualWebPFactMismatches(t *testing.T) {
 	animation := strings.Index(string(loop), "ANIM")
 	loop[animation+12] = 5
 	twoFrameDocument := strings.NewReplacer(`"frame_count":3`, `"frame_count":2`, `[40,100,250]`, `[40,100]`, `"duration_ms":390`, `"duration_ms":140`, `"decoded_pixels":18`, `"decoded_pixels":12`).Replace(transformSuccess)
-	verificationMismatch := strings.Replace(webPVerificationSuccess, `"width":3`, `"width":4`, 1)
+	commonVerificationMismatch := strings.Replace(webPVerificationSuccess, `"width":3`, `"width":4`, 1)
+	webPVerificationMismatch := strings.NewReplacer(`[40,100,250]`, `[40,100,251]`, `"duration_ms":390`, `"duration_ms":391`).Replace(webPVerificationSuccess)
 	for name, test := range map[string]struct {
 		document, output, verification string
 	}{
-		"legacy combined counterexample": {transformSuccess, contradictoryWebP, webPVerificationSuccess},
-		"canvas":                         {transformSuccess, string(canvas), webPVerificationSuccess},
-		"frame count":                    {twoFrameDocument, fakeWebP, webPVerificationSuccess},
-		"frame duration":                 {transformSuccess, string(duration), webPVerificationSuccess},
-		"loop count":                     {transformSuccess, string(loop), webPVerificationSuccess},
-		"native verification result":     {transformSuccess, fakeWebP, verificationMismatch},
+		"legacy combined counterexample":    {transformSuccess, contradictoryWebP, webPVerificationSuccess},
+		"canvas":                            {transformSuccess, string(canvas), webPVerificationSuccess},
+		"frame count":                       {twoFrameDocument, fakeWebP, webPVerificationSuccess},
+		"frame duration":                    {transformSuccess, string(duration), webPVerificationSuccess},
+		"loop count":                        {transformSuccess, string(loop), webPVerificationSuccess},
+		"native common verification result": {transformSuccess, fakeWebP, commonVerificationMismatch},
+		"native WebP timing result":         {transformSuccess, fakeWebP, webPVerificationMismatch},
 	} {
 		t.Run(name, func(t *testing.T) {
 			helper := jsonHelperWithVerification(t, test.document, test.output, test.verification)
@@ -445,12 +493,18 @@ func TestAVIFZeroItemAndEmptyPropertiesAreIndependent(t *testing.T) {
 
 func TestTransformRejectsAVIFVerificationFactMismatch(t *testing.T) {
 	document := strings.NewReplacer(`"output_mime":"image/webp"`, `"output_mime":"image/avif"`, `"quality":80`, `"quality":50`, `"max_long_edge":1920`, `"max_long_edge":640`, `"encoder":"libwebp"`, `"encoder":"aom"`).Replace(transformSuccess)
-	verification := `{"protocol":1,"ok":true,"error_code":"","result":{"width":4,"height":2,"frame_count":1,"frame_durations_ms":[],"duration_ms":0,"total_plays":1,"bit_depth":8}}`
-	helper := jsonHelperWithVerification(t, document, string(structuralAVIFFixture(false, false, false, false, false)), verification)
-	input, output := testFiles(t, []byte("input"))
-	_, err := newProcessor(t, helper, Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: thumbnailRecipe()})
-	if !errors.Is(err, ErrProcess) {
-		t.Fatalf("AVIF verifier dimension mismatch error = %v", err)
+	for name, verification := range map[string]string{
+		"common dimensions": `{"protocol":1,"ok":true,"error_code":"","result":{"width":4,"height":2,"frame_count":1,"frame_durations_ms":[],"duration_ms":0,"total_plays":1,"bit_depth":8}}`,
+		"AVIF-only facts":   `{"protocol":1,"ok":true,"error_code":"","result":{"width":3,"height":2,"frame_count":2,"frame_durations_ms":[],"duration_ms":0,"total_plays":1,"bit_depth":8}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			helper := jsonHelperWithVerification(t, document, string(structuralAVIFFixture(false, false, false, false, false)), verification)
+			input, output := testFiles(t, []byte("input"))
+			_, err := newProcessor(t, helper, Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: thumbnailRecipe()})
+			if !errors.Is(err, ErrProcess) {
+				t.Fatalf("AVIF verifier mismatch error = %v", err)
+			}
+		})
 	}
 }
 
