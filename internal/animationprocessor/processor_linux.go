@@ -252,6 +252,15 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 			returnErr = ErrResourcePolicy
 		}
 	}()
+	// The advertised timeout is one wall-clock budget for decode/encode and the
+	// mandatory independent output verification together. Each Runner also has
+	// its own defensive ceiling, but this absolute deadline prevents a fresh
+	// full timeout from being granted to the second process.
+	operationCtx, cancelOperation := context.WithTimeoutCause(ctx, p.policy.Timeout, ErrTimeout)
+	defer cancelOperation()
+	if operationCtx.Err() != nil {
+		return Result{}, mapOperationError(operationCtx.Err(), ctx, operationCtx)
+	}
 	input, err := reopenInput(request.Input)
 	if err != nil {
 		return Result{}, ErrInvalid
@@ -270,9 +279,9 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		"--srgb-icc", "/proc/self/fd/5",
 	}
 	arguments = append(arguments, p.limitArguments()...)
-	output, err := p.runner.Run(ctx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{input, request.Output, icc}})
+	output, err := p.runner.Run(operationCtx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{input, request.Output, icc}})
 	if err != nil {
-		return Result{}, mapRunError(err)
+		return Result{}, mapOperationError(err, ctx, operationCtx)
 	}
 	var response transformResponse
 	if decodeProtocolJSON(output.Stdout, &response) != nil || response.Protocol != ProtocolVersion ||
@@ -293,8 +302,8 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		return Result{}, ErrResourcePolicy
 	}
 	r := response.Result
-	if err := p.validateOutput(ctx, request.Output, r); err != nil {
-		return Result{}, err
+	if err := p.validateOutput(operationCtx, request.Output, r); err != nil {
+		return Result{}, mapOperationError(err, ctx, operationCtx)
 	}
 	extension := "webp"
 	if r.OutputMIME == "image/avif" {
@@ -334,6 +343,9 @@ func (p *Processor) validateOutput(ctx context.Context, file *os.File, result *t
 	if _, err := file.Seek(0, io.SeekStart); err != nil || !valid {
 		return ErrProcess
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	input, err := reopenInput(file)
 	if err != nil {
 		return ErrProcess
@@ -343,7 +355,7 @@ func (p *Processor) validateOutput(ctx context.Context, file *os.File, result *t
 		"--input-mime", result.OutputMIME, "--max-output-bytes", strconv.FormatInt(p.policy.GeneratedOutputMaxBytes, 10)}
 	output, err := p.runner.Run(ctx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{input}})
 	if err != nil {
-		return mapRunError(err)
+		return err
 	}
 	var response outputVerificationResponse
 	if decodeProtocolJSON(output.Stdout, &response) != nil || response.Protocol != ProtocolVersion || !response.OK || response.ErrorCode != "" || response.Result == nil {
@@ -1113,6 +1125,16 @@ func mapRunError(err error) error {
 	default:
 		return ErrProcess
 	}
+}
+
+func mapOperationError(err error, parent, operation context.Context) error {
+	if parent.Err() != nil {
+		return parent.Err()
+	}
+	if operation.Err() != nil && errors.Is(context.Cause(operation), ErrTimeout) {
+		return ErrTimeout
+	}
+	return mapRunError(err)
 }
 func mapCapabilityError(code string) error {
 	switch code {

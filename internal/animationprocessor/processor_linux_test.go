@@ -5,6 +5,7 @@ package animationprocessor
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -272,6 +273,61 @@ func TestHelperAndProcessErrors(t *testing.T) {
 	})
 }
 
+func TestTransformUsesSingleOperationTimeoutBudget(t *testing.T) {
+	t.Run("partial transform leaves only remaining verifier budget", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "verifier-started")
+		helper := writeExecutable(t, "shared-budget", "#!/bin/sh\n"+
+			"if [ \"$1\" = verify-output ]; then printf started > '"+marker+"'; sleep 10; exit; fi\n"+
+			"sleep 2\nprintf '%b' '"+shellOctal(fakeWebP)+"' >&4\nprintf '%s' '"+transformSuccess+"'\n")
+		processor := newProcessor(t, helper, Policy{Timeout: 4 * time.Second})
+		input, output := testFiles(t, []byte("input"))
+		started := time.Now()
+		_, err := processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()})
+		elapsed := time.Since(started)
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("Transform() error = %v", err)
+		}
+		// Race-instrumented supervisor cleanup can add substantial latency after
+		// the 4s deadline. A fresh verifier budget would exceed 7s here.
+		if elapsed >= 5500*time.Millisecond {
+			t.Fatalf("shared operation budget took %v; verifier appears to have received a fresh timeout", elapsed)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("verifier was not started after partial transform budget: %v", err)
+		}
+		if info, statErr := output.Stat(); statErr != nil || info.Size() != 0 {
+			t.Fatalf("timeout output size = %d, %v", info.Size(), statErr)
+		}
+	})
+
+	t.Run("transform timeout never starts verifier", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "verifier-started")
+		helper := writeExecutable(t, "exhausted-before-verifier", "#!/bin/sh\n"+
+			"if [ \"$1\" = verify-output ]; then printf started > '"+marker+"'; exit; fi\nsleep 2\n")
+		input, output := testFiles(t, []byte("input"))
+		_, err := newProcessor(t, helper, Policy{Timeout: 200 * time.Millisecond}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()})
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("Transform() error = %v", err)
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("verifier unexpectedly started: %v", err)
+		}
+		if info, statErr := output.Stat(); statErr != nil || info.Size() != 0 {
+			t.Fatalf("timeout output size = %d, %v", info.Size(), statErr)
+		}
+	})
+
+	t.Run("both stages succeed within one near-boundary budget", func(t *testing.T) {
+		helper := writeExecutable(t, "shared-budget-success", "#!/bin/sh\n"+
+			"if [ \"$1\" = verify-output ]; then sleep 3; printf '%s' '"+webPVerificationSuccess+"'; exit; fi\n"+
+			"sleep 3\nprintf '%b' '"+shellOctal(fakeWebP)+"' >&4\nprintf '%s' '"+transformSuccess+"'\n")
+		input, output := testFiles(t, []byte("input"))
+		if _, err := newProcessor(t, helper, Policy{Timeout: 9 * time.Second}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: standardRecipe()}); err != nil {
+			t.Fatalf("Transform() before shared deadline: %v", err)
+		}
+	})
+}
+
 func TestTransformFailureClearsPartialOutput(t *testing.T) {
 	helper := writeExecutable(t, "partial", "#!/bin/sh\nprintf partial-output >&4\nexit 9\n")
 	processor := newProcessor(t, helper, Policy{})
@@ -299,7 +355,7 @@ func TestTransformRejectsInvalidOutputSignature(t *testing.T) {
 	}
 }
 
-func TestTransformRejectsMalformedOutputContainer(t *testing.T) {
+func TestTransformRejectsMalformedWebPOutput(t *testing.T) {
 	wrongRIFFSize := []byte(fakeWebP)
 	wrongRIFFSize[4]++
 	missingAnimation := strings.Replace(fakeWebP, "ANIM", "JUNK", 1)
@@ -315,6 +371,10 @@ func TestTransformRejectsMalformedOutputContainer(t *testing.T) {
 			}
 		})
 	}
+
+}
+
+func TestTransformRejectsMalformedAVIFOutput(t *testing.T) {
 	document := strings.NewReplacer(`"output_mime":"image/webp"`, `"output_mime":"image/avif"`, `"quality":80`, `"quality":50`, `"max_long_edge":1920`, `"max_long_edge":640`, `"encoder":"libwebp"`, `"encoder":"aom"`).Replace(transformSuccess)
 	for name, bytes := range map[string]string{
 		"AVIF truncated box":       fakeAVIF[:len(fakeAVIF)-1],
@@ -331,9 +391,66 @@ func TestTransformRejectsMalformedOutputContainer(t *testing.T) {
 	}
 }
 
-func TestTransformRejectsContradictoryOutputFacts(t *testing.T) {
-	if err := transformError(t, newProcessor(t, jsonHelper(t, transformSuccess, contradictoryWebP), Policy{}), context.Background()); !errors.Is(err, ErrProcess) {
-		t.Fatalf("one-frame 1x1 WebP reported as three-frame 3x2 output: %v", err)
+func TestTransformRejectsIndividualWebPFactMismatches(t *testing.T) {
+	canvas := []byte(fakeWebP)
+	canvas[24] = 3 // four-pixel VP8X canvas versus reported three.
+	duration := []byte(fakeWebP)
+	frame := strings.Index(string(duration), "ANMF")
+	duration[frame+20] = 41
+	loop := []byte(fakeWebP)
+	animation := strings.Index(string(loop), "ANIM")
+	loop[animation+12] = 5
+	twoFrameDocument := strings.NewReplacer(`"frame_count":3`, `"frame_count":2`, `[40,100,250]`, `[40,100]`, `"duration_ms":390`, `"duration_ms":140`, `"decoded_pixels":18`, `"decoded_pixels":12`).Replace(transformSuccess)
+	verificationMismatch := strings.Replace(webPVerificationSuccess, `"width":3`, `"width":4`, 1)
+	for name, test := range map[string]struct {
+		document, output, verification string
+	}{
+		"legacy combined counterexample": {transformSuccess, contradictoryWebP, webPVerificationSuccess},
+		"canvas":                         {transformSuccess, string(canvas), webPVerificationSuccess},
+		"frame count":                    {twoFrameDocument, fakeWebP, webPVerificationSuccess},
+		"frame duration":                 {transformSuccess, string(duration), webPVerificationSuccess},
+		"loop count":                     {transformSuccess, string(loop), webPVerificationSuccess},
+		"native verification result":     {transformSuccess, fakeWebP, verificationMismatch},
+	} {
+		t.Run(name, func(t *testing.T) {
+			helper := jsonHelperWithVerification(t, test.document, test.output, test.verification)
+			if err := transformError(t, newProcessor(t, helper, Policy{}), context.Background()); !errors.Is(err, ErrProcess) {
+				t.Fatalf("Transform() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestAVIFZeroItemAndEmptyPropertiesAreIndependent(t *testing.T) {
+	for name, data := range map[string][]byte{
+		"zero primary item": structuralAVIFFixture(true, false, false, false, false),
+		"zero iloc items":   structuralAVIFFixture(false, true, false, false, false),
+		"zero iinf items":   structuralAVIFFixture(false, false, true, false, false),
+		"empty ipco":        structuralAVIFFixture(false, false, false, true, false),
+		"empty ipma":        structuralAVIFFixture(false, false, false, false, true),
+	} {
+		t.Run(name, func(t *testing.T) {
+			file, _ := testFiles(t, data)
+			if validateAVIFContainer(file, int64(len(data))) {
+				t.Fatal("isolated impossible AVIF branch accepted")
+			}
+		})
+	}
+	valid := structuralAVIFFixture(false, false, false, false, false)
+	file, _ := testFiles(t, valid)
+	if !validateAVIFContainer(file, int64(len(valid))) {
+		t.Fatal("structural control fixture rejected")
+	}
+}
+
+func TestTransformRejectsAVIFVerificationFactMismatch(t *testing.T) {
+	document := strings.NewReplacer(`"output_mime":"image/webp"`, `"output_mime":"image/avif"`, `"quality":80`, `"quality":50`, `"max_long_edge":1920`, `"max_long_edge":640`, `"encoder":"libwebp"`, `"encoder":"aom"`).Replace(transformSuccess)
+	verification := `{"protocol":1,"ok":true,"error_code":"","result":{"width":4,"height":2,"frame_count":1,"frame_durations_ms":[],"duration_ms":0,"total_plays":1,"bit_depth":8}}`
+	helper := jsonHelperWithVerification(t, document, string(structuralAVIFFixture(false, false, false, false, false)), verification)
+	input, output := testFiles(t, []byte("input"))
+	_, err := newProcessor(t, helper, Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: thumbnailRecipe()})
+	if !errors.Is(err, ErrProcess) {
+		t.Fatalf("AVIF verifier dimension mismatch error = %v", err)
 	}
 }
 
@@ -425,8 +542,11 @@ func writeExecutable(t *testing.T, name, body string) string {
 	return path
 }
 func jsonHelper(t *testing.T, document, output string) string {
+	return jsonHelperWithVerification(t, document, output, webPVerificationSuccess)
+}
+func jsonHelperWithVerification(t *testing.T, document, output, verification string) string {
 	t.Helper()
-	body := "#!/bin/sh\nif [ \"$1\" = verify-output ]; then printf '%s' '" + webPVerificationSuccess + "'; exit; fi\n"
+	body := "#!/bin/sh\nif [ \"$1\" = verify-output ]; then printf '%s' '" + verification + "'; exit; fi\n"
 	if output != "" {
 		body += "printf '%b' '" + shellOctal(output) + "' >&4\n"
 	}
@@ -441,6 +561,49 @@ func shellOctal(value string) string {
 	}
 	return result.String()
 }
+
+func structuralAVIFBox(typ string, payload []byte) []byte {
+	result := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint32(result[:4], uint32(len(result)))
+	copy(result[4:8], typ)
+	copy(result[8:], payload)
+	return result
+}
+
+func structuralAVIFFixture(zeroPrimary, zeroLocation, zeroInfo, emptyIPCO, emptyIPMA bool) []byte {
+	handler := make([]byte, 12)
+	copy(handler[8:], "pict")
+	primary := []byte{0, 0, 0, 0, 0, 1}
+	if zeroPrimary {
+		primary[5] = 0
+	}
+	location := []byte{0, 0, 0, 0, 0, 0, 0, 1}
+	if zeroLocation {
+		location[7] = 0
+	}
+	item := []byte{2, 0, 0, 0, 0, 1, 0, 0, 'a', 'v', '0', '1'}
+	info := append([]byte{0, 0, 0, 0, 0, 1}, structuralAVIFBox("infe", item)...)
+	if zeroInfo {
+		info = []byte{0, 0, 0, 0, 0, 0}
+	}
+	propertyContainer := []byte{1}
+	if emptyIPCO {
+		propertyContainer = nil
+	}
+	associations := make([]byte, 9)
+	if emptyIPMA {
+		associations = nil
+	}
+	properties := append(structuralAVIFBox("ipco", propertyContainer), structuralAVIFBox("ipma", associations)...)
+	meta := []byte{0, 0, 0, 0}
+	for _, child := range [][]byte{structuralAVIFBox("hdlr", handler), structuralAVIFBox("pitm", primary), structuralAVIFBox("iloc", location), structuralAVIFBox("iinf", info), structuralAVIFBox("iprp", properties)} {
+		meta = append(meta, child...)
+	}
+	ftyp := []byte{'a', 'v', 'i', 'f', 0, 0, 0, 0, 'a', 'v', 'i', 'f'}
+	result := append(structuralAVIFBox("ftyp", ftyp), structuralAVIFBox("meta", meta)...)
+	return append(result, structuralAVIFBox("mdat", []byte{1})...)
+}
+
 func transformError(t *testing.T, p *Processor, ctx context.Context) error {
 	t.Helper()
 	input, output := testFiles(t, []byte("input"))
