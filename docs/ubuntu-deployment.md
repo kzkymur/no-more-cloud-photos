@@ -141,16 +141,21 @@ path before execution. The installer also acquires a separate root-only
 execution lease before dispatch and atomically transfers that same locked open
 file description to the transient migration over a root-only Unix socket. The
 tracked wrapper is the sole deadline/cancellation authority: after the receiver
-announces readiness, it rechecks the child and deadline, then sends the FD and a
-monotonic execution authorization in one `sendmsg`. The receiver rejects an
-expired authorization, verifies the descriptor, and acknowledges ownership before database
-work. Thus installer death before transfer prevents execution, while death after
-transfer leaves the child holding the lease and blocks every new
+announces readiness, it rechecks the child, installer identity, and deadline,
+then sends an FD offer with its monotonic deadline. The receiver rejects an
+expired offer and verifies the descriptor before declaring execution readiness.
+The wrapper monitors the same absolute deadline and the installer's pinned pidfd
+through that declaration, rechecks all authority, and only then sends the final
+`EXEC` grant. The receiver rechecks expiry immediately before exec. Thus
+installer death before the final grant prevents execution, while death after
+the grant leaves the child holding the lease and blocks every new
 host/release/TLS/direct-migration mutation until the exact binary exits.
 The concrete database unit must expose a finite `TimeoutStartUSec`. Before it
-can dispatch anything, a tracked runner writes its own PID/start-time record and
-then launches and reaps the exact `systemd-run` process. Identity validation
-pins the recorded process with a pidfd and revalidates its start time afterward.
+can dispatch anything, a tracked wrapper writes its own PID/start-time record
+and launches and reaps the exact `systemd-run` process. The installer supplies
+its previously captured PID/start time; the wrapper pins that production owner
+with a pidfd, revalidates identity after opening it, and aborts the exact unit if
+the owner dies before the final execution grant.
 The lifecycle wrapper imposes a 20-minute total operation deadline that includes
 queued dependency jobs and running admin work; on expiry it makes cancellation
 irrevocable, stops the exact transient unit, and does not return until that unit

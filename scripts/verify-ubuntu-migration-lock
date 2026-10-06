@@ -61,12 +61,11 @@ fi
   /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks verify direct \
   3</dev/null 4</dev/null 5</dev/null 6</dev/null 7</dev/null
 runner_start=$(/usr/bin/python3 -c 'import sys; value=open(f"/proc/{sys.argv[1]}/stat").read(); print(value[value.rfind(")") + 2:].split()[19])' "$$")
-/usr/bin/printf '%s %s\n' "$$" "$runner_start" > /run/nmcp-deploy/stale-runner
-/usr/bin/chmod 0600 /run/nmcp-deploy/stale-runner
 /usr/bin/rm -f /run/nmcp-deploy/test-pidfd-{open.ready,open.go,rejected}
-NMCP_TEST_REPLACE_RUNNER_AFTER_PIDFD=1 \
+NMCP_TEST_REPLACE_OWNER_AFTER_PIDFD=1 \
   /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock \
-  validate-runner /run/nmcp-deploy/stale-runner >"$work/pidfd.out" 2>&1 &
+  run-tracked "$$" "$runner_start" unused-socket unused-lock 8 unused-runner \
+  unused-unit 1 /usr/bin/true >"$work/pidfd.out" 2>&1 &
 pidfd_test=$!
 for attempt in {1..100}; do
   [[ -e /run/nmcp-deploy/test-pidfd-open.ready ]] && break
@@ -80,7 +79,7 @@ fi
 [[ -e /run/nmcp-deploy/test-pidfd-rejected ]] || {
   printf 'post-pidfd identity validation branch was not exercised\n' >&2; exit 1;
 }
-/usr/bin/rm -f /run/nmcp-deploy/stale-runner /run/nmcp-deploy/test-pidfd-{open.ready,open.go,rejected}
+/usr/bin/rm -f /run/nmcp-deploy/test-pidfd-{open.ready,open.go,rejected}
 
 # Once root established the stable inode, an unprivileged user cannot replace it.
 /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- \

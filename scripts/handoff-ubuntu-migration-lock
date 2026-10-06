@@ -38,16 +38,11 @@ def process_start(pid: int) -> str | None:
     return value[value.rfind(")") + 2 :].split()[19]
 
 
-def load_runner(runner_file: str) -> tuple[int, str, int] | None:
-    try:
-        fields = pathlib.Path(runner_file).read_text().split()
-        pid, start = int(fields[0]), fields[1]
-    except (FileNotFoundError, IndexError, ValueError):
-        return None
+def pin_identity(pid: int, start: str, inject_replacement: bool = False) -> int:
     if process_start(pid) != start:
-        fail("tracked systemd-run identity exited or was replaced")
+        fail("tracked process identity exited or was replaced")
     pidfd = os.pidfd_open(pid)
-    if os.environ.get("NMCP_TEST_REPLACE_RUNNER_AFTER_PIDFD") == "1":
+    if inject_replacement:
         ready = pathlib.Path("/run/nmcp-deploy/test-pidfd-open.ready")
         go = pathlib.Path("/run/nmcp-deploy/test-pidfd-open.go")
         ready.touch(mode=0o600)
@@ -59,8 +54,24 @@ def load_runner(runner_file: str) -> tuple[int, str, int] | None:
     if post_open_start != start:
         pathlib.Path("/run/nmcp-deploy/test-pidfd-rejected").touch(mode=0o600)
         os.close(pidfd)
-        fail("tracked systemd-run identity changed during pidfd acquisition")
-    return pid, start, pidfd
+        fail("tracked process identity changed during pidfd acquisition")
+    return pidfd
+
+
+def recv_authorized(
+    connection: socket.socket, size: int, deadline: float, owner_pidfd: int
+) -> bytes:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        readable, _, _ = select.select(
+            [connection, owner_pidfd], [], [], min(remaining, 0.1)
+        )
+        if owner_pidfd in readable:
+            fail("dispatch owner died before execution authorization")
+        if connection in readable:
+            return connection.recv(size)
 
 
 def unit_state(unit: str) -> tuple[str, str, int, bool]:
@@ -149,6 +160,8 @@ def ensure_terminal(unit: str, test_pause: bool = False) -> None:
 
 
 def run_tracked(
+    owner_pid: int,
+    owner_start: str,
     socket_path: str,
     lock_path: str,
     descriptor: int,
@@ -157,6 +170,11 @@ def run_tracked(
     queue_timeout: int,
     command: list[str],
 ) -> None:
+    owner_pidfd = pin_identity(
+        owner_pid,
+        owner_start,
+        os.environ.get("NMCP_TEST_REPLACE_OWNER_AFTER_PIDFD") == "1",
+    )
     lock_stat = os.stat(lock_path, follow_symlinks=False)
     if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
         fail("runner descriptor does not name the execution lease")
@@ -196,38 +214,52 @@ def run_tracked(
         # through the explicit, authorized SCM_RIGHTS protocol below.
         child = subprocess.Popen(command, close_fds=True)
         deadline = time.monotonic() + queue_timeout
-        protocol_failed = False
+        if os.environ.get("NMCP_TEST_PAUSE_AFTER_WRAPPER_LAUNCH") == "1":
+            pathlib.Path("/run/nmcp-deploy/test-wrapper-launched.ready").touch(mode=0o600)
+            go = pathlib.Path("/run/nmcp-deploy/test-wrapper-launched.go")
+            while not go.is_file():
+                if select.select([owner_pidfd], [], [], 0.01)[0]:
+                    fail("dispatch owner died after wrapper launch")
         while not authorized and child.poll() is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            readable, _, _ = select.select([listener], [], [], min(remaining, 0.1))
+            readable, _, _ = select.select(
+                [listener, owner_pidfd], [], [], min(remaining, 0.1)
+            )
+            if owner_pidfd in readable:
+                fail("dispatch owner died before lease transfer")
             if not readable:
                 continue
             connection, _ = listener.accept()
             with connection:
-                connection.settimeout(max(0.001, deadline - time.monotonic()))
-                if connection.recv(5) != b"READY":
-                    protocol_failed = True
+                if recv_authorized(connection, 5, deadline, owner_pidfd) != b"READY":
                     continue
-                # This process is the sole deadline/cancellation authority.  The
-                # final check and the one atomic FD+COMMIT sendmsg are serialized
-                # in this event loop.  Once cancellation starts there is no code
-                # path that can transfer the lease or authorize execution.
                 deadline_ns = int(deadline * 1_000_000_000)
                 if time.monotonic_ns() >= deadline_ns or child.poll() is not None:
                     continue
                 rights = array.array("i", [descriptor])
                 connection.sendmsg(
-                    [b"C" + deadline_ns.to_bytes(8, "big")],
+                    [b"O" + deadline_ns.to_bytes(8, "big")],
                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
                 )
+                if recv_authorized(connection, 10, deadline, owner_pidfd) != b"EXEC_READY":
+                    continue
+                # The wrapper remains the sole authority through the final
+                # execution grant.  Parent death, child exit, or deadline expiry
+                # before this send makes cancellation irrevocable instead.
+                if (
+                    select.select([owner_pidfd], [], [], 0)[0]
+                    or time.monotonic_ns() >= deadline_ns
+                    or child.poll() is not None
+                ):
+                    continue
+                connection.sendall(b"EXEC" + deadline_ns.to_bytes(8, "big"))
                 authorized = True
                 os.close(descriptor)
                 descriptor = -1
-                connection.settimeout(30)
-                if connection.recv(2) != b"OK":
-                    protocol_failed = True
+                os.close(owner_pidfd)
+                owner_pidfd = -1
 
         if authorized:
             try:
@@ -236,11 +268,9 @@ def run_tracked(
                 ensure_terminal(unit, test_pause=True)
                 status = 124
             ensure_terminal(unit)
-            if protocol_failed and status == 0:
-                status = 1
         elif child.poll() is None:
             # Cancellation is now irrevocable; listener stays open only during the
-            # test pause so a racing receiver can connect but can never get COMMIT.
+            # test pause so a racing receiver can connect but can never get EXEC.
             ensure_terminal(unit, test_pause=True)
             status = 124
         else:
@@ -266,7 +296,10 @@ def run_tracked(
                     child.wait()
         if descriptor >= 0:
             os.close(descriptor)
+        if owner_pidfd >= 0:
+            os.close(owner_pidfd)
         pathlib.Path(socket_path).unlink(missing_ok=True)
+        pathlib.Path(socket_path + ".receiver-ready").unlink(missing_ok=True)
         pathlib.Path(runner_file).unlink(missing_ok=True)
     raise SystemExit(status if status >= 0 else 128 - status)
 
@@ -275,6 +308,7 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     connection.connect(socket_path)
     connection.sendall(b"READY")
+    pathlib.Path(socket_path + ".receiver-ready").touch(mode=0o600)
     size = array.array("i").itemsize
     message, ancillary, _flags, _address = connection.recvmsg(9, socket.CMSG_SPACE(size))
     received: list[int] = []
@@ -283,12 +317,12 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
             values = array.array("i")
             values.frombytes(data[: len(data) - (len(data) % size)])
             received.extend(values)
-    if len(message) != 9 or message[0:1] != b"C" or len(received) != 1:
-        fail("did not receive one atomically authorized execution lease")
+    if len(message) != 9 or message[0:1] != b"O" or len(received) != 1:
+        fail("did not receive exactly one execution-lease offer")
     deadline_ns = int.from_bytes(message[1:], "big")
     if time.monotonic_ns() >= deadline_ns:
         os.close(received[0])
-        fail("execution authorization expired before receipt")
+        fail("execution-lease offer expired before receipt")
     descriptor = received[0]
     lock_stat = os.stat(lock_path, follow_symlinks=False)
     if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
@@ -298,29 +332,48 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
     except BlockingIOError:
         fail("received descriptor does not carry the execution lease")
     os.set_inheritable(descriptor, True)
-    connection.sendall(b"OK")
+    pause_enabled = pathlib.Path(
+        "/run/nmcp-deploy/test-pause-after-offer-check.enabled"
+    )
+    if pause_enabled.is_file():
+        pathlib.Path("/run/nmcp-deploy/test-receiver-exec-check.ready").touch(mode=0o600)
+        while not pathlib.Path(
+            "/run/nmcp-deploy/test-receiver-exec-check.go"
+        ).is_file():
+            time.sleep(0.01)
+    if time.monotonic_ns() >= deadline_ns:
+        fail("execution-lease offer expired before execution readiness")
+    connection.sendall(b"EXEC_READY")
+    connection.settimeout(max(0.001, (deadline_ns - time.monotonic_ns()) / 1_000_000_000))
+    grant = connection.recv(12)
+    if grant != b"EXEC" + deadline_ns.to_bytes(8, "big"):
+        fail("wrapper did not grant execution")
+    if time.monotonic_ns() >= deadline_ns:
+        fail("execution grant expired before exec")
     connection.close()
     os.execv(command[0], command)
 
 
-if len(sys.argv) >= 9 and sys.argv[1] == "run-tracked":
+if len(sys.argv) >= 11 and sys.argv[1] == "run-tracked":
     run_tracked(
-        sys.argv[2],
+        int(sys.argv[2]),
         sys.argv[3],
-        int(sys.argv[4]),
+        sys.argv[4],
         sys.argv[5],
-        sys.argv[6],
-        int(sys.argv[7]),
-        sys.argv[8:],
+        int(sys.argv[6]),
+        sys.argv[7],
+        sys.argv[8],
+        int(sys.argv[9]),
+        sys.argv[10:],
     )
 elif len(sys.argv) >= 5 and sys.argv[1] == "receive":
     receive_fd(sys.argv[2], sys.argv[3], sys.argv[4:])
-elif len(sys.argv) == 3 and sys.argv[1] == "validate-runner":
-    validated = load_runner(sys.argv[2])
-    if validated is None:
-        fail("runner record is missing")
-    os.close(validated[2])
 elif len(sys.argv) == 3 and sys.argv[1] == "ensure-terminal":
     ensure_terminal(sys.argv[2])
+elif len(sys.argv) == 3 and sys.argv[1] == "process-start":
+    value = process_start(int(sys.argv[2]))
+    if value is None:
+        fail("process identity is unavailable")
+    print(value)
 else:
-    fail("usage: run-tracked SOCKET LOCK FD FILE UNIT QUEUE_TIMEOUT COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...] | validate-runner FILE | ensure-terminal UNIT")
+    fail("usage: run-tracked OWNER_PID OWNER_START SOCKET LOCK FD FILE UNIT TIMEOUT COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...] | ensure-terminal UNIT | process-start PID")

@@ -8,15 +8,19 @@ predispatch_pid=
 installer_pid=
 registration_pid=
 cancel_pid=
+pretransfer_pid=
 cleanup() {
   /usr/bin/touch "$work/ownerdeath-proceed" 2>/dev/null || true
   /usr/bin/touch /run/nmcp-deploy/test-runner-record.go \
     /run/nmcp-deploy/test-before-admin-dispatch.go \
-    /run/nmcp-deploy/test-cancel-stop.go 2>/dev/null || true
+    /run/nmcp-deploy/test-cancel-stop.go \
+    /run/nmcp-deploy/test-receiver-exec-check.go \
+    /run/nmcp-deploy/test-wrapper-launched.go 2>/dev/null || true
   [[ -z $predispatch_pid ]] || /usr/bin/kill "$predispatch_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/kill "$installer_pid" 2>/dev/null || true
   [[ -z $registration_pid ]] || /usr/bin/kill "$registration_pid" 2>/dev/null || true
   [[ -z $cancel_pid ]] || /usr/bin/kill "$cancel_pid" 2>/dev/null || true
+  [[ -z $pretransfer_pid ]] || /usr/bin/kill "$pretransfer_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$installer_pid-1.service" >/dev/null 2>&1 || true
   [[ -z $registration_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$registration_pid-1.service" >/dev/null 2>&1 || true
   for _attempt in {1..50}; do
@@ -88,6 +92,7 @@ make_release candidate
 make_release pgfail
 make_release queuefail
 make_release cancelrace
+make_release ownerpretransfer
 make_release predispatch
 make_release ownerdeath
 /usr/bin/printf '#!/bin/sh\nexit 1\n' > /opt/nmcp/releases/migratefail/bin/nmcp-admin
@@ -192,36 +197,41 @@ if compgen -G '/run/nmcp-deploy/migration-handoff.*' >/dev/null \
 fi
 /usr/bin/systemctl stop postgresql@nmcp-test.service
 
-# Force receiver connection after cancellation has become irrevocable.  The
-# delayed exact-unit stop proves that no lease COMMIT, migration entry, rollback,
-# or lock release can occur while the cancelled admin unit is still live.
+# Pause the receiver after validating its lease offer but before declaring exec
+# readiness. The wrapper must expire the total deadline without issuing EXEC;
+# delayed exact-unit stop then proves rollback and locks remain fail-closed.
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
 Type=notify
 NotifyAccess=all
-ExecStart=/bin/sh -c '/usr/bin/touch "$work/cancel-postgresql-started"; while ! test -e "$work/cancel-postgresql-release"; do /usr/bin/sleep 0.01; done; /usr/bin/touch "$work/postgresql-ready"; /usr/bin/systemd-notify --ready; exec /usr/bin/sleep infinity'
+ExecStart=/bin/sh -c '/usr/bin/touch "$work/cancel-postgresql-started" "$work/postgresql-ready"; /usr/bin/systemd-notify --ready; exec /usr/bin/sleep infinity'
 TimeoutStartSec=45s
 EOF
 /usr/bin/systemctl daemon-reload
 /usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
-/usr/bin/rm -f "$work/postgresql-ready" "$work/cancel-postgresql-release" \
-  /run/nmcp-deploy/test-cancel-stop.{ready,go}
-NMCP_TEST_ADMIN_OPERATION_TIMEOUT_SECONDS=2 NMCP_TEST_PAUSE_CANCEL_STOP=1 \
+/usr/bin/rm -f "$work/postgresql-ready" /run/nmcp-deploy/test-cancel-stop.{ready,go} \
+  /run/nmcp-deploy/test-receiver-exec-check.{ready,go}
+/usr/bin/install -o root -g root -m 0600 /dev/null \
+  /run/nmcp-deploy/test-pause-after-offer-check.enabled
+NMCP_TEST_ADMIN_OPERATION_TIMEOUT_SECONDS=5 NMCP_TEST_PAUSE_CANCEL_STOP=1 \
   "$repo/scripts/install-ubuntu-release" activate cancelrace >"$work/cancelrace.out" 2>&1 &
 cancel_pid=$!
 for attempt in {1..200}; do
-  [[ -e /run/nmcp-deploy/test-cancel-stop.ready ]] && break
-  [[ $attempt -lt 200 ]] || { printf 'cancel race did not reach irrevocable cancellation\n' >&2; exit 1; }
+  [[ -e /run/nmcp-deploy/migration-handoff.$cancel_pid.1.receiver-ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'cancel race receiver never sent READY\n' >&2; exit 1; }
   /usr/bin/sleep 0.02
 done
 [[ -e $work/cancel-postgresql-started ]]
-/usr/bin/touch "$work/cancel-postgresql-release"
-for attempt in {1..100}; do
-  [[ -e $work/postgresql-ready ]] && break
-  [[ $attempt -lt 100 ]] || { printf 'receiver dependency did not become ready during cancellation\n' >&2; exit 1; }
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-receiver-exec-check.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'receiver did not reach synchronized pre-exec check\n' >&2; exit 1; }
   /usr/bin/sleep 0.02
 done
-/usr/bin/sleep 0.2
+for attempt in {1..400}; do
+  [[ -e /run/nmcp-deploy/test-cancel-stop.ready ]] && break
+  [[ $attempt -lt 400 ]] || { printf 'wrapper did not cancel the paused receiver at deadline\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
 if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=cancelrace' "$work/cancelrace.out"; then
   printf 'cancelled receiver obtained execution authorization\n' >&2; exit 1
 fi
@@ -233,6 +243,7 @@ if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/t
   || /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then
   printf 'cancellation released a deployment lock before exact unit terminal\n' >&2; exit 1
 fi
+/usr/bin/touch /run/nmcp-deploy/test-receiver-exec-check.go
 /usr/bin/touch /run/nmcp-deploy/test-cancel-stop.go
 if wait "$cancel_pid"; then
   printf 'cancelled receiver unexpectedly activated release\n' >&2; exit 1
@@ -249,7 +260,60 @@ if /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q 'nmcp-deploy-admi
 fi
 /usr/bin/systemctl is-active --quiet postgresql@nmcp-test.service
 /usr/bin/systemctl stop postgresql@nmcp-test.service
-/usr/bin/rm -f /run/nmcp-deploy/test-cancel-stop.{ready,go}
+/usr/bin/rm -f /run/nmcp-deploy/test-cancel-stop.{ready,go} \
+  /run/nmcp-deploy/test-receiver-exec-check.{ready,go} \
+  /run/nmcp-deploy/test-pause-after-offer-check.enabled
+
+# Kill the installer only after its wrapper and exact systemd-run child exist,
+# but before a receiver can request the lease. The production owner pidfd must
+# cancel the unit and prevent a later PostgreSQL readiness event from orphaning
+# a migration.
+cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/bin/sh -c '/usr/bin/touch "$work/pretransfer-postgresql-started"; while ! test -e "$work/pretransfer-postgresql-release"; do /usr/bin/sleep 0.01; done; /usr/bin/touch "$work/postgresql-ready"; /usr/bin/systemd-notify --ready; exec /usr/bin/sleep infinity'
+TimeoutStartSec=45s
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
+/usr/bin/rm -f "$work/postgresql-ready" "$work/pretransfer-postgresql-release" \
+  /run/nmcp-deploy/test-wrapper-launched.{ready,go}
+NMCP_TEST_PAUSE_AFTER_WRAPPER_LAUNCH=1 \
+  "$repo/scripts/install-ubuntu-release" activate ownerpretransfer \
+  >"$work/ownerpretransfer.out" 2>&1 &
+pretransfer_pid=$!
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-wrapper-launched.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'owner-death test did not launch tracked wrapper\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+[[ -e $work/pretransfer-postgresql-started ]]
+compgen -G "/run/nmcp-deploy/migration-runner.$pretransfer_pid.*" >/dev/null
+/usr/bin/kill -KILL "$pretransfer_pid"
+wait "$pretransfer_pid" 2>/dev/null || true
+for attempt in {1..300}; do
+  if ! compgen -G "/run/nmcp-deploy/migration-runner.$pretransfer_pid.*" >/dev/null \
+    && ! compgen -G "/run/nmcp-deploy/migration-handoff.$pretransfer_pid.*" >/dev/null \
+    && ! /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q "nmcp-deploy-admin-$pretransfer_pid-"; then break; fi
+  [[ $attempt -lt 300 ]] || { printf 'owner-death wrapper did not cancel and clean exact unit\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+/usr/bin/touch "$work/pretransfer-postgresql-release"
+/usr/bin/systemctl start postgresql@nmcp-test.service
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=ownerpretransfer' "$work/ownerpretransfer.out"; then
+  printf 'orphaned wrapper ran migration after installer death\n' >&2; exit 1
+fi
+for attempt in {1..100}; do
+  if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
+    && /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'owner-death before transfer retained deployment locks\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+pretransfer_pid=
+/usr/bin/ln -sfn /opt/nmcp/releases/old /opt/nmcp/current
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+/usr/bin/rm -f /run/nmcp-deploy/test-wrapper-launched.{ready,go}
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
 Type=notify

@@ -146,7 +146,7 @@ stop_services() {
 admin_sequence=0
 run_admin() {
   local admin_release=$1 operation=$2 subcommand=$3
-  local handoff operation_timeout runner runner_file status=0 unit
+  local handoff operation_timeout owner_start runner runner_file status=0 unit
   admin_sequence=$((admin_sequence + 1))
   handoff=/run/nmcp-deploy/migration-handoff.$$.$admin_sequence
   runner_file=/run/nmcp-deploy/migration-runner.$$.$admin_sequence
@@ -163,7 +163,8 @@ run_admin() {
     printf 'install-ubuntu-release: invalid transient operation timeout\n' >&2
     return 1
   }
-  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$handoff" \
+  owner_start=$(/usr/local/libexec/nmcp/handoff-ubuntu-migration-lock process-start "$$")
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$$" "$owner_start" "$handoff" \
     /run/nmcp-deploy/migration-execution.lock 8 "$runner_file" \
     "$unit.service" "$operation_timeout" \
     /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="$unit" \
