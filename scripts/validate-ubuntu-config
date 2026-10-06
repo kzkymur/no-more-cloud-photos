@@ -90,6 +90,10 @@ def main() -> int:
     if len(database_urls) != 1:
         fail("all processes must use the same NMCP_DATABASE_URL")
     database_text = next(iter(database_urls))
+    if not database_text.startswith(("postgres://", "postgresql://")):
+        fail("NMCP_DATABASE_URL requires a canonical lowercase PostgreSQL URI scheme")
+    if re.search(r"%(?![0-9A-Fa-f]{2})", database_text):
+        fail("NMCP_DATABASE_URL contains an invalid percent escape")
     if database_text.count("@") != 1:
         fail("NMCP_DATABASE_URL must contain exactly one authority delimiter")
     database = urllib.parse.urlsplit(database_text)

@@ -22,7 +22,7 @@ cleanup() {
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
   /usr/bin/rm -rf -- /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp \
     /usr/local/libexec/nmcp "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" \
-    "/root/nmcp-tls-renew-persistent.$$" "$work"
+    "/root/nmcp-tls-renew-persistent.$$" "/root/nmcp-tls-renew-inactive.$$" "$work"
 }
 trap cleanup EXIT
 
@@ -138,12 +138,48 @@ fi
 
 # Host asset installation must fail before mutation when the credential-bearing
 # File Server is live; reinstall otherwise creates disk/served TLS divergence.
+guard_error=$work/host-guard-error
+guard_link=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
+guard_config=$(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf)
 if "$repo_root/scripts/install-ubuntu-host" --config-dir /nonexistent \
   --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
   --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@none.service \
-  --tls-cert /nonexistent/cert.pem --tls-key /nonexistent/key.pem >/dev/null 2>&1; then
+  --tls-cert /nonexistent/cert.pem --tls-key /nonexistent/key.pem >/dev/null 2>"$guard_error"; then
   printf 'live host reinstall was accepted\n' >&2; exit 1
 fi
+/usr/bin/grep -q 'must be exactly inactive/dead' "$guard_error"
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$guard_link" ]]
+[[ $(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf) == "$guard_config" ]]
+
+/usr/bin/systemctl stop nmcp-files.service
+cat > /run/systemd/system/nmcp-files.service <<'EOF'
+[Service]
+Type=notify
+User=nmcp
+ExecStart=/usr/bin/sleep 30
+TimeoutStartSec=30
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl start --no-block nmcp-files.service
+for attempt in {1..20}; do
+  [[ $(/usr/bin/systemctl show nmcp-files.service --property=ActiveState --value) == activating ]] && break
+  [[ $attempt -lt 20 ]] || { printf 'File Server did not enter activating state\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+if "$repo_root/scripts/install-ubuntu-host" --config-dir /nonexistent \
+  --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
+  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@none.service \
+  --tls-cert /nonexistent/cert.pem --tls-key /nonexistent/key.pem >/dev/null 2>"$guard_error"; then
+  printf 'activating host reinstall was accepted\n' >&2; exit 1
+fi
+/usr/bin/grep -q 'must be exactly inactive/dead' "$guard_error"
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$guard_link" ]]
+[[ $(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf) == "$guard_config" ]]
+/usr/bin/systemctl stop nmcp-files.service
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/nmcp-files.service" \
+  /run/systemd/system/nmcp-files.service
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl start nmcp-files.service
 
 base=https://$test_ip:$files_port
 trusted_base=https://host.example.ts.net:$files_port
@@ -262,4 +298,18 @@ fi
 /usr/bin/systemctl restart nmcp-files.service
 [[ $(fingerprint) == "$new_fingerprint" ]]
 /usr/bin/rm -rf -- "$persistent_input"
+
+# Publishing while intentionally stopped must not start the File Server or its
+# API dependency and is validated for the next explicit start.
+inactive_input=/root/nmcp-tls-renew-inactive.$$
+/usr/bin/install -d -o root -g root -m 0700 "$inactive_input"
+issue_certificate "$inactive_input" 5
+/usr/bin/chown root:root "$inactive_input"/*.pem
+/usr/bin/chmod 0600 "$inactive_input"/*.pem
+/usr/bin/systemctl stop nmcp-files.service
+api_state=$(/usr/bin/systemctl show nmcp-api.service --property=ActiveState --value)
+/usr/local/libexec/nmcp/renew-ubuntu-tls "$inactive_input/cert.pem" "$inactive_input/key.pem"
+[[ $(/usr/bin/systemctl show nmcp-files.service --property=ActiveState --value) == inactive ]]
+[[ $(/usr/bin/systemctl show nmcp-files.service --property=SubState --value) == dead ]]
+[[ $(/usr/bin/systemctl show nmcp-api.service --property=ActiveState --value) == "$api_state" ]]
 printf 'Installed-path nmcp Nginx service and full HTTP matrix passed\n'

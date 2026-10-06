@@ -159,6 +159,10 @@ jobs:
             echo 'concurrent deployment operation unexpectedly staged' >&2
             exit 1
           fi
+          if sudo env NMCP_DEPLOY_LOCKED=1 scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID-spoofed"; then
+            echo 'caller-controlled lock sentinel bypassed serialization' >&2
+            exit 1
+          fi
           wait "$lock_pid"
           sudo scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID"
           sudo test "$(stat -c '%U:%G' "/opt/nmcp/releases/$RELEASE_ID/bin/core-api")" = root:root
@@ -172,7 +176,8 @@ jobs:
         run: |
           sudo rm -rf -- "/opt/nmcp/releases/$RELEASE_ID" \
             "/opt/nmcp/releases/$RELEASE_ID-bad-mode" \
-            "/opt/nmcp/releases/$RELEASE_ID-locked" /tmp/nmcp-release
+            "/opt/nmcp/releases/$RELEASE_ID-locked" \
+            "/opt/nmcp/releases/$RELEASE_ID-spoofed" /tmp/nmcp-release
           sudo rm -f /tmp/nmcp-deploy-lock-held
 
       - name: Remove test Tailnet address

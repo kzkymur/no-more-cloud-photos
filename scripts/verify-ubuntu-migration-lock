@@ -7,7 +7,7 @@ work=$(/usr/bin/mktemp -d /var/tmp/nmcp-migration-lock.XXXXXX)
 cleanup() {
   /usr/bin/systemctl stop nmcp-lock-dependent.service nmcp-lock-migrate.service >/dev/null 2>&1 || true
   /usr/bin/rm -f /run/systemd/system/nmcp-lock-dependent.service /run/systemd/system/nmcp-lock-migrate.service \
-    /run/nmcp-migrate-delegation /run/lock/nmcp-deploy.lock
+    /run/nmcp-migration-complete /run/lock/nmcp-deploy.lock
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
   /usr/bin/rm -rf /opt/nmcp /usr/local/libexec/nmcp "$work"
 }
@@ -59,46 +59,21 @@ fi
 [[ ! -e $work/entries ]]
 wait "$holder"
 
-# The owning deployment may delegate exactly its current release migration.
-cat > "$work/delegate" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-owner=$PPID
-start=$(/usr/bin/python3 - "$owner" <<'PY'
-import pathlib, sys
-print(pathlib.Path(f"/proc/{sys.argv[1]}/stat").read_text().rsplit(") ", 1)[1].split()[19])
-PY
-)
-/usr/bin/printf '/opt/nmcp/current\t%s\t%s\n' "$owner" "$start" > /run/nmcp-migrate-delegation
-/usr/bin/chown root:root /run/nmcp-migrate-delegation
-/usr/bin/chmod 0600 /run/nmcp-migrate-delegation
-if [[ $1 == orphan ]]; then
-  /usr/bin/touch "$2/orphan-ready"
-  /usr/bin/sleep 30
-else
-  /usr/local/libexec/nmcp/run-ubuntu-migration
-fi
-EOF
-/usr/bin/chmod 0755 "$work/delegate"
-/usr/bin/flock /run/lock/nmcp-deploy.lock "$work/delegate" run "$work"
-[[ ! -e /run/nmcp-migrate-delegation ]]
+# A deploy-held lock permits only consumption of exact completion evidence; the
+# systemd dependency performs no migration body and cannot race a later deploy.
+/usr/bin/printf '/opt/nmcp/current\n' > /run/nmcp-migration-complete
+/usr/bin/chown root:root /run/nmcp-migration-complete
+/usr/bin/chmod 0600 /run/nmcp-migration-complete
+/usr/bin/flock /run/lock/nmcp-deploy.lock -c "/usr/local/libexec/nmcp/run-ubuntu-migration"
+[[ ! -e /run/nmcp-migration-complete ]]
+[[ ! -e $work/entries ]]
+
+# A normal systemd-triggered migration owns the lock through exact binary
+# execution and invalidates any stale completion evidence first.
+/usr/bin/printf '/opt/nmcp/current\n' > /run/nmcp-migration-complete
+/usr/bin/chmod 0600 /run/nmcp-migration-complete
+/usr/local/libexec/nmcp/run-ubuntu-migration
+[[ ! -e /run/nmcp-migration-complete ]]
 [[ $(/usr/bin/wc -l < "$work/entries") -eq 1 ]]
 [[ $(/usr/bin/cat "$work/identities") == nmcp ]]
-
-# SIGKILL leaves a pathname, but provenance is dead: it cannot authorize work
-# under an unrelated later lock owner and is removed by the next normal run.
-/usr/bin/setsid /usr/bin/flock /run/lock/nmcp-deploy.lock "$work/delegate" orphan "$work" & killed_owner=$!
-while [[ ! -e $work/orphan-ready ]]; do /usr/bin/sleep 0.05; done
-/usr/bin/kill -KILL -- "-$killed_owner"
-wait "$killed_owner" 2>/dev/null || true
-/usr/bin/flock /run/lock/nmcp-deploy.lock -c "sleep 2" & unrelated=$!
-/usr/bin/sleep 0.2
-if /usr/local/libexec/nmcp/run-ubuntu-migration; then
-  printf 'stale delegation authorized migration under another lock owner\n' >&2; exit 1
-fi
-wait "$unrelated"
-[[ $(/usr/bin/wc -l < "$work/entries") -eq 1 ]]
-/usr/local/libexec/nmcp/run-ubuntu-migration
-[[ ! -e /run/nmcp-migrate-delegation ]]
-[[ $(/usr/bin/wc -l < "$work/entries") -eq 2 ]]
 printf 'Direct and dependency migration lock races passed\n'

@@ -10,6 +10,16 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 exec 9>/run/lock/nmcp-deploy.lock
 /usr/bin/flock --exclusive --nonblock 9 || { printf 'renew-ubuntu-tls: another NMCP deployment operation is active\n' >&2; exit 1; }
 hostname=$(</etc/nmcp/tailnet-hostname)
+active_state=$(/usr/bin/systemctl show nmcp-files.service --property=ActiveState --value)
+sub_state=$(/usr/bin/systemctl show nmcp-files.service --property=SubState --value)
+if [[ $active_state == active && $sub_state == running ]]; then
+  was_active=true
+elif [[ $active_state == inactive && $sub_state == dead ]]; then
+  was_active=false
+else
+  printf 'renew-ubuntu-tls: nmcp-files.service must be stable running or inactive/dead\n' >&2
+  exit 1
+fi
 capture=$(/usr/bin/mktemp -d /run/nmcp-tls-input.XXXXXX)
 temporary_link=/etc/nmcp/tls-current.new.$$
 cleanup() {
@@ -38,6 +48,11 @@ fi
 old_target=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
 /usr/bin/ln -s -- "$release" "$temporary_link"
 /usr/bin/mv -Tf -- "$temporary_link" /etc/nmcp/tls-current
+if [[ $was_active == false ]]; then
+  "$script_dir/check-ubuntu-tls-expiry"
+  printf 'Installed TLS generation %s; File Server remains inactive\n' "$release_id"
+  exit 0
+fi
 if ! /usr/bin/systemctl restart nmcp-files.service || ! /usr/bin/systemctl is-active --quiet nmcp-files.service; then
   /usr/bin/ln -s -- "$old_target" "$temporary_link"
   /usr/bin/mv -Tf -- "$temporary_link" /etc/nmcp/tls-current

@@ -2,49 +2,28 @@
 set -euo pipefail
 
 lock=/run/lock/nmcp-deploy.lock
-delegation=/run/nmcp-migrate-delegation
+completion=/run/nmcp-migration-complete
 current=/opt/nmcp/current
 exec 9>"$lock"
 if /usr/bin/flock --exclusive --nonblock 9; then
-  # A normally serialized invocation invalidates any authorization orphaned by
-  # a killed deploy before doing migration work.
-  /usr/bin/rm -f -- "$delegation"
+  /usr/bin/rm -f -- "$completion"
+  release=$(/usr/bin/readlink -f -- "$current")
 else
-  # A deploy may delegate exactly one migration to this systemd singleton while
-  # retaining the lock across link, evidence, and service-state mutations.
-  [[ -f $delegation && ! -L $delegation \
-    && $(/usr/bin/stat -c '%U:%G:%a' "$delegation") == root:root:600 ]] || {
-    printf 'run-ubuntu-migration: deployment lock is held without a valid delegation\n' >&2
+  # The lock owner already ran the exact release migration. This systemd
+  # dependency consumes completion evidence and performs no database work.
+  [[ -f $completion && ! -L $completion \
+    && $(/usr/bin/stat -c '%U:%G:%a' "$completion") == root:root:600 ]] || {
+    printf 'run-ubuntu-migration: deployment lock is held without completion evidence\n' >&2
     exit 1
   }
-  IFS=$'\t' read -r delegated owner_pid owner_start < "$delegation"
+  delegated=$(/usr/bin/cat -- "$completion")
   active=$(/usr/bin/readlink -f -- "$current")
-  [[ $delegated == "$active" && $owner_pid =~ ^[1-9][0-9]*$ \
-    && $owner_start =~ ^[1-9][0-9]*$ ]] || {
-    printf 'run-ubuntu-migration: delegation does not match the active release\n' >&2
+  [[ $delegated == "$active" ]] || {
+    printf 'run-ubuntu-migration: completion does not match the active release\n' >&2
     exit 1
   }
-  /usr/bin/python3 - "$lock" "$owner_pid" "$owner_start" <<'PY'
-import os, pathlib, sys
-lock, pid_text, expected_start = sys.argv[1:]
-pid = int(pid_text)
-try:
-    stat_text = pathlib.Path(f"/proc/{pid}/stat").read_text()
-except OSError as error:
-    raise SystemExit("delegating process is not live") from error
-actual_start = stat_text.rsplit(") ", 1)[1].split()[19]
-if actual_start != expected_start:
-    raise SystemExit("delegating process identity was reused")
-st = os.stat(lock)
-key = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):x}:{st.st_ino}"
-for line in pathlib.Path("/proc/locks").read_text().splitlines():
-    fields = line.split()
-    if len(fields) >= 6 and fields[1] == "FLOCK" and fields[4] == pid_text and fields[5] == key:
-        break
-else:
-    raise SystemExit("delegating process does not own the deployment lock")
-PY
-  /usr/bin/rm -f -- "$delegation"
+  /usr/bin/rm -f -- "$completion"
+  exit 0
 fi
 exec /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
-  "$current/bin/nmcp-admin" migrate up --json
+  "$release/bin/nmcp-admin" migrate up --json

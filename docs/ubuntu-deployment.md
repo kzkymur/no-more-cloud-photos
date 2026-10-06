@@ -118,14 +118,20 @@ sudo scripts/install-ubuntu-release stage /root/nmcp-release <RELEASE_ID>
 sudo scripts/install-ubuntu-release activate <RELEASE_ID>
 ```
 
+Host-asset installation/reinstallation is accepted only while
+`nmcp-files.service` is exactly `inactive/dead`, checked after acquiring the
+deployment lock; active, activating, deactivating, reloading, and failed states
+are refused before any asset changes.
+
 All stage/activate/rollback/host/TLS mutations and every direct or
 dependency-triggered `nmcp-migrate.service` execution share one deployment lock.
-The installer retains the lock across link, migration, service-state, and
-evidence mutations and delegates only its exact active-release migration to the
-systemd singleton. Delegation is bound to the live kernel lock owner PID/start
-identity, consumed atomically, and invalid after owner death or PID reuse.
-Successful oneshot migration remains active so production API/Worker dependency
-starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
+The installer retains the lock across link, exact-release migration,
+service-state, and evidence mutations. It then publishes root-only completion
+evidence; the systemd singleton consumes that evidence without doing database
+work while the installer owns the lock. Ordinary direct/dependency-triggered
+migrations acquire and retain the lock themselves and snapshot the exact release
+path before execution. Successful oneshot migration remains active so production
+API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.
 Activation stops the target, moves the active symlink atomically, starts the
 concrete PostgreSQL dependency and migration, and records success only after API
@@ -199,7 +205,8 @@ sudo /usr/local/libexec/nmcp/renew-ubuntu-tls /root/new-cert.pem /root/new-key.p
 sudo systemctl status nmcp-tls-expiry.service nmcp-files.service
 ```
 
-Renewal validates current validity, SAN/hostname, trusted chain, key pair,
+Renewal preserves an intentionally inactive File Server; it restarts only a
+stable running service and rejects transition states. It validates current validity, SAN/hostname, trusted chain, key pair,
 ownership/path, and seven-day lifetime; writes
 one immutable generation; atomically switches `tls-current`; and **restarts**
 Nginx so systemd `LoadCredential` is refreshed. If restart fails, it restores

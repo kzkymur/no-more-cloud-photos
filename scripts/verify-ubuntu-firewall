@@ -49,8 +49,13 @@ def main() -> int:
         raise ValueError(f"missing exact Tailnet-only UFW rules: {sorted(missing)}")
     protected = {args.api_port, args.files_port}
     for line in normalized:
-        if not line.lower().startswith("ufw allow") or line in expected:
+        action = line.lower().split(maxsplit=2)[:2]
+        if action not in (["ufw", "allow"], ["ufw", "limit"]):
             continue
+        if line in expected:
+            continue
+        if action == ["ufw", "limit"]:
+            raise ValueError(f"rate-limited ingress allow is forbidden: {line}")
         # Accept other management allows only when they name one numeric port
         # and one protocol. Profiles, ranges, service names, and all-port rules
         # are not provably disjoint from the protected listeners.

@@ -42,6 +42,7 @@ for broad in \
   'ufw allow in on tailscale0' \
   'ufw allow from any' \
   'ufw allow from any port 22 proto tcp' \
+  'ufw limit 9443/tcp' \
   'ufw allow 8000:9500/tcp' \
   'ufw allow proto tcp from any to any port 8000:9500' \
   "ufw allow 'Nginx Full'"; do

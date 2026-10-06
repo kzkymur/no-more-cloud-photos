@@ -9,7 +9,7 @@ cleanup() {
   for unit in "${units[@]}"; do /usr/bin/rm -f -- "/run/systemd/system/$unit"; done
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
   /usr/bin/rm -rf /opt/nmcp /etc/nmcp /var/lib/nmcp/deployment /usr/local/libexec/nmcp "$work"
-  /usr/bin/rm -f /run/nmcp-migrate-delegation /run/lock/nmcp-deploy.lock
+  /usr/bin/rm -f /run/nmcp-migration-complete /run/lock/nmcp-deploy.lock
 }
 trap cleanup EXIT
 /usr/bin/chown nmcp:nmcp "$work"

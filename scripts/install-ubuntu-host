@@ -39,10 +39,6 @@ done
 [[ $EUID -eq 0 ]] || { printf 'install-ubuntu-host: must run as root\n' >&2; exit 1; }
 [[ -n $config_dir && -n $api_listen && -n $files_listen && -n $tailnet_hostname \
   && -n $postgresql_unit && -n $tls_cert && -n $tls_key ]] || usage
-if /usr/bin/systemctl is-active --quiet nmcp-files.service; then
-  printf 'install-ubuntu-host: refusing to replace TLS/units while nmcp-files.service is active\n' >&2
-  exit 1
-fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd -- "$script_dir/.." && pwd -P)
 
@@ -51,6 +47,16 @@ exec 9>/run/lock/nmcp-deploy.lock
   printf 'install-ubuntu-host: another NMCP deployment operation is active\n' >&2
   exit 1
 }
+read -r files_load files_active files_sub < <(
+  /usr/bin/systemctl show nmcp-files.service \
+    --property=LoadState --property=ActiveState --property=SubState --value \
+    | /usr/bin/xargs
+)
+if [[ $files_load != not-found \
+  && ! ( $files_active == inactive && $files_sub == dead ) ]]; then
+  printf 'install-ubuntu-host: nmcp-files.service must be exactly inactive/dead before reinstall\n' >&2
+  exit 1
+fi
 for command in /usr/sbin/nginx /usr/sbin/ufw /usr/bin/systemd-analyze \
   /usr/bin/systemd-sysusers /usr/bin/systemd-tmpfiles /usr/bin/openssl /usr/bin/python3; do
   [[ -x $command ]] || { printf 'install-ubuntu-host: missing %s\n' "$command" >&2; exit 1; }

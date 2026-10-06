@@ -54,6 +54,8 @@ for unsafe_url in \
   'postgres://nmcp:secret@127.0.0.1:5432/nmcp?hostaddr=203.0.113.10' \
   'postgres://nmcp:secret@127.0.0.1:5432/nmcp?service=remote' \
   'postgres://nmcp:secret@203.0.113.10,@127.0.0.1:5432/nmcp?sslmode=disable' \
+  'POSTGRES://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
+  'postgres://nm%ZZcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
   'postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable#remote'; do
   write_valid
   /usr/bin/python3 - "$work" "$unsafe_url" <<'PY'
