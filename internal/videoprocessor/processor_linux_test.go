@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -176,6 +178,37 @@ func TestOperationTimeoutUsesPrivateCause(t *testing.T) {
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("error = %v", err)
 	}
+}
+
+func TestOperationTimeoutReapsDetachedCodecDescendant(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	script := "#!/bin/sh\n/usr/bin/setsid /bin/sh -c 'printf %s $$ > \"" + pidFile + "\"; /bin/sleep 30' &\nwhile [ ! -s \"" + pidFile + "\" ]; do /bin/sleep 0.01; done\n/bin/sleep 30\n"
+	p := newTestProcessorWithPolicy(t, helperScript(t, script), Policy{Timeout: 150 * time.Millisecond})
+	input := regularFile(t, []byte("source"))
+	defer input.Close()
+	output := regularFile(t, nil)
+	defer output.Close()
+	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"]})
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("error=%v", err)
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		process, _ := os.FindProcess(pid)
+		if process.Signal(syscall.Signal(0)) != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("detached codec descendant %d survived", pid)
 }
 
 func validInspection() Inspection {
