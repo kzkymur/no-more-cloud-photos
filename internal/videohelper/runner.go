@@ -21,7 +21,11 @@ type commandRunner interface {
 	stream(path string, args []string, consume func(io.Reader) error) error
 }
 
-type osCommandRunner struct{}
+type osCommandRunner struct {
+	// beforeConsumerFailureCleanup is used by synchronized regression tests to
+	// hold cleanup while a later stderr event is delivered.
+	beforeConsumerFailureCleanup func()
+}
 
 type limitedBuffer struct {
 	b          bytes.Buffer
@@ -90,7 +94,7 @@ func (osCommandRunner) run(path string, args []string, maxOutput int64) ([]byte,
 	return stdout.b.Bytes(), stderr.b.Bytes(), err
 }
 
-func (osCommandRunner) stream(path string, args []string, consume func(io.Reader) error) error {
+func (r osCommandRunner) stream(path string, args []string, consume func(io.Reader) error) error {
 	cmd := exec.Command(path, args...)
 	files, err := inheritedDescriptorFiles(args)
 	if err != nil {
@@ -128,6 +132,9 @@ func (osCommandRunner) stream(path string, args []string, consume func(io.Reader
 		consumeErr = <-consumeResult
 	}
 	if consumeErr != nil {
+		if r.beforeConsumerFailureCleanup != nil {
+			r.beforeConsumerFailureCleanup()
+		}
 		_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
 		_ = stdout.Close()
 	}

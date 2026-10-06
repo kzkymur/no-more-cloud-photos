@@ -109,11 +109,90 @@ func TestStreamFirstCauseArbitratesConsumerAndStderrOverflow(t *testing.T) {
 	}
 }
 
+func TestStreamPreservesConsumerFailureDuringLaterCleanupOverflow(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	releaseFile, overflowFile := directory+"/release", directory+"/overflow"
+	t.Setenv("VIDEOHELPER_RUNNER_CHILD", "consumer-first")
+	t.Setenv("VIDEOHELPER_RUNNER_RELEASE", releaseFile)
+	t.Setenv("VIDEOHELPER_RUNNER_OVERFLOW", overflowFile)
+	runner := osCommandRunner{beforeConsumerFailureCleanup: func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if _, err := os.Stat(overflowFile); err == nil {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("child did not deliver cleanup-time stderr overflow")
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}}
+	err = runner.stream(executable, []string{"-test.run=^TestStreamCodecChild$"}, func(stdout io.Reader) error {
+		var marker [1]byte
+		if _, err := io.ReadFull(stdout, marker[:]); err != nil {
+			return err
+		}
+		if err := os.WriteFile(releaseFile, []byte("release"), 0o600); err != nil {
+			return err
+		}
+		return fail("unsupported_input")
+	})
+	if !isCode(err, "unsupported_input") {
+		t.Fatalf("consumer-first error = %v", err)
+	}
+}
+
+func TestStreamPreservesStderrOverflowBeforeConsumerFailure(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VIDEOHELPER_RUNNER_CHILD", "stderr-first")
+	err = (osCommandRunner{}).stream(executable, []string{"-test.run=^TestStreamCodecChild$"}, func(stdout io.Reader) error {
+		_, _ = io.Copy(io.Discard, stdout)
+		return fail("unsupported_input")
+	})
+	if !isCode(err, "resource_limit") {
+		t.Fatalf("stderr-first error = %v", err)
+	}
+}
+
 func TestStreamCodecChild(t *testing.T) {
 	switch os.Getenv("VIDEOHELPER_RUNNER_CHILD") {
 	case "":
 		return
 	case "descendant":
+		for {
+			time.Sleep(time.Hour)
+		}
+	case "consumer-first":
+		if _, err := os.Stdout.Write([]byte{1}); err != nil {
+			os.Exit(2)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if _, err := os.Stat(os.Getenv("VIDEOHELPER_RUNNER_RELEASE")); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				os.Exit(2)
+			}
+			time.Sleep(time.Millisecond)
+		}
+		writeRunnerStderrOverflow()
+		if err := os.WriteFile(os.Getenv("VIDEOHELPER_RUNNER_OVERFLOW"), []byte("overflow"), 0o600); err != nil {
+			os.Exit(2)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	case "stderr-first":
+		writeRunnerStderrOverflow()
 		for {
 			time.Sleep(time.Hour)
 		}
@@ -136,13 +215,17 @@ func TestStreamCodecChild(t *testing.T) {
 	if err := os.WriteFile(os.Getenv("VIDEOHELPER_RUNNER_DESCENDANT_PID"), []byte(strconv.Itoa(descendant.Process.Pid)), 0o600); err != nil {
 		os.Exit(2)
 	}
+	writeRunnerStderrOverflow()
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+func writeRunnerStderrOverflow() {
 	chunk := make([]byte, 64<<10)
 	for i := 0; i < 17; i++ {
 		if _, err := os.Stderr.Write(chunk); err != nil {
 			os.Exit(2)
 		}
-	}
-	for {
-		time.Sleep(time.Hour)
 	}
 }
