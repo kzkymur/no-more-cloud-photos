@@ -189,6 +189,43 @@ done
 /usr/bin/grep -q 'active=candidate.*attempted=old.*state=rollback-activation-failed' \
   /var/lib/nmcp/deployment/active-release
 
+# Kill the explicit lock owner after the handoff broker has inherited the
+# execution lease but before any transient unit is dispatched.
+cat > "$work/pretransfer-owner" <<EOF
+#!/bin/bash
+set -euo pipefail
+exec 9>/run/lock/nmcp-deploy.lock
+/usr/bin/flock --exclusive 9
+exec 8>/run/lock/nmcp-migration-execution.lock
+/usr/bin/flock --exclusive 8
+/usr/local/libexec/nmcp/handoff-ubuntu-migration-lock send \
+  '$work/pretransfer.sock' /run/lock/nmcp-migration-execution.lock 8 9>&- &
+printf '%s\n' \$! > '$work/pretransfer-broker.pid'
+wait
+EOF
+/usr/bin/chmod 0755 "$work/pretransfer-owner"
+"$work/pretransfer-owner" & pretransfer_owner=$!
+for attempt in {1..100}; do
+  [[ -S $work/pretransfer.sock && -s $work/pretransfer-broker.pid ]] && break
+  [[ $attempt -lt 100 ]] || { printf 'pre-transfer broker did not become ready\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+/usr/bin/kill -KILL "$pretransfer_owner"
+wait "$pretransfer_owner" 2>/dev/null || true
+/usr/bin/flock --exclusive --nonblock /run/lock/nmcp-deploy.lock /usr/bin/true
+if /usr/local/libexec/nmcp/run-ubuntu-migration >"$work/pretransfer-overlap.out" 2>&1; then
+  printf 'direct migration overlapped a pre-transfer owner death\n' >&2; exit 1
+fi
+/usr/bin/grep -q 'orphaned migration execution is still active' "$work/pretransfer-overlap.out"
+pretransfer_broker=$(/usr/bin/cat "$work/pretransfer-broker.pid")
+/usr/bin/kill "$pretransfer_broker"
+for attempt in {1..100}; do
+  if /usr/bin/flock --exclusive --nonblock /run/lock/nmcp-migration-execution.lock /usr/bin/true; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'pre-transfer broker did not release lease\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+/usr/bin/rm -f "$work/pretransfer.sock"
+
 # The installer owns the primary lock on its own FD. Kill it only after
 # the transient child has received the same execution-lease open description.
 cat > /opt/nmcp/releases/ownerdeath/bin/nmcp-admin <<EOF
