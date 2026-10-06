@@ -9,10 +9,14 @@ cleanup() {
   /usr/bin/rm -f /run/systemd/system/nmcp-lock-dependent.service /run/systemd/system/nmcp-lock-migrate.service \
     /run/nmcp-migrate-delegation /run/lock/nmcp-deploy.lock
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
-  /usr/bin/rm -rf /opt/nmcp/current "$work"
+  /usr/bin/rm -rf /opt/nmcp/current /usr/local/libexec/nmcp "$work"
 }
 trap cleanup EXIT
+/usr/bin/chown nmcp:nmcp "$work"
 /usr/bin/install -d -o root -g root -m 0755 /opt/nmcp/current/bin
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp
+/usr/bin/install -o root -g root -m 0755 "$repo/scripts/run-ubuntu-migration" \
+  /usr/local/libexec/nmcp/run-ubuntu-migration
 cat > /opt/nmcp/current/bin/nmcp-admin <<EOF
 #!/bin/sh
 printf 'entered\n' >> '$work/entries'
@@ -25,7 +29,7 @@ EOF
 # Direct migration must not enter while a deployment owns the lock.
 /usr/bin/flock /run/lock/nmcp-deploy.lock -c "sleep 3" & holder=$!
 /usr/bin/sleep 0.2
-if /usr/sbin/runuser -u nmcp -- "$repo/scripts/run-ubuntu-migration"; then
+if /usr/sbin/runuser -u nmcp -- /usr/local/libexec/nmcp/run-ubuntu-migration; then
   printf 'direct migration bypassed deployment lock\n' >&2; exit 1
 fi
 [[ ! -e $work/entries ]]
@@ -35,7 +39,7 @@ cat > /run/systemd/system/nmcp-lock-migrate.service <<EOF
 [Service]
 Type=oneshot
 User=nmcp
-ExecStart=$repo/scripts/run-ubuntu-migration
+ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration
 EOF
 cat > /run/systemd/system/nmcp-lock-dependent.service <<'EOF'
 [Unit]
@@ -58,6 +62,6 @@ wait "$holder"
 /usr/bin/printf '/opt/nmcp/current\n' > /run/nmcp-migrate-delegation
 /usr/bin/chown root:root /run/nmcp-migrate-delegation
 /usr/bin/chmod 0644 /run/nmcp-migrate-delegation
-/usr/bin/flock /run/lock/nmcp-deploy.lock -c "/usr/sbin/runuser -u nmcp -- '$repo/scripts/run-ubuntu-migration'"
+/usr/bin/flock /run/lock/nmcp-deploy.lock -c "/usr/sbin/runuser -u nmcp -- /usr/local/libexec/nmcp/run-ubuntu-migration"
 [[ $(/usr/bin/wc -l < "$work/entries") -eq 1 ]]
 printf 'Direct and dependency migration lock races passed\n'
