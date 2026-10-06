@@ -19,6 +19,8 @@ printf 'must-not-be-visible' > "$work/state/backups/secret"
 # This is the same parent-hide plus nested read-only bind composition used by
 # nmcp-files.service, applied to disposable paths. Root is intentional: a
 # successful write would prove the mount itself is not read-only.
+# Positional parameters must expand in the transient /bin/sh, not this shell.
+# shellcheck disable=SC2016
 systemd-run --quiet --wait --collect --unit "$unit" \
   --property=Type=oneshot \
   --property="InaccessiblePaths=$work/state" \
