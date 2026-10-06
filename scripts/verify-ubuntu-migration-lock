@@ -20,6 +20,7 @@ trap cleanup EXIT
 cat > /opt/nmcp/current/bin/nmcp-admin <<EOF
 #!/bin/sh
 printf 'entered\n' >> '$work/entries'
+id -un >> '$work/identities'
 sleep 1
 EOF
 /usr/bin/chown -R root:root /opt/nmcp/current
@@ -65,4 +66,5 @@ wait "$holder"
 /usr/bin/flock /run/lock/nmcp-deploy.lock -c "/usr/local/libexec/nmcp/run-ubuntu-migration"
 [[ ! -e /run/nmcp-migrate-delegation ]]
 [[ $(/usr/bin/wc -l < "$work/entries") -eq 1 ]]
+[[ $(/usr/bin/cat "$work/identities") == nmcp ]]
 printf 'Direct and dependency migration lock races passed\n'
