@@ -36,6 +36,7 @@ type probeStream struct {
 	BitsPerRaw     string `json:"bits_per_raw_sample"`
 	SampleAspect   string `json:"sample_aspect_ratio"`
 	TimeBase       string `json:"time_base"`
+	DurationTicks  int64  `json:"duration_ts"`
 	ColorPrimaries string `json:"color_primaries"`
 	ColorTransfer  string `json:"color_transfer"`
 	ColorSpace     string `json:"color_space"`
@@ -123,7 +124,7 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 	if err != nil {
 		return inspection{}, nil, err
 	}
-	facts, err := e.frameFacts(path, videoIndex, video.Width, video.Height, timeBase, limit)
+	facts, err := e.frameFacts(path, videoIndex, video.Width, video.Height, timeBase, video.DurationTicks, limit)
 	if err != nil {
 		return inspection{}, nil, err
 	}
@@ -159,8 +160,8 @@ type frameAccounting struct {
 	decodedPixels uint64
 }
 
-func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBase rational, limit limits) (frameAccounting, error) {
-	args := []string{"-v", "error", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,pts,pkt_duration,width,height", "-of", "compact=p=0:nk=0", path}
+func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBase rational, streamDurationTicks int64, limit limits) (frameAccounting, error) {
+	args := []string{"-v", "error", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,pts,duration,pkt_duration,width,height", "-of", "compact=p=0:nk=0", path}
 	var result frameAccounting
 	var lastDuration int64
 	err := e.run.stream(e.ffprobe, args, func(reader io.Reader) error {
@@ -196,9 +197,12 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 			}
 			result.decodedPixels += pixels
 			result.pts = append(result.pts, pts)
-			lastDuration, err = strconv.ParseInt(fields["pkt_duration"], 10, 64)
-			if err != nil || lastDuration <= 0 {
-				return fail("unsupported_input")
+			durationValue := fields["duration"]
+			if durationValue == "" {
+				durationValue = fields["pkt_duration"]
+			}
+			if durationValue != "" {
+				lastDuration, _ = strconv.ParseInt(durationValue, 10, 64)
 			}
 		}
 		return scanner.Err()
@@ -210,7 +214,7 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 		}
 		return frameAccounting{}, fail("unsupported_input")
 	}
-	if len(result.pts) == 0 || lastDuration < 0 {
+	if len(result.pts) == 0 || lastDuration < 0 || streamDurationTicks < 0 {
 		return frameAccounting{}, fail("unsupported_input")
 	}
 	span, overflow := subtractInt64(result.pts[len(result.pts)-1], result.pts[0])
@@ -218,7 +222,10 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 		return frameAccounting{}, fail("resource_limit")
 	}
 	durationTicks, overflow := addInt64(span, lastDuration)
-	if overflow || durationTicks <= 0 {
+	if streamDurationTicks > 0 {
+		durationTicks, overflow = streamDurationTicks, false
+	}
+	if overflow || durationTicks <= span {
 		return frameAccounting{}, fail("unsupported_input")
 	}
 	durationUS, within, ok := durationMicroseconds(durationTicks, timeBase, limit.DurationUS)

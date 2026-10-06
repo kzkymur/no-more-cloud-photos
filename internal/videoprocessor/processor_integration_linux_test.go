@@ -67,7 +67,7 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 			defer input.Close()
 			inspection, err := processor.Inspect(context.Background(), InspectRequest{Input: input, MIMEType: test.mime})
 			if err != nil {
-				if diagnostic, diagnosticErr := exec.Command(ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", path).CombinedOutput(); diagnosticErr == nil {
+				if diagnostic, diagnosticErr := exec.Command(ffprobe, "-v", "error", "-show_streams", "-show_format", "-show_frames", "-show_entries", "frame=media_type,pts,best_effort_timestamp,duration,pkt_duration,width,height:stream:format", "-of", "json", path).CombinedOutput(); diagnosticErr == nil {
 					t.Logf("input diagnostic: %s", diagnostic)
 				}
 				t.Fatal(err)

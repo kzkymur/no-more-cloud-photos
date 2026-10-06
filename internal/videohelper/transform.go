@@ -243,7 +243,7 @@ func (e *engine) probeOutput(path, kind string, limit limits) (*outputProbe, err
 	if kind == "first-frame-avif" {
 		frameLimit.FPSNum, frameLimit.FPSDen = math.MaxInt64, 1
 	}
-	facts, err := e.frameFacts(path, videoIndex, video.Width, video.Height, timeBase, frameLimit)
+	facts, err := e.frameFacts(path, videoIndex, video.Width, video.Height, timeBase, video.DurationTicks, frameLimit)
 	if err != nil {
 		return nil, err
 	}

@@ -122,7 +122,7 @@ func TestFrameFactsBoundedStreamingAndAccounting(t *testing.T) {
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
 	limit := maxLimits()
 	limit.DecodedPixels = 8
-	facts, err := e.frameFacts("input", 0, 2, 2, rational{1, 1000}, limit)
+	facts, err := e.frameFacts("input", 0, 2, 2, rational{1, 1000}, 80, limit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestFrameFactsBoundedStreamingAndAccounting(t *testing.T) {
 	}
 	runner.streams = []string{frames}
 	limit.DecodedPixels = 7
-	if _, err := e.frameFacts("input", 0, 2, 2, rational{1, 1000}, limit); !isCode(err, "resource_limit") {
+	if _, err := e.frameFacts("input", 0, 2, 2, rational{1, 1000}, 80, limit); !isCode(err, "resource_limit") {
 		t.Fatalf("decoded pixels +1 error = %v", err)
 	}
 }
@@ -376,6 +376,7 @@ func probeJSON(codec, pixFmt string, width, height int, audio bool) []byte {
 	streams := []map[string]interface{}{{
 		"index": 0, "codec_name": codec, "codec_type": "video", "profile": "High", "width": width, "height": height,
 		"pix_fmt": pixFmt, "bits_per_raw_sample": "8", "sample_aspect_ratio": "1:1", "time_base": "1/1000",
+		"duration_ts":     80,
 		"color_primaries": "bt709", "color_transfer": "bt709", "color_space": "bt709", "color_range": "tv",
 		"disposition": map[string]int{"default": 1, "attached_pic": 0}, "tags": map[string]string{}, "side_data_list": []interface{}{},
 	}}
