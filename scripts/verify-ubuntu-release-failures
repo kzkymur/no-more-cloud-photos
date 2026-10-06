@@ -100,7 +100,10 @@ fi
 if "$repo/scripts/install-ubuntu-release" activate startfail >"$work/startfail.out" 2>&1; then
   printf 'service startup failure unexpectedly activated release\n' >&2; exit 1
 fi
-[[ $(/usr/bin/grep -c '^NMCP_TEST_MIGRATION=startfail$' "$work/startfail.out") -eq 1 ]]
+/usr/bin/cat "$work/startfail.out"
+[[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=startfail' "$work/startfail.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/startfail.out" >&2; exit 1;
+}
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   ! /usr/bin/systemctl is-active --quiet "$unit" || { printf 'partial startup remained live: %s\n' "$unit" >&2; exit 1; }
 done
@@ -115,7 +118,10 @@ EOF
 if "$repo/scripts/install-ubuntu-release" activate candidate >"$work/candidate.out" 2>&1; then
   printf 'failed readiness gate unexpectedly activated release\n' >&2; exit 1
 fi
-[[ $(/usr/bin/grep -c '^NMCP_TEST_MIGRATION=candidate$' "$work/candidate.out") -eq 1 ]]
+/usr/bin/cat "$work/candidate.out"
+[[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=candidate' "$work/candidate.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/candidate.out" >&2; exit 1;
+}
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   ! /usr/bin/systemctl is-active --quiet "$unit" || { printf 'partial service remained live: %s\n' "$unit" >&2; exit 1; }
 done
@@ -127,8 +133,13 @@ done
 if "$repo/scripts/install-ubuntu-release" rollback old >"$work/rollback.out" 2>&1; then
   printf 'failed rollback gate unexpectedly succeeded\n' >&2; exit 1
 fi
-[[ $(/usr/bin/grep -c '^NMCP_TEST_MIGRATION=old$' "$work/rollback.out") -eq 1 ]]
-[[ $(/usr/bin/grep -c '^NMCP_TEST_MIGRATION=candidate$' "$work/rollback.out") -eq 1 ]]
+/usr/bin/cat "$work/rollback.out"
+[[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=old' "$work/rollback.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/rollback.out" >&2; exit 1;
+}
+[[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=candidate' "$work/rollback.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/rollback.out" >&2; exit 1;
+}
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/candidate ]]
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   /usr/bin/systemctl is-active --quiet "$unit" || { printf 'prior live service state was not restored: %s\n' "$unit" >&2; exit 1; }
