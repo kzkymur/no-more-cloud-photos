@@ -9,7 +9,7 @@ cleanup() {
   /usr/bin/rm -f /run/systemd/system/nmcp-lock-dependent.service /run/systemd/system/nmcp-lock-migrate.service \
     /run/nmcp-migrate-delegation /run/lock/nmcp-deploy.lock
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
-  /usr/bin/rm -rf /opt/nmcp/current /usr/local/libexec/nmcp "$work"
+  /usr/bin/rm -rf /opt/nmcp /usr/local/libexec/nmcp "$work"
 }
 trap cleanup EXIT
 /usr/bin/chown nmcp:nmcp "$work"
