@@ -118,7 +118,9 @@ EOF
 if "$repo/scripts/install-ubuntu-release" activate pgfail >"$work/pgfail.out" 2>&1; then
   printf 'PostgreSQL start failure unexpectedly ran migration\n' >&2; exit 1
 fi
-! /usr/bin/grep -q 'NMCP_TEST_MIGRATION=pgfail' "$work/pgfail.out"
+if /usr/bin/grep -q 'NMCP_TEST_MIGRATION=pgfail' "$work/pgfail.out"; then
+  printf 'admin binary ran despite PostgreSQL start failure\n' >&2; exit 1
+fi
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
@@ -217,7 +219,9 @@ if /usr/local/libexec/nmcp/run-ubuntu-migration >"$work/direct-overlap.out" 2>&1
 fi
 /usr/bin/grep -q 'orphaned migration execution is still active' "$work/direct-overlap.out"
 [[ ! -e $work/ownerdeath-finished ]]
-! /usr/bin/systemctl is-active --quiet nmcp.target
+if /usr/bin/systemctl is-active --quiet nmcp.target; then
+  printf 'killed installer continued into service activation\n' >&2; exit 1
+fi
 /usr/bin/touch "$work/ownerdeath-proceed"
 for attempt in {1..100}; do
   [[ -e $work/ownerdeath-finished ]] && break

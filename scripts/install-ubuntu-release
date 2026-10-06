@@ -159,7 +159,7 @@ run_admin() {
   admin_sequence=$((admin_sequence + 1))
   handoff=/run/nmcp-migration-handoff.$$.$admin_sequence
   unit=nmcp-deploy-admin-$$-$admin_sequence
-  "$script_dir/handoff-ubuntu-migration-lock" send "$handoff" \
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock send "$handoff" \
     /run/lock/nmcp-migration-execution.lock 8 &
   broker=$!
   for attempt in {1..100}; do
