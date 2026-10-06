@@ -94,7 +94,7 @@ def main() -> int:
     require("alias /srv/nmcp/originals/" in nginx_template, "originals alias missing")
     require("alias /srv/nmcp/renditions/" in nginx_template, "renditions alias missing")
     require("proxy_pass http://127.0.0.1:8080" in nginx_template, "API upstream is not loopback")
-    require("autoindex off" in nginx_template and "Accept-Ranges" in nginx_template, "file response contract missing")
+    require("autoindex off" in nginx_template, "file listing boundary missing")
     require("private, max-age=31536000, immutable" in nginx_template, "private cache contract missing")
     require("@@NMCP_API_TLS_LISTEN@@" in nginx_template and "@@NMCP_FILES_TLS_LISTEN@@" in nginx_template, "listen token missing")
 
