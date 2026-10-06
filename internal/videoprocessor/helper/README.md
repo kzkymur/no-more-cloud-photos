@@ -20,6 +20,13 @@ encoder used by the MP4 transform is `libsvtav1`; H.264 fallback is forbidden.
 The first-frame AVIF uses the already pinned libaom encoder. AAC-LC uses
 FFmpeg's native encoder.
 
+The video build requires the still builder's deterministic manifest, verifies
+its libaom source fields and concrete shared-object digest before and after the
+FFmpeg build, and records the same evidence in its own manifest. FFmpeg uses an
+absolute, non-fallback pinned-prefix RPATH. At runtime the helper rehashes that
+exact object and verifies the FFmpeg-to-libavcodec-to-libaom ELF dependency chain before it
+accepts any command or advertises library identities.
+
 The helper implements four commands: `capabilities`, `inspect`, `transform`,
 and `verify-output`. Argument order, descriptor numbers, limits, result fields,
 and error codes are closed. The Go adapter grants transform and independent

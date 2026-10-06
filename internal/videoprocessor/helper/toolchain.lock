@@ -1,7 +1,10 @@
 # Direct source inputs for the production video toolchain. libaom 3.8.2,
 # libheif 1.23.5, and the sRGB2014 ICC are inherited from the exact pins in
-# internal/stillprocessor/helper/toolchain.lock. The transitive system/OCI
-# closure remains issue #20's responsibility.
+# internal/stillprocessor/helper/toolchain.lock. Its generated manifest must
+# authenticate commit 615b5f541e4434aebd993036bc97ebc1a77ebc25, source archive
+# SHA-256 eb0bfa625cd17849be2e17ffd38bf8e1dc67b7c7787e7152250a4075d05f245f,
+# and the digest of the concrete installed libaom object before this build runs.
+# The transitive system/OCI closure remains issue #20's responsibility.
 
 FFmpeg 9.0.2
 url https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -116,8 +118,7 @@ func TestGeometryEvenFloorAndNoUpscale(t *testing.T) {
 }
 
 func TestFrameFactsBoundedStreamingAndAccounting(t *testing.T) {
-	frames := "media_type=video|pts=0|pkt_duration=40|width=2|height=2\n" +
-		"media_type=video|pts=40|pkt_duration=40|width=2|height=2\n"
+	frames := frameJSON(0, 2, 2, frameTiming{0, 40}, frameTiming{40, 40})
 	runner := &fakeRunner{streams: []string{frames}}
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
 	limit := maxLimits()
@@ -147,7 +148,7 @@ func TestDurationAccountingDoesNotFloorPastLimit(t *testing.T) {
 
 func TestInspectUsesProbeAndRejectsAmbiguousColor(t *testing.T) {
 	metadata := probeJSON("h264", "yuv420p", 320, 180, false)
-	frames := "media_type=video|pts=0|pkt_duration=40|width=320|height=180\nmedia_type=video|pts=40|pkt_duration=40|width=320|height=180\n"
+	frames := frameJSON(0, 320, 180, frameTiming{0, 40}, frameTiming{40, 40})
 	runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{frames}}
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
 	got, _, err := e.inspect("input", "video/mp4", maxLimits())
@@ -182,7 +183,7 @@ func TestCapabilitiesRequirePinnedSiblingFeatures(t *testing.T) {
 		[]byte("libsvtav1 libaom-av1 aac"),
 		[]byte("zscale tonemap"),
 	}}
-	e := engine{ffprobe: "/prefix/bin/ffprobe", ffmpeg: "/prefix/bin/ffmpeg", run: runner}
+	e := engine{ffprobe: "/prefix/bin/ffprobe", ffmpeg: "/prefix/bin/ffmpeg", run: runner, closure: func() error { return nil }}
 	var response bytes.Buffer
 	if err := e.capabilities(request{icc: icc, threads: 1}, &response); err != nil {
 		t.Fatal(err)
@@ -205,6 +206,74 @@ func TestCapabilitiesRequirePinnedSiblingFeatures(t *testing.T) {
 	}
 }
 
+func TestToolchainManifestRejectsSubstitutedIdentity(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	manifest := toolchainManifestPrefix + "libaom_object=lib/libaom.so.3.8.2\nlibaom_object_sha256=" + digest + "\n" + toolchainManifestSuffix
+	object, gotDigest, err := parseToolchainManifest(manifest)
+	if err != nil || object != "lib/libaom.so.3.8.2" || gotDigest != digest {
+		t.Fatalf("manifest = %q, %q, %v", object, gotDigest, err)
+	}
+	for _, substituted := range []string{
+		strings.Replace(manifest, "libaom_commit=615b5f", "libaom_commit=715b5f", 1),
+		strings.Replace(manifest, "libaom.so.3.8.2", "../../usr/lib/libaom.so.3", 1),
+		strings.Replace(manifest, digest, strings.Repeat("A", 64), 1),
+		manifest + "extra=true\n",
+	} {
+		if _, _, err := parseToolchainManifest(substituted); err == nil {
+			t.Fatalf("accepted substituted manifest:\n%s", substituted)
+		}
+	}
+}
+
+func TestRuntimeClosureRequiresPinnedAOMObjectAndNonFallbackRPATH(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("cc is unavailable")
+	}
+	prefix := t.TempDir()
+	libDir := filepath.Join(prefix, "lib")
+	binDir := filepath.Join(prefix, "bin")
+	if err := os.MkdirAll(libDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aomSource := writeNamedTemp(t, prefix, "aom.c", "int nmcp_aom(void) { return 1; }\n")
+	codecSource := writeNamedTemp(t, prefix, "codec.c", "extern int nmcp_aom(void); int nmcp_codec(void) { return nmcp_aom(); }\n")
+	mainSource := writeNamedTemp(t, prefix, "main.c", "extern int nmcp_codec(void); int main(void) { return nmcp_codec() == 1 ? 0 : 1; }\n")
+	aomObject := filepath.Join(libDir, "libaom.so.3.8.2")
+	runCC(t, "-shared", "-fPIC", "-Wl,-soname,libaom.so.3", "-o", aomObject, aomSource)
+	symlink(t, "libaom.so.3.8.2", filepath.Join(libDir, "libaom.so.3"))
+	symlink(t, "libaom.so.3", filepath.Join(libDir, "libaom.so"))
+	codecObject := filepath.Join(libDir, "libavcodec.so.62.0.0")
+	runCC(t, "-shared", "-fPIC", "-Wl,-soname,libavcodec.so.62", "-Wl,--disable-new-dtags,-rpath,"+libDir, "-L"+libDir, "-o", codecObject, codecSource, "-laom")
+	symlink(t, "libavcodec.so.62.0.0", filepath.Join(libDir, "libavcodec.so.62"))
+	symlink(t, "libavcodec.so.62", filepath.Join(libDir, "libavcodec.so"))
+	ffmpeg := filepath.Join(binDir, "ffmpeg")
+	runCC(t, "-Wl,--disable-new-dtags,-rpath,"+libDir, "-Wl,-rpath-link,"+libDir, "-L"+libDir, "-o", ffmpeg, mainSource, "-lavcodec")
+	if err := validateAOMDependency(ffmpeg, prefix, aomObject); err != nil {
+		t.Fatalf("valid pinned closure rejected: %v", err)
+	}
+	alternateAOM := filepath.Join(libDir, "libaom-alternate.so.3.8.2")
+	runCC(t, "-shared", "-fPIC", "-Wl,-soname,libaom.so.3", "-o", alternateAOM, aomSource)
+	if err := os.Remove(filepath.Join(libDir, "libaom.so.3")); err != nil {
+		t.Fatal(err)
+	}
+	symlink(t, filepath.Base(alternateAOM), filepath.Join(libDir, "libaom.so.3"))
+	if err := validateAOMDependency(ffmpeg, prefix, aomObject); err == nil {
+		t.Fatal("substituted libaom SONAME target was accepted")
+	}
+	if err := os.Remove(filepath.Join(libDir, "libaom.so.3")); err != nil {
+		t.Fatal(err)
+	}
+	symlink(t, filepath.Base(aomObject), filepath.Join(libDir, "libaom.so.3"))
+	hostFallback := filepath.Join(binDir, "ffmpeg-runpath")
+	runCC(t, "-Wl,-rpath,"+libDir, "-Wl,-rpath-link,"+libDir, "-L"+libDir, "-o", hostFallback, mainSource, "-lavcodec")
+	if err := validateAOMDependency(hostFallback, prefix, aomObject); err == nil {
+		t.Fatal("RUNPATH host fallback was accepted")
+	}
+}
+
 func TestTransformInvokesSVTAV1WithoutH264FallbackAndTruncatesFailure(t *testing.T) {
 	input, err := os.CreateTemp(t.TempDir(), "input")
 	if err != nil {
@@ -217,7 +286,7 @@ func TestTransformInvokesSVTAV1WithoutH264FallbackAndTruncatesFailure(t *testing
 	}
 	defer output.Close()
 	icc := writeTemp(t, "icc")
-	frames := "media_type=video|pts=0|pkt_duration=40|width=320|height=180\nmedia_type=video|pts=40|pkt_duration=40|width=320|height=180\n"
+	frames := frameJSON(0, 320, 180, frameTiming{0, 40}, frameTiming{40, 40})
 	runner := &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, writeOutput: []byte("mp4")}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
 	r := request{command: "transform", input: input.Name(), output: output.Name(), mime: "video/mp4", kind: "mp4-av1", icc: icc, maxLongEdge: 1920, bitDepth: 10, threads: 1, limits: maxLimits()}
@@ -254,7 +323,7 @@ func TestThumbnailDiscardsSourceAudioWithoutAudioAudit(t *testing.T) {
 	input := writeTemp(t, "input")
 	output := writeTemp(t, "")
 	icc := writeTemp(t, "icc")
-	frames := "media_type=video|pts=0|pkt_duration=40|width=320|height=180\n"
+	frames := frameJSON(0, 320, 180, frameTiming{0, 80})
 	runner := &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, true), nil}, streams: []string{frames}, writeOutput: []byte("avif")}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
 	r := request{command: "transform", input: input, output: output, mime: "video/mp4", kind: "first-frame-avif", icc: icc, maxLongEdge: 640, quality: 80, bitDepth: 8, threads: 1, limits: maxLimits()}
@@ -289,8 +358,8 @@ func TestTimingVerificationAllowsOneTickAndRejectsTwo(t *testing.T) {
 }
 
 func TestVerifyOutputIndependentlyProbesAndFullyDecodes(t *testing.T) {
-	sourceFrames := "media_type=video|pts=100|pkt_duration=40|width=320|height=180\nmedia_type=video|pts=140|pkt_duration=40|width=320|height=180\n"
-	outputFrames := "media_type=video|pts=0|pkt_duration=40|width=320|height=180\nmedia_type=video|pts=40|pkt_duration=40|width=320|height=180\n"
+	sourceFrames := frameJSON(0, 320, 180, frameTiming{100, 40}, frameTiming{140, 40})
+	outputFrames := frameJSON(0, 320, 180, frameTiming{0, 40}, frameTiming{40, 40})
 	outputMetadata := probeJSON("av1", "yuv420p10le", 320, 180, false)
 	var outputDocument map[string]interface{}
 	if err := json.Unmarshal(outputMetadata, &outputDocument); err != nil {
@@ -342,6 +411,7 @@ type fakeRunner struct {
 	runErrorAt  int
 	writeOutput []byte
 	lastFFmpeg  []string
+	lastStream  []string
 }
 
 func (f *fakeRunner) run(path string, args []string, _ int64) ([]byte, []byte, error) {
@@ -363,13 +433,30 @@ func (f *fakeRunner) run(path string, args []string, _ int64) ([]byte, []byte, e
 	return result, nil, nil
 }
 
-func (f *fakeRunner) stream(_ string, _ []string, consume func(io.Reader) error) error {
+func (f *fakeRunner) stream(_ string, args []string, consume func(io.Reader) error) error {
+	f.lastStream = slices.Clone(args)
 	if len(f.streams) == 0 {
 		return errors.New("unexpected stream")
 	}
 	value := f.streams[0]
 	f.streams = f.streams[1:]
 	return consume(strings.NewReader(value))
+}
+
+type frameTiming struct {
+	pts      int64
+	duration int64
+}
+
+func frameJSON(streamIndex, width, height int, timings ...frameTiming) string {
+	frames := make([]map[string]interface{}, 0, len(timings))
+	for _, timing := range timings {
+		frames = append(frames, map[string]interface{}{
+			"media_type": "video", "stream_index": streamIndex, "pts": timing.pts, "duration": timing.duration, "width": width, "height": height,
+		})
+	}
+	encoded, _ := json.Marshal(map[string]interface{}{"frames": frames})
+	return string(encoded)
 }
 
 func probeJSON(codec, pixFmt string, width, height int, audio bool) []byte {
@@ -444,4 +531,27 @@ func writeTemp(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writeNamedTemp(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func runCC(t *testing.T, args ...string) {
+	t.Helper()
+	if output, err := exec.Command("cc", args...).CombinedOutput(); err != nil {
+		t.Fatalf("cc %q: %v\n%s", args, err, output)
+	}
+}
+
+func symlink(t *testing.T, oldname, newname string) {
+	t.Helper()
+	if err := os.Symlink(oldname, newname); err != nil {
+		t.Fatal(err)
+	}
 }

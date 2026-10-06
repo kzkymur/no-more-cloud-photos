@@ -5,10 +5,11 @@ package videohelper
 import "time"
 
 const (
-	protocolVersion   = 1
-	helperVersion     = "nmcp-video-helper/1"
-	buildManifest     = "ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1"
-	toolchainManifest = "ffmpeg=9.0.2\nffmpeg_sha256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e\nsvt_av1=4.2.0\nsvt_av1_sha256=c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740\nzimg=3.0.6\nzimg_sha256=be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577\nlibaom=v3.8.2\nconfigure=shared,no-autodetect,no-network,no-gpl,no-nonfree,libsvtav1,libzimg,libaom\n"
+	protocolVersion         = 1
+	helperVersion           = "nmcp-video-helper/1"
+	buildManifest           = "ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1"
+	toolchainManifestPrefix = "manifest_version=1\nffmpeg_version=9.0.2\nffmpeg_source_sha256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e\nsvt_av1_version=4.2.0\nsvt_av1_source_sha256=c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740\nzimg_version=3.0.6\nzimg_source_sha256=be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577\nlibaom_version=3.8.2\nlibaom_commit=615b5f541e4434aebd993036bc97ebc1a77ebc25\nlibaom_source_sha256=eb0bfa625cd17849be2e17ffd38bf8e1dc67b7c7787e7152250a4075d05f245f\n"
+	toolchainManifestSuffix = "configure=shared,no-autodetect,no-network,no-gpl,no-nonfree,libsvtav1,libzimg,libaom,rpath-pinned\n"
 
 	maxStreams       = 32
 	maxDimension     = 16_384

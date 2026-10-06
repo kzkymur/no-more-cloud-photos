@@ -36,7 +36,7 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 		return fail("capability_failed")
 	}
 	even := r.kind == "mp4-av1"
-	width, height, err := fitDimensions(source.DisplayWidth, source.DisplayHeight, r.maxLongEdge, even)
+	width, height, err := fitRationalDimensions(probe.displayWidth, probe.displayHeight, r.maxLongEdge, even)
 	if err != nil {
 		return err
 	}
@@ -55,9 +55,9 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 	if outputLimit <= 0 {
 		return fail("output_too_large")
 	}
-	args := []string{"-v", "error", "-nostdin", "-y", "-noautorotate"}
-	if source.RotationDegrees != 0 {
-		args = append(args, "-display_rotation:v:0", "0")
+	args := []string{"-v", "error", "-xerror", "-nostdin", "-y", "-noautorotate"}
+	if probe.rotation != "none" {
+		args = append(args, "-display_rotation:"+strconv.Itoa(source.VideoStreamIndex), "0")
 	}
 	args = append(args, "-threads", "1", "-i", r.input, "-map", "0:"+strconv.Itoa(source.VideoStreamIndex), "-vf", videoFilter, "-map_metadata", "-1", "-map_chapters", "-1", "-threads:v", "1")
 	if r.kind == "mp4-av1" {
@@ -195,11 +195,25 @@ func fitDimensions(width, height, edge int, even bool) (int, int, error) {
 	if width <= 0 || height <= 0 || edge <= 0 || width > maxDimension || height > maxDimension {
 		return 0, 0, fail("unsupported_input")
 	}
-	outWidth, outHeight := width, height
-	long := max(width, height)
-	if long > edge {
-		outWidth = int(uint64(width) * uint64(edge) / uint64(long))
-		outHeight = int(uint64(height) * uint64(edge) / uint64(long))
+	return fitRationalDimensions(new(big.Rat).SetInt64(int64(width)), new(big.Rat).SetInt64(int64(height)), edge, even)
+}
+
+func fitRationalDimensions(width, height *big.Rat, edge int, even bool) (int, int, error) {
+	if width == nil || height == nil || width.Sign() <= 0 || height.Sign() <= 0 || edge <= 0 {
+		return 0, 0, fail("unsupported_input")
+	}
+	long := new(big.Rat).Set(width)
+	if height.Cmp(long) > 0 {
+		long.Set(height)
+	}
+	scale := new(big.Rat).SetInt64(1)
+	if long.Cmp(new(big.Rat).SetInt64(int64(edge))) > 0 {
+		scale.Quo(new(big.Rat).SetInt64(int64(edge)), long)
+	}
+	outWidth, errWidth := floorRationalAxis(new(big.Rat).Mul(width, scale))
+	outHeight, errHeight := floorRationalAxis(new(big.Rat).Mul(height, scale))
+	if errWidth != nil || errHeight != nil {
+		return 0, 0, fail("unsupported_input")
 	}
 	if even {
 		outWidth -= outWidth % 2

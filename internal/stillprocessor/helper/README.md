@@ -19,6 +19,9 @@ against `toolchain.lock` and builds libaom 3.8.2, lcms2 2.14, LibRaw 0.22.2,
 libheif 1.23.5, and libvips 8.18.7 using the recorded reduced feature set.
 System packages supply only the transitive build closure; pinning that complete
 closure and the deployment image is the explicit issue #20 boundary.
+The build also writes `share/nmcp/still-toolchain.manifest`, binding the verified
+libaom commit and source archive to the concrete installed shared-object digest
+for downstream toolchains that inherit this prefix.
 
 ## Closed behavior
 

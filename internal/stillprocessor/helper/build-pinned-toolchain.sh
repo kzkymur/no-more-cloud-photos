@@ -97,3 +97,19 @@ meson compile -C "$work/build/vips" -j 2
 meson install -C "$work/build/vips"
 
 pkg-config --modversion vips libheif libraw aom lcms2
+
+shopt -s nullglob
+aom_objects=("$prefix"/lib/libaom.so.*.*.* "$prefix"/lib64/libaom.so.*.*.*)
+shopt -u nullglob
+[[ ${#aom_objects[@]} -eq 1 && -f "${aom_objects[0]}" && ! -L "${aom_objects[0]}" ]]
+aom_object=${aom_objects[0]#"$prefix"/}
+read -r aom_object_sha256 _ < <(sha256sum "${aom_objects[0]}")
+mkdir -p "$prefix/share/nmcp"
+printf '%s\n' \
+  'manifest_version=1' \
+  'libaom_version=3.8.2' \
+  'libaom_commit=615b5f541e4434aebd993036bc97ebc1a77ebc25' \
+  'libaom_source_sha256=eb0bfa625cd17849be2e17ffd38bf8e1dc67b7c7787e7152250a4075d05f245f' \
+  "libaom_object=$aom_object" \
+  "libaom_object_sha256=$aom_object_sha256" \
+  >"$prefix/share/nmcp/still-toolchain.manifest"

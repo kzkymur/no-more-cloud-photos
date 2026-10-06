@@ -4,6 +4,7 @@ package videohelper
 
 import (
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,8 @@ type engine struct {
 	ffmpeg   string
 	run      commandRunner
 	manifest string
+	prefix   string
+	closure  func() error
 }
 
 func Main(args []string, stdout, stderr io.Writer) int {
@@ -60,10 +63,15 @@ func newEngine() (*engine, error) {
 	}
 	prefix := filepath.Dir(dir)
 	manifestBytes, err := os.ReadFile(filepath.Join(prefix, "share", "nmcp", "video-toolchain.manifest"))
-	if err != nil || string(manifestBytes) != toolchainManifest {
+	if err != nil {
 		return nil, fail("capability_failed")
 	}
-	return &engine{ffprobe: ffprobe, ffmpeg: ffmpeg, run: osCommandRunner{}, manifest: string(manifestBytes)}, nil
+	e := &engine{ffprobe: ffprobe, ffmpeg: ffmpeg, run: osCommandRunner{}, manifest: string(manifestBytes), prefix: prefix}
+	e.closure = e.validateRuntimeClosure
+	if err := e.closure(); err != nil {
+		return nil, fail("capability_failed")
+	}
+	return e, nil
 }
 
 func siblingExecutable(dir, name string) (string, error) {
@@ -245,7 +253,7 @@ func decimalInt(s string) (int, error) {
 
 func (e *engine) capabilities(r request, out io.Writer) error {
 	digest, err := digestFile(r.icc)
-	if err != nil || e.manifest != "" && e.manifest != toolchainManifest || e.checkTools() != nil {
+	if err != nil || e.closure == nil || e.closure() != nil || e.checkTools() != nil {
 		return fail("capability_failed")
 	}
 	result := struct {
@@ -262,6 +270,154 @@ func (e *engine) capabilities(r request, out io.Writer) error {
 		BuildManifest    string            `json:"build_manifest"`
 	}{helperVersion, versions, []string{"video/mp4", "video/quicktime"}, []string{"first-frame-avif", "mp4-av1"}, "libsvtav1", "aac-lc", "mp4", "zscale+hable", digest, 1, buildManifest}
 	return writeEnvelope(out, true, "", result)
+}
+
+func (e *engine) validateRuntimeClosure() error {
+	object, digest, err := parseToolchainManifest(e.manifest)
+	if err != nil || e.prefix == "" {
+		return errors.New("invalid toolchain manifest")
+	}
+	objectPath := filepath.Join(e.prefix, filepath.FromSlash(object))
+	info, err := os.Lstat(objectPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("invalid libaom object")
+	}
+	actualDigest, err := digestFile(objectPath)
+	if err != nil || actualDigest != digest {
+		return errors.New("libaom digest mismatch")
+	}
+	return validateAOMDependency(e.ffmpeg, e.prefix, objectPath)
+}
+
+func parseToolchainManifest(manifest string) (string, string, error) {
+	if !strings.HasPrefix(manifest, toolchainManifestPrefix) {
+		return "", "", errors.New("invalid manifest prefix")
+	}
+	remainder := strings.TrimPrefix(manifest, toolchainManifestPrefix)
+	lines := strings.Split(remainder, "\n")
+	if len(lines) != 4 || lines[3] != "" || lines[2]+"\n" != toolchainManifestSuffix {
+		return "", "", errors.New("invalid manifest fields")
+	}
+	const objectKey = "libaom_object="
+	const digestKey = "libaom_object_sha256="
+	if !strings.HasPrefix(lines[0], objectKey) || !strings.HasPrefix(lines[1], digestKey) {
+		return "", "", errors.New("invalid libaom fields")
+	}
+	object := strings.TrimPrefix(lines[0], objectKey)
+	digest := strings.TrimPrefix(lines[1], digestKey)
+	parts := strings.Split(object, "/")
+	if len(parts) != 2 || parts[0] != "lib" && parts[0] != "lib64" || !validVersionedAOM(parts[1]) || !validSHA256(digest) {
+		return "", "", errors.New("invalid libaom identity")
+	}
+	return object, digest, nil
+}
+
+func validVersionedAOM(name string) bool {
+	const prefix = "libaom.so."
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(name, prefix), ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, character := range part {
+			if character < '0' || character > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil && value == strings.ToLower(value)
+}
+
+func validateAOMDependency(ffmpegPath, prefix, aomPath string) error {
+	ffmpeg, err := elf.Open(ffmpegPath)
+	if err != nil {
+		return err
+	}
+	defer ffmpeg.Close()
+	pinnedLibDir := filepath.Join(prefix, "lib")
+	if err := requirePinnedRPATH(ffmpeg, pinnedLibDir); err != nil {
+		return err
+	}
+	needed, err := ffmpeg.ImportedLibraries()
+	if err != nil {
+		return err
+	}
+	libavcodecName := ""
+	for _, name := range needed {
+		if strings.HasPrefix(name, "libavcodec.so.") {
+			libavcodecName = name
+			break
+		}
+	}
+	if libavcodecName == "" {
+		return errors.New("ffmpeg does not require libavcodec")
+	}
+	libavcodecPath, err := filepath.EvalSymlinks(filepath.Join(prefix, "lib", libavcodecName))
+	if err != nil || filepath.Dir(libavcodecPath) != filepath.Join(prefix, "lib") {
+		return errors.New("libavcodec escapes pinned prefix")
+	}
+	libavcodec, err := elf.Open(libavcodecPath)
+	if err != nil {
+		return err
+	}
+	defer libavcodec.Close()
+	if err := requirePinnedRPATH(libavcodec, pinnedLibDir); err != nil {
+		return err
+	}
+	aom, err := elf.Open(aomPath)
+	if err != nil {
+		return err
+	}
+	defer aom.Close()
+	sonames, err := aom.DynString(elf.DT_SONAME)
+	if err != nil || len(sonames) != 1 {
+		return errors.New("invalid libaom SONAME")
+	}
+	loadedAOMPath, err := filepath.EvalSymlinks(filepath.Join(pinnedLibDir, sonames[0]))
+	if err != nil || filepath.Clean(loadedAOMPath) != filepath.Clean(aomPath) {
+		return errors.New("libaom SONAME does not resolve to pinned object")
+	}
+	loadedInfo, err := os.Stat(loadedAOMPath)
+	pinnedInfo, pinnedErr := os.Stat(aomPath)
+	if err != nil || pinnedErr != nil || !os.SameFile(pinnedInfo, loadedInfo) {
+		return errors.New("libaom SONAME identity mismatch")
+	}
+	codecNeeded, err := libavcodec.ImportedLibraries()
+	if err != nil {
+		return err
+	}
+	for _, name := range codecNeeded {
+		if name == sonames[0] {
+			return nil
+		}
+	}
+	return errors.New("libavcodec does not require pinned libaom SONAME")
+}
+
+func requirePinnedRPATH(file *elf.File, pinnedLibDir string) error {
+	runpath, err := file.DynString(elf.DT_RUNPATH)
+	if err != nil || len(runpath) != 0 {
+		return errors.New("RUNPATH permits host fallback")
+	}
+	rpath, err := file.DynString(elf.DT_RPATH)
+	if err != nil || len(rpath) != 1 || rpath[0] != pinnedLibDir {
+		return errors.New("missing pinned RPATH")
+	}
+	return nil
 }
 
 func digestFile(path string) (string, error) {

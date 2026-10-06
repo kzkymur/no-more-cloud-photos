@@ -3,10 +3,8 @@
 package videoprocessor
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -111,42 +109,19 @@ func TestContainerRejectsFallbackAndMalformedLengths(t *testing.T) {
 	}
 }
 
-func minimalMP4(videoEntry string, audio bool) []byte {
-	box := func(kind string, payload ...[]byte) []byte {
-		var body []byte
-		for _, part := range payload {
-			body = append(body, part...)
-		}
-		result := make([]byte, 8+len(body))
-		binary.BigEndian.PutUint32(result[:4], uint32(len(result)))
-		copy(result[4:8], kind)
-		copy(result[8:], body)
-		return result
-	}
-	entry := box(videoEntry)
-	count := make([]byte, 8)
-	binary.BigEndian.PutUint32(count[4:], 1)
-	stsd := box("stsd", count, entry)
-	moov := box("moov", box("trak", box("mdia", box("minf", box("stbl", stsd)))))
-	brand := append([]byte("isom\x00\x00\x02\x00isomiso6av01mp41"), []byte{}...)
-	ftyp := box("ftyp", brand)
-	if audio {
-		audioEntry := box("mp4a")
-		binary.BigEndian.PutUint32(count[4:], 2)
-		stsd = box("stsd", count, entry, audioEntry)
-		moov = box("moov", box("trak", box("mdia", box("minf", box("stbl", stsd)))))
-	}
-	return bytes.Join([][]byte{ftyp, moov, box("mdat", []byte{1})}, nil)
-}
-
 func TestVerifierFailureClearsOutput(t *testing.T) {
 	inspection := validInspection()
 	transform := fmt.Sprintf(`{"protocol":1,"ok":true,"error_code":"","result":{"kind":"mp4-av1","output_mime":"video/mp4","width":320,"height":180,"max_long_edge":1920,"threads":1,"crf":32,"quality":0,"bit_depth":10,"chroma":"4:2:0","audio_present":false,"audio_codec":"none","audio_bitrate_kbps":0,"source":%s,"audit":%s}}`, inspectionJSON(inspection), auditJSON(inspection, testDigest))
+	physical := filepath.Join(t.TempDir(), "physical.mp4")
+	if err := os.WriteFile(physical, minimalMP4("av01", false), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verifierCalled := filepath.Join(t.TempDir(), "verifier-called")
 	script := `#!/bin/sh
 set -eu
 case "$1" in
-transform) printf 'partial' >&4; printf '%s' '` + transform + `' ;;
-verify-output) printf '%s' '{"protocol":1,"ok":false,"error_code":"decode_failed","result":null}' ;;
+transform) /bin/cat '` + physical + `' >&4; printf '%s' '` + transform + `' ;;
+verify-output) : > '` + verifierCalled + `'; printf '%s' '{"protocol":1,"ok":false,"error_code":"decode_failed","result":null}' ;;
 esac
 `
 	p := newTestProcessor(t, helperScript(t, script))
@@ -157,6 +132,9 @@ esac
 	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"]})
 	if !errors.Is(err, ErrProcess) {
 		t.Fatalf("error = %v", err)
+	}
+	if _, err := os.Stat(verifierCalled); err != nil {
+		t.Fatalf("independent verifier was not called: %v", err)
 	}
 	info, _ := output.Stat()
 	if info.Size() != 0 {

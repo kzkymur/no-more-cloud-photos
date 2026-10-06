@@ -79,7 +79,13 @@ func validateVideoContainer(file *os.File, size int64, kind string, audioExpecte
 			}
 		case "moov":
 			facts.moov++
-			if !walkBMFF(file, box.payloadOffset, box.end, 1, &boxCount, &facts) {
+			valid := false
+			if kind == "mp4-av1" {
+				valid = parseMovie(file, box, &boxCount, &facts)
+			} else {
+				valid = walkBMFF(file, box.payloadOffset, box.end, 1, &boxCount, &facts)
+			}
+			if !valid {
 				return false
 			}
 		case "meta":
@@ -135,15 +141,11 @@ func walkBMFF(file *os.File, offset, limit int64, depth int, count *int, facts *
 		if !ok || box.next <= offset {
 			return false
 		}
-		*count++
+		(*count)++
 		if *count > maxBMFFBoxes {
 			return false
 		}
-		if box.typ == "stsd" {
-			if !parseSTSD(file, box, facts) {
-				return false
-			}
-		} else if box.typ == "av1C" {
+		if box.typ == "av1C" {
 			facts.video["av01"]++
 		} else if isContainerBox(box.typ) {
 			childOffset := box.payloadOffset
@@ -162,7 +164,112 @@ func walkBMFF(file *os.File, offset, limit int64, depth int, count *int, facts *
 	return offset == limit
 }
 
-func parseSTSD(file *os.File, box bmffBox, facts *bmffFacts) bool {
+func parseMovie(file *os.File, box bmffBox, count *int, facts *bmffFacts) bool {
+	offset := box.payloadOffset
+	for offset < box.end {
+		child, ok := readCountedBMFFBox(file, offset, box.end, count)
+		if !ok {
+			return false
+		}
+		if child.typ == "trak" && !parseTrack(file, child, count, facts) {
+			return false
+		}
+		offset = child.next
+	}
+	return offset == box.end
+}
+
+func parseTrack(file *os.File, box bmffBox, count *int, facts *bmffFacts) bool {
+	var media bmffBox
+	mediaCount := 0
+	for offset := box.payloadOffset; offset < box.end; {
+		child, ok := readCountedBMFFBox(file, offset, box.end, count)
+		if !ok {
+			return false
+		}
+		if child.typ == "mdia" {
+			media, mediaCount = child, mediaCount+1
+		}
+		offset = child.next
+	}
+	return mediaCount == 1 && parseMedia(file, media, count, facts)
+}
+
+func parseMedia(file *os.File, box bmffBox, count *int, facts *bmffFacts) bool {
+	var handler, mediaInfo bmffBox
+	handlerCount, mediaInfoCount := 0, 0
+	for offset := box.payloadOffset; offset < box.end; {
+		child, ok := readCountedBMFFBox(file, offset, box.end, count)
+		if !ok {
+			return false
+		}
+		switch child.typ {
+		case "hdlr":
+			handler, handlerCount = child, handlerCount+1
+		case "minf":
+			mediaInfo, mediaInfoCount = child, mediaInfoCount+1
+		}
+		offset = child.next
+	}
+	if handlerCount != 1 || mediaInfoCount != 1 {
+		return false
+	}
+	handlerType, ok := parseHandler(file, handler)
+	if !ok || handlerType != "vide" && handlerType != "soun" || !parseMediaInfo(file, mediaInfo, handlerType, count) {
+		return false
+	}
+	if handlerType == "vide" {
+		facts.video["av01"]++
+	} else {
+		facts.audio["mp4a"]++
+	}
+	return true
+}
+
+func parseHandler(file *os.File, box bmffBox) (string, bool) {
+	// FullBox header, pre_defined, handler_type, and three reserved words.
+	if box.end-box.payloadOffset < 24 {
+		return "", false
+	}
+	var data [12]byte
+	if !readExactAt(file, box.payloadOffset, data[:]) || data[0] != 0 {
+		return "", false
+	}
+	return string(data[8:12]), true
+}
+
+func parseMediaInfo(file *os.File, box bmffBox, handler string, count *int) bool {
+	var sampleTable bmffBox
+	sampleTableCount := 0
+	for offset := box.payloadOffset; offset < box.end; {
+		child, ok := readCountedBMFFBox(file, offset, box.end, count)
+		if !ok {
+			return false
+		}
+		if child.typ == "stbl" {
+			sampleTable, sampleTableCount = child, sampleTableCount+1
+		}
+		offset = child.next
+	}
+	if sampleTableCount != 1 {
+		return false
+	}
+	var sampleDescription bmffBox
+	sampleDescriptionCount := 0
+	for offset := sampleTable.payloadOffset; offset < sampleTable.end; {
+		child, ok := readCountedBMFFBox(file, offset, sampleTable.end, count)
+		if !ok {
+			return false
+		}
+		if child.typ == "stsd" {
+			sampleDescription, sampleDescriptionCount = child, sampleDescriptionCount+1
+		}
+		offset = child.next
+	}
+	return sampleDescriptionCount == 1 && parseSTSD(file, sampleDescription, handler, count)
+}
+
+func parseSTSD(file *os.File, box bmffBox, handler string, count *int) bool {
 	if box.end-box.payloadOffset < 8 {
 		return false
 	}
@@ -171,46 +278,181 @@ func parseSTSD(file *os.File, box bmffBox, facts *bmffFacts) bool {
 		return false
 	}
 	entries := binary.BigEndian.Uint32(header[4:])
-	if entries == 0 || entries > 32 {
+	if header[0] != 0 || entries != 1 {
 		return false
 	}
 	offset := box.payloadOffset + 8
 	for range entries {
-		entry, ok := readBMFFBox(file, offset, box.end)
-		if !ok || entry.next <= offset {
+		entry, ok := readCountedBMFFBox(file, offset, box.end, count)
+		if !ok {
 			return false
 		}
-		if isVideoEntry(entry.typ) {
-			facts.video[entry.typ]++
-		} else if isAudioEntry(entry.typ) {
-			facts.audio[entry.typ]++
+		if handler == "vide" {
+			if entry.typ != "av01" || !parseVisualSampleEntry(file, entry, count) {
+				return false
+			}
+		} else if entry.typ != "mp4a" || !parseAudioSampleEntry(file, entry, count) {
+			return false
 		}
 		offset = entry.next
 	}
 	return offset == box.end
 }
 
+func parseVisualSampleEntry(file *os.File, entry bmffBox, count *int) bool {
+	// SampleEntry (8 bytes) followed by the 70-byte VisualSampleEntry fields.
+	if entry.end-entry.payloadOffset < 78 {
+		return false
+	}
+	var data [78]byte
+	if !readExactAt(file, entry.payloadOffset, data[:]) || binary.BigEndian.Uint16(data[6:8]) == 0 ||
+		binary.BigEndian.Uint16(data[24:26]) == 0 || binary.BigEndian.Uint16(data[26:28]) == 0 ||
+		binary.BigEndian.Uint32(data[28:32]) == 0 || binary.BigEndian.Uint32(data[32:36]) == 0 ||
+		binary.BigEndian.Uint16(data[40:42]) == 0 || data[42] > 31 ||
+		binary.BigEndian.Uint16(data[74:76]) == 0 {
+		return false
+	}
+	av1C := 0
+	for offset := entry.payloadOffset + int64(len(data)); offset < entry.end; {
+		child, ok := readCountedBMFFBox(file, offset, entry.end, count)
+		if !ok {
+			return false
+		}
+		if child.typ == "av1C" {
+			av1C++
+			var config [4]byte
+			if child.end-child.payloadOffset < int64(len(config)) || !readExactAt(file, child.payloadOffset, config[:]) || config[0] != 0x81 {
+				return false
+			}
+		}
+		offset = child.next
+	}
+	return av1C == 1
+}
+
+func parseAudioSampleEntry(file *os.File, entry bmffBox, count *int) bool {
+	// This output contract uses version-0 AudioSampleEntry with an ES descriptor.
+	if entry.end-entry.payloadOffset < 28 {
+		return false
+	}
+	var data [28]byte
+	if !readExactAt(file, entry.payloadOffset, data[:]) || binary.BigEndian.Uint16(data[6:8]) == 0 ||
+		binary.BigEndian.Uint16(data[8:10]) != 0 || binary.BigEndian.Uint16(data[16:18]) == 0 ||
+		binary.BigEndian.Uint16(data[18:20]) == 0 || binary.BigEndian.Uint32(data[24:28]) == 0 {
+		return false
+	}
+	esds := 0
+	for offset := entry.payloadOffset + int64(len(data)); offset < entry.end; {
+		child, ok := readCountedBMFFBox(file, offset, entry.end, count)
+		if !ok {
+			return false
+		}
+		if child.typ == "esds" {
+			esds++
+			if !parseESDS(file, child) {
+				return false
+			}
+		}
+		offset = child.next
+	}
+	return esds == 1
+}
+
+func parseESDS(file *os.File, box bmffBox) bool {
+	if box.end-box.payloadOffset < 4 {
+		return false
+	}
+	var fullBox [4]byte
+	if !readExactAt(file, box.payloadOffset, fullBox[:]) || fullBox[0] != 0 {
+		return false
+	}
+	tag, payload, end, ok := readDescriptor(file, box.payloadOffset+4, box.end)
+	if !ok || tag != 0x03 || end != box.end || end-payload < 3 {
+		return false
+	}
+	var flags [3]byte
+	if !readExactAt(file, payload, flags[:]) {
+		return false
+	}
+	offset := payload + 3
+	if flags[2]&0x80 != 0 {
+		if end-offset < 2 {
+			return false
+		}
+		offset += 2
+	}
+	if flags[2]&0x40 != 0 {
+		var length [1]byte
+		if offset >= end || !readExactAt(file, offset, length[:]) {
+			return false
+		}
+		if int64(length[0]) > end-offset-1 {
+			return false
+		}
+		offset += 1 + int64(length[0])
+	}
+	if flags[2]&0x20 != 0 {
+		if end-offset < 2 {
+			return false
+		}
+		offset += 2
+	}
+	decoderTag, decoderPayload, decoderEnd, ok := readDescriptor(file, offset, end)
+	if !ok || decoderTag != 0x04 || decoderEnd-decoderPayload < 13 {
+		return false
+	}
+	var decoder [13]byte
+	if !readExactAt(file, decoderPayload, decoder[:]) || decoder[0] != 0x40 || decoder[1]>>2 != 0x05 {
+		return false
+	}
+	configTag, configPayload, configEnd, ok := readDescriptor(file, decoderPayload+13, decoderEnd)
+	if !ok || configTag != 0x05 || configEnd-configPayload < 2 {
+		return false
+	}
+	var config [2]byte
+	// Audio Object Type 2 is AAC Low Complexity, the required output profile.
+	return readExactAt(file, configPayload, config[:]) && config[0]>>3 == 2
+}
+
+func readDescriptor(file *os.File, offset, limit int64) (byte, int64, int64, bool) {
+	if offset < 0 || offset >= limit {
+		return 0, 0, 0, false
+	}
+	var value [1]byte
+	if !readExactAt(file, offset, value[:]) {
+		return 0, 0, 0, false
+	}
+	tag := value[0]
+	offset++
+	length := uint64(0)
+	for i := 0; i < 4; i++ {
+		if offset >= limit || !readExactAt(file, offset, value[:]) || length > (^uint64(0)>>7) {
+			return 0, 0, 0, false
+		}
+		offset++
+		length = length<<7 | uint64(value[0]&0x7f)
+		if value[0]&0x80 == 0 {
+			if length > uint64(limit-offset) {
+				return 0, 0, 0, false
+			}
+			return tag, offset, offset + int64(length), true
+		}
+	}
+	return 0, 0, 0, false
+}
+
+func readCountedBMFFBox(file *os.File, offset, limit int64, count *int) (bmffBox, bool) {
+	box, ok := readBMFFBox(file, offset, limit)
+	if !ok || box.next <= offset || *count >= maxBMFFBoxes {
+		return bmffBox{}, false
+	}
+	(*count)++
+	return box, true
+}
+
 func isContainerBox(typ string) bool {
 	switch typ {
 	case "trak", "mdia", "minf", "stbl", "edts", "dinf", "mvex", "moof", "traf", "meta", "iprp", "ipco":
-		return true
-	default:
-		return false
-	}
-}
-
-func isVideoEntry(typ string) bool {
-	switch typ {
-	case "av01", "avc1", "avc3", "hvc1", "hev1", "vp08", "vp09":
-		return true
-	default:
-		return false
-	}
-}
-
-func isAudioEntry(typ string) bool {
-	switch typ {
-	case "mp4a", "ac-3", "ec-3", "Opus", "fLaC":
 		return true
 	default:
 		return false

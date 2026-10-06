@@ -20,10 +20,7 @@ import (
 
 type probeDocument struct {
 	Streams []probeStream `json:"streams"`
-	Frames  []struct {
-		SideDataList []map[string]interface{} `json:"side_data_list"`
-	} `json:"frames"`
-	Format struct {
+	Format  struct {
 		FormatName string `json:"format_name"`
 	} `json:"format"`
 }
@@ -63,13 +60,15 @@ type mediaProbe struct {
 	rotation      string
 	pts           []int64
 	durationTicks int64
+	displayWidth  *big.Rat
+	displayHeight *big.Rat
 }
 
 func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaProbe, error) {
 	if !oneOf(mime, "video/mp4", "video/quicktime") {
 		return inspection{}, nil, fail("unsupported_input")
 	}
-	stdout, _, err := e.run.run(e.ffprobe, []string{"-v", "error", "-threads", "1", "-read_intervals", "%+#1", "-show_format", "-show_streams", "-show_frames", "-show_entries", "stream:format:frame=side_data_list", "-of", "json", path}, 1<<20)
+	stdout, _, err := e.run.run(e.ffprobe, []string{"-v", "error", "-threads", "1", "-show_format", "-show_streams", "-show_entries", "stream:format", "-of", "json", path}, 1<<20)
 	if err != nil {
 		return inspection{}, nil, fail("decode_failed")
 	}
@@ -108,13 +107,18 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 	if err != nil {
 		return inspection{}, nil, err
 	}
-	displayWidth, err := scaledAxis(video.Width, sar.Numerator, sar.Denominator)
+	displayWidthExact := new(big.Rat).Mul(new(big.Rat).SetInt64(int64(video.Width)), new(big.Rat).SetFrac(big.NewInt(sar.Numerator), big.NewInt(sar.Denominator)))
+	displayHeightExact := new(big.Rat).SetInt64(int64(video.Height))
+	if rotation == 90 || rotation == 270 {
+		displayWidthExact, displayHeightExact = displayHeightExact, displayWidthExact
+	}
+	displayWidth, err := floorRationalAxis(displayWidthExact)
 	if err != nil {
 		return inspection{}, nil, fail("unsupported_input")
 	}
-	displayHeight := video.Height
-	if rotation == 90 || rotation == 270 {
-		displayWidth, displayHeight = displayHeight, displayWidth
+	displayHeight, err := floorRationalAxis(displayHeightExact)
+	if err != nil {
+		return inspection{}, nil, fail("unsupported_input")
 	}
 	if displayWidth > limit.Dimension || displayHeight > limit.Dimension {
 		return inspection{}, nil, fail("resource_limit")
@@ -123,15 +127,11 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 	if err != nil || timeBase.Numerator <= 0 {
 		return inspection{}, nil, fail("unsupported_input")
 	}
-	var frameSideData []map[string]interface{}
-	if len(document.Frames) > 0 {
-		frameSideData = document.Frames[0].SideDataList
-	}
-	primaries, transfer, matrix, colorRange, hdr, peak, mastering, maxCLL, err := classifyColor(video, frameSideData)
+	facts, err := e.frameFacts(path, videoIndex, video.Width, video.Height, timeBase, video.DurationTicks, limit)
 	if err != nil {
 		return inspection{}, nil, err
 	}
-	facts, err := e.frameFacts(path, videoIndex, video.Width, video.Height, timeBase, video.DurationTicks, limit)
+	primaries, transfer, matrix, colorRange, hdr, peak, mastering, maxCLL, err := classifyColor(video, facts.frameHDR)
 	if err != nil {
 		return inspection{}, nil, err
 	}
@@ -156,7 +156,14 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 		}
 		selectedAudio = &audio
 	}
-	return i, &mediaProbe{inspection: i, document: document, video: video, audio: selectedAudio, rotation: rotationSource, pts: facts.pts, durationTicks: facts.durationTicks}, nil
+	return i, &mediaProbe{inspection: i, document: document, video: video, audio: selectedAudio, rotation: rotationSource, pts: facts.pts, durationTicks: facts.durationTicks, displayWidth: displayWidthExact, displayHeight: displayHeightExact}, nil
+}
+
+type hdrEvidence struct {
+	mastering int
+	cll       int
+	present   bool
+	invalid   bool
 }
 
 type frameAccounting struct {
@@ -165,35 +172,59 @@ type frameAccounting struct {
 	durationTicks int64
 	fps           rational
 	decodedPixels uint64
+	frameHDR      hdrEvidence
 }
 
 func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBase rational, streamDurationTicks int64, limit limits) (frameAccounting, error) {
-	args := []string{"-v", "error", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,pts,duration,pkt_duration,width,height", "-of", "compact=p=0:nk=0", path}
+	args := []string{"-v", "error", "-xerror", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,stream_index,pts,duration,pkt_duration,width,height:frame_side_data=side_data_type,max_luminance,max_content", "-of", "json", path}
 	var result frameAccounting
 	var lastDuration int64
 	err := e.run.stream(e.ffprobe, args, func(reader io.Reader) error {
-		scanner := bufio.NewScanner(reader)
-		scanner.Buffer(make([]byte, 4096), 64<<10)
-		for scanner.Scan() {
-			fields := parseCompactLine(scanner.Text())
-			if fields["media_type"] != "video" {
-				continue
+		decoder := json.NewDecoder(bufio.NewReader(reader))
+		return decodeFrameDocument(decoder, func(frame probeFrame) error {
+			if frame.MediaType != "video" {
+				return nil
 			}
-			pts, err := strconv.ParseInt(fields["pts"], 10, 64)
+			frameStream, err := parseJSONInt(frame.StreamIndex)
+			if err != nil || frameStream != int64(streamIndex) {
+				return fail("unsupported_input")
+			}
+			pts, err := parseJSONInt(frame.PTS)
 			if err != nil || len(result.pts) > 0 && pts <= result.pts[len(result.pts)-1] {
 				return fail("unsupported_input")
 			}
 			if len(result.pts) > 0 {
-				var overflow bool
-				_, overflow = subtractInt64(pts, result.pts[len(result.pts)-1])
+				delta, overflow := subtractInt64(pts, result.pts[len(result.pts)-1])
 				if overflow {
 					return fail("resource_limit")
 				}
+				if delta != lastDuration {
+					return fail("unsupported_input")
+				}
 			}
-			frameWidth, errW := decimalInt(fields["width"])
-			frameHeight, errH := decimalInt(fields["height"])
-			if errW != nil || errH != nil || frameWidth != width || frameHeight != height {
+			frameWidth, errW := parseJSONInt(frame.Width)
+			frameHeight, errH := parseJSONInt(frame.Height)
+			if errW != nil || errH != nil || frameWidth != int64(width) || frameHeight != int64(height) {
 				return fail("unsupported_input")
+			}
+			durationValue := frame.Duration
+			if len(durationValue) == 0 {
+				durationValue = frame.PacketDuration
+			}
+			duration, durationErr := parseJSONInt(durationValue)
+			if durationErr != nil || duration <= 0 {
+				return fail("unsupported_input")
+			}
+			frameHDR, hdrErr := parseHDREvidence(frame.SideDataList)
+			if hdrErr != nil {
+				result.frameHDR.invalid = true
+			} else if frameHDR.present {
+				if result.frameHDR.present && (frameHDR.mastering != result.frameHDR.mastering || frameHDR.cll != result.frameHDR.cll) {
+					result.frameHDR.invalid = true
+				} else {
+					frameHDR.invalid = result.frameHDR.invalid
+					result.frameHDR = frameHDR
+				}
 			}
 			if len(result.pts) == limit.Frames {
 				return fail("resource_limit")
@@ -204,15 +235,9 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 			}
 			result.decodedPixels += pixels
 			result.pts = append(result.pts, pts)
-			durationValue := fields["duration"]
-			if durationValue == "" {
-				durationValue = fields["pkt_duration"]
-			}
-			if durationValue != "" {
-				lastDuration, _ = strconv.ParseInt(durationValue, 10, 64)
-			}
-		}
-		return scanner.Err()
+			lastDuration = duration
+			return nil
+		})
 	})
 	if err != nil {
 		var protocolErr helperError
@@ -221,7 +246,7 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 		}
 		return frameAccounting{}, fail("unsupported_input")
 	}
-	if len(result.pts) == 0 || lastDuration < 0 || streamDurationTicks < 0 {
+	if len(result.pts) == 0 || streamDurationTicks < 0 {
 		return frameAccounting{}, fail("unsupported_input")
 	}
 	span, overflow := subtractInt64(result.pts[len(result.pts)-1], result.pts[0])
@@ -229,10 +254,13 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 		return frameAccounting{}, fail("resource_limit")
 	}
 	durationTicks, overflow := addInt64(span, lastDuration)
-	if streamDurationTicks > 0 {
-		durationTicks, overflow = streamDurationTicks, false
+	if overflow {
+		return frameAccounting{}, fail("resource_limit")
 	}
-	if overflow || durationTicks <= span {
+	if durationTicks <= span {
+		return frameAccounting{}, fail("unsupported_input")
+	}
+	if streamDurationTicks > 0 && streamDurationTicks != durationTicks {
 		return frameAccounting{}, fail("unsupported_input")
 	}
 	durationUS, within, ok := durationMicroseconds(durationTicks, timeBase, limit.DurationUS)
@@ -254,15 +282,78 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 	return result, nil
 }
 
-func parseCompactLine(line string) map[string]string {
-	result := make(map[string]string)
-	for _, field := range strings.Split(line, "|") {
-		name, value, ok := strings.Cut(field, "=")
-		if ok {
-			result[name] = value
+type probeFrame struct {
+	MediaType      string                   `json:"media_type"`
+	StreamIndex    json.RawMessage          `json:"stream_index"`
+	PTS            json.RawMessage          `json:"pts"`
+	Duration       json.RawMessage          `json:"duration"`
+	PacketDuration json.RawMessage          `json:"pkt_duration"`
+	Width          json.RawMessage          `json:"width"`
+	Height         json.RawMessage          `json:"height"`
+	SideDataList   []map[string]interface{} `json:"side_data_list"`
+}
+
+func decodeFrameDocument(decoder *json.Decoder, consume func(probeFrame) error) error {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return fail("unsupported_input")
+	}
+	foundFrames := false
+	for decoder.More() {
+		name, err := decoder.Token()
+		if err != nil {
+			return fail("unsupported_input")
+		}
+		if name != "frames" {
+			var ignored json.RawMessage
+			if decoder.Decode(&ignored) != nil {
+				return fail("unsupported_input")
+			}
+			continue
+		}
+		if foundFrames {
+			return fail("unsupported_input")
+		}
+		foundFrames = true
+		token, err = decoder.Token()
+		if err != nil || token != json.Delim('[') {
+			return fail("unsupported_input")
+		}
+		for decoder.More() {
+			var frame probeFrame
+			if decoder.Decode(&frame) != nil {
+				return fail("unsupported_input")
+			}
+			if err := consume(frame); err != nil {
+				return err
+			}
+		}
+		if token, err = decoder.Token(); err != nil || token != json.Delim(']') {
+			return fail("unsupported_input")
 		}
 	}
-	return result
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') || !foundFrames {
+		return fail("unsupported_input")
+	}
+	if _, err = decoder.Token(); err != io.EOF {
+		return fail("unsupported_input")
+	}
+	return nil
+}
+
+func parseJSONInt(value json.RawMessage) (int64, error) {
+	if len(value) == 0 {
+		return 0, errors.New("missing integer")
+	}
+	text := string(value)
+	if value[0] == '"' {
+		decoded, err := strconv.Unquote(text)
+		if err != nil {
+			return 0, err
+		}
+		text = decoded
+	}
+	return strconv.ParseInt(text, 10, 64)
 }
 
 func selectStream(streams []probeStream, kind string) (int, bool) {
@@ -347,7 +438,7 @@ func exactRotation(value int) (int, bool) {
 	return value, value == 0 || value == 90 || value == 180 || value == 270
 }
 
-func classifyColor(stream probeStream, frameSideData []map[string]interface{}) (string, string, string, string, bool, int, int, int, error) {
+func classifyColor(stream probeStream, frameHDR hdrEvidence) (string, string, string, string, bool, int, int, int, error) {
 	primaries := stream.ColorPrimaries
 	transfer := stream.ColorTransfer
 	matrix := stream.ColorSpace
@@ -362,14 +453,15 @@ func classifyColor(stream probeStream, frameSideData []map[string]interface{}) (
 		if transfer == "arib-std-b67" {
 			return primaries, transfer, matrix, rangeName, true, 1000, 0, 0, nil
 		}
-		mastering, cll, masteringCount, cllCount := hdrFacts(stream.SideDataList)
-		if masteringCount == 0 && cllCount == 0 {
-			mastering, cll, masteringCount, cllCount = hdrFacts(frameSideData)
-		}
-		if masteringCount != 1 || cllCount != 1 || mastering <= 0 || cll <= 0 || cll > mastering {
+		streamHDR, evidenceErr := parseHDREvidence(stream.SideDataList)
+		if evidenceErr != nil || frameHDR.invalid || !streamHDR.present && !frameHDR.present || streamHDR.present && frameHDR.present && (streamHDR.mastering != frameHDR.mastering || streamHDR.cll != frameHDR.cll) {
 			return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 		}
-		return primaries, transfer, matrix, rangeName, true, mastering, mastering, cll, nil
+		evidence := streamHDR
+		if !evidence.present {
+			evidence = frameHDR
+		}
+		return primaries, transfer, matrix, rangeName, true, evidence.mastering, evidence.mastering, evidence.cll, nil
 	}
 	bt709 := primaries == "bt709" && matrix == "bt709"
 	bt2020 := primaries == "bt2020" && oneOf(matrix, "bt2020nc", "bt2020c")
@@ -377,6 +469,17 @@ func classifyColor(stream probeStream, frameSideData []map[string]interface{}) (
 		return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 	}
 	return primaries, transfer, matrix, rangeName, false, 0, 0, 0, nil
+}
+
+func parseHDREvidence(sideData []map[string]interface{}) (hdrEvidence, error) {
+	mastering, cll, masteringCount, cllCount := hdrFacts(sideData)
+	if masteringCount == 0 && cllCount == 0 {
+		return hdrEvidence{}, nil
+	}
+	if masteringCount != 1 || cllCount != 1 || mastering <= 0 || cll <= 0 || cll > mastering {
+		return hdrEvidence{}, errors.New("invalid HDR evidence")
+	}
+	return hdrEvidence{mastering: mastering, cll: cll, present: true}, nil
 }
 
 func hdrFacts(sideData []map[string]interface{}) (mastering, cll, masteringCount, cllCount int) {
@@ -456,16 +559,15 @@ func parseRationalDefault(value string, fallback rational) (rational, error) {
 	return parseRational(value)
 }
 
-func scaledAxis(axis int, n, d int64) (int, error) {
-	hi, lo := bits.Mul64(uint64(axis), uint64(n))
-	if hi != 0 || d <= 0 || lo > uint64(math.MaxInt64)-uint64(d/2) {
-		return 0, errors.New("overflow")
-	}
-	value := (lo + uint64(d/2)) / uint64(d)
-	if value == 0 || value > maxDimension {
+func floorRationalAxis(value *big.Rat) (int, error) {
+	if value == nil || value.Sign() <= 0 {
 		return 0, errors.New("invalid display axis")
 	}
-	return int(value), nil
+	floor := new(big.Int).Quo(value.Num(), value.Denom())
+	if !floor.IsInt64() || floor.Sign() <= 0 || floor.Int64() > maxDimension {
+		return 0, errors.New("invalid display axis")
+	}
+	return int(floor.Int64()), nil
 }
 
 func rationalAxisWithin(axis int, n, d int64, limit int) bool {

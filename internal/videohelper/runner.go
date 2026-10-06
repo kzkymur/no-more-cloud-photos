@@ -80,6 +80,7 @@ func (osCommandRunner) stream(path string, args []string, consume func(io.Reader
 	}
 	defer closeFiles(files)
 	cmd.ExtraFiles = files
+	cmd.SysProcAttr = &unix.SysProcAttr{Setpgid: true}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -90,14 +91,34 @@ func (osCommandRunner) stream(path string, args []string, consume func(io.Reader
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	consumeErr := consume(stdout)
+	consumeResult := make(chan error, 1)
+	go func() { consumeResult <- consume(stdout) }()
+
+	var consumeErr error
+	select {
+	case consumeErr = <-consumeResult:
+	case <-exceeded:
+		_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+		_ = stdout.Close()
+		consumeErr = <-consumeResult
+	}
 	if consumeErr != nil {
+		_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
 		_ = stdout.Close()
 	}
-	if stderr.exceeded.Load() {
-		_ = cmd.Process.Kill()
+
+	waitResult := make(chan error, 1)
+	go func() { waitResult <- cmd.Wait() }()
+	var waitErr error
+	select {
+	case waitErr = <-waitResult:
+	case <-exceeded:
+		_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+		_ = stdout.Close()
+		waitErr = <-waitResult
 	}
-	waitErr := cmd.Wait()
+	// Remove descendants that retained codec descriptors after their parent exited.
+	_ = unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
 	if stderr.exceeded.Load() {
 		return fail("resource_limit")
 	}
