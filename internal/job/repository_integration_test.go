@@ -1336,6 +1336,15 @@ func integrationRepository(t *testing.T, options Options) (*pgxpool.Pool, *Repos
 	if err := migrator.Up(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// Publication tests need executable pinned profiles. Capability
+	// certification/activation behavior is covered by the profile/schema suites;
+	// this package isolates publication by installing valid bundled definitions
+	// as previously activated profiles.
+	if _, err := pool.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER USER;
+		UPDATE profiles SET status='active',activated_at=clock_timestamp() WHERE status='draft';
+		ALTER TABLE profiles ENABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
 	if options.FileBaseURL == "" {
 		options.FileBaseURL = "https://files.example.test/files/"
 	}
@@ -1534,7 +1543,28 @@ func ensureVersionProfile(t *testing.T, pool *pgxpool.Pool, key string, version 
 		t.Fatal(err)
 	}
 	if activate && status == "draft" {
-		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, profileID); err != nil {
+		// Model a profile that was activated while its older queued Jobs retained
+		// their pinned IDs. The schema's certification and monotonic activation
+		// paths are independently tested; publication only consumes that history.
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err = tx.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER USER`); err == nil {
+			_, err = tx.Exec(ctx, `UPDATE profiles SET status='retired',retired_at=COALESCE(retired_at,clock_timestamp())
+				WHERE key=$2 AND status='active' AND id<>$1`, profileID, key)
+		}
+		if err == nil {
+			_, err = tx.Exec(ctx, `UPDATE profiles SET status='active',activated_at=COALESCE(activated_at,clock_timestamp()),retired_at=NULL WHERE id=$1`, profileID)
+		}
+		if err == nil {
+			_, err = tx.Exec(ctx, `ALTER TABLE profiles ENABLE TRIGGER USER`)
+		}
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
