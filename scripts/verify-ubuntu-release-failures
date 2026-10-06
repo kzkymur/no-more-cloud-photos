@@ -6,11 +6,16 @@ work=$(/usr/bin/mktemp -d /run/nmcp-release-failures.XXXXXX)
 units=(nmcp-api.service nmcp-worker.service nmcp-files.service nmcp-migrate.service nmcp.target nmcp.slice postgresql@nmcp-test.service)
 predispatch_pid=
 installer_pid=
+registration_pid=
 cleanup() {
   /usr/bin/touch "$work/ownerdeath-proceed" 2>/dev/null || true
+  /usr/bin/touch /run/nmcp-deploy/test-runner-record.go \
+    /run/nmcp-deploy/test-before-admin-dispatch.go 2>/dev/null || true
   [[ -z $predispatch_pid ]] || /usr/bin/kill "$predispatch_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/kill "$installer_pid" 2>/dev/null || true
+  [[ -z $registration_pid ]] || /usr/bin/kill "$registration_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$installer_pid-1.service" >/dev/null 2>&1 || true
+  [[ -z $registration_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$registration_pid-1.service" >/dev/null 2>&1 || true
   for _attempt in {1..50}; do
     if ! compgen -G '/run/nmcp-deploy/migration-handoff.*' >/dev/null \
       && ! compgen -G '/run/nmcp-deploy/migration-runner.*' >/dev/null; then break; fi
@@ -78,6 +83,7 @@ make_release migratefail
 make_release startfail
 make_release candidate
 make_release pgfail
+make_release queuefail
 make_release predispatch
 make_release ownerdeath
 /usr/bin/printf '#!/bin/sh\nexit 1\n' > /opt/nmcp/releases/migratefail/bin/nmcp-admin
@@ -139,6 +145,39 @@ if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=pgfail' "$work/pgfail.out"; then
   printf 'admin binary entered despite PostgreSQL start failure\n' >&2; exit 1
 fi
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
+
+# A transient job queued behind a never-ready but finitely bounded PostgreSQL
+# start must hit its own queue deadline and release every deployment resource.
+cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
+[Service]
+Type=notify
+ExecStart=/usr/bin/sleep infinity
+TimeoutStartSec=45s
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
+queue_started=$(/usr/bin/date +%s)
+if NMCP_TEST_ADMIN_JOB_TIMEOUT=2s \
+  "$repo/scripts/install-ubuntu-release" activate queuefail >"$work/queuefail.out" 2>&1; then
+  printf 'never-runnable dependency unexpectedly activated release\n' >&2; exit 1
+fi
+queue_elapsed=$(( $(/usr/bin/date +%s) - queue_started ))
+((queue_elapsed < 10)) || { printf 'transient queue timeout was not enforced\n' >&2; exit 1; }
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=queuefail' "$work/queuefail.out"; then
+  printf 'queued admin binary entered before PostgreSQL readiness\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+for attempt in {1..100}; do
+  if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
+    && /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'queue timeout retained deployment locks\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+if compgen -G '/run/nmcp-deploy/migration-handoff.*' >/dev/null \
+  || compgen -G '/run/nmcp-deploy/migration-runner.*' >/dev/null; then
+  printf 'queue timeout leaked broker state\n' >&2; exit 1
+fi
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
 Type=notify
@@ -151,8 +190,23 @@ EOF
 
 /usr/bin/rm -f "$work/postgresql-started" "$work/postgresql-ready"
 /usr/bin/touch "$work/postgresql-slow"
-if "$repo/scripts/install-ubuntu-release" activate startfail >"$work/startfail.out" 2>&1; then
+/usr/bin/rm -f /run/nmcp-deploy/test-runner-record.{ready,go}
+NMCP_TEST_PAUSE_AFTER_RUNNER_RECORD=1 \
+  "$repo/scripts/install-ubuntu-release" activate startfail >"$work/startfail.out" 2>&1 &
+registration_pid=$!
+for attempt in {1..100}; do
+  [[ -e /run/nmcp-deploy/test-runner-record.ready ]] && break
+  [[ $attempt -lt 100 ]] || { printf 'tracked runner was not registered before dispatch\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+compgen -G "/run/nmcp-deploy/migration-runner.$registration_pid.*" >/dev/null
+/usr/bin/touch /run/nmcp-deploy/test-runner-record.go
+if wait "$registration_pid"; then
   printf 'service startup failure unexpectedly activated release\n' >&2; exit 1
+fi
+/usr/bin/rm -f /run/nmcp-deploy/test-runner-record.{ready,go}
+if compgen -G "/run/nmcp-deploy/migration-runner.$registration_pid.*" >/dev/null; then
+  printf 'fast completed runner record leaked after wait\n' >&2; exit 1
 fi
 /usr/bin/cat "$work/startfail.out"
 [[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=startfail' "$work/startfail.out") -eq 1 ]] || {

@@ -146,7 +146,7 @@ stop_services() {
 admin_sequence=0
 run_admin() {
   local admin_release=$1 operation=$2 subcommand=$3
-  local handoff broker runner runner_file status=0 unit
+  local handoff broker job_timeout runner runner_file status=0 unit
   admin_sequence=$((admin_sequence + 1))
   handoff=/run/nmcp-deploy/migration-handoff.$$.$admin_sequence
   runner_file=/run/nmcp-deploy/migration-runner.$$.$admin_sequence
@@ -177,11 +177,14 @@ run_admin() {
       /usr/bin/sleep 0.01
     done
   fi
-  /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="$unit" \
+  job_timeout=${NMCP_TEST_ADMIN_JOB_TIMEOUT:-5min}
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$runner_file" \
+    /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="$unit" \
     --property=Slice=nmcp.slice \
     --property="Requires=$postgresql_unit" --property="After=$postgresql_unit" \
     --property=EnvironmentFile=/etc/nmcp/admin.env \
-    --property=TimeoutStartSec=15min --property=RuntimeMaxSec=15min \
+    --property="JobTimeoutSec=$job_timeout" --property=TimeoutStartSec=15min \
+    --property=TimeoutStopSec=30s --property=RuntimeMaxSec=15min \
     --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
     --property=ProtectSystem=strict --property=ProtectHome=yes \
     -- /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock receive "$handoff" \
@@ -190,14 +193,10 @@ run_admin() {
     "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json \
     8>&- 9>&- &
   runner=$!
-  if ! /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock \
-    record-runner "$runner_file" "$runner"; then
-    /usr/bin/kill "$runner" "$broker" 2>/dev/null || true
-    wait "$runner" 2>/dev/null || true
-    wait "$broker" 2>/dev/null || true
-    return 1
-  fi
   wait "$runner" || status=$?
+  if ((status != 0)); then
+    /usr/bin/systemctl stop "$unit" >/dev/null 2>&1 || true
+  fi
   if ! wait "$broker"; then status=1; fi
   /usr/bin/rm -f -- "$handoff" "$runner_file"
   return "$status"

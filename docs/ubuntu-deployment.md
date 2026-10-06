@@ -126,7 +126,9 @@ are refused before any asset changes.
 All stage/activate/rollback/host/TLS mutations and every direct or
 dependency-triggered `nmcp-migrate.service` execution share the deployment
 serializer. Both stable lock inodes live below root:root mode-0700
-`/run/nmcp-deploy`, not the world-writable `/run/lock`. A no-follow dirfd opener
+`/run/nmcp-deploy`, not the world-writable `/run/lock`. The opener first proves
+`/run` itself is root-owned and has no group/world write bits, then anchors all
+creation through that validated dirfd. A no-follow dirfd opener
 creates them mode 0600 and rejects symlinks, non-regular files, foreign
 ownership, extra hard links, mode drift, or pathname/inode replacement before
 locking. The installer process itself opens and retains the primary lock FD
@@ -142,11 +144,15 @@ receiver verifies the descriptor and acknowledges ownership before database
 work. Thus installer death before transfer prevents execution, while death after
 transfer leaves the child holding the lease and blocks every new
 host/release/TLS/direct-migration mutation until the exact binary exits.
-The concrete database unit must expose a finite `TimeoutStartUSec`. The broker
-tracks the exact `systemd-run` PID/start time rather than running an independent
-pre-database timer: it remains valid through that bounded database start job and
-the 15-minute transient admin deadline, and releases
-automatically if the dispatch owner or runner exits before transfer.
+The concrete database unit must expose a finite `TimeoutStartUSec`. Before it
+can dispatch anything, a tracked runner writes its own PID/start-time record and
+then `exec`s `systemd-run` without changing identity; the broker also pins that
+identity with a pidfd. The transient has a five-minute queue `JobTimeoutSec`, a
+15-minute runtime deadline, and a 30-second stop deadline. Thus the broker has no
+independent pre-database timer, but queued dependency jobs and running admin work
+are both bounded. It releases automatically if the dispatch owner or exact
+runner exits before transfer, and owns cleanup of the runner record through
+terminal runner exit.
 Successful oneshot migration remains active so production
 API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.

@@ -5,6 +5,7 @@ import array
 import fcntl
 import os
 import pathlib
+import select
 import socket
 import stat
 import sys
@@ -35,6 +36,21 @@ def process_start(pid: int) -> str | None:
     return value[value.rfind(")") + 2 :].split()[19]
 
 
+def load_runner(runner_file: str) -> tuple[int, str, int] | None:
+    try:
+        fields = pathlib.Path(runner_file).read_text().split()
+        pid, start = int(fields[0]), fields[1]
+    except (FileNotFoundError, IndexError, ValueError):
+        return None
+    if process_start(pid) != start:
+        fail("tracked systemd-run identity exited or was replaced")
+    pidfd = os.pidfd_open(pid)
+    if process_start(pid) != start:
+        os.close(pidfd)
+        fail("tracked systemd-run identity changed during pidfd acquisition")
+    return pid, start, pidfd
+
+
 def send_fd(
     socket_path: str, lock_path: str, descriptor: int, owner_pid: int, runner_file: str
 ) -> None:
@@ -51,40 +67,45 @@ def send_fd(
         owner_start = process_start(owner_pid)
         if owner_start is None:
             fail("dispatch owner is already gone")
-        runner: tuple[int, str] | None = None
+        runner: tuple[int, str, int] | None = None
         while True:
+            if runner is None:
+                runner = load_runner(runner_file)
             try:
                 connection, _ = listener.accept()
                 break
             except TimeoutError:
                 pass
-            try:
-                fields = pathlib.Path(runner_file).read_text().split()
-                candidate = (int(fields[0]), fields[1])
-                runner = candidate
-            except (FileNotFoundError, IndexError, ValueError):
-                pass
             if runner is None:
                 if process_start(owner_pid) != owner_start:
                     fail("dispatch owner died before starting systemd-run")
-            elif process_start(runner[0]) != runner[1]:
+            elif select.select([runner[2]], [], [], 0)[0]:
                 fail("systemd-run exited before lease transfer")
+        if runner is None:
+            runner = load_runner(runner_file)
+        if runner is None:
+            fail("receiver connected before runner identity was registered")
         with connection:
             rights = array.array("i", [descriptor])
             connection.sendmsg([b"L"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
             connection.settimeout(30)
             if connection.recv(2) != b"OK":
                 fail("receiver did not confirm the execution lease")
+        os.close(descriptor)
+        while not select.select([runner[2]], [], [], 0.1)[0]:
+            pass
+        os.close(runner[2])
     finally:
         listener.close()
         pathlib.Path(socket_path).unlink(missing_ok=True)
         pathlib.Path(runner_file).unlink(missing_ok=True)
 
 
-def record_runner(runner_file: str, pid: int) -> None:
+def run_tracked(runner_file: str, command: list[str]) -> None:
+    pid = os.getpid()
     start = process_start(pid)
     if start is None:
-        fail("systemd-run exited before runner registration")
+        fail("cannot identify tracked runner")
     descriptor = os.open(
         runner_file,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -92,6 +113,13 @@ def record_runner(runner_file: str, pid: int) -> None:
     )
     with os.fdopen(descriptor, "w") as target:
         target.write(f"{pid} {start}\n")
+    if os.environ.get("NMCP_TEST_PAUSE_AFTER_RUNNER_RECORD") == "1":
+        pathlib.Path("/run/nmcp-deploy/test-runner-record.ready").touch(mode=0o600)
+        while not pathlib.Path("/run/nmcp-deploy/test-runner-record.go").is_file():
+            import time
+
+            time.sleep(0.01)
+    os.execv(command[0], command)
 
 
 def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
@@ -125,7 +153,7 @@ if len(sys.argv) == 7 and sys.argv[1] == "send":
     send_fd(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
 elif len(sys.argv) >= 5 and sys.argv[1] == "receive":
     receive_fd(sys.argv[2], sys.argv[3], sys.argv[4:])
-elif len(sys.argv) == 4 and sys.argv[1] == "record-runner":
-    record_runner(sys.argv[2], int(sys.argv[3]))
+elif len(sys.argv) >= 4 and sys.argv[1] == "run-tracked":
+    run_tracked(sys.argv[2], sys.argv[3:])
 else:
-    fail("usage: send SOCKET LOCK FD OWNER_PID RUNNER_FILE | record-runner FILE PID | receive SOCKET LOCK COMMAND [ARG ...]")
+    fail("usage: send SOCKET LOCK FD OWNER_PID RUNNER_FILE | run-tracked FILE COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...]")

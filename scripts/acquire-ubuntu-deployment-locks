@@ -16,17 +16,34 @@ def fail(message: str) -> "NoReturn":
     raise SystemExit(f"acquire-ubuntu-deployment-locks: {message}")
 
 
+def trusted_directory(path: str) -> int:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    current = os.fstat(descriptor)
+    visible = os.stat(path, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_uid != 0
+        or current.st_gid != 0
+        or stat.S_IMODE(current.st_mode) & 0o022
+        or (current.st_dev, current.st_ino) != (visible.st_dev, visible.st_ino)
+    ):
+        fail(f"{path} is not a stable non-writable root-owned directory")
+    return descriptor
+
+
 def runtime_fd() -> int:
-    parent = os.stat("/run", follow_symlinks=False)
-    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_gid != 0:
-        fail("/run is not a trusted root-owned directory")
+    parent_descriptor = trusted_directory("/run")
     try:
-        os.mkdir(RUNTIME, 0o700)
+        os.mkdir("nmcp-deploy", 0o700, dir_fd=parent_descriptor)
     except FileExistsError:
         pass
-    descriptor = os.open(RUNTIME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    descriptor = os.open(
+        "nmcp-deploy",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=parent_descriptor,
+    )
     current = os.fstat(descriptor)
-    path = os.stat(RUNTIME, follow_symlinks=False)
+    path = os.stat("nmcp-deploy", dir_fd=parent_descriptor, follow_symlinks=False)
     if (
         not stat.S_ISDIR(current.st_mode)
         or current.st_uid != 0
@@ -35,6 +52,7 @@ def runtime_fd() -> int:
         or (current.st_dev, current.st_ino) != (path.st_dev, path.st_ino)
     ):
         fail("runtime directory must be stable root:root mode 0700")
+    os.close(parent_descriptor)
     return descriptor
 
 
@@ -59,10 +77,17 @@ def lock_fd(directory: int, name: str) -> int:
     return descriptor
 
 
-def install_fd(source: int, target: int) -> None:
-    temporary = fcntl.fcntl(source, fcntl.F_DUPFD_CLOEXEC, 10)
-    os.dup2(temporary, target, inheritable=True)
-    os.close(temporary)
+def install_lock_fds(directory: int, primary: int, execution: int) -> None:
+    safe_directory = fcntl.fcntl(directory, fcntl.F_DUPFD_CLOEXEC, 10)
+    safe_primary = fcntl.fcntl(primary, fcntl.F_DUPFD_CLOEXEC, 10)
+    safe_execution = fcntl.fcntl(execution, fcntl.F_DUPFD_CLOEXEC, 10)
+    for descriptor in {directory, primary, execution}:
+        os.close(descriptor)
+    os.dup2(safe_primary, 9, inheritable=True)
+    os.dup2(safe_execution, 8, inheritable=True)
+    os.close(safe_primary)
+    os.close(safe_execution)
+    os.close(safe_directory)
 
 
 def locked(descriptor: int) -> bool:
@@ -97,11 +122,7 @@ def exec_owner(mode: str, command: list[str]) -> None:
             lock_mode = "delegated"
     else:
         fail("unknown acquisition mode")
-    install_fd(primary, 9)
-    install_fd(execution, 8)
-    os.close(primary)
-    os.close(execution)
-    os.close(directory)
+    install_lock_fds(directory, primary, execution)
     environment = os.environ.copy()
     environment["NMCP_LOCK_MODE"] = lock_mode
     os.execve(command[0], command, environment)
@@ -140,5 +161,7 @@ if len(sys.argv) >= 4 and sys.argv[1] in {"both", "migration"} and sys.argv[2] =
     exec_owner(sys.argv[1], sys.argv[3:])
 elif len(sys.argv) == 3 and sys.argv[1] == "verify":
     verify(sys.argv[2])
+elif len(sys.argv) == 3 and sys.argv[1] == "validate-parent":
+    os.close(trusted_directory(sys.argv[2]))
 else:
-    fail("usage: (both|migration) -- COMMAND [ARG ...] | verify MODE")
+    fail("usage: (both|migration) -- COMMAND [ARG ...] | verify MODE | validate-parent PATH")

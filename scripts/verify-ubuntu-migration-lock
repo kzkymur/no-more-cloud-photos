@@ -29,6 +29,12 @@ EOF
 /usr/bin/chmod 0755 /opt/nmcp/current/bin/nmcp-admin
 /usr/bin/install -d -o root -g root -m 0700 /run/nmcp-deploy
 
+/usr/bin/install -d -o root -g root -m 0770 "$work/unsafe-parent"
+if /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks \
+  validate-parent "$work/unsafe-parent"; then
+  printf 'group-writable root-owned parent was accepted\n' >&2; exit 1
+fi
+
 # Hostile pre-created entries must never be followed, repaired, or locked.
 /usr/bin/install -o nmcp -g nmcp -m 0600 /dev/null /run/nmcp-deploy/deploy.lock
 if /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- /usr/bin/true; then
@@ -49,6 +55,9 @@ if /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- /usr/bin/true
 fi
 /usr/bin/rm -f /run/nmcp-deploy/deploy.lock /run/nmcp-deploy/hardlink-source
 /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- /usr/bin/true
+/usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- \
+  /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks verify direct \
+  3</dev/null 4</dev/null 5</dev/null 6</dev/null 7</dev/null
 
 # Once root established the stable inode, an unprivileged user cannot replace it.
 /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- \
