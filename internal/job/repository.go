@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 const (
@@ -31,11 +32,13 @@ type Repository struct {
 	reclaimBatch  int
 	jitter        func(time.Duration) time.Duration
 	uuid          func() (string, error)
+	fileBaseURL   string
+	checkpoint    func(context.Context, storage.Boundary, string) error
 }
 
 func NewRepository(pool *pgxpool.Pool, options Options) (*Repository, error) {
 	if pool == nil || options.LeaseDuration < 0 || options.LeaseDuration > 0 && options.LeaseDuration.Microseconds() == 0 ||
-		options.ReclaimBatch < 0 || options.ReclaimBatch > 50 {
+		options.ReclaimBatch < 0 || options.ReclaimBatch > 50 || !validFileBaseURL(options.FileBaseURL) {
 		return nil, ErrInvalid
 	}
 	if options.LeaseDuration == 0 {
@@ -50,7 +53,10 @@ func NewRepository(pool *pgxpool.Pool, options Options) (*Repository, error) {
 	if options.UUID == nil {
 		options.UUID = newUUIDv4
 	}
-	return &Repository{pool: pool, leaseDuration: options.LeaseDuration, reclaimBatch: options.ReclaimBatch, jitter: options.Jitter, uuid: options.UUID}, nil
+	return &Repository{
+		pool: pool, leaseDuration: options.LeaseDuration, reclaimBatch: options.ReclaimBatch,
+		jitter: options.Jitter, uuid: options.UUID, fileBaseURL: options.FileBaseURL, checkpoint: options.Checkpoint,
+	}, nil
 }
 
 func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, error) {
@@ -72,6 +78,7 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 	defer rollback(tx)
 
 	var lease Lease
+	var originalID *string
 	err = tx.QueryRow(ctx, `
 		WITH candidate AS (
 			SELECT id FROM jobs
@@ -85,7 +92,7 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 		FROM candidate WHERE j.id=candidate.id
 		RETURNING j.id::text,j.type,j.original_id::text,j.media_id_snapshot::text,j.attempts,j.max_attempts,
 			j.lease_expires_at,j.started_at,j.available_at,j.created_at`, types, token, intervalText(r.leaseDuration)).Scan(
-		&lease.ID, &lease.Type, &lease.OriginalID, &lease.MediaID, &lease.Attempts, &lease.MaxAttempts,
+		&lease.ID, &lease.Type, &originalID, &lease.MediaID, &lease.Attempts, &lease.MaxAttempts,
 		&lease.LeaseExpiresAt, &lease.StartedAt, &lease.AvailableAt, &lease.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Lease{}, ErrNoWork
@@ -94,6 +101,10 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 		return Lease{}, classifyDatabaseError(err)
 	}
 	lease.Token = token
+	lease.Original, err = loadOriginal(ctx, tx, lease.Type, originalID, lease.MediaID)
+	if err != nil {
+		return Lease{}, err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='pending',error_code=NULL,error_message=NULL,updated_at=clock_timestamp() WHERE job_id=$1 AND status='failed'`, lease.ID); err != nil {
 		return Lease{}, classifyDatabaseError(err)
 	}
@@ -392,6 +403,49 @@ func loadTargets(ctx context.Context, tx pgx.Tx, jobID string) ([]Target, error)
 		return nil, classifyDatabaseError(err)
 	}
 	return targets, nil
+}
+
+func loadOriginal(ctx context.Context, tx pgx.Tx, jobType Type, originalID *string, mediaID string) (*Original, error) {
+	if jobType == TypePurge {
+		if originalID != nil {
+			return nil, ErrInvariant
+		}
+		return nil, nil
+	}
+	if jobType != TypeTransform || originalID == nil {
+		return nil, ErrInvariant
+	}
+	var original Original
+	var mediaMIME string
+	err := tx.QueryRow(ctx, `SELECT o.id::text,o.media_id::text,o.relative_path,o.mime_type,o.size_bytes,o.sha256,
+		o.width,o.height,o.duration_ms,m.media_type
+		FROM originals o JOIN media m ON m.id=o.media_id WHERE o.id=$1`, *originalID).Scan(
+		&original.ID, &original.MediaID, &original.RelativePath, &original.MIMEType, &original.SizeBytes,
+		&original.SHA256, &original.Width, &original.Height, &original.DurationMS, &mediaMIME)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrInvariant
+	}
+	if err != nil {
+		return nil, classifyDatabaseError(err)
+	}
+	if original.ID != *originalID || original.MediaID != mediaID || original.MIMEType != mediaMIME ||
+		original.SizeBytes < 0 || !validSHA256(original.SHA256) || (original.Width == nil) != (original.Height == nil) ||
+		original.Width != nil && (*original.Width <= 0 || *original.Height <= 0) || original.DurationMS != nil && *original.DurationMS < 0 {
+		return nil, ErrInvariant
+	}
+	key, err := storage.ParseOriginalKey(original.RelativePath)
+	if err != nil || key.OriginalID().String() != original.ID {
+		return nil, ErrInvariant
+	}
+	extension, err := storage.OriginalExtensionForMIME(original.MIMEType)
+	if err != nil {
+		return nil, ErrInvariant
+	}
+	expectedKey, err := storage.NewOriginalKey(key.OriginalID(), extension)
+	if err != nil || expectedKey.String() != original.RelativePath {
+		return nil, ErrInvariant
+	}
+	return &original, nil
 }
 
 func targetStateError(ctx context.Context, tx pgx.Tx, jobID, targetID string) error {

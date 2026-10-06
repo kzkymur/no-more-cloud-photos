@@ -68,7 +68,7 @@ transactional migrations, non-transactional execution, and recovery.
 |---|---:|---:|---:|---|
 | `NMCP_DATABASE_URL` | required | required | required | PostgreSQL DSN; secret, never logged. |
 | `NMCP_STORAGE_ROOT` | required | required | - | Absolute clean path; never logged. |
-| `NMCP_FILE_BASE_URL` | required | - | - | Absolute HTTPS File Server files root with a non-root path, e.g. `https://photos.example.ts.net/files`; trailing slash is normalized. Core appends the canonical storage key directly and never inserts `/files`. No credentials, query, fragment, dot/empty segments, or encoded path ambiguity. |
+| `NMCP_FILE_BASE_URL` | required | required | - | Absolute HTTPS File Server files root with a non-root path, e.g. `https://photos.example.ts.net/files`; trailing slash is normalized. Core appends the canonical storage key directly and never inserts `/files`. No credentials, query, fragment, dot/empty segments, or encoded path ambiguity. |
 | `NMCP_CURSOR_HMAC_KEY` | required | - | - | At least 32 bytes; secret, never logged. |
 | `NMCP_API_ADDR` | optional | - | - | `127.0.0.1:8080`; explicit host and valid port. |
 | `NMCP_LOG_LEVEL` | optional | optional | optional | `info`; one of `debug`, `info`, `warn`, `error`. |

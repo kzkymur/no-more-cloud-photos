@@ -1,9 +1,12 @@
 package job
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"time"
+
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 var (
@@ -78,10 +81,24 @@ type Target struct {
 	UpdatedAt    time.Time
 }
 
+// Original is the immutable input descriptor pinned by a transform Job.
+// Lease owns this value; callers cannot mutate repository state through it.
+type Original struct {
+	ID           string
+	MediaID      string
+	RelativePath string
+	MIMEType     string
+	SizeBytes    int64
+	SHA256       string
+	Width        *int
+	Height       *int
+	DurationMS   *int64
+}
+
 type Lease struct {
 	ID             string
 	Type           Type
-	OriginalID     *string
+	Original       *Original
 	MediaID        string
 	Token          string
 	Attempts       int
@@ -92,6 +109,47 @@ type Lease struct {
 	CreatedAt      time.Time
 	Targets        []Target
 }
+
+type Rendition struct {
+	ID             string
+	JobID          string
+	LeaseToken     string
+	TargetID       string
+	OriginalID     string
+	MediaID        string
+	ProfileID      string
+	RelativePath   string
+	MIMEType       string
+	Width          *int
+	Height         *int
+	DurationMS     *int64
+	SizeBytes      int64
+	SHA256         string
+	ProcessorAudit json.RawMessage
+}
+
+type Publication struct {
+	RenditionID string
+	Current     bool
+	JobFinished bool
+	CreatedAt   time.Time
+}
+
+// CommitRolledBack proves PostgreSQL rejected COMMIT. The durable rendition
+// file is an orphan and must be retained for reconciliation.
+type CommitRolledBack struct{ Cause error }
+
+func (e *CommitRolledBack) Error() string { return "rendition publication commit was rolled back" }
+func (e *CommitRolledBack) Unwrap() error { return e.Cause }
+
+// CommitOutcomeUnknown means COMMIT may have succeeded. The durable rendition
+// file must never be removed based on this result.
+type CommitOutcomeUnknown struct{ Cause error }
+
+func (e *CommitOutcomeUnknown) Error() string {
+	return "rendition publication commit outcome is unknown"
+}
+func (e *CommitOutcomeUnknown) Unwrap() error { return e.Cause }
 
 type AdminAudit struct {
 	ID                 string
@@ -105,6 +163,8 @@ type Options struct {
 	ReclaimBatch  int
 	Jitter        func(time.Duration) time.Duration
 	UUID          func() (string, error)
+	FileBaseURL   string
+	Checkpoint    func(context.Context, storage.Boundary, string) error
 }
 
 type classifiedError struct {

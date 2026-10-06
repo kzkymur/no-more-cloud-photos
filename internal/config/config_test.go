@@ -83,13 +83,13 @@ func TestLoadWorkerDefaultsAndValid(t *testing.T) {
 	}{
 		{
 			name: "defaults",
-			vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data"},
-			want: WorkerConfig{DatabaseURL: "postgres://localhost/photos", StorageRoot: "/data", LogLevel: "info", ShutdownTimeout: 30 * time.Second},
+			vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files"},
+			want: WorkerConfig{DatabaseURL: "postgres://localhost/photos", StorageRoot: "/data", FileBaseURL: "https://files.example.test/files/", LogLevel: "info", ShutdownTimeout: 30 * time.Second},
 		},
 		{
 			name: "valid overrides",
-			vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", logLevelEnv: "warn", shutdownTimeoutEnv: "2m"},
-			want: WorkerConfig{DatabaseURL: "postgres://localhost/photos", StorageRoot: "/data", LogLevel: "warn", ShutdownTimeout: 2 * time.Minute},
+			vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files", logLevelEnv: "warn", shutdownTimeoutEnv: "2m"},
+			want: WorkerConfig{DatabaseURL: "postgres://localhost/photos", StorageRoot: "/data", FileBaseURL: "https://files.example.test/files/", LogLevel: "warn", ShutdownTimeout: 2 * time.Minute},
 		},
 	}
 	for _, tt := range tests {
@@ -170,8 +170,9 @@ func TestMissingRequiredConfiguration(t *testing.T) {
 		{name: "api storage", load: apiError, base: apiBase, key: storageRootEnv},
 		{name: "api file URL", load: apiError, base: apiBase, key: fileBaseURLEnv},
 		{name: "api cursor key", load: apiError, base: apiBase, key: cursorHMACKeyEnv},
-		{name: "worker database", load: workerError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data"}, key: databaseURLEnv},
-		{name: "worker storage", load: workerError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data"}, key: storageRootEnv},
+		{name: "worker database", load: workerError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files"}, key: databaseURLEnv},
+		{name: "worker storage", load: workerError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files"}, key: storageRootEnv},
+		{name: "worker file URL", load: workerError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files"}, key: fileBaseURLEnv},
 		{name: "admin database", load: adminError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos"}, key: databaseURLEnv},
 	}
 	for _, tt := range tests {
@@ -236,9 +237,10 @@ func TestInvalidWorkerAndAdminCommonConfiguration(t *testing.T) {
 		load func(map[string]string) error
 		vars map[string]string
 	}{
-		{name: "worker relative root", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "data"}},
-		{name: "worker bad level", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", logLevelEnv: "verbose"}},
-		{name: "worker bad duration", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", shutdownTimeoutEnv: "0s"}},
+		{name: "worker relative root", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "data", fileBaseURLEnv: "https://files.example.test/files"}},
+		{name: "worker bad file URL", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "http://files.example.test/files"}},
+		{name: "worker bad level", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files", logLevelEnv: "verbose"}},
+		{name: "worker bad duration", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files", shutdownTimeoutEnv: "0s"}},
 		{name: "admin bad level", load: adminError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", logLevelEnv: "verbose"}},
 		{name: "admin bad duration", load: adminError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", shutdownTimeoutEnv: "6m"}},
 		{name: "nil reader API", load: func(map[string]string) error { _, err := LoadAPIFrom(nil); return err }},
@@ -277,7 +279,7 @@ func TestErrorsAndLogAttrsRedactSecretsAndPaths(t *testing.T) {
 	text := attrsText(cfg.LogAttrs())
 	assertOmits(t, text, databaseSecret, storagePath, cursorSecret, "files.example.test")
 
-	worker, err := LoadWorkerFrom(env(map[string]string{databaseURLEnv: databaseSecret, storageRootEnv: storagePath}))
+	worker, err := LoadWorkerFrom(env(map[string]string{databaseURLEnv: databaseSecret, storageRootEnv: storagePath, fileBaseURLEnv: "https://files.example.test/files"}))
 	if err != nil {
 		t.Fatalf("LoadWorkerFrom() error = %v", err)
 	}

@@ -17,7 +17,7 @@ EXPECTED = {
         "NMCP_SHUTDOWN_TIMEOUT",
     },
     "worker.env": {
-        "NMCP_DATABASE_URL", "NMCP_STORAGE_ROOT", "NMCP_LOG_LEVEL",
+        "NMCP_DATABASE_URL", "NMCP_STORAGE_ROOT", "NMCP_FILE_BASE_URL", "NMCP_LOG_LEVEL",
         "NMCP_SHUTDOWN_TIMEOUT",
     },
 }
@@ -131,6 +131,8 @@ def main() -> int:
         or files.username or files.password or files.query or files.fragment
     ):
         fail("NMCP_FILE_BASE_URL must be the configured Tailnet File Server HTTPS /files/ root")
+    if worker["NMCP_FILE_BASE_URL"] != api["NMCP_FILE_BASE_URL"]:
+        fail("API and Worker must use the same NMCP_FILE_BASE_URL")
     print("Ubuntu production environment configuration validated")
     return 0
 

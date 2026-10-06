@@ -81,6 +81,7 @@ services:
     environment:
       <<: *common-environment
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
+      NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
     depends_on:
       migrate:
         condition: service_completed_successfully

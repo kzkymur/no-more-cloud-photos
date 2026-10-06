@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	dbmigration "github.com/kzkymur/no-more-cloud-photos/internal/database"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
@@ -31,6 +32,11 @@ func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	}
 	if len(lease.Targets) != 1 {
 		t.Fatalf("transform targets = %+v", lease.Targets)
+	}
+	if lease.Original == nil || lease.Original.ID == "" || lease.Original.MediaID != lease.MediaID ||
+		lease.Original.RelativePath == "" || lease.Original.MIMEType != "image/jpeg" || lease.Original.SizeBytes != 1 ||
+		len(lease.Original.SHA256) != 64 || lease.Original.Width == nil || lease.Original.Height == nil {
+		t.Fatalf("transform original = %+v", lease.Original)
 	}
 	if _, err := repository.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("future/unsupported claim error = %v", err)
@@ -51,6 +57,37 @@ func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	}
 	if _, err := repository.Claim(ctx, []Type{"unsupported"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unregistered API type error = %v", err)
+	}
+}
+
+func TestClaimRejectsOriginalExtensionMIMEContradictionIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx := context.Background()
+	mediaID, originalID := newTestUUID(t), newTestUUID(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	badPath := "originals/" + originalID[:2] + "/" + originalID + "/original.png"
+	if _, err := pool.Exec(ctx, `INSERT INTO originals
+		(id,media_id,sha256,relative_path,mime_type,size_bytes,width,height)
+		VALUES ($1,$2,$3,$4,'image/jpeg',1,1,1)`, originalID, mediaID, strings.Repeat("d", 64), badPath); err != nil {
+		t.Fatal(err)
+	}
+	var profileID string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM profiles WHERE key='standard' AND version=1`).Scan(&profileID); err != nil {
+		t.Fatal(err)
+	}
+	jobID, _ := insertTransformForProfile(t, pool, mediaID, originalID, profileID)
+	if _, err := repository.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("Claim() extension/MIME contradiction = %v", err)
+	}
+	var status Status
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusQueued || attempts != 0 {
+		t.Fatalf("failed hydration committed status=%s attempts=%d", status, attempts)
 	}
 }
 
@@ -428,7 +465,10 @@ func TestTransformTargetsRetryAndCompletionIntegration(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT attempts FROM job_targets WHERE id=$1`, targets[0]).Scan(&attempts); err != nil || attempts != 1 {
 		t.Fatalf("target begin attempts = %d, %v", attempts, err)
 	}
-	publishTargetFixture(t, pool, targets[0])
+	firstPublication, err := repository.PublishRendition(ctx, testRendition(t, lease, targets[0]))
+	if err != nil || !firstPublication.Current || firstPublication.JobFinished {
+		t.Fatalf("partial publication = %+v, %v", firstPublication, err)
+	}
 	if err := repository.BeginTarget(ctx, jobID, lease.Token, targets[1]); err != nil {
 		t.Fatal(err)
 	}
@@ -448,11 +488,443 @@ func TestTransformTargetsRetryAndCompletionIntegration(t *testing.T) {
 	if err := repository.BeginTarget(ctx, jobID, retry.Token, targets[1]); err != nil {
 		t.Fatal(err)
 	}
-	publishTargetFixture(t, pool, targets[1])
+	finalPublication, err := repository.PublishRendition(ctx, testRendition(t, retry, targets[1]))
+	if err != nil || !finalPublication.Current || !finalPublication.JobFinished {
+		t.Fatalf("final publication = %+v, %v", finalPublication, err)
+	}
 	var status Status
 	if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, jobID).Scan(&status); err != nil || status != StatusSucceeded {
 		t.Fatalf("completed status = %s, %v", status, err)
 	}
+	var eventCount int
+	var positions []int64
+	var latestPayload []byte
+	if err := pool.QueryRow(ctx, `SELECT count(*),array_agg(position ORDER BY position),
+		(array_agg(payload ORDER BY position DESC))[1]::text FROM change_events`).Scan(&eventCount, &positions, &latestPayload); err != nil {
+		t.Fatal(err)
+	}
+	if eventCount != 2 || len(positions) != 2 || positions[0] != 1 || positions[1] != 2 ||
+		strings.Contains(string(latestPayload), `"jobs"`) || !strings.Contains(string(latestPayload), `"current_renditions"`) ||
+		!strings.Contains(string(latestPayload), `https://files.example.test/files/renditions/`) {
+		t.Fatalf("publication events count=%d positions=%v payload=%s", eventCount, positions, latestPayload)
+	}
+}
+
+func TestPublishRenditionRejectsInvalidOwnershipAndStateIntegration(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Rendition, *pgxpool.Pool)
+		want   error
+	}{
+		{name: "wrong token", mutate: func(value *Rendition, _ *pgxpool.Pool) { value.LeaseToken = newTestUUID(t) }, want: ErrLeaseLost},
+		{name: "wrong profile", mutate: func(value *Rendition, _ *pgxpool.Pool) { value.ProfileID = newTestUUID(t) }, want: ErrConflict},
+		{name: "exact expiry", mutate: func(value *Rendition, pool *pgxpool.Pool) {
+			if _, err := pool.Exec(context.Background(), `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, value.JobID); err != nil {
+				t.Fatal(err)
+			}
+		}, want: ErrLeaseLost},
+		{name: "deleted media", mutate: func(value *Rendition, pool *pgxpool.Pool) {
+			if _, err := pool.Exec(context.Background(), `UPDATE media SET deleted_at=clock_timestamp() WHERE id=$1`, value.MediaID); err != nil {
+				t.Fatal(err)
+			}
+		}, want: ErrConflict},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool, repository := integrationRepository(t, Options{})
+			jobID, targets := insertTransformJob(t, pool, 3, 1)
+			lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := testRendition(t, lease, targets[0])
+			test.mutate(&candidate, pool)
+			if _, err := repository.PublishRendition(context.Background(), candidate); !errors.Is(err, test.want) {
+				t.Fatalf("PublishRendition(%s) = %v, want %v", jobID, err, test.want)
+			}
+			var renditions, events int
+			if err := pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM renditions),(SELECT count(*) FROM change_events)`).Scan(&renditions, &events); err != nil {
+				t.Fatal(err)
+			}
+			if renditions != 0 || events != 0 {
+				t.Fatalf("rejected publication persisted renditions=%d events=%d", renditions, events)
+			}
+		})
+	}
+
+	t.Run("duplicate", func(t *testing.T) {
+		pool, repository := integrationRepository(t, Options{})
+		_, targets := insertTransformJob(t, pool, 3, 1)
+		lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := testRendition(t, lease, targets[0])
+		if _, err := repository.PublishRendition(context.Background(), candidate); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repository.PublishRendition(context.Background(), candidate); !errors.Is(err, ErrLeaseLost) && !errors.Is(err, ErrConflict) {
+			t.Fatalf("duplicate publication = %v", err)
+		}
+		var count int
+		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM renditions`).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("rendition count=%d err=%v", count, err)
+		}
+	})
+
+	t.Run("JPEG still cannot publish canonical MP4", func(t *testing.T) {
+		pool, repository := integrationRepository(t, Options{})
+		_, targets := insertTransformJob(t, pool, 3, 1)
+		lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate := testRendition(t, lease, targets[0])
+		candidate.MIMEType = "video/mp4"
+		candidate.RelativePath = strings.TrimSuffix(candidate.RelativePath, ".avif") + ".mp4"
+		if _, err := repository.PublishRendition(context.Background(), candidate); !errors.Is(err, ErrConflict) {
+			t.Fatalf("JPEG/MP4 publication = %v, want ErrConflict", err)
+		}
+		assertPublicationCounts(t, pool, 0, 0, 0)
+	})
+
+	t.Run("draft pinned profile", func(t *testing.T) {
+		pool, repository := integrationRepository(t, Options{})
+		mediaID, originalID := insertPublicationMedia(t, pool)
+		profileID := ensureVersionProfile(t, pool, "draft_target", 1, false)
+		_, targetID := insertTransformForProfile(t, pool, mediaID, originalID, profileID)
+		lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repository.PublishRendition(context.Background(), testRendition(t, lease, targetID)); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("draft profile publication = %v, want ErrInvariant", err)
+		}
+		assertPublicationCounts(t, pool, 0, 0, 0)
+	})
+
+	t.Run("malformed pinned profile", func(t *testing.T) {
+		pool, repository := integrationRepository(t, Options{})
+		ctx := context.Background()
+		mediaID, originalID := insertPublicationMedia(t, pool)
+		profileID := newTestUUID(t)
+		if _, err := pool.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER profiles_definition_validate`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO profiles
+			(id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			VALUES ($1,'malformed_target',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,'{}')`, profileID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, profileID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `ALTER TABLE profiles ENABLE TRIGGER profiles_definition_validate`); err != nil {
+			t.Fatal(err)
+		}
+		_, targetID := insertTransformForProfile(t, pool, mediaID, originalID, profileID)
+		lease, err := repository.Claim(ctx, []Type{TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repository.PublishRendition(ctx, testRendition(t, lease, targetID)); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("malformed profile publication = %v, want ErrInvariant", err)
+		}
+		assertPublicationCounts(t, pool, 0, 0, 0)
+	})
+}
+
+func TestPublishRenditionVersionOrderingAndRetentionIntegration(t *testing.T) {
+	orders := []struct {
+		name       string
+		versions   []int
+		wantEvents int
+	}{
+		{name: "v1 then v2", versions: []int{1, 2}, wantEvents: 2},
+		{name: "v2 then v1", versions: []int{2, 1}, wantEvents: 1},
+		{name: "equal version last wins", versions: []int{1, 1}, wantEvents: 2},
+	}
+	for _, test := range orders {
+		t.Run(test.name, func(t *testing.T) {
+			pool, repository := integrationRepository(t, Options{})
+			mediaID, originalID := insertPublicationMedia(t, pool)
+			ensureVersionProfile(t, pool, "ordered", 1, true)
+			ensureVersionProfile(t, pool, "ordered", 2, true)
+			var lastRendition string
+			for index, version := range test.versions {
+				_, targetID := insertVersionTransform(t, pool, mediaID, originalID, "ordered", version)
+				lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+				if err != nil {
+					t.Fatal(err)
+				}
+				candidate := testRendition(t, lease, targetID)
+				publication, err := repository.PublishRendition(context.Background(), candidate)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if index == 1 && version < test.versions[0] && publication.Current {
+					t.Fatal("late lower version became current")
+				}
+				if publication.Current {
+					lastRendition = candidate.ID
+				}
+			}
+			var currentID string
+			var events int
+			if err := pool.QueryRow(context.Background(), `SELECT r.id::text,(SELECT count(*) FROM change_events)
+				FROM renditions r WHERE r.media_id=$1 AND r.profile_key='ordered' AND r.is_current`, mediaID).Scan(&currentID, &events); err != nil {
+				t.Fatal(err)
+			}
+			if currentID != lastRendition || events != test.wantEvents {
+				t.Fatalf("current=%s want=%s events=%d want=%d", currentID, lastRendition, events, test.wantEvents)
+			}
+		})
+	}
+
+	for _, days := range []*int{nil, intPointer(0), intPointer(3)} {
+		name := "null"
+		if days != nil {
+			name = fmt.Sprintf("%d days", *days)
+		}
+		t.Run(name, func(t *testing.T) {
+			pool, repository := integrationRepository(t, Options{})
+			if _, err := pool.Exec(context.Background(), `UPDATE system_config SET superseded_rendition_retention_days=$1`, days); err != nil {
+				t.Fatal(err)
+			}
+			mediaID, originalID := insertPublicationMedia(t, pool)
+			var firstID string
+			for index := range 2 {
+				_, targetID := insertVersionTransform(t, pool, mediaID, originalID, "retained", 1)
+				lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+				if err != nil {
+					t.Fatal(err)
+				}
+				candidate := testRendition(t, lease, targetID)
+				if index == 0 {
+					firstID = candidate.ID
+				}
+				if _, err := repository.PublishRendition(context.Background(), candidate); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var purgeAfter *time.Time
+			var currentNull bool
+			if err := pool.QueryRow(context.Background(), `SELECT
+				(SELECT purge_after FROM renditions WHERE id=$1),
+				(SELECT purge_after IS NULL FROM renditions WHERE media_id=$2 AND profile_key='retained' AND is_current)`, firstID, mediaID).Scan(&purgeAfter, &currentNull); err != nil {
+				t.Fatal(err)
+			}
+			if !currentNull || days == nil && purgeAfter != nil || days != nil && purgeAfter == nil {
+				t.Fatalf("retention days=%v old deadline=%v current null=%v", days, purgeAfter, currentNull)
+			}
+			if days != nil {
+				remaining := time.Until(*purgeAfter)
+				want := time.Duration(*days) * 24 * time.Hour
+				if remaining < want-time.Minute || remaining > want+time.Minute {
+					t.Fatalf("retention days=%d remaining=%s", *days, remaining)
+				}
+			}
+		})
+	}
+}
+
+func TestPublishRenditionSerializesOnMediaAndKeepsMaximumVersionIntegration(t *testing.T) {
+	for _, order := range [][]int{{1, 2}, {2, 1}} {
+		name := fmt.Sprintf("v%d acquires before v%d", order[0], order[1])
+		t.Run(name, func(t *testing.T) {
+			pool, repository := integrationRepository(t, Options{LeaseDuration: 30 * time.Second})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			mediaID, originalID := insertPublicationMedia(t, pool)
+			ensureVersionProfile(t, pool, "concurrent", 1, true)
+			ensureVersionProfile(t, pool, "concurrent", 2, true)
+			for _, version := range []int{1, 2} {
+				insertVersionTransform(t, pool, mediaID, originalID, "concurrent", version)
+			}
+			leases := make(map[int]Lease)
+			for range 2 {
+				lease, err := repository.Claim(ctx, []Type{TypeTransform})
+				if err != nil {
+					t.Fatal(err)
+				}
+				leases[lease.Targets[0].Profile.Version] = lease
+			}
+
+			locker, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer locker.Rollback(context.Background())
+			if _, err := locker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			type result struct {
+				version     int
+				publication Publication
+				err         error
+			}
+			results := make(chan result, 2)
+			start := func(version int) {
+				lease := leases[version]
+				candidate := testRendition(t, lease, lease.Targets[0].ID)
+				go func() {
+					publication, err := repository.PublishRendition(ctx, candidate)
+					results <- result{version: version, publication: publication, err: err}
+				}()
+			}
+			start(order[0])
+			waitForBlockedPublications(t, ctx, pool, 1)
+			start(order[1])
+			waitForBlockedPublications(t, ctx, pool, 2)
+			if err := locker.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			seen := make(map[int]Publication)
+			for range 2 {
+				result := <-results
+				if result.err != nil {
+					t.Fatalf("v%d publication error: %v", result.version, result.err)
+				}
+				seen[result.version] = result.publication
+			}
+			if len(seen) != 2 || !seen[1].JobFinished || !seen[2].JobFinished || !seen[2].Current || order[0] == 2 && seen[1].Current {
+				t.Fatalf("publication outcomes by version = %+v", seen)
+			}
+			var currentVersion, eventCount int
+			if err := pool.QueryRow(ctx, `SELECT p.version,(SELECT count(*) FROM change_events)
+				FROM renditions r JOIN job_targets jt ON jt.id=r.job_target_id JOIN profiles p ON p.id=jt.profile_id
+				WHERE r.media_id=$1 AND r.profile_key='concurrent' AND r.is_current`, mediaID).Scan(&currentVersion, &eventCount); err != nil {
+				t.Fatal(err)
+			}
+			wantEvents := 2
+			if order[0] == 2 {
+				wantEvents = 1
+			}
+			if currentVersion != 2 || eventCount != wantEvents {
+				t.Fatalf("current version=%d events=%d, want version=2 events=%d", currentVersion, eventCount, wantEvents)
+			}
+		})
+	}
+}
+
+func TestPublishRenditionRechecksLeaseAfterMediaLockWaitIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{LeaseDuration: 200 * time.Millisecond})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	jobID, targets := insertTransformJob(t, pool, 3, 1)
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil {
+		t.Fatal(err)
+	}
+	locker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locker.Rollback(context.Background())
+	if _, err := locker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, lease.MediaID); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	candidate := testRendition(t, lease, targets[0])
+	go func() {
+		_, err := repository.PublishRendition(ctx, candidate)
+		result <- err
+	}()
+	waitForBlockedPublications(t, ctx, pool, 1)
+	for {
+		var expired bool
+		if err := pool.QueryRow(ctx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, jobID).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired {
+			break
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("lease did not expire while publication waited: %v", ctx.Err())
+		}
+	}
+	if err := locker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("publication after Media wait = %v, want ErrLeaseLost", err)
+	}
+	assertPublicationCounts(t, pool, 0, 0, 0)
+	var jobStatus Status
+	var targetStatus TargetStatus
+	if err := pool.QueryRow(ctx, `SELECT j.status,jt.status FROM jobs j JOIN job_targets jt ON jt.job_id=j.id WHERE j.id=$1`, jobID).Scan(&jobStatus, &targetStatus); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != StatusRunning || targetStatus != TargetPending {
+		t.Fatalf("expired blocked publication changed job=%s target=%s", jobStatus, targetStatus)
+	}
+}
+
+func TestPublishRenditionDatabaseBoundariesIntegration(t *testing.T) {
+	t.Run("known pre-commit rollback", func(t *testing.T) {
+		fault := errors.New("before commit")
+		pool, repository := integrationRepository(t, Options{Checkpoint: func(_ context.Context, boundary storage.Boundary, _ string) error {
+			if boundary == storage.BoundaryBeforeDBCommit {
+				return fault
+			}
+			return nil
+		}})
+		_, targets := insertTransformJob(t, pool, 3, 1)
+		lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repository.PublishRendition(context.Background(), testRendition(t, lease, targets[0])); !errors.Is(err, fault) {
+			t.Fatalf("pre-commit error=%v", err)
+		}
+		assertPublicationCounts(t, pool, 0, 0, 0)
+	})
+
+	t.Run("commit rejected", func(t *testing.T) {
+		pool, repository := integrationRepository(t, Options{})
+		if _, err := pool.Exec(context.Background(), `CREATE FUNCTION test_reject_publication_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'deferred publication rejection' USING ERRCODE='23514'; END $$;
+		CREATE CONSTRAINT TRIGGER test_reject_publication_commit AFTER INSERT ON renditions
+		DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION test_reject_publication_commit()`); err != nil {
+			t.Fatal(err)
+		}
+		_, targets := insertTransformJob(t, pool, 3, 1)
+		lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = repository.PublishRendition(context.Background(), testRendition(t, lease, targets[0]))
+		var rolledBack *CommitRolledBack
+		var unknown *CommitOutcomeUnknown
+		if !errors.As(err, &rolledBack) || errors.As(err, &unknown) {
+			t.Fatalf("commit error=%#v", err)
+		}
+		assertPublicationCounts(t, pool, 0, 0, 0)
+	})
+
+	t.Run("post-commit outcome unknown", func(t *testing.T) {
+		fault := errors.New("lost commit response")
+		pool, repository := integrationRepository(t, Options{Checkpoint: func(_ context.Context, boundary storage.Boundary, _ string) error {
+			if boundary == storage.BoundaryAfterDBCommit {
+				return fault
+			}
+			return nil
+		}})
+		_, targets := insertTransformJob(t, pool, 3, 1)
+		lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = repository.PublishRendition(context.Background(), testRendition(t, lease, targets[0]))
+		var unknown *CommitOutcomeUnknown
+		if !errors.As(err, &unknown) || !errors.Is(err, fault) {
+			t.Fatalf("post-commit error=%#v", err)
+		}
+		assertPublicationCounts(t, pool, 1, 1, 1)
+	})
 }
 
 func TestFinishAttemptCeilingAndSafeErrorsIntegration(t *testing.T) {
@@ -628,7 +1100,7 @@ func TestJobClaimProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	repository, err := NewRepository(pool, Options{LeaseDuration: 150 * time.Millisecond})
+	repository, err := NewRepository(pool, Options{LeaseDuration: 150 * time.Millisecond, FileBaseURL: "https://files.example.test/files/"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -864,6 +1336,9 @@ func integrationRepository(t *testing.T, options Options) (*pgxpool.Pool, *Repos
 	if err := migrator.Up(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if options.FileBaseURL == "" {
+		options.FileBaseURL = "https://files.example.test/files/"
+	}
 	repository, err := NewRepository(pool, options)
 	if err != nil {
 		t.Fatal(err)
@@ -894,7 +1369,7 @@ func insertTransformJobAt(t *testing.T, pool *pgxpool.Pool, maxAttempts, targetC
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes,width,height) VALUES ($1,$2,$3,$4,'image/jpeg',1,1,1)`,
-		originalID, mediaID, strings.Repeat(strings.ReplaceAll(mediaID, "-", ""), 2), "originals/aa/"+originalID+"/original.jpg"); err != nil {
+		originalID, mediaID, strings.Repeat(strings.ReplaceAll(mediaID, "-", ""), 2), "originals/"+originalID[:2]+"/"+originalID+"/original.jpg"); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := pool.Query(ctx, `SELECT id::text FROM profiles ORDER BY key,version LIMIT $1`, targetCount)
@@ -971,6 +1446,135 @@ func publishTargetFixture(t *testing.T, pool *pgxpool.Pool, targetID string) {
 		t.Fatal(err)
 	}
 }
+
+func testRendition(t *testing.T, lease Lease, targetID string) Rendition {
+	t.Helper()
+	if lease.Original == nil {
+		t.Fatal("transform lease has no original")
+	}
+	var profileID string
+	for _, target := range lease.Targets {
+		if target.ID == targetID {
+			profileID = target.Profile.ID
+			break
+		}
+	}
+	if profileID == "" {
+		t.Fatalf("target %s is not in lease", targetID)
+	}
+	renditionID := newTestUUID(t)
+	width, height := 1, 1
+	return Rendition{
+		ID: renditionID, JobID: lease.ID, LeaseToken: lease.Token, TargetID: targetID,
+		OriginalID: lease.Original.ID, MediaID: lease.MediaID, ProfileID: profileID,
+		RelativePath: "renditions/" + lease.Original.ID[:2] + "/" + lease.Original.ID + "/" + targetID + "/" + renditionID + ".avif",
+		MIMEType:     "image/avif", Width: &width, Height: &height, SizeBytes: 1,
+		SHA256: strings.Repeat("b", 64), ProcessorAudit: []byte(`{"processor":"integration"}`),
+	}
+}
+
+func insertPublicationMedia(t *testing.T, pool *pgxpool.Pool) (string, string) {
+	t.Helper()
+	mediaID, originalID := newTestUUID(t), newTestUUID(t)
+	if _, err := pool.Exec(context.Background(), `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	path := "originals/" + originalID[:2] + "/" + originalID + "/original.jpg"
+	if _, err := pool.Exec(context.Background(), `INSERT INTO originals
+		(id,media_id,sha256,relative_path,mime_type,size_bytes,width,height)
+		VALUES ($1,$2,$3,$4,'image/jpeg',1,1,1)`, originalID, mediaID, strings.Repeat("c", 64), path); err != nil {
+		t.Fatal(err)
+	}
+	return mediaID, originalID
+}
+
+func insertVersionTransform(t *testing.T, pool *pgxpool.Pool, mediaID, originalID, key string, version int) (string, string) {
+	t.Helper()
+	profileID := ensureVersionProfile(t, pool, key, version, true)
+	return insertTransformForProfile(t, pool, mediaID, originalID, profileID)
+}
+
+func insertTransformForProfile(t *testing.T, pool *pgxpool.Pool, mediaID, originalID, profileID string) (string, string) {
+	t.Helper()
+	ctx := context.Background()
+	jobID, targetID := newTestUUID(t), newTestUUID(t)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts)
+		VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return jobID, targetID
+}
+
+func ensureVersionProfile(t *testing.T, pool *pgxpool.Pool, key string, version int, activate bool) string {
+	t.Helper()
+	ctx := context.Background()
+	var profileID, status string
+	err := pool.QueryRow(ctx, `SELECT id::text,status FROM profiles WHERE key=$1 AND version=$2`, key, version).Scan(&profileID, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		profileID = newTestUUID(t)
+		if _, err = pool.Exec(ctx, `INSERT INTO profiles
+			(id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			SELECT $1,$2,$3,'draft',input_mime_types,processor,parameters_schema_version,parameters
+			FROM profiles WHERE key='standard' AND version=1`, profileID, key, version); err != nil {
+			t.Fatal(err)
+		}
+		status = "draft"
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if activate && status == "draft" {
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='active' WHERE id=$1`, profileID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return profileID
+}
+
+func assertPublicationCounts(t *testing.T, pool *pgxpool.Pool, renditions, events int, position int64) {
+	t.Helper()
+	var gotRenditions, gotEvents int
+	var gotPosition int64
+	if err := pool.QueryRow(context.Background(), `SELECT
+		(SELECT count(*) FROM renditions),(SELECT count(*) FROM change_events),
+		(SELECT last_position FROM change_feed_state WHERE id=1)`).Scan(&gotRenditions, &gotEvents, &gotPosition); err != nil {
+		t.Fatal(err)
+	}
+	if gotRenditions != renditions || gotEvents != events || gotPosition != position {
+		t.Fatalf("publication counts renditions=%d events=%d position=%d", gotRenditions, gotEvents, gotPosition)
+	}
+}
+
+func waitForBlockedPublications(t *testing.T, ctx context.Context, pool *pgxpool.Pool, want int) {
+	t.Helper()
+	for {
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_stat_activity
+			WHERE wait_event_type='Lock' AND query LIKE 'SELECT deleted_at FROM media WHERE id=$1 FOR UPDATE%'`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count >= want {
+			return
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("blocked publications=%d, want at least %d: %v", count, want, ctx.Err())
+		}
+	}
+}
+
+func intPointer(value int) *int { return &value }
 
 func newTestUUID(t *testing.T) string {
 	t.Helper()

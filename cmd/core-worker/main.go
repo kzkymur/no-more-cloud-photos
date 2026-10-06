@@ -66,7 +66,7 @@ func run(ctx context.Context) error {
 	if err := store.Probe(ctx); err != nil {
 		return fmt.Errorf("storage root is unavailable: %w", err)
 	}
-	repository, err := job.NewRepository(pool, job.Options{})
+	repository, err := job.NewRepository(pool, job.Options{FileBaseURL: cfg.FileBaseURL})
 	if err != nil {
 		return fmt.Errorf("configure job repository: %w", err)
 	}

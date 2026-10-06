@@ -48,6 +48,7 @@ type APIConfig struct {
 type WorkerConfig struct {
 	DatabaseURL     string
 	StorageRoot     string
+	FileBaseURL     string
 	LogLevel        string
 	ShutdownTimeout time.Duration
 }
@@ -117,10 +118,19 @@ func LoadWorkerFrom(getenv Getenv) (WorkerConfig, error) {
 	if err := validateStorageRoot(storageRoot); err != nil {
 		return WorkerConfig{}, err
 	}
+	fileBaseURL, err := required(getenv, fileBaseURLEnv)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	fileBaseURL, err = normalizeFileBaseURL(fileBaseURL)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
 
 	return WorkerConfig{
 		DatabaseURL:     common.databaseURL,
 		StorageRoot:     storageRoot,
+		FileBaseURL:     fileBaseURL,
 		LogLevel:        common.logLevel,
 		ShutdownTimeout: common.shutdownTimeout,
 	}, nil

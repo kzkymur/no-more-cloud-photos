@@ -22,6 +22,7 @@ EOF
   cat > "$work/worker.env" <<'EOF'
 NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable
 NMCP_STORAGE_ROOT=/var/lib/nmcp/media
+NMCP_FILE_BASE_URL=https://host.example.ts.net:9443/files/
 NMCP_LOG_LEVEL=info
 NMCP_SHUTDOWN_TIMEOUT=30s
 EOF
