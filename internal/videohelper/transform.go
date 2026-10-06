@@ -42,6 +42,9 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 	}
 	videoFilter := filterGraph(source, width, height, r.bitDepth, r.kind)
 	audioRate, audioFilter := outputAudio(source)
+	if r.kind != "mp4-av1" {
+		audioRate, audioFilter = 0, "none"
+	}
 	outputLimit := r.limits.VideoBytes
 	if r.kind == "first-frame-avif" {
 		outputLimit = r.limits.ThumbBytes

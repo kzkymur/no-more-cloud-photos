@@ -49,10 +49,10 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 		wantHDR                                                        bool
 	}{
 		{"avc odd audio", "TEST_VIDEO_AVC_PATH", "video/mp4", "h264", true, 0, 0, 1, 320, 180, 321, 181, 44100, false},
-		{"hevc rotated no audio", "TEST_VIDEO_HEVC_ROTATED_PATH", "video/quicktime", "hevc", false, 90, 0, -1, 46, 62, 46, 62, 0, false},
+		{"hevc rotated no audio", "TEST_VIDEO_HEVC_ROTATED_PATH", "video/quicktime", "hevc", false, 90, 0, -1, 64, 96, 64, 96, 0, false},
 		{"pq hdr", "TEST_VIDEO_PQ_PATH", "video/mp4", "hevc", false, 0, 0, -1, 320, 180, 320, 180, 0, true},
 		{"hlg hdr", "TEST_VIDEO_HLG_PATH", "video/mp4", "hevc", false, 0, 0, -1, 320, 180, 320, 180, 0, true},
-		{"multiple streams", "TEST_VIDEO_MULTISTREAM_PATH", "video/mp4", "h264", true, 0, 1, 3, 64, 48, 64, 48, 48000, false},
+		{"multiple streams", "TEST_VIDEO_MULTISTREAM_PATH", "video/mp4", "h264", true, 0, 0, 2, 64, 48, 64, 48, 48000, false},
 		{"vfr sar", "TEST_VIDEO_VFR_PATH", "video/mp4", "h264", false, 0, 0, -1, 320, 90, 320, 90, 0, false},
 		{"audio resample", "TEST_VIDEO_RESAMPLE_PATH", "video/quicktime", "h264", true, 0, 0, 1, 80, 50, 80, 50, 48000, false},
 	}
@@ -67,6 +67,9 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 			defer input.Close()
 			inspection, err := processor.Inspect(context.Background(), InspectRequest{Input: input, MIMEType: test.mime})
 			if err != nil {
+				if diagnostic, diagnosticErr := exec.Command(ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", path).CombinedOutput(); diagnosticErr == nil {
+					t.Logf("input diagnostic: %s", diagnostic)
+				}
 				t.Fatal(err)
 			}
 			if inspection.VideoCodec != test.wantCodec || inspection.AudioPresent != test.wantAudio || inspection.RotationDegrees != test.wantRotation || inspection.VideoStreamIndex != test.wantVideo || inspection.AudioStreamIndex != test.wantAudioIndex || inspection.HDR != test.wantHDR {

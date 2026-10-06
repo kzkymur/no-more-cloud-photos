@@ -250,6 +250,34 @@ func TestTransformInvokesSVTAV1WithoutH264FallbackAndTruncatesFailure(t *testing
 	}
 }
 
+func TestThumbnailDiscardsSourceAudioWithoutAudioAudit(t *testing.T) {
+	input := writeTemp(t, "input")
+	output := writeTemp(t, "")
+	icc := writeTemp(t, "icc")
+	frames := "media_type=video|pts=0|pkt_duration=40|width=320|height=180\n"
+	runner := &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, true), nil}, streams: []string{frames}, writeOutput: []byte("avif")}
+	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
+	r := request{command: "transform", input: input, output: output, mime: "video/mp4", kind: "first-frame-avif", icc: icc, maxLongEdge: 640, quality: 80, bitDepth: 8, threads: 1, limits: maxLimits()}
+	var response bytes.Buffer
+	if err := e.transform(r, &response); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(runner.lastFFmpeg, " "), "-af") {
+		t.Fatalf("thumbnail encoded audio: %q", runner.lastFFmpeg)
+	}
+	var envelope struct {
+		Result struct {
+			Audit audit `json:"audit"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Result.Audit.AudioFilterGraph != "none" || envelope.Result.Audit.OutputAudioSampleRate != 0 || envelope.Result.Audit.OutputAudioLayout != "none" {
+		t.Fatalf("thumbnail audio audit = %#v", envelope.Result.Audit)
+	}
+}
+
 func TestTimingVerificationAllowsOneTickAndRejectsTwo(t *testing.T) {
 	source := []int64{0, 40, 80}
 	if got, err := timingErrorTicks(source, rational{1, 1000}, []int64{0, 39, 80}, rational{1, 1000}); err != nil || got != 1 {
@@ -320,7 +348,7 @@ func (f *fakeRunner) run(path string, args []string, _ int64) ([]byte, []byte, e
 	f.runCalls++
 	if strings.HasSuffix(path, "ffmpeg") {
 		f.lastFFmpeg = slices.Clone(args)
-		if len(f.writeOutput) > 0 && len(args) > 0 {
+		if len(f.writeOutput) > 0 && len(args) > 0 && args[len(args)-1] != "-" {
 			_ = os.WriteFile(args[len(args)-1], f.writeOutput, 0o600)
 		}
 	}

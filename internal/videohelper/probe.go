@@ -383,10 +383,14 @@ func classifyColor(stream probeStream) (string, string, string, string, bool, in
 func parseNits(value interface{}) (int, error) {
 	s := fmt.Sprint(value)
 	r, err := parseRational(s)
-	if err != nil || r.Numerator <= 0 {
+	if err == nil && r.Numerator > 0 {
+		return int(r.Numerator / r.Denominator), nil
+	}
+	n, intErr := decimalInt(s)
+	if intErr != nil || n <= 0 {
 		return 0, errors.New("invalid luminance")
 	}
-	return int(r.Numerator / r.Denominator), nil
+	return n, nil
 }
 
 func interfaceInt(value interface{}) (int, error) {
