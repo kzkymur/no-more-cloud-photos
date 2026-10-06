@@ -1,0 +1,6 @@
+FFmpeg static fixture/reference tool 6.0.1 (John Van Sickle build)
+url https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz
+sha256 28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
+upstream_source https://ffmpeg.org/releases/ffmpeg-6.0.1.tar.xz
+license GPL-3.0-or-later build including x264/x265; see archive GPLv3.txt
+use CI-only fixture generation and independent cross-version decode; binary is not redistributed

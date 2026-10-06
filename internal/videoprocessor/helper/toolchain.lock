@@ -1,0 +1,22 @@
+# Direct source inputs for the production video toolchain. libaom 3.8.2,
+# libheif 1.23.5, and the sRGB2014 ICC are inherited from the exact pins in
+# internal/stillprocessor/helper/toolchain.lock. Its generated manifest must
+# authenticate commit 615b5f541e4434aebd993036bc97ebc1a77ebc25, source archive
+# SHA-256 eb0bfa625cd17849be2e17ffd38bf8e1dc67b7c7787e7152250a4075d05f245f,
+# and the digest of the concrete installed libaom object before this build runs.
+# The transitive system/OCI closure remains issue #20's responsibility.
+
+FFmpeg 9.0.2
+url https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
+sha256 8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
+license LGPL-2.1-or-later (GPL/nonfree components disabled)
+
+SVT-AV1 4.2.0
+url https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v4.2.0/SVT-AV1-v4.2.0.tar.gz
+sha256 c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740
+license BSD-3-Clause-Clear AND Alliance-for-Open-Media-Patent-License-1.0
+
+zimg 3.0.6
+url https://github.com/sekrit-twc/zimg/archive/refs/tags/release-3.0.6.tar.gz
+sha256 be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577
+license WTFPL-2.0
