@@ -160,7 +160,17 @@ jobs:
             echo 'new deployment overlapped an ownerless migration execution' >&2
             exit 1
           fi
-          sudo systemctl wait nmcp-orphan-migration.service
+          for attempt in {1..50}; do
+            orphan_state=$(sudo systemctl show --property=ActiveState --value nmcp-orphan-migration.service)
+            case "$orphan_state" in
+              inactive) break ;;
+              active|activating|deactivating) ;;
+              *) echo "unexpected orphan migration state: $orphan_state" >&2; exit 1 ;;
+            esac
+            test "$attempt" -lt 50 || exit 1
+            sleep 0.1
+          done
+          test "$(sudo systemctl show --property=Result --value nmcp-orphan-migration.service)" = success
           sudo flock /run/lock/nmcp-deploy.lock -c 'touch /tmp/nmcp-deploy-lock-held; sleep 3' &
           lock_pid=$!
           for attempt in {1..30}; do
