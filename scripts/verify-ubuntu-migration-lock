@@ -19,6 +19,8 @@ trap cleanup EXIT
   /usr/local/libexec/nmcp/run-ubuntu-migration
 /usr/bin/install -o root -g root -m 0755 "$repo/scripts/acquire-ubuntu-deployment-locks" \
   /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks
+/usr/bin/install -o root -g root -m 0755 "$repo/scripts/handoff-ubuntu-migration-lock" \
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock
 cat > /opt/nmcp/current/bin/nmcp-admin <<EOF
 #!/bin/sh
 printf 'entered\n' >> '$work/entries'
@@ -58,6 +60,13 @@ fi
 /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- \
   /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks verify direct \
   3</dev/null 4</dev/null 5</dev/null 6</dev/null 7</dev/null
+/usr/bin/printf '%s %s\n' "$$" 0 > /run/nmcp-deploy/stale-runner
+/usr/bin/chmod 0600 /run/nmcp-deploy/stale-runner
+if /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock \
+  validate-runner /run/nmcp-deploy/stale-runner; then
+  printf 'PID-reuse/stale-start runner identity was accepted\n' >&2; exit 1
+fi
+/usr/bin/rm -f /run/nmcp-deploy/stale-runner
 
 # Once root established the stable inode, an unprivileged user cannot replace it.
 /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- \

@@ -174,5 +174,10 @@ elif len(sys.argv) >= 5 and sys.argv[1] == "receive":
     receive_fd(sys.argv[2], sys.argv[3], sys.argv[4:])
 elif len(sys.argv) >= 6 and sys.argv[1] == "run-tracked":
     run_tracked(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5:])
+elif len(sys.argv) == 3 and sys.argv[1] == "validate-runner":
+    validated = load_runner(sys.argv[2])
+    if validated is None:
+        fail("runner record is missing")
+    os.close(validated[2])
 else:
-    fail("usage: send SOCKET LOCK FD OWNER_PID RUNNER_FILE | run-tracked FILE UNIT TIMEOUT_SECONDS COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...]")
+    fail("usage: send SOCKET LOCK FD OWNER_PID RUNNER_FILE | run-tracked FILE UNIT TIMEOUT_SECONDS COMMAND [ARG ...] | validate-runner FILE | receive SOCKET LOCK COMMAND [ARG ...]")
