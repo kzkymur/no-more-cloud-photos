@@ -273,6 +273,9 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit || info.Size() > p.policy.GeneratedOutputMaxBytes {
 		return Result{}, ErrResourcePolicy
 	}
+	if !validateVideoContainer(request.Output, info.Size(), kind, response.Result.AudioPresent) {
+		return Result{}, ErrProcess
+	}
 	if _, err := request.Output.Seek(0, io.SeekStart); err != nil {
 		return Result{}, ErrResourcePolicy
 	}
@@ -312,14 +315,14 @@ func (p *Processor) verifyOutput(ctx context.Context, request Request, transform
 		return ErrProcess
 	}
 	got := response.Result
-	if !got.FullyDecodedVideo || got.Kind != transformed.Kind || got.Width != transformed.Width || got.Height != transformed.Height || got.VideoCodec != "av1" || got.RotationDegrees != 0 || got.HasDisplayMatrix || got.HasRotateMetadata || got.ColorPrimaries != "bt709" || got.ColorTransfer != "bt709" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" || got.Source.VideoStreamIndex != transformed.Source.VideoStreamIndex || got.Source.AudioStreamIndex != transformed.Source.AudioStreamIndex {
+	if !got.FullyDecodedVideo || got.Kind != transformed.Kind || got.Width != transformed.Width || got.Height != transformed.Height || got.VideoCodec != "av1" || got.RotationDegrees != 0 || got.HasDisplayMatrix || got.HasRotateMetadata || got.Source != transformed.Source {
 		return ErrProcess
 	}
 	if transformed.Kind == "mp4-av1" {
-		if got.Container != "mp4" || got.SampleAspectRatio != (Rational{1, 1}) || got.BitDepth != 10 || got.Chroma != "4:2:0" || got.FrameCount != transformed.Source.FrameCount || got.PTSDeltaSHA256 != transformed.Source.PTSDeltaSHA256 || got.MaxTimingErrorTicks < 0 || got.MaxTimingErrorTicks > 1 || got.AudioPresent != transformed.AudioPresent || got.AudioPresent && (!got.FullyDecodedAudio || got.AudioCodec != "aac" || got.AudioProfile != "LC") {
+		if got.Container != "mp4" || got.SampleAspectRatio != (Rational{1, 1}) || got.BitDepth != 10 || got.Chroma != "4:2:0" || got.FrameCount != transformed.Source.FrameCount || got.PTSDeltaSHA256 != transformed.Source.PTSDeltaSHA256 || got.MaxTimingErrorTicks < 0 || got.MaxTimingErrorTicks > 1 || got.AudioPresent != transformed.AudioPresent || got.AudioPresent && (!got.FullyDecodedAudio || got.AudioCodec != "aac" || got.AudioProfile != "LC") || got.ColorPrimaries != "bt709" || got.ColorTransfer != "bt709" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
 			return ErrProcess
 		}
-	} else if got.Container != "avif" || got.FrameCount != 1 || got.AudioPresent || got.FullyDecodedAudio {
+	} else if got.Container != "avif" || got.FrameCount != 1 || got.AudioPresent || got.FullyDecodedAudio || got.ColorPrimaries != "bt709" || got.ColorTransfer != "iec61966-2-1" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
 		return ErrProcess
 	}
 	_, err = request.Output.Seek(0, io.SeekStart)
@@ -427,11 +430,20 @@ func validateTransform(r transformWire, request Request, p Policy, digest string
 	if r.Kind != kind || r.OutputMIME != mime || r.Width <= 0 || r.Height <= 0 || r.Width > request.Recipe.MaxLongEdge || r.Height > request.Recipe.MaxLongEdge || r.MaxLongEdge != request.Recipe.MaxLongEdge || r.Threads != 1 || r.Quality != quality || r.BitDepth != depth {
 		return ErrProcess
 	}
+	expectedWidth, expectedHeight, err := fitDimensions(r.Source.DisplayWidth, r.Source.DisplayHeight, request.Recipe.MaxLongEdge, kind == "mp4-av1")
+	if err != nil || r.Width != expectedWidth || r.Height != expectedHeight {
+		return ErrProcess
+	}
 	if kind == "mp4-av1" && (r.Width%2 != 0 || r.Height%2 != 0 || r.CRF != 32 || r.Chroma != "4:2:0" || r.AudioPresent != r.Source.AudioPresent || r.AudioCodec != map[bool]string{true: "aac", false: "none"}[r.Source.AudioPresent] || r.AudioBitrateKbps != map[bool]int{true: 128, false: 0}[r.Source.AudioPresent]) {
 		return ErrProcess
 	}
 	a := r.Audit
-	if a.BuildManifest != BuildManifest || validateVersionMap(a.LibraryVersions) != nil || a.ICCSHA256 != digest || a.SelectedVideoStream != r.Source.VideoStreamIndex || a.SelectedAudioStream != r.Source.AudioStreamIndex || a.StreamSelection != "default-first-then-index" || a.RotationDegreesApplied != r.Source.RotationDegrees || a.Orientation != "identity" || a.Timing != "preserve-presentation-order-vfr-rebase-zero" || !safeString(a.VideoFilterGraph) || !safeString(a.AudioFilterGraph) || a.OutputPrimaries != "bt709" || a.OutputTransfer != "bt709" || a.OutputMatrix != "bt709" || a.OutputRange != "limited" || a.Metadata != "strip-after-normalization-keep-color-tags" {
+	geometry := "display-aspect-square-pixel-thumbnail-no-upscale"
+	videoEncoder, muxer, outputColor, outputTransfer := "libaom-av1", "avif", "srgb", "iec61966-2-1"
+	if kind == "mp4-av1" {
+		geometry, videoEncoder, muxer, outputColor, outputTransfer = "display-aspect-square-pixel-even-floor-no-upscale", "libsvtav1", "mp4", "bt709-sdr-100nit", "bt709"
+	}
+	if a.BuildManifest != BuildManifest || validateVersionMap(a.LibraryVersions) != nil || a.ICCSHA256 != digest || a.SelectedVideoStream != r.Source.VideoStreamIndex || a.SelectedAudioStream != r.Source.AudioStreamIndex || a.StreamSelection != "default-first-then-index" || a.RotationDegreesApplied != r.Source.RotationDegrees || a.Orientation != "identity" || a.Geometry != geometry || a.Timing != "preserve-presentation-order-vfr-rebase-zero" || !safeString(a.VideoFilterGraph) || !safeString(a.AudioFilterGraph) || a.VideoEncoder != videoEncoder || a.Muxer != muxer || a.OutputColor != outputColor || a.OutputPrimaries != "bt709" || a.OutputTransfer != outputTransfer || a.OutputMatrix != "bt709" || a.OutputRange != "limited" || a.Metadata != "strip-after-normalization-keep-color-tags" {
 		return ErrProcess
 	}
 	if r.Source.HDR {

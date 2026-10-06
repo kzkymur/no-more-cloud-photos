@@ -3,8 +3,10 @@
 package videoprocessor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -60,10 +62,14 @@ func TestTransformUsesDescriptorProtocolAndIndependentVerifier(t *testing.T) {
 	inspection := validInspection()
 	transform := fmt.Sprintf(`{"protocol":1,"ok":true,"error_code":"","result":{"kind":"mp4-av1","output_mime":"video/mp4","width":320,"height":180,"max_long_edge":1920,"threads":1,"crf":32,"quality":0,"bit_depth":10,"chroma":"4:2:0","audio_present":false,"audio_codec":"none","audio_bitrate_kbps":0,"source":%s,"audit":%s}}`, inspectionJSON(inspection), auditJSON(inspection, testDigest))
 	verification := fmt.Sprintf(`{"protocol":1,"ok":true,"error_code":"","result":{"kind":"mp4-av1","container":"mp4","width":320,"height":180,"sample_aspect_ratio":{"numerator":1,"denominator":1},"video_codec":"av1","bit_depth":10,"chroma":"4:2:0","frame_count":2,"pts_delta_sha256":"%s","max_timing_error_ticks":1,"rotation_degrees":0,"has_display_matrix":false,"has_rotate_metadata":false,"color_primaries":"bt709","color_transfer":"bt709","color_matrix":"bt709","color_range":"limited","audio_present":false,"audio_codec":"none","audio_profile":"none","fully_decoded_video":true,"fully_decoded_audio":false,"source":%s}}`, inspection.PTSDeltaSHA256, inspectionJSON(inspection))
+	physical := filepath.Join(t.TempDir(), "physical.mp4")
+	if err := os.WriteFile(physical, minimalMP4("av01", false), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	script := `#!/bin/sh
 set -eu
 case "$1" in
-transform) printf 'physical-mp4' >&4; printf '%s' '` + transform + `' ;;
+transform) /bin/cat '` + physical + `' >&4; printf '%s' '` + transform + `' ;;
 verify-output) printf '%s' '` + verification + `' ;;
 *) exit 9 ;;
 esac
@@ -84,6 +90,51 @@ esac
 	if offset, _ := output.Seek(0, 1); offset != 0 {
 		t.Fatalf("output offset = %d", offset)
 	}
+}
+
+func TestContainerRejectsFallbackAndMalformedLengths(t *testing.T) {
+	for name, data := range map[string][]byte{
+		"valid":         minimalMP4("av01", false),
+		"h264 fallback": minimalMP4("avc1", false),
+		"truncated":     minimalMP4("av01", false)[:20],
+	} {
+		t.Run(name, func(t *testing.T) {
+			file := regularFile(t, data)
+			defer file.Close()
+			got := validateVideoContainer(file, int64(len(data)), "mp4-av1", false)
+			if got != (name == "valid") {
+				t.Fatalf("valid = %t", got)
+			}
+		})
+	}
+}
+
+func minimalMP4(videoEntry string, audio bool) []byte {
+	box := func(kind string, payload ...[]byte) []byte {
+		var body []byte
+		for _, part := range payload {
+			body = append(body, part...)
+		}
+		result := make([]byte, 8+len(body))
+		binary.BigEndian.PutUint32(result[:4], uint32(len(result)))
+		copy(result[4:8], kind)
+		copy(result[8:], body)
+		return result
+	}
+	entry := box(videoEntry)
+	count := make([]byte, 8)
+	binary.BigEndian.PutUint32(count[4:], 1)
+	stsd := box("stsd", count, entry)
+	moov := box("moov", box("trak", box("mdia", box("minf", box("stbl", stsd)))))
+	brand := append([]byte("isom\x00\x00\x02\x00isomiso6av01mp41"), []byte{}...)
+	ftyp := box("ftyp", brand)
+	if audio {
+		audioEntry := box("mp4a")
+		binary.BigEndian.PutUint32(count[4:], 2)
+		stsd = box("stsd", count, entry, audioEntry)
+		moov = box("moov", box("trak", box("mdia", box("minf", box("stbl", stsd)))))
+	}
+	return bytes.Join([][]byte{ftyp, moov, box("mdat", []byte{1})}, nil)
 }
 
 func TestVerifierFailureClearsOutput(t *testing.T) {
