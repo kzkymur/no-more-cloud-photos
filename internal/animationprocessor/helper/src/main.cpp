@@ -24,6 +24,9 @@ int main(int argc, char **argv) {
       case nmcp_animation::Arguments::Command::transform:
         response = nmcp_animation::transform_json(arguments.transform);
         break;
+      case nmcp_animation::Arguments::Command::verify_output:
+        response = nmcp_animation::verify_output_json(arguments.verify_output);
+        break;
     }
     std::cout << response;
     heif_deinit();

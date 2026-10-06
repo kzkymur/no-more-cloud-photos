@@ -293,8 +293,8 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		return Result{}, ErrResourcePolicy
 	}
 	r := response.Result
-	if validateOutputSignature(request.Output, r.OutputMIME) != nil {
-		return Result{}, ErrProcess
+	if err := p.validateOutput(ctx, request.Output, r); err != nil {
+		return Result{}, err
 	}
 	extension := "webp"
 	if r.OutputMIME == "image/avif" {
@@ -306,14 +306,62 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	}}, nil
 }
 
-func validateOutputSignature(file *os.File, mimeType string) error {
+type outputFacts struct {
+	Width            int   `json:"width"`
+	Height           int   `json:"height"`
+	FrameCount       int   `json:"frame_count"`
+	TotalPlays       int   `json:"total_plays"`
+	BitDepth         int   `json:"bit_depth"`
+	FrameDurationsMS []int `json:"frame_durations_ms"`
+	DurationMS       int64 `json:"duration_ms"`
+}
+
+func (p *Processor) validateOutput(ctx context.Context, file *os.File, result *transformWire) error {
 	info, err := file.Stat()
 	if err != nil {
 		return ErrProcess
 	}
-	valid := (mimeType == "image/webp" && validateWebPContainer(file, info.Size())) ||
-		(mimeType == "image/avif" && validateAVIFContainer(file, info.Size()))
+	var structural outputFacts
+	var valid bool
+	if result.OutputMIME == "image/webp" {
+		structural, valid = validateWebPContainer(file, info.Size())
+		valid = valid && structural.Width == result.Width && structural.Height == result.Height &&
+			structural.FrameCount == result.Source.FrameCount && structural.DurationMS == result.Source.DurationMS &&
+			structural.TotalPlays == result.Source.TotalPlays && slices.Equal(structural.FrameDurationsMS, result.Source.FrameDurationsMS)
+	} else if result.OutputMIME == "image/avif" {
+		valid = validateAVIFContainer(file, info.Size())
+	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil || !valid {
+		return ErrProcess
+	}
+	input, err := reopenInput(file)
+	if err != nil {
+		return ErrProcess
+	}
+	defer input.Close()
+	arguments := []string{"verify-output", "--protocol", strconv.Itoa(ProtocolVersion), "--input", "/proc/self/fd/3",
+		"--input-mime", result.OutputMIME, "--max-output-bytes", strconv.FormatInt(p.policy.GeneratedOutputMaxBytes, 10)}
+	output, err := p.runner.Run(ctx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{input}})
+	if err != nil {
+		return mapRunError(err)
+	}
+	var response outputVerificationResponse
+	if decodeProtocolJSON(output.Stdout, &response) != nil || response.Protocol != ProtocolVersion || !response.OK || response.ErrorCode != "" || response.Result == nil {
+		return ErrProcess
+	}
+	got := response.Result
+	if got.Width != result.Width || got.Height != result.Height || got.BitDepth != result.BitDepth {
+		return ErrProcess
+	}
+	if result.OutputMIME == "image/webp" {
+		if got.FrameCount != result.Source.FrameCount || got.DurationMS != result.Source.DurationMS || got.TotalPlays != result.Source.TotalPlays ||
+			!slices.Equal(got.FrameDurationsMS, result.Source.FrameDurationsMS) {
+			return ErrProcess
+		}
+	} else if got.FrameCount != 1 || len(got.FrameDurationsMS) != 0 || got.DurationMS != 0 || got.TotalPlays != 1 {
+		return ErrProcess
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return ErrProcess
 	}
 	return nil
@@ -324,47 +372,64 @@ func readAt(file *os.File, offset int64, buffer []byte) bool {
 	return n == len(buffer) && err == nil
 }
 
-func validateWebPContainer(file *os.File, size int64) bool {
+func validateWebPContainer(file *os.File, size int64) (outputFacts, bool) {
 	if size < 12 || size > math.MaxUint32+8 {
-		return false
+		return outputFacts{}, false
 	}
 	var header [12]byte
 	if !readAt(file, 0, header[:]) || string(header[:4]) != "RIFF" || string(header[8:]) != "WEBP" || int64(binary.LittleEndian.Uint32(header[4:8]))+8 != size {
-		return false
+		return outputFacts{}, false
 	}
+	facts := outputFacts{BitDepth: 8}
 	var vp8x, anim, frames int
 	for offset := int64(12); offset < size; {
 		var chunk [8]byte
 		if size-offset < 8 || !readAt(file, offset, chunk[:]) {
-			return false
+			return outputFacts{}, false
 		}
 		payload := int64(binary.LittleEndian.Uint32(chunk[4:]))
 		end := offset + 8 + payload
 		next := end + payload%2
 		if end < offset || next > size {
-			return false
+			return outputFacts{}, false
 		}
 		switch string(chunk[:4]) {
 		case "VP8X":
-			var flags [1]byte
-			if vp8x != 0 || payload != 10 || !readAt(file, offset+8, flags[:]) || flags[0]&0x02 == 0 {
-				return false
+			var value [10]byte
+			if vp8x != 0 || payload != 10 || !readAt(file, offset+8, value[:]) || value[0]&0x02 == 0 {
+				return outputFacts{}, false
 			}
+			facts.Width = 1 + int(value[4]) + int(value[5])<<8 + int(value[6])<<16
+			facts.Height = 1 + int(value[7]) + int(value[8])<<8 + int(value[9])<<16
 			vp8x++
 		case "ANIM":
-			if anim != 0 || payload != 6 {
-				return false
+			var value [6]byte
+			if anim != 0 || payload != 6 || !readAt(file, offset+8, value[:]) {
+				return outputFacts{}, false
 			}
+			facts.TotalPlays = int(binary.LittleEndian.Uint16(value[4:6]))
 			anim++
 		case "ANMF":
-			if payload < 26 || !validateWebPFrameChunks(file, offset+24, end) {
-				return false
+			var value [16]byte
+			if payload < 26 || !readAt(file, offset+8, value[:]) || !validateWebPFrameChunks(file, offset+24, end) {
+				return outputFacts{}, false
 			}
+			x := 2 * (int(value[0]) + int(value[1])<<8 + int(value[2])<<16)
+			y := 2 * (int(value[3]) + int(value[4])<<8 + int(value[5])<<16)
+			width := 1 + int(value[6]) + int(value[7])<<8 + int(value[8])<<16
+			height := 1 + int(value[9]) + int(value[10])<<8 + int(value[11])<<16
+			duration := int(value[12]) + int(value[13])<<8 + int(value[14])<<16
+			if width <= 0 || height <= 0 || x > facts.Width-width || y > facts.Height-height || duration <= 0 {
+				return outputFacts{}, false
+			}
+			facts.FrameDurationsMS = append(facts.FrameDurationsMS, duration)
+			facts.DurationMS += int64(duration)
 			frames++
 		}
 		offset = next
 	}
-	return vp8x == 1 && anim == 1 && frames > 0
+	facts.FrameCount = frames
+	return facts, vp8x == 1 && anim == 1 && frames > 0 && facts.Width > 0 && facts.Height > 0
 }
 
 func validateWebPFrameChunks(file *os.File, offset, end int64) bool {
@@ -449,6 +514,8 @@ func validateAVIFMeta(file *os.File, offset, size int64) bool {
 		return false
 	}
 	var required uint8
+	var primaryID uint32
+	av1Items := map[uint32]bool{}
 	for position := offset + 4; position < offset+size; {
 		typ, payloadOffset, payloadSize, next, ok := readBMFFBox(file, position, offset+size)
 		if !ok {
@@ -462,17 +529,21 @@ func validateAVIFMeta(file *os.File, offset, size int64) bool {
 			}
 			required |= 1
 		case "pitm":
-			if payloadSize < 6 {
+			var valid bool
+			primaryID, valid = readAVIFPrimaryItem(file, payloadOffset, payloadSize)
+			if !valid {
 				return false
 			}
 			required |= 2
 		case "iloc":
-			if payloadSize < 8 {
+			if !validateAVIFItemCount(file, payloadOffset, payloadSize, true) {
 				return false
 			}
 			required |= 4
 		case "iinf":
-			if payloadSize < 6 {
+			var valid bool
+			av1Items, valid = readAVIFItemInfo(file, payloadOffset, payloadSize)
+			if !valid {
 				return false
 			}
 			required |= 8
@@ -484,21 +555,104 @@ func validateAVIFMeta(file *os.File, offset, size int64) bool {
 		}
 		position = next
 	}
-	return required == 31
+	return required == 31 && primaryID != 0 && av1Items[primaryID]
 }
 
 func validateAVIFProperties(file *os.File, offset, size int64) bool {
 	var container, associations bool
 	for position := offset; position < offset+size; {
-		typ, _, _, next, ok := readBMFFBox(file, position, offset+size)
+		typ, _, payloadSize, next, ok := readBMFFBox(file, position, offset+size)
 		if !ok {
 			return false
 		}
-		container = container || typ == "ipco"
-		associations = associations || typ == "ipma"
+		container = container || (typ == "ipco" && payloadSize > 0)
+		associations = associations || (typ == "ipma" && payloadSize > 8)
 		position = next
 	}
 	return container && associations
+}
+
+func readAVIFPrimaryItem(file *os.File, offset, size int64) (uint32, bool) {
+	var header [8]byte
+	if size < 6 || !readAt(file, offset, header[:min(int64(len(header)), size)]) {
+		return 0, false
+	}
+	if header[0] == 0 {
+		value := uint32(binary.BigEndian.Uint16(header[4:6]))
+		return value, value != 0
+	}
+	value := binary.BigEndian.Uint32(header[4:8])
+	return value, header[0] == 1 && size >= 8 && value != 0
+}
+
+func readAVIFItemInfo(file *os.File, offset, size int64) (map[uint32]bool, bool) {
+	var header [8]byte
+	if size < 6 || !readAt(file, offset, header[:min(int64(len(header)), size)]) {
+		return nil, false
+	}
+	count, position := uint32(binary.BigEndian.Uint16(header[4:6])), offset+6
+	if header[0] != 0 {
+		if header[0] > 2 || size < 8 {
+			return nil, false
+		}
+		count, position = binary.BigEndian.Uint32(header[4:8]), offset+8
+	}
+	if count == 0 {
+		return nil, false
+	}
+	items := map[uint32]bool{}
+	limit := offset + size
+	for index := uint32(0); index < count; index++ {
+		typ, payloadOffset, payloadSize, next, ok := readBMFFBox(file, position, limit)
+		if !ok || typ != "infe" || payloadSize < 12 {
+			return nil, false
+		}
+		var value [14]byte
+		if !readAt(file, payloadOffset, value[:min(int64(len(value)), payloadSize)]) {
+			return nil, false
+		}
+		var id uint32
+		var itemType string
+		switch value[0] {
+		case 2:
+			id = uint32(binary.BigEndian.Uint16(value[4:6]))
+			itemType = string(value[8:12])
+		case 3:
+			if payloadSize < 14 {
+				return nil, false
+			}
+			id = binary.BigEndian.Uint32(value[4:8])
+			itemType = string(value[10:14])
+		default:
+			return nil, false
+		}
+		if id == 0 {
+			return nil, false
+		}
+		items[id] = itemType == "av01"
+		position = next
+	}
+	return items, position == limit
+}
+
+func validateAVIFItemCount(file *os.File, offset, size int64, iloc bool) bool {
+	var header [10]byte
+	if size < 6 || !readAt(file, offset, header[:min(int64(len(header)), size)]) {
+		return false
+	}
+	if iloc {
+		if size < 8 {
+			return false
+		}
+		if header[0] < 2 {
+			return binary.BigEndian.Uint16(header[6:8]) != 0
+		}
+		return header[0] == 2 && size >= 10 && binary.BigEndian.Uint32(header[6:10]) != 0
+	}
+	if header[0] == 0 {
+		return binary.BigEndian.Uint16(header[4:6]) != 0
+	}
+	return header[0] <= 2 && size >= 8 && binary.BigEndian.Uint32(header[4:8]) != 0
 }
 
 func readBMFFBox(file *os.File, offset, limit int64) (string, int64, int64, int64, bool) {
@@ -529,6 +683,7 @@ func validateAVIFBrands(file *os.File, offset, size int64) bool {
 		return false
 	}
 	var brand [4]byte
+	avif := false
 	for position := int64(0); position < size; position += 4 {
 		if position == 4 {
 			continue // minor version
@@ -536,11 +691,12 @@ func validateAVIFBrands(file *os.File, offset, size int64) bool {
 		if !readAt(file, offset+position, brand[:]) {
 			return false
 		}
-		if string(brand[:]) == "avif" || string(brand[:]) == "avis" {
-			return true
+		if string(brand[:]) == "avis" {
+			return false
 		}
+		avif = avif || string(brand[:]) == "avif"
 	}
-	return false
+	return avif
 }
 
 func (p *Processor) limitArguments() []string {
@@ -578,6 +734,12 @@ type transformResponse struct {
 	OK        bool           `json:"ok"`
 	ErrorCode string         `json:"error_code"`
 	Result    *transformWire `json:"result"`
+}
+type outputVerificationResponse struct {
+	Protocol  int          `json:"protocol"`
+	OK        bool         `json:"ok"`
+	ErrorCode string       `json:"error_code"`
+	Result    *outputFacts `json:"result"`
 }
 type transformWire struct {
 	OutputMIME  string     `json:"output_mime"`

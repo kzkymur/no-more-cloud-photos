@@ -130,6 +130,22 @@ Arguments parse_arguments(int argc, char **argv) {
         .limits = parse_limits(argc, argv, 22)};
     return result;
   }
+  if (argc == 10 && std::string_view(argv[1]) == "verify-output") {
+    expect(argc, argv, 2, "--protocol");
+    if (parse_number<int>(argv[3], 1, 1) != kProtocolVersion) throw Failure("policy_violation");
+    expect(argc, argv, 4, "--input");
+    expect(argc, argv, 6, "--input-mime");
+    expect(argc, argv, 8, "--max-output-bytes");
+    const std::string_view mime = argv[7];
+    if (std::string_view(argv[5]) != "/proc/self/fd/3" || (mime != "image/webp" && mime != "image/avif")) {
+      throw Failure("policy_violation");
+    }
+    Arguments result{};
+    result.command = Arguments::Command::verify_output;
+    result.verify_output = {.input = argv[5], .input_mime = argv[7],
+                            .maximum_bytes = parse_number<std::uint64_t>(argv[9], 1, kAbsoluteMaxOutputBytes)};
+    return result;
+  }
   throw Failure("policy_violation");
 }
 

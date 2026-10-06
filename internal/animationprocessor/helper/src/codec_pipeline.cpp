@@ -585,4 +585,96 @@ std::string transform_json(const TransformArgs &args) {
          ",\"audit\":" + audit_json(animation, encoder, sha256_hex(icc), library_versions()) + "}}";
 }
 
+std::string verify_output_json(const VerifyOutputArgs &args) {
+  const auto bytes = read_regular_file(args.input, static_cast<std::size_t>(args.maximum_bytes));
+  int width = 0;
+  int height = 0;
+  int frames = 0;
+  int total_plays = 1;
+  std::vector<int> durations;
+  if (args.input_mime == "image/webp") {
+    WebPData data{reinterpret_cast<const std::uint8_t *>(bytes.data()), bytes.size()};
+    std::unique_ptr<WebPDemuxer, WebPDemuxCloser> demux(WebPDemux(&data));
+    if (!demux) throw Failure("decode_failed");
+    width = static_cast<int>(WebPDemuxGetI(demux.get(), WEBP_FF_CANVAS_WIDTH));
+    height = static_cast<int>(WebPDemuxGetI(demux.get(), WEBP_FF_CANVAS_HEIGHT));
+    frames = static_cast<int>(WebPDemuxGetI(demux.get(), WEBP_FF_FRAME_COUNT));
+    total_plays = static_cast<int>(WebPDemuxGetI(demux.get(), WEBP_FF_LOOP_COUNT));
+    if (width <= 0 || height <= 0 || width > 1920 || height > 1920 ||
+        static_cast<std::uint64_t>(width) * height > 1920U * 1920U ||
+        frames <= 0 || frames > kAbsoluteMaxFrames) throw Failure("decode_failed");
+    WebPIterator iterator{};
+    if (!WebPDemuxGetFrame(demux.get(), 1, &iterator)) throw Failure("decode_failed");
+    do {
+      if (iterator.duration <= 0) { WebPDemuxReleaseIterator(&iterator); throw Failure("decode_failed"); }
+      durations.push_back(iterator.duration);
+    } while (WebPDemuxNextFrame(&iterator));
+    WebPDemuxReleaseIterator(&iterator);
+    WebPAnimDecoderOptions decoder_options{};
+    if (!WebPAnimDecoderOptionsInit(&decoder_options)) throw Failure("capability_failed");
+    decoder_options.color_mode = MODE_RGBA;
+    decoder_options.use_threads = 0;
+    std::unique_ptr<WebPAnimDecoder, WebPAnimCloser> decoder(WebPAnimDecoderNew(&data, &decoder_options));
+    if (!decoder) throw Failure("decode_failed");
+    std::uint8_t *pixels = nullptr;
+    int timestamp = 0;
+    int decoded = 0;
+    int expected_timestamp = 0;
+    while (WebPAnimDecoderHasMoreFrames(decoder.get())) {
+      if (!WebPAnimDecoderGetNext(decoder.get(), &pixels, &timestamp) || pixels == nullptr) throw Failure("decode_failed");
+      if (decoded >= static_cast<int>(durations.size()) ||
+          durations[static_cast<std::size_t>(decoded)] > std::numeric_limits<int>::max() - expected_timestamp) {
+        throw Failure("decode_failed");
+      }
+      expected_timestamp += durations[static_cast<std::size_t>(decoded)];
+      if (timestamp != expected_timestamp) throw Failure("decode_failed");
+      ++decoded;
+    }
+    if (decoded != frames || durations.size() != static_cast<std::size_t>(frames)) throw Failure("decode_failed");
+  } else if (args.input_mime == "image/avif") {
+    std::unique_ptr<heif_context, decltype(&heif_context_free)> context(heif_context_alloc(), heif_context_free);
+    if (!context) throw Failure("resource_limit");
+    heif_context_set_max_decoding_threads(context.get(), 1);
+    check_heif(heif_context_read_from_memory_without_copy(context.get(), bytes.data(), bytes.size(), nullptr), "decode_failed");
+    if (heif_context_get_number_of_top_level_images(context.get()) != 1) throw Failure("decode_failed");
+    heif_image_handle *raw_handle = nullptr;
+    check_heif(heif_context_get_primary_image_handle(context.get(), &raw_handle), "decode_failed");
+    std::unique_ptr<heif_image_handle, decltype(&heif_image_handle_release)> handle(raw_handle, heif_image_handle_release);
+    width = heif_image_handle_get_width(handle.get());
+    height = heif_image_handle_get_height(handle.get());
+    if (width <= 0 || height <= 0 || width > 1920 || height > 1920 ||
+        static_cast<std::uint64_t>(width) * height > 1920U * 1920U ||
+        heif_image_handle_get_luma_bits_per_pixel(handle.get()) != 8) throw Failure("decode_failed");
+    heif_decoding_options *raw_options = heif_decoding_options_alloc();
+    if (!raw_options) throw Failure("resource_limit");
+    std::unique_ptr<heif_decoding_options, decltype(&heif_decoding_options_free)> options(raw_options, heif_decoding_options_free);
+    options->strict_decoding = 1;
+    options->num_codec_threads = 1;
+    heif_image *raw_image = nullptr;
+    check_heif(heif_decode_image(handle.get(), &raw_image, heif_colorspace_RGB, heif_chroma_interleaved_RGBA, options.get()), "decode_failed");
+    std::unique_ptr<heif_image, decltype(&heif_image_release)> image(raw_image, heif_image_release);
+    int stride = 0;
+    const auto *pixels = heif_image_get_plane_readonly(image.get(), heif_channel_interleaved, &stride);
+    if (!pixels || stride < width * 4 || heif_image_get_width(image.get(), heif_channel_interleaved) != width ||
+        heif_image_get_height(image.get(), heif_channel_interleaved) != height) throw Failure("decode_failed");
+    frames = 1;
+  } else {
+    throw Failure("policy_violation");
+  }
+  std::int64_t duration = 0;
+  std::ostringstream duration_json;
+  duration_json << '[';
+  for (std::size_t index = 0; index < durations.size(); ++index) {
+    if (index != 0) duration_json << ',';
+    duration_json << durations[index];
+    if (duration > kAbsoluteMaxDurationMs - durations[index]) throw Failure("decode_failed");
+    duration += durations[index];
+  }
+  duration_json << ']';
+  return "{\"protocol\":1,\"ok\":true,\"error_code\":\"\",\"result\":{\"width\":" +
+         std::to_string(width) + ",\"height\":" + std::to_string(height) + ",\"frame_count\":" +
+         std::to_string(frames) + ",\"frame_durations_ms\":" + duration_json.str() + ",\"duration_ms\":" +
+         std::to_string(duration) + ",\"total_plays\":" + std::to_string(total_plays) + ",\"bit_depth\":8}}";
+}
+
 }  // namespace nmcp_animation

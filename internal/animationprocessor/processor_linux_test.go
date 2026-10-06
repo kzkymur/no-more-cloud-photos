@@ -24,13 +24,20 @@ const animationInspection = `{"classification":"animation","width":3,"height":2,
 const staticInspection = `{"classification":"static","width":3,"height":2,"frame_count":1,"frame_durations_ms":[100],"duration_ms":100,"total_plays":1,"has_alpha":false,"zero_duration_frame_indices":[0],"decoded_pixels":6}`
 const inspectSuccess = `{"protocol":1,"ok":true,"error_code":"","result":` + animationInspection + `}`
 const transformSuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"output_mime":"image/webp","width":3,"height":2,"quality":80,"bit_depth":8,"max_long_edge":1920,"threads":1,"source":` + animationInspection + `,"audit":{"decoder":"giflib-gif","encoder":"libwebp","tool_version":"animation-helper-1","library_versions":` + versionsJSON + `,"icc_sha256":"` + testICCDigest + `","composition":"composited-rgba","timing_normalization":"zero-duration-to-100ms","loop_normalization":"total-play-count","input_color":"assumed-srgb","output_color":"srgb","alpha":"preserved","metadata":"strip-after-normalization-keep-color-tags"}}}`
+const webPVerificationSuccess = `{"protocol":1,"ok":true,"error_code":"","result":{"width":3,"height":2,"frame_count":3,"frame_durations_ms":[40,100,250],"duration_ms":390,"total_plays":4,"bit_depth":8}}`
 
 var fakeWebP = string([]byte{
-	'R', 'I', 'F', 'F', 86, 0, 0, 0, 'W', 'E', 'B', 'P',
-	'V', 'P', '8', 'X', 10, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	'A', 'N', 'I', 'M', 6, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	'R', 'I', 'F', 'F', 186, 0, 0, 0, 'W', 'E', 'B', 'P',
+	'V', 'P', '8', 'X', 10, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 1, 0, 0,
+	'A', 'N', 'I', 'M', 6, 0, 0, 0, 0, 0, 0, 0, 4, 0,
+	'A', 'N', 'M', 'F', 42, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0,
+	'V', 'P', '8', 'L', 17, 0, 0, 0, 47, 0, 0, 0, 0, 7, 208, 255, 254, 247, 191, 255, 129, 136, 232, 127, 0, 0,
 	'A', 'N', 'M', 'F', 42, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0,
+	'V', 'P', '8', 'L', 17, 0, 0, 0, 47, 0, 0, 0, 0, 7, 208, 255, 254, 247, 191, 255, 129, 136, 232, 127, 0, 0,
+	'A', 'N', 'M', 'F', 42, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 250, 0, 0, 0,
 	'V', 'P', '8', 'L', 17, 0, 0, 0, 47, 0, 0, 0, 0, 7, 208, 255, 254, 247, 191, 255, 129, 136, 232, 127, 0, 0,
 })
 
@@ -43,6 +50,15 @@ var fakeAVIF = string([]byte{
 	0, 0, 0, 14, 'i', 'i', 'n', 'f', 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 24, 'i', 'p', 'r', 'p', 0, 0, 0, 8, 'i', 'p', 'c', 'o', 0, 0, 0, 8, 'i', 'p', 'm', 'a',
 	0, 0, 0, 9, 'm', 'd', 'a', 't', 0,
+})
+
+var contradictoryWebP = string([]byte{
+	'R', 'I', 'F', 'F', 86, 0, 0, 0, 'W', 'E', 'B', 'P',
+	'V', 'P', '8', 'X', 10, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	'A', 'N', 'I', 'M', 6, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	'A', 'N', 'M', 'F', 42, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0,
+	'V', 'P', '8', 'L', 17, 0, 0, 0, 47, 0, 0, 0, 0, 7, 208, 255, 254, 247, 191, 255, 129, 136, 232, 127, 0, 0,
 })
 
 func TestCapabilities(t *testing.T) {
@@ -100,6 +116,7 @@ func TestInspectUsesExactArgumentsAndDescriptor(t *testing.T) {
 
 func TestTransformUsesExactArgumentsAndDescriptors(t *testing.T) {
 	helper := writeExecutable(t, "transform", "#!/bin/sh\n"+
+		"if [ \"$1\" = verify-output ]; then [ \"$#\" -eq 9 ] && [ \"$5\" = /proc/self/fd/3 ] && [ \"$7\" = image/webp ] || exit 30; printf '%s' '"+webPVerificationSuccess+"'; exit; fi\n"+
 		"[ \"$#\" -eq 33 ] || exit 20\n"+
 		"[ \"$1\" = transform ] && [ \"$3\" = 1 ] && [ \"$5\" = /proc/self/fd/3 ] && [ \"$7\" = /proc/self/fd/4 ] || exit 21\n"+
 		"[ \"$9\" = image/gif ] && [ \"${11}\" = animated-webp ] && [ \"${13}\" = 1920 ] && [ \"${15}\" = 80 ] && [ \"${17}\" = 8 ] && [ \"${19}\" = 1 ] && [ \"${21}\" = /proc/self/fd/5 ] || exit 22\n"+
@@ -118,16 +135,12 @@ func TestTransformUsesExactArgumentsAndDescriptors(t *testing.T) {
 	}
 }
 
-func TestThumbnailResult(t *testing.T) {
+func TestThumbnailRejectsImpossibleSuccessFixture(t *testing.T) {
 	document := strings.NewReplacer(`"output_mime":"image/webp"`, `"output_mime":"image/avif"`, `"quality":80`, `"quality":50`, `"max_long_edge":1920`, `"max_long_edge":640`, `"encoder":"libwebp"`, `"encoder":"aom"`).Replace(transformSuccess)
 	helper := jsonHelper(t, document, fakeAVIF)
 	input, output := testFiles(t, []byte("input"))
-	got, err := newProcessor(t, helper, Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: thumbnailRecipe()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.OutputExtension != "avif" || got.Quality != 50 {
-		t.Fatalf("Transform() = %+v", got)
+	if _, err := newProcessor(t, helper, Policy{}).Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "image/gif", Recipe: thumbnailRecipe()}); !errors.Is(err, ErrProcess) {
+		t.Fatalf("Transform() error = %v", err)
 	}
 }
 
@@ -318,6 +331,12 @@ func TestTransformRejectsMalformedOutputContainer(t *testing.T) {
 	}
 }
 
+func TestTransformRejectsContradictoryOutputFacts(t *testing.T) {
+	if err := transformError(t, newProcessor(t, jsonHelper(t, transformSuccess, contradictoryWebP), Policy{}), context.Background()); !errors.Is(err, ErrProcess) {
+		t.Fatalf("one-frame 1x1 WebP reported as three-frame 3x2 output: %v", err)
+	}
+}
+
 func TestCommandSpecificHelperErrors(t *testing.T) {
 	errorDocument := func(code string) string {
 		return `{"protocol":1,"ok":false,"error_code":"` + code + `","result":null}`
@@ -407,7 +426,7 @@ func writeExecutable(t *testing.T, name, body string) string {
 }
 func jsonHelper(t *testing.T, document, output string) string {
 	t.Helper()
-	body := "#!/bin/sh\n"
+	body := "#!/bin/sh\nif [ \"$1\" = verify-output ]; then printf '%s' '" + webPVerificationSuccess + "'; exit; fi\n"
 	if output != "" {
 		body += "printf '%b' '" + shellOctal(output) + "' >&4\n"
 	}

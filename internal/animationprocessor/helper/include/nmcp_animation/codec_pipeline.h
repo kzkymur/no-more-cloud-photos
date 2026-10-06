@@ -20,5 +20,6 @@ std::map<std::string, std::string> library_versions();
 std::string capabilities_json(const CapabilityArgs &args);
 std::string inspect_json(const InspectArgs &args);
 std::string transform_json(const TransformArgs &args);
+std::string verify_output_json(const VerifyOutputArgs &args);
 
 }  // namespace nmcp_animation

@@ -58,11 +58,18 @@ struct TransformArgs {
   Limits limits;
 };
 
+struct VerifyOutputArgs {
+  std::string input;
+  std::string input_mime;
+  std::uint64_t maximum_bytes{};
+};
+
 struct Arguments {
-  enum class Command { capabilities, inspect, transform } command;
+  enum class Command { capabilities, inspect, transform, verify_output } command;
   CapabilityArgs capabilities;
   InspectArgs inspect;
   TransformArgs transform;
+  VerifyOutputArgs verify_output;
 };
 
 struct Inspection {

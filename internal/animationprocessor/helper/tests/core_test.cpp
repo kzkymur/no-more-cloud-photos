@@ -63,6 +63,11 @@ int main() {
   check(transform.command == Arguments::Command::transform && transform.transform.quality == 80,
         "transform exact protocol");
 
+  const auto verification = parse({"helper", "verify-output", "--protocol", "1", "--input", "/proc/self/fd/3",
+      "--input-mime", "image/avif", "--max-output-bytes", "1024"});
+  check(verification.command == Arguments::Command::verify_output && verification.verify_output.maximum_bytes == 1024,
+        "output verification exact protocol");
+
   fails_with([] { (void)parse({"helper", "capabilities", "--threads", "1", "--protocol", "1", "--srgb-icc", "x"}); },
              "policy_violation", "reject reordered flags");
   fails_with([] { (void)parse({"helper", "capabilities", "--protocol", "1", "--threads", "1", "--srgb-icc", "/tmp/profile"}); },
