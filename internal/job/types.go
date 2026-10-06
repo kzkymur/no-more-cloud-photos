@@ -84,15 +84,16 @@ type Target struct {
 // Original is the immutable input descriptor pinned by a transform Job.
 // Lease owns this value; callers cannot mutate repository state through it.
 type Original struct {
-	ID           string
-	MediaID      string
-	RelativePath string
-	MIMEType     string
-	SizeBytes    int64
-	SHA256       string
-	Width        *int
-	Height       *int
-	DurationMS   *int64
+	ID                      string
+	MediaID                 string
+	RelativePath            string
+	MIMEType                string
+	SizeBytes               int64
+	SHA256                  string
+	Width                   *int
+	Height                  *int
+	DurationMS              *int64
+	PrimaryVideoStreamIndex *int
 }
 
 type Lease struct {

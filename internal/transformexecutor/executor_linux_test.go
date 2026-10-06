@@ -129,6 +129,7 @@ type fakeProcessors struct {
 	calls          []string
 	classification animationprocessor.Classification
 	stillHook      func(context.Context) error
+	videoRequests  []videoprocessor.Request
 }
 
 func (processors *fakeProcessors) Inspect(context.Context, animationprocessor.InspectRequest) (animationprocessor.Inspection, error) {
@@ -156,6 +157,7 @@ func (processors *fakeProcessors) TransformAnimation(_ context.Context, request 
 
 func (processors *fakeProcessors) TransformVideo(_ context.Context, request videoprocessor.Request) (videoprocessor.Result, error) {
 	processors.calls = append(processors.calls, "video")
+	processors.videoRequests = append(processors.videoRequests, request)
 	_, _ = request.Output.Write([]byte("video"))
 	return videoprocessor.Result{OutputMIME: "video/mp4", OutputExtension: "mp4", Width: 10, Height: 8,
 		OutputDurationUS: 250000, Source: videoprocessor.Inspection{DurationUS: 300000}, Audit: videoprocessor.Audit{ToolVersion: "fake"}}, nil
@@ -205,8 +207,37 @@ func TestExecutorDispatchesByMIMEAndWebPInspection(t *testing.T) {
 			if test.mime == "video/mp4" && (repository.candidates[0].DurationMS == nil || *repository.candidates[0].DurationMS != 250) {
 				t.Fatalf("video duration = %v, want verified output 250ms", repository.candidates[0].DurationMS)
 			}
+			if test.mime == "video/mp4" && (len(processors.videoRequests) != 1 || processors.videoRequests[0].ExpectedVideoStreamIndex == nil || *processors.videoRequests[0].ExpectedVideoStreamIndex != 2) {
+				t.Fatalf("expected video stream propagation = %+v", processors.videoRequests)
+			}
 			if !slices.Equal(*store.events, []string{"begin-target", "storage-publish", "db-publish"}) {
 				t.Fatalf("events = %v", *store.events)
+			}
+		})
+	}
+}
+
+func TestExecutorRejectsMissingOrUnexpectedPrimaryVideoStream(t *testing.T) {
+	stream := 2
+	tests := []struct {
+		name   string
+		mime   string
+		stream *int
+	}{
+		{name: "MP4 missing", mime: "video/mp4"},
+		{name: "QuickTime missing", mime: "video/quicktime"},
+		{name: "still unexpectedly set", mime: "image/jpeg", stream: &stream},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executor, repository, store, processors := fixture(t, "", nil, nil, []string{renderOne})
+			lease := leaseFor(t, test.mime, attemptOne, 1, 0)
+			lease.Original.PrimaryVideoStreamIndex = test.stream
+			if err := executor.Execute(context.Background(), lease, executionLimits()); !errors.Is(err, job.ErrInvalid) {
+				t.Fatalf("Execute() error = %v, want ErrInvalid", err)
+			}
+			if len(*store.events) != 0 || len(processors.calls) != 0 || len(repository.candidates) != 0 {
+				t.Fatalf("invalid lease performed work: events=%v calls=%v candidates=%d", *store.events, processors.calls, len(repository.candidates))
 			}
 		})
 	}
@@ -558,8 +589,13 @@ func leaseFor(t *testing.T, mime, attempt string, attempts, targetAttempts int) 
 	}
 	id, _ := storage.ParseOriginalID(originalID)
 	key, _ := storage.NewOriginalKey(id, extension)
+	var primaryVideoStreamIndex *int
+	if mime == "video/mp4" || mime == "video/quicktime" {
+		value := 2
+		primaryVideoStreamIndex = &value
+	}
 	return job.Lease{ID: jobID, Type: job.TypeTransform, MediaID: mediaID, Token: attempt, Attempts: attempts, MaxAttempts: 3,
-		Original: &job.Original{ID: originalID, MediaID: mediaID, RelativePath: key.String(), MIMEType: mime, SizeBytes: 8, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		Original: &job.Original{ID: originalID, MediaID: mediaID, RelativePath: key.String(), MIMEType: mime, SizeBytes: 8, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PrimaryVideoStreamIndex: primaryVideoStreamIndex},
 		Targets: []job.Target{{ID: targetID, Status: job.TargetPending, Attempts: targetAttempts, Profile: job.Profile{
 			ID: definition.ID, Key: definition.Key, Version: definition.Version, Processor: definition.Processor,
 			ParametersSchemaVersion: definition.ParametersSchemaVersion, InputMIMETypes: definition.InputMIMETypes, Parameters: definition.Parameters,

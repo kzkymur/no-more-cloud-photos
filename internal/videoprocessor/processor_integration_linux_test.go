@@ -94,7 +94,8 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer output.Close()
-					result, err := processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: test.mime, Recipe: target.recipe})
+					expectedVideoStream := test.wantVideo
+					result, err := processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: test.mime, Recipe: target.recipe, ExpectedVideoStreamIndex: &expectedVideoStream})
 					if err != nil {
 						t.Fatal(err)
 					}

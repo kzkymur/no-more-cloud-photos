@@ -226,7 +226,7 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 				transformed.durationMS = &duration
 			}
 		case profile.SourceVideo:
-			result, err := executor.video.Transform(ctx, videoprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe, GeneratedBytesBefore: generatedBytes})
+			result, err := executor.video.Transform(ctx, videoprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe, GeneratedBytesBefore: generatedBytes, ExpectedVideoStreamIndex: lease.Original.PrimaryVideoStreamIndex})
 			processErr = err
 			transformed = transformResult{mimeType: result.OutputMIME, extension: extension, width: result.Width, height: result.Height,
 				audit: processorAudit{Family: worker.FamilyVideo, Result: result}}
@@ -272,11 +272,14 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 }
 
 func validateLease(lease job.Lease) (storage.OriginalKey, storage.AttemptID, error) {
+	video := lease.Original != nil && (lease.Original.MIMEType == "video/mp4" || lease.Original.MIMEType == "video/quicktime")
 	if lease.Type != job.TypeTransform || lease.Original == nil || lease.ID == "" || lease.Token == "" || lease.MediaID == "" ||
 		lease.Original.MediaID != lease.MediaID || lease.Original.SizeBytes < 0 || !validSHA256(lease.Original.SHA256) ||
 		(lease.Original.Width == nil) != (lease.Original.Height == nil) ||
 		(lease.Original.Width != nil && (*lease.Original.Width <= 0 || *lease.Original.Height <= 0)) ||
-		(lease.Original.DurationMS != nil && *lease.Original.DurationMS < 0) || lease.Attempts <= 0 ||
+		(lease.Original.DurationMS != nil && *lease.Original.DurationMS < 0) ||
+		(video && (lease.Original.PrimaryVideoStreamIndex == nil || *lease.Original.PrimaryVideoStreamIndex < 0)) ||
+		(!video && lease.Original.PrimaryVideoStreamIndex != nil) || lease.Attempts <= 0 ||
 		lease.MaxAttempts < lease.Attempts || len(lease.Targets) == 0 {
 		return storage.OriginalKey{}, storage.AttemptID{}, job.ErrInvalid
 	}

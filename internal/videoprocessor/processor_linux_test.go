@@ -145,6 +145,44 @@ esac
 	}
 }
 
+func TestTransformRejectsPersistedPrimaryStreamMismatchAfterVerification(t *testing.T) {
+	inspection := validInspection()
+	transform := fmt.Sprintf(`{"protocol":1,"ok":true,"error_code":"","result":{"kind":"mp4-av1","output_mime":"video/mp4","width":320,"height":180,"max_long_edge":1920,"threads":1,"crf":32,"quality":0,"bit_depth":10,"chroma":"4:2:0","audio_present":false,"audio_codec":"none","audio_bitrate_kbps":0,"source":%s,"audit":%s}}`, inspectionJSON(inspection), auditJSON(inspection, testDigest))
+	verification := fmt.Sprintf(`{"protocol":1,"ok":true,"error_code":"","result":{"kind":"mp4-av1","container":"mp4","width":320,"height":180,"sample_aspect_ratio":{"numerator":1,"denominator":1},"video_codec":"av1","bit_depth":10,"chroma":"4:2:0","frame_count":2,"pts_delta_sha256":"%s","max_timing_error_ticks":1,"output_duration_us":80000,"max_duration_error_ticks":1,"rotation_degrees":0,"has_display_matrix":false,"has_rotate_metadata":false,"color_primaries":"bt709","color_transfer":"bt709","color_matrix":"bt709","color_range":"limited","audio_present":false,"audio_codec":"none","audio_profile":"none","fully_decoded_video":true,"fully_decoded_audio":false,"source":%s}}`, inspection.PTSDeltaSHA256, inspectionJSON(inspection))
+	physical := filepath.Join(t.TempDir(), "physical.mp4")
+	if err := os.WriteFile(physical, minimalMP4("av01", false), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verified := filepath.Join(t.TempDir(), "verified")
+	script := `#!/bin/sh
+set -eu
+case "$1" in
+transform) /bin/cat '` + physical + `' >&4; printf '%s' '` + transform + `' ;;
+verify-output) : > '` + verified + `'; printf '%s' '` + verification + `' ;;
+esac
+`
+	p := newTestProcessor(t, helperScript(t, script))
+	input := regularFile(t, []byte("source"))
+	defer input.Close()
+	output := regularFile(t, nil)
+	defer output.Close()
+	expected := inspection.VideoStreamIndex + 1
+	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"], ExpectedVideoStreamIndex: &expected})
+	if !errors.Is(err, ErrProcess) {
+		t.Fatalf("error = %v, want ErrProcess", err)
+	}
+	if _, err := os.Stat(verified); err != nil {
+		t.Fatalf("mismatch was not checked after independent verification: %v", err)
+	}
+	info, statErr := output.Stat()
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("mismatched output was retained: size=%d", info.Size())
+	}
+}
+
 func TestOperationTimeoutUsesPrivateCause(t *testing.T) {
 	script := "#!/bin/sh\nsleep 5\n"
 	p := newTestProcessorWithPolicy(t, helperScript(t, script), Policy{Timeout: 30 * time.Millisecond})

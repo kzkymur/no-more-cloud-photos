@@ -91,6 +91,44 @@ func TestClaimRejectsOriginalExtensionMIMEContradictionIntegration(t *testing.T)
 	}
 }
 
+func TestClaimHydratesAndValidatesPrimaryVideoStreamIntegration(t *testing.T) {
+	tests := []struct {
+		name, mime, sourceMetadata string
+		want                       *int
+	}{
+		{name: "MP4 hydration", mime: "video/mp4", sourceMetadata: `{"primary_stream":2}`, want: intPointer(2)},
+		{name: "QuickTime hydration", mime: "video/quicktime", sourceMetadata: `{"primary_stream":0}`, want: intPointer(0)},
+		{name: "video missing", mime: "video/mp4", sourceMetadata: `{}`},
+		{name: "video malformed", mime: "video/mp4", sourceMetadata: `{"primary_stream":"0"}`},
+		{name: "video negative", mime: "video/mp4", sourceMetadata: `{"primary_stream":-1}`},
+		{name: "non-video unexpectedly set", mime: "image/jpeg", sourceMetadata: `{"primary_stream":0}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool, repository := integrationRepository(t, Options{})
+			jobID := insertPrimaryStreamTransform(t, pool, test.mime, test.sourceMetadata)
+			lease, err := repository.Claim(context.Background(), []Type{TypeTransform})
+			if test.want != nil {
+				if err != nil || lease.Original == nil || lease.Original.PrimaryVideoStreamIndex == nil || *lease.Original.PrimaryVideoStreamIndex != *test.want {
+					t.Fatalf("Claim() = %+v, %v", lease, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInvariant) {
+				t.Fatalf("Claim() error = %v, want ErrInvariant", err)
+			}
+			var status Status
+			var attempts int
+			if err := pool.QueryRow(context.Background(), `SELECT status,attempts FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts); err != nil {
+				t.Fatal(err)
+			}
+			if status != StatusQueued || attempts != 0 {
+				t.Fatalf("failed hydration committed status=%s attempts=%d", status, attempts)
+			}
+		})
+	}
+}
+
 func TestClaimIntegrationExclusivitySkipLockedAndReturnsCommitted(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{})
 	ctx := context.Background()
@@ -1418,6 +1456,36 @@ func insertTransformJobAt(t *testing.T, pool *pgxpool.Pool, maxAttempts, targetC
 		t.Fatal(err)
 	}
 	return jobID, targets
+}
+
+func insertPrimaryStreamTransform(t *testing.T, pool *pgxpool.Pool, mime, sourceMetadata string) string {
+	t.Helper()
+	ctx := context.Background()
+	mediaID, originalID := newTestUUID(t), newTestUUID(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,source_metadata,taken_at_source) VALUES ($1,$2,$3::jsonb,'unknown')`, mediaID, mime, sourceMetadata); err != nil {
+		t.Fatal(err)
+	}
+	extension, err := storage.OriginalExtensionForMIME(mime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := storage.ParseOriginalID(originalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := storage.NewOriginalKey(original, extension)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes,width,height) VALUES ($1,$2,$3,$4,$5,1,1,1)`, originalID, mediaID, strings.Repeat("e", 64), key.String(), mime); err != nil {
+		t.Fatal(err)
+	}
+	var profileID string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM profiles WHERE key='standard' AND version=1`).Scan(&profileID); err != nil {
+		t.Fatal(err)
+	}
+	jobID, _ := insertTransformForProfile(t, pool, mediaID, originalID, profileID)
+	return jobID
 }
 
 // publishTargetFixture establishes the publication cross-table invariants

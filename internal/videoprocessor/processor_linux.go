@@ -44,11 +44,12 @@ type InspectRequest struct {
 }
 
 type Request struct {
-	Input                *os.File
-	Output               *os.File
-	MIMEType             string
-	Recipe               profile.Recipe
-	GeneratedBytesBefore int64
+	Input                    *os.File
+	Output                   *os.File
+	MIMEType                 string
+	Recipe                   profile.Recipe
+	GeneratedBytesBefore     int64
+	ExpectedVideoStreamIndex *int
 }
 
 type Rational struct {
@@ -313,6 +314,11 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		return Result{}, mapOperationError(err, ctx, operation)
 	}
 	r := response.Result
+	if request.ExpectedVideoStreamIndex != nil && r.Source.VideoStreamIndex != *request.ExpectedVideoStreamIndex {
+		// The deferred cleanup truncates the temporary output, so a transform of
+		// any stream other than the upload-persisted primary is never published.
+		return Result{}, ErrProcess
+	}
 	extension := "mp4"
 	if r.Kind == "first-frame-avif" {
 		extension = "avif"
@@ -398,7 +404,7 @@ func validateInput(file *os.File, mime string) error {
 }
 
 func validateRequest(request Request) error {
-	if validateInput(request.Input, request.MIMEType) != nil || request.Output == nil || request.GeneratedBytesBefore < 0 || request.GeneratedBytesBefore > MaxGeneratedOutputBytes || validateRecipe(request.Recipe, request.MIMEType) != nil {
+	if validateInput(request.Input, request.MIMEType) != nil || request.Output == nil || request.GeneratedBytesBefore < 0 || request.GeneratedBytesBefore > MaxGeneratedOutputBytes || request.ExpectedVideoStreamIndex != nil && *request.ExpectedVideoStreamIndex < 0 || validateRecipe(request.Recipe, request.MIMEType) != nil {
 		return ErrInvalid
 	}
 	inputInfo, err := request.Input.Stat()

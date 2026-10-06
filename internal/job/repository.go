@@ -417,11 +417,12 @@ func loadOriginal(ctx context.Context, tx pgx.Tx, jobType Type, originalID *stri
 	}
 	var original Original
 	var mediaMIME string
+	var sourceMetadata []byte
 	err := tx.QueryRow(ctx, `SELECT o.id::text,o.media_id::text,o.relative_path,o.mime_type,o.size_bytes,o.sha256,
-		o.width,o.height,o.duration_ms,m.media_type
+		o.width,o.height,o.duration_ms,m.media_type,m.source_metadata
 		FROM originals o JOIN media m ON m.id=o.media_id WHERE o.id=$1`, *originalID).Scan(
 		&original.ID, &original.MediaID, &original.RelativePath, &original.MIMEType, &original.SizeBytes,
-		&original.SHA256, &original.Width, &original.Height, &original.DurationMS, &mediaMIME)
+		&original.SHA256, &original.Width, &original.Height, &original.DurationMS, &mediaMIME, &sourceMetadata)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrInvariant
 	}
@@ -433,6 +434,15 @@ func loadOriginal(ctx context.Context, tx pgx.Tx, jobType Type, originalID *stri
 		original.Width != nil && (*original.Width <= 0 || *original.Height <= 0) || original.DurationMS != nil && *original.DurationMS < 0 {
 		return nil, ErrInvariant
 	}
+	var metadata struct {
+		PrimaryStream *int `json:"primary_stream"`
+	}
+	if json.Unmarshal(sourceMetadata, &metadata) != nil ||
+		(oneOfVideoMIME(original.MIMEType) && (metadata.PrimaryStream == nil || *metadata.PrimaryStream < 0)) ||
+		(!oneOfVideoMIME(original.MIMEType) && metadata.PrimaryStream != nil) {
+		return nil, ErrInvariant
+	}
+	original.PrimaryVideoStreamIndex = metadata.PrimaryStream
 	key, err := storage.ParseOriginalKey(original.RelativePath)
 	if err != nil || key.OriginalID().String() != original.ID {
 		return nil, ErrInvariant
@@ -446,6 +456,10 @@ func loadOriginal(ctx context.Context, tx pgx.Tx, jobType Type, originalID *stri
 		return nil, ErrInvariant
 	}
 	return &original, nil
+}
+
+func oneOfVideoMIME(value string) bool {
+	return value == "video/mp4" || value == "video/quicktime"
 }
 
 func targetStateError(ctx context.Context, tx pgx.Tx, jobID, targetID string) error {
