@@ -2,7 +2,7 @@
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-release-failures: must run as root\n' >&2; exit 1; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-work=$(/usr/bin/mktemp -d /var/tmp/nmcp-release-failures.XXXXXX)
+work=$(/usr/bin/mktemp -d /run/nmcp-release-failures.XXXXXX)
 units=(nmcp-api.service nmcp-worker.service nmcp-files.service nmcp-migrate.service nmcp.target nmcp.slice postgresql@nmcp-test.service)
 cleanup() {
   /usr/bin/systemctl stop "${units[@]}" >/dev/null 2>&1 || true
