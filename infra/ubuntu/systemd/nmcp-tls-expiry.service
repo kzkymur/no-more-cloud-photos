@@ -1,0 +1,22 @@
+[Unit]
+Description=Check No More Cloud Photos Tailnet TLS certificate lifetime
+Documentation=file:/usr/share/doc/nmcp/ubuntu-deployment.md
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Slice=nmcp.slice
+ExecStart=/usr/local/libexec/nmcp/check-ubuntu-tls-expiry
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+UMask=0077

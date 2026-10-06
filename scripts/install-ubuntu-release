@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 0077
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  install-ubuntu-release stage RELEASE_DIR RELEASE_ID
+  install-ubuntu-release activate RELEASE_ID
+  install-ubuntu-release rollback RELEASE_ID
+
+RELEASE_DIR must contain MANIFEST.sha256 plus executable bin/core-api,
+bin/core-worker, and bin/nmcp-admin. Release IDs use only letters, digits,
+period, underscore, and hyphen (maximum 64 characters).
+EOF
+  exit 2
+}
+
+[[ $EUID -eq 0 ]] || { printf 'install-ubuntu-release: must run as root\n' >&2; exit 1; }
+action=${1:-}
+release_id=${3:-${2:-}}
+[[ $release_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || usage
+release_root=/opt/nmcp/releases
+release_path=$release_root/$release_id
+current=/opt/nmcp/current
+evidence=/var/lib/nmcp/deployment
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+if [[ ${NMCP_LOCK_MODE:-} != direct ]]; then
+  exec "$script_dir/acquire-ubuntu-deployment-locks" both -- "$0" "$@"
+fi
+"$script_dir/acquire-ubuntu-deployment-locks" verify direct
+
+verify_release() {
+  local directory=$1
+  /usr/bin/python3 - "$directory" <<'PY'
+import os, pathlib, re, stat, sys
+root = pathlib.Path(sys.argv[1])
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit("release must be a non-symlink directory")
+if stat.S_IMODE(root.stat().st_mode) != 0o755:
+    raise SystemExit("release root mode must be 0755")
+manifest = root / "MANIFEST.sha256"
+if not manifest.is_file() or manifest.is_symlink():
+    raise SystemExit("MANIFEST.sha256 must be a regular file")
+if stat.S_IMODE(manifest.stat().st_mode) != 0o644:
+    raise SystemExit("MANIFEST.sha256 mode must be 0644")
+listed = []
+for line in manifest.read_text(encoding="ascii").splitlines():
+    match = re.fullmatch(r"[0-9a-f]{64}  ([A-Za-z0-9][A-Za-z0-9._/+@-]*)", line)
+    if not match:
+        raise SystemExit("manifest contains a malformed or unsafe entry")
+    path = pathlib.PurePosixPath(match.group(1))
+    if path.is_absolute() or ".." in path.parts or path.name == "MANIFEST.sha256":
+        raise SystemExit("manifest contains an unsafe path")
+    listed.append(path.as_posix())
+if len(listed) != len(set(listed)):
+    raise SystemExit("manifest contains duplicate paths")
+actual = []
+for base, directories, files in os.walk(root, followlinks=False):
+    for name in directories + files:
+        candidate = pathlib.Path(base, name)
+        mode = candidate.lstat().st_mode
+        if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise SystemExit(f"release contains unsupported entry: {candidate.relative_to(root)}")
+        relative = candidate.relative_to(root)
+        expected_mode = 0o755 if stat.S_ISDIR(mode) or relative.parts[0] == "bin" else 0o644
+        if stat.S_IMODE(mode) != expected_mode:
+            raise SystemExit(f"release entry mode must be {expected_mode:04o}: {relative}")
+    for name in files:
+        relative = pathlib.Path(base, name).relative_to(root).as_posix()
+        if relative != "MANIFEST.sha256":
+            actual.append(relative)
+if sorted(actual) != sorted(listed):
+    raise SystemExit("manifest does not exactly cover release files")
+for required in ("bin/core-api", "bin/core-worker", "bin/nmcp-admin"):
+    path = root / required
+    if required not in listed or not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o755:
+        raise SystemExit(f"missing executable {required}")
+PY
+  (cd -- "$directory" && /usr/bin/sha256sum --check --strict MANIFEST.sha256)
+}
+
+verify_runtime_access() {
+  local directory=$1
+  /usr/bin/python3 - "$directory" <<'PY'
+import os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+if root.stat().st_uid != 0 or root.stat().st_gid != 0:
+    raise SystemExit("release root is not root:root")
+for base, directories, files in os.walk(root):
+    for name in directories + files:
+        path = pathlib.Path(base, name)
+        if path.lstat().st_uid != 0 or path.lstat().st_gid != 0:
+            raise SystemExit(f"release entry is not root:root: {path.relative_to(root)}")
+PY
+  /usr/sbin/runuser -u nmcp -- /usr/bin/test -x "$directory/bin/core-api"
+  /usr/sbin/runuser -u nmcp -- /usr/bin/test -x "$directory/bin/core-worker"
+  /usr/sbin/runuser -u nmcp -- /usr/bin/test -x "$directory/bin/nmcp-admin"
+  /usr/sbin/runuser -u nmcp -- /usr/bin/test -r "$directory/MANIFEST.sha256"
+}
+
+load_host_contract() {
+  [[ -d $evidence && -f /etc/nmcp/postgresql-unit ]] || {
+    printf 'install-ubuntu-release: host assets are not installed\n' >&2
+    exit 1
+  }
+  postgresql_unit=$(</etc/nmcp/postgresql-unit)
+  [[ $postgresql_unit =~ ^postgresql@[A-Za-z0-9_.-]+\.service$ \
+    && $postgresql_unit != postgresql@.service ]] || {
+    printf 'install-ubuntu-release: invalid concrete PostgreSQL unit contract\n' >&2
+    exit 1
+  }
+  [[ $(/usr/bin/systemctl show --property=LoadState --value -- "$postgresql_unit") == loaded ]] || {
+    printf 'install-ubuntu-release: concrete PostgreSQL unit is not loaded: %s\n' "$postgresql_unit" >&2
+    exit 1
+  }
+  postgresql_start_timeout=$(
+    /usr/bin/systemctl show --property=TimeoutStartUSec --value -- "$postgresql_unit"
+  )
+  [[ -n $postgresql_start_timeout && $postgresql_start_timeout != infinity ]] || {
+    printf 'install-ubuntu-release: concrete PostgreSQL unit must have a finite start timeout\n' >&2
+    exit 1
+  }
+}
+
+atomic_link() {
+  local destination=$1 temporary=$current.new.$$
+  /usr/bin/ln -s -- "$destination" "$temporary"
+  /usr/bin/mv -Tf -- "$temporary" "$current"
+}
+
+record() {
+  local state=$1 temporary=$evidence/active-release.new.$$ active=none
+  if [[ -L $current ]]; then active=$(/usr/bin/basename -- "$(/usr/bin/readlink -f -- "$current")"); fi
+  /usr/bin/printf 'active=%s\tattempted=%s\tstate=%s\ttime=%s\n' \
+    "$active" "$release_id" "$state" "$(/usr/bin/date --iso-8601=seconds)" > "$temporary"
+  /usr/bin/chown root:root "$temporary"
+  /usr/bin/chmod 0600 "$temporary"
+  /usr/bin/mv -f -- "$temporary" "$evidence/active-release"
+}
+
+stop_services() {
+  /usr/bin/systemctl stop nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service || true
+}
+
+admin_sequence=0
+run_admin() {
+  local admin_release=$1 operation=$2 subcommand=$3
+  local handoff operation_timeout owner_start runner runner_file status=0 unit
+  admin_sequence=$((admin_sequence + 1))
+  handoff=/run/nmcp-deploy/migration-handoff.$$.$admin_sequence
+  runner_file=/run/nmcp-deploy/migration-runner.$$.$admin_sequence
+  unit=nmcp-deploy-admin-$$-$admin_sequence
+  if [[ ${NMCP_TEST_PAUSE_BEFORE_ADMIN_DISPATCH:-} == 1 ]]; then
+    /usr/bin/install -o root -g root -m 0600 /dev/null \
+      /run/nmcp-deploy/test-before-admin-dispatch.ready
+    while [[ ! -f /run/nmcp-deploy/test-before-admin-dispatch.go ]]; do
+      /usr/bin/sleep 0.01
+    done
+  fi
+  operation_timeout=${NMCP_TEST_ADMIN_OPERATION_TIMEOUT_SECONDS:-1200}
+  [[ $operation_timeout =~ ^[1-9][0-9]{0,3}$ && $operation_timeout -le 3600 ]] || {
+    printf 'install-ubuntu-release: invalid transient operation timeout\n' >&2
+    return 1
+  }
+  owner_start=$(/usr/local/libexec/nmcp/handoff-ubuntu-migration-lock process-start "$$")
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$$" "$owner_start" "$handoff" \
+    /run/nmcp-deploy/migration-execution.lock 8 "$runner_file" \
+    "$unit.service" "$operation_timeout" \
+    /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="$unit" \
+    --property=Slice=nmcp.slice \
+    --property="Requires=$postgresql_unit" --property="After=$postgresql_unit" \
+    --property=EnvironmentFile=/etc/nmcp/admin.env \
+    --property=TimeoutStartSec=15min --property=TimeoutStopSec=30s \
+    --property=RuntimeMaxSec=15min \
+    --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
+    --property=ProtectSystem=strict --property=ProtectHome=yes \
+    -- /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock receive "$handoff" \
+    /run/nmcp-deploy/migration-execution.lock \
+    /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+    "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json \
+    9>&- &
+  runner=$!
+  wait "$runner" || status=$?
+  if ((status != 0)); then
+    /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock ensure-terminal "$unit.service"
+  fi
+  /usr/bin/rm -f -- "$handoff" "$runner_file"
+  return "$status"
+}
+
+run_migration() {
+  local migration_release token=/run/nmcp-migration-complete temporary
+  migration_release=$(/usr/bin/readlink -f -- "$current")
+  temporary=$token.new.$$
+  run_admin "$migration_release" migrate up || return 1
+  /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
+  /usr/bin/chown root:root "$temporary"
+  /usr/bin/chmod 0600 "$temporary"
+  /usr/bin/mv -f -- "$temporary" "$token"
+  /usr/bin/systemctl reset-failed nmcp-migrate.service >/dev/null 2>&1 || true
+  if ! /usr/bin/systemctl restart nmcp-migrate.service; then
+    /usr/bin/rm -f -- "$token"
+    return 1
+  fi
+  /usr/bin/rm -f -- "$token"
+}
+
+activate_services() {
+  run_migration
+  /usr/bin/systemctl restart nmcp-api.service nmcp-worker.service
+  /usr/bin/systemctl restart nmcp-files.service
+  /usr/bin/systemctl start nmcp.target
+  /usr/local/libexec/nmcp/check-ubuntu-services --postgresql-unit "$postgresql_unit"
+}
+
+case "$action" in
+  stage)
+    [[ $# -eq 3 ]] || usage
+    source_dir=$2
+    [[ ! -e $release_path ]] || { printf 'release already exists: %s\n' "$release_path" >&2; exit 1; }
+    verify_release "$source_dir"
+    /usr/bin/install -d -o root -g root -m 0755 /opt/nmcp "$release_root"
+    temporary=$release_root/.$release_id.new.$$
+    trap '/usr/bin/rm -rf -- "$temporary"' EXIT
+    /usr/bin/install -d -o root -g root -m 0755 "$temporary"
+    /usr/bin/cp -a -- "$source_dir/." "$temporary/"
+    /usr/bin/chown -R root:root "$temporary"
+    verify_release "$temporary"
+    verify_runtime_access "$temporary"
+    /usr/bin/mv -- "$temporary" "$release_path"
+    trap - EXIT
+    printf 'Staged %s; run activate explicitly.\n' "$release_id"
+    ;;
+  activate)
+    [[ $# -eq 2 ]] || usage
+    load_host_contract
+    verify_release "$release_path"
+    verify_runtime_access "$release_path"
+    old_target=
+    if [[ -L $current ]]; then old_target=$(/usr/bin/readlink -f -- "$current"); fi
+    was_active=false
+    if /usr/bin/systemctl is-active --quiet nmcp.target; then was_active=true; fi
+    /usr/bin/systemctl stop nmcp.target
+    atomic_link "$release_path"
+    if ! run_migration; then
+      stop_services
+      if [[ -n $old_target ]]; then atomic_link "$old_target"; else /usr/bin/rm -f -- "$current"; fi
+      if [[ $was_active == true && -n $old_target ]]; then
+        if ! activate_services; then stop_services; fi
+      fi
+      record migration-failed-link-restored
+      printf 'Migration failed; the previous release link was restored.\n' >&2
+      exit 1
+    fi
+    if ! /usr/bin/systemctl restart nmcp-api.service nmcp-worker.service \
+      || ! /usr/bin/systemctl restart nmcp-files.service \
+      || ! /usr/bin/systemctl start nmcp.target; then
+      stop_services
+      record post-migration-service-failed
+      printf 'Service start failed after migration; automatic binary rollback is unsafe.\n' >&2
+      exit 1
+    fi
+    if ! /usr/local/libexec/nmcp/check-ubuntu-services --postgresql-unit "$postgresql_unit"; then
+      stop_services
+      record post-migration-readiness-failed
+      printf 'Whole-service stability failed after migration; automatic binary rollback is unsafe.\n' >&2
+      exit 1
+    fi
+    /usr/bin/systemctl enable nmcp.target
+    record active
+    ;;
+  rollback)
+    [[ $# -eq 2 ]] || usage
+    load_host_contract
+    verify_release "$release_path"
+    verify_runtime_access "$release_path"
+    [[ -f /etc/nmcp/admin.env ]] || { printf 'host assets are not installed\n' >&2; exit 1; }
+    # The old admin binary must understand the current schema before switching.
+    run_admin "$release_path" migrate status
+    old_target=
+    if [[ -L $current ]]; then old_target=$(/usr/bin/readlink -f -- "$current"); fi
+    was_active=false
+    if /usr/bin/systemctl is-active --quiet nmcp.target; then was_active=true; fi
+    stop_services
+    atomic_link "$release_path"
+    if ! activate_services; then
+      stop_services
+      if [[ -n $old_target ]]; then atomic_link "$old_target"; else /usr/bin/rm -f -- "$current"; fi
+      if [[ $was_active == true && -n $old_target ]]; then
+        if ! activate_services; then stop_services; fi
+      fi
+      record rollback-activation-failed
+      printf 'Rollback activation failed; the prior release link and service state were restored.\n' >&2
+      exit 1
+    fi
+    /usr/bin/systemctl enable nmcp.target
+    record active-after-compatible-rollback
+    ;;
+  *) usage ;;
+esac

@@ -1,0 +1,32 @@
+[Unit]
+Description=No More Cloud Photos database migration
+Documentation=file:/usr/share/doc/nmcp/ubuntu-deployment.md
+# The installer adds a reviewed concrete postgresql@<cluster>.service drop-in.
+Before=nmcp-api.service nmcp-worker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+Slice=nmcp.slice
+EnvironmentFile=/etc/nmcp/admin.env
+ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=nmcp.target

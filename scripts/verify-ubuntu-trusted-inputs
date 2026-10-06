@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-trusted-inputs: must run as root\n' >&2; exit 1; }
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+safe=$(/usr/bin/mktemp -d /root/nmcp-input-safe.XXXXXX)
+bad=$(/usr/bin/mktemp -d /tmp/nmcp-input-bad.XXXXXX)
+output=$(/usr/bin/mktemp -d /run/nmcp-input-output.XXXXXX)
+/usr/bin/chmod 0700 "$safe" "$output"
+cleanup() { /usr/bin/rm -rf -- "$safe" "$bad" "$output"; }
+trap cleanup EXIT
+/usr/bin/printf 'trusted\n' > "$safe/value"
+/usr/bin/chmod 0600 "$safe/value"
+"$script_dir/capture-trusted-inputs" "$output" "$safe/value" captured
+[[ $(<"$output/captured") == trusted ]]
+
+/usr/bin/rm -f "$output/captured"
+/usr/bin/printf 'replaceable\n' > "$bad/value"
+/usr/bin/chmod 0600 "$bad/value"
+if "$script_dir/capture-trusted-inputs" "$output" "$bad/value" captured >/dev/null 2>&1; then
+  printf 'input below world-writable parent was accepted\n' >&2; exit 1
+fi
+/usr/bin/rm -f "$output/captured"
+/usr/bin/chmod 0770 "$safe"
+if "$script_dir/capture-trusted-inputs" "$output" "$safe/value" captured >/dev/null 2>&1; then
+  printf 'input below group-writable parent was accepted\n' >&2; exit 1
+fi
+printf 'Trusted privileged input counterexamples passed\n'

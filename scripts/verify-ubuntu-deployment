@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Fail-closed static and parser checks for Ubuntu production assets."""
+
+import ast
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+UBUNTU = ROOT / "infra" / "ubuntu"
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+
+def run(command, **kwargs):
+    print("+", " ".join(map(str, command)))
+    return subprocess.run(command, check=True, text=True, **kwargs)
+
+
+def text(path: pathlib.Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def main() -> int:
+    scripts = [
+        ROOT / "scripts" / "install-ubuntu-host",
+        ROOT / "scripts" / "install-ubuntu-release",
+        ROOT / "scripts" / "verify-ubuntu-nginx-http",
+        ROOT / "scripts" / "verify-ubuntu-systemd-mounts",
+        ROOT / "scripts" / "verify-ubuntu-installed-nginx",
+        ROOT / "scripts" / "verify-ubuntu-postgresql-dependency",
+        ROOT / "scripts" / "verify-ubuntu-service-gate",
+        ROOT / "scripts" / "verify-ubuntu-config-boundaries",
+        ROOT / "scripts" / "verify-ubuntu-firewall-fixtures",
+        ROOT / "scripts" / "verify-ubuntu-trusted-inputs",
+        ROOT / "scripts" / "renew-ubuntu-tls",
+        ROOT / "scripts" / "check-ubuntu-tls-expiry",
+        ROOT / "scripts" / "run-ubuntu-migration",
+        ROOT / "scripts" / "verify-ubuntu-migration-lock",
+        ROOT / "scripts" / "verify-ubuntu-release-failures",
+        ROOT / "scripts" / "verify-ubuntu-tls-certificate",
+        ROOT / "scripts" / "verify-ubuntu-systemd-environment",
+    ]
+    for script in scripts:
+        require(os.access(script, os.X_OK), f"{script.name} is not executable")
+        run(["bash", "-n", script])
+    render = ROOT / "scripts" / "render-ubuntu-nginx"
+    python_scripts = [
+        render, ROOT / "scripts" / "assert-ubuntu-files-endpoint",
+        ROOT / "scripts" / "validate-ubuntu-config",
+        ROOT / "scripts" / "render-ubuntu-postgresql-dependency",
+        ROOT / "scripts" / "verify-ubuntu-firewall",
+        ROOT / "scripts" / "capture-trusted-inputs",
+        ROOT / "scripts" / "check-ubuntu-services",
+        ROOT / "scripts" / "acquire-ubuntu-deployment-locks",
+        ROOT / "scripts" / "handoff-ubuntu-migration-lock",
+    ]
+    for script in python_scripts:
+        require(os.access(script, os.X_OK), f"{script.name} is not executable")
+        ast.parse(text(script), filename=str(script))
+
+    units = UBUNTU / "systemd"
+    slice_text = text(units / "nmcp.slice")
+    require("CPUQuota=200%" in slice_text, "aggregate CPU ceiling changed")
+    require("MemoryMax=4G" in slice_text, "aggregate memory ceiling changed")
+    for name in ("nmcp-migrate.service", "nmcp-api.service", "nmcp-worker.service", "nmcp-files.service"):
+        unit = text(units / name)
+        require("Slice=nmcp.slice" in unit, f"{name} escapes aggregate slice")
+        if name != "nmcp-migrate.service":
+            require("User=nmcp" in unit and "Group=nmcp" in unit, f"{name} identity changed")
+        require("NoNewPrivileges=yes" in unit and "ProtectSystem=strict" in unit, f"{name} hardening missing")
+        require("CPUQuota=" not in unit and "MemoryMax=" not in unit, f"{name} duplicates aggregate budget")
+    require("NMCP_API_ADDR=127.0.0.1:8080" in text(UBUNTU / "env" / "api.env.example"), "API example is not loopback-only")
+    require((units / "postgresql@.service.d" / "10-nmcp-slice.conf").is_file(), "PostgreSQL instance slice drop-in missing")
+    timers = {path.name for path in UBUNTU.rglob("*.timer")}
+    require(timers == {"nmcp-tls-expiry.timer"}, "only independent TLS expiry monitoring may have a timer")
+    migrate_unit = text(units / "nmcp-migrate.service")
+    require("postgresql.service" not in migrate_unit, "migration still depends on PostgreSQL meta-unit")
+    require(
+        "ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration" in migrate_unit,
+        "systemd migration bypasses the deployment serializer",
+    )
+    require("RemainAfterExit=yes" in migrate_unit, "successful migration is not retained for dependent starts")
+    for dependent in ("nmcp-api.service", "nmcp-worker.service"):
+        dependent_text = text(units / dependent)
+        require(
+            "Requires=nmcp-migrate.service" in dependent_text and "After=nmcp-migrate.service" in dependent_text,
+            f"{dependent} lost its production migration dependency edge",
+        )
+    require(
+        "d /run/nmcp-deploy 0700 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf")
+        and "f /run/nmcp-deploy/deploy.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "shared migration lock ownership/mode is missing",
+    )
+    require(
+        "f /run/nmcp-deploy/migration-execution.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "owner-death migration execution lease is missing",
+    )
+    host_install = text(ROOT / "scripts" / "install-ubuntu-host")
+    require(
+        "handoff-ubuntu-migration-lock" in host_install,
+        "migration execution-lease handoff helper is not installed",
+    )
+    require("User=root" in migrate_unit, "migration serializer must own the root-only lock")
+    require(
+        "setpriv --reuid=nmcp --regid=nmcp" in text(ROOT / "scripts" / "run-ubuntu-migration"),
+        "migration body does not drop permanently to nmcp",
+    )
+
+    files_unit = text(units / "nmcp-files.service")
+    for required in (
+        "InaccessiblePaths=/var/lib/nmcp",
+        "BindReadOnlyPaths=/var/lib/nmcp/media/originals:/srv/nmcp/originals",
+        "BindReadOnlyPaths=/var/lib/nmcp/media/renditions:/srv/nmcp/renditions",
+        "LoadCredential=tls-key.pem:/etc/nmcp/tls-current/key.pem",
+        "ExecStartPre=/usr/sbin/nginx -t -c /etc/nmcp-nginx/nginx.conf",
+        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+    ):
+        require(required in files_unit, f"Nginx boundary missing: {required}")
+    require("ReadWritePaths=" not in files_unit, "Nginx received a writable host path")
+
+    nginx_template = text(UBUNTU / "nginx.conf.in")
+    require(nginx_template.count("alias ") == 2, "Nginx must expose exactly two aliases")
+    require("alias /srv/nmcp/originals/" in nginx_template, "originals alias missing")
+    require("alias /srv/nmcp/renditions/" in nginx_template, "renditions alias missing")
+    require("proxy_pass http://127.0.0.1:8080" in nginx_template, "API upstream is not loopback")
+    require("autoindex off" in nginx_template and "Accept-Ranges" in nginx_template, "file response boundary missing")
+    require("private, max-age=31536000, immutable" in nginx_template, "private cache contract missing")
+    require("@@NMCP_API_TLS_LISTEN@@" in nginx_template and "@@NMCP_FILES_TLS_LISTEN@@" in nginx_template, "listen token missing")
+
+    with tempfile.TemporaryDirectory(prefix="nmcp-ubuntu-verify-") as raw:
+        temporary = pathlib.Path(raw)
+        rendered = temporary / "nginx.conf"
+        run([
+            render,
+            "--template", UBUNTU / "nginx.conf.in",
+            "--output", rendered,
+            "--api-listen", "100.64.0.10:8443",
+            "--files-listen", "100.64.0.10:9443",
+            "--tailnet-hostname", "host.example.ts.net",
+        ])
+        rendered_text = text(rendered)
+        require("@@NMCP_" not in rendered_text, "renderer left a token")
+        rejected = subprocess.run([
+            render,
+            "--template", UBUNTU / "nginx.conf.in",
+            "--output", temporary / "rejected.conf",
+            "--api-listen", "0.0.0.0:8443",
+            "--files-listen", "100.64.0.10:9443",
+            "--tailnet-hostname", "host.example.ts.net",
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        require(rejected.returncode != 0, "renderer accepted a wildcard listener")
+
+        nginx = shutil.which("nginx")
+        openssl = shutil.which("openssl")
+        if nginx and openssl:
+            cert = temporary / "cert.pem"
+            key = temporary / "key.pem"
+            run([
+                openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-subj", "/CN=host.example.ts.net", "-days", "1",
+                "-keyout", key, "-out", cert,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cache = temporary / "cache"
+            (cache / "client").mkdir(parents=True)
+            (cache / "proxy").mkdir()
+            test_config = rendered_text.replace(
+                "/run/credentials/nmcp-files.service/tls-cert.pem", str(cert)
+            ).replace(
+                "/run/credentials/nmcp-files.service/tls-key.pem", str(key)
+            ).replace(
+                "/run/nmcp-nginx/nginx.pid", str(temporary / "nginx.pid")
+            ).replace(
+                "/run/nmcp-nginx/client", str(cache / "client")
+            ).replace(
+                "/run/nmcp-nginx/proxy", str(cache / "proxy")
+            ).replace(
+                "100.64.0.10:8443", "127.0.0.1:18443"
+            ).replace(
+                "100.64.0.10:9443", "127.0.0.1:19443"
+            )
+            test_path = temporary / "nginx-test.conf"
+            test_path.write_text(test_config, encoding="utf-8")
+            run([nginx, "-t", "-c", test_path])
+        else:
+            print("SKIP: nginx/openssl unavailable; parser test must run in CI", file=sys.stderr)
+
+    analyzer = shutil.which("systemd-analyze")
+    if analyzer:
+        unit_files = [
+            units / "nmcp.slice", *sorted(units.glob("nmcp-*.service")),
+            *sorted(units.glob("nmcp-*.timer")), units / "nmcp.target"
+        ]
+        environment = os.environ.copy()
+        environment["SYSTEMD_UNIT_PATH"] = f"{units}:/usr/lib/systemd/system:/lib/systemd/system"
+        result = subprocess.run(
+            [analyzer, "verify", *unit_files], text=True, capture_output=True, env=environment
+        )
+        output = result.stdout + result.stderr
+        forbidden = ("Unknown key", "Failed to parse", "Ignoring unknown escape", "Invalid section")
+        require(not any(item in output for item in forbidden), f"systemd parser warning:\n{output}")
+        def allowed_missing(line: str) -> bool:
+            return (
+                "Command /opt/nmcp/current/bin/" in line
+                or "Command /usr/sbin/nginx is not executable:" in line
+                or "Command /usr/local/libexec/nmcp/" in line
+            )
+        unexpected = [
+            line for line in output.splitlines()
+            if line.strip() and not allowed_missing(line)
+        ]
+        require(not unexpected, "unexpected systemd verification output:\n" + "\n".join(unexpected))
+        require(result.returncode in (0, 1), f"systemd-analyze exited {result.returncode}")
+    else:
+        print("SKIP: systemd-analyze unavailable; parser test must run in CI", file=sys.stderr)
+
+    print("Ubuntu deployment static verification passed")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, UnicodeError) as error:
+        print(f"verify-ubuntu-deployment: {error}", file=sys.stderr)
+        sys.exit(1)

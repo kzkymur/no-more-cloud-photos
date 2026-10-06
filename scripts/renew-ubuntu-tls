@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 0077
+
+if [[ $# -ne 2 ]]; then
+  printf 'usage: renew-ubuntu-tls CERTIFICATE PRIVATE_KEY\n' >&2
+  exit 2
+fi
+[[ $EUID -eq 0 ]] || { printf 'renew-ubuntu-tls: must run as root\n' >&2; exit 1; }
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+if [[ ${NMCP_LOCK_MODE:-} != direct ]]; then
+  exec "$script_dir/acquire-ubuntu-deployment-locks" both -- "$0" "$@"
+fi
+"$script_dir/acquire-ubuntu-deployment-locks" verify direct
+hostname=$(</etc/nmcp/tailnet-hostname)
+active_state=$(/usr/bin/systemctl show nmcp-files.service --property=ActiveState --value)
+sub_state=$(/usr/bin/systemctl show nmcp-files.service --property=SubState --value)
+if [[ $active_state == active && $sub_state == running ]]; then
+  was_active=true
+elif [[ $active_state == inactive && $sub_state == dead ]]; then
+  was_active=false
+else
+  printf 'renew-ubuntu-tls: nmcp-files.service must be stable running or inactive/dead\n' >&2
+  exit 1
+fi
+capture=$(/usr/bin/mktemp -d /run/nmcp-tls-input.XXXXXX)
+temporary_link=/etc/nmcp/tls-current.new.$$
+cleanup() {
+  /usr/bin/rm -rf -- "$capture"
+  /usr/bin/rm -f -- "$temporary_link"
+}
+trap cleanup EXIT
+"$script_dir/capture-trusted-inputs" "$capture" "$1" cert.pem "$2" key.pem
+"$script_dir/verify-ubuntu-tls-certificate" \
+  "$capture/cert.pem" "$hostname" "$capture/key.pem"
+release_id=$(/usr/bin/sha256sum "$capture/cert.pem" "$capture/key.pem" | /usr/bin/sha256sum | /usr/bin/cut -d' ' -f1)
+release=/etc/nmcp/tls-releases/$release_id
+if [[ ! -e $release ]]; then
+  /usr/bin/install -d -o root -g root -m 0700 "$release"
+  /usr/bin/install -o root -g root -m 0600 "$capture/cert.pem" "$release/cert.pem"
+  /usr/bin/install -o root -g root -m 0600 "$capture/key.pem" "$release/key.pem"
+else
+  /usr/bin/cmp --silent "$capture/cert.pem" "$release/cert.pem"
+  /usr/bin/cmp --silent "$capture/key.pem" "$release/key.pem"
+fi
+[[ $(/usr/bin/stat -c '%U:%G:%a' "$release") == root:root:700 \
+  && $(/usr/bin/stat -c '%U:%G:%a' "$release/cert.pem") == root:root:600 \
+  && $(/usr/bin/stat -c '%U:%G:%a' "$release/key.pem") == root:root:600 ]] || {
+  printf 'renew-ubuntu-tls: TLS generation ownership/mode is unsafe\n' >&2; exit 1;
+}
+old_target=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
+/usr/bin/ln -s -- "$release" "$temporary_link"
+/usr/bin/mv -Tf -- "$temporary_link" /etc/nmcp/tls-current
+if [[ $was_active == false ]]; then
+  "$script_dir/check-ubuntu-tls-expiry"
+  printf 'Installed TLS generation %s; File Server remains inactive\n' "$release_id"
+  exit 0
+fi
+if ! /usr/bin/systemctl restart nmcp-files.service || ! /usr/bin/systemctl is-active --quiet nmcp-files.service; then
+  /usr/bin/ln -s -- "$old_target" "$temporary_link"
+  /usr/bin/mv -Tf -- "$temporary_link" /etc/nmcp/tls-current
+  if ! /usr/bin/systemctl restart nmcp-files.service \
+    || ! /usr/bin/systemctl is-active --quiet nmcp-files.service; then
+    printf 'renew-ubuntu-tls: previous TLS link restored, but Nginx recovery restart failed\n' >&2
+    exit 1
+  fi
+  printf 'renew-ubuntu-tls: candidate restart failed; previous TLS generation restored and restarted\n' >&2
+  exit 1
+fi
+"$script_dir/check-ubuntu-tls-expiry"
+printf 'Installed TLS generation %s and restarted Nginx\n' "$release_id"

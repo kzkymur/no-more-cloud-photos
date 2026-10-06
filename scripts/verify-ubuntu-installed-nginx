@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-installed-nginx: must run as root\n' >&2; exit 1; }
+test_ip=${NMCP_NGINX_TEST_IP:-100.64.0.10}
+api_port=${NMCP_NGINX_TEST_API_PORT:-18443}
+files_port=${NMCP_NGINX_TEST_FILES_PORT:-19443}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd -- "$script_dir/.." && pwd -P)
+work=$(/usr/bin/mktemp -d /var/tmp/nmcp-installed-nginx.XXXXXX)
+for path in /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp /usr/local/libexec/nmcp; do
+  [[ ! -e $path ]] || { printf 'refusing to replace existing test-host path: %s\n' "$path" >&2; exit 1; }
+done
+cleanup() {
+  /usr/bin/systemctl stop nmcp-files.service nmcp-api.service >/dev/null 2>&1 || true
+  /usr/bin/rm -f /run/systemd/system/nmcp-files.service /run/systemd/system/nmcp-api.service \
+    /run/systemd/system/postgresql@nmcp-test.service /run/systemd/system/nmcp.slice
+  /usr/bin/rm -rf /run/systemd/system/nmcp-files.service.d
+  /usr/bin/rm -rf "/run/nmcp-test-restart.$$"
+  /usr/bin/rm -f "/usr/local/share/ca-certificates/nmcp-test-$$.crt"
+  /usr/sbin/update-ca-certificates >/dev/null 2>&1 || true
+  /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+  /usr/bin/rm -rf -- /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp \
+    /usr/local/libexec/nmcp "/root/nmcp-host-reinstall.$$" "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" \
+    "/root/nmcp-tls-renew-persistent.$$" "/root/nmcp-tls-renew-inactive.$$" "$work"
+}
+trap cleanup EXIT
+
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf" "$work/nmcp-sysusers.conf"
+/usr/bin/systemd-sysusers "$work/nmcp-sysusers.conf"
+/usr/bin/install -d -o root -g root -m 0700 /etc/nmcp /etc/nmcp/tls-releases/test
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=NMCP-Test-CA -days 30 \
+  -addext basicConstraints=critical,CA:TRUE -keyout "$work/ca.key" -out "$work/ca.crt" >/dev/null 2>&1
+/usr/bin/install -o root -g root -m 0644 "$work/ca.crt" "/usr/local/share/ca-certificates/nmcp-test-$$.crt"
+/usr/sbin/update-ca-certificates >/dev/null
+issue_certificate() {
+  local directory=$1 serial=$2
+  /usr/bin/openssl req -new -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net \
+    -addext subjectAltName=DNS:host.example.ts.net \
+    -keyout "$directory/key.pem" -out "$directory/request.pem" >/dev/null 2>&1
+  /usr/bin/openssl x509 -req -in "$directory/request.pem" -CA "$work/ca.crt" -CAkey "$work/ca.key" \
+    -set_serial "$serial" -days 30 -copy_extensions copy -out "$directory/leaf.pem" >/dev/null 2>&1
+  /usr/bin/cp "$directory/leaf.pem" "$directory/cert.pem"
+  /usr/bin/cat "$work/ca.crt" >> "$directory/cert.pem"
+  /usr/bin/rm -f "$directory/request.pem" "$directory/leaf.pem"
+}
+issue_certificate /etc/nmcp/tls-releases/test 1
+/usr/bin/install -d -m 0700 "$work/future" "$work/newcerts"
+: > "$work/index.txt"
+/usr/bin/printf '1000\n' > "$work/serial"
+cat > "$work/ca.cnf" <<EOF
+[ ca ]
+default_ca = local
+[ local ]
+database = $work/index.txt
+new_certs_dir = $work/newcerts
+certificate = $work/ca.crt
+private_key = $work/ca.key
+serial = $work/serial
+default_md = sha256
+policy = policy
+copy_extensions = copy
+[ policy ]
+commonName = supplied
+EOF
+/usr/bin/openssl req -new -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net \
+  -addext subjectAltName=DNS:host.example.ts.net -keyout "$work/future/key.pem" \
+  -out "$work/future/request.pem" >/dev/null 2>&1
+future_start=$(/usr/bin/date --utc --date='+1 day' +%y%m%d%H%M%SZ)
+future_end=$(/usr/bin/date --utc --date='+31 days' +%y%m%d%H%M%SZ)
+/usr/bin/openssl ca -batch -config "$work/ca.cnf" -startdate "$future_start" -enddate "$future_end" \
+  -in "$work/future/request.pem" -out "$work/future/cert.pem" >/dev/null 2>&1
+if "$repo_root/scripts/verify-ubuntu-tls-certificate" "$work/future/cert.pem" \
+  host.example.ts.net "$work/future/key.pem" >/dev/null 2>&1; then
+  printf 'future-notBefore TLS certificate was accepted\n' >&2; exit 1
+fi
+/usr/bin/chown root:root /etc/nmcp/tls-releases/test/*.pem
+/usr/bin/chmod 0600 /etc/nmcp/tls-releases/test/*.pem
+/usr/bin/ln -s /etc/nmcp/tls-releases/test /etc/nmcp/tls-current
+/usr/bin/printf 'host.example.ts.net\n' > /etc/nmcp/tailnet-hostname
+/usr/bin/chmod 0600 /etc/nmcp/tailnet-hostname
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp
+for script in acquire-ubuntu-deployment-locks renew-ubuntu-tls capture-trusted-inputs \
+  check-ubuntu-tls-expiry verify-ubuntu-tls-certificate; do
+  /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
+done
+
+/usr/bin/install -d -o root -g root -m 0755 /etc/nmcp-nginx
+"$repo_root/scripts/render-ubuntu-nginx" \
+  --template "$repo_root/infra/ubuntu/nginx.conf.in" --output /etc/nmcp-nginx/nginx.conf \
+  --api-listen "$test_ip:$api_port" --files-listen "$test_ip:$files_port" \
+  --tailnet-hostname host.example.ts.net
+/usr/bin/chown root:root /etc/nmcp-nginx/nginx.conf
+/usr/bin/chmod 0644 /etc/nmcp-nginx/nginx.conf
+
+original_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+rendition_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+profile_id=cccccccc-cccc-4ccc-8ccc-cccccccccccc
+symlink_original_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab
+symlink_rendition_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc
+original_dir=/var/lib/nmcp/media/originals/aa/$original_id
+rendition_dir=/var/lib/nmcp/media/renditions/aa/$original_id/$rendition_id
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 "$original_dir" "$rendition_dir" \
+  "/var/lib/nmcp/media/originals/aa/$symlink_original_id" \
+  "/var/lib/nmcp/media/renditions/aa/$original_id/$symlink_rendition_id" \
+  /var/lib/nmcp/media/tmp /var/lib/nmcp/backups /srv/nmcp/originals /srv/nmcp/renditions
+/usr/bin/printf '0123456789abcdef' > "$original_dir/original.jpg"
+/usr/bin/printf 'rendition-fixture' > "$rendition_dir/$profile_id.webp"
+/usr/bin/chown -R nmcp:nmcp /var/lib/nmcp/media /srv/nmcp
+/usr/bin/chmod 0600 "$original_dir/original.jpg" "$rendition_dir/$profile_id.webp"
+/usr/bin/ln -s "$original_dir/original.jpg" \
+  "/var/lib/nmcp/media/originals/aa/$symlink_original_id/original.jpg"
+/usr/bin/ln -s "$rendition_dir/$profile_id.webp" \
+  "/var/lib/nmcp/media/renditions/aa/$original_id/$symlink_rendition_id/$profile_id.webp"
+
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/nmcp.slice" /run/systemd/system/nmcp.slice
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/nmcp-files.service" /run/systemd/system/nmcp-files.service
+cat > /run/systemd/system/nmcp-api.service <<'EOF'
+[Unit]
+Description=Disposable NMCP API dependency
+[Service]
+Type=simple
+ExecStart=/usr/bin/sleep infinity
+EOF
+cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/true
+RemainAfterExit=yes
+EOF
+/usr/bin/systemctl daemon-reload
+
+# Prove the exact installed traversal boundary before service startup.
+/usr/sbin/runuser -u nmcp -- /usr/bin/test -r /etc/nmcp-nginx/nginx.conf
+if /usr/sbin/runuser -u nmcp -- /usr/bin/test -r /etc/nmcp/tailnet-hostname; then
+  printf 'nmcp unexpectedly read a root-only source credential/config path\n' >&2
+  exit 1
+fi
+if ! /usr/bin/systemctl start nmcp-api.service nmcp-files.service; then
+  /usr/bin/systemctl status nmcp-api.service nmcp-files.service --no-pager >&2 || true
+  /usr/bin/journalctl -u nmcp-files.service --no-pager >&2 || true
+  exit 1
+fi
+/usr/bin/systemctl is-active --quiet nmcp-files.service
+
+# Host asset installation must fail before mutation when the credential-bearing
+# File Server is live; reinstall otherwise creates disk/served TLS divergence.
+guard_error=$work/host-guard-error
+guard_link=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
+guard_config=$(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf)
+guard_input=/root/nmcp-host-reinstall.$$
+/usr/bin/install -d -o root -g root -m 0700 "$guard_input"
+/usr/bin/printf '%s\n' \
+  'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
+  'NMCP_LOG_LEVEL=info' 'NMCP_SHUTDOWN_TIMEOUT=30s' > "$guard_input/admin.env"
+/usr/bin/printf '%s\n' \
+  'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
+  'NMCP_STORAGE_ROOT=/var/lib/nmcp/media' \
+  'NMCP_FILE_BASE_URL=https://host.example.ts.net:19443/files/' \
+  'NMCP_CURSOR_HMAC_KEY=0123456789abcdef0123456789abcdef' \
+  'NMCP_API_ADDR=127.0.0.1:8080' 'NMCP_LOG_LEVEL=info' \
+  'NMCP_SHUTDOWN_TIMEOUT=30s' > "$guard_input/api.env"
+/usr/bin/printf '%s\n' \
+  'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
+  'NMCP_STORAGE_ROOT=/var/lib/nmcp/media' 'NMCP_LOG_LEVEL=info' \
+  'NMCP_SHUTDOWN_TIMEOUT=30s' > "$guard_input/worker.env"
+/usr/bin/chown root:root "$guard_input"/*.env
+/usr/bin/chmod 0600 "$guard_input"/*.env
+if "$repo_root/scripts/install-ubuntu-host" --config-dir "$guard_input" \
+  --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
+  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@nmcp-test.service \
+  --tls-cert /etc/nmcp/tls-releases/test/cert.pem \
+  --tls-key /etc/nmcp/tls-releases/test/key.pem >/dev/null 2>"$guard_error"; then
+  printf 'live host reinstall was accepted\n' >&2; exit 1
+fi
+/usr/bin/grep -q 'must be exactly inactive/dead' "$guard_error"
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$guard_link" ]]
+[[ $(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf) == "$guard_config" ]]
+
+/usr/bin/systemctl stop nmcp-files.service
+cat > /run/systemd/system/nmcp-files.service <<'EOF'
+[Service]
+Type=notify
+User=nmcp
+ExecStart=/usr/bin/sleep 30
+TimeoutStartSec=30
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl start --no-block nmcp-files.service
+for attempt in {1..20}; do
+  [[ $(/usr/bin/systemctl show nmcp-files.service --property=ActiveState --value) == activating ]] && break
+  [[ $attempt -lt 20 ]] || { printf 'File Server did not enter activating state\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+if "$repo_root/scripts/install-ubuntu-host" --config-dir "$guard_input" \
+  --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
+  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@nmcp-test.service \
+  --tls-cert /etc/nmcp/tls-releases/test/cert.pem \
+  --tls-key /etc/nmcp/tls-releases/test/key.pem >/dev/null 2>"$guard_error"; then
+  printf 'activating host reinstall was accepted\n' >&2; exit 1
+fi
+/usr/bin/grep -q 'must be exactly inactive/dead' "$guard_error"
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$guard_link" ]]
+[[ $(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf) == "$guard_config" ]]
+/usr/bin/systemctl stop nmcp-files.service
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/nmcp-files.service" \
+  /run/systemd/system/nmcp-files.service
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl start nmcp-files.service
+
+base=https://$test_ip:$files_port
+trusted_base=https://host.example.ts.net:$files_port
+fingerprint() {
+  local attempt value
+  for attempt in {1..30}; do
+    if value=$(
+      /usr/bin/openssl s_client -connect "$test_ip:$files_port" -servername host.example.ts.net \
+        -CAfile "$work/ca.crt" -verify_return_error </dev/null 2>/dev/null \
+        | /usr/bin/openssl x509 -noout -fingerprint -sha256 2>/dev/null
+    ); then
+      /usr/bin/printf '%s\n' "$value"
+      return 0
+    fi
+    /usr/bin/sleep 0.2
+  done
+  return 1
+}
+for attempt in {1..30}; do
+  if /usr/bin/curl --noproxy '*' --insecure --silent --fail --max-time 2 "$base/files-healthz" >/dev/null; then break; fi
+  [[ $attempt -lt 30 ]] || { /usr/bin/journalctl -u nmcp-files.service --no-pager >&2; exit 1; }
+  /usr/bin/sleep 0.2
+done
+/usr/bin/curl --noproxy '*' --silent --fail --max-time 2 --cacert "$work/ca.crt" \
+  --resolve "host.example.ts.net:$files_port:$test_ip" "$trusted_base/files-healthz" >/dev/null
+old_fingerprint=$(fingerprint)
+"$repo_root/scripts/assert-ubuntu-files-endpoint" --base-url "$base" --insecure \
+  --original-path "/files/originals/aa/$original_id/original.jpg" \
+  --original-file "$original_dir/original.jpg" --original-mime image/jpeg \
+  --original-symlink-path "/files/originals/aa/$symlink_original_id/original.jpg" \
+  --rendition-path "/files/renditions/aa/$original_id/$rendition_id/$profile_id.webp" \
+  --rendition-file "$rendition_dir/$profile_id.webp" --rendition-mime image/webp \
+  --rendition-symlink-path "/files/renditions/aa/$original_id/$symlink_rendition_id/$profile_id.webp"
+
+# Renew as one immutable certificate/key generation, restart to refresh
+# LoadCredential, and retain service availability. Reject a mismatched pair.
+renew_input=/root/nmcp-tls-renew.$$
+/usr/bin/install -d -o root -g root -m 0700 "$renew_input"
+issue_certificate "$renew_input" 2
+/usr/bin/chown root:root "$renew_input"/*.pem
+/usr/bin/chmod 0600 "$renew_input"/*.pem
+old_tls=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
+/usr/local/libexec/nmcp/renew-ubuntu-tls "$renew_input/cert.pem" "$renew_input/key.pem"
+new_tls=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
+[[ $new_tls != "$old_tls" ]]
+/usr/bin/systemctl is-active --quiet nmcp-files.service
+/usr/bin/curl --noproxy '*' --silent --fail --max-time 2 --cacert "$work/ca.crt" \
+  --resolve "host.example.ts.net:$files_port:$test_ip" "$trusted_base/files-healthz" >/dev/null
+new_fingerprint=$(fingerprint)
+disk_fingerprint=$(/usr/bin/openssl x509 -in "$new_tls/cert.pem" -noout -fingerprint -sha256)
+[[ $new_fingerprint != "$old_fingerprint" && $new_fingerprint == "$disk_fingerprint" ]]
+/usr/bin/openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -out "$renew_input/wrong-key.pem" >/dev/null 2>&1
+/usr/bin/chmod 0600 "$renew_input/wrong-key.pem"
+if /usr/local/libexec/nmcp/renew-ubuntu-tls \
+  "$renew_input/cert.pem" "$renew_input/wrong-key.pem" >/dev/null 2>&1; then
+  printf 'mismatched TLS generation was accepted\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
+
+# Model SIGKILL after publishing a new symlink but before restart. The durable
+# expiry check must detect that disk and the active LoadCredential snapshot differ.
+/usr/bin/ln -s -- "$old_tls" /etc/nmcp/tls-current.interrupted
+/usr/bin/mv -Tf -- /etc/nmcp/tls-current.interrupted /etc/nmcp/tls-current
+if /usr/local/libexec/nmcp/check-ubuntu-tls-expiry >/dev/null 2>&1; then
+  printf 'interrupted TLS publication was not detected\n' >&2; exit 1
+fi
+/usr/bin/ln -s -- "$new_tls" /etc/nmcp/tls-current.interrupted
+/usr/bin/mv -Tf -- /etc/nmcp/tls-current.interrupted /etc/nmcp/tls-current
+/usr/local/libexec/nmcp/check-ubuntu-tls-expiry >/dev/null
+
+# A failed candidate restart must restore both the prior generation and the
+# certificate actually served by the recovery restart.
+failure_input=/root/nmcp-tls-renew-failure.$$
+/usr/bin/install -d -o root -g root -m 0700 "$failure_input"
+issue_certificate "$failure_input" 3
+/usr/bin/chown root:root "$failure_input"/*.pem
+/usr/bin/chmod 0600 "$failure_input"/*.pem
+/usr/bin/install -d -o root -g root -m 0755 /run/systemd/system/nmcp-files.service.d
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 "/run/nmcp-test-restart.$$"
+cat > /run/systemd/system/nmcp-files.service.d/99-fail-once.conf <<EOF
+[Service]
+ExecStartPre=/bin/sh -c 'if ! test -e /run/nmcp-test-restart.$$/failed; then touch /run/nmcp-test-restart.$$/failed; exit 1; fi'
+EOF
+/usr/bin/systemctl daemon-reload
+if /usr/local/libexec/nmcp/renew-ubuntu-tls "$failure_input/cert.pem" "$failure_input/key.pem"; then
+  printf 'TLS renewal unexpectedly survived a failed candidate restart\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
+/usr/bin/systemctl is-active --quiet nmcp-files.service
+[[ $(fingerprint) == "$new_fingerprint" ]]
+/usr/bin/rm -rf -- "$failure_input"
+
+# If both candidate and recovery restarts fail, renewal must retain the previous
+# disk link but explicitly report failure without claiming service restoration.
+persistent_input=/root/nmcp-tls-renew-persistent.$$
+/usr/bin/install -d -o root -g root -m 0700 "$persistent_input"
+issue_certificate "$persistent_input" 4
+/usr/bin/chown root:root "$persistent_input"/*.pem
+/usr/bin/chmod 0600 "$persistent_input"/*.pem
+cat > /run/systemd/system/nmcp-files.service.d/99-fail-once.conf <<'EOF'
+[Service]
+ExecStartPre=/usr/bin/false
+EOF
+/usr/bin/systemctl daemon-reload
+if /usr/local/libexec/nmcp/renew-ubuntu-tls "$persistent_input/cert.pem" "$persistent_input/key.pem"; then
+  printf 'persistent Nginx restart failure was accepted\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
+if /usr/bin/systemctl is-active --quiet nmcp-files.service; then
+  printf 'File Server remained active after both restart attempts failed\n' >&2; exit 1
+fi
+/usr/bin/rm -f /run/systemd/system/nmcp-files.service.d/99-fail-once.conf
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed nmcp-files.service
+/usr/bin/systemctl restart nmcp-files.service
+[[ $(fingerprint) == "$new_fingerprint" ]]
+/usr/bin/rm -rf -- "$persistent_input"
+
+# Publishing while intentionally stopped must not start the File Server or its
+# API dependency and is validated for the next explicit start.
+inactive_input=/root/nmcp-tls-renew-inactive.$$
+/usr/bin/install -d -o root -g root -m 0700 "$inactive_input"
+issue_certificate "$inactive_input" 5
+/usr/bin/chown root:root "$inactive_input"/*.pem
+/usr/bin/chmod 0600 "$inactive_input"/*.pem
+/usr/bin/systemctl stop nmcp-files.service
+api_state=$(/usr/bin/systemctl show nmcp-api.service --property=ActiveState --value)
+/usr/local/libexec/nmcp/renew-ubuntu-tls "$inactive_input/cert.pem" "$inactive_input/key.pem"
+[[ $(/usr/bin/systemctl show nmcp-files.service --property=ActiveState --value) == inactive ]]
+[[ $(/usr/bin/systemctl show nmcp-files.service --property=SubState --value) == dead ]]
+[[ $(/usr/bin/systemctl show nmcp-api.service --property=ActiveState --value) == "$api_state" ]]
+printf 'Installed-path nmcp Nginx service and full HTTP matrix passed\n'

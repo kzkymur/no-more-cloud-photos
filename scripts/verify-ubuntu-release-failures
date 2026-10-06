@@ -1,0 +1,545 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-release-failures: must run as root\n' >&2; exit 1; }
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+work=$(/usr/bin/mktemp -d /run/nmcp-release-failures.XXXXXX)
+units=(nmcp-api.service nmcp-worker.service nmcp-files.service nmcp-migrate.service nmcp.target nmcp.slice postgresql@nmcp-test.service)
+predispatch_pid=
+installer_pid=
+registration_pid=
+cancel_pid=
+pretransfer_pid=
+cleanup() {
+  /usr/bin/touch "$work/ownerdeath-proceed" 2>/dev/null || true
+  /usr/bin/touch /run/nmcp-deploy/test-runner-record.go \
+    /run/nmcp-deploy/test-before-admin-dispatch.go \
+    /run/nmcp-deploy/test-cancel-stop.go \
+    /run/nmcp-deploy/test-receiver-exec-check.go \
+    /run/nmcp-deploy/test-wrapper-launched.go \
+    /run/nmcp-deploy/test-registration-paused.go \
+    /run/nmcp-deploy/test-before-launcher-reap.go 2>/dev/null || true
+  [[ -z $predispatch_pid ]] || /usr/bin/kill "$predispatch_pid" 2>/dev/null || true
+  [[ -z $installer_pid ]] || /usr/bin/kill "$installer_pid" 2>/dev/null || true
+  [[ -z $registration_pid ]] || /usr/bin/kill "$registration_pid" 2>/dev/null || true
+  [[ -z $cancel_pid ]] || /usr/bin/kill "$cancel_pid" 2>/dev/null || true
+  [[ -z $pretransfer_pid ]] || /usr/bin/kill "$pretransfer_pid" 2>/dev/null || true
+  [[ -z $installer_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$installer_pid-1.service" >/dev/null 2>&1 || true
+  [[ -z $registration_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$registration_pid-1.service" >/dev/null 2>&1 || true
+  for _attempt in {1..50}; do
+    if ! compgen -G '/run/nmcp-deploy/migration-handoff.*' >/dev/null \
+      && ! compgen -G '/run/nmcp-deploy/migration-runner.*' >/dev/null; then break; fi
+    /usr/bin/sleep 0.02
+  done
+  /usr/bin/systemctl stop "${units[@]}" >/dev/null 2>&1 || true
+  for unit in "${units[@]}"; do /usr/bin/rm -f -- "/run/systemd/system/$unit"; done
+  /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+  /usr/bin/rm -rf /opt/nmcp /etc/nmcp /var/lib/nmcp/deployment /usr/local/libexec/nmcp \
+    /run/nmcp-deploy "$work"
+  /usr/bin/rm -f /run/nmcp-migration-complete
+}
+trap cleanup EXIT
+/usr/bin/chown nmcp:nmcp "$work"
+for path in /opt/nmcp /etc/nmcp /var/lib/nmcp/deployment /usr/local/libexec/nmcp; do
+  [[ ! -e $path ]] || { printf 'test path already exists: %s\n' "$path" >&2; exit 1; }
+done
+/usr/bin/install -d -o root -g root -m 0755 /opt/nmcp/releases /usr/local/libexec/nmcp
+/usr/bin/install -d -o root -g root -m 0700 /etc/nmcp /var/lib/nmcp/deployment
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 /var/lib/nmcp/media
+/usr/bin/printf 'postgresql@nmcp-test.service\n' > /etc/nmcp/postgresql-unit
+/usr/bin/printf 'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable\nNMCP_LOG_LEVEL=info\nNMCP_SHUTDOWN_TIMEOUT=30s\n' > /etc/nmcp/admin.env
+/usr/bin/cp /etc/nmcp/admin.env /etc/nmcp/api.env
+/usr/bin/cp /etc/nmcp/admin.env /etc/nmcp/worker.env
+/usr/bin/chmod 0600 /etc/nmcp/*
+/usr/bin/install -m 0755 "$repo/scripts/run-ubuntu-migration" /usr/local/libexec/nmcp/run-ubuntu-migration
+/usr/bin/install -m 0755 "$repo/scripts/acquire-ubuntu-deployment-locks" \
+  /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks
+/usr/bin/install -m 0755 "$repo/scripts/handoff-ubuntu-migration-lock" \
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock
+cat > /usr/local/libexec/nmcp/check-ubuntu-services <<EOF
+#!/bin/sh
+if test -e '$work/allow-candidate' && test "\$(readlink -f /opt/nmcp/current)" = /opt/nmcp/releases/candidate; then exit 0; fi
+exit 1
+EOF
+/usr/bin/chmod 0755 /usr/local/libexec/nmcp/check-ubuntu-services
+make_release() {
+  local id=$1 root=/opt/nmcp/releases/$1
+  /usr/bin/install -d -o root -g root -m 0755 "$root/bin"
+  for binary in core-api core-worker nmcp-admin; do
+    /usr/bin/printf '#!/bin/sh\nexit 0\n' > "$root/bin/$binary"
+    /usr/bin/chmod 0755 "$root/bin/$binary"
+  done
+  for binary in core-api core-worker; do
+    /usr/bin/printf '#!/bin/sh\nexec /usr/bin/sleep infinity\n' > "$root/bin/$binary"
+    /usr/bin/chmod 0755 "$root/bin/$binary"
+  done
+  cat > "$root/bin/nmcp-admin" <<EOF
+#!/bin/sh
+if test "\${1:-}" = migrate; then
+  printf 'NMCP_TEST_ADMIN_ENTERED=%s\n' '$id'
+  /usr/bin/systemctl is-active --quiet postgresql@nmcp-test.service || exit 70
+  test -e '$work/postgresql-ready' || exit 71
+fi
+if test "\${1:-}" = migrate && test "\${2:-}" = up; then printf 'NMCP_TEST_MIGRATION=%s\n' '$id'; fi
+if test "\${1:-}" = migrate && test "\${2:-}" = status; then printf 'NMCP_TEST_STATUS=%s\n' '$id'; fi
+exit 0
+EOF
+  /usr/bin/chmod 0755 "$root/bin/nmcp-admin"
+  (cd "$root" && /usr/bin/sha256sum bin/* > MANIFEST.sha256)
+  /usr/bin/chmod 0644 "$root/MANIFEST.sha256"
+}
+make_release old
+make_release migratefail
+make_release startfail
+make_release candidate
+make_release pgfail
+make_release queuefail
+make_release cancelrace
+make_release ownerpretransfer
+make_release predispatch
+make_release ownerdeath
+/usr/bin/printf '#!/bin/sh\nexit 1\n' > /opt/nmcp/releases/migratefail/bin/nmcp-admin
+/usr/bin/chmod 0755 /opt/nmcp/releases/migratefail/bin/nmcp-admin
+(cd /opt/nmcp/releases/migratefail && /usr/bin/sha256sum bin/* > MANIFEST.sha256)
+/usr/bin/ln -s /opt/nmcp/releases/old /opt/nmcp/current
+cat > /run/systemd/system/nmcp-migrate.service <<EOF
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+EnvironmentFile=/etc/nmcp/admin.env
+ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration
+EOF
+/usr/bin/install -o root -g root -m 0644 "$repo/infra/ubuntu/systemd/nmcp.slice" /run/systemd/system/nmcp.slice
+for unit in nmcp-api.service nmcp-worker.service; do
+  /usr/bin/install -o root -g root -m 0644 "$repo/infra/ubuntu/systemd/$unit" "/run/systemd/system/$unit"
+done
+cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/bin/sh -c '/usr/bin/touch "$work/postgresql-started"; if test -e "$work/postgresql-slow"; then /usr/bin/sleep 31; fi; /usr/bin/touch "$work/postgresql-ready"; /usr/bin/systemd-notify --ready; exec /usr/bin/sleep infinity'
+TimeoutStartSec=45s
+EOF
+cat > /run/systemd/system/nmcp-files.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/false
+EOF
+cat > /run/systemd/system/nmcp.target <<'EOF'
+[Unit]
+Requires=nmcp-api.service nmcp-worker.service nmcp-files.service
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl start postgresql@nmcp-test.service
+
+if "$repo/scripts/install-ubuntu-release" activate migratefail; then
+  printf 'migration failure unexpectedly activated release\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
+/usr/bin/grep -q 'active=old.*attempted=migratefail.*state=migration-failed-link-restored' \
+  /var/lib/nmcp/deployment/active-release
+
+# The real transient migration must require/order after the concrete database,
+# and a database start failure must prevent the admin binary from running.
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+/usr/bin/rm -f "$work/postgresql-started" "$work/postgresql-ready"
+cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/false
+EOF
+/usr/bin/systemctl daemon-reload
+if "$repo/scripts/install-ubuntu-release" activate pgfail >"$work/pgfail.out" 2>&1; then
+  printf 'PostgreSQL start failure unexpectedly ran migration\n' >&2; exit 1
+fi
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=pgfail' "$work/pgfail.out"; then
+  printf 'admin binary entered despite PostgreSQL start failure\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
+
+# A transient job queued behind a never-ready but finitely bounded PostgreSQL
+# start must hit its own queue deadline and release every deployment resource.
+cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
+[Service]
+Type=notify
+ExecStart=/usr/bin/sleep infinity
+TimeoutStartSec=45s
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
+queue_started=$(/usr/bin/date +%s)
+if NMCP_TEST_ADMIN_OPERATION_TIMEOUT_SECONDS=2 \
+  "$repo/scripts/install-ubuntu-release" activate queuefail >"$work/queuefail.out" 2>&1; then
+  printf 'never-runnable dependency unexpectedly activated release\n' >&2; exit 1
+fi
+queue_elapsed=$(( $(/usr/bin/date +%s) - queue_started ))
+((queue_elapsed < 10)) || { printf 'transient queue timeout was not enforced\n' >&2; exit 1; }
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=queuefail' "$work/queuefail.out"; then
+  printf 'queued admin binary entered before PostgreSQL readiness\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
+[[ $(/usr/bin/systemctl show postgresql@nmcp-test.service --property=ActiveState --value) == activating ]] || {
+  printf 'queue proof lost the still-activating PostgreSQL dependency\n' >&2; exit 1;
+}
+if /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q 'nmcp-deploy-admin-'; then
+  printf 'queue timeout left a transient systemd job\n' >&2; exit 1
+fi
+if /usr/bin/systemctl is-active --quiet 'nmcp-deploy-admin-*'; then
+  printf 'queue timeout left a transient unit active\n' >&2; exit 1
+fi
+for attempt in {1..100}; do
+  if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
+    && /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'queue timeout retained deployment locks\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+if compgen -G '/run/nmcp-deploy/migration-handoff.*' >/dev/null \
+  || compgen -G '/run/nmcp-deploy/migration-runner.*' >/dev/null; then
+  printf 'queue timeout leaked tracked-runner state\n' >&2; exit 1
+fi
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+
+# Pause the receiver after validating its lease offer but before declaring exec
+# readiness. The wrapper must expire the total deadline without issuing EXEC;
+# delayed exact-unit stop then proves rollback and locks remain fail-closed.
+cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/bin/sh -c '/usr/bin/touch "$work/cancel-postgresql-started" "$work/postgresql-ready"; /usr/bin/systemd-notify --ready; exec /usr/bin/sleep infinity'
+TimeoutStartSec=45s
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
+/usr/bin/rm -f "$work/postgresql-ready" /run/nmcp-deploy/test-cancel-stop.{ready,go} \
+  /run/nmcp-deploy/test-receiver-exec-check.{ready,go}
+/usr/bin/install -o root -g root -m 0600 /dev/null \
+  /run/nmcp-deploy/test-pause-after-offer-check.enabled
+NMCP_TEST_ADMIN_OPERATION_TIMEOUT_SECONDS=5 NMCP_TEST_PAUSE_CANCEL_STOP=1 \
+  "$repo/scripts/install-ubuntu-release" activate cancelrace >"$work/cancelrace.out" 2>&1 &
+cancel_pid=$!
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/migration-handoff.$cancel_pid.1.receiver-ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'cancel race receiver never sent READY\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+[[ -e $work/cancel-postgresql-started ]]
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-receiver-exec-check.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'receiver did not reach synchronized pre-exec check\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+for attempt in {1..400}; do
+  [[ -e /run/nmcp-deploy/test-cancel-stop.ready ]] && break
+  [[ $attempt -lt 400 ]] || { printf 'wrapper did not cancel the paused receiver at deadline\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=cancelrace' "$work/cancelrace.out"; then
+  printf 'cancelled receiver obtained execution authorization\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/cancelrace ]] || {
+  printf 'rollback mutated the current link before exact-unit terminal proof\n' >&2; exit 1;
+}
+/usr/bin/kill -0 "$cancel_pid"
+if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
+  || /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then
+  printf 'cancellation released a deployment lock before exact unit terminal\n' >&2; exit 1
+fi
+/usr/bin/touch /run/nmcp-deploy/test-receiver-exec-check.go
+/usr/bin/touch /run/nmcp-deploy/test-cancel-stop.go
+if wait "$cancel_pid"; then
+  printf 'cancelled receiver unexpectedly activated release\n' >&2; exit 1
+fi
+cancel_pid=
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=cancelrace' "$work/cancelrace.out"; then
+  printf 'cancelled receiver entered migration after deadline\n' >&2; exit 1
+fi
+cancel_unit=$(compgen -G '/run/systemd/transient/nmcp-deploy-admin-*.service' || true)
+[[ -z $cancel_unit ]] || { printf 'cancelled transient unit was not collected\n' >&2; exit 1; }
+if /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q 'nmcp-deploy-admin-'; then
+  printf 'cancelled transient job survived installer failure\n' >&2; exit 1
+fi
+/usr/bin/systemctl is-active --quiet postgresql@nmcp-test.service
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+/usr/bin/rm -f /run/nmcp-deploy/test-cancel-stop.{ready,go} \
+  /run/nmcp-deploy/test-receiver-exec-check.{ready,go} \
+  /run/nmcp-deploy/test-pause-after-offer-check.enabled
+
+# Kill the installer after the wrapper exists but while its launcher is paused
+# before systemd-run registration. Register the exact unit only after the first
+# not-found terminal check; the mandatory post-reap gate must still cancel it.
+cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/bin/sh -c '/usr/bin/touch "$work/pretransfer-postgresql-started"; while ! test -e "$work/pretransfer-postgresql-release"; do /usr/bin/sleep 0.01; done; /usr/bin/touch "$work/postgresql-ready"; /usr/bin/systemd-notify --ready; exec /usr/bin/sleep infinity'
+TimeoutStartSec=45s
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
+/usr/bin/rm -f "$work/postgresql-ready" "$work/pretransfer-postgresql-release" \
+  /run/nmcp-deploy/test-wrapper-launched.{ready,go} \
+  /run/nmcp-deploy/test-registration-paused.{ready,go} \
+  /run/nmcp-deploy/test-before-launcher-reap.{ready,go}
+NMCP_TEST_PAUSE_AFTER_WRAPPER_LAUNCH=1 \
+NMCP_TEST_PAUSE_SYSTEMD_RUN_REGISTRATION=1 \
+NMCP_TEST_PAUSE_BEFORE_LAUNCHER_REAP=1 \
+  "$repo/scripts/install-ubuntu-release" activate ownerpretransfer \
+  >"$work/ownerpretransfer.out" 2>&1 &
+pretransfer_pid=$!
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-wrapper-launched.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'owner-death test did not launch tracked wrapper\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-registration-paused.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'launcher did not pause before unit registration\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+[[ ! -e $work/pretransfer-postgresql-started ]]
+compgen -G "/run/nmcp-deploy/migration-runner.$pretransfer_pid.*" >/dev/null
+/usr/bin/kill -KILL "$pretransfer_pid"
+wait "$pretransfer_pid" 2>/dev/null || true
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-before-launcher-reap.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'wrapper did not finish its pre-registration terminal check\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+/usr/bin/touch /run/nmcp-deploy/test-registration-paused.go
+for attempt in {1..200}; do
+  unit_state=$(/usr/bin/systemctl show --property=LoadState --value \
+    "nmcp-deploy-admin-$pretransfer_pid-1.service")
+  [[ $unit_state != not-found ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'late transient unit was not registered in the synchronized window\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+[[ -e $work/pretransfer-postgresql-started ]]
+/usr/bin/touch /run/nmcp-deploy/test-before-launcher-reap.go
+for attempt in {1..300}; do
+  if ! compgen -G "/run/nmcp-deploy/migration-runner.$pretransfer_pid.*" >/dev/null \
+    && ! compgen -G "/run/nmcp-deploy/migration-handoff.$pretransfer_pid.*" >/dev/null \
+    && ! /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q "nmcp-deploy-admin-$pretransfer_pid-"; then break; fi
+  [[ $attempt -lt 300 ]] || { printf 'owner-death wrapper did not cancel and clean exact unit\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+# Once launcher reap plus the second terminal gate complete, keep polling to
+# prove no late unit/job can appear after lock/socket cleanup.
+for attempt in {1..20}; do
+  [[ $(/usr/bin/systemctl show --property=LoadState --value \
+    "nmcp-deploy-admin-$pretransfer_pid-1.service") == not-found ]]
+  if /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q \
+    "nmcp-deploy-admin-$pretransfer_pid-"; then
+    printf 'late transient job appeared after post-reap terminal gate\n' >&2; exit 1
+  fi
+  /usr/bin/sleep 0.05
+done
+/usr/bin/touch "$work/pretransfer-postgresql-release"
+/usr/bin/systemctl start postgresql@nmcp-test.service
+if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=ownerpretransfer' "$work/ownerpretransfer.out"; then
+  printf 'orphaned wrapper ran migration after installer death\n' >&2; exit 1
+fi
+for attempt in {1..100}; do
+  if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
+    && /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'owner-death before transfer retained deployment locks\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+pretransfer_pid=
+/usr/bin/ln -sfn /opt/nmcp/releases/old /opt/nmcp/current
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+/usr/bin/rm -f /run/nmcp-deploy/test-wrapper-launched.{ready,go} \
+  /run/nmcp-deploy/test-registration-paused.{ready,go} \
+  /run/nmcp-deploy/test-before-launcher-reap.{ready,go}
+cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/bin/sh -c '/usr/bin/touch "$work/postgresql-started"; if test -e "$work/postgresql-slow"; then /usr/bin/sleep 31; fi; /usr/bin/touch "$work/postgresql-ready"; /usr/bin/systemd-notify --ready; exec /usr/bin/sleep infinity'
+TimeoutStartSec=45s
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
+
+/usr/bin/rm -f "$work/postgresql-started" "$work/postgresql-ready"
+/usr/bin/touch "$work/postgresql-slow"
+/usr/bin/rm -f /run/nmcp-deploy/test-runner-record.{ready,go}
+NMCP_TEST_PAUSE_AFTER_RUNNER_RECORD=1 \
+  "$repo/scripts/install-ubuntu-release" activate startfail >"$work/startfail.out" 2>&1 &
+registration_pid=$!
+for attempt in {1..100}; do
+  [[ -e /run/nmcp-deploy/test-runner-record.ready ]] && break
+  [[ $attempt -lt 100 ]] || { printf 'tracked runner was not registered before dispatch\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+compgen -G "/run/nmcp-deploy/migration-runner.$registration_pid.*" >/dev/null
+/usr/bin/touch /run/nmcp-deploy/test-runner-record.go
+if wait "$registration_pid"; then
+  printf 'service startup failure unexpectedly activated release\n' >&2; exit 1
+fi
+/usr/bin/rm -f /run/nmcp-deploy/test-runner-record.{ready,go}
+if compgen -G "/run/nmcp-deploy/migration-runner.$registration_pid.*" >/dev/null; then
+  printf 'fast completed runner record leaked after wait\n' >&2; exit 1
+fi
+/usr/bin/cat "$work/startfail.out"
+[[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=startfail' "$work/startfail.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/startfail.out" >&2; exit 1;
+}
+[[ -e $work/postgresql-started ]]
+[[ -e $work/postgresql-ready ]]
+/usr/bin/systemctl is-active --quiet postgresql@nmcp-test.service
+/usr/bin/rm -f "$work/postgresql-slow"
+for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
+  ! /usr/bin/systemctl is-active --quiet "$unit" || { printf 'partial startup remained live: %s\n' "$unit" >&2; exit 1; }
+done
+/usr/bin/grep -q 'active=startfail.*attempted=startfail.*state=post-migration-service-failed' \
+  /var/lib/nmcp/deployment/active-release
+cat > /run/systemd/system/nmcp-files.service <<'EOF'
+[Service]
+ExecStart=/usr/bin/sleep infinity
+EOF
+/usr/bin/systemctl daemon-reload
+
+if "$repo/scripts/install-ubuntu-release" activate candidate >"$work/candidate.out" 2>&1; then
+  printf 'failed readiness gate unexpectedly activated release\n' >&2; exit 1
+fi
+/usr/bin/cat "$work/candidate.out"
+[[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=candidate' "$work/candidate.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/candidate.out" >&2; exit 1;
+}
+for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
+  ! /usr/bin/systemctl is-active --quiet "$unit" || { printf 'partial service remained live: %s\n' "$unit" >&2; exit 1; }
+done
+/usr/bin/grep -q 'active=candidate.*attempted=candidate.*state=post-migration-readiness-failed' \
+  /var/lib/nmcp/deployment/active-release
+
+/usr/bin/systemctl start nmcp-api.service nmcp-worker.service nmcp-files.service nmcp.target
+/usr/bin/touch "$work/allow-candidate"
+/usr/bin/systemctl stop postgresql@nmcp-test.service
+/usr/bin/rm -f "$work/postgresql-started" "$work/postgresql-ready"
+if "$repo/scripts/install-ubuntu-release" rollback old >"$work/rollback.out" 2>&1; then
+  printf 'failed rollback gate unexpectedly succeeded\n' >&2; exit 1
+fi
+/usr/bin/cat "$work/rollback.out"
+[[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=old' "$work/rollback.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/rollback.out" >&2; exit 1;
+}
+[[ $(/usr/bin/grep -c 'NMCP_TEST_STATUS=old' "$work/rollback.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/rollback.out" >&2; exit 1;
+}
+[[ -e $work/postgresql-started ]]
+/usr/bin/systemctl is-active --quiet postgresql@nmcp-test.service
+[[ $(/usr/bin/grep -c 'NMCP_TEST_MIGRATION=candidate' "$work/rollback.out") -eq 1 ]] || {
+  /usr/bin/cat "$work/rollback.out" >&2; exit 1;
+}
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/candidate ]]
+for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
+  /usr/bin/systemctl is-active --quiet "$unit" || { printf 'prior live service state was not restored: %s\n' "$unit" >&2; exit 1; }
+done
+/usr/bin/grep -q 'active=candidate.*attempted=old.*state=rollback-activation-failed' \
+  /var/lib/nmcp/deployment/active-release
+
+# Exercise production run_admin's synchronized pre-dispatch phase. Installer
+# death must release both locks without ever creating transient handoff state.
+/usr/bin/rm -f /run/nmcp-deploy/test-before-admin-dispatch.{ready,go}
+NMCP_TEST_PAUSE_BEFORE_ADMIN_DISPATCH=1 \
+  "$repo/scripts/install-ubuntu-release" activate predispatch >"$work/predispatch.out" 2>&1 &
+predispatch_pid=$!
+for attempt in {1..100}; do
+  [[ -e /run/nmcp-deploy/test-before-admin-dispatch.ready ]] && break
+  [[ $attempt -lt 100 ]] || { printf 'production pre-dispatch hook did not become ready\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then
+  printf 'production pre-dispatch owner did not hold the execution lease\n' >&2; exit 1
+fi
+/usr/bin/kill -KILL "$predispatch_pid"
+wait "$predispatch_pid" 2>/dev/null || true
+for attempt in {1..100}; do
+  if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
+    && /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'production pre-dispatch cleanup did not release locks\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+if compgen -G "/run/nmcp-deploy/migration-handoff.$predispatch_pid.*" >/dev/null \
+  || compgen -G "/run/nmcp-deploy/migration-runner.$predispatch_pid.*" >/dev/null; then
+  printf 'production pre-dispatch cleanup leaked handoff state\n' >&2; exit 1
+fi
+[[ $(/usr/bin/systemctl show --property=LoadState --value \
+  "nmcp-deploy-admin-$predispatch_pid-1.service") == not-found ]]
+/usr/bin/rm -f /run/nmcp-deploy/test-before-admin-dispatch.{ready,go}
+
+# The installer owns the primary lock on its own FD. Kill it only after
+# the transient child has received the same execution-lease open description.
+cat > /opt/nmcp/releases/ownerdeath/bin/nmcp-admin <<EOF
+#!/bin/sh
+if test "\${1:-}" = migrate && test "\${2:-}" = up; then
+  printf 'NMCP_OWNERDEATH_ENTERED\n'
+  while test ! -e '$work/ownerdeath-proceed'; do /usr/bin/sleep 0.05; done
+  printf 'NMCP_OWNERDEATH_FINISHED\n'
+fi
+exit 0
+EOF
+/usr/bin/chmod 0755 /opt/nmcp/releases/ownerdeath/bin/nmcp-admin
+(cd /opt/nmcp/releases/ownerdeath && /usr/bin/sha256sum bin/* > MANIFEST.sha256)
+"$repo/scripts/install-ubuntu-release" activate ownerdeath >"$work/ownerdeath.out" 2>&1 &
+installer_pid=$!
+for attempt in {1..600}; do
+  /usr/bin/grep -q 'NMCP_OWNERDEATH_ENTERED' "$work/ownerdeath.out" 2>/dev/null && break
+  if ! /usr/bin/kill -0 "$installer_pid" 2>/dev/null; then
+    wait "$installer_pid" 2>/dev/null || true
+    /usr/bin/cat "$work/ownerdeath.out" >&2
+    printf 'owner-death installer exited before migration entered\n' >&2
+    exit 1
+  fi
+  if [[ $attempt -eq 600 ]]; then
+    /usr/bin/cat "$work/ownerdeath.out" >&2
+    printf 'owner-death migration did not enter\n' >&2
+    exit 1
+  fi
+  /usr/bin/sleep 0.05
+done
+/usr/bin/kill -KILL "$installer_pid"
+if wait "$installer_pid" 2>/dev/null; then
+  printf 'killed installer unexpectedly exited successfully\n' >&2; exit 1
+fi
+/usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true
+if /usr/local/libexec/nmcp/run-ubuntu-migration >"$work/direct-overlap.out" 2>&1; then
+  printf 'direct migration overlapped the orphan transient\n' >&2; exit 1
+fi
+/usr/bin/grep -q 'orphaned migration execution is still active' "$work/direct-overlap.out"
+if /usr/bin/grep -q 'NMCP_OWNERDEATH_FINISHED' "$work/ownerdeath.out"; then
+  printf 'owner-death migration finished before release signal\n' >&2; exit 1
+fi
+if /usr/bin/systemctl is-active --quiet nmcp.target; then
+  printf 'killed installer continued into service activation\n' >&2; exit 1
+fi
+/usr/bin/touch "$work/ownerdeath-proceed"
+for attempt in {1..100}; do
+  /usr/bin/grep -q 'NMCP_OWNERDEATH_FINISHED' "$work/ownerdeath.out" 2>/dev/null && break
+  [[ $attempt -lt 100 ]] || { printf 'orphan migration did not finish\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+owner_unit=nmcp-deploy-admin-$installer_pid-1.service
+for attempt in {1..100}; do
+  owner_load=$(/usr/bin/systemctl show --property=LoadState --value "$owner_unit")
+  owner_state=$(/usr/bin/systemctl show --property=ActiveState --value "$owner_unit")
+  [[ $owner_load == not-found || $owner_state == inactive || $owner_state == failed ]] && break
+  [[ $attempt -lt 100 ]] || { printf 'orphan transient unit did not terminate\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+for attempt in {1..100}; do
+  if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'terminated transient retained execution lease\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+for attempt in {1..100}; do
+  if ! compgen -G "/run/nmcp-deploy/migration-handoff.$installer_pid.*" >/dev/null \
+    && ! compgen -G "/run/nmcp-deploy/migration-runner.$installer_pid.*" >/dev/null; then break; fi
+  [[ $attempt -lt 100 ]] || { printf 'owner-death transient leaked handoff state\n' >&2; exit 1; }
+  /usr/bin/sleep 0.05
+done
+/usr/local/libexec/nmcp/run-ubuntu-migration >"$work/direct-after-ownerdeath.out" 2>&1
+[[ ! -e /run/nmcp-migration-complete ]]
+printf 'Activation cleanup, rollback restoration, and evidence tests passed\n'

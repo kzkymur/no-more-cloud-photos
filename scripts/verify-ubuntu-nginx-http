@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+test_ip=${NMCP_NGINX_TEST_IP:-100.64.0.10}
+api_port=${NMCP_NGINX_TEST_API_PORT:-18443}
+files_port=${NMCP_NGINX_TEST_FILES_PORT:-19443}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd -- "$script_dir/.." && pwd -P)
+work=$(mktemp -d)
+nginx_pid=
+cleanup() {
+  if [[ -n $nginx_pid ]]; then kill "$nginx_pid" 2>/dev/null || true; wait "$nginx_pid" 2>/dev/null || true; fi
+  rm -rf -- "$work"
+}
+trap cleanup EXIT
+
+for command in nginx curl openssl python3; do
+  command -v "$command" >/dev/null || { printf 'missing command: %s\n' "$command" >&2; exit 1; }
+done
+
+mkdir -p "$work/cache/client" "$work/cache/proxy" "$work/media/originals" "$work/media/renditions"
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net -days 1 \
+  -keyout "$work/key.pem" -out "$work/cert.pem" >/dev/null 2>&1
+"$repo_root/scripts/render-ubuntu-nginx" \
+  --template "$repo_root/infra/ubuntu/nginx.conf.in" --output "$work/rendered.conf" \
+  --api-listen "$test_ip:$api_port" --files-listen "$test_ip:$files_port" \
+  --tailnet-hostname host.example.ts.net
+python3 - "$work" <<'PY'
+import pathlib, sys
+work = pathlib.Path(sys.argv[1])
+text = (work / "rendered.conf").read_text()
+replacements = {
+    "/run/credentials/nmcp-files.service/tls-cert.pem": str(work / "cert.pem"),
+    "/run/credentials/nmcp-files.service/tls-key.pem": str(work / "key.pem"),
+    "/run/nmcp-nginx/nginx.pid": str(work / "nginx.pid"),
+    "/run/nmcp-nginx/client": str(work / "cache/client"),
+    "/run/nmcp-nginx/proxy": str(work / "cache/proxy"),
+    "/srv/nmcp/originals": str(work / "media/originals"),
+    "/srv/nmcp/renditions": str(work / "media/renditions"),
+}
+for old, new in replacements.items():
+    text = text.replace(old, new)
+(work / "nginx.conf").write_text(text)
+PY
+
+original_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+rendition_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+profile_id=cccccccc-cccc-4ccc-8ccc-cccccccccccc
+original_dir=$work/media/originals/aa/$original_id
+rendition_dir=$work/media/renditions/aa/$original_id/$rendition_id
+mkdir -p "$original_dir" "$rendition_dir"
+printf '0123456789abcdef' > "$original_dir/original.jpg"
+printf 'webp-fixture' > "$rendition_dir/$profile_id.webp"
+
+# Canonical-looking symlinks in both public trees must receive the strict denial.
+symlink_original_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab
+symlink_rendition_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc
+mkdir -p "$work/media/originals/aa/$symlink_original_id"
+mkdir -p "$work/media/renditions/aa/$original_id/$symlink_rendition_id"
+ln -s "$original_dir/original.jpg" "$work/media/originals/aa/$symlink_original_id/original.jpg"
+ln -s "$rendition_dir/$profile_id.webp" \
+  "$work/media/renditions/aa/$original_id/$symlink_rendition_id/$profile_id.webp"
+
+nginx -t -c "$work/nginx.conf"
+nginx -c "$work/nginx.conf" -g 'daemon off;' >"$work/nginx.stdout" 2>"$work/nginx.stderr" &
+nginx_pid=$!
+base=https://$test_ip:$files_port
+for attempt in {1..30}; do
+  if curl --noproxy '*' --insecure --silent --fail --max-time 2 "$base/files-healthz" >/dev/null; then break; fi
+  [[ $attempt -lt 30 ]] || { printf 'nginx did not become ready\n' >&2; exit 1; }
+  sleep 0.2
+done
+
+"$repo_root/scripts/assert-ubuntu-files-endpoint" \
+  --base-url "$base" --insecure \
+  --original-path "/files/originals/aa/$original_id/original.jpg" \
+  --original-file "$original_dir/original.jpg" --original-mime image/jpeg \
+  --original-symlink-path "/files/originals/aa/$symlink_original_id/original.jpg" \
+  --rendition-path "/files/renditions/aa/$original_id/$rendition_id/$profile_id.webp" \
+  --rendition-file "$rendition_dir/$profile_id.webp" --rendition-mime image/webp \
+  --rendition-symlink-path "/files/renditions/aa/$original_id/$symlink_rendition_id/$profile_id.webp"
+
+printf 'Ubuntu disposable production Nginx HTTP verification passed\n'

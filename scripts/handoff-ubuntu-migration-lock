@@ -1,0 +1,477 @@
+#!/usr/bin/python3
+"""Authorize one migration lease transfer and track its exact transient unit."""
+
+import array
+import fcntl
+import os
+import pathlib
+import select
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(f"handoff-ubuntu-migration-lock: {message}")
+
+
+def same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def safe_lock(lock_stat: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(lock_stat.st_mode)
+        and lock_stat.st_uid == 0
+        and lock_stat.st_gid == 0
+        and stat.S_IMODE(lock_stat.st_mode) == 0o600
+    )
+
+
+def process_start(pid: int) -> str | None:
+    try:
+        value = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return value[value.rfind(")") + 2 :].split()[19]
+
+
+def pin_identity(pid: int, start: str, inject_replacement: bool = False) -> int:
+    if process_start(pid) != start:
+        fail("tracked process identity exited or was replaced")
+    pidfd = os.pidfd_open(pid)
+    if inject_replacement:
+        ready = pathlib.Path("/run/nmcp-deploy/test-pidfd-open.ready")
+        go = pathlib.Path("/run/nmcp-deploy/test-pidfd-open.go")
+        ready.touch(mode=0o600)
+        while not go.is_file():
+            time.sleep(0.01)
+        post_open_start = "injected-replacement"
+    else:
+        post_open_start = process_start(pid)
+    if post_open_start != start:
+        pathlib.Path("/run/nmcp-deploy/test-pidfd-rejected").touch(mode=0o600)
+        os.close(pidfd)
+        fail("tracked process identity changed during pidfd acquisition")
+    return pidfd
+
+
+def recv_authorized(
+    connection: socket.socket, size: int, deadline: float, owner_pidfd: int
+) -> bytes:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        readable, _, _ = select.select(
+            [connection, owner_pidfd], [], [], min(remaining, 0.1)
+        )
+        if owner_pidfd in readable:
+            fail("dispatch owner died before execution authorization")
+        if connection in readable:
+            message, _ancillary = recv_packet(connection, size)
+            return message
+
+
+def recv_packet(
+    connection: socket.socket, size: int, ancillary_space: int = 0
+) -> tuple[bytes, list[tuple[int, int, bytes]]]:
+    message, ancillary, flags, _address = connection.recvmsg(size + 1, ancillary_space)
+    if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(message) != size:
+        fail("invalid execution protocol packet framing")
+    return message, ancillary
+
+
+def unit_state(unit: str) -> tuple[str, str, int, bool]:
+    result = subprocess.run(
+        ["/usr/bin/systemctl", "show", unit, "--property=LoadState,ActiveState,MainPID"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    values = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+    jobs_result = subprocess.run(
+        ["/usr/bin/systemctl", "list-jobs", "--no-legend", unit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or jobs_result.returncode != 0:
+        return "unknown", "unknown", 1, True
+    try:
+        main_pid = int(values.get("MainPID", "0") or "0")
+    except ValueError:
+        return "unknown", "unknown", 1, True
+    return (
+        values.get("LoadState", "not-found"),
+        values.get("ActiveState", "inactive"),
+        main_pid,
+        bool(jobs_result.stdout.strip()),
+    )
+
+
+def terminal(unit: str) -> bool:
+    load, active, main_pid, has_job = unit_state(unit)
+    return (
+        (load == "not-found" or active in ("inactive", "failed"))
+        and main_pid == 0
+        and not has_job
+    )
+
+
+def ensure_terminal(unit: str, test_pause: bool = False) -> None:
+    """Do not return while the exact unit could still mutate the database."""
+    if terminal(unit):
+        return
+    if test_pause and os.environ.get("NMCP_TEST_PAUSE_CANCEL_STOP") == "1":
+        ready = pathlib.Path("/run/nmcp-deploy/test-cancel-stop.ready")
+        go = pathlib.Path("/run/nmcp-deploy/test-cancel-stop.go")
+        ready.touch(mode=0o600)
+        while not go.is_file():
+            time.sleep(0.01)
+    while not terminal(unit):
+        try:
+            subprocess.run(
+                ["/usr/bin/systemctl", "stop", unit],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=40,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        if terminal(unit):
+            break
+        subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "kill",
+                "--kill-whom=all",
+                "--signal=KILL",
+                unit,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        subprocess.run(
+            ["/usr/bin/systemctl", "stop", "--no-block", unit],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        time.sleep(0.1)
+
+
+def run_tracked(
+    owner_pid: int,
+    owner_start: str,
+    socket_path: str,
+    lock_path: str,
+    descriptor: int,
+    runner_file: str,
+    unit: str,
+    queue_timeout: int,
+    command: list[str],
+) -> None:
+    owner_pidfd = pin_identity(
+        owner_pid,
+        owner_start,
+        os.environ.get("NMCP_TEST_REPLACE_OWNER_AFTER_PIDFD") == "1",
+    )
+    lock_stat = os.stat(lock_path, follow_symlinks=False)
+    if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
+        fail("runner descriptor does not name the execution lease")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("runner descriptor does not carry the execution lease")
+
+    pid = os.getpid()
+    start = process_start(pid)
+    if start is None:
+        fail("cannot identify tracked runner")
+    record_fd = os.open(
+        runner_file,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    with os.fdopen(record_fd, "w") as target:
+        target.write(f"{pid} {start}\n")
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    child: subprocess.Popen[bytes] | None = None
+    status = 1
+    authorized = False
+    try:
+        pathlib.Path(socket_path).unlink(missing_ok=True)
+        listener.bind(socket_path)
+        os.chmod(socket_path, 0o600)
+        listener.listen(1)
+        listener.setblocking(False)
+        if os.environ.get("NMCP_TEST_PAUSE_AFTER_RUNNER_RECORD") == "1":
+            pathlib.Path("/run/nmcp-deploy/test-runner-record.ready").touch(mode=0o600)
+            while not pathlib.Path("/run/nmcp-deploy/test-runner-record.go").is_file():
+                time.sleep(0.01)
+
+        # close_fds ensures the transient launcher and admin receive the lease only
+        # through the explicit, authorized SCM_RIGHTS protocol below.
+        if os.environ.get("NMCP_TEST_PAUSE_SYSTEMD_RUN_REGISTRATION") == "1":
+            command = [sys.argv[0], "pause-exec", *command]
+        child = subprocess.Popen(command, close_fds=True)
+        deadline = time.monotonic() + queue_timeout
+        if os.environ.get("NMCP_TEST_PAUSE_AFTER_WRAPPER_LAUNCH") == "1":
+            pathlib.Path("/run/nmcp-deploy/test-wrapper-launched.ready").touch(mode=0o600)
+            go = pathlib.Path("/run/nmcp-deploy/test-wrapper-launched.go")
+            while not go.is_file():
+                if select.select([owner_pidfd], [], [], 0.01)[0]:
+                    fail("dispatch owner died after wrapper launch")
+        while not authorized and child.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select(
+                [listener, owner_pidfd], [], [], min(remaining, 0.1)
+            )
+            if owner_pidfd in readable:
+                fail("dispatch owner died before lease transfer")
+            if not readable:
+                continue
+            connection, _ = listener.accept()
+            with connection:
+                if recv_authorized(connection, 5, deadline, owner_pidfd) != b"READY":
+                    continue
+                pathlib.Path(socket_path + ".receiver-ready").touch(mode=0o600)
+                deadline_ns = int(deadline * 1_000_000_000)
+                if time.monotonic_ns() >= deadline_ns or child.poll() is not None:
+                    continue
+                rights = array.array("i", [descriptor])
+                connection.sendmsg(
+                    [b"O" + deadline_ns.to_bytes(8, "big")],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+                )
+                if recv_authorized(connection, 13, deadline, owner_pidfd) != b"OFFER_CHECKED":
+                    continue
+                if pathlib.Path(
+                    "/run/nmcp-deploy/test-pause-after-offer-check.enabled"
+                ).is_file():
+                    pathlib.Path(
+                        "/run/nmcp-deploy/test-receiver-exec-check.ready"
+                    ).touch(mode=0o600)
+                if recv_authorized(connection, 10, deadline, owner_pidfd) != b"EXEC_READY":
+                    continue
+                # The wrapper remains the sole authority through the final
+                # execution grant.  Parent death, child exit, or deadline expiry
+                # before this send makes cancellation irrevocable instead.
+                if (
+                    select.select([owner_pidfd], [], [], 0)[0]
+                    or time.monotonic_ns() >= deadline_ns
+                    or child.poll() is not None
+                ):
+                    continue
+                connection.sendall(b"EXEC" + deadline_ns.to_bytes(8, "big"))
+                authorized = True
+                os.close(descriptor)
+                descriptor = -1
+                os.close(owner_pidfd)
+                owner_pidfd = -1
+
+        if authorized:
+            try:
+                status = child.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                ensure_terminal(unit, test_pause=True)
+                status = 124
+            ensure_terminal(unit)
+        elif child.poll() is None:
+            # Cancellation is now irrevocable; listener stays open only during the
+            # test pause so a racing receiver can connect but can never get EXEC.
+            ensure_terminal(unit, test_pause=True)
+            status = 124
+        else:
+            status = child.wait()
+            ensure_terminal(unit)
+    except (BrokenPipeError, ConnectionError, TimeoutError, socket.timeout):
+        if child is not None and child.poll() is None:
+            ensure_terminal(unit, test_pause=True)
+            status = 124
+    finally:
+        listener.close()
+        if child is not None and child.poll() is None:
+            ensure_terminal(unit)
+        if (
+            child is not None
+            and os.environ.get("NMCP_TEST_PAUSE_BEFORE_LAUNCHER_REAP") == "1"
+        ):
+            pathlib.Path("/run/nmcp-deploy/test-before-launcher-reap.ready").touch(
+                mode=0o600
+            )
+            while not pathlib.Path(
+                "/run/nmcp-deploy/test-before-launcher-reap.go"
+            ).is_file():
+                time.sleep(0.01)
+        if child is not None:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            # The launcher is now reaped, so the unit-creation window is closed.
+            # Re-check terminal state after that linearization point: a late
+            # registration can no longer appear after this gate and cleanup.
+            ensure_terminal(unit)
+        if descriptor >= 0:
+            os.close(descriptor)
+        if owner_pidfd >= 0:
+            os.close(owner_pidfd)
+        pathlib.Path(socket_path).unlink(missing_ok=True)
+        pathlib.Path(socket_path + ".receiver-ready").unlink(missing_ok=True)
+        pathlib.Path(runner_file).unlink(missing_ok=True)
+    raise SystemExit(status if status >= 0 else 128 - status)
+
+
+def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    connection.connect(socket_path)
+    connection.sendall(b"READY")
+    size = array.array("i").itemsize
+    message, ancillary = recv_packet(connection, 9, socket.CMSG_SPACE(size))
+    received: list[int] = []
+    for level, kind, data in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            values = array.array("i")
+            values.frombytes(data[: len(data) - (len(data) % size)])
+            received.extend(values)
+    if len(message) != 9 or message[0:1] != b"O" or len(received) != 1:
+        fail("did not receive exactly one execution-lease offer")
+    deadline_ns = int.from_bytes(message[1:], "big")
+    if time.monotonic_ns() >= deadline_ns:
+        os.close(received[0])
+        fail("execution-lease offer expired before receipt")
+    descriptor = received[0]
+    lock_stat = os.stat(lock_path, follow_symlinks=False)
+    if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
+        fail("received descriptor does not name the execution lease")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("received descriptor does not carry the execution lease")
+    os.set_inheritable(descriptor, True)
+    connection.sendall(b"OFFER_CHECKED")
+    pause_enabled = pathlib.Path(
+        "/run/nmcp-deploy/test-pause-after-offer-check.enabled"
+    )
+    if pause_enabled.is_file():
+        while not pathlib.Path(
+            "/run/nmcp-deploy/test-receiver-exec-check.go"
+        ).is_file():
+            time.sleep(0.01)
+    if time.monotonic_ns() >= deadline_ns:
+        fail("execution-lease offer expired before execution readiness")
+    connection.sendall(b"EXEC_READY")
+    connection.settimeout(max(0.001, (deadline_ns - time.monotonic_ns()) / 1_000_000_000))
+    grant, _ancillary = recv_packet(connection, 12)
+    if grant != b"EXEC" + deadline_ns.to_bytes(8, "big"):
+        fail("wrapper did not grant execution")
+    if time.monotonic_ns() >= deadline_ns:
+        fail("execution grant expired before exec")
+    connection.close()
+    os.execv(command[0], command)
+
+
+def pause_exec(command: list[str]) -> None:
+    pathlib.Path("/run/nmcp-deploy/test-registration-paused.ready").touch(mode=0o600)
+    while not pathlib.Path("/run/nmcp-deploy/test-registration-paused.go").is_file():
+        time.sleep(0.01)
+    os.execv(command[0], command)
+
+
+def verify_framing() -> None:
+    records = {
+        "READY": b"READY",
+        "OFFER_CHECKED": b"OFFER_CHECKED",
+        "EXEC_READY": b"EXEC_READY",
+        "OFFER": b"O" + (123).to_bytes(8, "big"),
+        "EXEC": b"EXEC" + (123).to_bytes(8, "big"),
+    }
+    for name, record in records.items():
+        ancillary_space = socket.CMSG_SPACE(array.array("i").itemsize) if name == "OFFER" else 0
+
+        def send_record(sender: socket.socket, payload: bytes) -> None:
+            if name != "OFFER":
+                sender.sendall(payload)
+                return
+            descriptor = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                rights = array.array("i", [descriptor])
+                sender.sendmsg(
+                    [payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+                )
+            finally:
+                os.close(descriptor)
+
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with sender, receiver:
+            send_record(sender, record)
+            message, ancillary = recv_packet(receiver, len(record), ancillary_space)
+            if message != record:
+                fail(f"exact {name} protocol control changed")
+            received_descriptors = 0
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    descriptors = array.array("i")
+                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
+                    received_descriptors += len(descriptors)
+                    for descriptor in descriptors:
+                        os.close(descriptor)
+            if name == "OFFER" and received_descriptors != 1:
+                fail("exact OFFER control did not carry one descriptor")
+        for suffix, kind in ((b"X", "oversized"), (b"XY", "truncated")):
+            sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            with sender, receiver:
+                send_record(sender, record + suffix)
+                try:
+                    recv_packet(receiver, len(record), ancillary_space)
+                except SystemExit:
+                    continue
+                fail(f"{kind} valid-prefix {name} record was accepted")
+    print("Exact protocol framing and all valid-prefix counterexamples passed")
+
+
+if len(sys.argv) >= 11 and sys.argv[1] == "run-tracked":
+    run_tracked(
+        int(sys.argv[2]),
+        sys.argv[3],
+        sys.argv[4],
+        sys.argv[5],
+        int(sys.argv[6]),
+        sys.argv[7],
+        sys.argv[8],
+        int(sys.argv[9]),
+        sys.argv[10:],
+    )
+elif len(sys.argv) >= 5 and sys.argv[1] == "receive":
+    receive_fd(sys.argv[2], sys.argv[3], sys.argv[4:])
+elif len(sys.argv) == 3 and sys.argv[1] == "ensure-terminal":
+    ensure_terminal(sys.argv[2])
+elif len(sys.argv) == 3 and sys.argv[1] == "process-start":
+    value = process_start(int(sys.argv[2]))
+    if value is None:
+        fail("process identity is unavailable")
+    print(value)
+elif len(sys.argv) >= 3 and sys.argv[1] == "pause-exec":
+    pause_exec(sys.argv[2:])
+elif len(sys.argv) == 2 and sys.argv[1] == "verify-framing":
+    verify_framing()
+else:
+    fail("usage: run-tracked OWNER_PID OWNER_START SOCKET LOCK FD FILE UNIT TIMEOUT COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...] | ensure-terminal UNIT | process-start PID | pause-exec COMMAND [ARG ...] | verify-framing")

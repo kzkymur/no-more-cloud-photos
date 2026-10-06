@@ -1,0 +1,115 @@
+worker_processes 1;
+pid /run/nmcp-nginx/nginx.pid;
+
+events {
+    worker_connections 256;
+}
+
+http {
+    default_type application/octet-stream;
+    types {
+        image/avif avif;
+        image/bmp bmp;
+        image/dng dng;
+        image/gif gif;
+        image/heic heic;
+        image/heif heif;
+        image/jpeg jpg;
+        image/png png;
+        image/webp webp;
+        image/x-canon-cr2 cr2;
+        image/x-canon-cr3 cr3;
+        image/x-fuji-raf raf;
+        image/x-nikon-nef nef;
+        image/x-olympus-orf orf;
+        image/x-panasonic-rw2 rw2;
+        image/x-sony-arw arw;
+        video/mp4 mp4;
+        video/quicktime mov;
+    }
+
+    # systemd's stdout is a journal socket and cannot be reopened through
+    # /dev/stdout. Send access records to the local journal/syslog socket and
+    # keep errors on the inherited stderr descriptor.
+    access_log syslog:server=unix:/dev/log,facility=local7,tag=nmcp_files,severity=info combined;
+    error_log stderr warn;
+    server_tokens off;
+    sendfile on;
+    client_body_temp_path /run/nmcp-nginx/client;
+    proxy_temp_path /run/nmcp-nginx/proxy;
+
+    # API is loopback-only behind this Tailnet-bound TLS listener.
+    server {
+        listen @@NMCP_API_TLS_LISTEN@@ ssl;
+        server_name @@NMCP_TAILNET_HOSTNAME@@;
+        ssl_certificate /run/credentials/nmcp-files.service/tls-cert.pem;
+        ssl_certificate_key /run/credentials/nmcp-files.service/tls-key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_session_tickets off;
+
+        # API MaxOriginalBytes (20 GiB) plus its 1 MiB multipart allowance.
+        client_max_body_size 20481m;
+        client_body_timeout 130s;
+        location / {
+            proxy_pass http://127.0.0.1:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header Connection "";
+            proxy_request_buffering off;
+            proxy_send_timeout 130s;
+            proxy_read_timeout 24h;
+        }
+    }
+
+    # The file server has only read-only bind mounts for the two public trees.
+    server {
+        listen @@NMCP_FILES_TLS_LISTEN@@ ssl;
+        server_name @@NMCP_TAILNET_HOSTNAME@@;
+        ssl_certificate /run/credentials/nmcp-files.service/tls-cert.pem;
+        ssl_certificate_key /run/credentials/nmcp-files.service/tls-key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_session_tickets off;
+
+        # Canonical storage URLs contain neither escapes nor dot segments.
+        # Check the unnormalized request target before location matching.
+        if ($request_uri ~ "%") {
+            return 400;
+        }
+        if ($request_uri ~ "(?:^|/)[.]{1,2}(?:/|$)") {
+            return 400;
+        }
+        if ($request_method !~ ^(GET|HEAD)$) {
+            return 405;
+        }
+
+        location = /files-healthz {
+            default_type application/json;
+            return 200 '{"status":"ok"}\n';
+        }
+
+        location ~ "^/files/originals/(?<original_path>(?<original_shard>[0-9a-f]{2})/(?P=original_shard)[0-9a-f]{6}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/original[.](?:arw|bmp|cr2|cr3|dng|gif|heic|heif|jpg|mov|mp4|nef|orf|png|raf|rw2|webp))$" {
+            alias /srv/nmcp/originals/$original_path;
+            autoindex off;
+            disable_symlinks on from=/srv/nmcp/originals;
+            add_header Accept-Ranges bytes always;
+            add_header Cache-Control "private, max-age=31536000, immutable" always;
+            add_header X-Content-Type-Options nosniff always;
+        }
+
+        location ~ "^/files/renditions/(?<rendition_path>(?<rendition_shard>[0-9a-f]{2})/(?P=rendition_shard)[0-9a-f]{6}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}[.](?:avif|mp4|webp))$" {
+            alias /srv/nmcp/renditions/$rendition_path;
+            autoindex off;
+            disable_symlinks on from=/srv/nmcp/renditions;
+            add_header Accept-Ranges bytes always;
+            add_header Cache-Control "private, max-age=31536000, immutable" always;
+            add_header X-Content-Type-Options nosniff always;
+        }
+
+        location / {
+            return 404;
+        }
+    }
+}

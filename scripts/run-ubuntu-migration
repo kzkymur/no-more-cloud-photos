@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 0077
+
+completion=/run/nmcp-migration-complete
+current=/opt/nmcp/current
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+if [[ ${NMCP_LOCK_MODE:-} != direct && ${NMCP_LOCK_MODE:-} != delegated ]]; then
+  exec "$script_dir/acquire-ubuntu-deployment-locks" migration -- "$0" "$@"
+fi
+"$script_dir/acquire-ubuntu-deployment-locks" verify "$NMCP_LOCK_MODE"
+if [[ $NMCP_LOCK_MODE == direct ]]; then
+  /usr/bin/rm -f -- "$completion"
+  release=$(/usr/bin/readlink -f -- "$current")
+else
+  # The lock owner already ran the exact release migration. This systemd
+  # dependency consumes completion evidence and performs no database work.
+  [[ -f $completion && ! -L $completion \
+    && $(/usr/bin/stat -c '%U:%G:%a' "$completion") == root:root:600 ]] || {
+    printf 'run-ubuntu-migration: deployment lock is held without completion evidence\n' >&2
+    exit 1
+  }
+  delegated=$(/usr/bin/cat -- "$completion")
+  active=$(/usr/bin/readlink -f -- "$current")
+  [[ $delegated == "$active" ]] || {
+    printf 'run-ubuntu-migration: completion does not match the active release\n' >&2
+    exit 1
+  }
+  /usr/bin/rm -f -- "$completion"
+  exit 0
+fi
+exec /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+  "$release/bin/nmcp-admin" migrate up --json

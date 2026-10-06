@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-migration-lock: must run as root\n' >&2; exit 1; }
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+work=$(/usr/bin/mktemp -d /var/tmp/nmcp-migration-lock.XXXXXX)
+[[ ! -e /opt/nmcp/current ]] || { printf 'test requires no existing NMCP current release\n' >&2; exit 1; }
+cleanup() {
+  /usr/bin/systemctl stop nmcp-lock-dependent.service nmcp-lock-migrate.service >/dev/null 2>&1 || true
+  /usr/bin/rm -f /run/systemd/system/nmcp-lock-dependent.service /run/systemd/system/nmcp-lock-migrate.service \
+    /run/nmcp-migration-complete
+  /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+  /usr/bin/rm -rf /opt/nmcp /usr/local/libexec/nmcp /run/nmcp-deploy "$work"
+}
+trap cleanup EXIT
+/usr/bin/chown nmcp:nmcp "$work"
+/usr/bin/install -d -o root -g root -m 0755 /opt/nmcp/current/bin
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp
+/usr/bin/install -o root -g root -m 0755 "$repo/scripts/run-ubuntu-migration" \
+  /usr/local/libexec/nmcp/run-ubuntu-migration
+/usr/bin/install -o root -g root -m 0755 "$repo/scripts/acquire-ubuntu-deployment-locks" \
+  /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks
+/usr/bin/install -o root -g root -m 0755 "$repo/scripts/handoff-ubuntu-migration-lock" \
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock
+/usr/local/libexec/nmcp/handoff-ubuntu-migration-lock verify-framing
+cat > /opt/nmcp/current/bin/nmcp-admin <<EOF
+#!/bin/sh
+printf 'entered\n' >> '$work/entries'
+id -un >> '$work/identities'
+sleep 1
+EOF
+/usr/bin/chown -R root:root /opt/nmcp/current
+/usr/bin/chmod 0755 /opt/nmcp/current/bin/nmcp-admin
+/usr/bin/install -d -o root -g root -m 0700 /run/nmcp-deploy
+
+/usr/bin/install -d -o root -g root -m 0770 "$work/unsafe-parent"
+if /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks \
+  validate-parent "$work/unsafe-parent"; then
+  printf 'group-writable root-owned parent was accepted\n' >&2; exit 1
+fi
+
+# Hostile pre-created entries must never be followed, repaired, or locked.
+/usr/bin/install -o nmcp -g nmcp -m 0600 /dev/null /run/nmcp-deploy/deploy.lock
+if /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- /usr/bin/true; then
+  printf 'attacker-owned lock file was accepted\n' >&2; exit 1
+fi
+/usr/bin/rm -f /run/nmcp-deploy/deploy.lock
+/usr/bin/printf 'do-not-truncate\n' > "$work/symlink-target"
+/usr/bin/ln -s "$work/symlink-target" /run/nmcp-deploy/deploy.lock
+if /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- /usr/bin/true; then
+  printf 'symlink lock file was accepted\n' >&2; exit 1
+fi
+[[ $(/usr/bin/cat "$work/symlink-target") == do-not-truncate ]]
+/usr/bin/rm -f /run/nmcp-deploy/deploy.lock
+/usr/bin/install -o root -g root -m 0600 /dev/null /run/nmcp-deploy/hardlink-source
+/usr/bin/ln /run/nmcp-deploy/hardlink-source /run/nmcp-deploy/deploy.lock
+if /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- /usr/bin/true; then
+  printf 'multiply-linked lock file was accepted\n' >&2; exit 1
+fi
+/usr/bin/rm -f /run/nmcp-deploy/deploy.lock /run/nmcp-deploy/hardlink-source
+/usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- /usr/bin/true
+/usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- \
+  /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks verify direct \
+  3</dev/null 4</dev/null 5</dev/null 6</dev/null 7</dev/null
+runner_start=$(/usr/bin/python3 -c 'import sys; value=open(f"/proc/{sys.argv[1]}/stat").read(); print(value[value.rfind(")") + 2:].split()[19])' "$$")
+/usr/bin/rm -f /run/nmcp-deploy/test-pidfd-{open.ready,open.go,rejected}
+NMCP_TEST_REPLACE_OWNER_AFTER_PIDFD=1 \
+  /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock \
+  run-tracked "$$" "$runner_start" unused-socket unused-lock 8 unused-runner \
+  unused-unit 1 /usr/bin/true >"$work/pidfd.out" 2>&1 &
+pidfd_test=$!
+for attempt in {1..100}; do
+  [[ -e /run/nmcp-deploy/test-pidfd-open.ready ]] && break
+  [[ $attempt -lt 100 ]] || { printf 'PID-reuse fixture did not reach pidfd_open\n' >&2; exit 1; }
+  /usr/bin/sleep 0.01
+done
+/usr/bin/touch /run/nmcp-deploy/test-pidfd-open.go
+if wait "$pidfd_test"; then
+  printf 'post-pidfd PID identity replacement was accepted\n' >&2; exit 1
+fi
+[[ -e /run/nmcp-deploy/test-pidfd-rejected ]] || {
+  printf 'post-pidfd identity validation branch was not exercised\n' >&2; exit 1;
+}
+/usr/bin/rm -f /run/nmcp-deploy/test-pidfd-{open.ready,open.go,rejected}
+
+# Once root established the stable inode, an unprivileged user cannot replace it.
+/usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- \
+  /bin/sh -c "touch '$work/secure-lock-held'; sleep 3" & secure_owner=$!
+for attempt in {1..30}; do
+  [[ -e $work/secure-lock-held ]] && break
+  [[ $attempt -lt 30 ]] || exit 1
+  /usr/bin/sleep 0.1
+done
+if /usr/sbin/runuser -u nmcp -- /usr/bin/rm -f /run/nmcp-deploy/deploy.lock; then
+  printf 'unprivileged lock replacement succeeded\n' >&2; exit 1
+fi
+if /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks both -- /usr/bin/true; then
+  printf 'concurrent secure lock acquisition succeeded\n' >&2; exit 1
+fi
+wait "$secure_owner"
+
+# Direct migration must not enter while a deployment owns the lock.
+/usr/bin/flock /run/nmcp-deploy/deploy.lock -c "sleep 3" & holder=$!
+/usr/bin/sleep 0.2
+if /usr/local/libexec/nmcp/run-ubuntu-migration; then
+  printf 'direct migration bypassed deployment lock\n' >&2; exit 1
+fi
+[[ ! -e $work/entries ]]
+wait "$holder"
+
+cat > /run/systemd/system/nmcp-lock-migrate.service <<EOF
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration
+EOF
+cat > /run/systemd/system/nmcp-lock-dependent.service <<'EOF'
+[Unit]
+Requires=nmcp-lock-migrate.service
+After=nmcp-lock-migrate.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/true
+EOF
+/usr/bin/systemctl daemon-reload
+/usr/bin/flock /run/nmcp-deploy/deploy.lock -c "sleep 3" & holder=$!
+/usr/bin/sleep 0.2
+if /usr/bin/systemctl start nmcp-lock-dependent.service; then
+  printf 'dependency-triggered migration bypassed deployment lock\n' >&2; exit 1
+fi
+[[ ! -e $work/entries ]]
+wait "$holder"
+
+# A deploy-held lock permits only consumption of exact completion evidence; the
+# systemd dependency performs no migration body and cannot race a later deploy.
+/usr/bin/printf '/opt/nmcp/current\n' > /run/nmcp-migration-complete
+/usr/bin/chown root:root /run/nmcp-migration-complete
+/usr/bin/chmod 0600 /run/nmcp-migration-complete
+/usr/bin/flock /run/nmcp-deploy/deploy.lock -c \
+  "/usr/bin/flock /run/nmcp-deploy/migration-execution.lock -c /usr/local/libexec/nmcp/run-ubuntu-migration"
+[[ ! -e /run/nmcp-migration-complete ]]
+[[ ! -e $work/entries ]]
+
+# A normal systemd-triggered migration owns the lock through exact binary
+# execution and invalidates any stale completion evidence first.
+/usr/bin/printf '/opt/nmcp/current\n' > /run/nmcp-migration-complete
+/usr/bin/chmod 0600 /run/nmcp-migration-complete
+/usr/local/libexec/nmcp/run-ubuntu-migration
+[[ ! -e /run/nmcp-migration-complete ]]
+[[ $(/usr/bin/wc -l < "$work/entries") -eq 1 ]]
+[[ $(/usr/bin/cat "$work/identities") == nmcp ]]
+printf 'Direct and dependency migration lock races passed\n'

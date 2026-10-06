@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Validate exact production environment-file and endpoint relationships."""
+
+import argparse
+import ipaddress
+import pathlib
+import re
+import sys
+import urllib.parse
+
+
+EXPECTED = {
+    "admin.env": {"NMCP_DATABASE_URL", "NMCP_LOG_LEVEL", "NMCP_SHUTDOWN_TIMEOUT"},
+    "api.env": {
+        "NMCP_DATABASE_URL", "NMCP_STORAGE_ROOT", "NMCP_FILE_BASE_URL",
+        "NMCP_CURSOR_HMAC_KEY", "NMCP_API_ADDR", "NMCP_LOG_LEVEL",
+        "NMCP_SHUTDOWN_TIMEOUT",
+    },
+    "worker.env": {
+        "NMCP_DATABASE_URL", "NMCP_STORAGE_ROOT", "NMCP_LOG_LEVEL",
+        "NMCP_SHUTDOWN_TIMEOUT",
+    },
+}
+ASSIGNMENT = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
+
+
+def fail(message: str) -> None:
+    raise ValueError(message)
+
+
+def parse_env(path: pathlib.Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    contents = path.read_bytes()
+    if any(byte < 0x20 and byte != 0x0A for byte in contents) or 0x7F in contents:
+        fail(f"{path.name}: control characters outside LF are forbidden")
+    text = contents.decode("utf-8")
+    for number, raw in enumerate(text.split("\n"), 1):
+        if not raw or raw.startswith("#"):
+            continue
+        match = ASSIGNMENT.fullmatch(raw)
+        if not match:
+            fail(f"{path.name}:{number}: expected an unquoted KEY=VALUE assignment")
+        key, value = match.groups()
+        if key in values:
+            fail(f"{path.name}:{number}: duplicate {key}")
+        if (
+            not value or value != value.strip() or "\x00" in value
+            or any(character in value for character in ("'", '"', "\\"))
+            or any(character.isspace() for character in value)
+        ):
+            fail(f"{path.name}:{number}: {key} has an empty or ambiguous value")
+        values[key] = value
+    expected = EXPECTED[path.name]
+    if set(values) != expected:
+        fail(f"{path.name}: keys differ (missing={sorted(expected - set(values))}, extra={sorted(set(values) - expected)})")
+    return values
+
+
+def split_listen(value: str) -> tuple[str, int]:
+    try:
+        if value.startswith("["):
+            end = value.index("]")
+            host, port_text = value[1:end], value[end + 2:]
+        else:
+            host, port_text = value.rsplit(":", 1)
+        ipaddress.ip_address(host)
+        port = int(port_text)
+    except (ValueError, IndexError) as error:
+        raise ValueError("files listen must be a literal IP:port") from error
+    if not 1 <= port <= 65535:
+        fail("files listen port is outside 1..65535")
+    return host, port
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config-dir", required=True, type=pathlib.Path)
+    parser.add_argument("--tailnet-hostname", required=True)
+    parser.add_argument("--files-listen", required=True)
+    args = parser.parse_args()
+    values = {name: parse_env(args.config_dir / name) for name in EXPECTED}
+
+    api, worker, admin = values["api.env"], values["worker.env"], values["admin.env"]
+    if api["NMCP_API_ADDR"] != "127.0.0.1:8080":
+        fail("NMCP_API_ADDR must be exactly 127.0.0.1:8080")
+    for item in (api, worker):
+        if item["NMCP_STORAGE_ROOT"] != "/var/lib/nmcp/media":
+            fail("NMCP_STORAGE_ROOT must be exactly /var/lib/nmcp/media")
+    database_urls = {api["NMCP_DATABASE_URL"], worker["NMCP_DATABASE_URL"], admin["NMCP_DATABASE_URL"]}
+    if len(database_urls) != 1:
+        fail("all processes must use the same NMCP_DATABASE_URL")
+    database_text = next(iter(database_urls))
+    if not database_text.startswith(("postgres://", "postgresql://")):
+        fail("NMCP_DATABASE_URL requires a canonical lowercase PostgreSQL URI scheme")
+    if re.search(r"%(?![0-9A-Fa-f]{2})", database_text):
+        fail("NMCP_DATABASE_URL contains an invalid percent escape")
+    if database_text.count("@") != 1:
+        fail("NMCP_DATABASE_URL must contain exactly one authority delimiter")
+    database = urllib.parse.urlsplit(database_text)
+    try:
+        database_port = database.port
+        query = urllib.parse.parse_qsl(database.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as error:
+        raise ValueError("NMCP_DATABASE_URL is malformed") from error
+    decoded_user = urllib.parse.unquote(database.username or "")
+    decoded_password = urllib.parse.unquote(database.password or "")
+    if (
+        database.scheme not in ("postgres", "postgresql")
+        or database.hostname not in ("127.0.0.1", "::1")
+        or "," in database.netloc
+        or "%" in (database.hostname or "")
+        or database_port != 5432
+        or database.path != "/nmcp"
+        or not decoded_user or not decoded_password
+        or any(character in decoded_user + decoded_password for character in ("\x00", "\n", "\r"))
+        or database.fragment
+        or query != [("sslmode", "disable")]
+    ):
+        fail("NMCP_DATABASE_URL must use the reviewed local PostgreSQL endpoint and sslmode only")
+    if len(api["NMCP_CURSOR_HMAC_KEY"].encode()) < 32:
+        fail("NMCP_CURSOR_HMAC_KEY must contain at least 32 bytes")
+    combined = "\n".join(item for process in values.values() for item in process.values())
+    if any(marker in combined for marker in ("REPLACE_", "REPLACE_WITH")):
+        fail("replacement marker remains in configuration")
+
+    _files_ip, files_port = split_listen(args.files_listen)
+    files = urllib.parse.urlsplit(api["NMCP_FILE_BASE_URL"])
+    if (
+        files.scheme != "https" or files.hostname != args.tailnet_hostname.lower()
+        or (files.port or 443) != files_port or files.path != "/files/"
+        or files.username or files.password or files.query or files.fragment
+    ):
+        fail("NMCP_FILE_BASE_URL must be the configured Tailnet File Server HTTPS /files/ root")
+    print("Ubuntu production environment configuration validated")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"validate-ubuntu-config: {error}", file=sys.stderr)
+        sys.exit(1)
