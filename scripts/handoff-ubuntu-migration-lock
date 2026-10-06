@@ -124,13 +124,16 @@ def run_tracked(runner_file: str, unit: str, timeout: int, command: list[str]) -
     try:
         status = child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        subprocess.run(
-            ["/usr/bin/systemctl", "stop", unit],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=30,
-        )
+        try:
+            subprocess.run(
+                ["/usr/bin/systemctl", "stop", "--no-block", unit],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            pass
         child.terminate()
         try:
             child.wait(timeout=5)

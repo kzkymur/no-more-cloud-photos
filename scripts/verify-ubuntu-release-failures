@@ -168,6 +168,12 @@ if /usr/bin/grep -q 'NMCP_TEST_ADMIN_ENTERED=queuefail' "$work/queuefail.out"; t
 fi
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
 /usr/bin/systemctl stop postgresql@nmcp-test.service
+if /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q 'nmcp-deploy-admin-'; then
+  printf 'queue timeout left a transient systemd job\n' >&2; exit 1
+fi
+if /usr/bin/systemctl is-active --quiet 'nmcp-deploy-admin-*'; then
+  printf 'queue timeout left a transient unit active\n' >&2; exit 1
+fi
 for attempt in {1..100}; do
   if /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
     && /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then break; fi
