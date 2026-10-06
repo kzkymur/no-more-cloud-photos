@@ -62,7 +62,12 @@ if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "24.04":
     raise SystemExit("install-ubuntu-host: only Ubuntu 24.04 is supported")
 PY
 
-[[ $(/usr/bin/systemctl show --property=LoadState --value "$postgresql_unit") == loaded ]] || {
+[[ $postgresql_unit =~ ^postgresql@[A-Za-z0-9_.-]+\.service$ \
+  && $postgresql_unit != postgresql@.service ]] || {
+  printf 'install-ubuntu-host: PostgreSQL dependency must name one concrete cluster unit\n' >&2
+  exit 1
+}
+[[ $(/usr/bin/systemctl show --property=LoadState --value -- "$postgresql_unit") == loaded ]] || {
   printf 'install-ubuntu-host: concrete PostgreSQL unit is not loaded: %s\n' "$postgresql_unit" >&2
   exit 1
 }

@@ -109,7 +109,7 @@ load_host_contract() {
     printf 'install-ubuntu-release: invalid concrete PostgreSQL unit contract\n' >&2
     exit 1
   }
-  [[ $(/usr/bin/systemctl show --property=LoadState --value "$postgresql_unit") == loaded ]] || {
+  [[ $(/usr/bin/systemctl show --property=LoadState --value -- "$postgresql_unit") == loaded ]] || {
     printf 'install-ubuntu-release: concrete PostgreSQL unit is not loaded: %s\n' "$postgresql_unit" >&2
     exit 1
   }
