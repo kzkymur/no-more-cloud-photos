@@ -138,9 +138,19 @@ fi
 base=https://$test_ip:$files_port
 trusted_base=https://host.example.ts.net:$files_port
 fingerprint() {
-  /usr/bin/openssl s_client -connect "$test_ip:$files_port" -servername host.example.ts.net \
-    -CAfile "$work/ca.crt" -verify_return_error </dev/null 2>/dev/null \
-    | /usr/bin/openssl x509 -noout -fingerprint -sha256
+  local attempt value
+  for attempt in {1..30}; do
+    if value=$(
+      /usr/bin/openssl s_client -connect "$test_ip:$files_port" -servername host.example.ts.net \
+        -CAfile "$work/ca.crt" -verify_return_error </dev/null 2>/dev/null \
+        | /usr/bin/openssl x509 -noout -fingerprint -sha256 2>/dev/null
+    ); then
+      /usr/bin/printf '%s\n' "$value"
+      return 0
+    fi
+    /usr/bin/sleep 0.2
+  done
+  return 1
 }
 for attempt in {1..30}; do
   if /usr/bin/curl --noproxy '*' --insecure --silent --fail --max-time 2 "$base/files-healthz" >/dev/null; then break; fi
