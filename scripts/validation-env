@@ -349,12 +349,12 @@ PY
   for expected in '"libvips":"8.18.7"' '"libheif":"1.23.5"' '"libraw":"0.22.2-Release"' '"libaom":"v3.8.2"' '"lcms2":"2.14"'; do
     printf '%s' "$still_capabilities" | grep -F "$expected" >/dev/null
   done
-  animation_capabilities=$(compose exec -T worker /opt/nmcp/bin/nmcp-animation-helper capabilities --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
+  animation_capabilities=$(compose exec -T worker sh -eu -c 'exec /opt/nmcp/bin/nmcp-animation-helper capabilities --protocol 1 --threads 1 --srgb-icc /proc/self/fd/3 3</opt/nmcp/share/sRGB2014.icc')
   printf '%s\n' "$animation_capabilities"
   for expected in '"libwebp":"1.6.0"' '"libwebp-demux":"1.6.0"' '"libwebp-mux":"1.6.0"' '"giflib":"5.2.2"' '"libheif":"1.23.5"' '"libaom":"v3.8.2"' '"lcms2":"2.14"'; do
     printf '%s' "$animation_capabilities" | grep -F "$expected" >/dev/null
   done
-  video_capabilities=$(compose exec -T worker /opt/nmcp/bin/nmcp-video-helper capabilities --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
+  video_capabilities=$(compose exec -T worker sh -eu -c 'exec /opt/nmcp/bin/nmcp-video-helper capabilities --protocol 1 --threads 1 --srgb-icc /proc/self/fd/3 3</opt/nmcp/share/sRGB2014.icc')
   printf '%s\n' "$video_capabilities"
   for expected in '"ffmpeg":"9.0.2"' '"libsvtav1":"4.2.0"' '"zimg":"3.0.6"' '"libaom":"v3.8.2"' '"video_encoder":"libsvtav1"' '"audio_encoder":"aac-lc"' '"tone_map":"zscale+hable"'; do
     printf '%s' "$video_capabilities" | grep -F "$expected" >/dev/null
