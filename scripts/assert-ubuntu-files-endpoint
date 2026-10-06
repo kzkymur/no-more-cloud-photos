@@ -117,12 +117,19 @@ def assert_status(actual: int, expected: int, label: str) -> None:
 def assert_object_headers(headers: dict[str, list[str]], mime: str, label: str) -> None:
     require(one_header(headers, "Content-Type", label).split(";", 1)[0].lower() == mime.lower(),
             f"{label}: incorrect Content-Type")
-    require(one_header(headers, "Accept-Ranges", label).lower() == "bytes",
-            f"{label}: incorrect Accept-Ranges")
+    assert_accept_ranges(headers, label)
     require(one_header(headers, "Cache-Control", label).lower() ==
             "private, max-age=31536000, immutable", f"{label}: incorrect Cache-Control")
     require(one_header(headers, "X-Content-Type-Options", label).lower() == "nosniff",
             f"{label}: incorrect X-Content-Type-Options")
+
+
+def assert_accept_ranges(headers: dict[str, list[str]], label: str) -> None:
+    values = headers.get("accept-ranges", [])
+    # Nginx may emit its native static-file field in addition to add_header on
+    # 200/HEAD, while add_header supplies it on 206/416. Every field must agree.
+    require(bool(values) and all(value.lower() == "bytes" for value in values),
+            f"{label}: incorrect Accept-Ranges values {values!r}")
 
 
 def parse_multipart(body: bytes, content_type: str, mime: str, expected, label: str) -> None:
@@ -253,8 +260,7 @@ def assert_file(endpoint: Endpoint, kind: str, path: str, fixture: bytes, mime: 
     assert_status(status, 416, f"{kind} unsatisfiable range")
     require(one_header(unsatisfied_headers, "Content-Range", f"{kind} unsatisfiable range").lower() ==
             f"bytes */{len(fixture)}", f"{kind} 416: incorrect Content-Range")
-    require(one_header(unsatisfied_headers, "Accept-Ranges", f"{kind} unsatisfiable range").lower() == "bytes",
-            f"{kind} 416: incorrect Accept-Ranges")
+    assert_accept_ranges(unsatisfied_headers, f"{kind} unsatisfiable range")
     require(one_header(unsatisfied_headers, "Cache-Control", f"{kind} unsatisfiable range").lower() ==
             "private, max-age=31536000, immutable", f"{kind} 416: incorrect Cache-Control")
     require(one_header(unsatisfied_headers, "X-Content-Type-Options", f"{kind} unsatisfiable range").lower() ==

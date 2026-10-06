@@ -91,6 +91,7 @@ http {
             alias /srv/nmcp/originals/$original_path;
             autoindex off;
             disable_symlinks on from=/srv/nmcp/originals;
+            add_header Accept-Ranges bytes always;
             add_header Cache-Control "private, max-age=31536000, immutable" always;
             add_header X-Content-Type-Options nosniff always;
         }
@@ -99,6 +100,7 @@ http {
             alias /srv/nmcp/renditions/$rendition_path;
             autoindex off;
             disable_symlinks on from=/srv/nmcp/renditions;
+            add_header Accept-Ranges bytes always;
             add_header Cache-Control "private, max-age=31536000, immutable" always;
             add_header X-Content-Type-Options nosniff always;
         }
