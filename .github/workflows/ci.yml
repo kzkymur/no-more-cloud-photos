@@ -11,7 +11,10 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Source-building the isolated video codec closure is distinct from the
+    # processor's two-hour media-operation deadline. Individual video build and
+    # fixture commands below retain tighter timeout(1) boundaries.
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:17-alpine
@@ -155,7 +158,81 @@ jobs:
             "${RUNNER_TEMP}/animation-gif-fixtures/dispose-background.gif" \
             "${RUNNER_TEMP}/animation-gif-fixtures/dispose-previous.gif" \
             "${RUNNER_TEMP}/animation-gif-fixtures/incompressible-single.gif" \
-            "${RUNNER_TEMP}/animation-gif-fixtures/incompressible-many.gif" >> "${GITHUB_ENV}"
+             "${RUNNER_TEMP}/animation-gif-fixtures/incompressible-many.gif" >> "${GITHUB_ENV}"
+      - name: Build isolated pinned video toolchain and fixtures
+        run: |
+          timeout 20m internal/videoprocessor/helper/build-pinned-toolchain.sh \
+            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/video-toolchain-work"
+          timeout 2m go build -o "${RUNNER_TEMP}/still-toolchain/bin/nmcp-video-helper" \
+            ./cmd/nmcp-video-helper
+          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
+          video_helper="${RUNNER_TEMP}/still-toolchain/bin/nmcp-video-helper"
+          capabilities=$(timeout 1m "${video_helper}" capabilities --protocol 1 --threads 1 \
+            --srgb-icc /proc/self/fd/3 3<"${RUNNER_TEMP}/sRGB2014.icc")
+          printf '%s\n' "${capabilities}"
+          CAPABILITIES="${capabilities}" python3 -c \
+            'import json,os; r=json.loads(os.environ["CAPABILITIES"])["result"]; v=r["library_versions"]; assert v=={"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libaom":"v3.8.2"} and r["video_encoder"]=="libsvtav1" and r["audio_encoder"]=="aac-lc" and r["tone_map"]=="zscale+hable" and r["build_manifest"]=="ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1", r'
+          ldd "${RUNNER_TEMP}/still-toolchain/bin/ffmpeg" | tee "${RUNNER_TEMP}/video-ffmpeg-ldd.txt"
+          python3 - "${RUNNER_TEMP}/video-ffmpeg-ldd.txt" "${RUNNER_TEMP}/still-toolchain" <<'PY'
+          import pathlib,sys
+          text=pathlib.Path(sys.argv[1]).read_text()
+          prefix=sys.argv[2]
+          for library in ("libSvtAv1Enc", "libzimg", "libaom"):
+              line=next((line for line in text.splitlines() if library in line), None)
+              assert line and prefix in line, (library,line,text)
+          PY
+          generator="${GITHUB_WORKSPACE}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg"
+          fixtures="${RUNNER_TEMP}/video-fixtures"
+          mkdir -p "${fixtures}"
+          timeout 2m "${generator}" -v error -y -threads 1 \
+            -f lavfi -i 'testsrc=size=321x181:rate=25:duration=0.16' \
+            -f lavfi -i 'sine=frequency=440:sample_rate=44100:duration=0.16' -shortest \
+            -c:v libx264 -preset ultrafast -pix_fmt yuv444p -color_primaries bt709 \
+            -color_trc bt709 -colorspace bt709 -color_range tv -c:a aac -b:a 96k \
+            "${fixtures}/avc-odd-audio.mp4"
+          timeout 2m "${generator}" -v error -y -threads 1 \
+            -f lavfi -i 'testsrc2=size=62x46:rate=25:duration=0.16' -an \
+            -c:v libx265 -preset ultrafast -x265-params pools=1:frame-threads=1 \
+            -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
+            "${fixtures}/hevc-base.mp4"
+          timeout 1m "${generator}" -v error -y -i "${fixtures}/hevc-base.mp4" -map 0 -c copy \
+            -metadata:s:v:0 rotate=90 "${fixtures}/hevc-rotated.mov"
+          timeout 2m "${generator}" -v error -y -threads 1 \
+            -f lavfi -i 'testsrc2=size=320x180:rate=25:duration=0.16' -an \
+            -vf format=yuv420p10le -c:v libx265 -preset ultrafast \
+            -x265-params 'pools=1:frame-threads=1:hdr10=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400' \
+            -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv \
+            "${fixtures}/hevc-pq.mp4"
+          timeout 2m "${generator}" -v error -y -threads 1 \
+            -f lavfi -i 'testsrc2=size=320x180:rate=25:duration=0.16' -an \
+            -vf format=yuv420p10le -c:v libx265 -preset ultrafast \
+            -x265-params 'pools=1:frame-threads=1' -color_primaries bt2020 \
+            -color_trc arib-std-b67 -colorspace bt2020nc -color_range tv \
+            "${fixtures}/hevc-hlg.mp4"
+          timeout 2m "${generator}" -v error -y -threads 1 \
+            -f lavfi -i 'color=red:size=96x64:rate=25:duration=0.16' \
+            -f lavfi -i 'color=blue:size=64x48:rate=25:duration=0.16' \
+            -f lavfi -i 'sine=frequency=440:sample_rate=44100:duration=0.16' \
+            -f lavfi -i 'sine=frequency=880:sample_rate=48000:duration=0.16' \
+            -map 0:v -map 1:v -map 2:a -map 3:a -c:v libx264 -preset ultrafast \
+            -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+            -color_range tv -c:a aac -shortest -disposition:v:0 0 -disposition:v:1 default \
+            -disposition:a:0 0 -disposition:a:1 default "${fixtures}/multistream.mp4"
+          timeout 2m "${generator}" -v error -y -threads 1 \
+            -f lavfi -i 'testsrc=size=160x90:rate=25:duration=0.2' -frames:v 3 \
+            -vf 'setpts=N*N/(25*TB),setsar=2/1' -fps_mode vfr -an -c:v libx264 \
+            -preset ultrafast -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 \
+            -colorspace bt709 -color_range tv "${fixtures}/vfr-sar.mp4"
+          for fixture in "${fixtures}"/*.mp4 "${fixtures}"/*.mov; do
+            timeout 1m "${GITHUB_WORKSPACE}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe" \
+              -v error -show_streams -show_format "${fixture}" >/dev/null
+            timeout 1m "${generator}" -v error -xerror -i "${fixture}" -f null -
+          done
+          printf 'TEST_VIDEO_HELPER_PATH=%s\nTEST_VIDEO_PRLIMIT_PATH=%s\nTEST_VIDEO_ICC_PATH=%s\nTEST_VIDEO_AVC_PATH=%s\nTEST_VIDEO_HEVC_ROTATED_PATH=%s\nTEST_VIDEO_PQ_PATH=%s\nTEST_VIDEO_HLG_PATH=%s\nTEST_VIDEO_MULTISTREAM_PATH=%s\nTEST_VIDEO_VFR_PATH=%s\n' \
+            "${video_helper}" "$(command -v prlimit)" "${RUNNER_TEMP}/sRGB2014.icc" \
+            "${fixtures}/avc-odd-audio.mp4" "${fixtures}/hevc-rotated.mov" \
+            "${fixtures}/hevc-pq.mp4" "${fixtures}/hevc-hlg.mp4" \
+            "${fixtures}/multistream.mp4" "${fixtures}/vfr-sar.mp4" >> "${GITHUB_ENV}"
       - name: Verify modules
         run: go mod verify
       - name: Check formatting
@@ -185,6 +262,12 @@ jobs:
         env:
           TEST_ANIMATION_HELPER: "1"
         run: go test -v -count=1 ./internal/animationprocessor
+      - name: Explicit native video codec evidence
+        env:
+          TEST_VIDEO_HELPER: "1"
+          TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
+          TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
+        run: timeout 10m go test -v -count=1 -run '^TestVideoHelperRealCodecMatrix$' ./internal/videoprocessor
       - name: Explicit Linux storage durability evidence
         run: go test -v -count=1 ./internal/storage
       - name: Race tests
