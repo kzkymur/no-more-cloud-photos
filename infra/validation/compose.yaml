@@ -1,0 +1,143 @@
+x-validation-labels: &validation-labels
+  com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER:?scripts/validation-env must set NMCP_VALIDATION_OWNER}"
+
+services:
+  postgres:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    environment:
+      POSTGRES_DB: nmcp
+      POSTGRES_USER: nmcp
+      POSTGRES_PASSWORD: nmcp-validation-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nmcp -d nmcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - database:/var/lib/postgresql/data
+    networks: [backend]
+    labels: *validation-labels
+
+  storage-init:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    user: "0:0"
+    command: ["sh", "-eu", "-c", "mkdir -p /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/backups /var/lib/nmcp/media/quarantine /var/lib/nmcp/media/tmp && chown -R 10001:10001 /var/lib/nmcp/media && chmod 0700 /var/lib/nmcp/media /var/lib/nmcp/media/*"]
+    volumes:
+      - media:/var/lib/nmcp/media
+    network_mode: none
+    labels: *validation-labels
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    command: ["nmcp-admin", "migrate", "up", "--json"]
+    environment: &common-environment
+      NMCP_DATABASE_URL: postgres://nmcp:nmcp-validation-only@postgres:5432/nmcp?sslmode=disable
+      NMCP_LOG_LEVEL: info
+      NMCP_SHUTDOWN_TIMEOUT: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+    labels: *validation-labels
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    command: ["core-api"]
+    environment:
+      <<: *common-environment
+      NMCP_STORAGE_ROOT: /var/lib/nmcp/media
+      NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
+      NMCP_CURSOR_HMAC_KEY: validation-only-cursor-key-32-bytes-minimum
+      NMCP_API_ADDR: 0.0.0.0:8080
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1:${NMCP_API_PORT:-18080}:8080"
+    stop_grace_period: 20s
+    volumes:
+      - media:/var/lib/nmcp/media
+    networks: [backend, api-edge]
+    labels: *validation-labels
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    command: ["core-worker"]
+    environment:
+      <<: *common-environment
+      NMCP_STORAGE_ROOT: /var/lib/nmcp/media
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      storage-init:
+        condition: service_completed_successfully
+    stop_grace_period: 15s
+    volumes:
+      - media:/var/lib/nmcp/media
+    networks: [backend]
+    labels: *validation-labels
+
+  files:
+    build:
+      context: ../..
+      dockerfile: infra/validation/nginx.Dockerfile
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--insecure", "--silent", "https://127.0.0.1:8443/files-healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1:${NMCP_FILES_PORT:-18443}:8443"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=16m,mode=0700
+      - /var/run:size=1m,mode=0700
+      - /tmp:size=4m,uid=10001,gid=10001,mode=0700
+    volumes:
+      - type: volume
+        source: media
+        target: /srv/nmcp/originals
+        read_only: true
+        volume:
+          subpath: originals
+      - type: volume
+        source: media
+        target: /srv/nmcp/renditions
+        read_only: true
+        volume:
+          subpath: renditions
+    networks: [files-edge]
+    labels: *validation-labels
+
+volumes:
+  database:
+    labels: *validation-labels
+  media:
+    labels: *validation-labels
+
+networks:
+  backend:
+    internal: true
+    labels: *validation-labels
+  files-edge:
+    labels: *validation-labels
+  api-edge:
+    labels: *validation-labels

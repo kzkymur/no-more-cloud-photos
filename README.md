@@ -7,3 +7,4 @@ Implementation contracts for the Core service:
 - [Requirements traceability](docs/traceability.md)
 - [Published design snapshot and provenance](docs/design-snapshot/README.md)
 - [Core development, pinned dependencies, and environment](docs/development.md)
+- [Reproducible Core validation environment](docs/validation-environment.md)
