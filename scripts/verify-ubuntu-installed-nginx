@@ -258,6 +258,7 @@ if /usr/bin/systemctl is-active --quiet nmcp-files.service; then
 fi
 /usr/bin/rm -f /run/systemd/system/nmcp-files.service.d/99-fail-once.conf
 /usr/bin/systemctl daemon-reload
+/usr/bin/systemctl reset-failed nmcp-files.service
 /usr/bin/systemctl restart nmcp-files.service
 [[ $(fingerprint) == "$new_fingerprint" ]]
 /usr/bin/rm -rf -- "$persistent_input"
