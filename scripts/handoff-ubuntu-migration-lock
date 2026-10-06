@@ -8,7 +8,6 @@ import pathlib
 import socket
 import stat
 import sys
-import time
 
 
 def fail(message: str) -> "NoReturn":
@@ -52,7 +51,6 @@ def send_fd(
         owner_start = process_start(owner_pid)
         if owner_start is None:
             fail("dispatch owner is already gone")
-        deadline = time.monotonic() + 3600
         runner: tuple[int, str] | None = None
         while True:
             try:
@@ -60,8 +58,6 @@ def send_fd(
                 break
             except TimeoutError:
                 pass
-            if time.monotonic() >= deadline:
-                fail("operation deadline expired before lease transfer")
             try:
                 fields = pathlib.Path(runner_file).read_text().split()
                 candidate = (int(fields[0]), fields[1])

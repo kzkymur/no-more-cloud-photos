@@ -82,6 +82,13 @@ PY
   printf 'install-ubuntu-host: concrete PostgreSQL unit is not loaded: %s\n' "$postgresql_unit" >&2
   exit 1
 }
+postgresql_start_timeout=$(
+  /usr/bin/systemctl show --property=TimeoutStartUSec --value -- "$postgresql_unit"
+)
+[[ -n $postgresql_start_timeout && $postgresql_start_timeout != infinity ]] || {
+  printf 'install-ubuntu-host: concrete PostgreSQL unit must have a finite start timeout\n' >&2
+  exit 1
+}
 capture=$(/usr/bin/mktemp -d /run/nmcp-host-input.XXXXXX)
 cleanup() { /usr/bin/rm -rf -- "$capture"; }
 trap cleanup EXIT

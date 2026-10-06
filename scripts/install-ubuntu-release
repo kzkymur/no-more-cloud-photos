@@ -114,6 +114,13 @@ load_host_contract() {
     printf 'install-ubuntu-release: concrete PostgreSQL unit is not loaded: %s\n' "$postgresql_unit" >&2
     exit 1
   }
+  postgresql_start_timeout=$(
+    /usr/bin/systemctl show --property=TimeoutStartUSec --value -- "$postgresql_unit"
+  )
+  [[ -n $postgresql_start_timeout && $postgresql_start_timeout != infinity ]] || {
+    printf 'install-ubuntu-release: concrete PostgreSQL unit must have a finite start timeout\n' >&2
+    exit 1
+  }
 }
 
 atomic_link() {

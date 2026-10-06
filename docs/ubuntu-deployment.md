@@ -142,9 +142,10 @@ receiver verifies the descriptor and acknowledges ownership before database
 work. Thus installer death before transfer prevents execution, while death after
 transfer leaves the child holding the lease and blocks every new
 host/release/TLS/direct-migration mutation until the exact binary exits.
-The broker tracks the exact `systemd-run` PID/start time rather than expiring
-while PostgreSQL is still starting: it remains valid through the concrete
-database unit's bounded start job and the transient admin deadline, and releases
+The concrete database unit must expose a finite `TimeoutStartUSec`. The broker
+tracks the exact `systemd-run` PID/start time rather than running an independent
+pre-database timer: it remains valid through that bounded database start job and
+the 15-minute transient admin deadline, and releases
 automatically if the dispatch owner or runner exits before transfer.
 Successful oneshot migration remains active so production
 API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
