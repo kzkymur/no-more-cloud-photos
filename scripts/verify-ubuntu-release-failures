@@ -12,6 +12,7 @@ cleanup() {
   /usr/bin/rm -f /run/nmcp-migrate-delegation /run/lock/nmcp-deploy.lock
 }
 trap cleanup EXIT
+/usr/bin/chown nmcp:nmcp "$work"
 for path in /opt/nmcp /etc/nmcp /var/lib/nmcp/deployment /usr/local/libexec/nmcp; do
   [[ ! -e $path ]] || { printf 'test path already exists: %s\n' "$path" >&2; exit 1; }
 done
