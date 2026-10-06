@@ -1,0 +1,80 @@
+name: Ubuntu deployment
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/ubuntu-deployment.yml"
+      - "docs/ubuntu-deployment.md"
+      - "infra/ubuntu/**"
+      - "scripts/install-ubuntu-host"
+      - "scripts/install-ubuntu-release"
+      - "scripts/render-ubuntu-nginx"
+      - "scripts/verify-ubuntu-deployment"
+      - "scripts/verify-ubuntu-nginx-http"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/ubuntu-deployment.yml"
+      - "docs/ubuntu-deployment.md"
+      - "infra/ubuntu/**"
+      - "scripts/install-ubuntu-host"
+      - "scripts/install-ubuntu-release"
+      - "scripts/render-ubuntu-nginx"
+      - "scripts/verify-ubuntu-deployment"
+      - "scripts/verify-ubuntu-nginx-http"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-deployment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install parser and HTTP test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends nginx-core shellcheck
+
+      - name: Check shell scripts
+        run: |
+          shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
+            scripts/verify-ubuntu-nginx-http
+
+      - name: Verify deployment assets
+        run: scripts/verify-ubuntu-deployment
+
+      - name: Verify production Nginx HTTP contract
+        run: |
+          sudo ip address add 100.64.0.10/32 dev lo
+          scripts/verify-ubuntu-nginx-http
+
+      - name: Verify immutable release staging
+        env:
+          RELEASE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          mkdir -p /tmp/nmcp-release/bin
+          for binary in core-api core-worker nmcp-admin; do
+            printf '#!/bin/sh\nexit 0\n' > "/tmp/nmcp-release/bin/$binary"
+            chmod 0755 "/tmp/nmcp-release/bin/$binary"
+          done
+          (cd /tmp/nmcp-release && sha256sum bin/* > MANIFEST.sha256)
+          sudo scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID"
+          sudo test "$(stat -c '%U:%G' "/opt/nmcp/releases/$RELEASE_ID/bin/core-api")" = root:root
+
+      - name: Remove staged release
+        if: always()
+        env:
+          RELEASE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: sudo rm -rf -- "/opt/nmcp/releases/$RELEASE_ID" /tmp/nmcp-release
+
+      - name: Remove test Tailnet address
+        if: always()
+        run: sudo ip address delete 100.64.0.10/32 dev lo || true
