@@ -42,6 +42,16 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 	}
 	videoFilter := filterGraph(source, width, height, r.bitDepth, r.kind)
 	audioRate, audioFilter := outputAudio(source)
+	outputLimit := r.limits.VideoBytes
+	if r.kind == "first-frame-avif" {
+		outputLimit = r.limits.ThumbBytes
+	}
+	if remaining := r.limits.GeneratedBytes - r.generatedBytesBefore; remaining < outputLimit {
+		outputLimit = remaining
+	}
+	if outputLimit <= 0 {
+		return fail("output_too_large")
+	}
 	args := []string{"-v", "error", "-nostdin", "-y", "-noautorotate", "-threads", "1", "-i", r.input, "-map", "0:" + strconv.Itoa(source.VideoStreamIndex), "-vf", videoFilter, "-map_metadata", "-1", "-map_chapters", "-1", "-threads:v", "1"}
 	if r.kind == "mp4-av1" {
 		args = append(args, "-c:v", "libsvtav1", "-crf", "32", "-preset", "6", "-svtav1-params", "lp=1", "-fps_mode:v", "passthrough", "-enc_time_base:v", source.TimeBase.NumeratorString()+"/"+source.TimeBase.DenominatorString(), "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv")
@@ -53,10 +63,10 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 		} else {
 			args = append(args, "-an")
 		}
-		args = append(args, "-movflags", "+faststart+write_colr", "-metadata:s:v:0", "rotate=0", "-fs", strconv.FormatInt(r.limits.VideoBytes, 10), "-f", "mp4", r.output)
+		args = append(args, "-movflags", "+faststart+write_colr", "-metadata:s:v:0", "rotate=0", "-fs", strconv.FormatInt(outputLimit, 10), "-f", "mp4", r.output)
 	} else {
 		crf := 63 - int(math.Round(float64(r.quality)*63/100))
-		args = append(args, "-an", "-frames:v", "1", "-c:v", "libaom-av1", "-crf", strconv.Itoa(crf), "-b:v", "0", "-cpu-used", "6", "-still-picture", "1", "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "iec61966-2-1", "-colorspace", "bt709", "-color_range", "tv", "-fs", strconv.FormatInt(r.limits.ThumbBytes, 10), "-f", "avif", r.output)
+		args = append(args, "-an", "-frames:v", "1", "-c:v", "libaom-av1", "-crf", strconv.Itoa(crf), "-b:v", "0", "-cpu-used", "6", "-still-picture", "1", "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "iec61966-2-1", "-colorspace", "bt709", "-color_range", "tv", "-fs", strconv.FormatInt(outputLimit, 10), "-f", "avif", r.output)
 	}
 	if _, _, err := e.run.run(e.ffmpeg, args, 1<<20); err != nil {
 		return fail("encode_failed")
@@ -66,7 +76,7 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 	if r.kind == "first-frame-avif" {
 		limit = r.limits.ThumbBytes
 	}
-	if err != nil || info.Size() <= 0 || info.Size() > limit || info.Size() > r.limits.GeneratedBytes {
+	if err != nil || info.Size() <= 0 || info.Size() > limit || r.generatedBytesBefore > r.limits.GeneratedBytes-info.Size() {
 		return fail("output_too_large")
 	}
 	result := struct {

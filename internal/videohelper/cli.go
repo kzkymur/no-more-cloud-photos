@@ -119,7 +119,7 @@ func parseRequest(a []string) (request, error) {
 	case "inspect":
 		names = append([]string{"--protocol", "--input", "--input-mime"}, limitNames...)
 	case "transform":
-		names = append([]string{"--protocol", "--input", "--output", "--input-mime", "--output-kind", "--max-long-edge", "--quality", "--bit-depth", "--threads", "--srgb-icc"}, limitNames...)
+		names = append([]string{"--protocol", "--input", "--output", "--input-mime", "--output-kind", "--max-long-edge", "--quality", "--bit-depth", "--threads", "--srgb-icc", "--generated-bytes-before"}, limitNames...)
 	case "verify-output":
 		names = append([]string{"--protocol", "--source", "--output", "--source-mime", "--output-kind"}, limitNames...)
 	default:
@@ -163,6 +163,10 @@ func parseRequest(a []string) (request, error) {
 		}
 	}
 	if r.command == "transform" {
+		r.generatedBytesBefore, err = strconv.ParseInt(values["--generated-bytes-before"], 10, 64)
+		if err != nil || r.generatedBytesBefore < 0 || strconv.FormatInt(r.generatedBytesBefore, 10) != values["--generated-bytes-before"] {
+			return request{}, fail("policy_violation")
+		}
 		if r.maxLongEdge, err = decimalInt(values["--max-long-edge"]); err != nil || r.maxLongEdge <= 0 || r.maxLongEdge > map[bool]int{true: 1920, false: 640}[r.kind == "mp4-av1"] {
 			return request{}, fail("policy_violation")
 		}
@@ -177,6 +181,9 @@ func parseRequest(a []string) (request, error) {
 		if err := parseLimits(values, &r.limits); err != nil {
 			return request{}, err
 		}
+	}
+	if r.command == "transform" && r.generatedBytesBefore > r.limits.GeneratedBytes {
+		return request{}, fail("policy_violation")
 	}
 	return r, nil
 }

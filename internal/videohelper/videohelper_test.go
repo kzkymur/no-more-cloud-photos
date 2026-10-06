@@ -229,6 +229,16 @@ func TestTransformInvokesSVTAV1WithoutH264FallbackAndTruncatesFailure(t *testing
 	if !strings.Contains(joined, "-c:v libsvtav1") || strings.Contains(joined, "libx264") {
 		t.Fatalf("ffmpeg args = %q", runner.lastFFmpeg)
 	}
+	if err := output.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	r.generatedBytesBefore = maxGenerated - 2
+	runner = &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, writeOutput: []byte("mp4")}
+	e.run = runner
+	if err := e.transform(r, io.Discard); !isCode(err, "output_too_large") {
+		t.Fatalf("cumulative output error = %v", err)
+	}
+	r.generatedBytesBefore = 0
 	runner = &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, runErrorAt: 2, writeOutput: []byte("partial")}
 	e.run = runner
 	if err := e.transform(r, io.Discard); !isCode(err, "encode_failed") {

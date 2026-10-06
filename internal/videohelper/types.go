@@ -114,6 +114,7 @@ type limits struct {
 type request struct {
 	command, input, output, source, mime, kind, icc string
 	maxLongEdge, quality, bitDepth, threads         int
+	generatedBytesBefore                            int64
 	limits                                          limits
 }
 

@@ -33,9 +33,9 @@ type Config struct {
 }
 
 type Processor struct {
-	helper, srgbICC, iccSHA256 string
-	policy                     Policy
-	runner, thumbnailRunner    *processrunner.Runner
+	helper, prlimit, srgbICC, iccSHA256 string
+	policy                              Policy
+	runner, thumbnailRunner             *processrunner.Runner
 }
 
 type InspectRequest struct {
@@ -44,10 +44,11 @@ type InspectRequest struct {
 }
 
 type Request struct {
-	Input    *os.File
-	Output   *os.File
-	MIMEType string
-	Recipe   profile.Recipe
+	Input                *os.File
+	Output               *os.File
+	MIMEType             string
+	Recipe               profile.Recipe
+	GeneratedBytesBefore int64
 }
 
 type Rational struct {
@@ -165,7 +166,7 @@ func New(config Config) (*Processor, error) {
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	return &Processor{helper: config.Helper, srgbICC: config.SRGBICC, iccSHA256: config.SRGBICCSHA256, policy: policy, runner: runner, thumbnailRunner: thumbnailRunner}, nil
+	return &Processor{helper: config.Helper, prlimit: config.Prlimit, srgbICC: config.SRGBICC, iccSHA256: config.SRGBICCSHA256, policy: policy, runner: runner, thumbnailRunner: thumbnailRunner}, nil
 }
 
 func (p *Processor) Capabilities(ctx context.Context) (Capabilities, error) {
@@ -258,11 +259,25 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	kind, quality, bitDepth := recipeOutput(request.Recipe)
 	arguments := []string{"transform", "--protocol", "1", "--input", "/proc/self/fd/3", "--output", "/proc/self/fd/4",
 		"--input-mime", request.MIMEType, "--output-kind", kind, "--max-long-edge", strconv.Itoa(request.Recipe.MaxLongEdge),
-		"--quality", strconv.Itoa(quality), "--bit-depth", strconv.Itoa(bitDepth), "--threads", "1", "--srgb-icc", "/proc/self/fd/5"}
+		"--quality", strconv.Itoa(quality), "--bit-depth", strconv.Itoa(bitDepth), "--threads", "1", "--srgb-icc", "/proc/self/fd/5",
+		"--generated-bytes-before", strconv.FormatInt(request.GeneratedBytesBefore, 10)}
 	arguments = append(arguments, p.limitArguments()...)
 	operationRunner := p.runner
 	if kind == "first-frame-avif" {
 		operationRunner = p.thumbnailRunner
+	}
+	if request.GeneratedBytesBefore > p.policy.GeneratedOutputMaxBytes {
+		return Result{}, ErrInvalid
+	}
+	remaining := p.policy.GeneratedOutputMaxBytes - request.GeneratedBytesBefore
+	if remaining == 0 {
+		return Result{}, ErrResourcePolicy
+	}
+	if kindLimit := limitForKind(p.policy, kind); remaining < kindLimit {
+		operationRunner, err = processrunner.New(p.prlimit, processrunner.Limits{Timeout: p.policy.Timeout, AddressSpaceBytes: p.policy.AddressSpaceBytes, FileSizeBytes: uint64(remaining), OutputBytesPerStream: p.policy.LogBytesPerStream})
+		if err != nil {
+			return Result{}, ErrInvalid
+		}
 	}
 	out, err := operationRunner.Run(operation, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{input, request.Output, icc}})
 	if err != nil {
@@ -283,7 +298,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	if kind == "first-frame-avif" {
 		limit = p.policy.ThumbnailOutputMaxBytes
 	}
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit || info.Size() > p.policy.GeneratedOutputMaxBytes {
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit || request.GeneratedBytesBefore > p.policy.GeneratedOutputMaxBytes-info.Size() {
 		return Result{}, ErrResourcePolicy
 	}
 	if !validateVideoContainer(request.Output, info.Size(), kind, response.Result.AudioPresent) {
@@ -301,6 +316,13 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		extension = "avif"
 	}
 	return Result{r.Kind, r.OutputMIME, extension, r.Width, r.Height, r.MaxLongEdge, r.Threads, r.CRF, r.Quality, r.BitDepth, r.Chroma, r.AudioPresent, r.AudioCodec, r.AudioBitrateKbps, r.Source, publicAudit(r.Audit)}, nil
+}
+
+func limitForKind(policy Policy, kind string) int64 {
+	if kind == "first-frame-avif" {
+		return policy.ThumbnailOutputMaxBytes
+	}
+	return policy.VideoOutputMaxBytes
 }
 
 func (p *Processor) verifyOutput(ctx context.Context, runner *processrunner.Runner, request Request, transformed *transformWire) error {
@@ -365,7 +387,7 @@ func validateInput(file *os.File, mime string) error {
 }
 
 func validateRequest(request Request) error {
-	if validateInput(request.Input, request.MIMEType) != nil || request.Output == nil || validateRecipe(request.Recipe, request.MIMEType) != nil {
+	if validateInput(request.Input, request.MIMEType) != nil || request.Output == nil || request.GeneratedBytesBefore < 0 || request.GeneratedBytesBefore > MaxGeneratedOutputBytes || validateRecipe(request.Recipe, request.MIMEType) != nil {
 		return ErrInvalid
 	}
 	inputInfo, err := request.Input.Stat()
