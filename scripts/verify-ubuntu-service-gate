@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-service-gate: must run as root\n' >&2; exit 1; }
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+work=$(/usr/bin/mktemp -d /var/tmp/nmcp-service-gate.XXXXXX)
+units=(nmcp-check-api.service nmcp-check-worker.service nmcp-check-files.service postgresql@nmcp-check.service)
+cleanup() {
+  /usr/bin/systemctl stop "${units[@]}" >/dev/null 2>&1 || true
+  for unit in "${units[@]}"; do /usr/bin/rm -f -- "/run/systemd/system/$unit"; done
+  /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+  /usr/bin/rm -rf -- "$work"
+}
+trap cleanup EXIT
+cat > "$work/ready.py" <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/readyz":
+            self.send_error(404); return
+        body = b'{"status":"ok"}\n'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def log_message(self, *_args): pass
+HTTPServer(("127.0.0.1", 18081), Handler).serve_forever()
+PY
+cat > /run/systemd/system/nmcp-check-api.service <<EOF
+[Service]
+ExecStart=/usr/bin/python3 $work/ready.py
+EOF
+for unit in nmcp-check-worker.service nmcp-check-files.service postgresql@nmcp-check.service; do
+  cat > "/run/systemd/system/$unit" <<'EOF'
+[Service]
+ExecStart=/usr/bin/sleep infinity
+EOF
+done
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl start "${units[@]}"
+check=("$script_dir/check-ubuntu-services" --api-url http://127.0.0.1:18081/readyz \
+  --consecutive 2 --attempts 5 --interval 0.1 \
+  --unit nmcp-check-api.service --unit nmcp-check-worker.service \
+  --unit nmcp-check-files.service --postgresql-unit postgresql@nmcp-check.service)
+"${check[@]}"
+/usr/bin/systemctl stop nmcp-check-worker.service
+if "${check[@]}" >/dev/null 2>&1; then
+  printf 'stopped Worker incorrectly passed whole-service gate\n' >&2; exit 1
+fi
+/usr/bin/systemctl start nmcp-check-worker.service
+/usr/bin/systemctl stop nmcp-check-files.service
+if "${check[@]}" >/dev/null 2>&1; then
+  printf 'stopped File Server incorrectly passed whole-service gate\n' >&2; exit 1
+fi
+printf 'Whole-service stability gate failure counterexamples passed\n'

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-installed-nginx: must run as root\n' >&2; exit 1; }
+test_ip=${NMCP_NGINX_TEST_IP:-100.64.0.10}
+api_port=${NMCP_NGINX_TEST_API_PORT:-18443}
+files_port=${NMCP_NGINX_TEST_FILES_PORT:-19443}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd -- "$script_dir/.." && pwd -P)
+work=$(/usr/bin/mktemp -d /var/tmp/nmcp-installed-nginx.XXXXXX)
+for path in /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp /usr/local/libexec/nmcp; do
+  [[ ! -e $path ]] || { printf 'refusing to replace existing test-host path: %s\n' "$path" >&2; exit 1; }
+done
+cleanup() {
+  /usr/bin/systemctl stop nmcp-files.service nmcp-api.service >/dev/null 2>&1 || true
+  /usr/bin/rm -f /run/systemd/system/nmcp-files.service /run/systemd/system/nmcp-api.service \
+    /run/systemd/system/nmcp.slice
+  /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+  /usr/bin/rm -rf -- /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp \
+    /usr/local/libexec/nmcp "/root/nmcp-tls-renew.$$" "$work"
+}
+trap cleanup EXIT
+
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf" "$work/nmcp-sysusers.conf"
+/usr/bin/systemd-sysusers "$work/nmcp-sysusers.conf"
+/usr/bin/install -d -o root -g root -m 0700 /etc/nmcp /etc/nmcp/tls-releases/test
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net -days 30 \
+  -keyout /etc/nmcp/tls-releases/test/key.pem -out /etc/nmcp/tls-releases/test/cert.pem >/dev/null 2>&1
+/usr/bin/chown root:root /etc/nmcp/tls-releases/test/*.pem
+/usr/bin/chmod 0600 /etc/nmcp/tls-releases/test/*.pem
+/usr/bin/ln -s /etc/nmcp/tls-releases/test /etc/nmcp/tls-current
+/usr/bin/printf 'host.example.ts.net\n' > /etc/nmcp/tailnet-hostname
+/usr/bin/chmod 0600 /etc/nmcp/tailnet-hostname
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp
+for script in renew-ubuntu-tls capture-trusted-inputs check-ubuntu-tls-expiry; do
+  /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
+done
+
+/usr/bin/install -d -o root -g root -m 0755 /etc/nmcp-nginx
+"$repo_root/scripts/render-ubuntu-nginx" \
+  --template "$repo_root/infra/ubuntu/nginx.conf.in" --output /etc/nmcp-nginx/nginx.conf \
+  --api-listen "$test_ip:$api_port" --files-listen "$test_ip:$files_port" \
+  --tailnet-hostname host.example.ts.net
+/usr/bin/chown root:root /etc/nmcp-nginx/nginx.conf
+/usr/bin/chmod 0644 /etc/nmcp-nginx/nginx.conf
+
+original_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+rendition_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+profile_id=cccccccc-cccc-4ccc-8ccc-cccccccccccc
+symlink_original_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab
+symlink_rendition_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc
+original_dir=/var/lib/nmcp/media/originals/aa/$original_id
+rendition_dir=/var/lib/nmcp/media/renditions/aa/$original_id/$rendition_id
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 "$original_dir" "$rendition_dir" \
+  "/var/lib/nmcp/media/originals/aa/$symlink_original_id" \
+  "/var/lib/nmcp/media/renditions/aa/$original_id/$symlink_rendition_id" \
+  /var/lib/nmcp/media/tmp /var/lib/nmcp/backups /srv/nmcp/originals /srv/nmcp/renditions
+/usr/bin/printf '0123456789abcdef' > "$original_dir/original.jpg"
+/usr/bin/printf 'rendition-fixture' > "$rendition_dir/$profile_id.webp"
+/usr/bin/chown -R nmcp:nmcp /var/lib/nmcp/media /srv/nmcp
+/usr/bin/chmod 0600 "$original_dir/original.jpg" "$rendition_dir/$profile_id.webp"
+/usr/bin/ln -s "$original_dir/original.jpg" \
+  "/var/lib/nmcp/media/originals/aa/$symlink_original_id/original.jpg"
+/usr/bin/ln -s "$rendition_dir/$profile_id.webp" \
+  "/var/lib/nmcp/media/renditions/aa/$original_id/$symlink_rendition_id/$profile_id.webp"
+
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/nmcp.slice" /run/systemd/system/nmcp.slice
+/usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/nmcp-files.service" /run/systemd/system/nmcp-files.service
+cat > /run/systemd/system/nmcp-api.service <<'EOF'
+[Unit]
+Description=Disposable NMCP API dependency
+[Service]
+Type=simple
+ExecStart=/usr/bin/sleep infinity
+EOF
+/usr/bin/systemctl daemon-reload
+
+# Prove the exact installed traversal boundary before service startup.
+/usr/sbin/runuser -u nmcp -- /usr/bin/test -r /etc/nmcp-nginx/nginx.conf
+if /usr/sbin/runuser -u nmcp -- /usr/bin/test -r /etc/nmcp/tailnet-hostname; then
+  printf 'nmcp unexpectedly read a root-only source credential/config path\n' >&2
+  exit 1
+fi
+/usr/bin/systemctl start nmcp-api.service nmcp-files.service
+/usr/bin/systemctl is-active --quiet nmcp-files.service
+
+base=https://$test_ip:$files_port
+for attempt in {1..30}; do
+  if /usr/bin/curl --noproxy '*' --insecure --silent --fail --max-time 2 "$base/files-healthz" >/dev/null; then break; fi
+  [[ $attempt -lt 30 ]] || { /usr/bin/journalctl -u nmcp-files.service --no-pager >&2; exit 1; }
+  /usr/bin/sleep 0.2
+done
+"$repo_root/scripts/assert-ubuntu-files-endpoint" --base-url "$base" --insecure \
+  --original-path "/files/originals/aa/$original_id/original.jpg" \
+  --original-file "$original_dir/original.jpg" --original-mime image/jpeg \
+  --original-symlink-path "/files/originals/aa/$symlink_original_id/original.jpg" \
+  --rendition-path "/files/renditions/aa/$original_id/$rendition_id/$profile_id.webp" \
+  --rendition-file "$rendition_dir/$profile_id.webp" --rendition-mime image/webp \
+  --rendition-symlink-path "/files/renditions/aa/$original_id/$symlink_rendition_id/$profile_id.webp"
+
+# Renew as one immutable certificate/key generation, restart to refresh
+# LoadCredential, and retain service availability. Reject a mismatched pair.
+renew_input=/root/nmcp-tls-renew.$$
+/usr/bin/install -d -o root -g root -m 0700 "$renew_input"
+/usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=host.example.ts.net -days 30 \
+  -keyout "$renew_input/key.pem" -out "$renew_input/cert.pem" >/dev/null 2>&1
+/usr/bin/chown root:root "$renew_input"/*.pem
+/usr/bin/chmod 0600 "$renew_input"/*.pem
+old_tls=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
+/usr/local/libexec/nmcp/renew-ubuntu-tls "$renew_input/cert.pem" "$renew_input/key.pem"
+new_tls=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
+[[ $new_tls != "$old_tls" ]]
+/usr/bin/systemctl is-active --quiet nmcp-files.service
+/usr/bin/curl --noproxy '*' --insecure --silent --fail --max-time 2 "$base/files-healthz" >/dev/null
+/usr/bin/openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -out "$renew_input/wrong-key.pem" >/dev/null 2>&1
+/usr/bin/chmod 0600 "$renew_input/wrong-key.pem"
+if /usr/local/libexec/nmcp/renew-ubuntu-tls \
+  "$renew_input/cert.pem" "$renew_input/wrong-key.pem" >/dev/null 2>&1; then
+  printf 'mismatched TLS generation was accepted\n' >&2; exit 1
+fi
+[[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$new_tls" ]]
+printf 'Installed-path nmcp Nginx service and full HTTP matrix passed\n'

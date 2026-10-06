@@ -35,13 +35,30 @@ def main() -> int:
         ROOT / "scripts" / "install-ubuntu-release",
         ROOT / "scripts" / "verify-ubuntu-nginx-http",
         ROOT / "scripts" / "verify-ubuntu-systemd-mounts",
+        ROOT / "scripts" / "verify-ubuntu-installed-nginx",
+        ROOT / "scripts" / "verify-ubuntu-postgresql-dependency",
+        ROOT / "scripts" / "verify-ubuntu-service-gate",
+        ROOT / "scripts" / "verify-ubuntu-config-boundaries",
+        ROOT / "scripts" / "verify-ubuntu-firewall-fixtures",
+        ROOT / "scripts" / "verify-ubuntu-trusted-inputs",
+        ROOT / "scripts" / "renew-ubuntu-tls",
+        ROOT / "scripts" / "check-ubuntu-tls-expiry",
     ]
     for script in scripts:
         require(os.access(script, os.X_OK), f"{script.name} is not executable")
         run(["bash", "-n", script])
     render = ROOT / "scripts" / "render-ubuntu-nginx"
-    require(os.access(render, os.X_OK), "renderer is not executable")
-    ast.parse(text(render), filename=str(render))
+    python_scripts = [
+        render, ROOT / "scripts" / "assert-ubuntu-files-endpoint",
+        ROOT / "scripts" / "validate-ubuntu-config",
+        ROOT / "scripts" / "render-ubuntu-postgresql-dependency",
+        ROOT / "scripts" / "verify-ubuntu-firewall",
+        ROOT / "scripts" / "capture-trusted-inputs",
+        ROOT / "scripts" / "check-ubuntu-services",
+    ]
+    for script in python_scripts:
+        require(os.access(script, os.X_OK), f"{script.name} is not executable")
+        ast.parse(text(script), filename=str(script))
 
     units = UBUNTU / "systemd"
     slice_text = text(units / "nmcp.slice")
@@ -55,14 +72,18 @@ def main() -> int:
         require("CPUQuota=" not in unit and "MemoryMax=" not in unit, f"{name} duplicates aggregate budget")
     require("NMCP_API_ADDR=127.0.0.1:8080" in text(UBUNTU / "env" / "api.env.example"), "API example is not loopback-only")
     require((units / "postgresql@.service.d" / "10-nmcp-slice.conf").is_file(), "PostgreSQL instance slice drop-in missing")
-    require(not list(UBUNTU.rglob("*.timer")), "timer shipped before application due/no-op interface")
+    timers = {path.name for path in UBUNTU.rglob("*.timer")}
+    require(timers == {"nmcp-tls-expiry.timer"}, "only independent TLS expiry monitoring may have a timer")
+    migrate_unit = text(units / "nmcp-migrate.service")
+    require("postgresql.service" not in migrate_unit, "migration still depends on PostgreSQL meta-unit")
 
     files_unit = text(units / "nmcp-files.service")
     for required in (
         "InaccessiblePaths=/var/lib/nmcp",
         "BindReadOnlyPaths=/var/lib/nmcp/media/originals:/srv/nmcp/originals",
         "BindReadOnlyPaths=/var/lib/nmcp/media/renditions:/srv/nmcp/renditions",
-        "LoadCredential=tls-key.pem:/etc/nmcp/tls-key.pem",
+        "LoadCredential=tls-key.pem:/etc/nmcp/tls-current/key.pem",
+        "ExecStartPre=/usr/sbin/nginx -t -c /etc/nmcp-nginx/nginx.conf",
         "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
     ):
         require(required in files_unit, f"Nginx boundary missing: {required}")
@@ -136,7 +157,10 @@ def main() -> int:
 
     analyzer = shutil.which("systemd-analyze")
     if analyzer:
-        unit_files = [units / "nmcp.slice", *sorted(units.glob("nmcp-*.service")), units / "nmcp.target"]
+        unit_files = [
+            units / "nmcp.slice", *sorted(units.glob("nmcp-*.service")),
+            *sorted(units.glob("nmcp-*.timer")), units / "nmcp.target"
+        ]
         environment = os.environ.copy()
         environment["SYSTEMD_UNIT_PATH"] = f"{units}:/usr/lib/systemd/system:/lib/systemd/system"
         result = subprocess.run(
@@ -149,7 +173,7 @@ def main() -> int:
             return (
                 "Command /opt/nmcp/current/bin/" in line
                 or "Command /usr/sbin/nginx is not executable:" in line
-                or ("Failed to create " in line and "Unit postgresql.service not found." in line)
+                or "Command /usr/local/libexec/nmcp/" in line
             )
         unexpected = [
             line for line in output.splitlines()

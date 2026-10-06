@@ -11,13 +11,15 @@ and Nginx. The worker currently performs lease reclamation only. It does not
 run transform jobs or `nmcp-still-helper` until issue #14 connects that runtime
 interface.
 
-No maintenance, backup, restore, cleanup service, or timer is installed. Issue
+No application maintenance, backup, restore, or cleanup service/timer is installed. Issue
 #19 has not yet defined the scheduled due/no-op command, exit codes, environment
 names, or database role. A timer that always runs the manual command would
 duplicate database policy and is unsafe. When #19 lands, a timer may only wake
 the application: due-time, last-success, retention, locking, and no-op decisions
 must remain database-backed application behavior. This is a fail-closed blocked
 boundary, not a claim that scheduled maintenance works.
+The independent `nmcp-tls-expiry.timer` only checks certificate lifetime; it
+does not encode or wake any database-backed application schedule.
 
 The repository does not contain a host's Tailnet IP, DNS name, certificate,
 ACL, firewall policy, mount device, or measured per-process resource split.
@@ -31,10 +33,12 @@ boundary.
 
 | Path | Owner/mode | Purpose |
 | --- | --- | --- |
-| `/opt/nmcp/releases/<id>` | `root:root`, not group/world writable | immutable release |
+| `/opt/nmcp/releases/<id>` | `root:root`; directories and `bin/*` 0755, other files 0644 | immutable runtime-readable release |
 | `/opt/nmcp/current` | root-owned atomic symlink | active release |
 | `/etc/nmcp/*.env` | `root:root 0600` | per-process environment; no CLI secrets |
-| `/etc/nmcp/tls-*.pem` | `root:root 0600` | Nginx systemd credentials |
+| `/etc/nmcp/tls-releases/<digest>/*.pem` | `root:root 0600` below 0700 parents | immutable Nginx credential generation |
+| `/etc/nmcp/tls-current` | root-owned atomic symlink | active certificate/key pair |
+| `/etc/nmcp-nginx/nginx.conf` | `root:root 0644` below 0755 parent | non-secret config readable by Nginx |
 | `/var/lib/nmcp/media` | `nmcp:nmcp 0700` | Core writable storage |
 | `/var/lib/nmcp/backups` | `nmcp:nmcp 0700` | reserved, never mounted into Nginx |
 | `/var/lib/nmcp/deployment` | `root:root 0700` | package and activation evidence |
@@ -53,7 +57,9 @@ credential directory. Nginx receives only `CAP_NET_BIND_SERVICE` for low ports.
    `infra/ubuntu/packages.txt`. Do not use `latest` as evidence: preserve
    `dpkg-query` package/version output with the deployment record.
 2. Provision PostgreSQL with a least-privilege application role and a database.
-   Keep PostgreSQL on a Unix socket or loopback; do not expose port 5432.
+   Keep PostgreSQL on literal loopback; do not expose port 5432. Record the
+   concrete Ubuntu cluster unit (for example `postgresql@16-main.service`); the
+   `postgresql.service` meta-unit is not an acceptable dependency.
 3. Mount the durable HDD at the operator-approved location before creating or
    bind-mounting `/var/lib/nmcp`. Confirm filesystem, capacity, boot-time mount
    ordering, and ownership. This repository cannot infer the block device.
@@ -69,6 +75,11 @@ Create separate files from `infra/ubuntu/env/*.example`. Replace every marker,
 use a random HMAC value of at least 32 bytes, and keep the API address exactly
 `127.0.0.1:8080`. `NMCP_FILE_BASE_URL` must name the separate File Server TLS
 listener and end in `/files/`.
+The three files and TLS inputs must be regular root-owned files below normalized,
+root-owned paths with no group/world-writable parent. The installer captures
+them through `O_NOFOLLOW` file descriptors before validation/copy, rejects
+duplicates or extra/missing environment keys, requires all DSNs to match and use
+literal loopback, and rejects wildcard API binds or a mismatched files-root URL.
 
 Render Nginx only with real Tailnet values:
 
@@ -85,8 +96,9 @@ IPv6 listens must use `[address]:port`. The renderer rejects wildcard,
 loopback, LAN, and non-Tailscale ranges, unresolved tokens, malformed hostnames,
 and a shared API/File endpoint.
 
-As root, install host assets and the first release using the scripts documented
-by `--help`:
+Complete the reviewed UFW procedure in the next section before installation.
+Then, as root, install host assets and the first release using the scripts
+documented by `--help`:
 
 ```sh
 sudo scripts/install-ubuntu-host \
@@ -94,16 +106,21 @@ sudo scripts/install-ubuntu-host \
   --api-listen "<TAILNET_IP>:<API_TLS_PORT>" \
   --files-listen "<TAILNET_IP>:<FILES_TLS_PORT>" \
   --tailnet-hostname "<HOSTNAME>" \
+  --postgresql-unit "postgresql@<VERSION>-<CLUSTER>.service" \
   --tls-cert /root/cert.pem --tls-key /root/key.pem
 sudo scripts/install-ubuntu-release stage /root/nmcp-release <RELEASE_ID>
 sudo scripts/install-ubuntu-release activate <RELEASE_ID>
 ```
 
-Activation verifies hashes and permissions, moves the active symlink atomically,
-runs migration, starts/restarts the units, waits for `/readyz`, and records the
-release. A failure before a completed migration restores the old link. A failure
-after migration does **not** automatically run old code against a potentially
-new schema.
+All stage/activate/rollback/host/TLS mutations share one nonblocking root-owned
+deployment lock. Staging requires an exact manifest and fixed runtime-safe modes,
+then proves the `nmcp` identity can traverse/read/execute the installed release.
+Activation stops the target, moves the active symlink atomically, starts the
+concrete PostgreSQL dependency and migration, and records success only after API
+readiness plus API, Worker, File Server, target, and concrete PostgreSQL remain
+active for five consecutive checks. A failure before a completed migration
+restores the old link. A failure after migration does **not** automatically run
+old code against a potentially new schema.
 
 Rollback is fail-closed:
 
@@ -120,8 +137,12 @@ during activation.
 ## Firewall and Tailnet checks
 
 Binding to the concrete Tailnet address is mandatory but does not replace ACLs
-or the host firewall. Adapt these commands to the approved firewall manager;
-do not flush an existing ruleset or risk the management session.
+or the host firewall. The installer is deliberately fail-closed on UFW: UFW must
+already be active, its default incoming policy must be deny, and its persisted
+rules must contain exactly the two interface+destination rules below with no
+broader rule for either port. Perform policy changes only from an approved
+console/change window. First inventory and preserve an explicit management/SSH
+allow; do not enable default deny from the only unprotected remote session.
 
 ```sh
 tailscale status
@@ -129,17 +150,42 @@ tailscale ip -4
 tailscale ip -6
 tailscale funnel status                 # must show no Funnel listener
 sudo ss -lntup                          # API direct only 127.0.0.1:8080
-sudo ufw status verbose                 # record existing policy first
+sudo ufw status verbose                 # record policy and management allows
+# Add/verify the approved management allow before changing the default.
+sudo ufw default deny incoming
 sudo ufw allow in on tailscale0 to <TAILNET_IP> port <API_TLS_PORT> proto tcp
 sudo ufw allow in on tailscale0 to <TAILNET_IP> port <FILES_TLS_PORT> proto tcp
+sudo ufw enable                         # only after console/management proof
+sudo scripts/verify-ubuntu-firewall --tailnet-ip <TAILNET_IP> \
+  --api-port <API_TLS_PORT> --files-port <FILES_TLS_PORT>
 ```
 
-If UFW is not the approved manager, encode the equivalent input-interface plus
-destination-address rules in the managed nftables/firewalld configuration.
+If UFW is not the approved manager, do not bypass the installer check. Extend
+and review the verifier/install contract for the managed nftables/firewalld
+policy in a separate change before deployment.
 Do not add wildcard `0.0.0.0`, `::`, LAN-interface, WAN-interface, or Funnel
 rules. From an authorized Tailnet client, both TLS listeners must work. From a
 LAN client with Tailscale disabled, both must fail. Run the latter from another
 machine: a local request is not evidence of a non-Tailnet denial.
+
+## TLS renewal and expiry
+
+`nmcp-tls-expiry.timer` checks daily and fails if the active certificate does
+not cover the recorded hostname or expires within seven days; monitor failed
+units/journal through the host's normal alerting. Obtain a new Tailnet
+certificate/key using the approved mechanism into trusted root-only paths, then:
+
+```sh
+sudo /usr/local/libexec/nmcp/renew-ubuntu-tls /root/new-cert.pem /root/new-key.pem
+sudo systemctl status nmcp-tls-expiry.service nmcp-files.service
+```
+
+Renewal validates hostname, pair, ownership/path, and seven-day lifetime; writes
+one immutable generation; atomically switches `tls-current`; and **restarts**
+Nginx so systemd `LoadCredential` is refreshed. If restart fails, it restores
+the previous generation and attempts to restart it. A config reload alone does
+not refresh systemd credentials. Retain the prior generation until verification
+and remove old generations only in a separately reviewed housekeeping step.
 
 ## Required verification and evidence
 
@@ -161,24 +207,51 @@ sudo systemd-analyze verify /etc/systemd/system/nmcp*.service \
 sudo systemctl is-enabled nmcp.target
 sudo systemctl --failed
 sudo systemctl show nmcp.slice -p CPUQuotaPerSecUSec -p MemoryMax
-sudo systemctl show postgresql@'*'.service nmcp-api.service nmcp-worker.service \
+sudo systemctl show "<CONCRETE_POSTGRESQL_UNIT>" nmcp-api.service nmcp-worker.service \
   nmcp-files.service -p Slice -p User -p Group
 sudo ss -lntup
-sudo stat -c '%U:%G %a %n' /etc/nmcp /etc/nmcp/*.env \
-  /etc/nmcp/tls-*.pem /var/lib/nmcp/media /var/lib/nmcp/backups
+sudo stat -c '%U:%G %a %n' /etc/nmcp /etc/nmcp/*.env /etc/nmcp-nginx \
+  /etc/nmcp-nginx/nginx.conf /etc/nmcp/tls-current \
+  /etc/nmcp/tls-current/*.pem /var/lib/nmcp/media /var/lib/nmcp/backups
 curl --fail --show-error http://127.0.0.1:8080/readyz
 ```
 
-Against the real File Server TLS URL, repeat the #36 matrix: GET; HEAD without a
-body; exact, open-ended, suffix, multi-range 206; unsatisfiable 416; conditional
-ETag 304; correct MIME; private immutable cache; and byte equality. Confirm 405
-for POST and 404/400 for directory listing, arbitrary name, backup/tmp paths,
-symlink, raw dot segment, encoded separator/dot, malformed escape, wrong shard,
-and noncanonical case. Verify Nginx cannot create, rename, or unlink in either
-bind mount. The repository validation environment supplies this complete HTTP
-assertion implementation; production evidence must use the real TLS endpoint.
+Prepare one small, dedicated Original and Rendition and a canonical-looking
+symlink to each in their respective storage trees. The symlinks must target the
+known objects; their IDs must differ from the target IDs, and the paths must
+otherwise match the production URL grammar. Preserve the fixture files used for
+byte comparison, then run the repository assertion client from an authorized
+Tailnet client:
 
-Stop/start each unit and PostgreSQL, and verify readiness becomes unavailable
+```sh
+scripts/assert-ubuntu-files-endpoint \
+  --base-url "https://<HOSTNAME>:<FILES_TLS_PORT>" \
+  --original-path "/files/originals/<SHARD>/<ORIGINAL_ID>/original.<EXT>" \
+  --original-file "<LOCAL_ORIGINAL_FIXTURE>" --original-mime "<ORIGINAL_MIME>" \
+  --original-symlink-path "/files/originals/<SHARD>/<SYMLINK_ORIGINAL_ID>/original.<EXT>" \
+  --rendition-path "/files/renditions/<SHARD>/<ORIGINAL_ID>/<RENDITION_ID>/<PROFILE_ID>.<EXT>" \
+  --rendition-file "<LOCAL_RENDITION_FIXTURE>" --rendition-mime "<RENDITION_MIME>" \
+  --rendition-symlink-path "/files/renditions/<SHARD>/<ORIGINAL_ID>/<SYMLINK_RENDITION_ID>/<PROFILE_ID>.<EXT>"
+```
+
+Use the DNS hostname covered by the certificate, not the Tailnet IP. Normal
+system trust is the default. For an approved private CA, append
+`--ca-file /path/to/ca-bundle.pem`. Never use `--insecure` against a real host;
+that switch exists only for the disposable self-signed launcher.
+
+The client independently checks Original and Rendition exact GET bytes;
+raw-socket body-free HEAD; exact, open-ended, suffix, and multipart ranges
+(including framing, per-part Content-Range, and payload); unsatisfiable 416;
+body-free ETag 304; MIME, cache, Accept-Ranges, and nosniff headers; POST denial;
+strict 403 symlink denial; and listing, arbitrary, non-public, noncanonical-case,
+wrong-shard, malformed-escape, encoded-separator, and raw/encoded normalized
+aliases to the existing object. Remove the dedicated symlinks after collecting
+evidence. Separately verify Nginx cannot create, rename, or unlink in either bind
+mount. `scripts/verify-ubuntu-nginx-http` runs this same client against a
+disposable self-signed instance; it is CI evidence for the template, not a
+substitute for running the command above against the real trusted endpoint.
+
+Stop/start each unit and the recorded concrete PostgreSQL instance, and verify readiness becomes unavailable
 then recovers. Send SIGTERM and confirm graceful shutdown within unit timeouts.
 Reboot only with explicit host approval, then confirm mount, PostgreSQL,
 migration, API, Worker, Nginx, and readiness ordering. If the real host,

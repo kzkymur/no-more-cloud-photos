@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+write_valid() {
+  cat > "$work/admin.env" <<'EOF'
+NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable
+NMCP_LOG_LEVEL=info
+NMCP_SHUTDOWN_TIMEOUT=30s
+EOF
+  cat > "$work/api.env" <<'EOF'
+NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable
+NMCP_STORAGE_ROOT=/var/lib/nmcp/media
+NMCP_FILE_BASE_URL=https://host.example.ts.net:9443/files/
+NMCP_CURSOR_HMAC_KEY=0123456789abcdef0123456789abcdef
+NMCP_API_ADDR=127.0.0.1:8080
+NMCP_LOG_LEVEL=info
+NMCP_SHUTDOWN_TIMEOUT=30s
+EOF
+  cat > "$work/worker.env" <<'EOF'
+NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable
+NMCP_STORAGE_ROOT=/var/lib/nmcp/media
+NMCP_LOG_LEVEL=info
+NMCP_SHUTDOWN_TIMEOUT=30s
+EOF
+}
+validate=("$script_dir/validate-ubuntu-config" --config-dir "$work" \
+  --tailnet-hostname host.example.ts.net --files-listen 100.64.0.10:9443)
+write_valid
+"${validate[@]}"
+
+write_valid
+/usr/bin/python3 - "$work/api.env" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1]); path.write_text(path.read_text().replace("127.0.0.1:8080", "0.0.0.0:8080"))
+PY
+if "${validate[@]}" >/dev/null 2>&1; then printf 'wildcard API bind was accepted\n' >&2; exit 1; fi
+
+write_valid
+printf 'NMCP_API_ADDR=127.0.0.1:8080\n' >> "$work/api.env"
+if "${validate[@]}" >/dev/null 2>&1; then printf 'duplicate environment key was accepted\n' >&2; exit 1; fi
+
+write_valid
+/usr/bin/python3 - "$work/api.env" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1]); path.write_text(path.read_text().replace(":9443/files/", ":9555/files/"))
+PY
+if "${validate[@]}" >/dev/null 2>&1; then printf 'mismatched File Server URL was accepted\n' >&2; exit 1; fi
+printf 'Ubuntu environment boundary counterexamples passed\n'

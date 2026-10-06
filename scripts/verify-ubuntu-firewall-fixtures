@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+cat > "$work/status" <<'EOF'
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+EOF
+cat > "$work/added" <<'EOF'
+Added user rules (see 'ufw status' for running firewall):
+ufw allow in on tailscale0 to 100.64.0.10 port 8443 proto tcp
+ufw allow in on tailscale0 to 100.64.0.10 port 9443 proto tcp
+EOF
+check=("$script_dir/verify-ubuntu-firewall" --tailnet-ip 100.64.0.10 \
+  --api-port 8443 --files-port 9443 --status-file "$work/status" --added-file "$work/added")
+"${check[@]}"
+/usr/bin/python3 - "$work/status" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1]); path.write_text(path.read_text().replace("Status: active", "Status: inactive"))
+PY
+if "${check[@]}" >/dev/null 2>&1; then printf 'inactive firewall was accepted\n' >&2; exit 1; fi
+sed_status='Status: active
+Default: allow (incoming), allow (outgoing), disabled (routed)'
+printf '%s\n' "$sed_status" > "$work/status"
+if "${check[@]}" >/dev/null 2>&1; then printf 'default-allow firewall was accepted\n' >&2; exit 1; fi
+cat > "$work/status" <<'EOF'
+Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+EOF
+printf 'ufw allow 9443/tcp\n' >> "$work/added"
+if "${check[@]}" >/dev/null 2>&1; then printf 'broader port allow was accepted\n' >&2; exit 1; fi
+printf 'Ubuntu firewall fail-closed fixture counterexamples passed\n'

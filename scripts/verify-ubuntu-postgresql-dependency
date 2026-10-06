@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-postgresql-dependency: must run as root\n' >&2; exit 1; }
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+unit=postgresql@nmcp-test.service
+migrate=nmcp-postgresql-dependency-test.service
+marker=/run/nmcp-postgresql-dependency.marker
+cleanup() {
+  /usr/bin/systemctl stop "$migrate" "$unit" >/dev/null 2>&1 || true
+  /usr/bin/rm -rf -- "/run/systemd/system/$migrate" "/run/systemd/system/$migrate.d" \
+    /run/systemd/system/postgresql@nmcp-test.service "$marker"
+  /usr/bin/rm -f "/run/nmcp-invalid-postgresql-dependency.$$"
+  /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+if "$script_dir/render-ubuntu-postgresql-dependency" --unit postgresql.service \
+  --output "/run/nmcp-invalid-postgresql-dependency.$$" >/dev/null 2>&1; then
+  printf 'PostgreSQL meta-unit was accepted as a concrete dependency\n' >&2; exit 1
+fi
+
+cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
+[Unit]
+Description=Disposable concrete PostgreSQL cluster
+[Service]
+Type=simple
+ExecStart=/usr/bin/sleep infinity
+EOF
+cat > "/run/systemd/system/$migrate" <<EOF
+[Unit]
+Description=Disposable migration dependency probe
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/touch $marker
+EOF
+/usr/bin/install -d -o root -g root -m 0755 "/run/systemd/system/$migrate.d"
+"$script_dir/render-ubuntu-postgresql-dependency" --unit "$unit" \
+  --output "/run/systemd/system/$migrate.d/10-postgresql.conf"
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl stop "$unit"
+[[ $(/usr/bin/systemctl is-active "$unit") == inactive ]]
+/usr/bin/systemctl start "$migrate"
+/usr/bin/systemctl is-active --quiet "$unit"
+[[ -f $marker ]]
+
+# A stopped real instance must be recovered again on a later migration run.
+/usr/bin/systemctl stop "$migrate" "$unit"
+/usr/bin/rm -f "$marker"
+/usr/bin/systemctl start "$migrate"
+/usr/bin/systemctl is-active --quiet "$unit"
+[[ -f $marker ]]
+printf 'Concrete stopped PostgreSQL dependency recovery passed\n'

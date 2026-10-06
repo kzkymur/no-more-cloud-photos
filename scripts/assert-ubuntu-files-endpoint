@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Assert the production File Server contract against an HTTPS endpoint."""
+
+import argparse
+import pathlib
+import socket
+import ssl
+import sys
+import urllib.parse
+
+
+class AssertionFailure(RuntimeError):
+    pass
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionFailure(message)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", required=True, help="HTTPS origin, without a path")
+    parser.add_argument("--original-path", required=True, help="canonical /files/originals/... path")
+    parser.add_argument("--original-file", required=True, type=pathlib.Path)
+    parser.add_argument("--original-mime", required=True)
+    parser.add_argument("--original-symlink-path", required=True)
+    parser.add_argument("--rendition-path", required=True, help="canonical /files/renditions/... path")
+    parser.add_argument("--rendition-file", required=True, type=pathlib.Path)
+    parser.add_argument("--rendition-mime", required=True)
+    parser.add_argument("--rendition-symlink-path", required=True)
+    trust = parser.add_mutually_exclusive_group()
+    trust.add_argument("--ca-file", type=pathlib.Path, help="trusted CA bundle")
+    trust.add_argument(
+        "--insecure",
+        action="store_true",
+        help="disable certificate verification (disposable self-signed tests only)",
+    )
+    parser.add_argument("--timeout", type=float, default=10.0)
+    return parser.parse_args()
+
+
+class Endpoint:
+    def __init__(self, base_url: str, ca_file: pathlib.Path | None, insecure: bool, timeout: float):
+        parsed = urllib.parse.urlsplit(base_url)
+        require(parsed.scheme == "https", "--base-url must use https")
+        require(bool(parsed.hostname), "--base-url must include a hostname")
+        require(not parsed.username and not parsed.password, "--base-url must not include credentials")
+        require(parsed.path in ("", "/") and not parsed.query and not parsed.fragment,
+                "--base-url must contain only an HTTPS origin")
+        self.host = parsed.hostname
+        self.port = parsed.port or 443
+        self.host_header = parsed.netloc
+        self.timeout = timeout
+        if insecure:
+            self.context = ssl.create_default_context()
+            self.context.check_hostname = False
+            self.context.verify_mode = ssl.CERT_NONE
+        else:
+            self.context = ssl.create_default_context(cafile=str(ca_file) if ca_file else None)
+
+    def request(self, method: str, path: str, headers: dict[str, str] | None = None):
+        require(path.startswith("/") and "\r" not in path and "\n" not in path,
+                f"invalid request path: {path!r}")
+        request_headers = {
+            "Host": self.host_header,
+            "Connection": "close",
+            "User-Agent": "nmcp-files-endpoint-assertion/1",
+        }
+        request_headers.update(headers or {})
+        lines = [f"{method} {path} HTTP/1.1", *(f"{key}: {value}" for key, value in request_headers.items()), "", ""]
+        wire_request = "\r\n".join(lines).encode("ascii")
+
+        with socket.create_connection((self.host, self.port), self.timeout) as plain:
+            with self.context.wrap_socket(plain, server_hostname=self.host) as connection:
+                connection.settimeout(self.timeout)
+                connection.sendall(wire_request)
+                chunks = []
+                while True:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+        response = b"".join(chunks)
+        head, separator, body = response.partition(b"\r\n\r\n")
+        require(bool(separator), f"{method} {path}: malformed HTTP response")
+        lines = head.split(b"\r\n")
+        try:
+            protocol, raw_status, _reason = lines[0].decode("ascii").split(" ", 2)
+            status = int(raw_status)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise AssertionFailure(f"{method} {path}: malformed status line") from error
+        require(protocol in ("HTTP/1.0", "HTTP/1.1"), f"{method} {path}: unexpected protocol {protocol}")
+        parsed_headers: dict[str, list[str]] = {}
+        for line in lines[1:]:
+            name, delimiter, value = line.partition(b":")
+            require(bool(delimiter), f"{method} {path}: malformed response header")
+            try:
+                key = name.decode("ascii").strip().lower()
+                text = value.decode("latin-1").strip()
+            except UnicodeDecodeError as error:
+                raise AssertionFailure(f"{method} {path}: malformed response header") from error
+            parsed_headers.setdefault(key, []).append(text)
+        return status, parsed_headers, body
+
+
+def one_header(headers: dict[str, list[str]], name: str, label: str) -> str:
+    values = headers.get(name.lower(), [])
+    require(len(values) == 1, f"{label}: expected exactly one {name} header, got {values!r}")
+    return values[0]
+
+
+def assert_status(actual: int, expected: int, label: str) -> None:
+    require(actual == expected, f"{label}: returned {actual}, expected {expected}")
+
+
+def assert_object_headers(headers: dict[str, list[str]], mime: str, label: str) -> None:
+    require(one_header(headers, "Content-Type", label).split(";", 1)[0].lower() == mime.lower(),
+            f"{label}: incorrect Content-Type")
+    require(one_header(headers, "Accept-Ranges", label).lower() == "bytes",
+            f"{label}: incorrect Accept-Ranges")
+    require(one_header(headers, "Cache-Control", label).lower() ==
+            "private, max-age=31536000, immutable", f"{label}: incorrect Cache-Control")
+    require(one_header(headers, "X-Content-Type-Options", label).lower() == "nosniff",
+            f"{label}: incorrect X-Content-Type-Options")
+
+
+def parse_multipart(body: bytes, content_type: str, mime: str, expected, label: str) -> None:
+    media_type, separator, parameters = content_type.partition(";")
+    require(media_type.strip().lower() == "multipart/byteranges" and separator,
+            f"{label}: response is not multipart/byteranges")
+    parameter_parts = [part.strip() for part in parameters.split(";")]
+    boundaries = [part.split("=", 1)[1].strip() for part in parameter_parts
+                  if part.lower().startswith("boundary=")]
+    require(len(boundaries) == 1, f"{label}: missing or duplicate multipart boundary")
+    boundary = boundaries[0]
+    if len(boundary) >= 2 and boundary[0] == boundary[-1] == '"':
+        boundary = boundary[1:-1]
+    require(boundary and all(character not in boundary for character in "\r\n"),
+            f"{label}: invalid multipart boundary")
+    delimiter = b"--" + boundary.encode("ascii")
+    # Nginx deliberately emits one CRLF preamble before the first delimiter.
+    require(body.startswith(b"\r\n" + delimiter + b"\r\n"),
+            f"{label}: malformed opening boundary/preamble")
+
+    position = 2
+    parts = []
+    while True:
+        require(body.startswith(delimiter, position), f"{label}: malformed boundary framing")
+        position += len(delimiter)
+        if body.startswith(b"--\r\n", position):
+            position += 4
+            require(position == len(body), f"{label}: multipart epilogue is not allowed")
+            break
+        require(body.startswith(b"\r\n", position), f"{label}: boundary lacks CRLF")
+        position += 2
+        header_end = body.find(b"\r\n\r\n", position)
+        require(header_end >= 0, f"{label}: multipart part lacks header terminator")
+        raw_headers = body[position:header_end].split(b"\r\n")
+        part_headers: dict[str, str] = {}
+        for line in raw_headers:
+            name, colon, value = line.partition(b":")
+            require(bool(colon), f"{label}: malformed multipart header")
+            key = name.decode("ascii").strip().lower()
+            require(key not in part_headers, f"{label}: duplicate multipart {key} header")
+            part_headers[key] = value.decode("latin-1").strip()
+        position = header_end + 4
+        next_boundary = body.find(b"\r\n" + delimiter, position)
+        require(next_boundary >= 0, f"{label}: multipart part lacks closing CRLF")
+        parts.append((part_headers, body[position:next_boundary]))
+        position = next_boundary + 2
+
+    require(len(parts) == len(expected), f"{label}: got {len(parts)} parts, expected {len(expected)}")
+    for index, ((headers, payload), (content_range, expected_payload)) in enumerate(zip(parts, expected), 1):
+        require(set(headers) == {"content-type", "content-range"},
+                f"{label} part {index}: unexpected headers {sorted(headers)}")
+        require(headers["content-range"].lower() == content_range,
+                f"{label} part {index}: incorrect Content-Range")
+        require(headers["content-type"].split(";", 1)[0].lower() == mime.lower(),
+                f"{label} part {index}: incorrect Content-Type")
+        require(payload == expected_payload, f"{label} part {index}: incorrect payload")
+
+
+def rejection_paths(path: str):
+    segments = path.split("/")
+    require(len(segments) >= 6 and segments[1] == "files", f"not a canonical file path: {path}")
+    parent, filename = path.rsplit("/", 1)
+    wrong_shard = "00" if segments[3] != "00" else "ff"
+    wrong = segments.copy()
+    wrong[3] = wrong_shard
+    case_changed = segments.copy()
+    case_changed[4] = case_changed[4].upper()
+    return {
+        "listing": parent + "/",
+        "arbitrary name": parent + "/arbitrary.invalid",
+        "wrong shard": "/".join(wrong),
+        "noncanonical case": "/".join(case_changed),
+        "raw normalized alias": parent + "/unused/../" + filename,
+        "encoded normalized alias": parent + "/unused/%2e%2e/" + filename,
+        "encoded separator alias": parent + "%2f" + filename,
+        "malformed escape": path + "%ZZ",
+    }
+
+
+def assert_file(endpoint: Endpoint, kind: str, path: str, fixture: bytes, mime: str, symlink_path: str) -> None:
+    label = f"{kind} GET"
+    require(len(fixture) >= 8, f"{kind} fixture must contain at least 8 bytes")
+    status, headers, body = endpoint.request("GET", path)
+    assert_status(status, 200, label)
+    require(body == fixture, f"{label}: response bytes differ from fixture")
+    assert_object_headers(headers, mime, label)
+    require(int(one_header(headers, "Content-Length", label)) == len(fixture),
+            f"{label}: incorrect Content-Length")
+    etag = one_header(headers, "ETag", label)
+
+    status, head_headers, body = endpoint.request("HEAD", path)
+    assert_status(status, 200, f"{kind} HEAD")
+    require(body == b"", f"{kind} HEAD: received {len(body)} response-body octets")
+    assert_object_headers(head_headers, mime, f"{kind} HEAD")
+    require(int(one_header(head_headers, "Content-Length", f"{kind} HEAD")) == len(fixture),
+            f"{kind} HEAD: incorrect Content-Length")
+
+    range_cases = (
+        ("0-3", 0, 3, fixture[0:4], "exact"),
+        ("4-", 4, len(fixture) - 1, fixture[4:], "open"),
+        ("-4", len(fixture) - 4, len(fixture) - 1, fixture[-4:], "suffix"),
+    )
+    for requested, first, last, expected_body, range_name in range_cases:
+        range_label = f"{kind} {range_name} range"
+        status, range_headers, body = endpoint.request("GET", path, {"Range": f"bytes={requested}"})
+        assert_status(status, 206, range_label)
+        require(body == expected_body, f"{range_label}: incorrect payload")
+        assert_object_headers(range_headers, mime, range_label)
+        require(one_header(range_headers, "Content-Range", range_label).lower() ==
+                f"bytes {first}-{last}/{len(fixture)}", f"{range_label}: incorrect Content-Range")
+
+    status, multi_headers, body = endpoint.request("GET", path, {"Range": "bytes=0-1,4-5"})
+    assert_status(status, 206, f"{kind} multi-range")
+    parse_multipart(
+        body,
+        one_header(multi_headers, "Content-Type", f"{kind} multi-range"),
+        mime,
+        (
+            (f"bytes 0-1/{len(fixture)}", fixture[0:2]),
+            (f"bytes 4-5/{len(fixture)}", fixture[4:6]),
+        ),
+        f"{kind} multi-range",
+    )
+
+    status, unsatisfied_headers, _body = endpoint.request(
+        "GET", path, {"Range": f"bytes={len(fixture) + 10}-"}
+    )
+    assert_status(status, 416, f"{kind} unsatisfiable range")
+    require(one_header(unsatisfied_headers, "Content-Range", f"{kind} unsatisfiable range").lower() ==
+            f"bytes */{len(fixture)}", f"{kind} 416: incorrect Content-Range")
+    require(one_header(unsatisfied_headers, "Accept-Ranges", f"{kind} unsatisfiable range").lower() == "bytes",
+            f"{kind} 416: incorrect Accept-Ranges")
+    require(one_header(unsatisfied_headers, "Cache-Control", f"{kind} unsatisfiable range").lower() ==
+            "private, max-age=31536000, immutable", f"{kind} 416: incorrect Cache-Control")
+    require(one_header(unsatisfied_headers, "X-Content-Type-Options", f"{kind} unsatisfiable range").lower() ==
+            "nosniff", f"{kind} 416: incorrect nosniff header")
+
+    status, conditional_headers, body = endpoint.request("GET", path, {"If-None-Match": etag})
+    assert_status(status, 304, f"{kind} conditional GET")
+    require(body == b"", f"{kind} 304: received {len(body)} response-body octets")
+    require(one_header(conditional_headers, "Cache-Control", f"{kind} conditional GET").lower() ==
+            "private, max-age=31536000, immutable", f"{kind} 304: incorrect Cache-Control")
+    require(one_header(conditional_headers, "X-Content-Type-Options", f"{kind} conditional GET").lower() ==
+            "nosniff", f"{kind} 304: incorrect nosniff header")
+
+    status, _headers, _body = endpoint.request("POST", path, {"Content-Length": "0"})
+    assert_status(status, 405, f"{kind} method denial")
+    status, _headers, _body = endpoint.request("GET", symlink_path)
+    assert_status(status, 403, f"{kind} symlink denial")
+
+    for rejection, rejected_path in rejection_paths(path).items():
+        status, _headers, _body = endpoint.request("GET", rejected_path)
+        expected = 400 if rejection in (
+            "raw normalized alias", "encoded normalized alias", "encoded separator alias", "malformed escape"
+        ) else 404
+        assert_status(status, expected, f"{kind} {rejection}")
+
+    for rejected_path in ("/files/backups/database.dump", "/files/tmp/upload.part", "/arbitrary"):
+        status, _headers, _body = endpoint.request("GET", rejected_path)
+        assert_status(status, 404, f"{kind} non-public path {rejected_path}")
+
+
+def validated_path(path: str, prefix: str, option: str) -> str:
+    require(path.startswith(prefix) and path.count("?") == 0 and path.count("#") == 0,
+            f"{option} must be a path below {prefix}")
+    require("%" not in path and "/./" not in path and "/../" not in path and "//" not in path,
+            f"{option} must be canonical")
+    return path
+
+
+def main() -> int:
+    args = parse_args()
+    endpoint = Endpoint(args.base_url, args.ca_file, args.insecure, args.timeout)
+    original_path = validated_path(args.original_path, "/files/originals/", "--original-path")
+    rendition_path = validated_path(args.rendition_path, "/files/renditions/", "--rendition-path")
+    original_symlink = validated_path(
+        args.original_symlink_path, "/files/originals/", "--original-symlink-path"
+    )
+    rendition_symlink = validated_path(
+        args.rendition_symlink_path, "/files/renditions/", "--rendition-symlink-path"
+    )
+    original_fixture = args.original_file.read_bytes()
+    rendition_fixture = args.rendition_file.read_bytes()
+    assert_file(endpoint, "Original", original_path, original_fixture, args.original_mime, original_symlink)
+    assert_file(endpoint, "Rendition", rendition_path, rendition_fixture, args.rendition_mime, rendition_symlink)
+    print("Ubuntu production File Server endpoint assertions passed")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (AssertionFailure, OSError, ssl.SSLError, UnicodeError, ValueError) as error:
+        print(f"assert-ubuntu-files-endpoint: {error}", file=sys.stderr)
+        sys.exit(1)

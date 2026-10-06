@@ -52,10 +52,14 @@ mkdir -p "$original_dir" "$rendition_dir"
 printf '0123456789abcdef' > "$original_dir/original.jpg"
 printf 'webp-fixture' > "$rendition_dir/$profile_id.webp"
 
-# A canonical-looking symlink must not be served.
-symlink_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab
-mkdir -p "$work/media/originals/aa/$symlink_id"
-ln -s "$original_dir/original.jpg" "$work/media/originals/aa/$symlink_id/original.jpg"
+# Canonical-looking symlinks in both public trees must receive the strict denial.
+symlink_original_id=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab
+symlink_rendition_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc
+mkdir -p "$work/media/originals/aa/$symlink_original_id"
+mkdir -p "$work/media/renditions/aa/$original_id/$symlink_rendition_id"
+ln -s "$original_dir/original.jpg" "$work/media/originals/aa/$symlink_original_id/original.jpg"
+ln -s "$rendition_dir/$profile_id.webp" \
+  "$work/media/renditions/aa/$original_id/$symlink_rendition_id/$profile_id.webp"
 
 nginx -t -c "$work/nginx.conf"
 nginx -c "$work/nginx.conf" -g 'daemon off;' >"$work/nginx.stdout" 2>"$work/nginx.stderr" &
@@ -67,85 +71,13 @@ for attempt in {1..30}; do
   sleep 0.2
 done
 
-url=$base/files/originals/aa/$original_id/original.jpg
-headers=$work/headers
-body=$work/body
-status=$(curl --noproxy '*' --insecure --silent --show-error -D "$headers" -o "$body" -w '%{http_code}' "$url")
-[[ $status == 200 ]] && cmp -s "$body" "$original_dir/original.jpg"
-python3 - "$headers" <<'PY'
-import pathlib, sys
-headers = pathlib.Path(sys.argv[1]).read_text().lower()
-for expected in (
-    "content-type: image/jpeg", "accept-ranges: bytes",
-    "cache-control: private, max-age=31536000, immutable",
-    "x-content-type-options: nosniff",
-):
-    if expected not in headers:
-        raise SystemExit(f"missing header: {expected}")
-PY
+"$repo_root/scripts/assert-ubuntu-files-endpoint" \
+  --base-url "$base" --insecure \
+  --original-path "/files/originals/aa/$original_id/original.jpg" \
+  --original-file "$original_dir/original.jpg" --original-mime image/jpeg \
+  --original-symlink-path "/files/originals/aa/$symlink_original_id/original.jpg" \
+  --rendition-path "/files/renditions/aa/$original_id/$rendition_id/$profile_id.webp" \
+  --rendition-file "$rendition_dir/$profile_id.webp" --rendition-mime image/webp \
+  --rendition-symlink-path "/files/renditions/aa/$original_id/$symlink_rendition_id/$profile_id.webp"
 
-status=$(curl --noproxy '*' --insecure --silent --show-error --head -o "$headers" -w '%{http_code}' "$url")
-[[ $status == 200 ]]
-
-range_case() {
-  local range=$1 expected_status=$2 expected_body=${3-}
-  local actual
-  actual=$(curl --noproxy '*' --insecure --silent --show-error -H "Range: bytes=$range" \
-    -D "$headers" -o "$body" -w '%{http_code}' "$url")
-  [[ $actual == "$expected_status" ]] || { printf 'range %s returned %s\n' "$range" "$actual" >&2; return 1; }
-  if [[ -n $expected_body ]]; then [[ $(<"$body") == "$expected_body" ]]; fi
-}
-range_case 0-3 206 0123
-range_case 4- 206 456789abcdef
-range_case -4 206 cdef
-range_case 0-1,4-5 206
-range_case 99- 416
-python3 - "$headers" <<'PY'
-import pathlib, sys
-if "content-range: bytes */16" not in pathlib.Path(sys.argv[1]).read_text().lower():
-    raise SystemExit("416 response lacks the unsatisfied Content-Range")
-PY
-
-etag=$(python3 - "$url" <<'PY'
-import subprocess, sys
-result = subprocess.run(["curl", "--noproxy", "*", "--insecure", "--silent", "--head", sys.argv[1]], check=True, capture_output=True, text=True)
-for line in result.stdout.splitlines():
-    if line.lower().startswith("etag:"):
-        print(line.split(":", 1)[1].strip()); break
-else:
-    raise SystemExit("ETag missing")
-PY
-)
-status=$(curl --noproxy '*' --insecure --silent -H "If-None-Match: $etag" -o "$body" -w '%{http_code}' "$url")
-[[ $status == 304 ]]
-
-assert_status() {
-  local expected=$1 request_url=$2; shift 2
-  local actual
-  actual=$(curl --noproxy '*' --path-as-is --insecure --silent -o /dev/null -w '%{http_code}' "$@" "$request_url")
-  [[ $actual == "$expected" ]] || { printf '%s returned %s, expected %s\n' "$request_url" "$actual" "$expected" >&2; return 1; }
-}
-assert_status 405 "$url" -X POST
-assert_status 404 "$base/files/originals/aa/$original_id/"
-assert_status 404 "$base/files/originals/aa/$original_id/arbitrary.jpg"
-assert_status 404 "$base/files/backups/database.dump"
-assert_status 400 "$base/files/originals/../renditions/file.webp"
-assert_status 400 "$base/files/originals/%2e%2e/renditions/file.webp"
-assert_status 400 "$base/files/originals/%2Fetc/passwd"
-assert_status 400 "$base/files/originals/%ZZ"
-assert_status 404 "$base/files/originals/ab/$original_id/original.jpg"
-assert_status 404 "$base/files/originals/aa/${original_id^^}/original.jpg"
-symlink_status=$(curl --noproxy '*' --insecure --silent -o /dev/null -w '%{http_code}' \
-  "$base/files/originals/aa/$symlink_id/original.jpg")
-[[ $symlink_status != 200 ]]
-
-rendition_url=$base/files/renditions/aa/$original_id/$rendition_id/$profile_id.webp
-status=$(curl --noproxy '*' --insecure --silent -D "$headers" -o "$body" -w '%{http_code}' "$rendition_url")
-[[ $status == 200 && $(<"$body") == webp-fixture ]]
-python3 - "$headers" <<'PY'
-import pathlib, sys
-if "content-type: image/webp" not in pathlib.Path(sys.argv[1]).read_text().lower():
-    raise SystemExit("rendition MIME mismatch")
-PY
-
-printf 'Ubuntu production Nginx HTTP verification passed\n'
+printf 'Ubuntu disposable production Nginx HTTP verification passed\n'
