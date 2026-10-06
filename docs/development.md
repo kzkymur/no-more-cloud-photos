@@ -20,9 +20,13 @@
   address-space limit. CI downloads the immutable named archives, verifies
   their documented SHA-256 digests before extraction, and records all tool
   versions in each run. The Ubuntu 24.04 CI image supplies `prlimit`; issue #20
-  must pin the production image digest (and therefore its exact util-linux
-  patch version) and verify these absolute executable paths:
+  pins the production platform contract and verifies these absolute executable paths:
   `/usr/bin/exiftool`, `/usr/bin/ffprobe`, and `/usr/bin/prlimit`.
+
+The isolated validation image builds the still, animation, and video helpers in
+that order into one pinned `/opt/nmcp` prefix. This proves the shared codec
+closure used by the Worker validation lane; issue #21 separately owns packaging
+and rollback proof for the production release artifact.
 
 The repository sets `go 1.27.0` as its language/toolchain floor while CI pins
 the security patch release `1.27.1`. Set `GOTOOLCHAIN=local` so an unexpected
@@ -69,6 +73,12 @@ transactional migrations, non-transactional execution, and recovery.
 | `NMCP_DATABASE_URL` | required | required | required | PostgreSQL DSN; secret, never logged. |
 | `NMCP_STORAGE_ROOT` | required | required | - | Absolute clean path; never logged. |
 | `NMCP_FILE_BASE_URL` | required | required | - | Absolute HTTPS File Server files root with a non-root path, e.g. `https://photos.example.ts.net/files`; trailing slash is normalized. Core appends the canonical storage key directly and never inserts `/files`. No credentials, query, fragment, dot/empty segments, or encoded path ambiguity. |
+| `NMCP_STILL_HELPER_PATH` | - | required | - | Clean absolute path to the trusted still/RAW protocol-v1 helper. |
+| `NMCP_ANIMATION_HELPER_PATH` | - | required | - | Clean absolute path to the trusted animation protocol-v1 helper. |
+| `NMCP_VIDEO_HELPER_PATH` | - | required | - | Clean absolute path to the trusted video protocol-v1 helper. |
+| `NMCP_PRLIMIT_PATH` | - | required | - | Clean absolute path to the trusted `prlimit` executable used by the process supervisor. |
+| `NMCP_SRGB_ICC_PATH` | - | required | - | Clean absolute path to the pinned sRGB2014 ICC profile. |
+| `NMCP_SRGB_ICC_SHA256` | - | required | - | Must equal the pinned sRGB2014 digest `384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a`. |
 | `NMCP_CURSOR_HMAC_KEY` | required | - | - | At least 32 bytes; secret, never logged. |
 | `NMCP_API_ADDR` | optional | - | - | `127.0.0.1:8080`; explicit host and valid port. |
 | `NMCP_LOG_LEVEL` | optional | optional | optional | `info`; one of `debug`, `info`, `warn`, `error`. |
@@ -79,7 +89,9 @@ API `GET /healthz` checks only the process handler. `GET /readyz` checks the
 database, migration currency/checksums, and the shared storage probe. The probe
 uses exclusive create, write, file sync, no-replace rename, directory sync,
 unlink, and deletion-directory sync beneath the pinned non-symlink root. Worker
-startup uses the same probe. Dependency failures return only the stable
+startup uses the same probe, verifies the pinned ICC, and completes all three
+processor capability handshakes before it can report ready or claim a transform
+job. Dependency failures return only the stable
 `unavailable` error and do not expose DSNs, paths, or SQL details.
 
 For example, with `NMCP_FILE_BASE_URL=https://photos.example.ts.net/files`,

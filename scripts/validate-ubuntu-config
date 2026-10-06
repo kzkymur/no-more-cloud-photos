@@ -18,7 +18,9 @@ EXPECTED = {
     },
     "worker.env": {
         "NMCP_DATABASE_URL", "NMCP_STORAGE_ROOT", "NMCP_FILE_BASE_URL", "NMCP_LOG_LEVEL",
-        "NMCP_SHUTDOWN_TIMEOUT",
+        "NMCP_SHUTDOWN_TIMEOUT", "NMCP_STILL_HELPER_PATH", "NMCP_ANIMATION_HELPER_PATH",
+        "NMCP_VIDEO_HELPER_PATH", "NMCP_PRLIMIT_PATH", "NMCP_SRGB_ICC_PATH",
+        "NMCP_SRGB_ICC_SHA256",
     },
 }
 ASSIGNMENT = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
@@ -133,6 +135,17 @@ def main() -> int:
         fail("NMCP_FILE_BASE_URL must be the configured Tailnet File Server HTTPS /files/ root")
     if worker["NMCP_FILE_BASE_URL"] != api["NMCP_FILE_BASE_URL"]:
         fail("API and Worker must use the same NMCP_FILE_BASE_URL")
+    required_worker_runtime = {
+        "NMCP_STILL_HELPER_PATH": "/opt/nmcp/current/bin/nmcp-still-helper",
+        "NMCP_ANIMATION_HELPER_PATH": "/opt/nmcp/current/bin/nmcp-animation-helper",
+        "NMCP_VIDEO_HELPER_PATH": "/opt/nmcp/current/bin/nmcp-video-helper",
+        "NMCP_PRLIMIT_PATH": "/usr/bin/prlimit",
+        "NMCP_SRGB_ICC_PATH": "/opt/nmcp/current/share/sRGB2014.icc",
+        "NMCP_SRGB_ICC_SHA256": "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a",
+    }
+    for key, expected in required_worker_runtime.items():
+        if worker[key] != expected:
+            fail(f"{key} must be exactly {expected}")
     print("Ubuntu production environment configuration validated")
     return 0
 
