@@ -316,6 +316,10 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	extension := "mp4"
 	if r.Kind == "first-frame-avif" {
 		extension = "avif"
+		// A still rendition has no playback duration. The verifier may report
+		// the source timeline while cross-checking its selected first frame;
+		// do not persist that source duration as an AVIF output fact.
+		outputDurationUS = 0
 	}
 	return Result{Kind: r.Kind, OutputMIME: r.OutputMIME, OutputExtension: extension, Width: r.Width, Height: r.Height,
 		MaxLongEdge: r.MaxLongEdge, Threads: r.Threads, CRF: r.CRF, Quality: r.Quality, BitDepth: r.BitDepth,
