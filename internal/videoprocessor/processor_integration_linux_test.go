@@ -49,7 +49,7 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 		wantHDR                                                        bool
 	}{
 		{"avc odd audio", "TEST_VIDEO_AVC_PATH", "video/mp4", "h264", true, 0, 0, 1, 320, 180, 321, 181, 44100, false},
-		{"hevc rotated no audio", "TEST_VIDEO_HEVC_ROTATED_PATH", "video/quicktime", "hevc", false, 90, 0, -1, 64, 96, 64, 96, 0, false},
+		{"hevc rotated no audio", "TEST_VIDEO_HEVC_ROTATED_PATH", "video/quicktime", "hevc", false, 90, 0, -1, 96, 128, 96, 128, 0, false},
 		{"pq hdr", "TEST_VIDEO_PQ_PATH", "video/mp4", "hevc", false, 0, 0, -1, 320, 180, 320, 180, 0, true},
 		{"hlg hdr", "TEST_VIDEO_HLG_PATH", "video/mp4", "hevc", false, 0, 0, -1, 320, 180, 320, 180, 0, true},
 		{"multiple streams", "TEST_VIDEO_MULTISTREAM_PATH", "video/mp4", "h264", true, 0, 0, 2, 64, 48, 64, 48, 48000, false},

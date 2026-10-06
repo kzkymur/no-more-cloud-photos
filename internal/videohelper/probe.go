@@ -20,7 +20,10 @@ import (
 
 type probeDocument struct {
 	Streams []probeStream `json:"streams"`
-	Format  struct {
+	Frames  []struct {
+		SideDataList []map[string]interface{} `json:"side_data_list"`
+	} `json:"frames"`
+	Format struct {
 		FormatName string `json:"format_name"`
 	} `json:"format"`
 }
@@ -66,7 +69,7 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 	if !oneOf(mime, "video/mp4", "video/quicktime") {
 		return inspection{}, nil, fail("unsupported_input")
 	}
-	stdout, _, err := e.run.run(e.ffprobe, []string{"-v", "error", "-threads", "1", "-show_format", "-show_streams", "-of", "json", path}, 1<<20)
+	stdout, _, err := e.run.run(e.ffprobe, []string{"-v", "error", "-threads", "1", "-read_intervals", "%+#1", "-show_format", "-show_streams", "-show_frames", "-show_entries", "stream:format:frame=side_data_list", "-of", "json", path}, 1<<20)
 	if err != nil {
 		return inspection{}, nil, fail("decode_failed")
 	}
@@ -120,7 +123,11 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 	if err != nil || timeBase.Numerator <= 0 {
 		return inspection{}, nil, fail("unsupported_input")
 	}
-	primaries, transfer, matrix, colorRange, hdr, peak, mastering, maxCLL, err := classifyColor(video)
+	var frameSideData []map[string]interface{}
+	if len(document.Frames) > 0 {
+		frameSideData = document.Frames[0].SideDataList
+	}
+	primaries, transfer, matrix, colorRange, hdr, peak, mastering, maxCLL, err := classifyColor(video, frameSideData)
 	if err != nil {
 		return inspection{}, nil, err
 	}
@@ -340,7 +347,7 @@ func exactRotation(value int) (int, bool) {
 	return value, value == 0 || value == 90 || value == 180 || value == 270
 }
 
-func classifyColor(stream probeStream) (string, string, string, string, bool, int, int, int, error) {
+func classifyColor(stream probeStream, frameSideData []map[string]interface{}) (string, string, string, string, bool, int, int, int, error) {
 	primaries := stream.ColorPrimaries
 	transfer := stream.ColorTransfer
 	matrix := stream.ColorSpace
@@ -355,24 +362,9 @@ func classifyColor(stream probeStream) (string, string, string, string, bool, in
 		if transfer == "arib-std-b67" {
 			return primaries, transfer, matrix, rangeName, true, 1000, 0, 0, nil
 		}
-		mastering, cll, masteringCount, cllCount := 0, 0, 0, 0
-		for _, side := range stream.SideDataList {
-			if value, ok := side["max_luminance"]; ok {
-				masteringCount++
-				parsed, parseErr := parseNits(value)
-				if parseErr != nil || masteringCount != 1 {
-					return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
-				}
-				mastering = parsed
-			}
-			if value, ok := side["max_content"]; ok {
-				cllCount++
-				parsed, parseErr := interfaceInt(value)
-				if parseErr != nil || cllCount != 1 {
-					return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
-				}
-				cll = parsed
-			}
+		mastering, cll, masteringCount, cllCount := hdrFacts(stream.SideDataList)
+		if masteringCount == 0 && cllCount == 0 {
+			mastering, cll, masteringCount, cllCount = hdrFacts(frameSideData)
 		}
 		if masteringCount != 1 || cllCount != 1 || mastering <= 0 || cll <= 0 || cll > mastering {
 			return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
@@ -385,6 +377,28 @@ func classifyColor(stream probeStream) (string, string, string, string, bool, in
 		return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 	}
 	return primaries, transfer, matrix, rangeName, false, 0, 0, 0, nil
+}
+
+func hdrFacts(sideData []map[string]interface{}) (mastering, cll, masteringCount, cllCount int) {
+	for _, side := range sideData {
+		if value, ok := side["max_luminance"]; ok {
+			masteringCount++
+			parsed, parseErr := parseNits(value)
+			if parseErr != nil || masteringCount != 1 {
+				return 0, 0, masteringCount, cllCount
+			}
+			mastering = parsed
+		}
+		if value, ok := side["max_content"]; ok {
+			cllCount++
+			parsed, parseErr := interfaceInt(value)
+			if parseErr != nil || cllCount != 1 {
+				return 0, 0, masteringCount, cllCount
+			}
+			cll = parsed
+		}
+	}
+	return mastering, cll, masteringCount, cllCount
 }
 
 func parseNits(value interface{}) (int, error) {

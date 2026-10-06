@@ -195,7 +195,7 @@ jobs:
             -color_trc bt709 -colorspace bt709 -color_range tv -c:a aac -b:a 96k \
             "${fixtures}/avc-odd-audio.mp4"
           timeout 2m "${generator}" -v error -y -threads 1 \
-            -f lavfi -i 'testsrc2=size=96x64:rate=25:duration=0.16' -an \
+            -f lavfi -i 'testsrc2=size=128x96:rate=25:duration=0.16' -an \
             -c:v libx265 -preset ultrafast -x265-params pools=1:frame-threads=1 \
             -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
             "${fixtures}/hevc-base.mp4"
@@ -234,8 +234,8 @@ jobs:
             -color_trc bt709 -colorspace bt709 -color_range tv -c:a pcm_s16le \
             "${fixtures}/audio-resample.mov"
           timeout 2m "${generator}" -v error -y -threads 1 \
-            -f lavfi -i 'testsrc=size=160x90:rate=25:duration=0.2' -frames:v 3 \
-            -vf 'setpts=N*N/(25*TB),setsar=2/1' -fps_mode vfr -an -c:v libx264 \
+            -f lavfi -i 'testsrc=size=160x90:rate=25:duration=0.2' -frames:v 4 \
+            -vf 'setpts=if(gte(N\,2)\,N+1\,N)/(25*TB),setsar=2/1' -fps_mode vfr -an -c:v libx264 \
             -preset ultrafast -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 \
             -colorspace bt709 -color_range tv "${fixtures}/vfr-sar.mp4"
           for fixture in "${fixtures}"/*.mp4 "${fixtures}"/*.mov; do
