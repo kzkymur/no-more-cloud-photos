@@ -204,9 +204,19 @@ EOF
 (cd /opt/nmcp/releases/ownerdeath && /usr/bin/sha256sum bin/* > MANIFEST.sha256)
 "$repo/scripts/install-ubuntu-release" activate ownerdeath >"$work/ownerdeath.out" 2>&1 &
 installer_pid=$!
-for attempt in {1..100}; do
+for attempt in {1..600}; do
   [[ -e $work/ownerdeath-entered ]] && break
-  [[ $attempt -lt 100 ]] || { printf 'owner-death migration did not enter\n' >&2; exit 1; }
+  if ! /usr/bin/kill -0 "$installer_pid" 2>/dev/null; then
+    wait "$installer_pid" 2>/dev/null || true
+    /usr/bin/cat "$work/ownerdeath.out" >&2
+    printf 'owner-death installer exited before migration entered\n' >&2
+    exit 1
+  fi
+  if [[ $attempt -eq 600 ]]; then
+    /usr/bin/cat "$work/ownerdeath.out" >&2
+    printf 'owner-death migration did not enter\n' >&2
+    exit 1
+  fi
   /usr/bin/sleep 0.05
 done
 /usr/bin/kill -KILL "$installer_pid"
