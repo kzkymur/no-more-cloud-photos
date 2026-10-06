@@ -142,8 +142,8 @@ run_migration() {
   /usr/bin/chown root:root "$temporary"
   /usr/bin/chmod 0644 "$temporary"
   /usr/bin/mv -f -- "$temporary" "$token"
-  if ! /usr/bin/systemctl reset-failed nmcp-migrate.service \
-    || ! /usr/bin/systemctl restart nmcp-migrate.service; then
+  /usr/bin/systemctl reset-failed nmcp-migrate.service >/dev/null 2>&1 || true
+  if ! /usr/bin/systemctl restart nmcp-migrate.service; then
     /usr/bin/rm -f -- "$token"
     return 1
   fi
