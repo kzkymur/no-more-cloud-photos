@@ -147,14 +147,15 @@ stop_services() {
 }
 
 run_migration() {
-  local token=/run/nmcp-migration-complete temporary
+  local migration_release token=/run/nmcp-migration-complete temporary
+  migration_release=$(/usr/bin/readlink -f -- "$current")
   temporary=$token.new.$$
   /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="nmcp-deploy-migrate-$$" \
     --uid=nmcp --gid=nmcp --property=Slice=nmcp.slice \
     --property=EnvironmentFile=/etc/nmcp/admin.env \
     --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
     --property=ProtectSystem=strict --property=ProtectHome=yes \
-    -- "$release_path/bin/nmcp-admin" migrate up --json || return 1
+    -- "$migration_release/bin/nmcp-admin" migrate up --json || return 1
   /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
   /usr/bin/chown root:root "$temporary"
   /usr/bin/chmod 0600 "$temporary"
