@@ -73,10 +73,10 @@ func TestNewDefaultsLimitsAndRejectsPurgeRegistration(t *testing.T) {
 	if worker.options.PollInterval != time.Second || worker.options.HeartbeatInterval != 30*time.Second ||
 		worker.options.DatabaseTimeout != 10*time.Second || worker.options.ShutdownReleaseTimeout != 10*time.Second ||
 		limits.Threads != 1 || limits.OutputBytesPerStream != 1<<20 || limits.StillTimeoutCeiling != 30*time.Minute ||
-		limits.AnimationTimeoutCeiling != 2*time.Hour || limits.VideoTimeoutCeiling != 24*time.Hour {
+		limits.AnimationTimeoutCeiling != 2*time.Hour || limits.VideoTimeoutCeiling != 2*time.Hour {
 		t.Fatalf("default options = %+v", worker.options)
 	}
-	if ceiling, ok := limits.TimeoutCeiling(FamilyVideo); !ok || ceiling != 24*time.Hour {
+	if ceiling, ok := limits.TimeoutCeiling(FamilyVideo); !ok || ceiling != 2*time.Hour {
 		t.Fatalf("video ceiling = %s, %v", ceiling, ok)
 	}
 	if _, ok := limits.TimeoutCeiling("unknown"); ok {

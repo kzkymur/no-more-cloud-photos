@@ -23,7 +23,7 @@ const (
 	DefaultOutputBytesPerStream    = int64(1 << 20)
 	DefaultStillTimeoutCeiling     = 30 * time.Minute
 	DefaultAnimationTimeoutCeiling = 2 * time.Hour
-	DefaultVideoTimeoutCeiling     = 24 * time.Hour
+	DefaultVideoTimeoutCeiling     = 2 * time.Hour
 )
 
 type Family string

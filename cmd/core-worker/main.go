@@ -9,11 +9,15 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/animationprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/config"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
+	"github.com/kzkymur/no-more-cloud-photos/internal/stillprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/transformexecutor"
+	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/worker"
 )
 
@@ -66,14 +70,15 @@ func run(ctx context.Context) error {
 	if err := store.Probe(ctx); err != nil {
 		return fmt.Errorf("storage root is unavailable: %w", err)
 	}
-	repository, err := job.NewRepository(pool, job.Options{FileBaseURL: cfg.FileBaseURL})
+	repository, err := job.NewRepository(pool, job.Options{FileBaseURL: cfg.FileBaseURL, Checkpoint: store.DatabaseCheckpoint})
 	if err != nil {
 		return fmt.Errorf("configure job repository: %w", err)
 	}
-	// Processor executors are registered by issues #11-#14 after their runtime
-	// capability checks and atomic publication path exist. An empty registry
-	// still reclaims expired leases but cannot claim or no-op-complete work.
-	jobWorker, err := worker.New(repository, nil, worker.Options{}, logger)
+	executor, err := configureTransformExecutor(ctx, cfg, repository, store)
+	if err != nil {
+		return err
+	}
+	jobWorker, err := worker.New(repository, map[job.Type]worker.Executor{job.TypeTransform: executor}, worker.Options{}, logger)
 	if err != nil {
 		return fmt.Errorf("configure job worker: %w", err)
 	}
@@ -83,4 +88,42 @@ func run(ctx context.Context) error {
 	}
 	logger.Info("core Worker stopped")
 	return nil
+}
+
+func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, repository *job.Repository, store *storage.Store) (*transformexecutor.Executor, error) {
+	still, err := stillprocessor.New(stillprocessor.Config{
+		Helper: cfg.StillHelperPath, Prlimit: cfg.PrlimitPath, SRGBICC: cfg.SRGBICCPath,
+		SRGBICCSHA256: cfg.SRGBICCSHA256, Policy: stillprocessor.DefaultPolicy(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure still processor: %w", err)
+	}
+	animation, err := animationprocessor.New(animationprocessor.Config{
+		Helper: cfg.AnimationHelperPath, Prlimit: cfg.PrlimitPath, SRGBICC: cfg.SRGBICCPath,
+		SRGBICCSHA256: cfg.SRGBICCSHA256, Policy: animationprocessor.DefaultPolicy(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure animation processor: %w", err)
+	}
+	video, err := videoprocessor.New(videoprocessor.Config{
+		Helper: cfg.VideoHelperPath, Prlimit: cfg.PrlimitPath, SRGBICC: cfg.SRGBICCPath,
+		SRGBICCSHA256: cfg.SRGBICCSHA256, Policy: videoprocessor.DefaultPolicy(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure video processor: %w", err)
+	}
+	if _, err := still.Capabilities(ctx); err != nil {
+		return nil, fmt.Errorf("check still processor capabilities: %w", err)
+	}
+	if _, err := animation.Capabilities(ctx); err != nil {
+		return nil, fmt.Errorf("check animation processor capabilities: %w", err)
+	}
+	if _, err := video.Capabilities(ctx); err != nil {
+		return nil, fmt.Errorf("check video processor capabilities: %w", err)
+	}
+	executor, err := transformexecutor.New(repository, transformexecutor.StoreAdapter{Store: store}, still, animation, video, transformexecutor.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("configure transform executor: %w", err)
+	}
+	return executor, nil
 }

@@ -18,18 +18,25 @@ const (
 	DefaultAPIAddr         = "127.0.0.1:8080"
 	DefaultLogLevel        = "info"
 	DefaultShutdownTimeout = 30 * time.Second
+	RequiredSRGBICCSHA256  = "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"
 	MinShutdownTimeout     = time.Second
 	MaxShutdownTimeout     = 5 * time.Minute
 )
 
 const (
-	databaseURLEnv     = "NMCP_DATABASE_URL"
-	storageRootEnv     = "NMCP_STORAGE_ROOT"
-	fileBaseURLEnv     = "NMCP_FILE_BASE_URL"
-	cursorHMACKeyEnv   = "NMCP_CURSOR_HMAC_KEY"
-	apiAddrEnv         = "NMCP_API_ADDR"
-	logLevelEnv        = "NMCP_LOG_LEVEL"
-	shutdownTimeoutEnv = "NMCP_SHUTDOWN_TIMEOUT"
+	databaseURLEnv         = "NMCP_DATABASE_URL"
+	storageRootEnv         = "NMCP_STORAGE_ROOT"
+	fileBaseURLEnv         = "NMCP_FILE_BASE_URL"
+	cursorHMACKeyEnv       = "NMCP_CURSOR_HMAC_KEY"
+	apiAddrEnv             = "NMCP_API_ADDR"
+	logLevelEnv            = "NMCP_LOG_LEVEL"
+	shutdownTimeoutEnv     = "NMCP_SHUTDOWN_TIMEOUT"
+	stillHelperPathEnv     = "NMCP_STILL_HELPER_PATH"
+	animationHelperPathEnv = "NMCP_ANIMATION_HELPER_PATH"
+	videoHelperPathEnv     = "NMCP_VIDEO_HELPER_PATH"
+	prlimitPathEnv         = "NMCP_PRLIMIT_PATH"
+	srgbICCPathEnv         = "NMCP_SRGB_ICC_PATH"
+	srgbICCSHA256Env       = "NMCP_SRGB_ICC_SHA256"
 )
 
 // Getenv makes configuration loading deterministic in tests and embedders.
@@ -46,11 +53,17 @@ type APIConfig struct {
 }
 
 type WorkerConfig struct {
-	DatabaseURL     string
-	StorageRoot     string
-	FileBaseURL     string
-	LogLevel        string
-	ShutdownTimeout time.Duration
+	DatabaseURL         string
+	StorageRoot         string
+	FileBaseURL         string
+	StillHelperPath     string
+	AnimationHelperPath string
+	VideoHelperPath     string
+	PrlimitPath         string
+	SRGBICCPath         string
+	SRGBICCSHA256       string
+	LogLevel            string
+	ShutdownTimeout     time.Duration
 }
 
 type AdminConfig struct {
@@ -126,13 +139,39 @@ func LoadWorkerFrom(getenv Getenv) (WorkerConfig, error) {
 	if err != nil {
 		return WorkerConfig{}, err
 	}
+	stillHelperPath, err := requiredCleanAbsolutePath(getenv, stillHelperPathEnv)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	animationHelperPath, err := requiredCleanAbsolutePath(getenv, animationHelperPathEnv)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	videoHelperPath, err := requiredCleanAbsolutePath(getenv, videoHelperPathEnv)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	prlimitPath, err := requiredCleanAbsolutePath(getenv, prlimitPathEnv)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	srgbICCPath, err := requiredCleanAbsolutePath(getenv, srgbICCPathEnv)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	srgbICCSHA256, err := required(getenv, srgbICCSHA256Env)
+	if err != nil {
+		return WorkerConfig{}, err
+	}
+	if srgbICCSHA256 != RequiredSRGBICCSHA256 {
+		return WorkerConfig{}, fmt.Errorf("%s must identify the required pinned sRGB2014 profile", srgbICCSHA256Env)
+	}
 
 	return WorkerConfig{
-		DatabaseURL:     common.databaseURL,
-		StorageRoot:     storageRoot,
-		FileBaseURL:     fileBaseURL,
-		LogLevel:        common.logLevel,
-		ShutdownTimeout: common.shutdownTimeout,
+		DatabaseURL: common.databaseURL, StorageRoot: storageRoot, FileBaseURL: fileBaseURL,
+		StillHelperPath: stillHelperPath, AnimationHelperPath: animationHelperPath, VideoHelperPath: videoHelperPath,
+		PrlimitPath: prlimitPath, SRGBICCPath: srgbICCPath, SRGBICCSHA256: srgbICCSHA256,
+		LogLevel: common.logLevel, ShutdownTimeout: common.shutdownTimeout,
 	}, nil
 }
 
@@ -233,6 +272,20 @@ func validateStorageRoot(root string) error {
 		return fmt.Errorf("%s must be a clean path", storageRootEnv)
 	}
 	return nil
+}
+
+func requiredCleanAbsolutePath(getenv Getenv, name string) (string, error) {
+	value, err := required(getenv, name)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(value) {
+		return "", fmt.Errorf("%s must be an absolute path", name)
+	}
+	if filepath.Clean(value) != value || strings.ContainsRune(value, '\x00') {
+		return "", fmt.Errorf("%s must be a clean path", name)
+	}
+	return value, nil
 }
 
 func normalizeFileBaseURL(raw string) (string, error) {
