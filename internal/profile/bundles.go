@@ -100,9 +100,13 @@ func bundledParameters(maxLongEdge, stillQuality int, standard bool) Parameters 
 }
 
 func baseRecipe(sourceMode SourceMode, maxLongEdge int) Recipe {
+	dimensionRule := "preserve-aspect-no-crop-no-upscale-round-nearest"
+	if sourceMode == SourceVideo {
+		dimensionRule = "preserve-aspect-no-crop-no-upscale-even-round-down"
+	}
 	return Recipe{
 		SourceMode: sourceMode, MaxLongEdge: maxLongEdge, AllowUpscale: false,
-		Crop: "none", DimensionRule: "preserve-aspect-no-crop-no-upscale-even-round-down",
+		Crop: "none", DimensionRule: dimensionRule,
 		Orientation: "apply", Color: "normalize-srgb-tone-map-hdr",
 		Metadata: "strip-after-normalization-keep-color-tags", Alpha: "preserve",
 	}
