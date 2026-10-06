@@ -343,19 +343,45 @@ PY
 
   check_processes_and_isolation
   compose exec -T files nginx -t
-  compose exec -T api sh -eu -c 'exiftool -ver; ffprobe -version; prlimit --version; dpkg-query --show ca-certificates curl ffmpeg libde265-0 libexif12 libimage-exiftool-perl libwebpdemux2 util-linux'
-  capabilities=$(compose exec -T api /opt/nmcp/bin/nmcp-still-helper capabilities --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
-  printf '%s\n' "$capabilities"
+  compose exec -T worker sh -eu -c 'exiftool -ver; /opt/nmcp/bin/ffprobe -version; prlimit --version; dpkg-query --show ca-certificates curl ffmpeg libde265-0 libexif12 libimage-exiftool-perl libwebpdemux2 util-linux'
+  still_capabilities=$(compose exec -T worker /opt/nmcp/bin/nmcp-still-helper capabilities --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
+  printf '%s\n' "$still_capabilities"
   for expected in '"libvips":"8.18.7"' '"libheif":"1.23.5"' '"libraw":"0.22.2-Release"' '"libaom":"v3.8.2"' '"lcms2":"2.14"'; do
-    printf '%s' "$capabilities" | grep -F "$expected" >/dev/null
+    printf '%s' "$still_capabilities" | grep -F "$expected" >/dev/null
   done
-  compose exec -T api sh -eu -c '
+  animation_capabilities=$(compose exec -T worker /opt/nmcp/bin/nmcp-animation-helper capabilities --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
+  printf '%s\n' "$animation_capabilities"
+  for expected in '"libwebp":"1.6.0"' '"libwebp-demux":"1.6.0"' '"libwebp-mux":"1.6.0"' '"giflib":"5.2.2"' '"libheif":"1.23.5"' '"libaom":"v3.8.2"' '"lcms2":"2.14"'; do
+    printf '%s' "$animation_capabilities" | grep -F "$expected" >/dev/null
+  done
+  video_capabilities=$(compose exec -T worker /opt/nmcp/bin/nmcp-video-helper capabilities --protocol 1 --threads 1 --srgb-icc /opt/nmcp/share/sRGB2014.icc)
+  printf '%s\n' "$video_capabilities"
+  for expected in '"ffmpeg":"9.0.2"' '"libsvtav1":"4.2.0"' '"zimg":"3.0.6"' '"libaom":"v3.8.2"' '"video_encoder":"libsvtav1"' '"audio_encoder":"aac-lc"' '"tone_map":"zscale+hable"'; do
+    printf '%s' "$video_capabilities" | grep -F "$expected" >/dev/null
+  done
+  compose exec -T worker sh -eu -c '
     printf "%s  %s\n" 384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a /opt/nmcp/share/sRGB2014.icc | sha256sum --check
-    du -sh /opt/nmcp/still-toolchain
-    closure=$(ldd /opt/nmcp/bin/nmcp-still-helper)
-    printf "%s\n" "$closure"
-    ! printf "%s\n" "$closure" | grep -F "not found"
+    du -sh /opt/nmcp
+    for executable in /opt/nmcp/bin/nmcp-still-helper /opt/nmcp/bin/nmcp-animation-helper /opt/nmcp/bin/ffmpeg /opt/nmcp/bin/ffprobe; do
+      closure=$(ldd "$executable")
+      printf "%s\n" "$closure"
+      ! printf "%s\n" "$closure" | grep -F "not found"
+    done
+    test -f /opt/nmcp/share/nmcp/still-toolchain.manifest
+    test -f /opt/nmcp/share/nmcp/video-toolchain.manifest
   '
+  for required in NMCP_STILL_HELPER_PATH NMCP_ANIMATION_HELPER_PATH NMCP_VIDEO_HELPER_PATH NMCP_PRLIMIT_PATH NMCP_SRGB_ICC_PATH NMCP_SRGB_ICC_SHA256; do
+    output="$tmp/worker-missing-$required"
+    if compose run --rm --no-deps -e "$required=" worker >"$output" 2>&1; then
+      echo "error: Worker started without $required" >&2
+      exit 1
+    fi
+    grep -F "$required is required" "$output" >/dev/null || {
+      echo "error: Worker did not report missing $required" >&2
+      cat "$output" >&2
+      exit 1
+    }
+  done
   image_id=$(compose images -q api)
   docker image inspect "$image_id" --format 'core_image_bytes={{.Size}}'
   compose exec -T postgres postgres --version

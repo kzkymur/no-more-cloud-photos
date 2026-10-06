@@ -1,5 +1,5 @@
 [Unit]
-Description=No More Cloud Photos Core Worker (reclaim-only until issue 14)
+Description=No More Cloud Photos Core Worker
 Documentation=file:/usr/share/doc/nmcp/ubuntu-deployment.md
 Requires=nmcp-migrate.service
 After=nmcp-migrate.service
