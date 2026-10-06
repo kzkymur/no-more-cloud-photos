@@ -32,4 +32,10 @@ Default: deny (incoming), allow (outgoing), disabled (routed)
 EOF
 printf 'ufw allow 9443/tcp\n' >> "$work/added"
 if "${check[@]}" >/dev/null 2>&1; then printf 'broader port allow was accepted\n' >&2; exit 1; fi
+cat > "$work/added" <<'EOF'
+ufw allow in on tailscale0 to 100.64.0.10 port 8443 proto tcp
+ufw allow in on tailscale0 to 100.64.0.10 port 9443 proto tcp
+ufw allow 9443
+EOF
+if "${check[@]}" >/dev/null 2>&1; then printf 'broader numeric allow was accepted\n' >&2; exit 1; fi
 printf 'Ubuntu firewall fail-closed fixture counterexamples passed\n'
