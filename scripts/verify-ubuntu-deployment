@@ -122,6 +122,10 @@ def main() -> int:
                 "/run/nmcp-nginx/client", str(cache / "client")
             ).replace(
                 "/run/nmcp-nginx/proxy", str(cache / "proxy")
+            ).replace(
+                "100.64.0.10:8443", "127.0.0.1:18443"
+            ).replace(
+                "100.64.0.10:9443", "127.0.0.1:19443"
             )
             test_path = temporary / "nginx-test.conf"
             test_path.write_text(test_config, encoding="utf-8")
