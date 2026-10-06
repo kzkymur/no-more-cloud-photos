@@ -149,7 +149,7 @@ stop_services() {
 run_migration() {
   local token=/run/nmcp-migration-complete temporary
   temporary=$token.new.$$
-  /usr/bin/systemd-run --quiet --wait --collect --unit="nmcp-deploy-migrate-$$" \
+  /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="nmcp-deploy-migrate-$$" \
     --uid=nmcp --gid=nmcp --property=Slice=nmcp.slice \
     --property=EnvironmentFile=/etc/nmcp/admin.env \
     --property=NoNewPrivileges=yes --property=PrivateTmp=yes \

@@ -45,7 +45,7 @@ make_release() {
   done
   cat > "$root/bin/nmcp-admin" <<EOF
 #!/bin/sh
-if test "\${1:-}" = migrate && test "\${2:-}" = up; then printf '%s\n' '$id' >> '$work/migrations'; fi
+if test "\${1:-}" = migrate && test "\${2:-}" = up; then printf 'NMCP_TEST_MIGRATION=%s\n' '$id'; fi
 exit 0
 EOF
   /usr/bin/chmod 0755 "$root/bin/nmcp-admin"
@@ -97,10 +97,10 @@ fi
 /usr/bin/grep -q 'active=old.*attempted=migratefail.*state=migration-failed-link-restored' \
   /var/lib/nmcp/deployment/active-release
 
-if "$repo/scripts/install-ubuntu-release" activate startfail; then
+if "$repo/scripts/install-ubuntu-release" activate startfail >"$work/startfail.out" 2>&1; then
   printf 'service startup failure unexpectedly activated release\n' >&2; exit 1
 fi
-[[ $(/usr/bin/wc -l < "$work/migrations") -eq 1 ]]
+[[ $(/usr/bin/grep -c '^NMCP_TEST_MIGRATION=startfail$' "$work/startfail.out") -eq 1 ]]
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   ! /usr/bin/systemctl is-active --quiet "$unit" || { printf 'partial startup remained live: %s\n' "$unit" >&2; exit 1; }
 done
@@ -112,10 +112,10 @@ ExecStart=/usr/bin/sleep infinity
 EOF
 /usr/bin/systemctl daemon-reload
 
-if "$repo/scripts/install-ubuntu-release" activate candidate; then
+if "$repo/scripts/install-ubuntu-release" activate candidate >"$work/candidate.out" 2>&1; then
   printf 'failed readiness gate unexpectedly activated release\n' >&2; exit 1
 fi
-[[ $(/usr/bin/wc -l < "$work/migrations") -eq 2 ]]
+[[ $(/usr/bin/grep -c '^NMCP_TEST_MIGRATION=candidate$' "$work/candidate.out") -eq 1 ]]
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   ! /usr/bin/systemctl is-active --quiet "$unit" || { printf 'partial service remained live: %s\n' "$unit" >&2; exit 1; }
 done
@@ -124,10 +124,11 @@ done
 
 /usr/bin/systemctl start nmcp-api.service nmcp-worker.service nmcp-files.service nmcp.target
 /usr/bin/touch "$work/allow-candidate"
-if "$repo/scripts/install-ubuntu-release" rollback old; then
+if "$repo/scripts/install-ubuntu-release" rollback old >"$work/rollback.out" 2>&1; then
   printf 'failed rollback gate unexpectedly succeeded\n' >&2; exit 1
 fi
-[[ $(/usr/bin/wc -l < "$work/migrations") -eq 4 ]]
+[[ $(/usr/bin/grep -c '^NMCP_TEST_MIGRATION=old$' "$work/rollback.out") -eq 1 ]]
+[[ $(/usr/bin/grep -c '^NMCP_TEST_MIGRATION=candidate$' "$work/rollback.out") -eq 1 ]]
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/candidate ]]
 for unit in nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service; do
   /usr/bin/systemctl is-active --quiet "$unit" || { printf 'prior live service state was not restored: %s\n' "$unit" >&2; exit 1; }
