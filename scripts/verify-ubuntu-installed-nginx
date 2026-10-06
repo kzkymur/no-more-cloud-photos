@@ -14,14 +14,14 @@ done
 cleanup() {
   /usr/bin/systemctl stop nmcp-files.service nmcp-api.service >/dev/null 2>&1 || true
   /usr/bin/rm -f /run/systemd/system/nmcp-files.service /run/systemd/system/nmcp-api.service \
-    /run/systemd/system/nmcp.slice
+    /run/systemd/system/postgresql@nmcp-test.service /run/systemd/system/nmcp.slice
   /usr/bin/rm -rf /run/systemd/system/nmcp-files.service.d
   /usr/bin/rm -rf "/run/nmcp-test-restart.$$"
   /usr/bin/rm -f "/usr/local/share/ca-certificates/nmcp-test-$$.crt"
   /usr/sbin/update-ca-certificates >/dev/null 2>&1 || true
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
   /usr/bin/rm -rf -- /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp \
-    /usr/local/libexec/nmcp "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" \
+    /usr/local/libexec/nmcp "/root/nmcp-host-reinstall.$$" "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" \
     "/root/nmcp-tls-renew-persistent.$$" "/root/nmcp-tls-renew-inactive.$$" "$work"
 }
 trap cleanup EXIT
@@ -121,6 +121,12 @@ Description=Disposable NMCP API dependency
 Type=simple
 ExecStart=/usr/bin/sleep infinity
 EOF
+cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/true
+RemainAfterExit=yes
+EOF
 /usr/bin/systemctl daemon-reload
 
 # Prove the exact installed traversal boundary before service startup.
@@ -141,10 +147,29 @@ fi
 guard_error=$work/host-guard-error
 guard_link=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
 guard_config=$(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf)
-if "$repo_root/scripts/install-ubuntu-host" --config-dir /nonexistent \
+guard_input=/root/nmcp-host-reinstall.$$
+/usr/bin/install -d -o root -g root -m 0700 "$guard_input"
+/usr/bin/printf '%s\n' \
+  'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
+  'NMCP_LOG_LEVEL=info' 'NMCP_SHUTDOWN_TIMEOUT=30s' > "$guard_input/admin.env"
+/usr/bin/printf '%s\n' \
+  'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
+  'NMCP_STORAGE_ROOT=/var/lib/nmcp/media' \
+  'NMCP_FILE_BASE_URL=https://host.example.ts.net:19443/files/' \
+  'NMCP_CURSOR_HMAC_KEY=0123456789abcdef0123456789abcdef' \
+  'NMCP_API_ADDR=127.0.0.1:8080' 'NMCP_LOG_LEVEL=info' \
+  'NMCP_SHUTDOWN_TIMEOUT=30s' > "$guard_input/api.env"
+/usr/bin/printf '%s\n' \
+  'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
+  'NMCP_STORAGE_ROOT=/var/lib/nmcp/media' 'NMCP_LOG_LEVEL=info' \
+  'NMCP_SHUTDOWN_TIMEOUT=30s' > "$guard_input/worker.env"
+/usr/bin/chown root:root "$guard_input"/*.env
+/usr/bin/chmod 0600 "$guard_input"/*.env
+if "$repo_root/scripts/install-ubuntu-host" --config-dir "$guard_input" \
   --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
-  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@none.service \
-  --tls-cert /nonexistent/cert.pem --tls-key /nonexistent/key.pem >/dev/null 2>"$guard_error"; then
+  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@nmcp-test.service \
+  --tls-cert /etc/nmcp/tls-releases/test/cert.pem \
+  --tls-key /etc/nmcp/tls-releases/test/key.pem >/dev/null 2>"$guard_error"; then
   printf 'live host reinstall was accepted\n' >&2; exit 1
 fi
 /usr/bin/grep -q 'must be exactly inactive/dead' "$guard_error"
@@ -166,10 +191,11 @@ for attempt in {1..20}; do
   [[ $attempt -lt 20 ]] || { printf 'File Server did not enter activating state\n' >&2; exit 1; }
   /usr/bin/sleep 0.05
 done
-if "$repo_root/scripts/install-ubuntu-host" --config-dir /nonexistent \
+if "$repo_root/scripts/install-ubuntu-host" --config-dir "$guard_input" \
   --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
-  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@none.service \
-  --tls-cert /nonexistent/cert.pem --tls-key /nonexistent/key.pem >/dev/null 2>"$guard_error"; then
+  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@nmcp-test.service \
+  --tls-cert /etc/nmcp/tls-releases/test/cert.pem \
+  --tls-key /etc/nmcp/tls-releases/test/key.pem >/dev/null 2>"$guard_error"; then
   printf 'activating host reinstall was accepted\n' >&2; exit 1
 fi
 /usr/bin/grep -q 'must be exactly inactive/dead' "$guard_error"
