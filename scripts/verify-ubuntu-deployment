@@ -34,6 +34,7 @@ def main() -> int:
         ROOT / "scripts" / "install-ubuntu-host",
         ROOT / "scripts" / "install-ubuntu-release",
         ROOT / "scripts" / "verify-ubuntu-nginx-http",
+        ROOT / "scripts" / "verify-ubuntu-systemd-mounts",
     ]
     for script in scripts:
         require(os.access(script, os.X_OK), f"{script.name} is not executable")
@@ -144,14 +145,15 @@ def main() -> int:
         output = result.stdout + result.stderr
         forbidden = ("Unknown key", "Failed to parse", "Ignoring unknown escape", "Invalid section")
         require(not any(item in output for item in forbidden), f"systemd parser warning:\n{output}")
-        allowed_missing = (
-            "Command /opt/nmcp/current/bin/",
-            "Command /usr/sbin/nginx is not executable:",
-            "Failed to create ",
-        )
+        def allowed_missing(line: str) -> bool:
+            return (
+                "Command /opt/nmcp/current/bin/" in line
+                or "Command /usr/sbin/nginx is not executable:" in line
+                or ("Failed to create " in line and "Unit postgresql.service not found." in line)
+            )
         unexpected = [
             line for line in output.splitlines()
-            if line.strip() and not any(marker in line for marker in allowed_missing)
+            if line.strip() and not allowed_missing(line)
         ]
         require(not unexpected, "unexpected systemd verification output:\n" + "\n".join(unexpected))
         require(result.returncode in (0, 1), f"systemd-analyze exited {result.returncode}")

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-systemd-mounts: must run as root\n' >&2; exit 1; }
+work=$(mktemp -d /var/tmp/nmcp-systemd-mounts.XXXXXX)
+unit=nmcp-mount-check-$$
+cleanup() {
+  systemctl reset-failed "$unit.service" >/dev/null 2>&1 || true
+  rm -rf -- "$work"
+}
+trap cleanup EXIT
+
+mkdir -p "$work/state/media/originals" "$work/state/media/renditions" \
+  "$work/state/backups" "$work/view/originals" "$work/view/renditions"
+printf 'original-marker' > "$work/state/media/originals/marker"
+printf 'rendition-marker' > "$work/state/media/renditions/marker"
+printf 'must-not-be-visible' > "$work/state/backups/secret"
+
+# This is the same parent-hide plus nested read-only bind composition used by
+# nmcp-files.service, applied to disposable paths. Root is intentional: a
+# successful write would prove the mount itself is not read-only.
+systemd-run --quiet --wait --collect --unit "$unit" \
+  --property=Type=oneshot \
+  --property="InaccessiblePaths=$work/state" \
+  --property="BindReadOnlyPaths=$work/state/media/originals:$work/view/originals" \
+  --property="BindReadOnlyPaths=$work/state/media/renditions:$work/view/renditions" \
+  /bin/sh -eu -c '
+    test "$(cat "$1/originals/marker")" = original-marker
+    test "$(cat "$1/renditions/marker")" = rendition-marker
+    ! touch "$1/originals/write-must-fail"
+    ! touch "$1/renditions/write-must-fail"
+    ! test -r "$2/backups/secret"
+  ' sh "$work/view" "$work/state"
+
+[[ ! -e $work/state/media/originals/write-must-fail ]]
+[[ ! -e $work/state/media/renditions/write-must-fail ]]
+printf 'Ubuntu systemd read-only mount verification passed\n'

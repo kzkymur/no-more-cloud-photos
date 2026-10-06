@@ -11,6 +11,7 @@ on:
       - "scripts/render-ubuntu-nginx"
       - "scripts/verify-ubuntu-deployment"
       - "scripts/verify-ubuntu-nginx-http"
+      - "scripts/verify-ubuntu-systemd-mounts"
   push:
     branches: [main]
     paths:
@@ -22,6 +23,7 @@ on:
       - "scripts/render-ubuntu-nginx"
       - "scripts/verify-ubuntu-deployment"
       - "scripts/verify-ubuntu-nginx-http"
+      - "scripts/verify-ubuntu-systemd-mounts"
   workflow_dispatch:
 
 permissions:
@@ -46,7 +48,7 @@ jobs:
       - name: Check shell scripts
         run: |
           shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
-            scripts/verify-ubuntu-nginx-http
+            scripts/verify-ubuntu-nginx-http scripts/verify-ubuntu-systemd-mounts
 
       - name: Verify deployment assets
         run: scripts/verify-ubuntu-deployment
@@ -55,6 +57,9 @@ jobs:
         run: |
           sudo ip address add 100.64.0.10/32 dev lo
           scripts/verify-ubuntu-nginx-http
+
+      - name: Verify systemd read-only storage namespace
+        run: sudo scripts/verify-ubuntu-systemd-mounts
 
       - name: Verify immutable release staging
         env:
