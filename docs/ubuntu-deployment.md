@@ -150,6 +150,9 @@ through that declaration, rechecks all authority, and only then sends the final
 installer death before the final grant prevents execution, while death after
 the grant leaves the child holding the lease and blocks every new
 host/release/TLS/direct-migration mutation until the exact binary exits.
+Every sequenced-packet protocol record is received with an expected-plus-one
+buffer and is rejected on `MSG_TRUNC`, `MSG_CTRUNC`, or any non-exact length;
+valid-prefix extensions cannot be interpreted as READY, offer, or EXEC records.
 The concrete database unit must expose a finite `TimeoutStartUSec`. Before it
 can dispatch anything, a tracked wrapper writes its own PID/start-time record
 and launches and reaps the exact `systemd-run` process. The installer supplies
@@ -164,6 +167,10 @@ transient additionally has a 15-minute runtime deadline and a 30-second stop
 deadline. A failed or delayed stop therefore retains both deployment locks and
 blocks rollback, link, and service mutation instead of racing live database
 work. The wrapper owns socket and runner-record cleanup through terminal exit.
+Cancellation also reaps the exact `systemd-run` launcher before a second
+mandatory terminal check. The reap closes the late unit-registration window;
+only the subsequent no-job/no-PID terminal result permits lock and socket
+cleanup.
 Successful oneshot migration remains active so production
 API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.

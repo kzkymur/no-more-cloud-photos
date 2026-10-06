@@ -71,7 +71,17 @@ def recv_authorized(
         if owner_pidfd in readable:
             fail("dispatch owner died before execution authorization")
         if connection in readable:
-            return connection.recv(size)
+            message, _ancillary = recv_packet(connection, size)
+            return message
+
+
+def recv_packet(
+    connection: socket.socket, size: int, ancillary_space: int = 0
+) -> tuple[bytes, list[tuple[int, int, bytes]]]:
+    message, ancillary, flags, _address = connection.recvmsg(size + 1, ancillary_space)
+    if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC) or len(message) != size:
+        fail("invalid execution protocol packet framing")
+    return message, ancillary
 
 
 def unit_state(unit: str) -> tuple[str, str, int, bool]:
@@ -212,6 +222,8 @@ def run_tracked(
 
         # close_fds ensures the transient launcher and admin receive the lease only
         # through the explicit, authorized SCM_RIGHTS protocol below.
+        if os.environ.get("NMCP_TEST_PAUSE_SYSTEMD_RUN_REGISTRATION") == "1":
+            command = [sys.argv[0], "pause-exec", *command]
         child = subprocess.Popen(command, close_fds=True)
         deadline = time.monotonic() + queue_timeout
         if os.environ.get("NMCP_TEST_PAUSE_AFTER_WRAPPER_LAUNCH") == "1":
@@ -293,6 +305,17 @@ def run_tracked(
         listener.close()
         if child is not None and child.poll() is None:
             ensure_terminal(unit)
+        if (
+            child is not None
+            and os.environ.get("NMCP_TEST_PAUSE_BEFORE_LAUNCHER_REAP") == "1"
+        ):
+            pathlib.Path("/run/nmcp-deploy/test-before-launcher-reap.ready").touch(
+                mode=0o600
+            )
+            while not pathlib.Path(
+                "/run/nmcp-deploy/test-before-launcher-reap.go"
+            ).is_file():
+                time.sleep(0.01)
         if child is not None:
             try:
                 child.wait(timeout=5)
@@ -303,6 +326,10 @@ def run_tracked(
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait()
+            # The launcher is now reaped, so the unit-creation window is closed.
+            # Re-check terminal state after that linearization point: a late
+            # registration can no longer appear after this gate and cleanup.
+            ensure_terminal(unit)
         if descriptor >= 0:
             os.close(descriptor)
         if owner_pidfd >= 0:
@@ -318,7 +345,7 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
     connection.connect(socket_path)
     connection.sendall(b"READY")
     size = array.array("i").itemsize
-    message, ancillary, _flags, _address = connection.recvmsg(9, socket.CMSG_SPACE(size))
+    message, ancillary = recv_packet(connection, 9, socket.CMSG_SPACE(size))
     received: list[int] = []
     for level, kind, data in ancillary:
         if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
@@ -353,13 +380,72 @@ def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
         fail("execution-lease offer expired before execution readiness")
     connection.sendall(b"EXEC_READY")
     connection.settimeout(max(0.001, (deadline_ns - time.monotonic_ns()) / 1_000_000_000))
-    grant = connection.recv(12)
+    grant, _ancillary = recv_packet(connection, 12)
     if grant != b"EXEC" + deadline_ns.to_bytes(8, "big"):
         fail("wrapper did not grant execution")
     if time.monotonic_ns() >= deadline_ns:
         fail("execution grant expired before exec")
     connection.close()
     os.execv(command[0], command)
+
+
+def pause_exec(command: list[str]) -> None:
+    pathlib.Path("/run/nmcp-deploy/test-registration-paused.ready").touch(mode=0o600)
+    while not pathlib.Path("/run/nmcp-deploy/test-registration-paused.go").is_file():
+        time.sleep(0.01)
+    os.execv(command[0], command)
+
+
+def verify_framing() -> None:
+    records = {
+        "READY": b"READY",
+        "OFFER_CHECKED": b"OFFER_CHECKED",
+        "EXEC_READY": b"EXEC_READY",
+        "OFFER": b"O" + (123).to_bytes(8, "big"),
+        "EXEC": b"EXEC" + (123).to_bytes(8, "big"),
+    }
+    for name, record in records.items():
+        ancillary_space = socket.CMSG_SPACE(array.array("i").itemsize) if name == "OFFER" else 0
+
+        def send_record(sender: socket.socket, payload: bytes) -> None:
+            if name != "OFFER":
+                sender.sendall(payload)
+                return
+            descriptor = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                rights = array.array("i", [descriptor])
+                sender.sendmsg(
+                    [payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+                )
+            finally:
+                os.close(descriptor)
+
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        with sender, receiver:
+            send_record(sender, record)
+            message, ancillary = recv_packet(receiver, len(record), ancillary_space)
+            if message != record:
+                fail(f"exact {name} protocol control changed")
+            received_descriptors = 0
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    descriptors = array.array("i")
+                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
+                    received_descriptors += len(descriptors)
+                    for descriptor in descriptors:
+                        os.close(descriptor)
+            if name == "OFFER" and received_descriptors != 1:
+                fail("exact OFFER control did not carry one descriptor")
+        for suffix, kind in ((b"X", "oversized"), (b"XY", "truncated")):
+            sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            with sender, receiver:
+                send_record(sender, record + suffix)
+                try:
+                    recv_packet(receiver, len(record), ancillary_space)
+                except SystemExit:
+                    continue
+                fail(f"{kind} valid-prefix {name} record was accepted")
+    print("Exact protocol framing and all valid-prefix counterexamples passed")
 
 
 if len(sys.argv) >= 11 and sys.argv[1] == "run-tracked":
@@ -383,5 +469,9 @@ elif len(sys.argv) == 3 and sys.argv[1] == "process-start":
     if value is None:
         fail("process identity is unavailable")
     print(value)
+elif len(sys.argv) >= 3 and sys.argv[1] == "pause-exec":
+    pause_exec(sys.argv[2:])
+elif len(sys.argv) == 2 and sys.argv[1] == "verify-framing":
+    verify_framing()
 else:
-    fail("usage: run-tracked OWNER_PID OWNER_START SOCKET LOCK FD FILE UNIT TIMEOUT COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...] | ensure-terminal UNIT | process-start PID")
+    fail("usage: run-tracked OWNER_PID OWNER_START SOCKET LOCK FD FILE UNIT TIMEOUT COMMAND [ARG ...] | receive SOCKET LOCK COMMAND [ARG ...] | ensure-terminal UNIT | process-start PID | pause-exec COMMAND [ARG ...] | verify-framing")

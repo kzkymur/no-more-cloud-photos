@@ -21,6 +21,7 @@ trap cleanup EXIT
   /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks
 /usr/bin/install -o root -g root -m 0755 "$repo/scripts/handoff-ubuntu-migration-lock" \
   /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock
+/usr/local/libexec/nmcp/handoff-ubuntu-migration-lock verify-framing
 cat > /opt/nmcp/current/bin/nmcp-admin <<EOF
 #!/bin/sh
 printf 'entered\n' >> '$work/entries'

@@ -15,7 +15,9 @@ cleanup() {
     /run/nmcp-deploy/test-before-admin-dispatch.go \
     /run/nmcp-deploy/test-cancel-stop.go \
     /run/nmcp-deploy/test-receiver-exec-check.go \
-    /run/nmcp-deploy/test-wrapper-launched.go 2>/dev/null || true
+    /run/nmcp-deploy/test-wrapper-launched.go \
+    /run/nmcp-deploy/test-registration-paused.go \
+    /run/nmcp-deploy/test-before-launcher-reap.go 2>/dev/null || true
   [[ -z $predispatch_pid ]] || /usr/bin/kill "$predispatch_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/kill "$installer_pid" 2>/dev/null || true
   [[ -z $registration_pid ]] || /usr/bin/kill "$registration_pid" 2>/dev/null || true
@@ -264,10 +266,9 @@ fi
   /run/nmcp-deploy/test-receiver-exec-check.{ready,go} \
   /run/nmcp-deploy/test-pause-after-offer-check.enabled
 
-# Kill the installer only after its wrapper and exact systemd-run child exist,
-# but before a receiver can request the lease. The production owner pidfd must
-# cancel the unit and prevent a later PostgreSQL readiness event from orphaning
-# a migration.
+# Kill the installer after the wrapper exists but while its launcher is paused
+# before systemd-run registration. Register the exact unit only after the first
+# not-found terminal check; the mandatory post-reap gate must still cancel it.
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
 Type=notify
@@ -278,8 +279,12 @@ EOF
 /usr/bin/systemctl daemon-reload
 /usr/bin/systemctl reset-failed postgresql@nmcp-test.service >/dev/null 2>&1 || true
 /usr/bin/rm -f "$work/postgresql-ready" "$work/pretransfer-postgresql-release" \
-  /run/nmcp-deploy/test-wrapper-launched.{ready,go}
+  /run/nmcp-deploy/test-wrapper-launched.{ready,go} \
+  /run/nmcp-deploy/test-registration-paused.{ready,go} \
+  /run/nmcp-deploy/test-before-launcher-reap.{ready,go}
 NMCP_TEST_PAUSE_AFTER_WRAPPER_LAUNCH=1 \
+NMCP_TEST_PAUSE_SYSTEMD_RUN_REGISTRATION=1 \
+NMCP_TEST_PAUSE_BEFORE_LAUNCHER_REAP=1 \
   "$repo/scripts/install-ubuntu-release" activate ownerpretransfer \
   >"$work/ownerpretransfer.out" 2>&1 &
 pretransfer_pid=$!
@@ -288,16 +293,47 @@ for attempt in {1..200}; do
   [[ $attempt -lt 200 ]] || { printf 'owner-death test did not launch tracked wrapper\n' >&2; exit 1; }
   /usr/bin/sleep 0.02
 done
-[[ -e $work/pretransfer-postgresql-started ]]
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-registration-paused.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'launcher did not pause before unit registration\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+[[ ! -e $work/pretransfer-postgresql-started ]]
 compgen -G "/run/nmcp-deploy/migration-runner.$pretransfer_pid.*" >/dev/null
 /usr/bin/kill -KILL "$pretransfer_pid"
 wait "$pretransfer_pid" 2>/dev/null || true
+for attempt in {1..200}; do
+  [[ -e /run/nmcp-deploy/test-before-launcher-reap.ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'wrapper did not finish its pre-registration terminal check\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+/usr/bin/touch /run/nmcp-deploy/test-registration-paused.go
+for attempt in {1..200}; do
+  unit_state=$(/usr/bin/systemctl show --property=LoadState --value \
+    "nmcp-deploy-admin-$pretransfer_pid-1.service")
+  [[ $unit_state != not-found ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'late transient unit was not registered in the synchronized window\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+[[ -e $work/pretransfer-postgresql-started ]]
+/usr/bin/touch /run/nmcp-deploy/test-before-launcher-reap.go
 for attempt in {1..300}; do
   if ! compgen -G "/run/nmcp-deploy/migration-runner.$pretransfer_pid.*" >/dev/null \
     && ! compgen -G "/run/nmcp-deploy/migration-handoff.$pretransfer_pid.*" >/dev/null \
     && ! /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q "nmcp-deploy-admin-$pretransfer_pid-"; then break; fi
   [[ $attempt -lt 300 ]] || { printf 'owner-death wrapper did not cancel and clean exact unit\n' >&2; exit 1; }
   /usr/bin/sleep 0.02
+done
+# Once launcher reap plus the second terminal gate complete, keep polling to
+# prove no late unit/job can appear after lock/socket cleanup.
+for attempt in {1..20}; do
+  [[ $(/usr/bin/systemctl show --property=LoadState --value \
+    "nmcp-deploy-admin-$pretransfer_pid-1.service") == not-found ]]
+  if /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q \
+    "nmcp-deploy-admin-$pretransfer_pid-"; then
+    printf 'late transient job appeared after post-reap terminal gate\n' >&2; exit 1
+  fi
+  /usr/bin/sleep 0.05
 done
 /usr/bin/touch "$work/pretransfer-postgresql-release"
 /usr/bin/systemctl start postgresql@nmcp-test.service
@@ -313,7 +349,9 @@ done
 pretransfer_pid=
 /usr/bin/ln -sfn /opt/nmcp/releases/old /opt/nmcp/current
 /usr/bin/systemctl stop postgresql@nmcp-test.service
-/usr/bin/rm -f /run/nmcp-deploy/test-wrapper-launched.{ready,go}
+/usr/bin/rm -f /run/nmcp-deploy/test-wrapper-launched.{ready,go} \
+  /run/nmcp-deploy/test-registration-paused.{ready,go} \
+  /run/nmcp-deploy/test-before-launcher-reap.{ready,go}
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
 Type=notify
