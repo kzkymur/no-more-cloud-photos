@@ -53,6 +53,7 @@ var (
 	ErrProcess          = errors.New("animation helper process failure")
 	ErrTimeout          = errors.New("animation helper timed out")
 	ErrLogOutputLimit   = errors.New("animation helper log output limit exceeded")
+	errOperationTimeout = errors.New("animation transform operation deadline exceeded")
 )
 
 type Classification string
@@ -256,7 +257,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	// mandatory independent output verification together. Each Runner also has
 	// its own defensive ceiling, but this absolute deadline prevents a fresh
 	// full timeout from being granted to the second process.
-	operationCtx, cancelOperation := context.WithTimeoutCause(ctx, p.policy.Timeout, ErrTimeout)
+	operationCtx, cancelOperation := context.WithTimeoutCause(ctx, p.policy.Timeout, errOperationTimeout)
 	defer cancelOperation()
 	if operationCtx.Err() != nil {
 		return Result{}, mapOperationError(operationCtx.Err(), ctx, operationCtx)
@@ -1131,7 +1132,7 @@ func mapOperationError(err error, parent, operation context.Context) error {
 	// context.Cause(operation) is immutable once the child completes. Consult it
 	// before re-reading the parent so a later shutdown cancellation cannot
 	// overwrite an operation timeout that already won the race.
-	if operation.Err() != nil && errors.Is(context.Cause(operation), ErrTimeout) {
+	if operation.Err() != nil && context.Cause(operation) == errOperationTimeout {
 		return ErrTimeout
 	}
 	if parent.Err() != nil {

@@ -352,26 +352,38 @@ func TestTransformUsesSingleOperationTimeoutBudget(t *testing.T) {
 }
 
 func TestOperationErrorPreservesFirstCause(t *testing.T) {
-	t.Run("operation timeout before late parent cancellation", func(t *testing.T) {
-		parent, cancelParent := context.WithCancel(context.Background())
-		operation, cancelOperation := context.WithTimeoutCause(parent, 20*time.Millisecond, ErrTimeout)
-		defer cancelOperation()
-		<-operation.Done()
-		cancelParent()
-		if err := mapOperationError(operation.Err(), parent, operation); !errors.Is(err, ErrTimeout) {
-			t.Fatalf("mapOperationError() = %v", err)
-		}
-	})
-	t.Run("parent cancellation before operation timeout", func(t *testing.T) {
-		parent, cancelParent := context.WithCancel(context.Background())
-		operation, cancelOperation := context.WithTimeoutCause(parent, time.Second, ErrTimeout)
-		cancelParent()
-		<-operation.Done()
-		defer cancelOperation()
-		if err := mapOperationError(operation.Err(), parent, operation); !errors.Is(err, context.Canceled) || errors.Is(err, ErrTimeout) {
-			t.Fatalf("mapOperationError() = %v", err)
-		}
-	})
+	for name, lateParentCause := range map[string]error{
+		"operation timeout before ordinary parent cancel": nil,
+		"operation timeout before colliding parent cause": ErrTimeout,
+		"operation timeout before wrapped parent cause":   fmt.Errorf("caller: %w", ErrTimeout),
+	} {
+		t.Run(name, func(t *testing.T) {
+			parent, cancelParent := context.WithCancelCause(context.Background())
+			operation, cancelOperation := context.WithTimeoutCause(parent, 20*time.Millisecond, errOperationTimeout)
+			defer cancelOperation()
+			<-operation.Done()
+			cancelParent(lateParentCause)
+			if err := mapOperationError(operation.Err(), parent, operation); !errors.Is(err, ErrTimeout) {
+				t.Fatalf("mapOperationError() = %v", err)
+			}
+		})
+	}
+	for name, parentCause := range map[string]error{
+		"ordinary parent cancellation before operation timeout":   nil,
+		"colliding public timeout cause before operation timeout": ErrTimeout,
+		"wrapped public timeout cause before operation timeout":   fmt.Errorf("caller: %w", ErrTimeout),
+	} {
+		t.Run(name, func(t *testing.T) {
+			parent, cancelParent := context.WithCancelCause(context.Background())
+			operation, cancelOperation := context.WithTimeoutCause(parent, time.Second, errOperationTimeout)
+			defer cancelOperation()
+			cancelParent(parentCause)
+			<-operation.Done()
+			if err := mapOperationError(operation.Err(), parent, operation); !errors.Is(err, context.Canceled) || errors.Is(err, ErrTimeout) {
+				t.Fatalf("mapOperationError() = %v, operation cause = %v", err, context.Cause(operation))
+			}
+		})
+	}
 }
 
 func TestTransformFailureClearsPartialOutput(t *testing.T) {
