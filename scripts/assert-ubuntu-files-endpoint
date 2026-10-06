@@ -118,18 +118,20 @@ def assert_object_headers(headers: dict[str, list[str]], mime: str, label: str) 
     require(one_header(headers, "Content-Type", label).split(";", 1)[0].lower() == mime.lower(),
             f"{label}: incorrect Content-Type")
     assert_accept_ranges(headers, label)
-    require(one_header(headers, "Cache-Control", label).lower() ==
-            "private, max-age=31536000, immutable", f"{label}: incorrect Cache-Control")
-    require(one_header(headers, "X-Content-Type-Options", label).lower() == "nosniff",
-            f"{label}: incorrect X-Content-Type-Options")
+    assert_header_values(headers, "Cache-Control", "private, max-age=31536000, immutable", label)
+    assert_header_values(headers, "X-Content-Type-Options", "nosniff", label)
 
 
 def assert_accept_ranges(headers: dict[str, list[str]], label: str) -> None:
-    values = headers.get("accept-ranges", [])
-    # Nginx may emit its native static-file field in addition to add_header on
-    # 200/HEAD, while add_header supplies it on 206/416. Every field must agree.
-    require(bool(values) and all(value.lower() == "bytes" for value in values),
-            f"{label}: incorrect Accept-Ranges values {values!r}")
+    assert_header_values(headers, "Accept-Ranges", "bytes", label)
+
+
+def assert_header_values(headers: dict[str, list[str]], name: str, expected: str, label: str) -> None:
+    values = headers.get(name.lower(), [])
+    # Nginx native/error processing can emit a field in addition to an inherited
+    # add_header value. Duplicates are harmless only when every value agrees.
+    require(bool(values) and all(value.lower() == expected.lower() for value in values),
+            f"{label}: incorrect {name} values {values!r}")
 
 
 def parse_multipart(body: bytes, content_type: str, mime: str, expected, label: str) -> None:
@@ -261,18 +263,18 @@ def assert_file(endpoint: Endpoint, kind: str, path: str, fixture: bytes, mime: 
     require(one_header(unsatisfied_headers, "Content-Range", f"{kind} unsatisfiable range").lower() ==
             f"bytes */{len(fixture)}", f"{kind} 416: incorrect Content-Range")
     assert_accept_ranges(unsatisfied_headers, f"{kind} unsatisfiable range")
-    require(one_header(unsatisfied_headers, "Cache-Control", f"{kind} unsatisfiable range").lower() ==
-            "private, max-age=31536000, immutable", f"{kind} 416: incorrect Cache-Control")
-    require(one_header(unsatisfied_headers, "X-Content-Type-Options", f"{kind} unsatisfiable range").lower() ==
-            "nosniff", f"{kind} 416: incorrect nosniff header")
+    assert_header_values(unsatisfied_headers, "Cache-Control", "private, max-age=31536000, immutable",
+                         f"{kind} unsatisfiable range")
+    assert_header_values(unsatisfied_headers, "X-Content-Type-Options", "nosniff",
+                         f"{kind} unsatisfiable range")
 
     status, conditional_headers, body = endpoint.request("GET", path, {"If-None-Match": etag})
     assert_status(status, 304, f"{kind} conditional GET")
     require(body == b"", f"{kind} 304: received {len(body)} response-body octets")
-    require(one_header(conditional_headers, "Cache-Control", f"{kind} conditional GET").lower() ==
-            "private, max-age=31536000, immutable", f"{kind} 304: incorrect Cache-Control")
-    require(one_header(conditional_headers, "X-Content-Type-Options", f"{kind} conditional GET").lower() ==
-            "nosniff", f"{kind} 304: incorrect nosniff header")
+    assert_header_values(conditional_headers, "Cache-Control", "private, max-age=31536000, immutable",
+                         f"{kind} conditional GET")
+    assert_header_values(conditional_headers, "X-Content-Type-Options", "nosniff",
+                         f"{kind} conditional GET")
 
     status, _headers, _body = endpoint.request("POST", path, {"Content-Length": "0"})
     assert_status(status, 405, f"{kind} method denial")
