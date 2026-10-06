@@ -1,0 +1,8 @@
+[Unit]
+Description=No More Cloud Photos services
+Documentation=file:/usr/share/doc/nmcp/ubuntu-deployment.md
+Requires=nmcp-api.service nmcp-worker.service nmcp-files.service
+After=nmcp-api.service nmcp-worker.service nmcp-files.service
+
+[Install]
+WantedBy=multi-user.target

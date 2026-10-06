@@ -1,0 +1,11 @@
+# Ubuntu 24.04 runtime packages. Record the exact installed versions in the
+# deployment evidence; this file deliberately does not claim repository-wide
+# versions that the project does not control.
+ca-certificates
+curl
+ffmpeg
+libimage-exiftool-perl
+nginx-core
+postgresql
+tzdata
+util-linux

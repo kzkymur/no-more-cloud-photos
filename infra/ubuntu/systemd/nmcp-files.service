@@ -1,0 +1,49 @@
+[Unit]
+Description=No More Cloud Photos Tailnet TLS and read-only File Server
+Documentation=file:/usr/share/doc/nmcp/ubuntu-deployment.md
+After=network-online.target nmcp-api.service
+Wants=network-online.target
+Requires=nmcp-api.service
+PartOf=nmcp.target
+
+[Service]
+Type=simple
+User=nmcp
+Group=nmcp
+Slice=nmcp.slice
+LoadCredential=tls-cert.pem:/etc/nmcp/tls-cert.pem
+LoadCredential=tls-key.pem:/etc/nmcp/tls-key.pem
+ExecStartPre=/usr/bin/install -d -m 0700 /run/nmcp-nginx/client /run/nmcp-nginx/proxy
+ExecStartPre=/usr/sbin/nginx -t -c /etc/nmcp/nginx.conf
+ExecStart=/usr/sbin/nginx -c /etc/nmcp/nginx.conf -g "daemon off;"
+ExecReload=/usr/sbin/nginx -c /etc/nmcp/nginx.conf -s reload
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+RuntimeDirectory=nmcp-nginx
+RuntimeDirectoryMode=0700
+InaccessiblePaths=/var/lib/nmcp
+BindReadOnlyPaths=/var/lib/nmcp/media/originals:/srv/nmcp/originals
+BindReadOnlyPaths=/var/lib/nmcp/media/renditions:/srv/nmcp/renditions
+UMask=0077
+
+[Install]
+WantedBy=nmcp.target
