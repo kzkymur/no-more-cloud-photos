@@ -308,7 +308,7 @@ func TestTransformInvokesSVTAV1WithoutH264FallbackAndTruncatesFailure(t *testing
 		t.Fatalf("cumulative output error = %v", err)
 	}
 	r.generatedBytesBefore = 0
-	runner = &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, runErrorAt: 2, writeOutput: []byte("partial")}
+	runner = &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, runErrorAt: 3, writeOutput: []byte("partial")}
 	e.run = runner
 	if err := e.transform(r, io.Discard); !isCode(err, "encode_failed") {
 		t.Fatalf("error = %v", err)
@@ -424,6 +424,9 @@ func (f *fakeRunner) run(path string, args []string, _ int64) ([]byte, []byte, e
 	}
 	if f.runErrorAt == f.runCalls {
 		return nil, nil, errors.New("fake command failure")
+	}
+	if strings.HasSuffix(path, "ffmpeg") && len(args) > 0 && args[len(args)-1] == "-" && slices.Contains(args, "null") {
+		return nil, nil, nil
 	}
 	if len(f.runs) == 0 {
 		return nil, nil, nil

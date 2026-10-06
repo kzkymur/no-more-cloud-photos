@@ -13,14 +13,14 @@ import (
 	"testing"
 )
 
-func TestSourceDecodeAndTransformUseXError(t *testing.T) {
+func TestSourceDecodeAndTransformFailFastOnDecodeErrors(t *testing.T) {
 	frames := frameJSON(0, 320, 180, frameTiming{0, 40}, frameTiming{40, 40})
 	runner := &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}}
-	e := engine{ffprobe: "/p/ffprobe", run: runner}
+	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
 	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); err != nil {
 		t.Fatal(err)
 	}
-	if !containsSequence(runner.lastStream, "-v", "error", "-xerror") {
+	if !containsSequence(runner.lastStream, "-err_detect", "explode") || !containsSequence(runner.lastFFmpeg, "-v", "error", "-xerror") {
 		t.Fatalf("frame decode args = %q", runner.lastStream)
 	}
 
@@ -35,7 +35,7 @@ func TestSourceDecodeAndTransformUseXError(t *testing.T) {
 	if !containsSequence(runner.lastFFmpeg, "-v", "error", "-xerror") {
 		t.Fatalf("transform args = %q", runner.lastFFmpeg)
 	}
-	runner = &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, runErrorAt: 2, writeOutput: []byte("partial")}
+	runner = &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, runErrorAt: 3, writeOutput: []byte("partial")}
 	e.run = runner
 	if err := e.transform(r, io.Discard); !isCode(err, "encode_failed") {
 		t.Fatalf("fail-fast transform error = %v", err)

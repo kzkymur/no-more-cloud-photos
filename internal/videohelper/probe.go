@@ -176,7 +176,7 @@ type frameAccounting struct {
 }
 
 func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBase rational, streamDurationTicks int64, limit limits) (frameAccounting, error) {
-	args := []string{"-v", "error", "-xerror", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,stream_index,pts,duration,pkt_duration,width,height:frame_side_data=side_data_type,max_luminance,max_content", "-of", "json", path}
+	args := []string{"-v", "error", "-err_detect", "explode", "-threads", "1", "-select_streams", strconv.Itoa(streamIndex), "-show_frames", "-show_entries", "frame=media_type,stream_index,pts,duration,pkt_duration,width,height:frame_side_data=side_data_type,max_luminance,max_content", "-of", "json", path}
 	var result frameAccounting
 	var lastDuration int64
 	err := e.run.stream(e.ffprobe, args, func(reader io.Reader) error {
@@ -244,6 +244,14 @@ func (e *engine) frameFacts(path string, streamIndex, width, height int, timeBas
 		if errors.As(err, &protocolErr) {
 			return frameAccounting{}, err
 		}
+		return frameAccounting{}, fail("unsupported_input")
+	}
+	// ffprobe reports frame facts but does not implement ffmpeg's -xerror and
+	// can exit successfully after concealed/recoverable decoder errors even with
+	// err_detect=explode. Require a separate full selected-stream decode whose
+	// process status is fatal on every logged decode error before trusting facts.
+	if _, _, err := e.run.run(e.ffmpeg, []string{"-v", "error", "-xerror", "-nostdin", "-threads", "1", "-i", path,
+		"-map", "0:" + strconv.Itoa(streamIndex), "-an", "-sn", "-dn", "-threads:v", "1", "-f", "null", "-"}, 1<<20); err != nil {
 		return frameAccounting{}, fail("unsupported_input")
 	}
 	if len(result.pts) == 0 || streamDurationTicks < 0 {
