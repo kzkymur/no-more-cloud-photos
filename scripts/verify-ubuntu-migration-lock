@@ -7,7 +7,8 @@ work=$(/usr/bin/mktemp -d /var/tmp/nmcp-migration-lock.XXXXXX)
 cleanup() {
   /usr/bin/systemctl stop nmcp-lock-dependent.service nmcp-lock-migrate.service >/dev/null 2>&1 || true
   /usr/bin/rm -f /run/systemd/system/nmcp-lock-dependent.service /run/systemd/system/nmcp-lock-migrate.service \
-    /run/nmcp-migration-complete /run/lock/nmcp-deploy.lock
+    /run/nmcp-migration-complete /run/lock/nmcp-deploy.lock \
+    /run/lock/nmcp-migration-execution.lock
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
   /usr/bin/rm -rf /opt/nmcp /usr/local/libexec/nmcp "$work"
 }
@@ -26,6 +27,7 @@ EOF
 /usr/bin/chown -R root:root /opt/nmcp/current
 /usr/bin/chmod 0755 /opt/nmcp/current/bin/nmcp-admin
 /usr/bin/install -o root -g root -m 0600 /dev/null /run/lock/nmcp-deploy.lock
+/usr/bin/install -o root -g root -m 0600 /dev/null /run/lock/nmcp-migration-execution.lock
 
 # Direct migration must not enter while a deployment owns the lock.
 /usr/bin/flock /run/lock/nmcp-deploy.lock -c "sleep 3" & holder=$!
@@ -64,7 +66,8 @@ wait "$holder"
 /usr/bin/printf '/opt/nmcp/current\n' > /run/nmcp-migration-complete
 /usr/bin/chown root:root /run/nmcp-migration-complete
 /usr/bin/chmod 0600 /run/nmcp-migration-complete
-/usr/bin/flock /run/lock/nmcp-deploy.lock -c "/usr/local/libexec/nmcp/run-ubuntu-migration"
+/usr/bin/flock /run/lock/nmcp-deploy.lock -c \
+  "/usr/bin/flock /run/lock/nmcp-migration-execution.lock -c /usr/local/libexec/nmcp/run-ubuntu-migration"
 [[ ! -e /run/nmcp-migration-complete ]]
 [[ ! -e $work/entries ]]
 

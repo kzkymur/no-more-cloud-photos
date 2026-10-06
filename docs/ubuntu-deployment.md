@@ -124,15 +124,20 @@ deployment lock; active, activating, deactivating, reloading, and failed states
 are refused before any asset changes.
 
 All stage/activate/rollback/host/TLS mutations and every direct or
-dependency-triggered `nmcp-migrate.service` execution share one deployment lock.
-The installer retains the lock across link, exact-release migration,
+dependency-triggered `nmcp-migrate.service` execution share the deployment
+serializer. The non-forking installer process itself retains the primary lock
+across link, exact-release migration,
 service-state, and evidence mutations. It then publishes root-only completion
 evidence; the systemd singleton consumes that evidence without doing database
 work while the installer owns the lock. Ordinary direct/dependency-triggered
 migrations acquire and retain the lock themselves and snapshot the exact release
-path before execution. A separate root-only execution lease is held by the
-transient migration itself, so owner death releases the primary lock but still
-blocks every new host/release/TLS mutation until the exact binary exits.
+path before execution. The installer also acquires a separate root-only
+execution lease before dispatch and atomically transfers that same locked open
+file description to the transient migration over a root-only Unix socket. The
+receiver verifies the descriptor and acknowledges ownership before database
+work. Thus installer death before transfer prevents execution, while death after
+transfer leaves the child holding the lease and blocks every new
+host/release/TLS/direct-migration mutation until the exact binary exits.
 Successful oneshot migration remains active so production
 API/Worker dependency starts cannot invoke it a second time. Staging requires an exact manifest and fixed runtime-safe modes,
 then proves the `nmcp` identity can traverse/read/execute the installed release.
@@ -151,7 +156,9 @@ Rollback is fail-closed:
 sudo scripts/install-ubuntu-release rollback <PREVIOUS_RELEASE_ID>
 ```
 
-The target release's `nmcp-admin migrate status --json` must report fully
+Both this status transient and every migration transient declare `Requires=`
+and `After=` on the reviewed concrete PostgreSQL unit. The target release's
+`nmcp-admin migrate status --json` must report fully
 compatible (exit 0) against the current database before the link changes. Any
 pending/drift/error status refuses rollback; database restoration is a separate,
 explicit disaster-recovery operation. Never delete the last known-good release

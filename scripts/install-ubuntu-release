@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 0077
 
 usage() {
   cat >&2 <<'EOF'
@@ -24,10 +25,10 @@ release_path=$release_root/$release_id
 current=/opt/nmcp/current
 evidence=/var/lib/nmcp/deployment
 if [[ ${NMCP_DEPLOY_LOCKED:-} != 1 ]]; then
-  exec /usr/bin/flock --exclusive --nonblock /run/lock/nmcp-deploy.lock \
+  exec /usr/bin/flock --exclusive --nonblock --no-fork /run/lock/nmcp-deploy.lock \
     /usr/bin/env NMCP_DEPLOY_LOCKED=1 "$0" "$@"
 fi
-/usr/bin/python3 - /run/lock/nmcp-deploy.lock "$PPID" <<'PY'
+/usr/bin/python3 - /run/lock/nmcp-deploy.lock "$$" <<'PY'
 import os, pathlib, sys
 lock, owner = sys.argv[1:]
 st = os.stat(lock)
@@ -44,7 +45,6 @@ exec 8>/run/lock/nmcp-migration-execution.lock
   printf 'install-ubuntu-release: an orphaned migration execution is still active\n' >&2
   exit 1
 }
-/usr/bin/flock --unlock 8
 
 verify_release() {
   local directory=$1
@@ -152,18 +152,52 @@ stop_services() {
   /usr/bin/systemctl stop nmcp.target nmcp-api.service nmcp-worker.service nmcp-files.service || true
 }
 
+admin_sequence=0
+run_admin() {
+  local admin_release=$1 operation=$2 subcommand=$3
+  local handoff broker status=0 unit
+  admin_sequence=$((admin_sequence + 1))
+  handoff=/run/nmcp-migration-handoff.$$.$admin_sequence
+  unit=nmcp-deploy-admin-$$-$admin_sequence
+  "$script_dir/handoff-ubuntu-migration-lock" send "$handoff" \
+    /run/lock/nmcp-migration-execution.lock 8 &
+  broker=$!
+  for attempt in {1..100}; do
+    [[ -S $handoff ]] && break
+    if ! /usr/bin/kill -0 "$broker" 2>/dev/null; then
+      wait "$broker" || true
+      printf 'install-ubuntu-release: execution-lease handoff failed before dispatch\n' >&2
+      return 1
+    fi
+    [[ $attempt -lt 100 ]] || {
+      /usr/bin/kill "$broker" 2>/dev/null || true
+      wait "$broker" 2>/dev/null || true
+      printf 'install-ubuntu-release: execution-lease handoff socket was not ready\n' >&2
+      return 1
+    }
+    /usr/bin/sleep 0.01
+  done
+  /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="$unit" \
+    --property=Slice=nmcp.slice \
+    --property="Requires=$postgresql_unit" --property="After=$postgresql_unit" \
+    --property=EnvironmentFile=/etc/nmcp/admin.env \
+    --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
+    --property=ProtectSystem=strict --property=ProtectHome=yes \
+    -- /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock receive "$handoff" \
+    /run/lock/nmcp-migration-execution.lock \
+    /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+    "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json || status=$?
+  if ((status != 0)); then /usr/bin/kill "$broker" 2>/dev/null || true; fi
+  if ! wait "$broker"; then status=1; fi
+  /usr/bin/rm -f -- "$handoff"
+  return "$status"
+}
+
 run_migration() {
   local migration_release token=/run/nmcp-migration-complete temporary
   migration_release=$(/usr/bin/readlink -f -- "$current")
   temporary=$token.new.$$
-  /usr/bin/systemd-run --quiet --wait --collect --pipe --unit="nmcp-deploy-migrate-$$" \
-    --property=Slice=nmcp.slice \
-    --property=EnvironmentFile=/etc/nmcp/admin.env \
-    --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
-    --property=ProtectSystem=strict --property=ProtectHome=yes \
-    -- /usr/bin/flock --exclusive /run/lock/nmcp-migration-execution.lock \
-    /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
-    "$migration_release/bin/nmcp-admin" migrate up --json || return 1
+  run_admin "$migration_release" migrate up || return 1
   /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
   /usr/bin/chown root:root "$temporary"
   /usr/bin/chmod 0600 "$temporary"
@@ -247,12 +281,7 @@ case "$action" in
     verify_runtime_access "$release_path"
     [[ -f /etc/nmcp/admin.env ]] || { printf 'host assets are not installed\n' >&2; exit 1; }
     # The old admin binary must understand the current schema before switching.
-    /usr/bin/systemd-run --quiet --wait --collect --unit=nmcp-rollback-check \
-      --uid=nmcp --gid=nmcp --property=Slice=nmcp.slice \
-      --property=EnvironmentFile=/etc/nmcp/admin.env \
-      --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
-      --property=ProtectSystem=strict --property=ProtectHome=yes \
-      -- "$release_path/bin/nmcp-admin" migrate status --json
+    run_admin "$release_path" migrate status
     old_target=
     if [[ -L $current ]]; then old_target=$(/usr/bin/readlink -f -- "$current"); fi
     was_active=false

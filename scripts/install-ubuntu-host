@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 0077
 
 usage() {
   cat >&2 <<'EOF'
@@ -52,7 +53,6 @@ exec 8>/run/lock/nmcp-migration-execution.lock
   printf 'install-ubuntu-host: an orphaned migration execution is still active\n' >&2
   exit 1
 }
-/usr/bin/flock --unlock 8
 read -r files_load files_active files_sub < <(
   /usr/bin/systemctl show nmcp-files.service \
     --property=LoadState --property=ActiveState --property=SubState --value \
@@ -174,7 +174,7 @@ done
   /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp /usr/share/doc/nmcp
 for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
-  capture-trusted-inputs run-ubuntu-migration validate-ubuntu-config \
+  capture-trusted-inputs handoff-ubuntu-migration-lock run-ubuntu-migration validate-ubuntu-config \
   verify-ubuntu-firewall verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done

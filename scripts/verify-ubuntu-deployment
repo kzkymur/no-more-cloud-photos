@@ -101,6 +101,11 @@ def main() -> int:
         "f /run/lock/nmcp-migration-execution.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
         "owner-death migration execution lease is missing",
     )
+    host_install = text(ROOT / "scripts" / "install-ubuntu-host")
+    require(
+        "handoff-ubuntu-migration-lock" in host_install,
+        "migration execution-lease handoff helper is not installed",
+    )
     require("User=root" in migrate_unit, "migration serializer must own the root-only lock")
     require(
         "setpriv --reuid=nmcp --regid=nmcp" in text(ROOT / "scripts" / "run-ubuntu-migration"),

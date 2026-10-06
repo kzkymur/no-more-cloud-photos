@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 0077
 
 lock=/run/lock/nmcp-deploy.lock
 completion=/run/nmcp-migration-complete
 current=/opt/nmcp/current
 exec 9>"$lock"
 if /usr/bin/flock --exclusive --nonblock 9; then
+  exec 8>/run/lock/nmcp-migration-execution.lock
+  /usr/bin/flock --exclusive --nonblock 8 || {
+    printf 'run-ubuntu-migration: an orphaned migration execution is still active\n' >&2
+    exit 1
+  }
   /usr/bin/rm -f -- "$completion"
   release=$(/usr/bin/readlink -f -- "$current")
 else
   # The lock owner already ran the exact release migration. This systemd
   # dependency consumes completion evidence and performs no database work.
+  exec 8>/run/lock/nmcp-migration-execution.lock
+  if /usr/bin/flock --exclusive --nonblock 8; then
+    printf 'run-ubuntu-migration: deployment owner does not hold the execution lease\n' >&2
+    exit 1
+  fi
   [[ -f $completion && ! -L $completion \
     && $(/usr/bin/stat -c '%U:%G:%a' "$completion") == root:root:600 ]] || {
     printf 'run-ubuntu-migration: deployment lock is held without completion evidence\n' >&2

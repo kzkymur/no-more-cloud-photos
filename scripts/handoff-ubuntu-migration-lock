@@ -1,0 +1,85 @@
+#!/usr/bin/python3
+"""Atomically transfer an already-locked deployment FD into a transient unit."""
+
+import array
+import fcntl
+import os
+import pathlib
+import socket
+import stat
+import sys
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(f"handoff-ubuntu-migration-lock: {message}")
+
+
+def same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def safe_lock(lock_stat: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(lock_stat.st_mode)
+        and lock_stat.st_uid == 0
+        and lock_stat.st_gid == 0
+        and stat.S_IMODE(lock_stat.st_mode) == 0o600
+    )
+
+
+def send_fd(socket_path: str, lock_path: str, descriptor: int) -> None:
+    lock_stat = os.stat(lock_path, follow_symlinks=False)
+    if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
+        fail("sender descriptor does not name the execution lease")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        pathlib.Path(socket_path).unlink(missing_ok=True)
+        listener.bind(socket_path)
+        os.chmod(socket_path, 0o600)
+        listener.listen(1)
+        listener.settimeout(30)
+        connection, _ = listener.accept()
+        with connection:
+            rights = array.array("i", [descriptor])
+            connection.sendmsg([b"L"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)])
+            connection.settimeout(30)
+            if connection.recv(2) != b"OK":
+                fail("receiver did not confirm the execution lease")
+    finally:
+        listener.close()
+        pathlib.Path(socket_path).unlink(missing_ok=True)
+
+
+def receive_fd(socket_path: str, lock_path: str, command: list[str]) -> None:
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.connect(socket_path)
+    size = array.array("i").itemsize
+    message, ancillary, _flags, _address = connection.recvmsg(1, socket.CMSG_SPACE(size))
+    received: list[int] = []
+    for level, kind, data in ancillary:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            values = array.array("i")
+            values.frombytes(data[: len(data) - (len(data) % size)])
+            received.extend(values)
+    if message != b"L" or len(received) != 1:
+        fail("did not receive exactly one execution-lease descriptor")
+    descriptor = received[0]
+    lock_stat = os.stat(lock_path, follow_symlinks=False)
+    if not safe_lock(lock_stat) or not same_file(os.fstat(descriptor), lock_stat):
+        fail("received descriptor does not name the execution lease")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("received descriptor does not carry the execution lease")
+    os.set_inheritable(descriptor, True)
+    connection.sendall(b"OK")
+    connection.close()
+    os.execv(command[0], command)
+
+
+if len(sys.argv) >= 5 and sys.argv[1] == "send":
+    send_fd(sys.argv[2], sys.argv[3], int(sys.argv[4]))
+elif len(sys.argv) >= 5 and sys.argv[1] == "receive":
+    receive_fd(sys.argv[2], sys.argv[3], sys.argv[4:])
+else:
+    fail("usage: send SOCKET LOCK FD | receive SOCKET LOCK COMMAND [ARG ...]")
