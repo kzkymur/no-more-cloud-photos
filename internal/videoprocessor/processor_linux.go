@@ -115,6 +115,7 @@ type Result struct {
 	AudioPresent                bool
 	AudioCodec                  string
 	AudioBitrateKbps            int
+	OutputDurationUS            int64
 	Source                      Inspection
 	Audit                       Audit
 }
@@ -307,7 +308,8 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	if _, err := request.Output.Seek(0, io.SeekStart); err != nil {
 		return Result{}, ErrResourcePolicy
 	}
-	if err := p.verifyOutput(operation, operationRunner, request, response.Result); err != nil {
+	outputDurationUS, err := p.verifyOutput(operation, operationRunner, request, response.Result)
+	if err != nil {
 		return Result{}, mapOperationError(err, ctx, operation)
 	}
 	r := response.Result
@@ -315,7 +317,10 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	if r.Kind == "first-frame-avif" {
 		extension = "avif"
 	}
-	return Result{r.Kind, r.OutputMIME, extension, r.Width, r.Height, r.MaxLongEdge, r.Threads, r.CRF, r.Quality, r.BitDepth, r.Chroma, r.AudioPresent, r.AudioCodec, r.AudioBitrateKbps, r.Source, publicAudit(r.Audit)}, nil
+	return Result{Kind: r.Kind, OutputMIME: r.OutputMIME, OutputExtension: extension, Width: r.Width, Height: r.Height,
+		MaxLongEdge: r.MaxLongEdge, Threads: r.Threads, CRF: r.CRF, Quality: r.Quality, BitDepth: r.BitDepth,
+		Chroma: r.Chroma, AudioPresent: r.AudioPresent, AudioCodec: r.AudioCodec, AudioBitrateKbps: r.AudioBitrateKbps,
+		OutputDurationUS: outputDurationUS, Source: r.Source, Audit: publicAudit(r.Audit)}, nil
 }
 
 func limitForKind(policy Policy, kind string) int64 {
@@ -325,43 +330,45 @@ func limitForKind(policy Policy, kind string) int64 {
 	return policy.VideoOutputMaxBytes
 }
 
-func (p *Processor) verifyOutput(ctx context.Context, runner *processrunner.Runner, request Request, transformed *transformWire) error {
+func (p *Processor) verifyOutput(ctx context.Context, runner *processrunner.Runner, request Request, transformed *transformWire) (int64, error) {
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
 	source, err := reopenInput(request.Input)
 	if err != nil {
-		return ErrProcess
+		return 0, ErrProcess
 	}
 	defer source.Close()
 	output, err := reopenInput(request.Output)
 	if err != nil {
-		return ErrProcess
+		return 0, ErrProcess
 	}
 	defer output.Close()
 	arguments := append([]string{"verify-output", "--protocol", "1", "--source", "/proc/self/fd/3", "--output", "/proc/self/fd/4",
 		"--source-mime", request.MIMEType, "--output-kind", transformed.Kind}, p.limitArguments()...)
 	result, err := runner.Run(ctx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{source, output}})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var response verificationResponse
 	if decodeProtocolJSON(result.Stdout, &response) != nil || !validEnvelope(response.Protocol, response.OK, response.ErrorCode, response.Result != nil) || !response.OK {
-		return ErrProcess
+		return 0, ErrProcess
 	}
 	got := response.Result
 	if !got.FullyDecodedVideo || got.Kind != transformed.Kind || got.Width != transformed.Width || got.Height != transformed.Height || got.VideoCodec != "av1" || got.RotationDegrees != 0 || got.HasDisplayMatrix || got.HasRotateMetadata || got.Source != transformed.Source {
-		return ErrProcess
+		return 0, ErrProcess
 	}
 	if transformed.Kind == "mp4-av1" {
 		if got.Container != "mp4" || got.SampleAspectRatio != (Rational{1, 1}) || got.BitDepth != 10 || got.Chroma != "4:2:0" || got.FrameCount != transformed.Source.FrameCount || !sha256Pattern.MatchString(got.PTSDeltaSHA256) || got.MaxTimingErrorTicks < 0 || got.MaxTimingErrorTicks > 1 || got.OutputDurationUS <= 0 || got.MaxDurationErrorTicks < 0 || got.MaxDurationErrorTicks > 1 || got.AudioPresent != transformed.AudioPresent || got.AudioPresent && (!got.FullyDecodedAudio || got.AudioCodec != "aac" || got.AudioProfile != "LC") || got.ColorPrimaries != "bt709" || got.ColorTransfer != "bt709" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
-			return ErrProcess
+			return 0, ErrProcess
 		}
 	} else if got.Container != "avif" || got.FrameCount != 1 || got.AudioPresent || got.FullyDecodedAudio || got.ColorPrimaries != "bt709" || got.ColorTransfer != "iec61966-2-1" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
-		return ErrProcess
+		return 0, ErrProcess
 	}
-	_, err = request.Output.Seek(0, io.SeekStart)
-	return err
+	if _, err = request.Output.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	return got.OutputDurationUS, nil
 }
 
 func (p *Processor) limitArguments() []string {

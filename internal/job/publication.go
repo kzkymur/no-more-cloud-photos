@@ -209,6 +209,11 @@ func validatePinnedOutput(pinned Profile, status, originalMIME, candidateMIME, r
 	case recipe.SourceMode == profiledefinition.SourceStill && recipe.FramePolicy == profiledefinition.FrameFirst && recipe.StillOutput != nil:
 		wantMIME, wantSuffix = "image/avif", ".avif"
 	case recipe.SourceMode == profiledefinition.SourceProbeAnimation && recipe.FramePolicy == profiledefinition.FrameAll && recipe.AnimationOutput != nil:
+		// A probe-animation WebP may be static. The trusted executor routes that
+		// classification through the still processor even for an all-frame recipe.
+		if originalMIME == "image/webp" && candidateMIME == "image/avif" && strings.HasSuffix(relativePath, ".avif") {
+			return nil
+		}
 		wantMIME, wantSuffix = "image/webp", ".webp"
 	case recipe.SourceMode == profiledefinition.SourceProbeAnimation && recipe.FramePolicy == profiledefinition.FrameFirst && recipe.StillOutput != nil:
 		wantMIME, wantSuffix = "image/avif", ".avif"

@@ -108,6 +108,9 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 					if result.Width != wantWidth || result.Height != wantHeight {
 						t.Fatalf("dimensions = %dx%d, want %dx%d", result.Width, result.Height, wantWidth, wantHeight)
 					}
+					if (target.mime == "video/mp4" && result.OutputDurationUS <= 0) || (target.mime == "image/avif" && result.OutputDurationUS != 0) {
+						t.Fatalf("verified output duration = %d for %s", result.OutputDurationUS, target.mime)
+					}
 					independentProbeAndDecode(t, ffprobe, ffmpeg, output.Name(), target.mime, test.wantAudio && target.mime == "video/mp4", wantWidth, wantHeight, test.outputAudioRate)
 				})
 			}
