@@ -6,8 +6,8 @@ Before=nmcp-api.service nmcp-worker.service
 
 [Service]
 Type=oneshot
-User=nmcp
-Group=nmcp
+User=root
+Group=root
 Slice=nmcp.slice
 EnvironmentFile=/etc/nmcp/admin.env
 ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration

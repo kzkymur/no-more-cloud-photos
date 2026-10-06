@@ -24,12 +24,12 @@ sleep 1
 EOF
 /usr/bin/chown -R root:root /opt/nmcp/current
 /usr/bin/chmod 0755 /opt/nmcp/current/bin/nmcp-admin
-/usr/bin/install -o root -g nmcp -m 0660 /dev/null /run/lock/nmcp-deploy.lock
+/usr/bin/install -o root -g root -m 0600 /dev/null /run/lock/nmcp-deploy.lock
 
 # Direct migration must not enter while a deployment owns the lock.
 /usr/bin/flock /run/lock/nmcp-deploy.lock -c "sleep 3" & holder=$!
 /usr/bin/sleep 0.2
-if /usr/sbin/runuser -u nmcp -- /usr/local/libexec/nmcp/run-ubuntu-migration; then
+if /usr/local/libexec/nmcp/run-ubuntu-migration; then
   printf 'direct migration bypassed deployment lock\n' >&2; exit 1
 fi
 [[ ! -e $work/entries ]]
@@ -38,7 +38,7 @@ wait "$holder"
 cat > /run/systemd/system/nmcp-lock-migrate.service <<EOF
 [Service]
 Type=oneshot
-User=nmcp
+User=root
 ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration
 EOF
 cat > /run/systemd/system/nmcp-lock-dependent.service <<'EOF'
@@ -61,7 +61,8 @@ wait "$holder"
 # The owning deployment may delegate exactly its current release migration.
 /usr/bin/printf '/opt/nmcp/current\n' > /run/nmcp-migrate-delegation
 /usr/bin/chown root:root /run/nmcp-migrate-delegation
-/usr/bin/chmod 0644 /run/nmcp-migrate-delegation
-/usr/bin/flock /run/lock/nmcp-deploy.lock -c "/usr/sbin/runuser -u nmcp -- /usr/local/libexec/nmcp/run-ubuntu-migration"
+/usr/bin/chmod 0600 /run/nmcp-migrate-delegation
+/usr/bin/flock /run/lock/nmcp-deploy.lock -c "/usr/local/libexec/nmcp/run-ubuntu-migration"
+[[ ! -e /run/nmcp-migrate-delegation ]]
 [[ $(/usr/bin/wc -l < "$work/entries") -eq 1 ]]
 printf 'Direct and dependency migration lock races passed\n'

@@ -72,7 +72,8 @@ def main() -> int:
     for name in ("nmcp-migrate.service", "nmcp-api.service", "nmcp-worker.service", "nmcp-files.service"):
         unit = text(units / name)
         require("Slice=nmcp.slice" in unit, f"{name} escapes aggregate slice")
-        require("User=nmcp" in unit and "Group=nmcp" in unit, f"{name} identity changed")
+        if name != "nmcp-migrate.service":
+            require("User=nmcp" in unit and "Group=nmcp" in unit, f"{name} identity changed")
         require("NoNewPrivileges=yes" in unit and "ProtectSystem=strict" in unit, f"{name} hardening missing")
         require("CPUQuota=" not in unit and "MemoryMax=" not in unit, f"{name} duplicates aggregate budget")
     require("NMCP_API_ADDR=127.0.0.1:8080" in text(UBUNTU / "env" / "api.env.example"), "API example is not loopback-only")
@@ -86,8 +87,13 @@ def main() -> int:
         "systemd migration bypasses the deployment serializer",
     )
     require(
-        "f /run/lock/nmcp-deploy.lock 0660 root nmcp" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "f /run/lock/nmcp-deploy.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
         "shared migration lock ownership/mode is missing",
+    )
+    require("User=root" in migrate_unit, "migration serializer must own the root-only lock")
+    require(
+        "setpriv --reuid=nmcp --regid=nmcp" in text(ROOT / "scripts" / "run-ubuntu-migration"),
+        "migration body does not drop permanently to nmcp",
     )
 
     files_unit = text(units / "nmcp-files.service")

@@ -17,7 +17,7 @@ for path in /opt/nmcp /etc/nmcp /var/lib/nmcp/deployment /usr/local/libexec/nmcp
 done
 /usr/bin/install -d -o root -g root -m 0755 /opt/nmcp/releases /usr/local/libexec/nmcp
 /usr/bin/install -d -o root -g root -m 0700 /etc/nmcp /var/lib/nmcp/deployment
-/usr/bin/install -o root -g nmcp -m 0660 /dev/null /run/lock/nmcp-deploy.lock
+/usr/bin/install -o root -g root -m 0600 /dev/null /run/lock/nmcp-deploy.lock
 /usr/bin/printf 'postgresql@nmcp-test.service\n' > /etc/nmcp/postgresql-unit
 /usr/bin/printf 'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable\nNMCP_LOG_LEVEL=info\nNMCP_SHUTDOWN_TIMEOUT=30s\n' > /etc/nmcp/admin.env
 /usr/bin/chmod 0600 /etc/nmcp/*
@@ -49,7 +49,7 @@ make_release candidate
 cat > /run/systemd/system/nmcp-migrate.service <<EOF
 [Service]
 Type=oneshot
-User=nmcp
+User=root
 EnvironmentFile=/etc/nmcp/admin.env
 ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration
 EOF

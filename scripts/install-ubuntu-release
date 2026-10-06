@@ -140,7 +140,7 @@ run_migration() {
   temporary=$token.new.$$
   /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
   /usr/bin/chown root:root "$temporary"
-  /usr/bin/chmod 0644 "$temporary"
+  /usr/bin/chmod 0600 "$temporary"
   /usr/bin/mv -f -- "$temporary" "$token"
   /usr/bin/systemctl reset-failed nmcp-migrate.service >/dev/null 2>&1 || true
   if ! /usr/bin/systemctl restart nmcp-migrate.service; then

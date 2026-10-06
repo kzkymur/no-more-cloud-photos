@@ -9,7 +9,7 @@ if ! /usr/bin/flock --exclusive --nonblock 9; then
   # A deploy may delegate exactly one migration to this systemd singleton while
   # retaining the lock across link, evidence, and service-state mutations.
   [[ -f $delegation && ! -L $delegation \
-    && $(/usr/bin/stat -c '%U:%G:%a' "$delegation") == root:root:644 ]] || {
+    && $(/usr/bin/stat -c '%U:%G:%a' "$delegation") == root:root:600 ]] || {
     printf 'run-ubuntu-migration: deployment lock is held without a valid delegation\n' >&2
     exit 1
   }
@@ -19,5 +19,7 @@ if ! /usr/bin/flock --exclusive --nonblock 9; then
     printf 'run-ubuntu-migration: delegation does not match the active release\n' >&2
     exit 1
   }
+  /usr/bin/rm -f -- "$delegation"
 fi
-exec "$current/bin/nmcp-admin" migrate up --json
+exec /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+  "$current/bin/nmcp-admin" migrate up --json
