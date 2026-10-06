@@ -55,7 +55,11 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 	if outputLimit <= 0 {
 		return fail("output_too_large")
 	}
-	args := []string{"-v", "error", "-nostdin", "-y", "-noautorotate", "-threads", "1", "-i", r.input, "-map", "0:" + strconv.Itoa(source.VideoStreamIndex), "-vf", videoFilter, "-map_metadata", "-1", "-map_chapters", "-1", "-threads:v", "1"}
+	args := []string{"-v", "error", "-nostdin", "-y", "-noautorotate"}
+	if source.RotationDegrees != 0 {
+		args = append(args, "-display_rotation:v:0", "0")
+	}
+	args = append(args, "-threads", "1", "-i", r.input, "-map", "0:"+strconv.Itoa(source.VideoStreamIndex), "-vf", videoFilter, "-map_metadata", "-1", "-map_chapters", "-1", "-threads:v", "1")
 	if r.kind == "mp4-av1" {
 		args = append(args, "-c:v", "libsvtav1", "-crf", "32", "-preset", "6", "-svtav1-params", "lp=1", "-fps_mode:v", "passthrough", "-enc_time_base:v", source.TimeBase.NumeratorString()+"/"+source.TimeBase.DenominatorString(), "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv")
 		if source.AudioPresent {
