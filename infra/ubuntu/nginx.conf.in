@@ -28,8 +28,11 @@ http {
         video/quicktime mov;
     }
 
-    access_log /dev/stdout;
-    error_log /dev/stderr warn;
+    # systemd's stdout is a journal socket and cannot be reopened through
+    # /dev/stdout. Send access records to the local journal/syslog socket and
+    # keep errors on the inherited stderr descriptor.
+    access_log syslog:server=unix:/dev/log,facility=local7,tag=nmcp_files,severity=info combined;
+    error_log stderr warn;
     server_tokens off;
     sendfile on;
     client_body_temp_path /run/nmcp-nginx/client;
