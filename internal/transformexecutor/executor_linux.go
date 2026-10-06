@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	defaultAbortTimeout = 5 * time.Second
-	maxAuditBytes       = 1 << 20
+	defaultAbortTimeout  = 5 * time.Second
+	maxAuditBytes        = 1 << 20
+	maxOriginalSizeBytes = int64(20 * 1024 * 1024 * 1024)
 )
 
 type Repository interface {
@@ -44,8 +45,13 @@ type Temporary interface {
 }
 
 type Storage interface {
-	OpenOriginal(context.Context, storage.OriginalKey) (*os.File, error)
+	OpenOriginal(context.Context, storage.OriginalKey, storage.Validation) (Original, error)
 	BeginRendition(context.Context, storage.RenditionKey, storage.AttemptID) (Temporary, error)
+}
+
+type Original interface {
+	UseReadOnlyFile(func(*os.File) error) error
+	Close() error
 }
 
 type StillProcessor interface {
@@ -80,8 +86,8 @@ type Executor struct {
 // storage contract.
 type StoreAdapter struct{ Store *storage.Store }
 
-func (adapter StoreAdapter) OpenOriginal(ctx context.Context, key storage.OriginalKey) (*os.File, error) {
-	return adapter.Store.OpenOriginal(ctx, key)
+func (adapter StoreAdapter) OpenOriginal(ctx context.Context, key storage.OriginalKey, validation storage.Validation) (Original, error) {
+	return adapter.Store.OpenOriginalPinned(ctx, key, validation)
 }
 
 func (adapter StoreAdapter) BeginRendition(ctx context.Context, key storage.RenditionKey, attempt storage.AttemptID) (Temporary, error) {
@@ -109,6 +115,15 @@ func (executor *Executor) Execute(ctx context.Context, lease job.Lease, limits w
 	if err != nil {
 		return err
 	}
+	expectedSHA256, err := decodeSHA256(lease.Original.SHA256)
+	if err != nil {
+		return err
+	}
+	original, err := executor.storage.OpenOriginal(ctx, originalKey, storage.Validation{ExpectedSize: lease.Original.SizeBytes, ExpectedSHA256: &expectedSHA256})
+	if err != nil {
+		return cancellationCause(ctx, err)
+	}
+	defer original.Close()
 	generatedBytes := lease.GeneratedBytes
 	for _, target := range lease.Targets {
 		if err := executor.repository.BeginTarget(ctx, lease.ID, lease.Token, target.ID); err != nil {
@@ -118,7 +133,7 @@ func (executor *Executor) Execute(ctx context.Context, lease job.Lease, limits w
 		if err != nil {
 			return executor.markFailed(ctx, lease, target, err)
 		}
-		local, size, err := executor.executeTarget(ctx, lease, target, recipe, originalKey, attemptID, generatedBytes)
+		local, size, err := executor.executeTarget(ctx, lease, target, recipe, original, originalKey, attemptID, generatedBytes)
 		if err == nil {
 			generatedBytes += size
 			continue
@@ -158,17 +173,16 @@ type processorAudit struct {
 	Result              any                               `json:"result"`
 }
 
-func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, target job.Target, recipe profile.Recipe, originalKey storage.OriginalKey, attemptID storage.AttemptID, generatedBytes int64) (local bool, size int64, returnErr error) {
-	input, err := executor.storage.OpenOriginal(ctx, originalKey)
-	if err != nil {
-		return true, 0, err
-	}
-	defer input.Close()
-
+func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, target job.Target, recipe profile.Recipe, original Original, originalKey storage.OriginalKey, attemptID storage.AttemptID, generatedBytes int64) (local bool, size int64, returnErr error) {
 	kind := recipe.SourceMode
 	classification := animationprocessor.Classification("")
 	if lease.Original.MIMEType == "image/webp" {
-		inspection, err := executor.animation.Inspect(ctx, animationprocessor.InspectRequest{Input: input, MIMEType: lease.Original.MIMEType})
+		var inspection animationprocessor.Inspection
+		err := original.UseReadOnlyFile(func(input *os.File) error {
+			var inspectErr error
+			inspection, inspectErr = executor.animation.Inspect(ctx, animationprocessor.InspectRequest{Input: input, MIMEType: lease.Original.MIMEType})
+			return inspectErr
+		})
 		if err != nil {
 			return true, 0, mapProcessorError(ctx, err)
 		}
@@ -211,35 +225,37 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 
 	var transformed transformResult
 	err = temporary.UseWritableFile(func(output *os.File) error {
-		var processErr error
-		switch kind {
-		case profile.SourceStill:
-			result, err := executor.still.Transform(ctx, stillprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe})
-			processErr = err
-			transformed = transformResult{mimeType: result.OutputMIME, extension: storage.RenditionAVIF, width: result.Width, height: result.Height,
-				audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyStill, InputClassification: classification, Result: result}}
-		case profile.SourceProbeAnimation:
-			result, err := executor.animation.Transform(ctx, animationprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe})
-			processErr = err
-			transformed = transformResult{mimeType: result.OutputMIME, extension: extension, width: result.Width, height: result.Height,
-				audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyAnimation, InputClassification: classification, Result: result}}
-			if result.OutputMIME == "image/webp" {
-				duration := result.Source.DurationMS
-				transformed.durationMS = &duration
+		return original.UseReadOnlyFile(func(input *os.File) error {
+			var processErr error
+			switch kind {
+			case profile.SourceStill:
+				result, err := executor.still.Transform(ctx, stillprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe})
+				processErr = err
+				transformed = transformResult{mimeType: result.OutputMIME, extension: storage.RenditionAVIF, width: result.Width, height: result.Height,
+					audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyStill, InputClassification: classification, Result: result}}
+			case profile.SourceProbeAnimation:
+				result, err := executor.animation.Transform(ctx, animationprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe})
+				processErr = err
+				transformed = transformResult{mimeType: result.OutputMIME, extension: extension, width: result.Width, height: result.Height,
+					audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyAnimation, InputClassification: classification, Result: result}}
+				if result.OutputMIME == "image/webp" {
+					duration := result.Source.DurationMS
+					transformed.durationMS = &duration
+				}
+			case profile.SourceVideo:
+				result, err := executor.video.Transform(ctx, videoprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe, GeneratedBytesBefore: generatedBytes, ExpectedVideoStreamIndex: lease.Original.PrimaryVideoStreamIndex})
+				processErr = err
+				transformed = transformResult{mimeType: result.OutputMIME, extension: extension, width: result.Width, height: result.Height,
+					audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyVideo, Result: result}}
+				if result.OutputMIME == "video/mp4" {
+					duration := result.OutputDurationUS / 1000
+					transformed.durationMS = &duration
+				}
+			default:
+				processErr = job.ErrInvariant
 			}
-		case profile.SourceVideo:
-			result, err := executor.video.Transform(ctx, videoprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe, GeneratedBytesBefore: generatedBytes, ExpectedVideoStreamIndex: lease.Original.PrimaryVideoStreamIndex})
-			processErr = err
-			transformed = transformResult{mimeType: result.OutputMIME, extension: extension, width: result.Width, height: result.Height,
-				audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyVideo, Result: result}}
-			if result.OutputMIME == "video/mp4" {
-				duration := result.OutputDurationUS / 1000
-				transformed.durationMS = &duration
-			}
-		default:
-			processErr = job.ErrInvariant
-		}
-		return mapProcessorError(ctx, processErr)
+			return mapProcessorError(ctx, processErr)
+		})
 	})
 	if err != nil {
 		return true, 0, err
@@ -279,7 +295,7 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 func validateLease(lease job.Lease) (storage.OriginalKey, storage.AttemptID, error) {
 	video := lease.Original != nil && (lease.Original.MIMEType == "video/mp4" || lease.Original.MIMEType == "video/quicktime")
 	if lease.Type != job.TypeTransform || lease.Original == nil || lease.ID == "" || lease.Token == "" || lease.MediaID == "" ||
-		lease.Original.MediaID != lease.MediaID || lease.Original.SizeBytes < 0 || !validSHA256(lease.Original.SHA256) ||
+		lease.Original.MediaID != lease.MediaID || lease.Original.SizeBytes < 0 || lease.Original.SizeBytes > maxOriginalSizeBytes || !validSHA256(lease.Original.SHA256) ||
 		(lease.Original.Width == nil) != (lease.Original.Height == nil) ||
 		(lease.Original.Width != nil && (*lease.Original.Width <= 0 || *lease.Original.Height <= 0)) ||
 		(lease.Original.DurationMS != nil && *lease.Original.DurationMS < 0) ||
@@ -437,6 +453,16 @@ func validSHA256(value string) bool {
 		}
 	}
 	return true
+}
+
+func decodeSHA256(value string) ([sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != len(digest) {
+		return digest, job.ErrInvalid
+	}
+	copy(digest[:], decoded)
+	return digest, nil
 }
 
 func mustTargetID(value string) storage.JobTargetID {

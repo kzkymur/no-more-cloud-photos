@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -43,11 +45,15 @@ type fakeRepository struct {
 	candidates  []job.Rendition
 	publishErr  error
 	publishHook func(job.Rendition) error
+	beginHook   func() error
 	marks       []job.FailureCode
 }
 
 func (repository *fakeRepository) BeginTarget(context.Context, string, string, string) error {
 	*repository.events = append(*repository.events, "begin-target")
+	if repository.beginHook != nil {
+		return repository.beginHook()
+	}
 	return nil
 }
 
@@ -74,7 +80,7 @@ type fakeStorage struct {
 	attemptIDs []string
 }
 
-func (store *fakeStorage) OpenOriginal(context.Context, storage.OriginalKey) (*os.File, error) {
+func (store *fakeStorage) OpenOriginal(_ context.Context, _ storage.OriginalKey, validation storage.Validation) (Original, error) {
 	file, err := os.CreateTemp(store.t.TempDir(), "original")
 	if err != nil {
 		store.t.Fatal(err)
@@ -82,11 +88,27 @@ func (store *fakeStorage) OpenOriginal(context.Context, storage.OriginalKey) (*o
 	if _, err := file.Write([]byte("original")); err != nil {
 		store.t.Fatal(err)
 	}
-	if _, err := file.Seek(0, 0); err != nil {
-		store.t.Fatal(err)
+	contents := []byte("original")
+	digest := sha256.Sum256(contents)
+	if validation.ExpectedSize != int64(len(contents)) || validation.ExpectedSHA256 == nil || *validation.ExpectedSHA256 != digest {
+		_ = file.Close()
+		return nil, storage.ErrValidation
 	}
-	return file, nil
+	return &fakeOriginal{file: file}, nil
 }
+
+type fakeOriginal struct{ file *os.File }
+
+func (original *fakeOriginal) UseReadOnlyFile(use func(*os.File) error) error {
+	file, err := os.Open("/proc/self/fd/" + strconv.Itoa(int(original.file.Fd())))
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return use(file)
+}
+
+func (original *fakeOriginal) Close() error { return original.file.Close() }
 
 func (store *fakeStorage) BeginRendition(_ context.Context, key storage.RenditionKey, attempt storage.AttemptID) (Temporary, error) {
 	file, err := os.CreateTemp(store.t.TempDir(), "rendition")
@@ -133,16 +155,36 @@ type fakeProcessors struct {
 	classification animationprocessor.Classification
 	stillHook      func(context.Context) error
 	videoHook      func(videoprocessor.Request) error
+	inspectHook    func(animationprocessor.InspectRequest) error
+	animationHook  func(animationprocessor.Request) error
+	stillInput     [][]byte
+	inspectInput   [][]byte
+	animationInput [][]byte
 	videoRequests  []videoprocessor.Request
 }
 
-func (processors *fakeProcessors) Inspect(context.Context, animationprocessor.InspectRequest) (animationprocessor.Inspection, error) {
+func (processors *fakeProcessors) Inspect(_ context.Context, request animationprocessor.InspectRequest) (animationprocessor.Inspection, error) {
 	processors.calls = append(processors.calls, "inspect")
+	contents, err := io.ReadAll(request.Input)
+	if err != nil {
+		return animationprocessor.Inspection{}, err
+	}
+	processors.inspectInput = append(processors.inspectInput, contents)
+	if processors.inspectHook != nil {
+		if err := processors.inspectHook(request); err != nil {
+			return animationprocessor.Inspection{}, err
+		}
+	}
 	return animationprocessor.Inspection{Classification: processors.classification}, nil
 }
 
 func (processors *fakeProcessors) Transform(ctx context.Context, request stillprocessor.Request) (stillprocessor.Result, error) {
 	processors.calls = append(processors.calls, "still")
+	contents, err := io.ReadAll(request.Input)
+	if err != nil {
+		return stillprocessor.Result{}, err
+	}
+	processors.stillInput = append(processors.stillInput, contents)
 	if processors.stillHook != nil {
 		if err := processors.stillHook(ctx); err != nil {
 			return stillprocessor.Result{}, err
@@ -154,6 +196,16 @@ func (processors *fakeProcessors) Transform(ctx context.Context, request stillpr
 
 func (processors *fakeProcessors) TransformAnimation(_ context.Context, request animationprocessor.Request) (animationprocessor.Result, error) {
 	processors.calls = append(processors.calls, "animation")
+	contents, err := io.ReadAll(request.Input)
+	if err != nil {
+		return animationprocessor.Result{}, err
+	}
+	processors.animationInput = append(processors.animationInput, contents)
+	if processors.animationHook != nil {
+		if err := processors.animationHook(request); err != nil {
+			return animationprocessor.Result{}, err
+		}
+	}
 	_, _ = request.Output.Write([]byte("animation"))
 	return animationprocessor.Result{OutputMIME: "image/webp", OutputExtension: "webp", Width: 10, Height: 8,
 		Source: animationprocessor.Inspection{DurationMS: 250}, Audit: animationprocessor.Audit{Decoder: "fake"}}, nil
@@ -234,6 +286,17 @@ func TestExecutorDispatchesByMIMEAndWebPInspection(t *testing.T) {
 	}
 }
 
+func TestExecutorWebPInspectionAndTransformUseIndependentOffsets(t *testing.T) {
+	executor, _, _, processors := fixture(t, animationprocessor.ClassificationAnimation, nil, nil, []string{renderOne})
+	if err := executor.Execute(context.Background(), leaseFor(t, "image/webp", attemptOne, 1, 0), executionLimits()); err != nil {
+		t.Fatal(err)
+	}
+	if len(processors.inspectInput) != 1 || string(processors.inspectInput[0]) != "original" ||
+		len(processors.animationInput) != 1 || string(processors.animationInput[0]) != "original" {
+		t.Fatalf("processor inputs: inspect=%q transform=%q", processors.inspectInput, processors.animationInput)
+	}
+}
+
 func TestExecutorRejectsMissingOrUnexpectedPrimaryVideoStream(t *testing.T) {
 	stream := 2
 	tests := []struct {
@@ -257,6 +320,18 @@ func TestExecutorRejectsMissingOrUnexpectedPrimaryVideoStream(t *testing.T) {
 				t.Fatalf("invalid lease performed work: events=%v calls=%v candidates=%d", *store.events, processors.calls, len(repository.candidates))
 			}
 		})
+	}
+}
+
+func TestExecutorRejectsOverlyLargeOriginalBeforeWork(t *testing.T) {
+	executor, repository, store, processors := fixture(t, "", nil, nil, []string{renderOne})
+	lease := leaseFor(t, "image/jpeg", attemptOne, 1, 0)
+	lease.Original.SizeBytes = maxOriginalSizeBytes + 1
+	if err := executor.Execute(context.Background(), lease, executionLimits()); !errors.Is(err, job.ErrInvalid) {
+		t.Fatalf("Execute() error = %v, want ErrInvalid", err)
+	}
+	if len(*store.events) != 0 || len(store.temps) != 0 || len(processors.calls) != 0 || len(repository.candidates) != 0 {
+		t.Fatalf("oversized lease performed work: events=%v temps=%d processors=%v DB=%d", *store.events, len(store.temps), processors.calls, len(repository.candidates))
 	}
 }
 
@@ -413,6 +488,60 @@ func TestExecutorRealStorePublishesDurablyBeforeDatabase(t *testing.T) {
 	}
 	if len(repository.candidates) != 1 {
 		t.Fatalf("database publications = %d, want 1", len(repository.candidates))
+	}
+}
+
+func TestExecutorRealStoreRejectsOriginalDescriptorMismatchBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*job.Lease)
+	}{
+		{name: "size", mutate: func(lease *job.Lease) { lease.Original.SizeBytes++ }},
+		{name: "SHA-256", mutate: func(lease *job.Lease) { lease.Original.SHA256 = hex.EncodeToString(make([]byte, sha256.Size)) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store := openExecutorStore(t, root, nil)
+			lease := leaseFor(t, "image/jpeg", attemptOne, 1, 0)
+			publishExecutorOriginal(t, store, lease)
+			test.mutate(&lease)
+			events := []string{}
+			repository := &fakeRepository{events: &events}
+			processors := &fakeProcessors{}
+			executor := integrationExecutor(t, repository, store, processors, []string{renderOne})
+			if err := executor.Execute(context.Background(), lease, executionLimits()); !errors.Is(err, storage.ErrValidation) {
+				t.Fatalf("Execute() error = %v, want ErrValidation", err)
+			}
+			if len(events) != 0 || len(processors.calls) != 0 || len(repository.candidates) != 0 {
+				t.Fatalf("mismatch performed work: events=%v processors=%v DB=%d", events, processors.calls, len(repository.candidates))
+			}
+			if _, err := os.Stat(filepath.Join(root, "renditions")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("mismatch staged output: %v", err)
+			}
+		})
+	}
+}
+
+func TestExecutorRealStorePathReplacementCannotSwapValidatedDescriptor(t *testing.T) {
+	root := t.TempDir()
+	store := openExecutorStore(t, root, nil)
+	lease := leaseFor(t, "image/jpeg", attemptOne, 1, 0)
+	publishExecutorOriginal(t, store, lease)
+	originalPath := filepath.Join(root, filepath.FromSlash(lease.Original.RelativePath))
+	events := []string{}
+	repository := &fakeRepository{events: &events, beginHook: func() error {
+		if err := os.Rename(originalPath, originalPath+".replaced"); err != nil {
+			return err
+		}
+		return os.WriteFile(originalPath, []byte("attacker"), 0o600)
+	}}
+	processors := &fakeProcessors{}
+	executor := integrationExecutor(t, repository, store, processors, []string{renderOne})
+	if err := executor.Execute(context.Background(), lease, executionLimits()); err != nil {
+		t.Fatal(err)
+	}
+	if len(processors.stillInput) != 1 || string(processors.stillInput[0]) != "original" {
+		t.Fatalf("processor input = %q, want pinned original", processors.stillInput)
 	}
 }
 
@@ -648,8 +777,9 @@ func leaseFor(t *testing.T, mime, attempt string, attempts, targetAttempts int) 
 		value := 2
 		primaryVideoStreamIndex = &value
 	}
+	digest := sha256.Sum256([]byte("original"))
 	return job.Lease{ID: jobID, Type: job.TypeTransform, MediaID: mediaID, Token: attempt, Attempts: attempts, MaxAttempts: 3,
-		Original: &job.Original{ID: originalID, MediaID: mediaID, RelativePath: key.String(), MIMEType: mime, SizeBytes: 8, SHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PrimaryVideoStreamIndex: primaryVideoStreamIndex},
+		Original: &job.Original{ID: originalID, MediaID: mediaID, RelativePath: key.String(), MIMEType: mime, SizeBytes: 8, SHA256: hex.EncodeToString(digest[:]), PrimaryVideoStreamIndex: primaryVideoStreamIndex},
 		Targets: []job.Target{{ID: targetID, Status: job.TargetPending, Attempts: targetAttempts, Profile: job.Profile{
 			ID: definition.ID, Key: definition.Key, Version: definition.Version, Processor: definition.Processor,
 			ParametersSchemaVersion: definition.ParametersSchemaVersion, InputMIMETypes: definition.InputMIMETypes, Parameters: definition.Parameters,
