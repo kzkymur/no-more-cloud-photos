@@ -975,6 +975,12 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `TRUNCATE job_targets CASCADE`)
 		expectExecError(t, pool, `TRUNCATE jobs CASCADE`)
 
+		var expectedProgressCount int
+		if err := pool.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM originals WHERE media_id=$1)
+			+ (SELECT count(*) FROM renditions WHERE media_id=$1)`, mediaID).Scan(&expectedProgressCount); err != nil {
+			t.Fatalf("count purge manifest source rows: %v", err)
+		}
 		purgeLease := newUUIDv4(t)
 		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=now()+interval '1 minute',started_at=now() WHERE id=$1`, replacementPurgeID, purgeLease); err != nil {
 			t.Fatalf("start replacement purge: %v", err)
@@ -1060,7 +1066,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='purge_file_progress' AND column_name='sha256')`).Scan(&progressHasSHA); err != nil {
 			t.Fatalf("inspect purge progress data minimization: %v", err)
 		}
-		if originalReference != nil || targetCount != 1 || renditionCount != 0 || progressCount != 2 || progressHasSHA {
+		if originalReference != nil || targetCount != 1 || renditionCount != 0 || progressCount != expectedProgressCount || progressHasSHA {
 			t.Fatalf("purge history = original %v target %d rendition %d progress %d has_sha=%t", originalReference, targetCount, renditionCount, progressCount, progressHasSHA)
 		}
 	})
