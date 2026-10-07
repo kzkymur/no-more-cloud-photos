@@ -27,6 +27,7 @@ func TestLifecycleRepositoryIntegrationDeleteRetentionAndRestore(t *testing.T) {
 		{name: "zero", retention: intPointer(0)},
 		{name: "positive", retention: intPointer(7)},
 		{name: "maximum", retention: intPointer(MaxDeletedMediaRetentionDays)},
+		{name: "maximum", retention: intPointer(MaxDeletedMediaRetentionDays)},
 	}
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
