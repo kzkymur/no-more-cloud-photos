@@ -9,8 +9,14 @@ certificates are never promoted to production defaults.
 The shipped units run PostgreSQL, migration, Core API, the Core Worker, and
 Nginx. Before it reports ready or claims transform work, the Worker verifies
 the configured pinned ICC and the still, animation, and video helper capability
-contracts. The release artifact must provide those trusted paths; full Ubuntu
-native-library closure and rollback evidence remains an issue #21 release gate.
+contracts. It then compares the retained results with all active profiles and
+retired profiles pinned by queued/running transform work and registers the real
+transform executor only when every exact MIME/recipe/output branch is supported.
+Claimed work reads a size/hash-verified pinned Original descriptor, preserves
+successful targets across retry, and atomically publishes each durable rendition
+under the live lease. The release artifact must provide those trusted paths;
+full Ubuntu native-library closure and rollback evidence remains an issue #21
+release gate.
 
 No application maintenance, backup, restore, or cleanup service/timer is installed. Issue
 #19 has not yet defined the scheduled due/no-op command, exit codes, environment
