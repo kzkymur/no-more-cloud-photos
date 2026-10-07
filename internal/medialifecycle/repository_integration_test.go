@@ -293,6 +293,15 @@ func TestLifecycleRepositoryIntegrationPurgeSchedulerReclaimRetryAndCeiling(t *t
 	if err != nil || retry.JobID != first.JobID || retry.Attempts != 2 || !retry.StartedAt.Equal(first.StartedAt) || retry.Token == first.Token {
 		t.Fatalf("retry purge lease = %#v, %v", retry, err)
 	}
+	if err := repository.FinishPurgeAttempt(ctx, retry.JobID, retry.Token, "file_delete_failed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,lease_token::text,error_code FROM jobs WHERE id=$1`, retry.JobID).Scan(&status, &token, &errorCode); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || token != nil || errorCode == nil || *errorCode != "file_delete_failed" {
+		t.Fatalf("finished retry status=%s token=%v error=%v", status, token, errorCode)
+	}
 
 	ceilingMediaID := integrationUUID(32)
 	insertMedia(t, pool, ceilingMediaID, integrationUUID(132))
@@ -308,12 +317,8 @@ func TestLifecycleRepositoryIntegrationPurgeSchedulerReclaimRetryAndCeiling(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, ceilingLease.JobID); err != nil {
+	if err := repository.FinishPurgeAttempt(ctx, ceilingLease.JobID, ceilingLease.Token, "file_delete_failed"); err != nil {
 		t.Fatal(err)
-	}
-	reclaimed, err = repository.ReclaimExpiredPurges(ctx, 10)
-	if err != nil || len(reclaimed) != 1 || reclaimed[0] != ceilingLease.JobID {
-		t.Fatalf("ceiling reclaimed purges = %#v, %v", reclaimed, err)
 	}
 	var finishedAt *time.Time
 	if err := pool.QueryRow(ctx, `SELECT status,attempts,started_at,finished_at FROM jobs WHERE id=$1`, ceilingLease.JobID).Scan(
@@ -344,8 +349,18 @@ func TestLifecycleRepositoryIntegrationPurgeReclaimLocksMediaBeforeJob(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	heartbeatExpiry, err := repository.HeartbeatPurge(ctx, lease.JobID, lease.Token)
+	if err != nil || !heartbeatExpiry.After(lease.LeaseExpiresAt) {
+		t.Fatalf("purge heartbeat expiry=%s error=%v", heartbeatExpiry, err)
+	}
+	if _, err := repository.HeartbeatPurge(ctx, lease.JobID, integrationUUID(997)); !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("stale purge heartbeat error = %#v", err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := repository.HeartbeatPurge(ctx, lease.JobID, lease.Token); !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("expired purge heartbeat error = %#v", err)
 	}
 	secondMediaID := integrationUUID(35)
 	insertMedia(t, pool, secondMediaID, integrationUUID(135))
@@ -708,6 +723,72 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	})
 	if err != nil || !done.Done || done.File != nil {
 		t.Fatalf("completed purge step = %#v, %v", done, err)
+	}
+	assertFinalizerRollback := func(stage string) {
+		t.Helper()
+		var intact bool
+		if err := pool.QueryRow(ctx, `SELECT
+			EXISTS(SELECT 1 FROM media WHERE id=$1)
+			AND (SELECT status='running' FROM jobs WHERE id=$2)
+			AND NOT EXISTS(SELECT 1 FROM change_events WHERE media_id=$1 AND event_type='media_purged' AND reason='physical_purge')`, mediaID, activeLease.JobID).Scan(&intact); err != nil || !intact {
+			t.Fatalf("%s finalizer rollback=%t error=%v", stage, intact, err)
+		}
+	}
+	faults := []struct {
+		name, create, drop string
+	}{
+		{"event", `CREATE FUNCTION nmcp_test_fail_final_event() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.event_type='media_purged' AND NEW.reason='physical_purge' THEN RAISE EXCEPTION 'event fault'; END IF; RETURN NEW; END $$; CREATE TRIGGER nmcp_test_fail_final_event BEFORE INSERT ON change_events FOR EACH ROW EXECUTE FUNCTION nmcp_test_fail_final_event()`, `DROP TRIGGER nmcp_test_fail_final_event ON change_events; DROP FUNCTION nmcp_test_fail_final_event()`},
+		{"feed", `CREATE FUNCTION nmcp_test_fail_final_feed() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'feed fault'; END $$; CREATE TRIGGER nmcp_test_fail_final_feed BEFORE UPDATE ON change_feed_state FOR EACH ROW EXECUTE FUNCTION nmcp_test_fail_final_feed()`, `DROP TRIGGER nmcp_test_fail_final_feed ON change_feed_state; DROP FUNCTION nmcp_test_fail_final_feed()`},
+		{"job", `CREATE FUNCTION nmcp_test_fail_final_job() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.type='purge' AND NEW.status='succeeded' THEN RAISE EXCEPTION 'job fault'; END IF; RETURN NEW; END $$; CREATE TRIGGER nmcp_test_fail_final_job BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION nmcp_test_fail_final_job()`, `DROP TRIGGER nmcp_test_fail_final_job ON jobs; DROP FUNCTION nmcp_test_fail_final_job()`},
+	}
+	for _, fault := range faults {
+		if _, err := pool.Exec(ctx, fault.create); err != nil {
+			t.Fatal(err)
+		}
+		if err := repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token); err == nil {
+			t.Fatalf("%s finalizer fault reported success", fault.name)
+		}
+		assertFinalizerRollback(fault.name)
+		if _, err := pool.Exec(ctx, fault.drop); err != nil {
+			t.Fatal(err)
+		}
+	}
+	feedBlocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := feedBlocker.Exec(ctx, `SELECT 1 FROM change_feed_state WHERE id=1 FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	var feedBlockerPID int32
+	if err := feedBlocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&feedBlockerPID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '1 second' WHERE id=$1`, activeLease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	blockedFinalize := make(chan error, 1)
+	go func() { blockedFinalize <- repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token) }()
+	awaitBlockedMediaLockCount(t, ctx, pool, feedBlockerPID, 1)
+	for {
+		var expired bool
+		if err := pool.QueryRow(ctx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, activeLease.JobID).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := feedBlocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-blockedFinalize; !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("feed-blocked expired finalizer error = %#v", err)
+	}
+	assertFinalizerRollback("feed-block expiry")
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '2 minutes' WHERE id=$1`, activeLease.JobID); err != nil {
+		t.Fatal(err)
 	}
 	injectedEventID := integrationUUID(998)
 	if _, err := pool.Exec(ctx, `ALTER TABLE change_events DISABLE TRIGGER USER`); err != nil {

@@ -2,6 +2,7 @@ package purgeexecutor
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ type fakeService struct {
 	steps     int
 	finalized int
 	err       error
+	finalErr  error
 }
 
 func (f *fakeService) StartNextPurge(context.Context, int) (medialifecycle.PurgeLease, error) {
@@ -27,6 +29,9 @@ func (f *fakeService) RunPurgeFileStep(context.Context, string, string, medialif
 }
 func (f *fakeService) FinalizePurge(context.Context, string, string) error {
 	f.finalized++
+	if f.finalErr != nil {
+		return f.finalErr
+	}
 	return f.err
 }
 func (f *fakeService) HeartbeatPurge(context.Context, string, string) (time.Time, error) {
@@ -58,5 +63,19 @@ func TestRepositoryClaimsOnlyPurge(t *testing.T) {
 	}
 	if _, err = (Repository{Service: f}).Claim(context.Background(), []job.Type{job.TypeTransform}); err != job.ErrInvalid {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestFinalizeCommitUncertaintyRemainsInfrastructureFailure(t *testing.T) {
+	f := &fakeService{finalErr: &medialifecycle.CommitOutcomeUnknown{Cause: errors.New("commit response lost")}}
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lease := job.Lease{ID: "job", MediaID: "media", Token: "token", Type: job.TypePurge}
+	err = (Executor{Service: f, Store: store}).Execute(context.Background(), lease, worker.ExecutionLimits{})
+	if !errors.Is(err, job.ErrDatabaseUnavailable) || f.finalized != 1 {
+		t.Fatalf("finalizer uncertainty error=%v finalized=%d", err, f.finalized)
 	}
 }

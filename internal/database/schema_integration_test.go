@@ -1184,6 +1184,100 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("insert absent Media tombstone: %v", err)
 		}
 		expectAppError(`INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, absentMediaID)
+		mediaHolder, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mediaHolder.Exec(ctx, `SELECT 1 FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		duplicateResult := make(chan error, 1)
+		go func() {
+			duplicateResult <- execAsApp(`INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID)
+		}()
+		select {
+		case err := <-duplicateResult:
+			if err == nil {
+				t.Fatal("same-ID Media insert succeeded")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("same-ID Media insert waited behind locked Media row")
+		}
+		_ = mediaHolder.Rollback(ctx)
+		// Prove both absent-identity races are causally serialized, rather than
+		// merely checking the two statements in sequence.
+		mediaWinsID := newUUIDv4(t)
+		mediaWins, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = mediaWins.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = mediaWins.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaWinsID)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectAppError(`UPDATE media SET id=$1 WHERE id=$2`, newUUIDv4(t), mediaID)
+		tombstoneResult := make(chan error, 1)
+		tombstoneContender, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tombstoneContender.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err != nil {
+			t.Fatal(err)
+		}
+		var tombstonePID int32
+		if err := tombstoneContender.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&tombstonePID); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			_, err := tombstoneContender.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999997,'media_purged','physical_purge',$2)`, newUUIDv4(t), mediaWinsID)
+			tombstoneResult <- err
+		}()
+		awaitBackendLock(t, pool, ctx, tombstonePID)
+		if err := mediaWins.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-tombstoneResult; err == nil {
+			t.Fatal("tombstone succeeded after concurrent Media creation")
+		}
+		_ = tombstoneContender.Rollback(ctx)
+
+		tombstoneWinsID := newUUIDv4(t)
+		tombstoneWins, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tombstoneWins.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = tombstoneWins.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999996,'media_purged','physical_purge',$2)`, newUUIDv4(t), tombstoneWinsID)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		mediaResult := make(chan error, 1)
+		mediaContender, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mediaContender.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err != nil {
+			t.Fatal(err)
+		}
+		var mediaPID int32
+		if err := mediaContender.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&mediaPID); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			_, err := mediaContender.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, tombstoneWinsID)
+			mediaResult <- err
+		}()
+		awaitBackendLock(t, pool, ctx, mediaPID)
+		if err := tombstoneWins.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-mediaResult; err == nil {
+			t.Fatal("Media succeeded after concurrent tombstone creation")
+		}
+		_ = mediaContender.Rollback(ctx)
 		repeatableTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 		if err != nil {
 			t.Fatal(err)
@@ -1639,6 +1733,24 @@ func expectTxCommitError(t *testing.T, pool *pgxpool.Pool, run func(pgx.Tx) erro
 	}
 	if err := tx.Commit(ctx); err == nil {
 		t.Fatal("transaction commit unexpectedly succeeded")
+	}
+}
+
+func awaitBackendLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context, pid int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(wait_event_type='Lock',false) FROM pg_stat_activity WHERE pid=$1`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backend %d did not reach a lock wait", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
