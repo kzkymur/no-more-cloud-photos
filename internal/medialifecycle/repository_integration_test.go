@@ -8,7 +8,6 @@ import (
 	"os"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -434,7 +433,7 @@ func TestLifecycleRepositoryIntegrationStartPurgeRestoreRaces(t *testing.T) {
 	})
 }
 
-func TestLifecycleRepositoryIntegrationStartPurgeGuards(t *testing.T) {
+func TestLifecycleRepositoryIntegrationStartPurgeCancelledGuard(t *testing.T) {
 	ctx := context.Background()
 	pool, service := integrationService(t)
 	mediaID := integrationUUID(44)
@@ -446,16 +445,6 @@ func TestLifecycleRepositoryIntegrationStartPurgeGuards(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='test',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.StartPurge(ctx, enqueued.Job.ID); !IsKind(err, KindDatabaseUnavailable) {
-		t.Fatalf("maintenance StartPurge error = %#v", err)
-	}
-	assertJobState(t, pool, enqueued.Job.ID, "queued", 0, false)
-	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := service.Restore(ctx, mediaID); err != nil {
 		t.Fatal(err)
 	}
@@ -464,115 +453,140 @@ func TestLifecycleRepositoryIntegrationStartPurgeGuards(t *testing.T) {
 	}
 }
 
-func TestLifecycleRepositoryIntegrationConcurrentDeleteAndEnqueue(t *testing.T) {
-	t.Run("concurrent delete emits one event", func(t *testing.T) {
-		ctx := context.Background()
-		pool, service := integrationService(t)
-		mediaID := integrationUUID(50)
-		insertMedia(t, pool, mediaID, integrationUUID(150))
-		results := make(chan DeleteResult, 2)
-		errorsChannel := make(chan error, 2)
-		var ready sync.WaitGroup
-		ready.Add(2)
-		start := make(chan struct{})
-		for range 2 {
-			go func() {
-				ready.Done()
-				<-start
-				result, err := service.Delete(ctx, mediaID)
-				results <- result
-				errorsChannel <- err
-			}()
-		}
-		ready.Wait()
-		close(start)
-		first, second := <-results, <-results
-		if err := <-errorsChannel; err != nil {
+func TestLifecycleRepositoryIntegrationOrderedLifecycleRaces(t *testing.T) {
+	tests := []struct {
+		name               string
+		mediaValue         int
+		initiallyDeleted   bool
+		first              lifecycleOperation
+		second             lifecycleOperation
+		firstConflict      bool
+		secondConflict     bool
+		firstDeleteChange  *bool
+		secondDeleteChange *bool
+		wantDeleted        bool
+		wantJobs           int
+		wantJobStatus      string
+		wantDeleteEvents   int
+		wantRestoreEvents  int
+	}{
+		{name: "delete replay precedes restore", mediaValue: 50, initiallyDeleted: true, first: operationDelete, second: operationRestore, firstDeleteChange: boolPointer(false), wantDeleteEvents: 1, wantRestoreEvents: 1},
+		{name: "restore precedes fresh delete", mediaValue: 51, initiallyDeleted: true, first: operationRestore, second: operationDelete, secondDeleteChange: boolPointer(true), wantDeleted: true, wantDeleteEvents: 2, wantRestoreEvents: 1},
+		{name: "delete wins over enqueue", mediaValue: 52, first: operationDelete, second: operationEnqueue, firstDeleteChange: boolPointer(true), wantDeleted: true, wantJobs: 1, wantJobStatus: "queued", wantDeleteEvents: 1},
+		{name: "enqueue loses before delete", mediaValue: 53, first: operationEnqueue, second: operationDelete, firstConflict: true, secondDeleteChange: boolPointer(true), wantDeleted: true, wantDeleteEvents: 1},
+		{name: "restore wins over enqueue", mediaValue: 54, initiallyDeleted: true, first: operationRestore, second: operationEnqueue, secondConflict: true, wantDeleteEvents: 1, wantRestoreEvents: 1},
+		{name: "enqueue wins over restore", mediaValue: 55, initiallyDeleted: true, first: operationEnqueue, second: operationRestore, wantJobs: 1, wantJobStatus: "cancelled", wantDeleteEvents: 1, wantRestoreEvents: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			pool, setupService := integrationService(t)
+			mediaID := integrationUUID(test.mediaValue)
+			insertMedia(t, pool, mediaID, integrationUUID(test.mediaValue+100))
+			if test.initiallyDeleted {
+				result, err := setupService.Delete(ctx, mediaID)
+				if err != nil || !result.Changed {
+					t.Fatalf("setup Delete() = %#v, %v", result, err)
+				}
+			}
+
+			blocker, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Rollback(context.Background())
+			if _, err := blocker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+
+			firstConn, firstService, firstPID := connectionService(t, ctx, pool)
+			defer firstConn.Release()
+			secondConn, secondService, secondPID := connectionService(t, ctx, pool)
+			defer secondConn.Release()
+			firstResult := runLifecycleOperation(ctx, firstService, mediaID, test.first)
+			awaitLockWait(t, ctx, pool, firstPID)
+			secondResult := runLifecycleOperation(ctx, secondService, mediaID, test.second)
+			awaitLockWait(t, ctx, pool, secondPID)
+			if err := blocker.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			assertLifecycleOperationResult(t, test.first, <-firstResult, mediaID, test.firstConflict, test.firstDeleteChange)
+			assertLifecycleOperationResult(t, test.second, <-secondResult, mediaID, test.secondConflict, test.secondDeleteChange)
+			assertLifecycleFinalState(t, pool, mediaID, test.wantDeleted, test.wantJobs, test.wantJobStatus, test.wantDeleteEvents, test.wantRestoreEvents)
+		})
+	}
+
+	t.Run("ordered duplicate delete emits one event", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool, _ := integrationService(t)
+		mediaID := integrationUUID(56)
+		insertMedia(t, pool, mediaID, integrationUUID(156))
+
+		blocker, err := pool.Begin(ctx)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if err := <-errorsChannel; err != nil {
+		defer blocker.Rollback(context.Background())
+		if _, err := blocker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
 			t.Fatal(err)
 		}
-		if first.Changed == second.Changed || !sameTime(first.Media.DeletedAt, second.Media.DeletedAt) {
-			t.Fatalf("delete results = %#v / %#v", first, second)
+		firstConn, firstService, firstPID := connectionService(t, ctx, pool)
+		defer firstConn.Release()
+		secondConn, secondService, secondPID := connectionService(t, ctx, pool)
+		defer secondConn.Release()
+		firstResult := runLifecycleOperation(ctx, firstService, mediaID, operationDelete)
+		awaitLockWait(t, ctx, pool, firstPID)
+		secondResult := runLifecycleOperation(ctx, secondService, mediaID, operationDelete)
+		awaitLockWait(t, ctx, pool, secondPID)
+		if err := blocker.Commit(ctx); err != nil {
+			t.Fatal(err)
 		}
-		assertEventCounts(t, pool, 1, 0)
+		first, second := <-firstResult, <-secondResult
+		if first.err != nil || !first.deleted.Changed || second.err != nil || second.deleted.Changed ||
+			!sameTime(first.deleted.Media.DeletedAt, second.deleted.Media.DeletedAt) {
+			t.Fatalf("ordered Delete() results = %#v / %#v", first, second)
+		}
+		assertLifecycleFinalState(t, pool, mediaID, true, 0, "", 1, 0)
 	})
 
-	t.Run("concurrent enqueue returns one job", func(t *testing.T) {
-		ctx := context.Background()
+	t.Run("ordered duplicate enqueue returns one job", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 		pool, service := integrationService(t)
-		mediaID := integrationUUID(51)
-		insertMedia(t, pool, mediaID, integrationUUID(151))
+		mediaID := integrationUUID(57)
+		insertMedia(t, pool, mediaID, integrationUUID(157))
 		if _, err := service.Delete(ctx, mediaID); err != nil {
 			t.Fatal(err)
 		}
-		results := make(chan EnqueueResult, 2)
-		errorsChannel := make(chan error, 2)
-		start := make(chan struct{})
-		for range 2 {
-			go func() {
-				<-start
-				result, err := service.EnqueuePurge(ctx, mediaID)
-				results <- result
-				errorsChannel <- err
-			}()
-		}
-		close(start)
-		first, second := <-results, <-results
-		if err := <-errorsChannel; err != nil {
-			t.Fatal(err)
-		}
-		if err := <-errorsChannel; err != nil {
-			t.Fatal(err)
-		}
-		if first.Job.ID != second.Job.ID || first.Disposition == second.Disposition {
-			t.Fatalf("enqueue results = %#v / %#v", first, second)
-		}
-		var count int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE type='purge'`).Scan(&count); err != nil || count != 1 {
-			t.Fatalf("purge count = %d, %v", count, err)
-		}
-	})
 
-	t.Run("restore and enqueue serialize", func(t *testing.T) {
-		ctx := context.Background()
-		pool, service := integrationService(t)
-		mediaID := integrationUUID(52)
-		insertMedia(t, pool, mediaID, integrationUUID(152))
-		if _, err := service.Delete(ctx, mediaID); err != nil {
+		blocker, err := pool.Begin(ctx)
+		if err != nil {
 			t.Fatal(err)
 		}
-		start := make(chan struct{})
-		restoreErrors := make(chan error, 1)
-		enqueueErrors := make(chan error, 1)
-		go func() {
-			<-start
-			_, err := service.Restore(ctx, mediaID)
-			restoreErrors <- err
-		}()
-		go func() {
-			<-start
-			_, err := service.EnqueuePurge(ctx, mediaID)
-			enqueueErrors <- err
-		}()
-		close(start)
-		if err := <-restoreErrors; err != nil {
-			t.Fatalf("restore error = %v", err)
-		}
-		if err := <-enqueueErrors; err != nil && !errorCodeIs(err, CodeMediaNotDeleted) {
-			t.Fatalf("enqueue error = %#v", err)
-		}
-		var deleted bool
-		var blockingJobs int
-		if err := pool.QueryRow(ctx, `SELECT
-			(SELECT deleted_at IS NOT NULL FROM media WHERE id=$1),
-			(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='purge' AND status IN ('queued','running','failed'))`, mediaID).Scan(&deleted, &blockingJobs); err != nil {
+		defer blocker.Rollback(context.Background())
+		if _, err := blocker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
 			t.Fatal(err)
 		}
-		if deleted || blockingJobs != 0 {
-			t.Fatalf("final deleted/blocking = %v/%d", deleted, blockingJobs)
+		firstConn, firstService, firstPID := connectionService(t, ctx, pool)
+		defer firstConn.Release()
+		secondConn, secondService, secondPID := connectionService(t, ctx, pool)
+		defer secondConn.Release()
+		firstResult := runLifecycleOperation(ctx, firstService, mediaID, operationEnqueue)
+		awaitLockWait(t, ctx, pool, firstPID)
+		secondResult := runLifecycleOperation(ctx, secondService, mediaID, operationEnqueue)
+		awaitLockWait(t, ctx, pool, secondPID)
+		if err := blocker.Commit(ctx); err != nil {
+			t.Fatal(err)
 		}
+		first, second := <-firstResult, <-secondResult
+		if first.err != nil || first.enqueued.Disposition != EnqueueCreated || second.err != nil ||
+			second.enqueued.Disposition != EnqueueExistingQueued || first.enqueued.Job.ID != second.enqueued.Job.ID {
+			t.Fatalf("ordered EnqueuePurge() results = %#v / %#v", first, second)
+		}
+		assertLifecycleFinalState(t, pool, mediaID, true, 1, "queued", 1, 0)
 	})
 
 	t.Run("direct purge insert waits for restore and rejects active media", func(t *testing.T) {
@@ -635,33 +649,219 @@ func TestLifecycleRepositoryIntegrationConcurrentDeleteAndEnqueue(t *testing.T) 
 	})
 }
 
-func TestLifecycleRepositoryIntegrationMaintenanceAndEventRollback(t *testing.T) {
+func TestLifecycleRepositoryIntegrationMaintenanceRejectsBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name       string
+		mediaValue int
+		setup      lifecycleOperation
+		operation  lifecycleOperation
+	}{
+		{name: "delete", mediaValue: 60, operation: operationDelete},
+		{name: "restore", mediaValue: 61, setup: operationEnqueue, operation: operationRestore},
+		{name: "enqueue purge", mediaValue: 62, setup: operationDelete, operation: operationEnqueue},
+		{name: "start purge", mediaValue: 63, setup: operationEnqueue, operation: operationStart},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			pool, service := integrationService(t)
+			mediaID := integrationUUID(test.mediaValue)
+			insertMedia(t, pool, mediaID, integrationUUID(test.mediaValue+100))
+
+			var jobID string
+			switch test.setup {
+			case operationDelete:
+				if _, err := service.Delete(ctx, mediaID); err != nil {
+					t.Fatal(err)
+				}
+			case operationEnqueue:
+				if _, err := service.Delete(ctx, mediaID); err != nil {
+					t.Fatal(err)
+				}
+				enqueued, err := service.EnqueuePurge(ctx, mediaID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				jobID = enqueued.Job.ID
+			}
+
+			before := lifecycleSnapshot(t, pool, mediaID)
+			if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='test',owner='test',entered_at=statement_timestamp() WHERE id=1`); err != nil {
+				t.Fatal(err)
+			}
+			result := <-runLifecycleOperation(ctx, service, operationID(test.operation, mediaID, jobID), test.operation)
+			assertUnavailableError(t, result.err)
+			after := lifecycleSnapshot(t, pool, mediaID)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("state mutated in maintenance mode\nbefore: %#v\nafter:  %#v", before, after)
+			}
+		})
+	}
+}
+
+func TestLifecycleRepositoryIntegrationEventRollback(t *testing.T) {
 	ctx := context.Background()
 	pool, service := integrationService(t)
-	mediaID := integrationUUID(60)
-	insertMedia(t, pool, mediaID, integrationUUID(160))
-	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='test',owner='test',entered_at=statement_timestamp() WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.Delete(ctx, mediaID); !IsKind(err, KindDatabaseUnavailable) {
-		t.Fatalf("maintenance error = %#v", err)
-	}
-	var deletedAt *time.Time
-	if err := pool.QueryRow(ctx, `SELECT deleted_at FROM media WHERE id=$1`, mediaID).Scan(&deletedAt); err != nil || deletedAt != nil {
-		t.Fatalf("maintenance mutation = %v, %v", deletedAt, err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
+	mediaID := integrationUUID(64)
+	insertMedia(t, pool, mediaID, integrationUUID(164))
 	if _, err := pool.Exec(ctx, `UPDATE change_feed_state SET last_position=9223372036854775807 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.Delete(ctx, mediaID); !IsKind(err, KindInvariant) {
 		t.Fatalf("feed overflow error = %#v", err)
 	}
+	var deletedAt *time.Time
 	if err := pool.QueryRow(ctx, `SELECT deleted_at FROM media WHERE id=$1`, mediaID).Scan(&deletedAt); err != nil || deletedAt != nil {
 		t.Fatalf("overflow rollback = %v, %v", deletedAt, err)
 	}
+}
+
+type lifecycleOperation string
+
+const (
+	operationDelete  lifecycleOperation = "delete"
+	operationRestore lifecycleOperation = "restore"
+	operationEnqueue lifecycleOperation = "enqueue"
+	operationStart   lifecycleOperation = "start"
+)
+
+type lifecycleOperationResult struct {
+	deleted  DeleteResult
+	restored RestoreResult
+	enqueued EnqueueResult
+	started  PurgeLease
+	err      error
+}
+
+func runLifecycleOperation(ctx context.Context, service *Service, id string, operation lifecycleOperation) <-chan lifecycleOperationResult {
+	result := make(chan lifecycleOperationResult, 1)
+	go func() {
+		var value lifecycleOperationResult
+		switch operation {
+		case operationDelete:
+			value.deleted, value.err = service.Delete(ctx, id)
+		case operationRestore:
+			value.restored, value.err = service.Restore(ctx, id)
+		case operationEnqueue:
+			value.enqueued, value.err = service.EnqueuePurge(ctx, id)
+		case operationStart:
+			value.started, value.err = service.StartPurge(ctx, id)
+		default:
+			value.err = fmt.Errorf("unknown lifecycle operation %q", operation)
+		}
+		result <- value
+	}()
+	return result
+}
+
+func assertLifecycleOperationResult(t *testing.T, operation lifecycleOperation, result lifecycleOperationResult, mediaID string, wantConflict bool, wantDeleteChange *bool) {
+	t.Helper()
+	if wantConflict {
+		assertMediaNotDeletedError(t, result.err)
+		return
+	}
+	if result.err != nil {
+		t.Fatalf("%s error = %#v", operation, result.err)
+	}
+	switch operation {
+	case operationDelete:
+		if wantDeleteChange == nil || result.deleted.Changed != *wantDeleteChange || result.deleted.Media.ID != mediaID || result.deleted.Media.DeletedAt == nil {
+			t.Fatalf("Delete() = %#v", result.deleted)
+		}
+	case operationRestore:
+		if result.restored.Media.ID != mediaID || result.restored.Media.DeletedAt != nil || result.restored.Media.PurgeAfter != nil {
+			t.Fatalf("Restore() = %#v", result.restored)
+		}
+	case operationEnqueue:
+		job := result.enqueued.Job
+		if result.enqueued.Disposition != EnqueueCreated || !readapi.IsUUIDv4(job.ID) || job.MediaID != mediaID ||
+			job.Type != readapi.JobPurge || job.Status != readapi.JobQueued || job.Attempts != 0 || job.MaxAttempts != InitialPurgeMaxAttempts {
+			t.Fatalf("EnqueuePurge() = %#v", result.enqueued)
+		}
+	}
+}
+
+func assertLifecycleFinalState(t *testing.T, pool *pgxpool.Pool, mediaID string, wantDeleted bool, wantJobs int, wantJobStatus string, wantDeleteEvents, wantRestoreEvents int) {
+	t.Helper()
+	var deleted bool
+	var jobs, queued, cancelled, deleteEvents, restoreEvents int
+	err := pool.QueryRow(context.Background(), `SELECT
+		(SELECT deleted_at IS NOT NULL FROM media WHERE id=$1),
+		(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='purge'),
+		(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='purge' AND status='queued'),
+		(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='purge' AND status='cancelled'),
+		(SELECT count(*) FROM change_events WHERE media_id=$1 AND reason='logical_delete'),
+		(SELECT count(*) FROM change_events WHERE media_id=$1 AND reason='restore')`, mediaID).Scan(
+		&deleted, &jobs, &queued, &cancelled, &deleteEvents, &restoreEvents,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantQueued, wantCancelled := 0, 0
+	switch wantJobStatus {
+	case "queued":
+		wantQueued = wantJobs
+	case "cancelled":
+		wantCancelled = wantJobs
+	case "":
+	default:
+		t.Fatalf("unsupported expected job status %q", wantJobStatus)
+	}
+	if deleted != wantDeleted || jobs != wantJobs || queued != wantQueued || cancelled != wantCancelled ||
+		deleteEvents != wantDeleteEvents || restoreEvents != wantRestoreEvents {
+		t.Fatalf("final state deleted=%v jobs=%d queued=%d cancelled=%d events=%d/%d, want %v/%d/%d/%d/%d/%d",
+			deleted, jobs, queued, cancelled, deleteEvents, restoreEvents,
+			wantDeleted, wantJobs, wantQueued, wantCancelled, wantDeleteEvents, wantRestoreEvents)
+	}
+}
+
+func assertMediaNotDeletedError(t *testing.T, err error) {
+	t.Helper()
+	var semantic *SemanticError
+	if !errors.As(err, &semantic) || semantic.Kind() != KindConflict || semantic.HTTPStatus() != 409 ||
+		semantic.Code() != CodeMediaNotDeleted || semantic.Message() != "media is not deleted" || len(semantic.Details()) != 0 {
+		t.Fatalf("media-not-deleted error = %#v", err)
+	}
+}
+
+func assertUnavailableError(t *testing.T, err error) {
+	t.Helper()
+	var semantic *SemanticError
+	if !errors.As(err, &semantic) || semantic.Kind() != KindDatabaseUnavailable || semantic.HTTPStatus() != 503 ||
+		semantic.Code() != CodeUnavailable || semantic.Message() != "service is temporarily unavailable" || len(semantic.Details()) != 0 {
+		t.Fatalf("maintenance error = %#v", err)
+	}
+}
+
+func operationID(operation lifecycleOperation, mediaID, jobID string) string {
+	if operation == operationStart {
+		return jobID
+	}
+	return mediaID
+}
+
+type lifecycleDatabaseSnapshot struct {
+	media        string
+	jobs         string
+	events       string
+	feedPosition int64
+}
+
+func lifecycleSnapshot(t *testing.T, pool *pgxpool.Pool, mediaID string) lifecycleDatabaseSnapshot {
+	t.Helper()
+	var snapshot lifecycleDatabaseSnapshot
+	err := pool.QueryRow(context.Background(), `SELECT
+		(SELECT to_jsonb(media)::text FROM media WHERE id=$1),
+		(SELECT COALESCE(jsonb_agg(to_jsonb(jobs) ORDER BY id)::text,'[]') FROM jobs WHERE media_id_snapshot=$1),
+		(SELECT COALESCE(jsonb_agg(to_jsonb(change_events) ORDER BY position)::text,'[]') FROM change_events WHERE media_id=$1),
+		(SELECT last_position FROM change_feed_state WHERE id=1)`, mediaID).Scan(
+		&snapshot.media, &snapshot.jobs, &snapshot.events, &snapshot.feedPosition,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 func integrationService(t *testing.T) (*pgxpool.Pool, *Service) {
@@ -793,7 +993,8 @@ func integrationUUID(value int) string {
 	return fmt.Sprintf("10000000-0000-4000-8000-%012x", value)
 }
 
-func intPointer(value int) *int { return &value }
+func intPointer(value int) *int    { return &value }
+func boolPointer(value bool) *bool { return &value }
 
 func sameTime(first, second *time.Time) bool {
 	return first == nil && second == nil || first != nil && second != nil && first.Equal(*second)
