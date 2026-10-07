@@ -70,7 +70,7 @@ transactional migrations, non-transactional execution, and recovery.
 
 | Variable | API | Worker | Admin | Rule/default |
 |---|---:|---:|---:|---|
-| `NMCP_DATABASE_URL` | required | required | required | PostgreSQL DSN; secret, never logged. |
+| `NMCP_DATABASE_URL` | required (`nmcp_api`) | required (`nmcp_worker`) | required (`nmcp_migrator`) | PostgreSQL DSN; distinct login/password per process against one reviewed endpoint; secret, never logged. |
 | `NMCP_STORAGE_ROOT` | required | required | - | Absolute clean path; never logged. |
 | `NMCP_FILE_BASE_URL` | required | required | - | Absolute HTTPS File Server files root with a non-root path, e.g. `https://photos.example.ts.net/files`; trailing slash is normalized. Core appends the canonical storage key directly and never inserts `/files`. No credentials, query, fragment, dot/empty segments, or encoded path ambiguity. |
 | `NMCP_STILL_HELPER_PATH` | - | required | - | Clean absolute path to the trusted still/RAW protocol-v1 helper. |
@@ -101,6 +101,15 @@ and reported-versus-required capability values so an operator can correct the
 deployment. They never include DSNs, configured paths, helper stderr, or SQL
 details; lower-level dependency errors remain classified rather than copied
 verbatim.
+
+The database privilege boundary uses stable NOLOGIN groups `nmcp_runtime` and
+`nmcp_worker_runtime`. The API login inherits only the common group; the Worker
+login additionally inherits the Worker group. `nmcp_purge_function_owner` is a
+credential-free NOLOGIN owner for the narrow purge completion function and is
+never available to a runtime login. Only `nmcp_migrator` owns schema/table
+objects. Runtime roles have no schema DDL or table `TRUNCATE`; the Worker can
+only `SELECT`/`INSERT` purge progress and invoke the ordered completion
+function, never update or delete progress directly.
 
 For example, with `NMCP_FILE_BASE_URL=https://photos.example.ts.net/files`,
 the stored key `originals/ab/<original-id>/original.jpg` is returned as

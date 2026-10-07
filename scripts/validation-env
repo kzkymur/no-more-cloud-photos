@@ -90,13 +90,13 @@ start_environment() {
 
 write_retention_markers() {
   compose exec -T api sh -eu -c 'printf "%s" "$1" >/var/lib/nmcp/media/backups/retained.marker; chmod 0600 /var/lib/nmcp/media/backups/retained.marker' sh "$retention_token"
-  compose exec -T postgres psql --username nmcp --dbname nmcp --set ON_ERROR_STOP=1 --command \
+  compose exec -T postgres psql --username nmcp_migrator --dbname nmcp --set ON_ERROR_STOP=1 --command \
     "CREATE TABLE validation_retention_marker (value text PRIMARY KEY); INSERT INTO validation_retention_marker VALUES ('$retention_token');"
 }
 
 assert_retention_markers() {
   compose exec -T api sh -eu -c '[ "$(cat /var/lib/nmcp/media/backups/retained.marker)" = "$1" ]' sh "$retention_token"
-  value=$(compose exec -T postgres psql --username nmcp --dbname nmcp --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
+  value=$(compose exec -T postgres psql --username nmcp_migrator --dbname nmcp --tuples-only --no-align --set ON_ERROR_STOP=1 --command \
     "SELECT value FROM validation_retention_marker;")
   [ "$value" = "$retention_token" ] || { echo "error: database retention marker was not preserved" >&2; exit 1; }
 }
@@ -133,11 +133,56 @@ assert_running() {
   [ "$(docker inspect --format '{{.State.Running}}' "$id")" = true ] || { echo "error: $service is not running" >&2; exit 1; }
 }
 
+database_query() {
+  user=$1
+  password=$2
+  shift 2
+  compose exec -T -e "PGPASSWORD=$password" postgres \
+    psql --host 127.0.0.1 --username "$user" --dbname nmcp --set ON_ERROR_STOP=1 "$@"
+}
+
+expect_database_denied() {
+  user=$1
+  password=$2
+  statement=$3
+  if database_query "$user" "$password" --command "$statement" >/dev/null 2>&1; then
+    echo "error: database role $user executed forbidden statement: $statement" >&2
+    exit 1
+  fi
+}
+
+check_database_role_boundary() {
+  for identity in \
+    nmcp_migrator:nmcp-migrator-validation-only \
+    nmcp_api:nmcp-api-validation-only \
+    nmcp_worker:nmcp-worker-validation-only; do
+    user=${identity%%:*}
+    password=${identity#*:}
+    actual=$(database_query "$user" "$password" --tuples-only --no-align --command 'SELECT current_user')
+    [ "$actual" = "$user" ] || { echo "error: expected database role $user, got $actual" >&2; exit 1; }
+  done
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --file /opt/nmcp-bootstrap/verify-runtime-roles.sql
+  expect_database_denied nmcp_worker nmcp-worker-validation-only \
+    "UPDATE purge_file_progress SET disposition=disposition WHERE false"
+  expect_database_denied nmcp_worker nmcp-worker-validation-only \
+    "DELETE FROM purge_file_progress WHERE false"
+  expect_database_denied nmcp_worker nmcp-worker-validation-only \
+    "TRUNCATE purge_file_progress"
+  expect_database_denied nmcp_worker nmcp-worker-validation-only \
+    "ALTER TABLE purge_file_progress DISABLE TRIGGER ALL"
+  expect_database_denied nmcp_worker nmcp-worker-validation-only \
+    "CREATE TABLE nmcp_runtime_ddl_probe (id integer)"
+  expect_database_denied nmcp_api nmcp-api-validation-only \
+    "SELECT * FROM purge_file_progress LIMIT 0"
+}
+
 check_processes_and_isolation() {
   assert_running api
   assert_running worker
   assert_running files
   assert_running postgres
+  check_database_role_boundary
 
   files_id=$(compose ps --quiet files)
   postgres_id=$(compose ps --quiet postgres)

@@ -6,15 +6,18 @@ services:
     image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     environment:
       POSTGRES_DB: nmcp
-      POSTGRES_USER: nmcp
-      POSTGRES_PASSWORD: nmcp-validation-only
+      POSTGRES_USER: nmcp_bootstrap
+      POSTGRES_PASSWORD: nmcp-bootstrap-validation-only
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nmcp -d nmcp"]
+      test: ["CMD-SHELL", "pg_isready -U nmcp_bootstrap -d nmcp"]
       interval: 2s
       timeout: 3s
       retries: 30
     volumes:
       - database:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-nmcp-roles.sql:ro
+      - ../postgresql/runtime-roles.sql:/opt/nmcp-bootstrap/runtime-roles.sql:ro
+      - ./verify-runtime-roles.sql:/opt/nmcp-bootstrap/verify-runtime-roles.sql:ro
     networks: [backend]
     labels: *validation-labels
 
@@ -35,7 +38,7 @@ services:
       dockerfile: infra/validation/core.Dockerfile
     command: ["nmcp-admin", "migrate", "up", "--json"]
     environment: &common-environment
-      NMCP_DATABASE_URL: postgres://nmcp:nmcp-validation-only@postgres:5432/nmcp?sslmode=disable
+      NMCP_DATABASE_URL: postgres://nmcp_migrator:nmcp-migrator-validation-only@postgres:5432/nmcp?sslmode=disable
       NMCP_LOG_LEVEL: info
       NMCP_SHUTDOWN_TIMEOUT: 10s
     depends_on:
@@ -51,6 +54,7 @@ services:
     command: ["core-api"]
     environment:
       <<: *common-environment
+      NMCP_DATABASE_URL: postgres://nmcp_api:nmcp-api-validation-only@postgres:5432/nmcp?sslmode=disable
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
       NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
       NMCP_CURSOR_HMAC_KEY: validation-only-cursor-key-32-bytes-minimum
@@ -80,6 +84,7 @@ services:
     command: ["core-worker"]
     environment:
       <<: *common-environment
+      NMCP_DATABASE_URL: postgres://nmcp_worker:nmcp-worker-validation-only@postgres:5432/nmcp?sslmode=disable
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
       NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
       NMCP_STILL_HELPER_PATH: /opt/nmcp/bin/nmcp-still-helper
