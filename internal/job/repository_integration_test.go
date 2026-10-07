@@ -1009,6 +1009,7 @@ func TestClaimHydratesPartialRetryGeneratedBytesIntegration(t *testing.T) {
 func TestClaimRejectsGeneratedByteOverflowIntegration(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
 	ctx := context.Background()
+	ensureVersionProfile(t, pool, "overflow-third-target", 1, true)
 	jobID, targets := insertTransformJob(t, pool, 3, 3)
 	lease, err := repository.Claim(ctx, []Type{TypeTransform})
 	if err != nil {
