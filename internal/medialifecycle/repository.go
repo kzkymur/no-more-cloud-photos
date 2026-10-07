@@ -17,6 +17,12 @@ import (
 
 const rollbackBudget = 5 * time.Second
 
+const (
+	purgeSchedulerBatchMax = 50
+	purgeBackoffBase       = 5 * time.Second
+	purgeBackoffCap        = 15 * time.Minute
+)
+
 type transactionDatabase interface {
 	Begin(context.Context) (pgx.Tx, error)
 }
@@ -26,6 +32,7 @@ type PostgresRepository struct {
 	fileBaseURL string
 	newID       func() (string, error)
 	afterCommit func(context.Context) error
+	jitter      func(time.Duration) time.Duration
 }
 
 func NewPostgresRepository(pool *pgxpool.Pool, fileBaseURL string) (*PostgresRepository, error) {
@@ -36,7 +43,7 @@ func NewPostgresRepository(pool *pgxpool.Pool, fileBaseURL string) (*PostgresRep
 	if err != nil {
 		return nil, err
 	}
-	return &PostgresRepository{db: pool, fileBaseURL: baseURL, newID: newUUIDv4}, nil
+	return &PostgresRepository{db: pool, fileBaseURL: baseURL, newID: newUUIDv4, jitter: cryptoJitter}, nil
 }
 
 func (r *PostgresRepository) Delete(ctx context.Context, mediaID string) (DeleteResult, error) {
@@ -280,6 +287,108 @@ func (r *PostgresRepository) DatabaseNow(ctx context.Context) (time.Time, error)
 	return now, nil
 }
 
+func (r *PostgresRepository) DiscoverPurgeJobs(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 || limit > purgeSchedulerBatchMax {
+		return nil, newInvariant(errors.New("invalid purge discovery limit"))
+	}
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT j.id::text
+		FROM jobs AS j JOIN media AS m ON m.id=j.media_id_snapshot
+		WHERE j.type='purge' AND j.status='queued' AND j.available_at<=clock_timestamp()
+		  AND j.attempts<j.max_attempts AND j.cancelled_at IS NULL AND m.deleted_at IS NOT NULL
+		ORDER BY j.available_at,j.created_at,j.id FOR UPDATE OF m SKIP LOCKED LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("discover purge jobs: %w", err)
+	}
+	defer rows.Close()
+	jobIDs := make([]string, 0, limit)
+	for rows.Next() {
+		var jobID string
+		if err := rows.Scan(&jobID); err != nil {
+			return nil, fmt.Errorf("read discovered purge job: %w", err)
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read discovered purge jobs: %w", err)
+	}
+	if err := r.commit(ctx, tx); err != nil {
+		return nil, err
+	}
+	return jobIDs, nil
+}
+
+func (r *PostgresRepository) ReclaimExpiredPurges(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 || limit > purgeSchedulerBatchMax || r.jitter == nil {
+		return nil, newInvariant(errors.New("invalid purge reclaim configuration"))
+	}
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return nil, err
+	}
+	reclaimed := make([]string, 0, limit)
+	excludedJobIDs := make([]string, 0)
+	for examined := 0; examined < limit; examined++ {
+		var jobID, mediaID string
+		err := tx.QueryRow(ctx, `SELECT j.id::text,m.id::text
+			FROM jobs AS j JOIN media AS m ON m.id=j.media_id_snapshot
+			WHERE j.type='purge' AND j.status='running' AND j.lease_expires_at<=clock_timestamp()
+			  AND NOT (j.id=ANY($1::uuid[]))
+			ORDER BY j.lease_expires_at,j.id FOR UPDATE OF m SKIP LOCKED LIMIT 1`, excludedJobIDs).Scan(&jobID, &mediaID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lock expired purge media: %w", err)
+		}
+		var attempts int
+		err = tx.QueryRow(ctx, `SELECT attempts FROM jobs
+			WHERE id=$1 AND media_id_snapshot=$2 AND type='purge' AND status='running'
+			  AND lease_expires_at<=clock_timestamp() FOR UPDATE SKIP LOCKED`, jobID, mediaID).Scan(&attempts)
+		if errors.Is(err, pgx.ErrNoRows) {
+			excludedJobIDs = append(excludedJobIDs, jobID)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("lock expired purge job: %w", err)
+		}
+		delay := r.jitter(purgeBackoffMaximum(attempts))
+		if delay < 0 || delay > purgeBackoffMaximum(attempts) {
+			return nil, newInvariant(errors.New("invalid purge retry jitter"))
+		}
+		tag, err := tx.Exec(ctx, `UPDATE jobs SET
+			status=CASE WHEN attempts<max_attempts THEN 'queued' ELSE 'failed' END,
+			available_at=CASE WHEN attempts<max_attempts THEN clock_timestamp()+$2::interval ELSE available_at END,
+			lease_token=NULL,lease_expires_at=NULL,error_code='lease_expired',error_message='job lease expired',
+			finished_at=CASE WHEN attempts<max_attempts THEN NULL ELSE clock_timestamp() END,
+			updated_at=clock_timestamp()
+			WHERE id=$1 AND type='purge' AND status='running' AND lease_expires_at<=clock_timestamp()`, jobID, intervalText(delay))
+		if err != nil {
+			return nil, fmt.Errorf("reclaim expired purge lease: %w", err)
+		}
+		if tag.RowsAffected() == 1 {
+			reclaimed = append(reclaimed, jobID)
+		} else {
+			excludedJobIDs = append(excludedJobIDs, jobID)
+		}
+	}
+	if err := r.commit(ctx, tx); err != nil {
+		return nil, err
+	}
+	return reclaimed, nil
+}
+
 func (r *PostgresRepository) StartPurge(ctx context.Context, jobID string) (PurgeLease, error) {
 	tx, err := r.begin(ctx)
 	if err != nil {
@@ -472,6 +581,35 @@ func newUUIDv4() (string, error) {
 
 func intervalText(duration time.Duration) string {
 	return fmt.Sprintf("%d microseconds", duration.Microseconds())
+}
+
+func purgeBackoffMaximum(attempt int) time.Duration {
+	maximum := purgeBackoffBase
+	for index := 1; index < attempt && maximum < purgeBackoffCap; index++ {
+		if maximum > purgeBackoffCap/2 {
+			return purgeBackoffCap
+		}
+		maximum *= 2
+	}
+	if maximum > purgeBackoffCap {
+		return purgeBackoffCap
+	}
+	return maximum
+}
+
+func cryptoJitter(maximum time.Duration) time.Duration {
+	if maximum <= 0 {
+		return 0
+	}
+	var value [8]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return 0
+	}
+	var number uint64
+	for _, b := range value {
+		number = number<<8 | uint64(b)
+	}
+	return time.Duration(number % (uint64(maximum) + 1))
 }
 
 const purgeJobsForUpdateSQL = `

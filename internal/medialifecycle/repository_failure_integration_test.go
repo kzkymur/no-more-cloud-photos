@@ -241,6 +241,35 @@ func TestLifecycleRepositoryIntegrationPostCommitResponseLossConverges(t *testin
 			t.Fatalf("purge jobs = %d, %v", jobs, err)
 		}
 	})
+
+	t.Run("purge reclaim", func(t *testing.T) {
+		ctx := context.Background()
+		pool, setupService := integrationService(t)
+		mediaID := integrationUUID(773)
+		insertMedia(t, pool, mediaID, integrationUUID(774))
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := setupService.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, err := setupService.StartPurge(ctx, enqueued.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, first.JobID); err != nil {
+			t.Fatal(err)
+		}
+		fault := errors.New("purge reclaim commit response lost")
+		service := lifecycleServiceWithOnePostCommitFailure(pool, fault)
+		_, err = service.StartNextPurge(ctx, 10)
+		assertCommitOutcomeUnknown(t, err, fault)
+		retry, err := service.StartNextPurge(ctx, 10)
+		if err != nil || retry.JobID != first.JobID || retry.Attempts != 2 || !retry.StartedAt.Equal(first.StartedAt) || retry.Token == first.Token {
+			t.Fatalf("StartNextPurge retry = %#v, %v", retry, err)
+		}
+	})
 }
 
 func TestLifecycleRepositoryIntegrationDeleteVersusTransformPublication(t *testing.T) {
@@ -435,6 +464,7 @@ func lifecycleServiceWithOnePostCommitFailure(pool *pgxpool.Pool, fault error) *
 	var failed atomic.Bool
 	repository := &PostgresRepository{
 		db: pool, fileBaseURL: "https://files.example/files/", newID: newUUIDv4,
+		jitter: func(time.Duration) time.Duration { return 0 },
 		afterCommit: func(context.Context) error {
 			if failed.CompareAndSwap(false, true) {
 				return fault

@@ -397,7 +397,7 @@ func (r *Repository) ReclaimExpired(ctx context.Context) (int, error) {
 	}
 	defer rollback(tx)
 	rows, err := tx.Query(ctx, `SELECT id::text,attempts FROM jobs
-		WHERE status='running' AND lease_expires_at<=clock_timestamp()
+		WHERE type='transform' AND status='running' AND lease_expires_at<=clock_timestamp()
 		ORDER BY lease_expires_at,id FOR UPDATE SKIP LOCKED LIMIT $1`, r.reclaimBatch)
 	if err != nil {
 		return 0, classifyDatabaseError(err)
@@ -429,7 +429,7 @@ func (r *Repository) ReclaimExpired(ctx context.Context) (int, error) {
 			available_at=CASE WHEN attempts<max_attempts THEN clock_timestamp()+$2::interval ELSE available_at END,
 			lease_token=NULL,lease_expires_at=NULL,error_code=$3,error_message=$4,
 			finished_at=CASE WHEN attempts<max_attempts THEN NULL ELSE clock_timestamp() END,updated_at=clock_timestamp()
-			WHERE id=$1`, item.id, intervalText(delay), FailureLeaseExpired, safeFailureMessages[FailureLeaseExpired])
+			WHERE id=$1 AND type='transform'`, item.id, intervalText(delay), FailureLeaseExpired, safeFailureMessages[FailureLeaseExpired])
 		if err != nil {
 			return 0, classifyDatabaseError(err)
 		}

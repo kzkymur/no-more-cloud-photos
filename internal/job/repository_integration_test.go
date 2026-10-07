@@ -804,6 +804,36 @@ func TestCompleteSucceededRejectsExpiredTransformAndPurgeIntegration(t *testing.
 	}
 }
 
+func TestTransformReclaimDoesNotOwnExpiredPurgeIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
+	ctx := context.Background()
+	purgeID, mediaID, token := newTestUUID(t), newTestUUID(t), newTestUUID(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after)
+		VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp())`, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts)
+		VALUES ($1,'purge',$2,'queued',3)`, purgeID, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,
+		lease_expires_at=clock_timestamp(),started_at=clock_timestamp() WHERE id=$1`, purgeID, token); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := repository.ReclaimExpired(ctx); err != nil || count != 0 {
+		t.Fatalf("transform reclaim count = %d, %v", count, err)
+	}
+	var status Status
+	var retainedToken string
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status,lease_token::text,attempts FROM jobs WHERE id=$1`, purgeID).Scan(&status, &retainedToken, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusRunning || retainedToken != token || attempts != 1 {
+		t.Fatalf("transform reclaim mutated purge status=%s token=%s attempts=%d", status, retainedToken, attempts)
+	}
+}
+
 func TestTransformTargetsRetryAndCompletionIntegration(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
 	ctx := context.Background()

@@ -21,6 +21,8 @@ type lifecycleRepository interface {
 	EnqueueDuePurge(context.Context, string) (EnqueueResult, error)
 	ScanDuePurges(context.Context, time.Time, *DuePurgeCursor, int) ([]DuePurgeCandidate, error)
 	DatabaseNow(context.Context) (time.Time, error)
+	DiscoverPurgeJobs(context.Context, int) ([]string, error)
+	ReclaimExpiredPurges(context.Context, int) ([]string, error)
 	StartPurge(context.Context, string) (PurgeLease, error)
 }
 
@@ -93,6 +95,31 @@ func (s *Service) DatabaseNow(ctx context.Context) (time.Time, error) {
 	defer cancel()
 	result, err := s.repository.DatabaseNow(dbCtx)
 	return result, classifyError(err)
+}
+
+func (s *Service) StartNextPurge(ctx context.Context, limit int) (PurgeLease, error) {
+	if limit <= 0 || limit > purgeSchedulerBatchMax {
+		return PurgeLease{}, newInvariant(errors.New("invalid purge scheduler limit"))
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	if _, err := s.repository.ReclaimExpiredPurges(dbCtx, limit); err != nil {
+		return PurgeLease{}, classifyError(err)
+	}
+	jobIDs, err := s.repository.DiscoverPurgeJobs(dbCtx, limit)
+	if err != nil {
+		return PurgeLease{}, classifyError(err)
+	}
+	for _, jobID := range jobIDs {
+		lease, err := s.repository.StartPurge(dbCtx, jobID)
+		if err == nil {
+			return lease, nil
+		}
+		if !errors.Is(err, ErrNoPurgeWork) {
+			return PurgeLease{}, classifyError(err)
+		}
+	}
+	return PurgeLease{}, ErrNoPurgeWork
 }
 
 func (s *Service) StartPurge(ctx context.Context, jobID string) (PurgeLease, error) {

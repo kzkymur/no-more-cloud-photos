@@ -249,6 +249,231 @@ func TestLifecycleRepositoryIntegrationDuePurgeScanBoundariesAndKeyset(t *testin
 	}
 }
 
+func TestLifecycleRepositoryIntegrationPurgeSchedulerReclaimRetryAndCeiling(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	repository.jitter = func(time.Duration) time.Duration { return 0 }
+
+	mediaID := integrationUUID(31)
+	insertMedia(t, pool, mediaID, integrationUUID(131))
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, first.JobID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0] != first.JobID {
+		t.Fatalf("reclaimed purges = %#v, %v", reclaimed, err)
+	}
+	var status string
+	var attempts int
+	var startedAt time.Time
+	var token *string
+	var errorCode *string
+	if err := pool.QueryRow(ctx, `SELECT status,attempts,started_at,lease_token::text,error_code FROM jobs WHERE id=$1`, first.JobID).Scan(
+		&status, &attempts, &startedAt, &token, &errorCode); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || attempts != 1 || !startedAt.Equal(first.StartedAt) || token != nil || errorCode == nil || *errorCode != "lease_expired" {
+		t.Fatalf("requeued purge status=%s attempts=%d started=%s token=%v error=%v", status, attempts, startedAt, token, errorCode)
+	}
+	retry, err := service.StartNextPurge(ctx, 10)
+	if err != nil || retry.JobID != first.JobID || retry.Attempts != 2 || !retry.StartedAt.Equal(first.StartedAt) || retry.Token == first.Token {
+		t.Fatalf("retry purge lease = %#v, %v", retry, err)
+	}
+
+	ceilingMediaID := integrationUUID(32)
+	insertMedia(t, pool, ceilingMediaID, integrationUUID(132))
+	if _, err := service.Delete(ctx, ceilingMediaID); err != nil {
+		t.Fatal(err)
+	}
+	ceilingJobID := integrationUUID(332)
+	if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts)
+		VALUES ($1,'purge',$2,'queued',1)`, ceilingJobID, ceilingMediaID); err != nil {
+		t.Fatal(err)
+	}
+	ceilingLease, err := service.StartPurge(ctx, ceilingJobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, ceilingLease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err = repository.ReclaimExpiredPurges(ctx, 10)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0] != ceilingLease.JobID {
+		t.Fatalf("ceiling reclaimed purges = %#v, %v", reclaimed, err)
+	}
+	var finishedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT status,attempts,started_at,finished_at FROM jobs WHERE id=$1`, ceilingLease.JobID).Scan(
+		&status, &attempts, &startedAt, &finishedAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" || attempts != 1 || !startedAt.Equal(ceilingLease.StartedAt) || finishedAt == nil {
+		t.Fatalf("ceiling purge status=%s attempts=%d started=%s finished=%v", status, attempts, startedAt, finishedAt)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationPurgeReclaimLocksMediaBeforeJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	repository.jitter = func(time.Duration) time.Duration { return 0 }
+	mediaID := integrationUUID(33)
+	insertMedia(t, pool, mediaID, integrationUUID(133))
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	secondMediaID := integrationUUID(35)
+	insertMedia(t, pool, secondMediaID, integrationUUID(135))
+	if _, err := service.Delete(ctx, secondMediaID); err != nil {
+		t.Fatal(err)
+	}
+	secondEnqueued, err := service.EnqueuePurge(ctx, secondMediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondLease, err := service.StartPurge(ctx, secondEnqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '1 millisecond' WHERE id=$1`, secondLease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	mediaBlocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mediaBlocker.Rollback(context.Background())
+	if _, err := mediaBlocker.Exec(ctx, `SELECT 1 FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	type reclaimOutcome struct {
+		ids []string
+		err error
+	}
+	result := make(chan reclaimOutcome, 1)
+	go func() {
+		ids, err := repository.ReclaimExpiredPurges(ctx, 10)
+		result <- reclaimOutcome{ids: ids, err: err}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	jobProbe, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobProbe.Exec(ctx, `SELECT 1 FROM jobs WHERE id=$1 FOR UPDATE NOWAIT`, lease.JobID); err != nil {
+		_ = jobProbe.Rollback(ctx)
+		t.Fatalf("purge reclaim locked Job before Media: %v", err)
+	}
+	if err := jobProbe.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := mediaBlocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	outcome := <-result
+	if outcome.err != nil || len(outcome.ids) != 1 || outcome.ids[0] != secondLease.JobID {
+		t.Fatalf("locked Media reclaim = %#v, %v", outcome.ids, outcome.err)
+	}
+	reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0] != lease.JobID {
+		t.Fatalf("post-lock reclaim = %#v, %v", reclaimed, err)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationPurgeDiscoverySkipsLockedMedia(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	mediaIDs := []string{integrationUUID(36), integrationUUID(37)}
+	jobIDs := make([]string, 0, len(mediaIDs))
+	for index, mediaID := range mediaIDs {
+		insertMedia(t, pool, mediaID, integrationUUID(136+index))
+		if _, err := service.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := service.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobIDs = append(jobIDs, enqueued.Job.ID)
+	}
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(context.Background())
+	if _, err := blocker.Exec(ctx, `SELECT 1 FROM media WHERE id=$1 FOR UPDATE`, mediaIDs[0]); err != nil {
+		t.Fatal(err)
+	}
+	discovered, err := service.repository.DiscoverPurgeJobs(ctx, 1)
+	if err != nil || len(discovered) != 1 || discovered[0] != jobIDs[1] {
+		t.Fatalf("discovered behind locked Media = %#v, %v", discovered, err)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationPurgeSchedulerMaintenanceBoundary(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	repository.jitter = func(time.Duration) time.Duration { return 0 }
+	mediaID := integrationUUID(34)
+	insertMedia(t, pool, mediaID, integrationUUID(134))
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='test',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.ReclaimExpiredPurges(ctx, 10); !IsKind(err, KindDatabaseUnavailable) {
+		t.Fatalf("maintenance reclaim error = %#v", err)
+	}
+	if _, err := repository.DiscoverPurgeJobs(ctx, 10); !IsKind(err, KindDatabaseUnavailable) {
+		t.Fatalf("maintenance discovery error = %#v", err)
+	}
+	var retainedStatus string
+	var retainedToken string
+	if err := pool.QueryRow(ctx, `SELECT status,lease_token::text FROM jobs WHERE id=$1`, lease.JobID).Scan(&retainedStatus, &retainedToken); err != nil {
+		t.Fatal(err)
+	}
+	if retainedStatus != "running" || retainedToken != lease.Token {
+		t.Fatalf("maintenance mutated purge status=%s token=%s", retainedStatus, retainedToken)
+	}
+}
+
 func TestLifecycleRepositoryIntegrationProjectionParityWithReadAPI(t *testing.T) {
 	ctx := context.Background()
 	pool, service := integrationService(t)

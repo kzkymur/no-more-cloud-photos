@@ -16,6 +16,10 @@ type stubRepository struct {
 	restoreResult RestoreResult
 	enqueueResult EnqueueResult
 	startResult   PurgeLease
+	discovered    []string
+	reclaimed     []string
+	startErrors   []error
+	startedIDs    []string
 	err           error
 	calls         int
 }
@@ -50,8 +54,25 @@ func (r *stubRepository) DatabaseNow(context.Context) (time.Time, error) {
 	return time.Time{}, r.err
 }
 
-func (r *stubRepository) StartPurge(context.Context, string) (PurgeLease, error) {
+func (r *stubRepository) DiscoverPurgeJobs(context.Context, int) ([]string, error) {
 	r.calls++
+	return r.discovered, r.err
+}
+
+func (r *stubRepository) ReclaimExpiredPurges(context.Context, int) ([]string, error) {
+	r.calls++
+	return r.reclaimed, r.err
+}
+
+func (r *stubRepository) StartPurge(_ context.Context, jobID string) (PurgeLease, error) {
+	r.calls++
+	r.startedIDs = append(r.startedIDs, jobID)
+	if len(r.startErrors) >= len(r.startedIDs) && r.startErrors[len(r.startedIDs)-1] != nil {
+		return PurgeLease{}, r.startErrors[len(r.startedIDs)-1]
+	}
+	if r.startResult.JobID == "" {
+		r.startResult.JobID = jobID
+	}
 	return r.startResult, r.err
 }
 
@@ -101,6 +122,23 @@ func TestServicePreservesResultsAndSemanticErrors(t *testing.T) {
 	repository.err = wantErr
 	if _, err := service.EnqueuePurge(context.Background(), unitMediaID); !errors.Is(err, wantErr) {
 		t.Fatalf("semantic error = %#v", err)
+	}
+}
+
+func TestStartNextPurgeFeedsDiscoveredIDsOnlyThroughStartPurge(t *testing.T) {
+	repository := &stubRepository{
+		discovered:  []string{"10000000-0000-4000-8000-000000000010", "10000000-0000-4000-8000-000000000011"},
+		startErrors: []error{ErrNoPurgeWork, nil},
+	}
+	lease, err := newService(repository).StartNextPurge(context.Background(), 10)
+	if err != nil || lease.JobID != repository.discovered[1] {
+		t.Fatalf("StartNextPurge = %#v, %v", lease, err)
+	}
+	if len(repository.startedIDs) != 2 || repository.startedIDs[0] != repository.discovered[0] || repository.startedIDs[1] != repository.discovered[1] {
+		t.Fatalf("started IDs = %#v", repository.startedIDs)
+	}
+	if repository.calls != 4 {
+		t.Fatalf("repository calls = %d, want reclaim + discover + two starts", repository.calls)
 	}
 }
 
