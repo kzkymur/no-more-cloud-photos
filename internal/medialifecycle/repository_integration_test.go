@@ -320,7 +320,58 @@ func TestLifecycleRepositoryIntegrationStartPurgeLeaseAndEligibility(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM media WHERE id=$1`, missingMediaID); err != nil {
+	missingLease, err := service.StartPurge(ctx, missing.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manifestTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, missingLease.Token); err == nil {
+		_, err = manifestTx.Exec(ctx, `INSERT INTO purge_file_progress
+			(job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes)
+			SELECT $1,$2,'original',id,relative_path,size_bytes FROM originals WHERE media_id=$2`, missing.Job.ID, missingMediaID)
+	}
+	if err != nil {
+		_ = manifestTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := manifestTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	progressTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = progressTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, missingLease.Token); err == nil {
+		_, err = progressTx.Exec(ctx, `UPDATE purge_file_progress SET disposition='missing' WHERE job_id=$1`, missing.Job.ID)
+	}
+	if err != nil {
+		_ = progressTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := progressTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	finalTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = finalTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, missing.Job.ID); err == nil {
+		_, err = finalTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, missingLease.Token)
+	}
+	if err == nil {
+		_, err = finalTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, missingMediaID)
+	}
+	if err == nil {
+		_, err = finalTx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, missing.Job.ID)
+	}
+	if err != nil {
+		_ = finalTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := finalTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.StartPurge(ctx, missing.Job.ID); !errors.Is(err, ErrNoPurgeWork) {

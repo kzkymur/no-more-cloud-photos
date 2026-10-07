@@ -121,7 +121,33 @@ func TestReadServiceIntegration(t *testing.T) {
 		if err != nil || len(detail.CurrentRenditions) != 1 || detail.CurrentRenditions[0].ID != renditionID || detail.Jobs == nil {
 			t.Fatalf("media detail = %#v, %v", detail, err)
 		}
-		if _, err := pool.Exec(ctx, `DELETE FROM renditions WHERE id=$1`, renditionID); err != nil {
+		if _, err := pool.Exec(ctx, `DELETE FROM renditions WHERE id=$1`, renditionID); err == nil {
+			t.Fatal("direct current Rendition deletion succeeded")
+		}
+		if _, err := pool.Exec(ctx, `UPDATE renditions SET is_current=false,purge_after=$2 WHERE id=$1`, renditionID, base); err != nil {
+			t.Fatal(err)
+		}
+		cleanupID := integrationUUID(3101)
+		if _, err := pool.Exec(ctx, `INSERT INTO rendition_cleanup_progress
+			(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
+			SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, cleanupID, renditionID); err != nil {
+			t.Fatal(err)
+		}
+		cleanupTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = cleanupTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID); err == nil {
+			_, err = cleanupTx.Exec(ctx, `UPDATE rendition_cleanup_progress SET disposition='missing' WHERE id=$1`, cleanupID)
+		}
+		if err == nil {
+			_, err = cleanupTx.Exec(ctx, `DELETE FROM renditions WHERE id=$1`, renditionID)
+		}
+		if err != nil {
+			_ = cleanupTx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := cleanupTx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
 		job, err := service.GetJob(ctx, integrationUUID(4001))
@@ -188,7 +214,51 @@ func TestReadServiceIntegration(t *testing.T) {
 			}
 		}
 
-		if _, err := pool.Exec(ctx, `DELETE FROM media WHERE id=$1`, purged.ID); err != nil {
+		purgeJobID := integrationUUID(5200)
+		purgeToken := integrationUUID(6200)
+		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, purgeJobID, purged.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, purgeJobID, purgeToken); err != nil {
+			t.Fatal(err)
+		}
+		manifestTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = manifestTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken); err == nil {
+			_, err = manifestTx.Exec(ctx, `INSERT INTO purge_file_progress
+				(job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes)
+				SELECT $1,$2,'original',id,relative_path,size_bytes FROM originals WHERE media_id=$2`, purgeJobID, purged.ID)
+		}
+		if err != nil {
+			_ = manifestTx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := manifestTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		purgeTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = purgeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken); err == nil {
+			_, err = purgeTx.Exec(ctx, `UPDATE purge_file_progress SET disposition='missing' WHERE job_id=$1`, purgeJobID)
+		}
+		if err == nil {
+			_, err = purgeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, purgeJobID)
+		}
+		if err == nil {
+			_, err = purgeTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, purged.ID)
+		}
+		if err == nil {
+			_, err = purgeTx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, purgeJobID)
+		}
+		if err != nil {
+			_ = purgeTx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := purgeTx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
 		request.Cursor = ""

@@ -38,8 +38,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 7 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version seven", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 8 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version eight", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,12 +62,116 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 7 || status.ExpectedVersion != 7 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version seven", status)
+		if status.CurrentVersion != 8 || status.ExpectedVersion != 8 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version eight", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
 		}
+	})
+
+	t.Run("purge cleanup invariant upgrade rejects invalid live history atomically", func(t *testing.T) {
+		ctx := context.Background()
+		prepareVersionSeven := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
+			t.Helper()
+			pool := integrationPool(t, databaseURL)
+			full, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := newMigrator(pool, full.migrations[:7]).Up(ctx); err != nil {
+				t.Fatalf("apply versions one through seven: %v", err)
+			}
+			return pool, full
+		}
+		insertInvalidTarget := func(t *testing.T, pool *pgxpool.Pool) string {
+			t.Helper()
+			mediaID, originalID, jobID, targetID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`, originalID, mediaID, strings.Repeat("a", 64), "originals/aa/v8-preflight/original.jpg"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `ALTER TABLE job_targets DISABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `ALTER TABLE job_targets ENABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			return targetID
+		}
+		assertRollback := func(t *testing.T, pool *pgxpool.Pool) {
+			t.Helper()
+			var version int64
+			var progressTable, guardFunction bool
+			if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT to_regclass('purge_file_progress') IS NOT NULL, to_regprocedure('nmcp_guard_media_purge_delete()') IS NOT NULL`).Scan(&progressTable, &guardFunction); err != nil {
+				t.Fatal(err)
+			}
+			if version != 7 || progressTable || guardFunction {
+				t.Fatalf("failed migration state version=%d progress=%t guard=%t", version, progressTable, guardFunction)
+			}
+		}
+
+		pool, migrator := prepareVersionSeven(t)
+		insertInvalidTarget(t, pool)
+		if err := migrator.Up(ctx); err == nil {
+			t.Fatal("migration accepted succeeded live Target without Rendition")
+		}
+		assertRollback(t, pool)
+
+		t.Run("waits for earlier target writer before preflight", func(t *testing.T) {
+			pool, migrator := prepareVersionSeven(t)
+			mediaID, originalID, jobID, targetID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`, originalID, mediaID, strings.Repeat("b", 64), "originals/bb/v8-lock/original.jpg"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+				t.Fatal(err)
+			}
+			writer, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Rollback(ctx)
+			if _, err := writer.Exec(ctx, `ALTER TABLE job_targets DISABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.Exec(ctx, `ALTER TABLE job_targets ENABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() { result <- migrator.Up(ctx) }()
+			awaitRelationLock(t, pool, ctx, 0, "job_targets", "AccessExclusiveLock", false)
+			if err := writer.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := awaitContextResult(t, ctx, result); err == nil {
+				t.Fatal("migration accepted invalid target committed by earlier writer")
+			}
+			assertRollback(t, pool)
+		})
 	})
 
 	t.Run("lifecycle guard upgrade validates legacy state and lock order", func(t *testing.T) {
