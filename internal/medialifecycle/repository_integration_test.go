@@ -1606,24 +1606,7 @@ func TestLifecycleRepositoryIntegrationStartPurgeLeaseAndEligibility(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	finalTx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = finalTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, missing.Job.ID); err == nil {
-		_, err = finalTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, missingLease.Token)
-	}
-	if err == nil {
-		_, err = finalTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, missingMediaID)
-	}
-	if err == nil {
-		_, err = finalTx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, missing.Job.ID)
-	}
-	if err != nil {
-		_ = finalTx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if err := finalTx.Commit(ctx); err != nil {
+	if err := service.repository.(*PostgresRepository).FinalizePurge(ctx, missingLease.JobID, missingLease.Token); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.StartPurge(ctx, missing.Job.ID); !errors.Is(err, ErrNoPurgeWork) {

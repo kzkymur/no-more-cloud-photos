@@ -721,9 +721,24 @@ func (r *PostgresRepository) HeartbeatPurge(ctx context.Context, jobID, token st
 	if deletedAt == nil {
 		return time.Time{}, ErrPurgeLeaseLost
 	}
+	var previousExpiry time.Time
+	if err := tx.QueryRow(ctx, `SELECT lease_expires_at FROM jobs
+		WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running' AND lease_token=$2
+		FOR UPDATE`, jobID, token, mediaID).Scan(&previousExpiry); errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrPurgeLeaseLost
+	} else if err != nil {
+		return time.Time{}, fmt.Errorf("lock purge heartbeat Job: %w", err)
+	}
+	now, err := databaseNow(ctx, tx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !previousExpiry.After(now) {
+		return time.Time{}, ErrPurgeLeaseLost
+	}
 	var expires time.Time
 	if err := tx.QueryRow(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '2 minutes',updated_at=clock_timestamp()
-		WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()
+		WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running' AND lease_token=$2
 		RETURNING lease_expires_at`, jobID, token, mediaID).Scan(&expires); errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, ErrPurgeLeaseLost
 	} else if err != nil {

@@ -244,10 +244,16 @@ func TestReadServiceIntegration(t *testing.T) {
 		}
 		_, err = purgeTx.Exec(ctx, `SELECT nmcp_complete_purge_file_progress($1,$2,'original',$3,$4,'missing')`, purgeJobID, purged.ID, purged.OriginalID, purgeToken)
 		if err == nil {
-			_, err = purgeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, purgeJobID)
+			_, err = purgeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true),pg_catalog.set_config('nmcp.purge_lease_token',$2,true)`, purgeJobID, purgeToken)
 		}
 		if err == nil {
 			_, err = purgeTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, purged.ID)
+		}
+		if err == nil {
+			var position int64
+			if err = purgeTx.QueryRow(ctx, `UPDATE change_feed_state SET last_position=last_position+1 WHERE id=1 RETURNING last_position`).Scan(&position); err == nil {
+				_, err = purgeTx.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id,payload) VALUES ($1,$2,'media_purged','physical_purge',$3,NULL)`, integrationUUID(999), position, purged.ID)
+			}
 		}
 		if err == nil {
 			_, err = purgeTx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, purgeJobID)

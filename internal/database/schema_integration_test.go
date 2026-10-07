@@ -1239,13 +1239,14 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatal("same-ID Media insert waited behind locked Media row")
 		}
 		_ = mediaHolder.Rollback(ctx)
-		// Prove both absent-identity races are causally serialized, rather than
-		// merely checking the two statements in sequence.
+		// An uncommitted brand-new Media identity is invisible to the tombstone
+		// statement, which must fail closed immediately rather than deadlock.
 		mediaWinsID := newUUIDv4(t)
 		mediaWins, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer mediaWins.Rollback(context.Background())
 		if _, err = mediaWins.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
 			_, err = mediaWins.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaWinsID)
 		}
@@ -1258,23 +1259,29 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer tombstoneContender.Rollback(context.Background())
 		if _, err := tombstoneContender.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err != nil {
 			t.Fatal(err)
 		}
-		var tombstonePID int32
-		if err := tombstoneContender.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&tombstonePID); err != nil {
-			t.Fatal(err)
-		}
+		raceCtx, cancelRace := context.WithTimeout(ctx, time.Second)
+		defer cancelRace()
 		go func() {
-			_, err := tombstoneContender.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999997,'media_purged','physical_purge',$2)`, newUUIDv4(t), mediaWinsID)
+			_, err := tombstoneContender.Exec(raceCtx, `INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999997,'media_purged','physical_purge',$2)`, newUUIDv4(t), mediaWinsID)
 			tombstoneResult <- err
 		}()
-		awaitBackendLock(t, pool, ctx, tombstonePID)
+		select {
+		case err := <-tombstoneResult:
+			if err == nil {
+				t.Fatal("tombstone succeeded against an uncommitted Media identity")
+			}
+		case <-raceCtx.Done():
+			_ = mediaWins.Rollback(context.Background())
+			<-tombstoneResult
+			_ = tombstoneContender.Rollback(context.Background())
+			t.Fatalf("tombstone waited on an uncommitted Media identity: %v", raceCtx.Err())
+		}
 		if err := mediaWins.Commit(ctx); err != nil {
 			t.Fatal(err)
-		}
-		if err := <-tombstoneResult; err == nil {
-			t.Fatal("tombstone succeeded after concurrent Media creation")
 		}
 		_ = tombstoneContender.Rollback(ctx)
 
@@ -1767,24 +1774,6 @@ func expectTxCommitError(t *testing.T, pool *pgxpool.Pool, run func(pgx.Tx) erro
 	}
 	if err := tx.Commit(ctx); err == nil {
 		t.Fatal("transaction commit unexpectedly succeeded")
-	}
-}
-
-func awaitBackendLock(t *testing.T, pool *pgxpool.Pool, ctx context.Context, pid int32) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var waiting bool
-		if err := pool.QueryRow(ctx, `SELECT COALESCE(wait_event_type='Lock',false) FROM pg_stat_activity WHERE pid=$1`, pid).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("backend %d did not reach a lock wait", pid)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
