@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -25,6 +26,7 @@ type systemOperations struct {
 	fsync     func(int) error
 	renameat2 func(int, string, int, string, uint) error
 	unlinkat  func(int, string, int) error
+	fstat     func(int, *unix.Stat_t) error
 	fstatat   func(int, string, *unix.Stat_t, int) error
 }
 
@@ -36,6 +38,7 @@ var linuxOperations = systemOperations{
 	fsync:     unix.Fsync,
 	renameat2: unix.Renameat2,
 	unlinkat:  unix.Unlinkat,
+	fstat:     unix.Fstat,
 	fstatat:   unix.Fstatat,
 }
 
@@ -297,6 +300,45 @@ type DeleteResult struct {
 	Missing bool
 }
 
+type DeleteExpectation struct {
+	ExpectedSize int64
+}
+
+type QuarantineResult struct {
+	Path    string
+	Moved   bool
+	Missing bool
+}
+
+type AttemptTempInfo struct {
+	Size       int64
+	ModifiedAt time.Time
+}
+
+func (store *Store) InspectAttemptTemp(ctx context.Context, key AttemptTempKey) (AttemptTempInfo, error) {
+	if _, err := ParseAttemptTempKey(key.String()); err != nil {
+		return AttemptTempInfo{}, ErrInvalidKey
+	}
+	parentFD, name, release, err := store.openParent(ctx, key.String())
+	if err != nil {
+		return AttemptTempInfo{}, err
+	}
+	defer release()
+	fd, err := store.ops.openat(parentFD, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return AttemptTempInfo{}, classifyError("open attempt temporary object", err)
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if err := store.ops.fstat(fd, &stat); err != nil {
+		return AttemptTempInfo{}, classifyError("stat attempt temporary object", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return AttemptTempInfo{}, ErrUnexpectedType
+	}
+	return AttemptTempInfo{Size: stat.Size, ModifiedAt: time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec)}, nil
+}
+
 func (store *Store) begin(ctx context.Context, key string, attempt AttemptID) (*Temp, error) {
 	directories, finalName := splitKey(key)
 	return store.beginAt(ctx, key, directories, finalName, finalName, attempt)
@@ -389,6 +431,15 @@ func (store *Store) beginAt(ctx context.Context, key string, directories []strin
 		parentFD = nextFD
 	}
 	tempName := "." + tempBase + "." + attempt.String() + ".tmp"
+	tempKey := strings.Join(append(append([]string(nil), directories...), tempName), "/")
+	if _, err := ParseAttemptTempKey(tempKey); err != nil {
+		cleanupErr := store.cleanupFailedBegin(context.WithoutCancel(ctx), parentFD, -1, "", cleanupParentFD, cleanupDirName, key)
+		_ = unix.Close(parentFD)
+		if cleanupParentFD >= 0 {
+			_ = unix.Close(cleanupParentFD)
+		}
+		return nil, errors.Join(ErrInvalidKey, cleanupErr)
+	}
 	if err := store.inject(ctx, BoundaryTempCreate, Before, key, len(directories)); err != nil {
 		cleanupErr := store.cleanupFailedBegin(context.WithoutCancel(ctx), parentFD, -1, "", cleanupParentFD, cleanupDirName, key)
 		_ = unix.Close(parentFD)
@@ -1029,21 +1080,24 @@ func (store *Store) openObject(ctx context.Context, key string) (*os.File, error
 	return os.NewFile(uintptr(fd), "storage-object"), nil
 }
 
-func (store *Store) DeleteOriginal(ctx context.Context, key OriginalKey) (DeleteResult, error) {
+func (store *Store) DeleteOriginal(ctx context.Context, key OriginalKey, expectation DeleteExpectation) (DeleteResult, error) {
 	if _, err := ParseOriginalKey(key.String()); err != nil {
 		return DeleteResult{}, ErrInvalidKey
 	}
-	return store.deleteObject(ctx, key.String())
+	return store.deleteObject(ctx, key.String(), expectation)
 }
 
-func (store *Store) DeleteRendition(ctx context.Context, key RenditionKey) (DeleteResult, error) {
+func (store *Store) DeleteRendition(ctx context.Context, key RenditionKey, expectation DeleteExpectation) (DeleteResult, error) {
 	if _, err := ParseRenditionKey(key.String()); err != nil {
 		return DeleteResult{}, ErrInvalidKey
 	}
-	return store.deleteObject(ctx, key.String())
+	return store.deleteObject(ctx, key.String(), expectation)
 }
 
-func (store *Store) deleteObject(ctx context.Context, key string) (DeleteResult, error) {
+func (store *Store) deleteObject(ctx context.Context, key string, expectation DeleteExpectation) (DeleteResult, error) {
+	if expectation.ExpectedSize < 0 {
+		return DeleteResult{}, ErrValidation
+	}
 	parentFD, finalName, release, err := store.openParent(ctx, key)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -1052,8 +1106,8 @@ func (store *Store) deleteObject(ctx context.Context, key string) (DeleteResult,
 		return DeleteResult{}, err
 	}
 	defer release()
-	var stat unix.Stat_t
-	if err := store.ops.fstatat(parentFD, finalName, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	objectFD, err := store.ops.openat(parentFD, finalName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
 			durable, syncErr := store.syncDeleteDirectory(ctx, parentFD, key)
 			if syncErr != nil {
@@ -1064,15 +1118,46 @@ func (store *Store) deleteObject(ctx context.Context, key string) (DeleteResult,
 			}
 			return DeleteResult{Missing: true}, nil
 		}
-		return DeleteResult{}, classifyError("stat object for delete", err)
+		return DeleteResult{}, classifyError("open object for delete", err)
 	}
-	if stat.Mode&unix.S_IFMT == unix.S_IFLNK {
-		return DeleteResult{}, ErrSymlink
+	defer unix.Close(objectFD)
+	var pinned unix.Stat_t
+	if err := store.ops.fstat(objectFD, &pinned); err != nil {
+		return DeleteResult{}, classifyError("stat pinned object for delete", err)
 	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+	if pinned.Mode&unix.S_IFMT != unix.S_IFREG {
 		return DeleteResult{}, ErrUnexpectedType
 	}
+	if pinned.Size != expectation.ExpectedSize {
+		return DeleteResult{}, ErrValidation
+	}
 	if err := store.inject(ctx, BoundaryDelete, Before, key, 0); err != nil {
+		return DeleteResult{}, err
+	}
+	var current unix.Stat_t
+	if err := store.ops.fstatat(parentFD, finalName, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			durable, syncErr := store.syncDeleteDirectory(ctx, parentFD, key)
+			if syncErr != nil {
+				if durable {
+					return DeleteResult{Missing: true}, syncErr
+				}
+				return DeleteResult{}, errors.Join(ErrOutcomeUncertain, ErrDurability, syncErr)
+			}
+			return DeleteResult{Missing: true}, nil
+		}
+		return DeleteResult{}, classifyError("restat object for delete", err)
+	}
+	if current.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return DeleteResult{}, ErrSymlink
+	}
+	if current.Mode&unix.S_IFMT != unix.S_IFREG {
+		return DeleteResult{}, ErrUnexpectedType
+	}
+	if current.Dev != pinned.Dev || current.Ino != pinned.Ino || current.Size != pinned.Size {
+		return DeleteResult{}, ErrValidation
+	}
+	if err := ctx.Err(); err != nil {
 		return DeleteResult{}, err
 	}
 	if err := store.ops.unlinkat(parentFD, finalName, 0); err != nil {
@@ -1088,10 +1173,11 @@ func (store *Store) deleteObject(ctx context.Context, key string) (DeleteResult,
 		}
 		return DeleteResult{}, classifyError("delete object", err)
 	}
-	if err := store.inject(ctx, BoundaryDelete, After, key, 0); err != nil {
+	durableCtx := context.WithoutCancel(ctx)
+	if err := store.inject(durableCtx, BoundaryDelete, After, key, 0); err != nil {
 		return DeleteResult{}, errors.Join(ErrOutcomeUncertain, err)
 	}
-	durable, err := store.syncDeleteDirectory(ctx, parentFD, key)
+	durable, err := store.syncDeleteDirectory(durableCtx, parentFD, key)
 	if err != nil {
 		if durable {
 			return DeleteResult{}, err
@@ -1099,6 +1185,235 @@ func (store *Store) deleteObject(ctx context.Context, key string) (DeleteResult,
 		return DeleteResult{}, errors.Join(ErrOutcomeUncertain, ErrDurability, err)
 	}
 	return DeleteResult{}, nil
+}
+
+func (store *Store) QuarantineOriginal(ctx context.Context, source OriginalKey, expectation DeleteExpectation, destination QuarantineKey) (QuarantineResult, error) {
+	if _, err := ParseOriginalKey(source.String()); err != nil {
+		return QuarantineResult{}, ErrInvalidKey
+	}
+	return store.quarantineObject(ctx, source.String(), expectation, destination)
+}
+
+func (store *Store) QuarantineRendition(ctx context.Context, source RenditionKey, expectation DeleteExpectation, destination QuarantineKey) (QuarantineResult, error) {
+	if _, err := ParseRenditionKey(source.String()); err != nil {
+		return QuarantineResult{}, ErrInvalidKey
+	}
+	return store.quarantineObject(ctx, source.String(), expectation, destination)
+}
+
+func (store *Store) QuarantineAttemptTemp(ctx context.Context, source AttemptTempKey, expectation DeleteExpectation, destination QuarantineKey) (QuarantineResult, error) {
+	if _, err := ParseAttemptTempKey(source.String()); err != nil {
+		return QuarantineResult{}, ErrInvalidKey
+	}
+	return store.quarantineObject(ctx, source.String(), expectation, destination)
+}
+
+func (store *Store) quarantineObject(ctx context.Context, source string, expectation DeleteExpectation, destination QuarantineKey) (QuarantineResult, error) {
+	destinationPath := destination.String()
+	if expectation.ExpectedSize < 0 {
+		return QuarantineResult{}, ErrValidation
+	}
+	if _, err := ParseQuarantineKey(destinationPath); err != nil {
+		return QuarantineResult{}, ErrInvalidKey
+	}
+	sourceFD, sourceName, release, err := store.openParent(ctx, source)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return QuarantineResult{Path: destinationPath, Missing: true}, nil
+		}
+		return QuarantineResult{}, err
+	}
+	defer release()
+	objectFD, err := store.ops.openat(sourceFD, sourceName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return store.recoverQuarantineMove(ctx, sourceFD, expectation, destination)
+		}
+		return QuarantineResult{}, classifyError("open quarantine source", err)
+	}
+	defer unix.Close(objectFD)
+	var pinned unix.Stat_t
+	if err := store.ops.fstat(objectFD, &pinned); err != nil {
+		return QuarantineResult{}, classifyError("stat quarantine source", err)
+	}
+	if pinned.Mode&unix.S_IFMT != unix.S_IFREG {
+		return QuarantineResult{}, ErrUnexpectedType
+	}
+	if pinned.Size != expectation.ExpectedSize {
+		return QuarantineResult{}, ErrValidation
+	}
+	quarantineFD, err := store.openQuarantineDirectory(ctx, destinationPath)
+	if err != nil {
+		return QuarantineResult{}, err
+	}
+	defer unix.Close(quarantineFD)
+	var sourceDirectory, quarantineDirectory unix.Stat_t
+	if err := store.ops.fstat(sourceFD, &sourceDirectory); err != nil {
+		return QuarantineResult{}, classifyError("stat quarantine source directory", err)
+	}
+	if err := store.ops.fstat(quarantineFD, &quarantineDirectory); err != nil {
+		return QuarantineResult{}, classifyError("stat quarantine destination directory", err)
+	}
+	if sourceDirectory.Dev != quarantineDirectory.Dev || pinned.Dev != quarantineDirectory.Dev {
+		return QuarantineResult{}, errors.Join(ErrValidation, errors.New("quarantine requires one filesystem"))
+	}
+	if err := store.inject(ctx, BoundaryQuarantineRename, Before, destinationPath, 0); err != nil {
+		return QuarantineResult{}, err
+	}
+	var current unix.Stat_t
+	if err := store.ops.fstatat(sourceFD, sourceName, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return store.recoverQuarantineMove(ctx, sourceFD, expectation, destination)
+		}
+		return QuarantineResult{}, classifyError("restat quarantine source", err)
+	}
+	if current.Mode&unix.S_IFMT != unix.S_IFREG || current.Dev != pinned.Dev || current.Ino != pinned.Ino || current.Size != pinned.Size {
+		return QuarantineResult{}, ErrValidation
+	}
+	if err := ctx.Err(); err != nil {
+		return QuarantineResult{}, err
+	}
+	_, destinationName := splitKey(destinationPath)
+	if err := store.ops.renameat2(sourceFD, sourceName, quarantineFD, destinationName, unix.RENAME_NOREPLACE); err != nil {
+		return QuarantineResult{}, classifyError("rename object to quarantine", err)
+	}
+	durableCtx := context.WithoutCancel(ctx)
+	var postErrors []error
+	uncertain := false
+	if err := store.inject(durableCtx, BoundaryQuarantineRename, After, destinationPath, 0); err != nil {
+		postErrors = append(postErrors, err)
+		uncertain = true
+	}
+	var moved unix.Stat_t
+	if err := store.ops.fstatat(quarantineFD, destinationName, &moved, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		postErrors = append(postErrors, classifyError("validate quarantined object", err))
+		uncertain = true
+	} else if moved.Mode&unix.S_IFMT != unix.S_IFREG || moved.Dev != pinned.Dev || moved.Ino != pinned.Ino || moved.Size != pinned.Size {
+		postErrors = append(postErrors, ErrValidation)
+		uncertain = true
+	}
+	if syncUncertain, syncErr := store.syncQuarantineMove(durableCtx, sourceFD, quarantineFD, destinationPath); syncErr != nil {
+		postErrors = append(postErrors, syncErr)
+		uncertain = uncertain || syncUncertain
+	}
+	result := QuarantineResult{Path: destinationPath, Moved: true}
+	if len(postErrors) != 0 {
+		cause := errors.Join(postErrors...)
+		if uncertain {
+			cause = errors.Join(ErrOutcomeUncertain, cause)
+		}
+		return result, &QuarantineError{Moved: true, Uncertain: uncertain, operation: "durability", cause: cause}
+	}
+	return result, nil
+}
+
+func (store *Store) recoverQuarantineMove(ctx context.Context, sourceFD int, expectation DeleteExpectation, destination QuarantineKey) (QuarantineResult, error) {
+	destinationPath := destination.String()
+	quarantineFD, err := store.openQuarantineDirectory(ctx, destinationPath)
+	if err != nil {
+		return QuarantineResult{}, err
+	}
+	defer unix.Close(quarantineFD)
+	_, destinationName := splitKey(destinationPath)
+	moved := false
+	var stat unix.Stat_t
+	if err := store.ops.fstatat(quarantineFD, destinationName, &stat, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+		if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Size != expectation.ExpectedSize {
+			return QuarantineResult{}, ErrValidation
+		}
+		moved = true
+	} else if !errors.Is(err, unix.ENOENT) {
+		return QuarantineResult{}, classifyError("inspect quarantine retry destination", err)
+	}
+	durableCtx := context.WithoutCancel(ctx)
+	uncertain, syncErr := store.syncQuarantineMove(durableCtx, sourceFD, quarantineFD, destinationPath)
+	result := QuarantineResult{Path: destinationPath, Moved: moved, Missing: !moved}
+	if syncErr == nil {
+		return result, nil
+	}
+	cause := syncErr
+	if uncertain {
+		cause = errors.Join(ErrOutcomeUncertain, cause)
+	}
+	return result, &QuarantineError{Moved: moved, Uncertain: uncertain, operation: "retry durability", cause: cause}
+}
+
+func (store *Store) syncQuarantineMove(ctx context.Context, sourceFD, quarantineFD int, destinationPath string) (bool, error) {
+	uncertain := false
+	var syncErrors []error
+	if durable, err := store.syncBoundary(ctx, sourceFD, BoundaryQuarantineSourceDirectorySync, destinationPath, 0, "sync quarantine source directory"); err != nil {
+		if !durable {
+			syncErrors = append(syncErrors, errors.Join(ErrDurability, err))
+			uncertain = true
+		} else {
+			syncErrors = append(syncErrors, err)
+		}
+	}
+	if durable, err := store.syncBoundary(ctx, quarantineFD, BoundaryQuarantineDestinationDirectorySync, destinationPath, 0, "sync quarantine destination directory"); err != nil {
+		if !durable {
+			syncErrors = append(syncErrors, errors.Join(ErrDurability, err))
+			uncertain = true
+		} else {
+			syncErrors = append(syncErrors, err)
+		}
+	}
+	return uncertain, errors.Join(syncErrors...)
+}
+
+func (store *Store) openQuarantineDirectory(ctx context.Context, key string) (int, error) {
+	const name = ".quarantine"
+	fd, err := store.ops.openat(store.rootFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	created := false
+	if errors.Is(err, unix.ENOENT) {
+		if err = store.inject(ctx, BoundaryQuarantineDirectoryCreate, Before, key, 0); err == nil {
+			err = store.ops.mkdirat(store.rootFD, name, 0o700)
+		}
+		if errors.Is(err, unix.EEXIST) {
+			err = nil
+		} else if err == nil {
+			created = true
+		}
+		if err == nil {
+			fd, err = store.ops.openat(store.rootFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		}
+		if err == nil && created {
+			err = store.inject(context.WithoutCancel(ctx), BoundaryQuarantineDirectoryCreate, After, key, 0)
+		}
+	}
+	if err != nil {
+		if fd >= 0 {
+			_ = unix.Close(fd)
+		}
+		return -1, classifyError("open quarantine directory", err)
+	}
+	var directoryStat unix.Stat_t
+	if err := store.ops.fstat(fd, &directoryStat); err != nil {
+		_ = unix.Close(fd)
+		return -1, classifyError("stat quarantine directory", err)
+	}
+	if directoryStat.Mode&unix.S_IFMT != unix.S_IFDIR || directoryStat.Mode&0o077 != 0 {
+		_ = unix.Close(fd)
+		return -1, ErrUnexpectedType
+	}
+	durableCtx := ctx
+	if created {
+		durableCtx = context.WithoutCancel(ctx)
+	}
+	if durable, syncErr := store.syncBoundary(durableCtx, fd, BoundaryQuarantineDirectorySync, key, 0, "sync quarantine directory"); syncErr != nil {
+		_ = unix.Close(fd)
+		if durable {
+			return -1, syncErr
+		}
+		return -1, errors.Join(ErrDurability, syncErr)
+	}
+	if durable, syncErr := store.syncBoundary(durableCtx, store.rootFD, BoundaryQuarantineDirectorySync, key, 1, "sync quarantine directory parent"); syncErr != nil {
+		_ = unix.Close(fd)
+		if durable {
+			return -1, syncErr
+		}
+		return -1, errors.Join(ErrDurability, syncErr)
+	}
+	return fd, nil
 }
 
 func (store *Store) openParent(ctx context.Context, key string) (int, string, func(), error) {

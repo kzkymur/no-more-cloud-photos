@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/mediaformat"
 )
@@ -24,10 +25,11 @@ func TestEveryDetectedMIMEHasClosedOriginalExtension(t *testing.T) {
 }
 
 const (
-	testOriginalID  = "01234567-89ab-4cde-8f01-23456789abcd"
-	testTargetID    = "11111111-2222-4333-8444-555555555555"
-	testRenditionID = "22222222-3333-4444-8555-666666666666"
-	testAttemptID   = "33333333-4444-4555-8666-777777777777"
+	testOriginalID   = "01234567-89ab-4cde-8f01-23456789abcd"
+	testTargetID     = "11111111-2222-4333-8444-555555555555"
+	testRenditionID  = "22222222-3333-4444-8555-666666666666"
+	testAttemptID    = "33333333-4444-4555-8666-777777777777"
+	testQuarantineID = "44444444-5555-4666-8777-888888888888"
 )
 
 func TestCanonicalKeys(t *testing.T) {
@@ -64,6 +66,79 @@ func TestCanonicalKeys(t *testing.T) {
 	parsedRendition, err := ParseRenditionKey(rendition.String())
 	if err != nil || parsedRendition.String() != rendition.String() {
 		t.Fatalf("ParseRenditionKey() = %q, %v", parsedRendition.String(), err)
+	}
+}
+
+func TestQuarantineAndAttemptTempKeysAreClosed(t *testing.T) {
+	originalID, _ := ParseOriginalID(testOriginalID)
+	targetID, _ := ParseJobTargetID(testTargetID)
+	renditionID, _ := ParseRenditionID(testRenditionID)
+	attemptID, _ := ParseAttemptID(testAttemptID)
+	quarantineID, _ := ParseQuarantineID(testQuarantineID)
+	original, _ := NewOriginalKey(originalID, OriginalJPEG)
+	rendition, _ := NewRenditionKey(originalID, targetID, renditionID, RenditionAVIF)
+	quarantine, err := NewQuarantineKey(quarantineID)
+	if err != nil || quarantine.String() != ".quarantine/"+testQuarantineID {
+		t.Fatalf("NewQuarantineKey() = %q, %v", quarantine.String(), err)
+	}
+	if parsed, err := ParseQuarantineKey(quarantine.String()); err != nil || parsed.String() != quarantine.String() {
+		t.Fatalf("ParseQuarantineKey() = %q, %v", parsed.String(), err)
+	}
+	constructors := []func() (AttemptTempKey, error){
+		func() (AttemptTempKey, error) { return NewOriginalUploadTempKey(originalID, attemptID) },
+		func() (AttemptTempKey, error) { return NewOriginalTempKey(original, attemptID) },
+		func() (AttemptTempKey, error) { return NewRenditionTempKey(rendition, attemptID) },
+	}
+	want := []string{
+		"originals/01/" + testOriginalID + "/.original." + testAttemptID + ".tmp",
+		"originals/01/" + testOriginalID + "/.original.jpg." + testAttemptID + ".tmp",
+		"renditions/01/" + testOriginalID + "/" + testTargetID + "/." + testRenditionID + ".avif." + testAttemptID + ".tmp",
+	}
+	for index, construct := range constructors {
+		key, err := construct()
+		if err != nil || key.String() != want[index] || key.AttemptID().String() != testAttemptID {
+			t.Fatalf("temp constructor %d = %q, %v", index, key.String(), err)
+		}
+		parsed, err := ParseAttemptTempKey(key.String())
+		if err != nil || parsed.String() != key.String() || parsed.AttemptID().String() != testAttemptID {
+			t.Fatalf("ParseAttemptTempKey(%q) = %q, %v", key.String(), parsed.String(), err)
+		}
+	}
+	for _, value := range []string{
+		"quarantine/" + testQuarantineID,
+		".quarantine/../" + testQuarantineID,
+		want[0] + ".old",
+		strings.Replace(want[0], ".original.", "original.", 1),
+		strings.Replace(want[1], ".jpg.", ".exe.", 1),
+		strings.Replace(want[2], testOriginalID, strings.ToUpper(testOriginalID), 1),
+		"originals/02/" + testOriginalID + "/.original." + testAttemptID + ".tmp",
+	} {
+		if _, err := ParseQuarantineKey(value); !errors.Is(err, ErrInvalidKey) {
+			t.Fatalf("ParseQuarantineKey(%q) error = %v", value, err)
+		}
+		if _, err := ParseAttemptTempKey(value); !errors.Is(err, ErrInvalidKey) {
+			t.Fatalf("ParseAttemptTempKey(%q) error = %v", value, err)
+		}
+	}
+}
+
+func TestAttemptTempAgeIsCandidateOnlyAtFortyEightHours(t *testing.T) {
+	now := time.Date(2026, time.October, 7, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name     string
+		modified time.Time
+		want     bool
+	}{
+		{name: "future", modified: now.Add(time.Nanosecond)},
+		{name: "recent", modified: now.Add(-AttemptTempGrace + time.Nanosecond)},
+		{name: "exact", modified: now.Add(-AttemptTempGrace), want: true},
+		{name: "older", modified: now.Add(-AttemptTempGrace - time.Nanosecond), want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsAgedAttemptTemp(test.modified, now); got != test.want {
+				t.Fatalf("IsAgedAttemptTemp() = %t, want %t", got, test.want)
+			}
+		})
 	}
 }
 

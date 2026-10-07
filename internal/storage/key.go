@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/mediaformat"
 )
@@ -19,6 +20,7 @@ type OriginalID struct{ uuidV4 }
 type JobTargetID struct{ uuidV4 }
 type RenditionID struct{ uuidV4 }
 type AttemptID struct{ uuidV4 }
+type QuarantineID struct{ uuidV4 }
 
 func ParseOriginalID(value string) (OriginalID, error) {
 	id, err := parseUUIDv4(value)
@@ -38,6 +40,11 @@ func ParseRenditionID(value string) (RenditionID, error) {
 func ParseAttemptID(value string) (AttemptID, error) {
 	id, err := parseUUIDv4(value)
 	return AttemptID{id}, err
+}
+
+func ParseQuarantineID(value string) (QuarantineID, error) {
+	id, err := parseUUIDv4(value)
+	return QuarantineID{id}, err
 }
 
 func parseUUIDv4(value string) (uuidV4, error) {
@@ -72,10 +79,11 @@ func (id uuidV4) valid() bool {
 	return id[6]>>4 == 4 && id[8]>>6 == 2
 }
 
-func (id OriginalID) String() string  { return id.uuidV4.String() }
-func (id JobTargetID) String() string { return id.uuidV4.String() }
-func (id RenditionID) String() string { return id.uuidV4.String() }
-func (id AttemptID) String() string   { return id.uuidV4.String() }
+func (id OriginalID) String() string   { return id.uuidV4.String() }
+func (id JobTargetID) String() string  { return id.uuidV4.String() }
+func (id RenditionID) String() string  { return id.uuidV4.String() }
+func (id AttemptID) String() string    { return id.uuidV4.String() }
+func (id QuarantineID) String() string { return id.uuidV4.String() }
 
 type OriginalExtension uint8
 
@@ -143,6 +151,139 @@ type RenditionKey struct {
 	targetID    JobTargetID
 	renditionID RenditionID
 	extension   RenditionExtension
+}
+
+type QuarantineKey struct {
+	id QuarantineID
+}
+
+type AttemptTempKey struct {
+	value     string
+	attemptID AttemptID
+}
+
+const AttemptTempGrace = 48 * time.Hour
+
+func NewQuarantineKey(id QuarantineID) (QuarantineKey, error) {
+	if !id.uuidV4.valid() {
+		return QuarantineKey{}, ErrInvalidKey
+	}
+	return QuarantineKey{id: id}, nil
+}
+
+func ParseQuarantineKey(value string) (QuarantineKey, error) {
+	if invalidRawKey(value) {
+		return QuarantineKey{}, ErrInvalidKey
+	}
+	parts := strings.Split(value, "/")
+	if len(parts) != 2 || parts[0] != ".quarantine" {
+		return QuarantineKey{}, ErrInvalidKey
+	}
+	id, err := ParseQuarantineID(parts[1])
+	if err != nil {
+		return QuarantineKey{}, ErrInvalidKey
+	}
+	key, _ := NewQuarantineKey(id)
+	if key.String() != value {
+		return QuarantineKey{}, ErrInvalidKey
+	}
+	return key, nil
+}
+
+func (key QuarantineKey) String() string { return ".quarantine/" + key.id.String() }
+
+func NewOriginalUploadTempKey(originalID OriginalID, attemptID AttemptID) (AttemptTempKey, error) {
+	if !originalID.uuidV4.valid() || !attemptID.uuidV4.valid() {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	id := originalID.String()
+	return AttemptTempKey{value: fmt.Sprintf("originals/%s/%s/.original.%s.tmp", id[:2], id, attemptID.String()), attemptID: attemptID}, nil
+}
+
+func NewOriginalTempKey(key OriginalKey, attemptID AttemptID) (AttemptTempKey, error) {
+	if _, err := ParseOriginalKey(key.String()); err != nil || !attemptID.uuidV4.valid() {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	directories, finalName := splitCanonicalKey(key.String())
+	return AttemptTempKey{value: strings.Join(directories, "/") + "/." + finalName + "." + attemptID.String() + ".tmp", attemptID: attemptID}, nil
+}
+
+func NewRenditionTempKey(key RenditionKey, attemptID AttemptID) (AttemptTempKey, error) {
+	if _, err := ParseRenditionKey(key.String()); err != nil || !attemptID.uuidV4.valid() {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	directories, finalName := splitCanonicalKey(key.String())
+	return AttemptTempKey{value: strings.Join(directories, "/") + "/." + finalName + "." + attemptID.String() + ".tmp", attemptID: attemptID}, nil
+}
+
+func ParseAttemptTempKey(value string) (AttemptTempKey, error) {
+	if invalidRawKey(value) {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	parts := strings.Split(value, "/")
+	if len(parts) < 4 {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	leaf := parts[len(parts)-1]
+	const suffix = ".tmp"
+	if !strings.HasPrefix(leaf, ".") || !strings.HasSuffix(leaf, suffix) {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	withoutSuffix := strings.TrimSuffix(leaf, suffix)
+	dot := strings.LastIndexByte(withoutSuffix, '.')
+	if dot <= 1 {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	attemptID, err := ParseAttemptID(withoutSuffix[dot+1:])
+	if err != nil {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	base := withoutSuffix[1:dot]
+	var canonical AttemptTempKey
+	if parts[0] == "originals" && len(parts) == 4 {
+		originalID, parseErr := ParseOriginalID(parts[2])
+		if parseErr != nil || parts[1] != parts[2][:2] {
+			return AttemptTempKey{}, ErrInvalidKey
+		}
+		if base == "original" {
+			canonical, err = NewOriginalUploadTempKey(originalID, attemptID)
+		} else {
+			finalKey := strings.Join(parts[:3], "/") + "/" + base
+			var originalKey OriginalKey
+			originalKey, err = ParseOriginalKey(finalKey)
+			if err == nil {
+				canonical, err = NewOriginalTempKey(originalKey, attemptID)
+			}
+		}
+	} else if parts[0] == "renditions" && len(parts) == 5 {
+		finalKey := strings.Join(parts[:4], "/") + "/" + base
+		var renditionKey RenditionKey
+		renditionKey, err = ParseRenditionKey(finalKey)
+		if err == nil {
+			canonical, err = NewRenditionTempKey(renditionKey, attemptID)
+		}
+	} else {
+		err = ErrInvalidKey
+	}
+	if err != nil || canonical.value != value {
+		return AttemptTempKey{}, ErrInvalidKey
+	}
+	return canonical, nil
+}
+
+func (key AttemptTempKey) String() string       { return key.value }
+func (key AttemptTempKey) AttemptID() AttemptID { return key.attemptID }
+
+// IsAgedAttemptTemp is candidate classification only. Reconciliation must
+// separately prove there is no live or recent owning attempt before repair may
+// quarantine the object; age never authorizes unlinking.
+func IsAgedAttemptTemp(modifiedAt, now time.Time) bool {
+	return !modifiedAt.After(now) && !modifiedAt.Add(AttemptTempGrace).After(now)
+}
+
+func splitCanonicalKey(value string) ([]string, string) {
+	parts := strings.Split(value, "/")
+	return parts[:len(parts)-1], parts[len(parts)-1]
 }
 
 func NewOriginalKey(originalID OriginalID, extension OriginalExtension) (OriginalKey, error) {

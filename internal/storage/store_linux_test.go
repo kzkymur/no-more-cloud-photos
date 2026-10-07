@@ -71,14 +71,475 @@ func TestPublishOpenAndIdempotentDelete(t *testing.T) {
 		t.Fatalf("collision changed existing bytes: %q", got)
 	}
 
-	deleted, err := store.DeleteOriginal(context.Background(), key)
+	deleted, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len(payload))})
 	if err != nil || deleted.Missing {
 		t.Fatalf("DeleteOriginal() = %+v, %v", deleted, err)
 	}
-	deleted, err = store.DeleteOriginal(context.Background(), key)
+	deleted, err = store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len(payload))})
 	if err != nil || !deleted.Missing {
 		t.Fatalf("second DeleteOriginal() = %+v, %v", deleted, err)
 	}
+}
+
+func TestExactDeleteValidatesSizeWithoutReading(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root, Options{})
+	key := testOriginalKey(t)
+	payload := []byte("exact deletion bytes")
+	publishTestObject(t, store, key, payload)
+	readCalls := 0
+	store.ops.read = func(int, []byte) (int, error) {
+		readCalls++
+		return 0, errors.New("delete must not read content")
+	}
+	for _, expected := range []int64{-1, int64(len(payload) - 1), int64(len(payload) + 1)} {
+		if _, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: expected}); !errors.Is(err, ErrValidation) {
+			t.Fatalf("DeleteOriginal(size=%d) error = %v", expected, err)
+		}
+		if got := readRelative(t, root, key.String()); !reflect.DeepEqual(got, payload) {
+			t.Fatalf("size mismatch changed object: %q", got)
+		}
+	}
+	if readCalls != 0 {
+		t.Fatalf("exact deletion read calls = %d", readCalls)
+	}
+	if _, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len(payload))}); err != nil {
+		t.Fatalf("DeleteOriginal(exact size) error = %v", err)
+	}
+}
+
+func TestExactDeleteRejectsPathReplacement(t *testing.T) {
+	root := t.TempDir()
+	key := testOriginalKey(t)
+	leaf := filepath.Join(root, filepath.FromSlash(key.String()))
+	backup := leaf + ".stale"
+	replacement := []byte("replacement object")
+	store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+		if event.Boundary != BoundaryDelete || event.Phase != Before {
+			return nil
+		}
+		if err := os.Rename(leaf, backup); err != nil {
+			return err
+		}
+		return os.WriteFile(leaf, replacement, 0o600)
+	})})
+	original := []byte("original object")
+	publishTestObject(t, store, key, original)
+	if _, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len(original))}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("DeleteOriginal(replaced path) error = %v", err)
+	}
+	if got := readRelative(t, root, key.String()); !reflect.DeepEqual(got, replacement) {
+		t.Fatalf("replacement was changed: %q", got)
+	}
+	if got, err := os.ReadFile(backup); err != nil || !reflect.DeepEqual(got, original) {
+		t.Fatalf("pinned original backup = %q, %v", got, err)
+	}
+}
+
+func TestExactDeleteRendition(t *testing.T) {
+	store := openTestStore(t, t.TempDir(), Options{})
+	key := testRenditionKey(t)
+	payload := []byte("rendition bytes")
+	temporary, err := store.BeginRendition(context.Background(), key, testAttempt(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Publish(context.Background(), Validation{ExpectedSize: int64(len(payload))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DeleteRendition(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len(payload))}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQuarantineOriginalMovesExactlyAndSyncsBothDirectories(t *testing.T) {
+	root := t.TempDir()
+	var events []FaultEvent
+	store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+		events = append(events, event)
+		return nil
+	})})
+	key := testOriginalKey(t)
+	payload := []byte("quarantine bytes")
+	publishTestObject(t, store, key, payload)
+	destination := testQuarantineKey(t)
+	result, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len(payload))}, destination)
+	if err != nil || !result.Moved || result.Missing || result.Path != destination.String() {
+		t.Fatalf("QuarantineOriginal() = %+v, %v", result, err)
+	}
+	assertFinalMissing(t, root, key.String())
+	if got := readRelative(t, root, destination.String()); !reflect.DeepEqual(got, payload) {
+		t.Fatalf("quarantined bytes = %q", got)
+	}
+	var got []string
+	for _, event := range events {
+		switch event.Boundary {
+		case BoundaryQuarantineRename, BoundaryQuarantineSourceDirectorySync, BoundaryQuarantineDestinationDirectorySync:
+			got = append(got, string(event.Boundary)+":"+string(event.Phase))
+		}
+	}
+	want := []string{
+		"quarantine_rename:before", "quarantine_rename:after",
+		"quarantine_source_directory_sync:before", "quarantine_source_directory_sync:after",
+		"quarantine_destination_directory_sync:before", "quarantine_destination_directory_sync:after",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("quarantine durability events = %v, want %v", got, want)
+	}
+}
+
+func TestQuarantineRejectsCollisionSymlinkAndCrossDevice(t *testing.T) {
+	t.Run("collision", func(t *testing.T) {
+		root := t.TempDir()
+		store := openTestStore(t, root, Options{})
+		key, destination := testOriginalKey(t), testQuarantineKey(t)
+		payload := []byte("source")
+		publishTestObject(t, store, key, payload)
+		destinationPath := filepath.Join(root, filepath.FromSlash(destination.String()))
+		if err := os.MkdirAll(filepath.Dir(destinationPath), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(destinationPath, []byte("existing"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len(payload))}, destination); !errors.Is(err, ErrCollision) {
+			t.Fatalf("QuarantineOriginal(collision) error = %v", err)
+		}
+		if got := readRelative(t, root, key.String()); !reflect.DeepEqual(got, payload) {
+			t.Fatalf("collision changed source: %q", got)
+		}
+		if got := readRelative(t, root, destination.String()); string(got) != "existing" {
+			t.Fatalf("collision changed destination: %q", got)
+		}
+	})
+	t.Run("quarantine symlink", func(t *testing.T) {
+		root := t.TempDir()
+		store := openTestStore(t, root, Options{})
+		key := testOriginalKey(t)
+		publishTestObject(t, store, key, []byte("source"))
+		if err := os.Symlink(t.TempDir(), filepath.Join(root, ".quarantine")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t)); !errors.Is(err, ErrSymlink) && !errors.Is(err, ErrUnexpectedType) {
+			t.Fatalf("QuarantineOriginal(symlink) error = %v", err)
+		}
+	})
+	t.Run("cross device", func(t *testing.T) {
+		store := openTestStore(t, t.TempDir(), Options{})
+		key := testOriginalKey(t)
+		publishTestObject(t, store, key, []byte("source"))
+		originalOpen := store.ops.openat
+		originalFstat := store.ops.fstat
+		quarantineFD := -1
+		store.ops.openat = func(fd int, name string, flags int, mode uint32) (int, error) {
+			opened, err := originalOpen(fd, name, flags, mode)
+			if err == nil && name == ".quarantine" {
+				quarantineFD = opened
+			}
+			return opened, err
+		}
+		store.ops.fstat = func(fd int, stat *unix.Stat_t) error {
+			if err := originalFstat(fd, stat); err != nil {
+				return err
+			}
+			if fd == quarantineFD {
+				stat.Dev++
+			}
+			return nil
+		}
+		if _, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t)); !errors.Is(err, ErrValidation) {
+			t.Fatalf("QuarantineOriginal(cross device) error = %v", err)
+		}
+	})
+}
+
+func TestQuarantineAttemptsBothSyncsAfterMove(t *testing.T) {
+	fault := errors.New("source sync fault")
+	root := t.TempDir()
+	var destinationSync bool
+	store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+		if event.Boundary == BoundaryQuarantineSourceDirectorySync && event.Phase == Before {
+			return fault
+		}
+		if event.Boundary == BoundaryQuarantineDestinationDirectorySync && event.Phase == Before {
+			destinationSync = true
+		}
+		return nil
+	})})
+	key := testOriginalKey(t)
+	publishTestObject(t, store, key, []byte("source"))
+	result, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t))
+	var quarantineError *QuarantineError
+	if !errors.As(err, &quarantineError) || !quarantineError.Moved || !quarantineError.Uncertain || !errors.Is(err, fault) || !destinationSync {
+		t.Fatalf("QuarantineOriginal(sync fault) = %+v, %#v, %v, destination_sync=%t", result, quarantineError, err, destinationSync)
+	}
+	assertFinalMissing(t, root, key.String())
+	if got := readRelative(t, root, testQuarantineKey(t).String()); string(got) != "source" {
+		t.Fatalf("quarantined bytes = %q", got)
+	}
+}
+
+func TestInspectAndQuarantineStrictAttemptTemp(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root, Options{})
+	tempKey, err := NewOriginalTempKey(testOriginalKey(t), testAttempt(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, filepath.FromSlash(tempKey.String()))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("aged strict temp")
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	modified := time.Now().Add(-AttemptTempGrace - time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, modified, modified); err != nil {
+		t.Fatal(err)
+	}
+	info, err := store.InspectAttemptTemp(context.Background(), tempKey)
+	if err != nil || info.Size != int64(len(payload)) || !info.ModifiedAt.Equal(modified) || !IsAgedAttemptTemp(info.ModifiedAt, time.Now()) {
+		t.Fatalf("InspectAttemptTemp() = %+v, %v", info, err)
+	}
+	destination := testQuarantineKey(t)
+	result, err := store.QuarantineAttemptTemp(context.Background(), tempKey, DeleteExpectation{ExpectedSize: info.Size}, destination)
+	if err != nil || result.Path != destination.String() || result.Missing {
+		t.Fatalf("QuarantineAttemptTemp() = %+v, %v", result, err)
+	}
+	assertFinalMissing(t, root, tempKey.String())
+	if got := readRelative(t, root, destination.String()); !reflect.DeepEqual(got, payload) {
+		t.Fatalf("quarantined temp bytes = %q", got)
+	}
+}
+
+func TestQuarantineFaultBoundariesPreserveClassifiedState(t *testing.T) {
+	fault := errors.New("quarantine boundary fault")
+	for _, test := range []struct {
+		name      string
+		boundary  Boundary
+		phase     Phase
+		moved     bool
+		uncertain bool
+	}{
+		{name: "before rename", boundary: BoundaryQuarantineRename, phase: Before},
+		{name: "after rename", boundary: BoundaryQuarantineRename, phase: After, moved: true, uncertain: true},
+		{name: "before source sync", boundary: BoundaryQuarantineSourceDirectorySync, phase: Before, moved: true, uncertain: true},
+		{name: "after source sync", boundary: BoundaryQuarantineSourceDirectorySync, phase: After, moved: true},
+		{name: "before destination sync", boundary: BoundaryQuarantineDestinationDirectorySync, phase: Before, moved: true, uncertain: true},
+		{name: "after destination sync", boundary: BoundaryQuarantineDestinationDirectorySync, phase: After, moved: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store := openTestStore(t, root, Options{Faults: faultAt(test.boundary, test.phase, fault)})
+			key := testOriginalKey(t)
+			publishTestObject(t, store, key, []byte("source"))
+			result, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t))
+			if !errors.Is(err, fault) {
+				t.Fatalf("QuarantineOriginal() error = %v", err)
+			}
+			if test.moved {
+				var quarantineError *QuarantineError
+				if !errors.As(err, &quarantineError) || !quarantineError.Moved || quarantineError.Uncertain != test.uncertain || result.Path != testQuarantineKey(t).String() {
+					t.Fatalf("post-move result=%+v error=%#v, %v", result, quarantineError, err)
+				}
+				assertFinalMissing(t, root, key.String())
+				if got := readRelative(t, root, testQuarantineKey(t).String()); string(got) != "source" {
+					t.Fatalf("quarantined bytes = %q", got)
+				}
+				store.faults = nil
+				retry, retryErr := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t))
+				if retryErr != nil || !retry.Moved || retry.Missing || retry.Path != testQuarantineKey(t).String() {
+					t.Fatalf("quarantine retry = %+v, %v", retry, retryErr)
+				}
+			} else {
+				if got := readRelative(t, root, key.String()); string(got) != "source" {
+					t.Fatalf("pre-move source bytes = %q", got)
+				}
+				assertFinalMissing(t, root, testQuarantineKey(t).String())
+			}
+		})
+	}
+}
+
+func TestDestructiveOperationsHonorLastMomentCancellation(t *testing.T) {
+	for _, operation := range []string{"delete", "quarantine"} {
+		t.Run(operation, func(t *testing.T) {
+			root := t.TempDir()
+			store := openTestStore(t, root, Options{})
+			key := testOriginalKey(t)
+			publishTestObject(t, store, key, []byte("source"))
+			ctx, cancel := context.WithCancel(context.Background())
+			originalStat := store.ops.fstatat
+			store.ops.fstatat = func(fd int, name string, stat *unix.Stat_t, flags int) error {
+				err := originalStat(fd, name, stat, flags)
+				if err == nil && name == "original.jpg" {
+					cancel()
+				}
+				return err
+			}
+			if operation == "delete" {
+				_, err := store.DeleteOriginal(ctx, key, DeleteExpectation{ExpectedSize: 6})
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("DeleteOriginal(canceled) error = %v", err)
+				}
+			} else {
+				_, err := store.QuarantineOriginal(ctx, key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t))
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("QuarantineOriginal(canceled) error = %v", err)
+				}
+				assertFinalMissing(t, root, testQuarantineKey(t).String())
+			}
+			if got := readRelative(t, root, key.String()); string(got) != "source" {
+				t.Fatalf("canceled operation changed source: %q", got)
+			}
+		})
+	}
+}
+
+func TestQuarantineAfterCreateFaultClosesDescriptorAndRetries(t *testing.T) {
+	root := t.TempDir()
+	fault := errors.New("after quarantine directory create")
+	store := openTestStore(t, root, Options{Faults: faultAt(BoundaryQuarantineDirectoryCreate, After, fault)})
+	key := testOriginalKey(t)
+	publishTestObject(t, store, key, []byte("source"))
+	before, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t)); !errors.Is(err, fault) {
+		t.Fatalf("QuarantineOriginal(after create) error = %v", err)
+	}
+	after, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("file descriptor count before=%d after=%d", len(before), len(after))
+	}
+	store.faults = nil
+	result, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t))
+	if err != nil || !result.Moved {
+		t.Fatalf("quarantine retry = %+v, %v", result, err)
+	}
+}
+
+func TestConcurrentQuarantineRepairsCrossDirectoryDurability(t *testing.T) {
+	root := t.TempDir()
+	moved := make(chan struct{})
+	var movedOnce sync.Once
+	store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+		if event.Boundary == BoundaryQuarantineRename && event.Phase == After {
+			movedOnce.Do(func() { close(moved) })
+		}
+		return nil
+	})})
+	key := testOriginalKey(t)
+	publishTestObject(t, store, key, []byte("source"))
+	originalOpen := store.ops.openat
+	var opens sync.WaitGroup
+	opens.Add(2)
+	releaseOpens := make(chan struct{})
+	store.ops.openat = func(fd int, name string, flags int, mode uint32) (int, error) {
+		opened, err := originalOpen(fd, name, flags, mode)
+		if err == nil && name == "original.jpg" {
+			opens.Done()
+			<-releaseOpens
+		}
+		return opened, err
+	}
+	originalStat := store.ops.fstatat
+	var statMu sync.Mutex
+	sourceStats := 0
+	store.ops.fstatat = func(fd int, name string, stat *unix.Stat_t, flags int) error {
+		if name == "original.jpg" {
+			statMu.Lock()
+			sourceStats++
+			call := sourceStats
+			statMu.Unlock()
+			if call == 2 {
+				<-moved
+			}
+		}
+		return originalStat(fd, name, stat, flags)
+	}
+	type outcome struct {
+		result QuarantineResult
+		err    error
+	}
+	results := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			result, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t))
+			results <- outcome{result: result, err: err}
+		}()
+	}
+	opens.Wait()
+	close(releaseOpens)
+	for range 2 {
+		outcome := <-results
+		if outcome.err != nil || !outcome.result.Moved || outcome.result.Missing {
+			t.Fatalf("concurrent quarantine = %+v, %v", outcome.result, outcome.err)
+		}
+	}
+	assertFinalMissing(t, root, key.String())
+	if got := readRelative(t, root, testQuarantineKey(t).String()); string(got) != "source" {
+		t.Fatalf("quarantined bytes = %q", got)
+	}
+}
+
+func TestQuarantineRejectsStaleSourceAndDrainsCancellationAfterRename(t *testing.T) {
+	t.Run("source replacement", func(t *testing.T) {
+		root := t.TempDir()
+		key := testOriginalKey(t)
+		leaf := filepath.Join(root, filepath.FromSlash(key.String()))
+		backup := leaf + ".stale"
+		store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+			if event.Boundary == BoundaryQuarantineRename && event.Phase == Before {
+				if err := os.Rename(leaf, backup); err != nil {
+					return err
+				}
+				return os.WriteFile(leaf, []byte("replacement"), 0o600)
+			}
+			return nil
+		})})
+		publishTestObject(t, store, key, []byte("source"))
+		if _, err := store.QuarantineOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t)); !errors.Is(err, ErrValidation) {
+			t.Fatalf("QuarantineOriginal(replaced source) error = %v", err)
+		}
+		if got := readRelative(t, root, key.String()); string(got) != "replacement" {
+			t.Fatalf("replacement bytes = %q", got)
+		}
+		assertFinalMissing(t, root, testQuarantineKey(t).String())
+	})
+	t.Run("cancel after rename", func(t *testing.T) {
+		root := t.TempDir()
+		ctx, cancel := context.WithCancel(context.Background())
+		var sourceSynced, destinationSynced bool
+		store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+			if event.Boundary == BoundaryQuarantineRename && event.Phase == After {
+				cancel()
+			}
+			if event.Boundary == BoundaryQuarantineSourceDirectorySync && event.Phase == After {
+				sourceSynced = true
+			}
+			if event.Boundary == BoundaryQuarantineDestinationDirectorySync && event.Phase == After {
+				destinationSynced = true
+			}
+			return nil
+		})})
+		key := testOriginalKey(t)
+		publishTestObject(t, store, key, []byte("source"))
+		if _, err := store.QuarantineOriginal(ctx, key, DeleteExpectation{ExpectedSize: 6}, testQuarantineKey(t)); err != nil {
+			t.Fatalf("QuarantineOriginal(cancel after rename) error = %v", err)
+		}
+		if !errors.Is(ctx.Err(), context.Canceled) || !sourceSynced || !destinationSynced {
+			t.Fatalf("post-rename drain canceled=%v source=%t destination=%t", ctx.Err(), sourceSynced, destinationSynced)
+		}
+	})
 }
 
 func TestDirectoryDurabilityOrder(t *testing.T) {
@@ -128,7 +589,7 @@ func TestPublishAndDeleteBoundaryOrder(t *testing.T) {
 	if _, err := temporary.Publish(context.Background(), Validation{ExpectedSize: 5}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DeleteOriginal(context.Background(), key); err != nil {
+	if _, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 5}); err != nil {
 		t.Fatal(err)
 	}
 	var got []string
@@ -980,7 +1441,7 @@ func TestLeafSymlinkDeleteRefused(t *testing.T) {
 	if err := os.Symlink(filepath.Join(t.TempDir(), "outside"), leaf); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DeleteOriginal(context.Background(), key); !errors.Is(err, ErrSymlink) {
+	if _, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{}); !errors.Is(err, ErrSymlink) {
 		t.Fatalf("DeleteOriginal(symlink) error = %v", err)
 	}
 	if _, err := store.OpenOriginal(context.Background(), key); !errors.Is(err, ErrSymlink) {
@@ -1007,7 +1468,7 @@ func TestDeleteRejectsUnexpectedLeafTypes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.DeleteOriginal(context.Background(), key); !errors.Is(err, ErrUnexpectedType) {
+			if _, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{}); !errors.Is(err, ErrUnexpectedType) {
 				t.Fatalf("DeleteOriginal(%s) error = %v", kind, err)
 			}
 		})
@@ -1194,7 +1655,7 @@ func TestFinalDeleteAndAbortSyncClassification(t *testing.T) {
 			}
 			store.ops.fsync = func(int) error { return syscall.EROFS }
 			if operation == "delete" {
-				_, err = store.DeleteOriginal(context.Background(), key)
+				_, err = store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 5})
 			} else {
 				err = temporary.Abort(context.Background())
 			}
@@ -1218,7 +1679,7 @@ func TestFinalDeleteAndAbortSyncClassification(t *testing.T) {
 			}
 			store.faults = faultAt(BoundaryDeleteDirectorySync, After, fault)
 			if operation == "delete" {
-				_, err = store.DeleteOriginal(context.Background(), key)
+				_, err = store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: 5})
 			} else {
 				err = temporary.Abort(context.Background())
 			}
@@ -1248,7 +1709,7 @@ func TestDeleteFaultsReportConvergentOutcomes(t *testing.T) {
 			key := testOriginalKey(t)
 			publishTestObject(t, store, key, []byte("delete me"))
 			store.faults = faultAt(test.boundary, test.phase, fault)
-			_, err := store.DeleteOriginal(context.Background(), key)
+			_, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len("delete me"))})
 			if !errors.Is(err, fault) {
 				t.Fatalf("DeleteOriginal() error = %v", err)
 			}
@@ -1258,7 +1719,7 @@ func TestDeleteFaultsReportConvergentOutcomes(t *testing.T) {
 			}
 			store.faults = nil
 			if test.missingAfter {
-				result, err := store.DeleteOriginal(context.Background(), key)
+				result, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len("delete me"))})
 				if err != nil || !result.Missing {
 					t.Fatalf("retry delete = %+v, %v", result, err)
 				}
@@ -1292,7 +1753,7 @@ func TestConcurrentDeleteConverges(t *testing.T) {
 	for range 2 {
 		go func() {
 			<-start
-			result, err := store.DeleteOriginal(context.Background(), key)
+			result, err := store.DeleteOriginal(context.Background(), key, DeleteExpectation{ExpectedSize: int64(len("delete concurrently"))})
 			results <- deleteOutcome{result: result, err: err}
 		}()
 	}
@@ -1455,6 +1916,19 @@ func testRenditionKey(t *testing.T) RenditionKey {
 
 func testAttempt(t *testing.T) AttemptID {
 	return mustAttempt(t, testAttemptID)
+}
+
+func testQuarantineKey(t *testing.T) QuarantineKey {
+	t.Helper()
+	id, err := ParseQuarantineID(testQuarantineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := NewQuarantineKey(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
 }
 
 func mustAttempt(t *testing.T, value string) AttemptID {

@@ -28,3 +28,16 @@ func (err *PublishError) Error() string {
 }
 
 func (err *PublishError) Unwrap() error { return err.cause }
+
+type QuarantineError struct {
+	Moved     bool
+	Uncertain bool
+	operation string
+	cause     error
+}
+
+func (err *QuarantineError) Error() string {
+	return fmt.Sprintf("storage quarantine %s failed", err.operation)
+}
+
+func (err *QuarantineError) Unwrap() error { return err.cause }
