@@ -809,6 +809,39 @@ func TestOpenOriginalPinnedHashIsBoundedCancelableAndFailsClosedOnReadAnomalies(
 	}
 }
 
+func TestPinnedObjectVerifyIsCancelableAndBounded(t *testing.T) {
+	store := openTestStore(t, t.TempDir(), Options{})
+	key := testOriginalKey(t)
+	payload := make([]byte, 1024*1024)
+	digest := sha256.Sum256(payload)
+	publishTestObject(t, store, key, payload)
+	object, err := store.OpenOriginalPinned(context.Background(), key, Validation{ExpectedSize: int64(len(payload)), ExpectedSHA256: &digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	originalRead := store.ops.read
+	readCalls, largestRead := 0, 0
+	store.ops.read = func(fd int, value []byte) (int, error) {
+		readCalls++
+		if len(value) > largestRead {
+			largestRead = len(value)
+		}
+		count, err := originalRead(fd, value)
+		cancel()
+		return count, err
+	}
+	if err := object.Verify(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Verify() error = %v, want context.Canceled", err)
+	}
+	if readCalls != 1 || largestRead != 128*1024 {
+		t.Fatalf("Verify() reads = %d, largest = %d", readCalls, largestRead)
+	}
+}
+
 func TestTrustedWriterCanUseDuplicateDescriptor(t *testing.T) {
 	store := openTestStore(t, t.TempDir(), Options{})
 	temporary, err := store.BeginRendition(context.Background(), testRenditionKey(t), testAttempt(t))

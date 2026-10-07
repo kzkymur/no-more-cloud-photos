@@ -108,6 +108,8 @@ func (original *fakeOriginal) UseReadOnlyFile(use func(*os.File) error) error {
 	return use(file)
 }
 
+func (original *fakeOriginal) Verify(context.Context) error { return nil }
+
 func (original *fakeOriginal) Close() error { return original.file.Close() }
 
 func (store *fakeStorage) BeginRendition(_ context.Context, key storage.RenditionKey, attempt storage.AttemptID) (Temporary, error) {
@@ -542,6 +544,45 @@ func TestExecutorRealStorePathReplacementCannotSwapValidatedDescriptor(t *testin
 	}
 	if len(processors.stillInput) != 1 || string(processors.stillInput[0]) != "original" {
 		t.Fatalf("processor input = %q, want pinned original", processors.stillInput)
+	}
+}
+
+func TestExecutorRealStoreSameInodeOverwriteCannotPublish(t *testing.T) {
+	root := t.TempDir()
+	store := openExecutorStore(t, root, nil)
+	lease := leaseFor(t, "image/jpeg", attemptOne, 1, 0)
+	publishExecutorOriginal(t, store, lease)
+	originalPath := filepath.Join(root, filepath.FromSlash(lease.Original.RelativePath))
+	before, err := os.Stat(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := []string{}
+	repository := &fakeRepository{events: &events}
+	processors := &fakeProcessors{stillHook: func(context.Context) error {
+		return os.WriteFile(originalPath, []byte("attacker"), 0o600)
+	}}
+	executor := integrationExecutor(t, repository, store, processors, []string{renderOne})
+	if err := executor.Execute(context.Background(), lease, executionLimits()); !errors.Is(err, storage.ErrValidation) {
+		t.Fatalf("Execute() error = %v, want ErrValidation", err)
+	}
+	after, err := os.Stat(originalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || before.Size() != after.Size() {
+		t.Fatalf("counterexample did not preserve inode and size: before=%+v after=%+v", before, after)
+	}
+	if !slices.Equal(events, []string{"begin-target"}) || len(repository.candidates) != 0 {
+		t.Fatalf("mutation publication events=%v DB=%d", events, len(repository.candidates))
+	}
+	finalPath, tempPath := renditionPaths(root, renderOne, attemptOne)
+	if _, err := os.Stat(finalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mutated original produced final rendition: %v", err)
+	}
+	if _, err := os.Stat(tempPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mutated original left temporary rendition: %v", err)
 	}
 }
 

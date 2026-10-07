@@ -51,6 +51,7 @@ type Storage interface {
 
 type Original interface {
 	UseReadOnlyFile(func(*os.File) error) error
+	Verify(context.Context) error
 	Close() error
 }
 
@@ -266,6 +267,9 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 	audit, err := marshalAudit(transformed.audit)
 	if err != nil {
 		return true, 0, err
+	}
+	if err := original.Verify(ctx); err != nil {
+		return true, 0, cancellationCause(ctx, err)
 	}
 	info, err := temporary.Publish(ctx, storage.Validation{ExpectedSize: -1})
 	if err != nil {

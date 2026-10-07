@@ -204,8 +204,11 @@ type ObjectInfo struct {
 // PinnedObject retains the exact regular file validated by the Store. Readers
 // are reopened from this descriptor, not from the storage namespace.
 type PinnedObject struct {
+	store    *Store
 	file     *os.File
 	identity unix.Stat_t
+	size     int64
+	sha256   [sha256.Size]byte
 	mu       sync.Mutex
 	closed   bool
 }
@@ -241,6 +244,21 @@ func (object *PinnedObject) UseReadOnlyFile(use func(*os.File) error) (returnErr
 		}
 	}()
 	return use(file)
+}
+
+// Verify revalidates the retained descriptor without reopening the object by
+// pathname. It must run after the last processor read and before publication.
+func (object *PinnedObject) Verify(ctx context.Context) error {
+	if object == nil || ctx == nil {
+		return ErrValidation
+	}
+	object.mu.Lock()
+	defer object.mu.Unlock()
+	if object.closed {
+		return ErrClosed
+	}
+	_, err := object.store.verifyPinnedObject(ctx, object.file, Validation{ExpectedSize: object.size, ExpectedSHA256: &object.sha256}, &object.identity)
+	return err
 }
 
 func (object *PinnedObject) Close() error {
@@ -893,25 +911,36 @@ func (store *Store) OpenOriginalPinned(ctx context.Context, key OriginalKey, val
 }
 
 func (store *Store) validatePinnedObject(ctx context.Context, file *os.File, validation Validation) (*PinnedObject, error) {
+	identity, err := store.verifyPinnedObject(ctx, file, validation, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &PinnedObject{store: store, file: file, identity: identity, size: validation.ExpectedSize, sha256: *validation.ExpectedSHA256}, nil
+}
+
+func (store *Store) verifyPinnedObject(ctx context.Context, file *os.File, validation Validation, expectedIdentity *unix.Stat_t) (unix.Stat_t, error) {
 	var before unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &before); err != nil {
-		return nil, errors.Join(ErrValidation, classifyError("stat pinned object", err))
+		return unix.Stat_t{}, errors.Join(ErrValidation, classifyError("stat pinned object", err))
 	}
 	if before.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, ErrUnexpectedType
+		return unix.Stat_t{}, ErrUnexpectedType
+	}
+	if expectedIdentity != nil && (before.Dev != expectedIdentity.Dev || before.Ino != expectedIdentity.Ino || before.Size != expectedIdentity.Size) {
+		return unix.Stat_t{}, errors.Join(ErrValidation, errors.New("pinned object identity changed"))
 	}
 	if before.Size != validation.ExpectedSize {
-		return nil, ErrValidation
+		return unix.Stat_t{}, ErrValidation
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return nil, errors.Join(ErrValidation, classifyError("rewind pinned object", err))
+		return unix.Stat_t{}, errors.Join(ErrValidation, classifyError("rewind pinned object", err))
 	}
 	hash := sha256.New()
 	buffer := make([]byte, 128*1024)
 	remaining := validation.ExpectedSize
 	for remaining > 0 {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return unix.Stat_t{}, err
 		}
 		limit := int64(len(buffer))
 		if remaining < limit {
@@ -919,51 +948,57 @@ func (store *Store) validatePinnedObject(ctx context.Context, file *os.File, val
 		}
 		count, readErr := store.ops.read(int(file.Fd()), buffer[:limit])
 		if count < 0 || int64(count) > limit {
-			return nil, errors.Join(ErrValidation, errors.New("invalid pinned object read count"))
+			return unix.Stat_t{}, errors.Join(ErrValidation, errors.New("invalid pinned object read count"))
 		}
 		if count > 0 {
 			_, _ = hash.Write(buffer[:count])
 			remaining -= int64(count)
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return unix.Stat_t{}, err
 		}
 		if errors.Is(readErr, unix.EINTR) {
 			continue
 		}
 		if readErr != nil {
-			return nil, errors.Join(ErrValidation, readErr)
+			return unix.Stat_t{}, errors.Join(ErrValidation, readErr)
 		}
 		if count == 0 {
-			return nil, errors.Join(ErrValidation, io.ErrUnexpectedEOF)
+			return unix.Stat_t{}, errors.Join(ErrValidation, io.ErrUnexpectedEOF)
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return unix.Stat_t{}, err
 	}
 	count, readErr := store.ops.read(int(file.Fd()), buffer[:1])
+	if err := ctx.Err(); err != nil {
+		return unix.Stat_t{}, err
+	}
 	if count < 0 || count > 1 || count != 0 {
-		return nil, errors.Join(ErrValidation, errors.New("pinned object exceeds expected size"))
+		return unix.Stat_t{}, errors.Join(ErrValidation, errors.New("pinned object exceeds expected size"))
 	}
 	if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, unix.EINTR) {
-		return nil, errors.Join(ErrValidation, readErr)
+		return unix.Stat_t{}, errors.Join(ErrValidation, readErr)
 	}
 	if errors.Is(readErr, unix.EINTR) {
-		return nil, errors.Join(ErrValidation, readErr)
+		return unix.Stat_t{}, errors.Join(ErrValidation, readErr)
 	}
 	var digest [sha256.Size]byte
 	copy(digest[:], hash.Sum(nil))
 	if digest != *validation.ExpectedSHA256 {
-		return nil, ErrValidation
+		return unix.Stat_t{}, ErrValidation
 	}
 	var after unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &after); err != nil {
-		return nil, errors.Join(ErrValidation, classifyError("restat pinned object", err))
+		return unix.Stat_t{}, errors.Join(ErrValidation, classifyError("restat pinned object", err))
+	}
+	if err := ctx.Err(); err != nil {
+		return unix.Stat_t{}, err
 	}
 	if after.Mode&unix.S_IFMT != unix.S_IFREG || after.Dev != before.Dev || after.Ino != before.Ino || after.Size != before.Size {
-		return nil, errors.Join(ErrValidation, errors.New("pinned object changed during validation"))
+		return unix.Stat_t{}, errors.Join(ErrValidation, errors.New("pinned object changed during validation"))
 	}
-	return &PinnedObject{file: file, identity: after}, nil
+	return after, nil
 }
 
 func (store *Store) OpenRendition(ctx context.Context, key RenditionKey) (*os.File, error) {
