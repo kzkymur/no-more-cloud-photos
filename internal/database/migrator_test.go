@@ -60,10 +60,10 @@ func TestEmbeddedMigrationExpectedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discoverMigrations() error = %v", err)
 	}
-	if got := expectedVersion(migrations); got != 10 {
-		t.Fatalf("expectedVersion() = %d, want 10", got)
+	if got := expectedVersion(migrations); got != 11 {
+		t.Fatalf("expectedVersion() = %d, want 11", got)
 	}
-	if migrations[len(migrations)-1].name != "purge_progress_privileges" {
+	if migrations[len(migrations)-1].name != "runtime_migration_status" {
 		t.Fatalf("latest migration name = %q", migrations[len(migrations)-1].name)
 	}
 }

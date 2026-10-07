@@ -151,6 +151,15 @@ expect_database_denied() {
   fi
 }
 
+runtime_migration_command() {
+  user=$1
+  password=$2
+  action=$3
+  compose run --rm --no-deps \
+    -e "NMCP_DATABASE_URL=postgres://$user:$password@postgres:5432/nmcp?sslmode=disable" \
+    migrate nmcp-admin migrate "$action" --json
+}
+
 check_database_role_boundary() {
   for identity in \
     nmcp_migrator:nmcp-migrator-validation-only \
@@ -175,6 +184,17 @@ check_database_role_boundary() {
     "CREATE TABLE nmcp_runtime_ddl_probe (id integer)"
   expect_database_denied nmcp_api nmcp-api-validation-only \
     "SELECT * FROM purge_file_progress LIMIT 0"
+  for identity in \
+    nmcp_api:nmcp-api-validation-only \
+    nmcp_worker:nmcp-worker-validation-only; do
+    user=${identity%%:*}
+    password=${identity#*:}
+    runtime_migration_command "$user" "$password" status >/dev/null
+    if runtime_migration_command "$user" "$password" up >/dev/null 2>&1; then
+      echo "error: runtime database role $user applied migrations" >&2
+      exit 1
+    fi
+  done
 }
 
 check_processes_and_isolation() {

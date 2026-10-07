@@ -165,6 +165,13 @@ func (m *Migrator) Up(ctx context.Context) (returnErr error) {
 			returnErr = errors.Join(returnErr, fmt.Errorf("discard migration connection: %w", err))
 		}
 	}()
+	var mayMigrate bool
+	if err := conn.QueryRow(ctx, `SELECT pg_catalog.has_schema_privilege(current_user,current_schema(),'CREATE')`).Scan(&mayMigrate); err != nil {
+		return fmt.Errorf("check migration role privileges: %w", err)
+	}
+	if !mayMigrate {
+		return errors.New("migration role lacks CREATE privilege on the current schema")
+	}
 
 	// Once acquisition is attempted, its server-side outcome is uncertain on a
 	// context/network error. The defer must therefore confirm unlock or discard

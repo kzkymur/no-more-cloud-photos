@@ -38,8 +38,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 10 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version ten", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 11 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version eleven", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,8 +62,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 10 || status.ExpectedVersion != 10 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version ten", status)
+		if status.CurrentVersion != 11 || status.ExpectedVersion != 11 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version eleven", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
@@ -151,7 +151,7 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := <-migrationResult; err != nil {
-			t.Fatalf("upgrade versions nine and ten: %v", err)
+			t.Fatalf("upgrade versions nine through eleven: %v", err)
 		}
 
 		var securityDefiner, ownerNoLogin, fixedSearchPath, workerExecute, publicRevoked, workerSelect, workerInsert, workerNoUpdate bool
@@ -175,6 +175,39 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 		if _, err := pool.Exec(ctx, `UPDATE purge_file_progress SET disposition='deleted' WHERE job_id=$1`, jobID); err == nil {
 			t.Fatal("migration/table owner bypassed ordered purge boundary")
+		}
+		var runtimeHistorySelect, runtimeHistoryNoWrite, workerHistorySelect, workerHistoryNoWrite bool
+		if err := pool.QueryRow(ctx, `SELECT
+			has_table_privilege('nmcp_runtime','schema_migrations','SELECT'),
+			NOT (has_table_privilege('nmcp_runtime','schema_migrations','INSERT') OR has_table_privilege('nmcp_runtime','schema_migrations','UPDATE') OR has_table_privilege('nmcp_runtime','schema_migrations','DELETE') OR has_table_privilege('nmcp_runtime','schema_migrations','TRUNCATE')),
+			has_table_privilege('nmcp_worker_runtime','schema_migrations','SELECT'),
+			NOT (has_table_privilege('nmcp_worker_runtime','schema_migrations','INSERT') OR has_table_privilege('nmcp_worker_runtime','schema_migrations','UPDATE') OR has_table_privilege('nmcp_worker_runtime','schema_migrations','DELETE') OR has_table_privilege('nmcp_worker_runtime','schema_migrations','TRUNCATE'))`).Scan(
+			&runtimeHistorySelect, &runtimeHistoryNoWrite, &workerHistorySelect, &workerHistoryNoWrite); err != nil {
+			t.Fatal(err)
+		}
+		if !runtimeHistorySelect || !runtimeHistoryNoWrite || !workerHistorySelect || !workerHistoryNoWrite {
+			t.Fatalf("migration history ACL runtime=(%t,%t) worker=(%t,%t)", runtimeHistorySelect, runtimeHistoryNoWrite, workerHistorySelect, workerHistoryNoWrite)
+		}
+		var schemaName string
+		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schemaName); err != nil {
+			t.Fatal(err)
+		}
+		for _, roleName := range []string{"nmcp_runtime", "nmcp_worker_runtime"} {
+			rolePool := integrationRolePool(t, databaseURL, schemaName, roleName)
+			roleMigrator, err := NewMigrator(rolePool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, err := roleMigrator.Status(ctx)
+			if err != nil || !status.Ready() || status.CurrentVersion != 11 {
+				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
+			}
+			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
+				t.Fatalf("%s migration Up error = %v", roleName, err)
+			}
+			if _, err := rolePool.Exec(ctx, `UPDATE schema_migrations SET dirty=dirty WHERE false`); err == nil {
+				t.Fatalf("%s wrote migration history", roleName)
+			}
 		}
 	})
 
@@ -495,7 +528,7 @@ func TestMigratorIntegration(t *testing.T) {
 			if err := pool.QueryRow(raceCtx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&migratedVersion); err != nil {
 				t.Fatal(err)
 			}
-			if !deleted || migratedVersion != 8 {
+			if !deleted || migratedVersion != 11 {
 				t.Fatalf("converged state deleted=%t version=%d", deleted, migratedVersion)
 			}
 		})
@@ -1865,6 +1898,32 @@ func integrationPool(t *testing.T, databaseURL string) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 	if err := pool.Ping(ctx); err != nil {
 		t.Fatalf("ping integration database: %v", err)
+	}
+	return pool
+}
+
+func integrationRolePool(t *testing.T, databaseURL, schema, role string) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{schema}.Sanitize()
+	quotedRole := pgx.Identifier{role}.Sanitize()
+	config.AfterConnect = func(ctx context.Context, connection *pgx.Conn) error {
+		_, err := connection.Exec(ctx, `SET ROLE `+quotedRole)
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	return pool
 }
