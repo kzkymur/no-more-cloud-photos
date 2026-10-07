@@ -603,6 +603,7 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	repository.jitter = func(time.Duration) time.Duration { return 0 }
 	mediaID, originalID := integrationUUID(50), integrationUUID(150)
 	insertMedia(t, pool, mediaID, originalID)
+	renditions := insertPurgeRenditionFixtures(t, pool, mediaID, originalID, 250)
 	if _, err := service.Delete(ctx, mediaID); err != nil {
 		t.Fatal(err)
 	}
@@ -614,18 +615,36 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	var manifestKind, manifestObjectID, manifestPath, disposition string
-	var manifestSize int64
-	if err := pool.QueryRow(ctx, `SELECT object_kind,object_id::text,relative_path,size_bytes,disposition
-		FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(
-		&manifestKind, &manifestObjectID, &manifestPath, &manifestSize, &disposition); err != nil {
+	type manifestFile struct {
+		kind, objectID, path, disposition string
+		size                              int64
+	}
+	rows, err := pool.Query(ctx, `SELECT object_kind,object_id::text,relative_path,size_bytes,disposition
+		FROM purge_file_progress WHERE job_id=$1 ORDER BY CASE object_kind WHEN 'rendition' THEN 0 ELSE 1 END,object_id`, lease.JobID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if manifestKind != "original" || manifestObjectID != originalID || manifestSize != 10 || disposition != "pending" {
-		t.Fatalf("manifest kind=%s object=%s path=%s size=%d disposition=%s", manifestKind, manifestObjectID, manifestPath, manifestSize, disposition)
+	manifest := make([]manifestFile, 0, 3)
+	for rows.Next() {
+		var file manifestFile
+		if err := rows.Scan(&file.kind, &file.objectID, &file.path, &file.size, &file.disposition); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		manifest = append(manifest, file)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	if len(manifest) != 3 || manifest[0].objectID != renditions[0] || manifest[1].objectID != renditions[1] || manifest[2].kind != "original" || manifest[2].objectID != originalID {
+		t.Fatalf("ordered manifest = %#v", manifest)
 	}
 	root := t.TempDir()
-	writePurgeFixture(t, root, manifestPath, []byte("0123456789"))
+	for _, file := range manifest {
+		writePurgeFixture(t, root, file.path, []byte(strings.Repeat("x", int(file.size))))
+	}
 	store, err := storage.Open(root, storage.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -638,27 +657,85 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	}); !errors.Is(err, ErrPurgeLeaseLost) || called {
 		t.Fatalf("stale-token purge step called=%t error=%#v", called, err)
 	}
-	step, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(store))
-	if err != nil || step.File == nil || step.File.ObjectID != originalID || step.Done {
-		t.Fatalf("purge file step = %#v, %v", step, err)
-	}
-	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(manifestPath))); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("purged file stat error = %v", err)
+	activeLease := lease
+	for index, want := range manifest {
+		step, err := repository.RunPurgeFileStep(ctx, activeLease.JobID, activeLease.Token, StoragePurgeFileAction(store))
+		if err != nil || step.File == nil || step.File.ObjectID != want.objectID || step.Done {
+			t.Fatalf("purge file step %d = %#v, %v; want %s", index, step, err, want.objectID)
+		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(want.path))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("purged file %s stat error = %v", want.path, err)
+		}
+		if index == 0 {
+			if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
+				t.Fatal(err)
+			}
+			if reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10); err != nil || len(reclaimed) != 1 {
+				t.Fatalf("reclaim ordered purge = %#v, %v", reclaimed, err)
+			}
+			activeLease, err = service.StartPurge(ctx, lease.JobID)
+			if err != nil || activeLease.Token == lease.Token {
+				t.Fatalf("restart ordered purge = %#v, %v", activeLease, err)
+			}
+		}
 	}
 	var completedAt *time.Time
+	var disposition string
 	if err := pool.QueryRow(ctx, `SELECT disposition,completed_at FROM purge_file_progress WHERE job_id=$1 AND object_id=$2`, lease.JobID, originalID).Scan(&disposition, &completedAt); err != nil {
 		t.Fatal(err)
 	}
 	if disposition != "deleted" || completedAt == nil {
 		t.Fatalf("completed manifest disposition=%s completed=%v", disposition, completedAt)
 	}
-	done, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
+	done, err := repository.RunPurgeFileStep(ctx, activeLease.JobID, activeLease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
 		t.Fatal("completed purge file was invoked again")
 		return "", nil
 	})
 	if err != nil || !done.Done || done.File != nil {
 		t.Fatalf("completed purge step = %#v, %v", done, err)
 	}
+}
+
+func insertPurgeRenditionFixtures(t *testing.T, pool *pgxpool.Pool, mediaID, originalID string, base int) []string {
+	t.Helper()
+	ctx := context.Background()
+	var profileID, profileKey string
+	if err := pool.QueryRow(ctx, `SELECT id::text,key FROM profiles WHERE key='standard' AND version=1`).Scan(&profileID, &profileKey); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	renditionIDs := []string{integrationUUID(base + 4), integrationUUID(base + 5)}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	for index, renditionID := range renditionIDs {
+		jobID := integrationUUID(base + index)
+		targetID := integrationUUID(base + index + 2)
+		token := integrationUUID(base + index + 10)
+		path := "renditions/" + originalID[:2] + "/" + originalID + "/" + targetID + "/" + renditionID + ".avif"
+		statements := []struct {
+			query string
+			args  []any
+		}{
+			{`INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts,available_at,created_at,updated_at) VALUES ($1,'transform',$2,$3,'queued',3,$4,$4,$4)`, []any{jobID, originalID, mediaID, now}},
+			{`INSERT INTO job_targets (id,job_id,profile_id,status,updated_at) VALUES ($1,$2,$3,'pending',$4)`, []any{targetID, jobID, profileID, now}},
+			{`UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=$3,started_at=$4,updated_at=$4 WHERE id=$1`, []any{jobID, token, now.Add(time.Minute), now}},
+			{`UPDATE job_targets SET status='succeeded',attempts=1,updated_at=$2 WHERE id=$1`, []any{targetID, now}},
+			{`INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,width,height,sha256,created_at,processor_audit) VALUES ($1,$2,$3,$4,$5,$6,'image/avif',$7,1,1,$8,$9,'{"fixture":"purge-order"}')`, []any{renditionID, mediaID, targetID, profileKey, index == 1, path, int64(11 + index), strings.Repeat(fmt.Sprintf("%x", index+10), 64)[:64], now}},
+			{`UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=$2,updated_at=$2 WHERE id=$1`, []any{jobID, now}},
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(ctx, statement.query, statement.args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return renditionIDs
 }
 
 func TestLifecycleRepositoryIntegrationPurgeFileExpiryAfterUnlinkConvergesMissing(t *testing.T) {
@@ -836,6 +913,188 @@ func TestLifecycleRepositoryIntegrationPurgeFileUncertainDeleteConvergesMissing(
 	}
 	if disposition != "missing" {
 		t.Fatalf("uncertain delete retry disposition = %s", disposition)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationPurgeFileDirectorySyncFaultsRemainPending(t *testing.T) {
+	for _, phase := range []storage.Phase{storage.Before, storage.After} {
+		t.Run(string(phase), func(t *testing.T) {
+			ctx := context.Background()
+			pool, service := integrationService(t)
+			repository := service.repository.(*PostgresRepository)
+			mediaID, originalID := integrationUUID(54), integrationUUID(154)
+			insertMedia(t, pool, mediaID, originalID)
+			if _, err := service.Delete(ctx, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			enqueued, err := service.EnqueuePurge(ctx, mediaID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var relativePath string
+			if err := pool.QueryRow(ctx, `SELECT relative_path FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&relativePath); err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			writePurgeFixture(t, root, relativePath, []byte("0123456789"))
+			fault := errors.New("injected directory sync fault")
+			faultyStore, err := storage.Open(root, storage.Options{Faults: storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+				if event.Boundary == storage.BoundaryDeleteDirectorySync && event.Phase == phase {
+					return fault
+				}
+				return nil
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = faultyStore.Close() })
+			_, stepErr := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(faultyStore))
+			wantUncertain := phase == storage.Before
+			if stepErr == nil || errors.Is(stepErr, fault) || wantUncertain != errors.Is(stepErr, storage.ErrOutcomeUncertain) || wantUncertain != errors.Is(stepErr, storage.ErrDurability) {
+				t.Fatalf("directory sync %s error = %#v", phase, stepErr)
+			}
+			var disposition string
+			if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
+				t.Fatal(err)
+			}
+			if disposition != "pending" {
+				t.Fatalf("directory sync %s disposition = %s", phase, disposition)
+			}
+			cleanStore, err := storage.Open(root, storage.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = cleanStore.Close() })
+			if _, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(cleanStore)); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
+				t.Fatal(err)
+			}
+			if disposition != "missing" {
+				t.Fatalf("directory sync %s retry disposition = %s", phase, disposition)
+			}
+		})
+	}
+}
+
+func TestLifecycleRepositoryIntegrationPurgeFileStepDrainsBeforeMaintenance(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	mediaID, originalID := integrationUUID(55), integrationUUID(155)
+	insertMedia(t, pool, mediaID, originalID)
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var relativePath string
+	if err := pool.QueryRow(ctx, `SELECT relative_path FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&relativePath); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writePurgeFixture(t, root, relativePath, []byte("0123456789"))
+	store, err := storage.Open(root, storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	filesystemDone := make(chan struct{})
+	releaseStep := make(chan struct{})
+	stepResult := make(chan error, 1)
+	storageAction := StoragePurgeFileAction(store)
+	go func() {
+		_, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(ctx context.Context, file PurgeFile) (PurgeFileDisposition, error) {
+			disposition, err := storageAction(ctx, file)
+			close(filesystemDone)
+			<-releaseStep
+			return disposition, err
+		})
+		stepResult <- err
+	}()
+	<-filesystemDone
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relativePath))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file step did not finish unlink+sync before pause: %v", err)
+	}
+	maintenanceConn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenanceConn.Release()
+	var maintenancePID int32
+	if err := maintenanceConn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&maintenancePID); err != nil {
+		t.Fatal(err)
+	}
+	maintenanceResult := make(chan error, 1)
+	go func() {
+		_, err := maintenanceConn.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='purge drain test',owner='test',entered_at=clock_timestamp() WHERE id=1`)
+		maintenanceResult <- err
+	}()
+	awaitLockWait(t, ctx, pool, maintenancePID)
+	close(releaseStep)
+	if err := <-stepResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-maintenanceResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationMalformedRenditionManifestStaysPending(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	mediaID, originalID := integrationUUID(56), integrationUUID(156)
+	insertMedia(t, pool, mediaID, originalID)
+	renditions := insertPurgeRenditionFixtures(t, pool, mediaID, originalID, 560)
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE purge_file_progress DISABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `ALTER TABLE purge_file_progress ENABLE TRIGGER USER`) })
+	wrongID := integrationUUID(999)
+	if _, err := pool.Exec(ctx, `UPDATE purge_file_progress SET relative_path=regexp_replace(relative_path,$3||'\.avif$',$4||'.avif') WHERE job_id=$1 AND object_id=$2`, lease.JobID, renditions[0], renditions[0], wrongID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE purge_file_progress ENABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(store)); !errors.Is(err, storage.ErrValidation) {
+		t.Fatalf("malformed Rendition key error = %#v", err)
+	}
+	var pending int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM purge_file_progress WHERE job_id=$1 AND disposition='pending'`, lease.JobID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 3 {
+		t.Fatalf("pending manifest rows = %d, want 3", pending)
 	}
 }
 

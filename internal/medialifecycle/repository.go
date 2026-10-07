@@ -551,7 +551,7 @@ func (r *PostgresRepository) RunPurgeFileStep(ctx context.Context, jobID, token 
 	var kind string
 	err = tx.QueryRow(ctx, `SELECT object_kind,object_id::text,relative_path,size_bytes
 		FROM purge_file_progress WHERE job_id=$1 AND disposition='pending'
-		ORDER BY object_kind,object_id FOR UPDATE LIMIT 1`, jobID).Scan(&kind, &file.ObjectID, &file.RelativePath, &file.SizeBytes)
+		ORDER BY CASE object_kind WHEN 'rendition' THEN 0 ELSE 1 END,object_id LIMIT 1`, jobID).Scan(&kind, &file.ObjectID, &file.RelativePath, &file.SizeBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := r.commit(ctx, tx); err != nil {
 			return PurgeStepResult{}, err

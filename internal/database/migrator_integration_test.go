@@ -38,8 +38,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 8 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version eight", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 10 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version ten", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,11 +62,119 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 8 || status.ExpectedVersion != 8 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version eight", status)
+		if status.CurrentVersion != 10 || status.ExpectedVersion != 10 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version ten", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
+		}
+	})
+
+	t.Run("purge progress boundary upgrades version eight after prior writer drains", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:8]).Up(ctx); err != nil {
+			t.Fatalf("apply versions one through eight: %v", err)
+		}
+		mediaID, originalID, jobID, token := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after) VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp())`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`, originalID, mediaID, strings.Repeat("e", 64), "originals/ee/v9-upgrade/original.jpg"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, jobID, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, jobID, token); err != nil {
+			t.Fatal(err)
+		}
+		manifestTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = manifestTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, token); err == nil {
+			_, err = manifestTx.Exec(ctx, `INSERT INTO purge_file_progress (job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes) SELECT $1,$2,'original',id,relative_path,size_bytes FROM originals WHERE id=$3`, jobID, mediaID, originalID)
+		}
+		if err != nil {
+			_ = manifestTx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := manifestTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := pool.Exec(ctx, `CREATE FUNCTION nmcp_v9_conflict() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `CREATE TRIGGER purge_file_progress_00_ordered_boundary BEFORE UPDATE ON purge_file_progress FOR EACH ROW EXECUTE FUNCTION nmcp_v9_conflict()`); err != nil {
+			t.Fatal(err)
+		}
+		if err := full.Up(ctx); err == nil {
+			t.Fatal("version nine accepted conflicting boundary trigger")
+		}
+		var version int64
+		var completionExists bool
+		if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT to_regprocedure('nmcp_complete_purge_file_progress(nmcp_uuid_v4,nmcp_uuid_v4,text,nmcp_uuid_v4,text,text)') IS NOT NULL`).Scan(&completionExists); err != nil {
+			t.Fatal(err)
+		}
+		if version != 8 || completionExists {
+			t.Fatalf("failed v9 migration version=%d completion_exists=%t", version, completionExists)
+		}
+		if _, err := pool.Exec(ctx, `DROP TRIGGER purge_file_progress_00_ordered_boundary ON purge_file_progress`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `DROP FUNCTION nmcp_v9_conflict()`); err != nil {
+			t.Fatal(err)
+		}
+
+		writer, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Rollback(ctx)
+		if _, err := writer.Exec(ctx, `SELECT 1 FROM purge_file_progress WHERE job_id=$1 FOR UPDATE`, jobID); err != nil {
+			t.Fatal(err)
+		}
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(ctx) }()
+		awaitRelationLock(t, pool, ctx, 0, "purge_file_progress", "AccessExclusiveLock", false)
+		if err := writer.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-migrationResult; err != nil {
+			t.Fatalf("upgrade versions nine and ten: %v", err)
+		}
+
+		var securityDefiner, ownerNoLogin, fixedSearchPath, workerExecute, publicRevoked, workerSelect, workerInsert, workerNoUpdate bool
+		if err := pool.QueryRow(ctx, `SELECT p.prosecdef,
+			p.proowner=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname='nmcp_purge_function_owner'),
+			NOT owner_role.rolcanlogin,
+			array_to_string(p.proconfig,',') LIKE 'search_path='||current_schema()||', pg_catalog, pg_temp%',
+			has_function_privilege('nmcp_worker_runtime',p.oid,'EXECUTE'),
+			NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) WHERE grantee=0 AND privilege_type='EXECUTE'),
+			has_table_privilege('nmcp_worker_runtime','purge_file_progress','SELECT'),
+			has_table_privilege('nmcp_worker_runtime','purge_file_progress','INSERT'),
+			NOT has_table_privilege('nmcp_worker_runtime','purge_file_progress','UPDATE')
+			FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid=p.proowner
+			WHERE p.oid='nmcp_complete_purge_file_progress(nmcp_uuid_v4,nmcp_uuid_v4,text,nmcp_uuid_v4,text,text)'::regprocedure`).Scan(
+			&securityDefiner, &completionExists, &ownerNoLogin, &fixedSearchPath, &workerExecute, &publicRevoked, &workerSelect, &workerInsert, &workerNoUpdate); err != nil {
+			t.Fatal(err)
+		}
+		if !securityDefiner || !completionExists || !ownerNoLogin || !fixedSearchPath || !workerExecute || !publicRevoked || !workerSelect || !workerInsert || !workerNoUpdate {
+			t.Fatalf("v10 boundary security=%t owner=%t no_login=%t search_path=%t execute=%t public_revoked=%t select=%t insert=%t no_update=%t",
+				securityDefiner, completionExists, ownerNoLogin, fixedSearchPath, workerExecute, publicRevoked, workerSelect, workerInsert, workerNoUpdate)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE purge_file_progress SET disposition='deleted' WHERE job_id=$1`, jobID); err == nil {
+			t.Fatal("migration/table owner bypassed ordered purge boundary")
 		}
 	})
 

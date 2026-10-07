@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func TestLifecycleRepositoryIntegrationDeferredCommitRejectionRollsBack(t *testing.T) {
@@ -332,15 +335,27 @@ func TestLifecycleRepositoryIntegrationPostCommitResponseLossConverges(t *testin
 		fault := errors.New("purge progress commit response lost")
 		faultyService := lifecycleServiceWithOnePostCommitFailure(pool, fault)
 		faultyRepository := faultyService.repository.(*PostgresRepository)
-		_, err = faultyRepository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
-			return PurgeFileMissing, nil
-		})
+		var relativePath string
+		if err := pool.QueryRow(ctx, `SELECT relative_path FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&relativePath); err != nil {
+			t.Fatal(err)
+		}
+		root := t.TempDir()
+		writePurgeFixture(t, root, relativePath, []byte("0123456789"))
+		store, err := storage.Open(root, storage.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		_, err = faultyRepository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(store))
 		assertCommitOutcomeUnknown(t, err, fault)
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relativePath))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("purge file after lost commit response stat error = %v", err)
+		}
 		var disposition string
 		if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
 			t.Fatal(err)
 		}
-		if disposition != "missing" {
+		if disposition != "deleted" {
 			t.Fatalf("durable purge progress disposition = %s", disposition)
 		}
 		retry, err := faultyRepository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {

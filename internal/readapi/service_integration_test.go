@@ -242,9 +242,7 @@ func TestReadServiceIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = purgeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken); err == nil {
-			_, err = purgeTx.Exec(ctx, `UPDATE purge_file_progress SET disposition='missing' WHERE job_id=$1`, purgeJobID)
-		}
+		_, err = purgeTx.Exec(ctx, `SELECT nmcp_complete_purge_file_progress($1,$2,'original',$3,$4,'missing')`, purgeJobID, purged.ID, purged.OriginalID, purgeToken)
 		if err == nil {
 			_, err = purgeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, purgeJobID)
 		}
