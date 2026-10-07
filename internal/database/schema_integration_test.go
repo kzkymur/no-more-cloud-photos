@@ -1126,6 +1126,26 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err := pool.Exec(ctx, `GRANT SELECT,INSERT,UPDATE,DELETE,TRUNCATE ON ALL TABLES IN SCHEMA `+quotedSchema+` TO `+quotedRole); err != nil {
 			t.Fatal(err)
 		}
+		execAsApp := func(query string, arguments ...any) error {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx)
+			if _, err = tx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err != nil {
+				return err
+			}
+			if _, err = tx.Exec(ctx, query, arguments...); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		expectAppError := func(query string, arguments ...any) {
+			t.Helper()
+			if err := execAsApp(query, arguments...); err == nil {
+				t.Fatalf("application role statement unexpectedly succeeded: %s", query)
+			}
+		}
 		roleTx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -1138,34 +1158,51 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatal("application role bypassed current Rendition deletion guard")
 		}
 		_ = roleTx.Rollback(ctx)
+		expectAppError(`ALTER TABLE media DISABLE TRIGGER media_purge_delete_guard`)
+		expectAppError(`ALTER TABLE renditions DISABLE TRIGGER renditions_delete_guard`)
+		expectAppError(`DROP TABLE purge_file_progress`)
+		expectAppError(`CREATE TABLE nmcp_app_ddl_probe (id integer)`)
 
 		expectExecError(t, pool, `DELETE FROM renditions WHERE id=$1`, renditionID)
+		expectAppError(`DELETE FROM renditions WHERE id=$1`, renditionID)
 		expectExecError(t, pool, `INSERT INTO rendition_cleanup_progress
+			(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
+			SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,clock_timestamp() FROM renditions WHERE id=$2`, newUUIDv4(t), renditionID)
+		expectAppError(`INSERT INTO rendition_cleanup_progress
 			(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
 			SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,clock_timestamp() FROM renditions WHERE id=$2`, newUUIDv4(t), renditionID)
 		if _, err := pool.Exec(ctx, `UPDATE renditions SET is_current=false,purge_after=clock_timestamp()+interval '1 hour' WHERE id=$1`, renditionID); err != nil {
 			t.Fatal(err)
 		}
 		expectExecError(t, pool, `DELETE FROM renditions WHERE id=$1`, renditionID)
+		expectAppError(`DELETE FROM renditions WHERE id=$1`, renditionID)
 		expectExecError(t, pool, `INSERT INTO rendition_cleanup_progress
+			(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
+			SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, newUUIDv4(t), renditionID)
+		expectAppError(`INSERT INTO rendition_cleanup_progress
 			(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
 			SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, newUUIDv4(t), renditionID)
 		if _, err := pool.Exec(ctx, `UPDATE renditions SET purge_after=clock_timestamp()-interval '1 second' WHERE id=$1`, renditionID); err != nil {
 			t.Fatal(err)
 		}
 		cleanupID := newUUIDv4(t)
-		if _, err := pool.Exec(ctx, `INSERT INTO rendition_cleanup_progress
+		if err := execAsApp(`INSERT INTO rendition_cleanup_progress
 			(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
 			SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, cleanupID, renditionID); err != nil {
-			t.Fatalf("snapshot due cleanup: %v", err)
+			t.Fatalf("application role snapshot due cleanup: %v", err)
 		}
 		expectExecError(t, pool, `UPDATE rendition_cleanup_progress SET disposition='missing' WHERE id=$1`, cleanupID)
+		expectAppError(`UPDATE rendition_cleanup_progress SET disposition='missing' WHERE id=$1`, cleanupID)
 		expectExecError(t, pool, `DELETE FROM renditions WHERE id=$1`, renditionID)
+		expectAppError(`DELETE FROM renditions WHERE id=$1`, renditionID)
 		cleanupTx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = cleanupTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID); err == nil {
+		if _, err = cleanupTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = cleanupTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID)
+		}
+		if err == nil {
 			_, err = cleanupTx.Exec(ctx, `UPDATE rendition_cleanup_progress SET disposition='missing' WHERE id=$1`, cleanupID)
 		}
 		if err == nil {
@@ -1191,9 +1228,152 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		expectExecError(t, pool, `UPDATE rendition_cleanup_progress SET disposition='deleted' WHERE id=$1`, cleanupID)
 		expectExecError(t, pool, `DELETE FROM rendition_cleanup_progress WHERE id=$1`, cleanupID)
+		expectAppError(`UPDATE rendition_cleanup_progress SET disposition='deleted' WHERE id=$1`, cleanupID)
+		expectAppError(`DELETE FROM rendition_cleanup_progress WHERE id=$1`, cleanupID)
 		expectExecError(t, pool, `TRUNCATE rendition_cleanup_progress`)
 		expectExecError(t, pool, `TRUNCATE renditions`)
 		expectExecError(t, pool, `TRUNCATE media CASCADE`)
+		expectAppError(`TRUNCATE rendition_cleanup_progress`)
+		expectAppError(`TRUNCATE renditions`)
+		expectAppError(`TRUNCATE media CASCADE`)
+
+		cascadeRenditionIDs := []string{newUUIDv4(t), newUUIDv4(t)}
+		cascadeTargetIDs := make([]string, 0, len(cascadeRenditionIDs))
+		for index, cascadeRenditionID := range cascadeRenditionIDs {
+			cascadeTargetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+			cascadeTargetIDs = append(cascadeTargetIDs, cascadeTargetID)
+			publishTx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = publishTx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, cascadeTargetID); err == nil {
+				_, err = publishTx.Exec(ctx, `INSERT INTO renditions
+					(id,media_id,job_target_id,profile_key,is_current,purge_after,relative_path,mime_type,size_bytes,sha256,width,height,processor_audit)
+					VALUES ($1,$2,$3,'ignored',$4,$5,$6,'image/avif',9,$7,1,1,'{"fixture":"app-role-cascade"}')`,
+					cascadeRenditionID, mediaID, cascadeTargetID, index == 0, nil,
+					fmt.Sprintf("renditions/88/cleanup/cascade-%d/output.avif", index), strings.Repeat(fmt.Sprintf("%x", index+10), 64))
+			}
+			if err == nil {
+				_, err = publishTx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=(SELECT job_id FROM job_targets WHERE id=$1)`, cascadeTargetID)
+			}
+			if err != nil {
+				_ = publishTx.Rollback(ctx)
+				t.Fatalf("publish app-role cascade fixture: %v", err)
+			}
+			if err := publishTx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=clock_timestamp(),purge_after=clock_timestamp() WHERE id=$1`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		purgeID, purgeToken := newUUIDv4(t), newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts)
+			VALUES ($1,'purge',$2,'queued',3)`, purgeID, mediaID); err != nil {
+			t.Fatalf("create app-role purge fixture: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,
+			lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, purgeID, purgeToken); err != nil {
+			t.Fatalf("start app-role purge fixture: %v", err)
+		}
+		expectAppError(`DELETE FROM media WHERE id=$1`, mediaID)
+		manifestTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = manifestTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = manifestTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken)
+		}
+		if err == nil {
+			_, err = manifestTx.Exec(ctx, `INSERT INTO purge_file_progress
+				(job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes)
+				SELECT $1::nmcp_uuid_v4,media_id,'original',id,relative_path,size_bytes FROM originals WHERE media_id=$2
+				UNION ALL
+				SELECT $1::nmcp_uuid_v4,media_id,'rendition',id,relative_path,size_bytes FROM renditions WHERE media_id=$2`, purgeID, mediaID)
+		}
+		if err != nil {
+			_ = manifestTx.Rollback(ctx)
+			t.Fatalf("application role purge manifest: %v", err)
+		}
+		if err := manifestTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		unapprovedTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = unapprovedTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = unapprovedTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, purgeID)
+		}
+		if err == nil {
+			_, err = unapprovedTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken)
+		}
+		if err == nil {
+			_, err = unapprovedTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID)
+		}
+		_ = unapprovedTx.Rollback(ctx)
+		if err == nil {
+			t.Fatal("application role deleted Media before purge progress completion")
+		}
+		completeTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = completeTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = completeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken)
+		}
+		if err == nil {
+			_, err = completeTx.Exec(ctx, `UPDATE purge_file_progress SET disposition='deleted' WHERE job_id=$1`, purgeID)
+		}
+		if err != nil {
+			_ = completeTx.Rollback(ctx)
+			t.Fatalf("application role purge progress: %v", err)
+		}
+		if err := completeTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		purgeTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = purgeTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = purgeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, purgeID)
+		}
+		if err == nil {
+			_, err = purgeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken)
+		}
+		if err == nil {
+			_, err = purgeTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID)
+		}
+		if err == nil {
+			_, err = purgeTx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, purgeID)
+		}
+		if err != nil {
+			_ = purgeTx.Rollback(ctx)
+			t.Fatalf("application role Media cascade: %v", err)
+		}
+		if err := purgeTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var mediaRows, originalRows, cascadeRenditionRows, jobRows, preservedTargets, purgeProgress, cleanupHistory int
+		if err := pool.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM media WHERE id=$1),
+			(SELECT count(*) FROM originals WHERE media_id=$1),
+			(SELECT count(*) FROM renditions WHERE id=ANY($2::uuid[])),
+			(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1),
+			(SELECT count(*) FROM job_targets WHERE id=$3 OR id=ANY($4::uuid[])),
+			(SELECT count(*) FROM purge_file_progress WHERE job_id=$5 AND disposition='deleted' AND completed_at IS NOT NULL),
+			(SELECT count(*) FROM rendition_cleanup_progress WHERE id=$6 AND disposition='missing' AND completed_at IS NOT NULL)`,
+			mediaID, cascadeRenditionIDs, targetID, cascadeTargetIDs, purgeID, cleanupID).Scan(&mediaRows, &originalRows, &cascadeRenditionRows, &jobRows, &preservedTargets, &purgeProgress, &cleanupHistory); err != nil {
+			t.Fatal(err)
+		}
+		if mediaRows != 0 || originalRows != 0 || cascadeRenditionRows != 0 || jobRows != 4 || preservedTargets != 3 || purgeProgress != 3 || cleanupHistory != 1 {
+			t.Fatalf("application role purge history media=%d originals=%d renditions=%d jobs=%d targets=%d purge_progress=%d cleanup_progress=%d",
+				mediaRows, originalRows, cascadeRenditionRows, jobRows, preservedTargets, purgeProgress, cleanupHistory)
+		}
+		expectAppError(`UPDATE purge_file_progress SET disposition='missing' WHERE job_id=$1`, purgeID)
+		expectAppError(`DELETE FROM purge_file_progress WHERE job_id=$1`, purgeID)
+		expectAppError(`TRUNCATE purge_file_progress`)
 		var guardCount int
 		if err := pool.QueryRow(ctx, `SELECT count(*)
 			FROM pg_catalog.pg_trigger

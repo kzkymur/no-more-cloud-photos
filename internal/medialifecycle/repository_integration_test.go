@@ -234,7 +234,7 @@ func TestLifecycleRepositoryIntegrationDuePurgeScanBoundariesAndKeyset(t *testin
 			t.Fatal(err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=$1,purge_after=$2 WHERE id=$3`, boundary, boundary.Add(time.Nanosecond), ids[5]); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=$1,purge_after=$2 WHERE id=$3`, boundary, boundary.Add(time.Second), ids[5]); err != nil {
 		t.Fatal(err)
 	}
 
