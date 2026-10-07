@@ -146,7 +146,7 @@ func TestBoundTransformClaimsExcludeProfilesAddedAfterStartupIntegration(t *test
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 hour' WHERE id=$1`, unsupportedJobID); err != nil {
 		t.Fatal(err)
 	}
-	supportedMediaID, supportedOriginalID := insertPublicationMedia(t, pool)
+	supportedMediaID, supportedOriginalID := insertPublicationMediaWithSHA(t, pool, strings.Repeat("d", 64))
 	supportedJobID, _ := insertTransformForProfile(t, pool, supportedMediaID, supportedOriginalID, definitions[0].ID)
 
 	lease, err := claimer.Claim(ctx, []Type{TypeTransform})
@@ -1892,6 +1892,10 @@ func testRendition(t *testing.T, lease Lease, targetID string) Rendition {
 }
 
 func insertPublicationMedia(t *testing.T, pool *pgxpool.Pool) (string, string) {
+	return insertPublicationMediaWithSHA(t, pool, strings.Repeat("c", 64))
+}
+
+func insertPublicationMediaWithSHA(t *testing.T, pool *pgxpool.Pool, digest string) (string, string) {
 	t.Helper()
 	mediaID, originalID := newTestUUID(t), newTestUUID(t)
 	if _, err := pool.Exec(context.Background(), `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
@@ -1900,7 +1904,7 @@ func insertPublicationMedia(t *testing.T, pool *pgxpool.Pool) (string, string) {
 	path := "originals/" + originalID[:2] + "/" + originalID + "/original.jpg"
 	if _, err := pool.Exec(context.Background(), `INSERT INTO originals
 		(id,media_id,sha256,relative_path,mime_type,size_bytes,width,height)
-		VALUES ($1,$2,$3,$4,'image/jpeg',1,1,1)`, originalID, mediaID, strings.Repeat("c", 64), path); err != nil {
+		VALUES ($1,$2,$3,$4,'image/jpeg',1,1,1)`, originalID, mediaID, digest, path); err != nil {
 		t.Fatal(err)
 	}
 	return mediaID, originalID
