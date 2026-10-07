@@ -407,7 +407,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `UPDATE media SET deleted_at=deleted_at+interval '1 second' WHERE id=$1`, mediaOne)
 		expectExecError(t, pool, `UPDATE media SET purge_after=purge_after+interval '1 second' WHERE id=$1`, mediaOne)
 		expectExecError(t, pool, `UPDATE media SET deleted_at=NULL WHERE id=$1`, mediaOne)
-		if _, err := pool.Exec(ctx, `UPDATE media SET media_type='image/png' WHERE id=$1`, mediaOne); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE media SET media_type=media_type WHERE id=$1`, mediaOne); err != nil {
 			t.Fatalf("update unrelated deleted Media field: %v", err)
 		}
 		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, mediaOne); err != nil {
@@ -415,6 +415,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(),purge_after=now() WHERE id=$1`, mediaOne); err != nil {
 			t.Fatalf("delete restored Media: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, mediaOne); err != nil {
+			t.Fatalf("restore Media after snapshot regression: %v", err)
 		}
 
 		var schemaName, functionConfig string

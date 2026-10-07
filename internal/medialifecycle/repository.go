@@ -25,6 +25,7 @@ type PostgresRepository struct {
 	db          transactionDatabase
 	fileBaseURL string
 	newID       func() (string, error)
+	afterCommit func(context.Context) error
 }
 
 func NewPostgresRepository(pool *pgxpool.Pool, fileBaseURL string) (*PostgresRepository, error) {
@@ -79,7 +80,7 @@ func (r *PostgresRepository) Delete(ctx context.Context, mediaID string) (Delete
 	if err != nil {
 		return DeleteResult{}, err
 	}
-	if err := commit(tx, ctx); err != nil {
+	if err := r.commit(ctx, tx); err != nil {
 		return DeleteResult{}, err
 	}
 	return DeleteResult{Media: media, Changed: changed}, nil
@@ -133,7 +134,7 @@ func (r *PostgresRepository) Restore(ctx context.Context, mediaID string) (Resto
 	if err := r.insertEvent(ctx, tx, mediaID, "media_upsert", "restore", payload, now); err != nil {
 		return RestoreResult{}, err
 	}
-	if err := commit(tx, ctx); err != nil {
+	if err := r.commit(ctx, tx); err != nil {
 		return RestoreResult{}, err
 	}
 	return RestoreResult{Media: media}, nil
@@ -162,12 +163,12 @@ func (r *PostgresRepository) EnqueuePurge(ctx context.Context, mediaID string) (
 	for _, job := range jobs {
 		switch job.Status {
 		case readapi.JobQueued:
-			if err := commit(tx, ctx); err != nil {
+			if err := r.commit(ctx, tx); err != nil {
 				return EnqueueResult{}, err
 			}
 			return EnqueueResult{Job: job, Disposition: EnqueueExistingQueued}, nil
 		case readapi.JobRunning:
-			if err := commit(tx, ctx); err != nil {
+			if err := r.commit(ctx, tx); err != nil {
 				return EnqueueResult{}, err
 			}
 			return EnqueueResult{Job: job, Disposition: EnqueueExistingRunning}, nil
@@ -195,7 +196,7 @@ func (r *PostgresRepository) EnqueuePurge(ctx context.Context, mediaID string) (
 	job := readapi.NewJob()
 	job.ID, job.Type, job.Status, job.MediaID = jobID, readapi.JobPurge, readapi.JobQueued, mediaID
 	job.MaxAttempts, job.AvailableAt, job.CreatedAt, job.UpdatedAt = InitialPurgeMaxAttempts, now.UTC(), now.UTC(), now.UTC()
-	if err := commit(tx, ctx); err != nil {
+	if err := r.commit(ctx, tx); err != nil {
 		return EnqueueResult{}, err
 	}
 	return EnqueueResult{Job: job, Disposition: EnqueueCreated}, nil
@@ -263,7 +264,7 @@ func (r *PostgresRepository) StartPurge(ctx context.Context, jobID string) (Purg
 	); err != nil {
 		return PurgeLease{}, fmt.Errorf("start purge job: %w", err)
 	}
-	if err := commit(tx, ctx); err != nil {
+	if err := r.commit(ctx, tx); err != nil {
 		return PurgeLease{}, err
 	}
 	lease.Token = token
@@ -355,13 +356,18 @@ func rollback(ctx context.Context, tx pgx.Tx) {
 	_ = tx.Rollback(rollbackCtx)
 }
 
-func commit(tx pgx.Tx, ctx context.Context) error {
+func (r *PostgresRepository) commit(ctx context.Context, tx pgx.Tx) error {
 	if err := tx.Commit(ctx); err != nil {
 		var postgresError *pgconn.PgError
 		if errors.Is(err, pgx.ErrTxCommitRollback) || errors.As(err, &postgresError) {
 			return &CommitRolledBack{Cause: err}
 		}
 		return &CommitOutcomeUnknown{Cause: err}
+	}
+	if r.afterCommit != nil {
+		if err := r.afterCommit(ctx); err != nil {
+			return &CommitOutcomeUnknown{Cause: err}
+		}
 	}
 	return nil
 }
