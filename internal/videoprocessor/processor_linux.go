@@ -44,11 +44,12 @@ type InspectRequest struct {
 }
 
 type Request struct {
-	Input                *os.File
-	Output               *os.File
-	MIMEType             string
-	Recipe               profile.Recipe
-	GeneratedBytesBefore int64
+	Input                    *os.File
+	Output                   *os.File
+	MIMEType                 string
+	Recipe                   profile.Recipe
+	GeneratedBytesBefore     int64
+	ExpectedVideoStreamIndex *int
 }
 
 type Rational struct {
@@ -115,6 +116,7 @@ type Result struct {
 	AudioPresent                bool
 	AudioCodec                  string
 	AudioBitrateKbps            int
+	OutputDurationUS            int64
 	Source                      Inspection
 	Audit                       Audit
 }
@@ -260,7 +262,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	arguments := []string{"transform", "--protocol", "1", "--input", "/proc/self/fd/3", "--output", "/proc/self/fd/4",
 		"--input-mime", request.MIMEType, "--output-kind", kind, "--max-long-edge", strconv.Itoa(request.Recipe.MaxLongEdge),
 		"--quality", strconv.Itoa(quality), "--bit-depth", strconv.Itoa(bitDepth), "--threads", "1", "--srgb-icc", "/proc/self/fd/5",
-		"--generated-bytes-before", strconv.FormatInt(request.GeneratedBytesBefore, 10)}
+		"--generated-bytes-before", strconv.FormatInt(request.GeneratedBytesBefore, 10), "--expected-video-stream-index", strconv.Itoa(*request.ExpectedVideoStreamIndex)}
 	arguments = append(arguments, p.limitArguments()...)
 	operationRunner := p.runner
 	if kind == "first-frame-avif" {
@@ -307,15 +309,28 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	if _, err := request.Output.Seek(0, io.SeekStart); err != nil {
 		return Result{}, ErrResourcePolicy
 	}
-	if err := p.verifyOutput(operation, operationRunner, request, response.Result); err != nil {
+	outputDurationUS, err := p.verifyOutput(operation, operationRunner, request, response.Result)
+	if err != nil {
 		return Result{}, mapOperationError(err, ctx, operation)
 	}
 	r := response.Result
+	if request.ExpectedVideoStreamIndex != nil && r.Source.VideoStreamIndex != *request.ExpectedVideoStreamIndex {
+		// The deferred cleanup truncates the temporary output, so a transform of
+		// any stream other than the upload-persisted primary is never published.
+		return Result{}, ErrProcess
+	}
 	extension := "mp4"
 	if r.Kind == "first-frame-avif" {
 		extension = "avif"
+		// A still rendition has no playback duration. The verifier may report
+		// the source timeline while cross-checking its selected first frame;
+		// do not persist that source duration as an AVIF output fact.
+		outputDurationUS = 0
 	}
-	return Result{r.Kind, r.OutputMIME, extension, r.Width, r.Height, r.MaxLongEdge, r.Threads, r.CRF, r.Quality, r.BitDepth, r.Chroma, r.AudioPresent, r.AudioCodec, r.AudioBitrateKbps, r.Source, publicAudit(r.Audit)}, nil
+	return Result{Kind: r.Kind, OutputMIME: r.OutputMIME, OutputExtension: extension, Width: r.Width, Height: r.Height,
+		MaxLongEdge: r.MaxLongEdge, Threads: r.Threads, CRF: r.CRF, Quality: r.Quality, BitDepth: r.BitDepth,
+		Chroma: r.Chroma, AudioPresent: r.AudioPresent, AudioCodec: r.AudioCodec, AudioBitrateKbps: r.AudioBitrateKbps,
+		OutputDurationUS: outputDurationUS, Source: r.Source, Audit: publicAudit(r.Audit)}, nil
 }
 
 func limitForKind(policy Policy, kind string) int64 {
@@ -325,43 +340,45 @@ func limitForKind(policy Policy, kind string) int64 {
 	return policy.VideoOutputMaxBytes
 }
 
-func (p *Processor) verifyOutput(ctx context.Context, runner *processrunner.Runner, request Request, transformed *transformWire) error {
+func (p *Processor) verifyOutput(ctx context.Context, runner *processrunner.Runner, request Request, transformed *transformWire) (int64, error) {
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
 	source, err := reopenInput(request.Input)
 	if err != nil {
-		return ErrProcess
+		return 0, ErrProcess
 	}
 	defer source.Close()
 	output, err := reopenInput(request.Output)
 	if err != nil {
-		return ErrProcess
+		return 0, ErrProcess
 	}
 	defer output.Close()
 	arguments := append([]string{"verify-output", "--protocol", "1", "--source", "/proc/self/fd/3", "--output", "/proc/self/fd/4",
-		"--source-mime", request.MIMEType, "--output-kind", transformed.Kind}, p.limitArguments()...)
+		"--source-mime", request.MIMEType, "--output-kind", transformed.Kind, "--expected-video-stream-index", strconv.Itoa(*request.ExpectedVideoStreamIndex)}, p.limitArguments()...)
 	result, err := runner.Run(ctx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{source, output}})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var response verificationResponse
 	if decodeProtocolJSON(result.Stdout, &response) != nil || !validEnvelope(response.Protocol, response.OK, response.ErrorCode, response.Result != nil) || !response.OK {
-		return ErrProcess
+		return 0, ErrProcess
 	}
 	got := response.Result
 	if !got.FullyDecodedVideo || got.Kind != transformed.Kind || got.Width != transformed.Width || got.Height != transformed.Height || got.VideoCodec != "av1" || got.RotationDegrees != 0 || got.HasDisplayMatrix || got.HasRotateMetadata || got.Source != transformed.Source {
-		return ErrProcess
+		return 0, ErrProcess
 	}
 	if transformed.Kind == "mp4-av1" {
 		if got.Container != "mp4" || got.SampleAspectRatio != (Rational{1, 1}) || got.BitDepth != 10 || got.Chroma != "4:2:0" || got.FrameCount != transformed.Source.FrameCount || !sha256Pattern.MatchString(got.PTSDeltaSHA256) || got.MaxTimingErrorTicks < 0 || got.MaxTimingErrorTicks > 1 || got.OutputDurationUS <= 0 || got.MaxDurationErrorTicks < 0 || got.MaxDurationErrorTicks > 1 || got.AudioPresent != transformed.AudioPresent || got.AudioPresent && (!got.FullyDecodedAudio || got.AudioCodec != "aac" || got.AudioProfile != "LC") || got.ColorPrimaries != "bt709" || got.ColorTransfer != "bt709" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
-			return ErrProcess
+			return 0, ErrProcess
 		}
 	} else if got.Container != "avif" || got.FrameCount != 1 || got.AudioPresent || got.FullyDecodedAudio || got.ColorPrimaries != "bt709" || got.ColorTransfer != "iec61966-2-1" || got.ColorMatrix != "bt709" || got.ColorRange != "limited" {
-		return ErrProcess
+		return 0, ErrProcess
 	}
-	_, err = request.Output.Seek(0, io.SeekStart)
-	return err
+	if _, err = request.Output.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	return got.OutputDurationUS, nil
 }
 
 func (p *Processor) limitArguments() []string {
@@ -387,7 +404,7 @@ func validateInput(file *os.File, mime string) error {
 }
 
 func validateRequest(request Request) error {
-	if validateInput(request.Input, request.MIMEType) != nil || request.Output == nil || request.GeneratedBytesBefore < 0 || request.GeneratedBytesBefore > MaxGeneratedOutputBytes || validateRecipe(request.Recipe, request.MIMEType) != nil {
+	if validateInput(request.Input, request.MIMEType) != nil || request.Output == nil || request.GeneratedBytesBefore < 0 || request.GeneratedBytesBefore > MaxGeneratedOutputBytes || request.ExpectedVideoStreamIndex == nil || *request.ExpectedVideoStreamIndex < 0 || validateRecipe(request.Recipe, request.MIMEType) != nil {
 		return ErrInvalid
 	}
 	inputInfo, err := request.Input.Stat()
@@ -490,7 +507,7 @@ func validateTransform(r transformWire, request Request, p Policy, digest string
 	if kind == "mp4-av1" && r.Source.AudioPresent {
 		expectedOutputLayout = r.Source.AudioChannelLayout
 	}
-	if a.ToolVersion != "nmcp-video-helper/1" || a.BuildManifest != BuildManifest || validateVersionMap(a.LibraryVersions) != nil || a.ICCSHA256 != digest || a.Demuxer != "mov" || a.VideoDecoder != r.Source.VideoCodec || a.AudioDecoder != expectedAudioDecoder || a.SelectedVideoStream != r.Source.VideoStreamIndex || a.SelectedAudioStream != r.Source.AudioStreamIndex || a.StreamSelection != "default-first-then-index" || !oneOf(a.RotationSource, "none", "display-matrix", "rotate-tag", "display-matrix+rotate") || a.RotationDegreesApplied != r.Source.RotationDegrees || a.Orientation != "identity" || a.Geometry != geometry || a.Timing != "preserve-presentation-order-vfr-rebase-zero" || a.VideoFilterGraph != auditVideoFilter(r.Source, r.Width, r.Height, r.BitDepth, kind) || a.AudioFilterGraph != expectedAudioFilter || a.VideoEncoder != videoEncoder || a.AudioEncoder != expectedAudioEncoder || a.Muxer != muxer || a.InputColor != auditInputColor(r.Source) || a.OutputColor != outputColor || a.OutputPrimaries != "bt709" || a.OutputTransfer != outputTransfer || a.OutputMatrix != "bt709" || a.OutputRange != "limited" || a.InputAudioLayout != r.Source.AudioChannelLayout || a.OutputAudioLayout != expectedOutputLayout || a.InputAudioSampleRate != r.Source.AudioSampleRate || a.OutputAudioSampleRate != expectedAudioRate || a.Metadata != "strip-after-normalization-keep-color-tags" {
+	if a.ToolVersion != "nmcp-video-helper/1" || a.BuildManifest != BuildManifest || validateVersionMap(a.LibraryVersions) != nil || a.ICCSHA256 != digest || a.Demuxer != "mov" || a.VideoDecoder != r.Source.VideoCodec || a.AudioDecoder != expectedAudioDecoder || a.SelectedVideoStream != r.Source.VideoStreamIndex || a.SelectedAudioStream != r.Source.AudioStreamIndex || a.StreamSelection != "expected-absolute-index" || !oneOf(a.RotationSource, "none", "display-matrix", "rotate-tag", "display-matrix+rotate") || a.RotationDegreesApplied != r.Source.RotationDegrees || a.Orientation != "identity" || a.Geometry != geometry || a.Timing != "preserve-presentation-order-vfr-rebase-zero" || a.VideoFilterGraph != auditVideoFilter(r.Source, r.Width, r.Height, r.BitDepth, kind) || a.AudioFilterGraph != expectedAudioFilter || a.VideoEncoder != videoEncoder || a.AudioEncoder != expectedAudioEncoder || a.Muxer != muxer || a.InputColor != auditInputColor(r.Source) || a.OutputColor != outputColor || a.OutputPrimaries != "bt709" || a.OutputTransfer != outputTransfer || a.OutputMatrix != "bt709" || a.OutputRange != "limited" || a.InputAudioLayout != r.Source.AudioChannelLayout || a.OutputAudioLayout != expectedOutputLayout || a.InputAudioSampleRate != r.Source.AudioSampleRate || a.OutputAudioSampleRate != expectedAudioRate || a.Metadata != "strip-after-normalization-keep-color-tags" {
 		return ErrProcess
 	}
 	if r.Source.HDR {

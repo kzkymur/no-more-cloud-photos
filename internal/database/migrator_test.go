@@ -54,6 +54,20 @@ func TestChecksumSQL(t *testing.T) {
 	}
 }
 
+func TestEmbeddedMigrationExpectedVersion(t *testing.T) {
+	t.Parallel()
+	migrations, err := discoverMigrations(embeddedMigrations, migrationsDirectory)
+	if err != nil {
+		t.Fatalf("discoverMigrations() error = %v", err)
+	}
+	if got := expectedVersion(migrations); got != 6 {
+		t.Fatalf("expectedVersion() = %d, want 6", got)
+	}
+	if migrations[len(migrations)-1].name != "transform_publication_invariants" {
+		t.Fatalf("latest migration name = %q", migrations[len(migrations)-1].name)
+	}
+}
+
 func TestDiscoverMigrations(t *testing.T) {
 	t.Parallel()
 

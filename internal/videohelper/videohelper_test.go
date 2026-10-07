@@ -38,6 +38,28 @@ func TestParseRequestClosedCLIAndLimits(t *testing.T) {
 	}
 }
 
+func TestParseRequestRequiresExpectedAbsoluteVideoStreamForProcessing(t *testing.T) {
+	for _, args := range [][]string{
+		processingArgs("transform", "2"),
+		processingArgs("verify-output", "2"),
+	} {
+		got, err := parseRequest(args)
+		if err != nil || got.expectedVideoStreamIndex == nil || *got.expectedVideoStreamIndex != 2 {
+			t.Fatalf("parseRequest(%q) = %#v, %v", args, got, err)
+		}
+		for _, invalid := range []string{"", "-1", "+2", "02", "2147483648"} {
+			mutated := slices.Clone(args)
+			mutated[12+map[bool]int{true: 12, false: 0}[args[0] == "transform"]] = invalid
+			if _, err := parseRequest(mutated); err == nil {
+				t.Fatalf("accepted expected index %q for %s", invalid, args[0])
+			}
+		}
+		if _, err := parseRequest(args[:len(args)-2]); err == nil {
+			t.Fatalf("accepted %s without expected index", args[0])
+		}
+	}
+}
+
 func TestParseLimitsExactPlusOneAndOverflow(t *testing.T) {
 	base := maxLimitValues()
 	for name, value := range map[string]string{
@@ -151,7 +173,7 @@ func TestInspectUsesProbeAndRejectsAmbiguousColor(t *testing.T) {
 	frames := frameJSON(0, 320, 180, frameTiming{0, 40}, frameTiming{40, 40})
 	runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{frames}}
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
-	got, _, err := e.inspect("input", "video/mp4", maxLimits())
+	got, _, err := e.inspect("input", "video/mp4", nil, maxLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +188,7 @@ func TestInspectUsesProbeAndRejectsAmbiguousColor(t *testing.T) {
 	streams[0].(map[string]interface{})["color_primaries"] = "unknown"
 	bad, _ := json.Marshal(document)
 	runner.runs, runner.streams = [][]byte{bad}, []string{frames}
-	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
+	if _, _, err := e.inspect("input", "video/mp4", nil, maxLimits()); !isCode(err, "unsupported_input") {
 		t.Fatalf("ambiguous color error = %v", err)
 	}
 }
@@ -289,7 +311,7 @@ func TestTransformInvokesSVTAV1WithoutH264FallbackAndTruncatesFailure(t *testing
 	frames := frameJSON(0, 320, 180, frameTiming{0, 40}, frameTiming{40, 40})
 	runner := &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, writeOutput: []byte("mp4")}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
-	r := request{command: "transform", input: input.Name(), output: output.Name(), mime: "video/mp4", kind: "mp4-av1", icc: icc, maxLongEdge: 1920, bitDepth: 10, threads: 1, limits: maxLimits()}
+	r := request{command: "transform", input: input.Name(), output: output.Name(), mime: "video/mp4", kind: "mp4-av1", icc: icc, maxLongEdge: 1920, bitDepth: 10, threads: 1, expectedVideoStreamIndex: intPointer(0), limits: maxLimits()}
 	var response bytes.Buffer
 	if err := e.transform(r, &response); err != nil {
 		t.Fatal(err)
@@ -326,7 +348,7 @@ func TestThumbnailDiscardsSourceAudioWithoutAudioAudit(t *testing.T) {
 	frames := frameJSON(0, 320, 180, frameTiming{0, 80})
 	runner := &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, true), nil}, streams: []string{frames}, writeOutput: []byte("avif")}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
-	r := request{command: "transform", input: input, output: output, mime: "video/mp4", kind: "first-frame-avif", icc: icc, maxLongEdge: 640, quality: 80, bitDepth: 8, threads: 1, limits: maxLimits()}
+	r := request{command: "transform", input: input, output: output, mime: "video/mp4", kind: "first-frame-avif", icc: icc, maxLongEdge: 640, quality: 80, bitDepth: 8, threads: 1, expectedVideoStreamIndex: intPointer(0), limits: maxLimits()}
 	var response bytes.Buffer
 	if err := e.transform(r, &response); err != nil {
 		t.Fatal(err)
@@ -373,7 +395,7 @@ func TestVerifyOutputIndependentlyProbesAndFullyDecodes(t *testing.T) {
 		streams: []string{sourceFrames, outputFrames},
 	}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
-	r := request{source: "source", output: "output", mime: "video/mp4", kind: "mp4-av1", limits: maxLimits()}
+	r := request{source: "source", output: "output", mime: "video/mp4", kind: "mp4-av1", expectedVideoStreamIndex: intPointer(0), limits: maxLimits()}
 	var response bytes.Buffer
 	if err := e.verify(r, &response); err != nil {
 		t.Fatal(err)
@@ -412,12 +434,15 @@ type fakeRunner struct {
 	writeOutput []byte
 	lastFFmpeg  []string
 	lastStream  []string
+	ffmpegCalls [][]string
+	streamCalls [][]string
 }
 
 func (f *fakeRunner) run(path string, args []string, _ int64) ([]byte, []byte, error) {
 	f.runCalls++
 	if strings.HasSuffix(path, "ffmpeg") {
 		f.lastFFmpeg = slices.Clone(args)
+		f.ffmpegCalls = append(f.ffmpegCalls, slices.Clone(args))
 		if len(f.writeOutput) > 0 && len(args) > 0 && args[len(args)-1] != "-" {
 			_ = os.WriteFile(args[len(args)-1], f.writeOutput, 0o600)
 		}
@@ -438,6 +463,7 @@ func (f *fakeRunner) run(path string, args []string, _ int64) ([]byte, []byte, e
 
 func (f *fakeRunner) stream(_ string, args []string, consume func(io.Reader) error) error {
 	f.lastStream = slices.Clone(args)
+	f.streamCalls = append(f.streamCalls, slices.Clone(args))
 	if len(f.streams) == 0 {
 		return errors.New("unexpected stream")
 	}
@@ -481,14 +507,18 @@ func probeJSON(codec, pixFmt string, width, height int, audio bool) []byte {
 }
 
 func disposition(defaultValue, attached int) struct {
-	Default     int `json:"default"`
-	AttachedPic int `json:"attached_pic"`
+	Default         int `json:"default"`
+	AttachedPic     int `json:"attached_pic"`
+	TimedThumbnails int `json:"timed_thumbnails"`
 } {
 	return struct {
-		Default     int `json:"default"`
-		AttachedPic int `json:"attached_pic"`
-	}{defaultValue, attached}
+		Default         int `json:"default"`
+		AttachedPic     int `json:"attached_pic"`
+		TimedThumbnails int `json:"timed_thumbnails"`
+	}{defaultValue, attached, 0}
 }
+
+func intPointer(value int) *int { return &value }
 
 func maxLimits() limits {
 	return limits{maxStreams, maxDimension, maxFrames, maxAudioChannels, maxAudioRate, maxPixels, maxDecodedPixels, maxDurationUS, 240, 1, maxVideoBytes, maxThumbBytes, maxGenerated}
@@ -508,6 +538,20 @@ func maxLimitValues() map[string]string {
 func inspectArgs(l limits) []string {
 	values := maxLimitValues()
 	args := []string{"inspect", "--protocol", "1", "--input", "/proc/self/fd/3", "--input-mime", "video/mp4"}
+	for _, name := range limitNames {
+		args = append(args, name, values[name])
+	}
+	return args
+}
+
+func processingArgs(command, expected string) []string {
+	values := maxLimitValues()
+	var args []string
+	if command == "transform" {
+		args = []string{"transform", "--protocol", "1", "--input", "/proc/self/fd/3", "--output", "/proc/self/fd/4", "--input-mime", "video/mp4", "--output-kind", "mp4-av1", "--max-long-edge", "1920", "--quality", "0", "--bit-depth", "10", "--threads", "1", "--srgb-icc", "/proc/self/fd/5", "--generated-bytes-before", "0", "--expected-video-stream-index", expected}
+	} else {
+		args = []string{"verify-output", "--protocol", "1", "--source", "/proc/self/fd/3", "--output", "/proc/self/fd/4", "--source-mime", "video/mp4", "--output-kind", "mp4-av1", "--expected-video-stream-index", expected}
+	}
 	for _, name := range limitNames {
 		args = append(args, name, values[name])
 	}

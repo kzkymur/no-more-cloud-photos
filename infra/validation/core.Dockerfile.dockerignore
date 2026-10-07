@@ -8,6 +8,8 @@
 !cmd/core-worker/**
 !cmd/nmcp-admin/
 !cmd/nmcp-admin/**
+!cmd/nmcp-video-helper/
+!cmd/nmcp-video-helper/**
 !internal/
 !internal/config/
 !internal/config/**
@@ -27,6 +29,8 @@
 !internal/metadata/**
 !internal/processrunner/
 !internal/processrunner/**
+!internal/profile/
+!internal/profile/**
 !internal/readapi/
 !internal/readapi/**
 !internal/storage/
@@ -36,7 +40,14 @@
 !internal/worker/
 !internal/worker/**
 !internal/stillprocessor/
-!internal/stillprocessor/helper/
-!internal/stillprocessor/helper/**
+!internal/stillprocessor/**
+!internal/animationprocessor/
+!internal/animationprocessor/**
+!internal/videoprocessor/
+!internal/videoprocessor/**
+!internal/videohelper/
+!internal/videohelper/**
+!internal/transformexecutor/
+!internal/transformexecutor/**
 **/*_test.go
 **/testdata/**

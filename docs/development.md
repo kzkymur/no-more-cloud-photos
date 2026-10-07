@@ -20,9 +20,13 @@
   address-space limit. CI downloads the immutable named archives, verifies
   their documented SHA-256 digests before extraction, and records all tool
   versions in each run. The Ubuntu 24.04 CI image supplies `prlimit`; issue #20
-  must pin the production image digest (and therefore its exact util-linux
-  patch version) and verify these absolute executable paths:
+  pins the production platform contract and verifies these absolute executable paths:
   `/usr/bin/exiftool`, `/usr/bin/ffprobe`, and `/usr/bin/prlimit`.
+
+The isolated validation image builds the still, animation, and video helpers in
+that order into one pinned `/opt/nmcp` prefix. This proves the shared codec
+closure used by the Worker validation lane; issue #21 separately owns packaging
+and rollback proof for the production release artifact.
 
 The repository sets `go 1.27.0` as its language/toolchain floor while CI pins
 the security patch release `1.27.1`. Set `GOTOOLCHAIN=local` so an unexpected
@@ -68,7 +72,13 @@ transactional migrations, non-transactional execution, and recovery.
 |---|---:|---:|---:|---|
 | `NMCP_DATABASE_URL` | required | required | required | PostgreSQL DSN; secret, never logged. |
 | `NMCP_STORAGE_ROOT` | required | required | - | Absolute clean path; never logged. |
-| `NMCP_FILE_BASE_URL` | required | - | - | Absolute HTTPS File Server files root with a non-root path, e.g. `https://photos.example.ts.net/files`; trailing slash is normalized. Core appends the canonical storage key directly and never inserts `/files`. No credentials, query, fragment, dot/empty segments, or encoded path ambiguity. |
+| `NMCP_FILE_BASE_URL` | required | required | - | Absolute HTTPS File Server files root with a non-root path, e.g. `https://photos.example.ts.net/files`; trailing slash is normalized. Core appends the canonical storage key directly and never inserts `/files`. No credentials, query, fragment, dot/empty segments, or encoded path ambiguity. |
+| `NMCP_STILL_HELPER_PATH` | - | required | - | Clean absolute path to the trusted still/RAW protocol-v1 helper. |
+| `NMCP_ANIMATION_HELPER_PATH` | - | required | - | Clean absolute path to the trusted animation protocol-v1 helper. |
+| `NMCP_VIDEO_HELPER_PATH` | - | required | - | Clean absolute path to the trusted video protocol-v1 helper. |
+| `NMCP_PRLIMIT_PATH` | - | required | - | Clean absolute path to the trusted `prlimit` executable used by the process supervisor. |
+| `NMCP_SRGB_ICC_PATH` | - | required | - | Clean absolute path to the pinned sRGB2014 ICC profile. |
+| `NMCP_SRGB_ICC_SHA256` | - | required | - | Must equal the pinned sRGB2014 digest `384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a`. |
 | `NMCP_CURSOR_HMAC_KEY` | required | - | - | At least 32 bytes; secret, never logged. |
 | `NMCP_API_ADDR` | optional | - | - | `127.0.0.1:8080`; explicit host and valid port. |
 | `NMCP_LOG_LEVEL` | optional | optional | optional | `info`; one of `debug`, `info`, `warn`, `error`. |
@@ -79,8 +89,18 @@ API `GET /healthz` checks only the process handler. `GET /readyz` checks the
 database, migration currency/checksums, and the shared storage probe. The probe
 uses exclusive create, write, file sync, no-replace rename, directory sync,
 unlink, and deletion-directory sync beneath the pinned non-symlink root. Worker
-startup uses the same probe. Dependency failures return only the stable
-`unavailable` error and do not expose DSNs, paths, or SQL details.
+startup uses the same probe, verifies the pinned ICC, and completes all three
+processor capability handshakes before it can report ready or claim a transform
+job. It retains those results, loads every active profile plus each retired
+profile pinned by queued/running transform work, strictly decodes every recipe,
+and fails closed unless every reachable MIME, source mode, and output kind is
+supported. Recipe validation also fixes the quality, CRF, bit-depth, geometry,
+color, metadata, audio, and stream-selection settings accepted by the helpers.
+Startup logs identify the failed stage and may include safe profile key/version
+and reported-versus-required capability values so an operator can correct the
+deployment. They never include DSNs, configured paths, helper stderr, or SQL
+details; lower-level dependency errors remain classified rather than copied
+verbatim.
 
 For example, with `NMCP_FILE_BASE_URL=https://photos.example.ts.net/files`,
 the stored key `originals/ab/<original-id>/original.jpg` is returned as
@@ -153,12 +173,16 @@ the row immediately claimable, and records both successful and rejected
 concurrent commands in immutable audit history. Error messages stored on Jobs
 are fixed summaries; child stderr, paths, DSNs, and secrets are never stored.
 
-Generic #10 claim deliberately rejects purge. Purge first start must lock Media,
+Generic claim deliberately rejects purge. Purge first start must lock Media,
 recheck deletion/cancellation, and atomically set `started_at` with its lease;
-issue #16 adds that operation with the restore lock order. Until #11-#14 register
-a capability-checked transform executor and atomic publication path, the
-production Worker has an empty executor registry: it may reclaim expired leases
-but cannot claim or silently no-op-complete a job.
+issue #16 adds that operation with the restore lock order. The production Worker
+now registers the transform executor only after storage, ICC, all three helper
+handshakes, and the claimable-profile capability envelope pass. It then claims
+transform jobs, binds the canonical Original's size and SHA-256 to one pinned
+descriptor, skips already-successful targets on retry, dispatches each pending
+recipe to the still, animation, or video processor, and publishes each durable
+attempt file through the atomic lease-checked operation below. It also reclaims
+expired leases; it never registers purge through the generic claim path.
 
 `internal/processrunner` is the shared Linux containment layer for metadata and
 Worker tools. It accepts only a clean absolute executable plus an argument
@@ -166,11 +190,13 @@ array, replaces the environment, applies the inherited address-space limit,
 and caps stdout/stderr independently. A short-lived `/proc/self/exe` subreaper
 kills the initial process group and adopted `setsid`/double-fork descendants,
 then reaps to `ECHILD` on success, timeout, cancellation, or output overflow.
-The initial Worker contract exposes one required processor thread and safety
+The Worker contract exposes one required processor thread and safety
 timeout ceilings of 30 minutes for still/RAW, two hours for animation, and 24
 hours for video. Registered processors must translate the thread value into
 their tool-specific trusted argument array and may only shorten the family
-ceiling. Exact recipes and runtime capability checks remain #11-#13 work.
+ceiling. Runtime startup checks compare the helpers' reported decoder/output
+sets against all claimable exact recipes; production codec artifact and resource
+evidence remains the #21 release gate.
 
 ## Profile recipe boundary
 
@@ -194,9 +220,9 @@ Candidate registry rows are immutable and carry pending evidence only. A profile
 can activate only when immutable certification rows cover every required exact
 MIME/source/output kind, maximum edge, and quality/CRF range. A database
 certification is deployment compatibility metadata, not proof that a particular
-Worker process has its binary/plugin/codec; #11–#13 add startup/runtime probes
-and must refuse execution on mismatch. Migration application alone never
-certifies a capability.
+Worker process has its binary/plugin/codec. The Worker therefore performs all
+three runtime capability probes and refuses registration on any claimable recipe
+mismatch. Migration application alone never certifies a capability.
 
 ## Metadata probe boundary
 
@@ -262,6 +288,7 @@ FFprobe excludes attached pictures, still-image thumbnails, and unusable
 zero-dimension video streams. It selects a default usable stream first, then
 the largest pixel area and lowest stream index. Duration uses the positive
 container duration first with the selected-stream duration as fallback and is
-converted to milliseconds with checked decimal arithmetic. Issue #13 must use
-the persisted primary stream index rather than independently choosing another
-stream.
+converted to milliseconds with checked decimal arithmetic. Transform passes
+that persisted absolute primary-stream index to video inspect, encode, and
+independent output verification; attached pictures, timed thumbnails, and any
+other stream cannot replace it through a helper-local default selection.

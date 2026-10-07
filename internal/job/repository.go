@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strings"
 	"time"
@@ -15,6 +16,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	profiledefinition "github.com/kzkymur/no-more-cloud-photos/internal/profile"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
 )
 
 const (
@@ -31,11 +35,21 @@ type Repository struct {
 	reclaimBatch  int
 	jitter        func(time.Duration) time.Duration
 	uuid          func() (string, error)
+	fileBaseURL   string
+	checkpoint    func(context.Context, storage.Boundary, string) error
+}
+
+// TransformClaimer binds every transform claim to one validated startup
+// capability snapshot. Repository intentionally has no unrestricted Claim.
+type TransformClaimer struct {
+	repository *Repository
+	profileIDs []string
+	bound      bool
 }
 
 func NewRepository(pool *pgxpool.Pool, options Options) (*Repository, error) {
 	if pool == nil || options.LeaseDuration < 0 || options.LeaseDuration > 0 && options.LeaseDuration.Microseconds() == 0 ||
-		options.ReclaimBatch < 0 || options.ReclaimBatch > 50 {
+		options.ReclaimBatch < 0 || options.ReclaimBatch > 50 || !validFileBaseURL(options.FileBaseURL) {
 		return nil, ErrInvalid
 	}
 	if options.LeaseDuration == 0 {
@@ -50,10 +64,34 @@ func NewRepository(pool *pgxpool.Pool, options Options) (*Repository, error) {
 	if options.UUID == nil {
 		options.UUID = newUUIDv4
 	}
-	return &Repository{pool: pool, leaseDuration: options.LeaseDuration, reclaimBatch: options.ReclaimBatch, jitter: options.Jitter, uuid: options.UUID}, nil
+	return &Repository{
+		pool: pool, leaseDuration: options.LeaseDuration, reclaimBatch: options.ReclaimBatch,
+		jitter: options.Jitter, uuid: options.UUID, fileBaseURL: options.FileBaseURL, checkpoint: options.Checkpoint,
+	}, nil
 }
 
-func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, error) {
+func (r *Repository) BindTransformClaims(envelope transformcapability.Envelope) (*TransformClaimer, error) {
+	profileIDs := envelope.ProfileIDs()
+	if r == nil || !envelope.Validated() {
+		return nil, ErrInvalid
+	}
+	if profileIDs == nil {
+		profileIDs = make([]string, 0)
+	}
+	return &TransformClaimer{repository: r, profileIDs: profileIDs, bound: true}, nil
+}
+
+func (r *TransformClaimer) Claim(ctx context.Context, registeredTypes []Type) (Lease, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return Lease{}, ErrInvalid
+	}
+	return r.repository.claim(ctx, registeredTypes, r.profileIDs)
+}
+
+func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedProfileIDs []string) (Lease, error) {
+	if r == nil || allowedProfileIDs == nil {
+		return Lease{}, ErrInvalid
+	}
 	types, err := validateTypes(registeredTypes)
 	if err != nil {
 		return Lease{}, err
@@ -72,10 +110,16 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 	defer rollback(tx)
 
 	var lease Lease
+	var originalID *string
 	err = tx.QueryRow(ctx, `
 		WITH candidate AS (
 			SELECT id FROM jobs
 			WHERE status='queued' AND type=ANY($1::text[]) AND available_at<=clock_timestamp() AND attempts<max_attempts
+			  AND NOT EXISTS (
+				SELECT 1 FROM job_targets AS jt
+				WHERE jt.job_id=jobs.id AND jt.status<>'succeeded'
+				  AND NOT COALESCE(jt.profile_id=ANY($4::uuid[]),false)
+			  )
 			ORDER BY available_at,created_at,id
 			FOR UPDATE SKIP LOCKED LIMIT 1
 		)
@@ -84,8 +128,8 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 			updated_at=clock_timestamp()
 		FROM candidate WHERE j.id=candidate.id
 		RETURNING j.id::text,j.type,j.original_id::text,j.media_id_snapshot::text,j.attempts,j.max_attempts,
-			j.lease_expires_at,j.started_at,j.available_at,j.created_at`, types, token, intervalText(r.leaseDuration)).Scan(
-		&lease.ID, &lease.Type, &lease.OriginalID, &lease.MediaID, &lease.Attempts, &lease.MaxAttempts,
+			j.lease_expires_at,j.started_at,j.available_at,j.created_at`, types, token, intervalText(r.leaseDuration), allowedProfileIDs).Scan(
+		&lease.ID, &lease.Type, &originalID, &lease.MediaID, &lease.Attempts, &lease.MaxAttempts,
 		&lease.LeaseExpiresAt, &lease.StartedAt, &lease.AvailableAt, &lease.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Lease{}, ErrNoWork
@@ -94,10 +138,18 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 		return Lease{}, classifyDatabaseError(err)
 	}
 	lease.Token = token
+	lease.Original, err = loadOriginal(ctx, tx, lease.Type, originalID, lease.MediaID)
+	if err != nil {
+		return Lease{}, err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='pending',error_code=NULL,error_message=NULL,updated_at=clock_timestamp() WHERE job_id=$1 AND status='failed'`, lease.ID); err != nil {
 		return Lease{}, classifyDatabaseError(err)
 	}
 	lease.Targets, err = loadTargets(ctx, tx, lease.ID)
+	if err != nil {
+		return Lease{}, err
+	}
+	lease.GeneratedBytes, err = loadGeneratedBytes(ctx, tx, lease.ID)
 	if err != nil {
 		return Lease{}, err
 	}
@@ -106,6 +158,98 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 	}
 	normalizeLease(&lease)
 	return lease, nil
+}
+
+func (r *TransformClaimer) Heartbeat(ctx context.Context, jobID, token string) (time.Time, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return time.Time{}, ErrInvalid
+	}
+	return r.repository.Heartbeat(ctx, jobID, token)
+}
+
+func (r *TransformClaimer) FinishAttempt(ctx context.Context, jobID, token string, code FailureCode) error {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return ErrInvalid
+	}
+	return r.repository.FinishAttempt(ctx, jobID, token, code)
+}
+
+func (r *TransformClaimer) ReclaimExpired(ctx context.Context) (int, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return 0, ErrInvalid
+	}
+	return r.repository.ReclaimExpired(ctx)
+}
+
+func (r *TransformClaimer) BeginTarget(ctx context.Context, jobID, token, targetID string) error {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return ErrInvalid
+	}
+	return r.repository.BeginTarget(ctx, jobID, token, targetID)
+}
+
+func (r *TransformClaimer) MarkTargetFailed(ctx context.Context, jobID, token, targetID string, code FailureCode) error {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return ErrInvalid
+	}
+	return r.repository.MarkTargetFailed(ctx, jobID, token, targetID, code)
+}
+
+func (r *TransformClaimer) PublishRendition(ctx context.Context, candidate Rendition) (Publication, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return Publication{}, ErrInvalid
+	}
+	return r.repository.PublishRendition(ctx, candidate)
+}
+
+// ClaimableTransformProfiles returns the exact profile definitions that this
+// repository may expose through a transform claim. Active profiles are joined
+// by retired profiles already pinned by queued or running work.
+func (r *Repository) ClaimableTransformProfiles(ctx context.Context) ([]profiledefinition.Definition, error) {
+	if r == nil || r.pool == nil || ctx == nil {
+		return nil, ErrInvalid
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, classifyDatabaseError(err)
+	}
+	defer rollback(tx)
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT p.id::text,p.key,p.version,p.processor,p.parameters_schema_version,p.input_mime_types,p.parameters
+		FROM profiles AS p
+		WHERE p.status='active' OR EXISTS (
+			SELECT 1 FROM job_targets AS jt JOIN jobs AS j ON j.id=jt.job_id
+			WHERE jt.profile_id=p.id AND jt.status<>'succeeded'
+			  AND j.type='transform' AND j.status IN ('queued','running')
+		)
+		ORDER BY p.key,p.version,p.id::text`)
+	if err != nil {
+		return nil, classifyDatabaseError(err)
+	}
+	definitions := make([]profiledefinition.Definition, 0)
+	for rows.Next() {
+		var definition profiledefinition.Definition
+		if err := rows.Scan(&definition.ID, &definition.Key, &definition.Version, &definition.Processor,
+			&definition.ParametersSchemaVersion, &definition.InputMIMETypes, &definition.Parameters); err != nil {
+			rows.Close()
+			return nil, classifyDatabaseError(err)
+		}
+		definition.Parameters = append(json.RawMessage(nil), definition.Parameters...)
+		if err := profiledefinition.ValidateDraft(definition); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("validate claimable profile %q version %d: %w", definition.Key, definition.Version, ErrInvariant)
+		}
+		definitions = append(definitions, definition)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, classifyDatabaseError(err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, classifyDatabaseError(err)
+	}
+	return definitions, nil
 }
 
 func (r *Repository) Heartbeat(ctx context.Context, jobID, token string) (time.Time, error) {
@@ -392,6 +536,93 @@ func loadTargets(ctx context.Context, tx pgx.Tx, jobID string) ([]Target, error)
 		return nil, classifyDatabaseError(err)
 	}
 	return targets, nil
+}
+
+func loadGeneratedBytes(ctx context.Context, tx pgx.Tx, jobID string) (int64, error) {
+	rows, err := tx.Query(ctx, `SELECT jt.status,r.size_bytes
+		FROM job_targets jt LEFT JOIN renditions r ON r.job_target_id=jt.id
+		WHERE jt.job_id=$1 ORDER BY jt.id`, jobID)
+	if err != nil {
+		return 0, classifyDatabaseError(err)
+	}
+	defer rows.Close()
+	var total int64
+	for rows.Next() {
+		var status TargetStatus
+		var size *int64
+		if err := rows.Scan(&status, &size); err != nil {
+			return 0, classifyDatabaseError(err)
+		}
+		if status == TargetSucceeded {
+			if size == nil || *size < 0 || total > math.MaxInt64-*size {
+				return 0, ErrInvariant
+			}
+			total += *size
+		} else if size != nil {
+			return 0, ErrInvariant
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, classifyDatabaseError(err)
+	}
+	return total, nil
+}
+
+func loadOriginal(ctx context.Context, tx pgx.Tx, jobType Type, originalID *string, mediaID string) (*Original, error) {
+	if jobType == TypePurge {
+		if originalID != nil {
+			return nil, ErrInvariant
+		}
+		return nil, nil
+	}
+	if jobType != TypeTransform || originalID == nil {
+		return nil, ErrInvariant
+	}
+	var original Original
+	var mediaMIME string
+	var sourceMetadata []byte
+	err := tx.QueryRow(ctx, `SELECT o.id::text,o.media_id::text,o.relative_path,o.mime_type,o.size_bytes,o.sha256,
+		o.width,o.height,o.duration_ms,m.media_type,m.source_metadata
+		FROM originals o JOIN media m ON m.id=o.media_id WHERE o.id=$1`, *originalID).Scan(
+		&original.ID, &original.MediaID, &original.RelativePath, &original.MIMEType, &original.SizeBytes,
+		&original.SHA256, &original.Width, &original.Height, &original.DurationMS, &mediaMIME, &sourceMetadata)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrInvariant
+	}
+	if err != nil {
+		return nil, classifyDatabaseError(err)
+	}
+	if original.ID != *originalID || original.MediaID != mediaID || original.MIMEType != mediaMIME ||
+		original.SizeBytes < 0 || !validSHA256(original.SHA256) || (original.Width == nil) != (original.Height == nil) ||
+		original.Width != nil && (*original.Width <= 0 || *original.Height <= 0) || original.DurationMS != nil && *original.DurationMS < 0 {
+		return nil, ErrInvariant
+	}
+	var metadata struct {
+		PrimaryStream *int `json:"primary_stream"`
+	}
+	if json.Unmarshal(sourceMetadata, &metadata) != nil ||
+		(oneOfVideoMIME(original.MIMEType) && (metadata.PrimaryStream == nil || *metadata.PrimaryStream < 0)) ||
+		(!oneOfVideoMIME(original.MIMEType) && metadata.PrimaryStream != nil) {
+		return nil, ErrInvariant
+	}
+	original.PrimaryVideoStreamIndex = metadata.PrimaryStream
+	key, err := storage.ParseOriginalKey(original.RelativePath)
+	if err != nil || key.OriginalID().String() != original.ID {
+		return nil, ErrInvariant
+	}
+	extension, err := storage.OriginalExtensionForMIME(original.MIMEType)
+	if err != nil {
+		return nil, ErrInvariant
+	}
+	expectedKey, err := storage.NewOriginalKey(key.OriginalID(), extension)
+	if err != nil || expectedKey.String() != original.RelativePath {
+		return nil, ErrInvariant
+	}
+	return &original, nil
+}
+
+func oneOfVideoMIME(value string) bool {
+	return value == "video/mp4" || value == "video/quicktime"
 }
 
 func targetStateError(ctx context.Context, tx pgx.Tx, jobID, targetID string) error {

@@ -183,7 +183,7 @@ func TestFrameFactsRuntimeArithmeticOverflow(t *testing.T) {
 		frames := runtimeFrames{width: 1, height: 1, count: 1, duration: math.MaxInt64}
 		runner := &runtimeLimitRunner{metadata: runtimeProbe(1, 1, math.MaxInt64, strconv.FormatInt(math.MaxInt64, 10)+"/1", 1, runtimeAudio{}), frames: frames}
 		e := engine{ffprobe: "/p/ffprobe", run: runner}
-		if _, _, err := e.inspect("input", "video/mp4", limit); !isCode(err, "resource_limit") {
+		if _, _, err := e.inspect("input", "video/mp4", nil, limit); !isCode(err, "resource_limit") {
 			t.Fatalf("duration scaling overflow error = %v, want resource_limit", err)
 		}
 	})
@@ -252,7 +252,7 @@ func requireRuntimeInspect(t *testing.T, metadata []byte, frames runtimeFrames, 
 	t.Helper()
 	runner := &runtimeLimitRunner{metadata: metadata, frames: frames}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
-	got, _, err := e.inspect("input", "video/mp4", limit)
+	got, _, err := e.inspect("input", "video/mp4", nil, limit)
 	if err != nil {
 		t.Fatalf("inspect rejected boundary corpus: %v", err)
 	}
@@ -263,7 +263,7 @@ func requireRuntimeInspectError(t *testing.T, metadata []byte, frames runtimeFra
 	t.Helper()
 	runner := &runtimeLimitRunner{metadata: metadata, frames: frames}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
-	if _, _, err := e.inspect("input", "video/mp4", limit); !isCode(err, code) {
+	if _, _, err := e.inspect("input", "video/mp4", nil, limit); !isCode(err, code) {
 		t.Fatalf("inspect error = %v, want %s", err, code)
 	}
 }

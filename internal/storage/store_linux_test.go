@@ -703,6 +703,145 @@ func TestValidationHashRetriesInterruptedRead(t *testing.T) {
 	}
 }
 
+func TestOpenOriginalPinnedValidatesAndProvidesIndependentReaders(t *testing.T) {
+	store := openTestStore(t, t.TempDir(), Options{})
+	key := testOriginalKey(t)
+	payload := []byte("immutable original bytes")
+	digest := sha256.Sum256(payload)
+	publishTestObject(t, store, key, payload)
+
+	object, err := store.OpenOriginalPinned(context.Background(), key, Validation{ExpectedSize: int64(len(payload)), ExpectedSHA256: &digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Close()
+	for index := range 2 {
+		if err := object.UseReadOnlyFile(func(file *os.File) error {
+			contents, err := io.ReadAll(file)
+			if err != nil {
+				return err
+			}
+			if !reflect.DeepEqual(contents, payload) {
+				t.Fatalf("reader %d bytes = %q", index, contents)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	wrong := sha256.Sum256([]byte("wrong"))
+	for _, validation := range []Validation{
+		{ExpectedSize: int64(len(payload) + 1), ExpectedSHA256: &digest},
+		{ExpectedSize: int64(len(payload)), ExpectedSHA256: &wrong},
+	} {
+		if _, err := store.OpenOriginalPinned(context.Background(), key, validation); !errors.Is(err, ErrValidation) {
+			t.Fatalf("OpenOriginalPinned(%+v) error = %v", validation, err)
+		}
+	}
+}
+
+func TestOpenOriginalPinnedHashIsBoundedCancelableAndFailsClosedOnReadAnomalies(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		configure  func(*Store, context.CancelFunc)
+		want       error
+		wantReads  int
+		maxReadSet bool
+	}{
+		{
+			name: "cancellation during large hash",
+			configure: func(store *Store, cancel context.CancelFunc) {
+				originalRead := store.ops.read
+				store.ops.read = func(fd int, value []byte) (int, error) {
+					count, err := originalRead(fd, value)
+					if count > 0 {
+						cancel()
+					}
+					return count, err
+				}
+			},
+			want: context.Canceled, wantReads: 1, maxReadSet: true,
+		},
+		{
+			name: "zero progress before expected size",
+			configure: func(store *Store, _ context.CancelFunc) {
+				store.ops.read = func(int, []byte) (int, error) { return 0, nil }
+			},
+			want: ErrValidation, wantReads: 1,
+		},
+		{
+			name: "invalid oversized read count",
+			configure: func(store *Store, _ context.CancelFunc) {
+				store.ops.read = func(_ int, value []byte) (int, error) { return len(value) + 1, nil }
+			},
+			want: ErrValidation, wantReads: 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := openTestStore(t, t.TempDir(), Options{})
+			key := testOriginalKey(t)
+			payload := make([]byte, 1024*1024)
+			digest := sha256.Sum256(payload)
+			publishTestObject(t, store, key, payload)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			readCalls, largestRead := 0, 0
+			test.configure(store, cancel)
+			configuredRead := store.ops.read
+			store.ops.read = func(fd int, value []byte) (int, error) {
+				readCalls++
+				if len(value) > largestRead {
+					largestRead = len(value)
+				}
+				return configuredRead(fd, value)
+			}
+			if _, err := store.OpenOriginalPinned(ctx, key, Validation{ExpectedSize: int64(len(payload)), ExpectedSHA256: &digest}); !errors.Is(err, test.want) {
+				t.Fatalf("OpenOriginalPinned() error = %v, want %v", err, test.want)
+			}
+			if readCalls != test.wantReads {
+				t.Fatalf("read calls = %d, want %d", readCalls, test.wantReads)
+			}
+			if test.maxReadSet && largestRead != 128*1024 {
+				t.Fatalf("largest streaming buffer = %d, want %d", largestRead, 128*1024)
+			}
+		})
+	}
+}
+
+func TestPinnedObjectVerifyIsCancelableAndBounded(t *testing.T) {
+	store := openTestStore(t, t.TempDir(), Options{})
+	key := testOriginalKey(t)
+	payload := make([]byte, 1024*1024)
+	digest := sha256.Sum256(payload)
+	publishTestObject(t, store, key, payload)
+	object, err := store.OpenOriginalPinned(context.Background(), key, Validation{ExpectedSize: int64(len(payload)), ExpectedSHA256: &digest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer object.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	originalRead := store.ops.read
+	readCalls, largestRead := 0, 0
+	store.ops.read = func(fd int, value []byte) (int, error) {
+		readCalls++
+		if len(value) > largestRead {
+			largestRead = len(value)
+		}
+		count, err := originalRead(fd, value)
+		cancel()
+		return count, err
+	}
+	if err := object.Verify(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Verify() error = %v, want context.Canceled", err)
+	}
+	if readCalls != 1 || largestRead != 128*1024 {
+		t.Fatalf("Verify() reads = %d, largest = %d", readCalls, largestRead)
+	}
+}
+
 func TestTrustedWriterCanUseDuplicateDescriptor(t *testing.T) {
 	store := openTestStore(t, t.TempDir(), Options{})
 	temporary, err := store.BeginRendition(context.Background(), testRenditionKey(t), testAttempt(t))

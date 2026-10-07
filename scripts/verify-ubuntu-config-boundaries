@@ -22,6 +22,13 @@ EOF
   cat > "$work/worker.env" <<'EOF'
 NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable
 NMCP_STORAGE_ROOT=/var/lib/nmcp/media
+NMCP_FILE_BASE_URL=https://host.example.ts.net:9443/files/
+NMCP_STILL_HELPER_PATH=/opt/nmcp/current/bin/nmcp-still-helper
+NMCP_ANIMATION_HELPER_PATH=/opt/nmcp/current/bin/nmcp-animation-helper
+NMCP_VIDEO_HELPER_PATH=/opt/nmcp/current/bin/nmcp-video-helper
+NMCP_PRLIMIT_PATH=/usr/bin/prlimit
+NMCP_SRGB_ICC_PATH=/opt/nmcp/current/share/sRGB2014.icc
+NMCP_SRGB_ICC_SHA256=384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
 NMCP_LOG_LEVEL=info
 NMCP_SHUTDOWN_TIMEOUT=30s
 EOF
@@ -48,6 +55,24 @@ import pathlib, sys
 path = pathlib.Path(sys.argv[1]); path.write_text(path.read_text().replace(":9443/files/", ":9555/files/"))
 PY
 if "${validate[@]}" >/dev/null 2>&1; then printf 'mismatched File Server URL was accepted\n' >&2; exit 1; fi
+
+for worker_override in \
+  'NMCP_STILL_HELPER_PATH=/usr/local/bin/nmcp-still-helper' \
+  'NMCP_ANIMATION_HELPER_PATH=/usr/local/bin/nmcp-animation-helper' \
+  'NMCP_VIDEO_HELPER_PATH=/usr/local/bin/nmcp-video-helper' \
+  'NMCP_PRLIMIT_PATH=/usr/local/bin/prlimit' \
+  'NMCP_SRGB_ICC_PATH=/usr/share/color/sRGB2014.icc' \
+  'NMCP_SRGB_ICC_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; do
+  write_valid
+  /usr/bin/python3 - "$work/worker.env" "$worker_override" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+key, replacement = sys.argv[2].split("=", 1)
+lines = path.read_text().splitlines()
+path.write_text("\n".join(replacement if line.startswith(key + "=") else line for line in lines) + "\n")
+PY
+  if "${validate[@]}" >/dev/null 2>&1; then printf 'unreviewed Worker runtime value was accepted: %s\n' "$worker_override" >&2; exit 1; fi
+done
 
 for unsafe_url in \
   'postgres://nmcp:secret@127.0.0.1:5432/nmcp?host=203.0.113.10' \

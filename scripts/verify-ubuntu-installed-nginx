@@ -162,7 +162,14 @@ guard_input=/root/nmcp-host-reinstall.$$
   'NMCP_SHUTDOWN_TIMEOUT=30s' > "$guard_input/api.env"
 /usr/bin/printf '%s\n' \
   'NMCP_DATABASE_URL=postgres://nmcp:secret@127.0.0.1:5432/nmcp?sslmode=disable' \
-  'NMCP_STORAGE_ROOT=/var/lib/nmcp/media' 'NMCP_LOG_LEVEL=info' \
+  'NMCP_STORAGE_ROOT=/var/lib/nmcp/media' \
+  'NMCP_FILE_BASE_URL=https://host.example.ts.net:19443/files/' 'NMCP_LOG_LEVEL=info' \
+  'NMCP_STILL_HELPER_PATH=/opt/nmcp/current/bin/nmcp-still-helper' \
+  'NMCP_ANIMATION_HELPER_PATH=/opt/nmcp/current/bin/nmcp-animation-helper' \
+  'NMCP_VIDEO_HELPER_PATH=/opt/nmcp/current/bin/nmcp-video-helper' \
+  'NMCP_PRLIMIT_PATH=/usr/bin/prlimit' \
+  'NMCP_SRGB_ICC_PATH=/opt/nmcp/current/share/sRGB2014.icc' \
+  'NMCP_SRGB_ICC_SHA256=384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a' \
   'NMCP_SHUTDOWN_TIMEOUT=30s' > "$guard_input/worker.env"
 /usr/bin/chown root:root "$guard_input"/*.env
 /usr/bin/chmod 0600 "$guard_input"/*.env

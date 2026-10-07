@@ -76,6 +76,16 @@ func TestFileBaseURLIsNormalizedAndUnambiguous(t *testing.T) {
 }
 
 func TestLoadWorkerDefaultsAndValid(t *testing.T) {
+	defaults := validWorkerEnv()
+	overrides := validWorkerEnv()
+	overrides[logLevelEnv] = "warn"
+	overrides[shutdownTimeoutEnv] = "2m"
+	wantRequired := WorkerConfig{
+		DatabaseURL: "postgres://localhost/photos", StorageRoot: "/data", FileBaseURL: "https://files.example.test/files/",
+		StillHelperPath: "/usr/local/bin/nmcp-still-helper", AnimationHelperPath: "/usr/local/bin/nmcp-animation-helper",
+		VideoHelperPath: "/usr/local/bin/nmcp-video-helper", PrlimitPath: "/usr/bin/prlimit",
+		SRGBICCPath: "/usr/share/color/icc/sRGB.icc", SRGBICCSHA256: RequiredSRGBICCSHA256,
+	}
 	tests := []struct {
 		name string
 		vars map[string]string
@@ -83,13 +93,13 @@ func TestLoadWorkerDefaultsAndValid(t *testing.T) {
 	}{
 		{
 			name: "defaults",
-			vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data"},
-			want: WorkerConfig{DatabaseURL: "postgres://localhost/photos", StorageRoot: "/data", LogLevel: "info", ShutdownTimeout: 30 * time.Second},
+			vars: defaults,
+			want: withWorkerOptionals(wantRequired, "info", 30*time.Second),
 		},
 		{
 			name: "valid overrides",
-			vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", logLevelEnv: "warn", shutdownTimeoutEnv: "2m"},
-			want: WorkerConfig{DatabaseURL: "postgres://localhost/photos", StorageRoot: "/data", LogLevel: "warn", ShutdownTimeout: 2 * time.Minute},
+			vars: overrides,
+			want: withWorkerOptionals(wantRequired, "warn", 2*time.Minute),
 		},
 	}
 	for _, tt := range tests {
@@ -143,6 +153,9 @@ func TestLoadFromProcessEnvironment(t *testing.T) {
 	t.Setenv(apiAddrEnv, "127.0.0.1:8081")
 	t.Setenv(logLevelEnv, "warn")
 	t.Setenv(shutdownTimeoutEnv, "20s")
+	for key, value := range validWorkerEnv() {
+		t.Setenv(key, value)
+	}
 
 	if _, err := LoadAPI(); err != nil {
 		t.Errorf("LoadAPI() error = %v", err)
@@ -160,6 +173,7 @@ func TestMissingRequiredConfiguration(t *testing.T) {
 		databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files",
 		cursorHMACKeyEnv: strings.Repeat("x", 32),
 	}
+	workerBase := validWorkerEnv()
 	tests := []struct {
 		name string
 		load func(map[string]string) error
@@ -170,8 +184,15 @@ func TestMissingRequiredConfiguration(t *testing.T) {
 		{name: "api storage", load: apiError, base: apiBase, key: storageRootEnv},
 		{name: "api file URL", load: apiError, base: apiBase, key: fileBaseURLEnv},
 		{name: "api cursor key", load: apiError, base: apiBase, key: cursorHMACKeyEnv},
-		{name: "worker database", load: workerError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data"}, key: databaseURLEnv},
-		{name: "worker storage", load: workerError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data"}, key: storageRootEnv},
+		{name: "worker database", load: workerError, base: workerBase, key: databaseURLEnv},
+		{name: "worker storage", load: workerError, base: workerBase, key: storageRootEnv},
+		{name: "worker file URL", load: workerError, base: workerBase, key: fileBaseURLEnv},
+		{name: "worker still helper", load: workerError, base: workerBase, key: stillHelperPathEnv},
+		{name: "worker animation helper", load: workerError, base: workerBase, key: animationHelperPathEnv},
+		{name: "worker video helper", load: workerError, base: workerBase, key: videoHelperPathEnv},
+		{name: "worker prlimit", load: workerError, base: workerBase, key: prlimitPathEnv},
+		{name: "worker sRGB ICC", load: workerError, base: workerBase, key: srgbICCPathEnv},
+		{name: "worker sRGB digest", load: workerError, base: workerBase, key: srgbICCSHA256Env},
 		{name: "admin database", load: adminError, base: map[string]string{databaseURLEnv: "postgres://localhost/photos"}, key: databaseURLEnv},
 	}
 	for _, tt := range tests {
@@ -231,14 +252,23 @@ func TestInvalidAPIConfiguration(t *testing.T) {
 }
 
 func TestInvalidWorkerAndAdminCommonConfiguration(t *testing.T) {
+	workerRelativeRoot := validWorkerEnv()
+	workerRelativeRoot[storageRootEnv] = "data"
+	workerBadURL := validWorkerEnv()
+	workerBadURL[fileBaseURLEnv] = "http://files.example.test/files"
+	workerBadLevel := validWorkerEnv()
+	workerBadLevel[logLevelEnv] = "verbose"
+	workerBadDuration := validWorkerEnv()
+	workerBadDuration[shutdownTimeoutEnv] = "0s"
 	tests := []struct {
 		name string
 		load func(map[string]string) error
 		vars map[string]string
 	}{
-		{name: "worker relative root", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "data"}},
-		{name: "worker bad level", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", logLevelEnv: "verbose"}},
-		{name: "worker bad duration", load: workerError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", shutdownTimeoutEnv: "0s"}},
+		{name: "worker relative root", load: workerError, vars: workerRelativeRoot},
+		{name: "worker bad file URL", load: workerError, vars: workerBadURL},
+		{name: "worker bad level", load: workerError, vars: workerBadLevel},
+		{name: "worker bad duration", load: workerError, vars: workerBadDuration},
 		{name: "admin bad level", load: adminError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", logLevelEnv: "verbose"}},
 		{name: "admin bad duration", load: adminError, vars: map[string]string{databaseURLEnv: "postgres://localhost/photos", shutdownTimeoutEnv: "6m"}},
 		{name: "nil reader API", load: func(map[string]string) error { _, err := LoadAPIFrom(nil); return err }},
@@ -249,6 +279,33 @@ func TestInvalidWorkerAndAdminCommonConfiguration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := tt.load(tt.vars); err == nil {
 				t.Fatal("load error = nil")
+			}
+		})
+	}
+}
+
+func TestInvalidWorkerProcessorConfiguration(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "relative still helper", key: stillHelperPathEnv, value: "bin/still-helper"},
+		{name: "unclean animation helper", key: animationHelperPathEnv, value: "/opt/nmcp/../animation-helper"},
+		{name: "relative video helper", key: videoHelperPathEnv, value: "video-helper"},
+		{name: "unclean prlimit", key: prlimitPathEnv, value: "/usr/./bin/prlimit"},
+		{name: "relative sRGB ICC", key: srgbICCPathEnv, value: "profiles/sRGB.icc"},
+		{name: "unclean sRGB ICC", key: srgbICCPathEnv, value: "/profiles/../sRGB.icc"},
+		{name: "uppercase digest", key: srgbICCSHA256Env, value: strings.Repeat("A", 64)},
+		{name: "short digest", key: srgbICCSHA256Env, value: strings.Repeat("a", 63)},
+		{name: "non-hex digest", key: srgbICCSHA256Env, value: strings.Repeat("g", 64)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := validWorkerEnv()
+			vars[tt.key] = tt.value
+			if _, err := LoadWorkerFrom(env(vars)); err == nil {
+				t.Fatal("LoadWorkerFrom() error = nil")
 			}
 		})
 	}
@@ -277,11 +334,15 @@ func TestErrorsAndLogAttrsRedactSecretsAndPaths(t *testing.T) {
 	text := attrsText(cfg.LogAttrs())
 	assertOmits(t, text, databaseSecret, storagePath, cursorSecret, "files.example.test")
 
-	worker, err := LoadWorkerFrom(env(map[string]string{databaseURLEnv: databaseSecret, storageRootEnv: storagePath}))
+	workerVars := validWorkerEnv()
+	workerVars[databaseURLEnv] = databaseSecret
+	workerVars[storageRootEnv] = storagePath
+	worker, err := LoadWorkerFrom(env(workerVars))
 	if err != nil {
 		t.Fatalf("LoadWorkerFrom() error = %v", err)
 	}
-	assertOmits(t, attrsText(worker.LogAttrs()), databaseSecret, storagePath)
+	assertOmits(t, attrsText(worker.LogAttrs()), databaseSecret, storagePath, worker.FileBaseURL, worker.StillHelperPath,
+		worker.AnimationHelperPath, worker.VideoHelperPath, worker.PrlimitPath, worker.SRGBICCPath, worker.SRGBICCSHA256)
 
 	admin, err := LoadAdminFrom(env(map[string]string{databaseURLEnv: databaseSecret}))
 	if err != nil {
@@ -306,6 +367,21 @@ func TestInvalidDatabaseDSNErrorIsRedacted(t *testing.T) {
 
 func env(values map[string]string) Getenv {
 	return func(key string) string { return values[key] }
+}
+
+func validWorkerEnv() map[string]string {
+	return map[string]string{
+		databaseURLEnv: "postgres://localhost/photos", storageRootEnv: "/data", fileBaseURLEnv: "https://files.example.test/files",
+		stillHelperPathEnv: "/usr/local/bin/nmcp-still-helper", animationHelperPathEnv: "/usr/local/bin/nmcp-animation-helper",
+		videoHelperPathEnv: "/usr/local/bin/nmcp-video-helper", prlimitPathEnv: "/usr/bin/prlimit",
+		srgbICCPathEnv: "/usr/share/color/icc/sRGB.icc", srgbICCSHA256Env: RequiredSRGBICCSHA256,
+	}
+}
+
+func withWorkerOptionals(config WorkerConfig, level string, timeout time.Duration) WorkerConfig {
+	config.LogLevel = level
+	config.ShutdownTimeout = timeout
+	return config
 }
 
 func clone(values map[string]string) map[string]string {

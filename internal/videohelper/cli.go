@@ -92,7 +92,7 @@ func (e *engine) execute(args []string, out io.Writer) error {
 	case "capabilities":
 		return e.capabilities(r, out)
 	case "inspect":
-		i, _, err := e.inspect(r.input, r.mime, r.limits)
+		i, _, err := e.inspect(r.input, r.mime, nil, r.limits)
 		if err != nil {
 			return err
 		}
@@ -127,9 +127,9 @@ func parseRequest(a []string) (request, error) {
 	case "inspect":
 		names = append([]string{"--protocol", "--input", "--input-mime"}, limitNames...)
 	case "transform":
-		names = append([]string{"--protocol", "--input", "--output", "--input-mime", "--output-kind", "--max-long-edge", "--quality", "--bit-depth", "--threads", "--srgb-icc", "--generated-bytes-before"}, limitNames...)
+		names = append([]string{"--protocol", "--input", "--output", "--input-mime", "--output-kind", "--max-long-edge", "--quality", "--bit-depth", "--threads", "--srgb-icc", "--generated-bytes-before", "--expected-video-stream-index"}, limitNames...)
 	case "verify-output":
-		names = append([]string{"--protocol", "--source", "--output", "--source-mime", "--output-kind"}, limitNames...)
+		names = append([]string{"--protocol", "--source", "--output", "--source-mime", "--output-kind", "--expected-video-stream-index"}, limitNames...)
 	default:
 		return request{}, fail("policy_violation")
 	}
@@ -184,6 +184,13 @@ func parseRequest(a []string) (request, error) {
 		if r.bitDepth, err = decimalInt(values["--bit-depth"]); err != nil || r.kind == "mp4-av1" && r.bitDepth != 10 || r.kind == "first-frame-avif" && r.bitDepth != 8 {
 			return request{}, fail("policy_violation")
 		}
+	}
+	if r.command == "transform" || r.command == "verify-output" {
+		expected, parseErr := decimalInt(values["--expected-video-stream-index"])
+		if parseErr != nil || expected < 0 {
+			return request{}, fail("policy_violation")
+		}
+		r.expectedVideoStreamIndex = &expected
 	}
 	if r.command != "capabilities" {
 		if err := parseLimits(values, &r.limits); err != nil {

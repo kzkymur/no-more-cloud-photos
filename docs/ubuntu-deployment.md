@@ -6,10 +6,17 @@ certificates are never promoted to production defaults.
 
 ## Supported and blocked scope
 
-The shipped units run PostgreSQL, migration, Core API, the current Core Worker,
-and Nginx. The worker currently performs lease reclamation only. It does not
-run transform jobs or `nmcp-still-helper` until issue #14 connects that runtime
-interface.
+The shipped units run PostgreSQL, migration, Core API, the Core Worker, and
+Nginx. Before it reports ready or claims transform work, the Worker verifies
+the configured pinned ICC and the still, animation, and video helper capability
+contracts. It then compares the retained results with all active profiles and
+retired profiles pinned by queued/running transform work and registers the real
+transform executor only when every exact MIME/recipe/output branch is supported.
+Claimed work reads a size/hash-verified pinned Original descriptor, preserves
+successful targets across retry, and atomically publishes each durable rendition
+under the live lease. The release artifact must provide those trusted paths;
+full Ubuntu native-library closure and rollback evidence remains an issue #21
+release gate.
 
 No application maintenance, backup, restore, or cleanup service/timer is installed. Issue
 #19 has not yet defined the scheduled due/no-op command, exit codes, environment
@@ -66,8 +73,11 @@ credential directory. Nginx receives only `CAP_NET_BIND_SERVICE` for low ports.
 4. Enroll the host in the intended Tailnet and apply the approved Tailscale ACL.
    Obtain a certificate for the concrete Tailnet hostname. Do **not** enable
    Funnel. Do not copy validation self-signed certificates.
-5. Build or obtain a reviewed release directory with `MANIFEST.sha256` and the
-   three currently wired Go binaries (`core-api`, `core-worker`, `nmcp-admin`).
+5. Build or obtain a reviewed release directory with `MANIFEST.sha256`, the
+   three Go binaries (`core-api`, `core-worker`, `nmcp-admin`), all three media
+   helpers, their pinned native closure, and `share/sRGB2014.icc`. Issue #21 owns
+   the production artifact composition and rollback evidence; do not infer that
+   closure from the validation image alone.
 
 ## Configuration and install
 

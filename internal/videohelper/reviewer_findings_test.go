@@ -3,6 +3,7 @@
 package videohelper
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"math"
@@ -17,7 +18,7 @@ func TestSourceDecodeAndTransformFailFastOnDecodeErrors(t *testing.T) {
 	frames := frameJSON(0, 320, 180, frameTiming{0, 40}, frameTiming{40, 40})
 	runner := &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}}
 	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
-	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); err != nil {
+	if _, _, err := e.inspect("input", "video/mp4", nil, maxLimits()); err != nil {
 		t.Fatal(err)
 	}
 	if !containsSequence(runner.lastStream, "-err_detect", "explode") || !containsSequence(runner.lastFFmpeg, "-v", "error", "-xerror") {
@@ -28,7 +29,7 @@ func TestSourceDecodeAndTransformFailFastOnDecodeErrors(t *testing.T) {
 	output := writeTemp(t, "")
 	runner = &fakeRunner{runs: [][]byte{probeJSON("h264", "yuv420p", 320, 180, false)}, streams: []string{frames}, writeOutput: []byte("mp4")}
 	e = engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
-	r := request{input: input, output: output, mime: "video/mp4", kind: "mp4-av1", icc: writeTemp(t, "icc"), maxLongEdge: 1920, bitDepth: 10, limits: maxLimits()}
+	r := request{input: input, output: output, mime: "video/mp4", kind: "mp4-av1", icc: writeTemp(t, "icc"), maxLongEdge: 1920, bitDepth: 10, expectedVideoStreamIndex: intPointer(0), limits: maxLimits()}
 	if err := e.transform(r, io.Discard); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +64,7 @@ func TestTransformNeutralizesExactSelectedStreamOrientation(t *testing.T) {
 			frames := frameJSON(3, 4, 6, frameTiming{0, 40}, frameTiming{40, 40})
 			runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{frames}, writeOutput: []byte("mp4")}
 			e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
-			r := request{input: writeTemp(t, "input"), output: writeTemp(t, ""), mime: "video/mp4", kind: "mp4-av1", icc: writeTemp(t, "icc"), maxLongEdge: 1920, bitDepth: 10, limits: maxLimits()}
+			r := request{input: writeTemp(t, "input"), output: writeTemp(t, ""), mime: "video/mp4", kind: "mp4-av1", icc: writeTemp(t, "icc"), maxLongEdge: 1920, bitDepth: 10, expectedVideoStreamIndex: intPointer(3), limits: maxLimits()}
 			if err := e.transform(r, io.Discard); err != nil {
 				t.Fatal(err)
 			}
@@ -81,13 +82,101 @@ func TestTransformNeutralizesExactSelectedStreamOrientation(t *testing.T) {
 	}
 }
 
+func TestExpectedAbsoluteStreamDrivesTransformAndRejectsInvalidTargets(t *testing.T) {
+	metadata := absoluteSelectionProbeJSON()
+	frames := frameJSON(2, 80, 60, frameTiming{0, 40}, frameTiming{40, 40})
+	runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{frames}, writeOutput: []byte("mp4")}
+	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
+	r := request{input: writeTemp(t, "input"), output: writeTemp(t, ""), mime: "video/mp4", kind: "mp4-av1", icc: writeTemp(t, "icc"), maxLongEdge: 1920, bitDepth: 10, expectedVideoStreamIndex: intPointer(2), limits: maxLimits()}
+	var response bytes.Buffer
+	if err := e.transform(r, &response); err != nil {
+		t.Fatal(err)
+	}
+	if !containsSequence(runner.streamCalls[0], "-select_streams", "2") || !containsSequence(runner.ffmpegCalls[0], "-map", "0:2") || !containsSequence(runner.lastFFmpeg, "-map", "0:2") {
+		t.Fatalf("selected stream was not used exclusively: streams=%q ffmpeg=%q", runner.streamCalls, runner.ffmpegCalls)
+	}
+	var envelope struct {
+		Result struct {
+			Width  int        `json:"width"`
+			Height int        `json:"height"`
+			Source inspection `json:"source"`
+			Audit  audit      `json:"audit"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Bytes(), &envelope); err != nil || envelope.Result.Width != 80 || envelope.Result.Height != 60 || envelope.Result.Source.VideoStreamIndex != 2 || envelope.Result.Audit.SelectedVideoStream != 2 || envelope.Result.Audit.StreamSelection != "expected-absolute-index" {
+		t.Fatalf("transform response = %s, %v", response.Bytes(), err)
+	}
+
+	for _, test := range []struct {
+		name  string
+		index int
+	}{
+		{"missing", 9},
+		{"audio", 1},
+		{"attached picture", 3},
+		{"timed thumbnail", 4},
+		{"negative", -1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testMetadata := metadata
+			if test.name == "audio" {
+				var document map[string]interface{}
+				_ = json.Unmarshal(metadata, &document)
+				document["streams"].([]interface{})[1] = map[string]interface{}{"index": 1, "codec_name": "aac", "codec_type": "audio", "channels": 2, "channel_layout": "stereo", "sample_rate": "48000"}
+				testMetadata, _ = json.Marshal(document)
+			}
+			runner := &fakeRunner{runs: [][]byte{testMetadata}}
+			e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
+			if _, _, err := e.inspect("input", "video/mp4", intPointer(test.index), maxLimits()); !isCode(err, "unsupported_input") {
+				t.Fatalf("index %d error = %v", test.index, err)
+			}
+			if len(runner.streamCalls) != 0 || len(runner.ffmpegCalls) != 0 {
+				t.Fatalf("invalid target was decoded: streams=%q ffmpeg=%q", runner.streamCalls, runner.ffmpegCalls)
+			}
+		})
+	}
+
+	runner = &fakeRunner{runs: [][]byte{metadata}, streams: []string{frames}, runErrorAt: 2}
+	e.run = runner
+	if _, _, err := e.inspect("input", "video/mp4", intPointer(2), maxLimits()); !isCode(err, "unsupported_input") {
+		t.Fatalf("undecodable selected stream error = %v", err)
+	}
+}
+
+func TestVerifierUsesExpectedAbsoluteSourceStream(t *testing.T) {
+	sourceFrames := frameJSON(2, 80, 60, frameTiming{100, 40}, frameTiming{140, 40})
+	outputFrames := frameJSON(0, 80, 60, frameTiming{0, 40}, frameTiming{40, 40})
+	outputMetadata := probeJSON("av1", "yuv420p10le", 80, 60, false)
+	var outputDocument map[string]interface{}
+	_ = json.Unmarshal(outputMetadata, &outputDocument)
+	outputDocument["streams"].([]interface{})[0].(map[string]interface{})["bits_per_raw_sample"] = "10"
+	outputMetadata, _ = json.Marshal(outputDocument)
+	runner := &fakeRunner{runs: [][]byte{absoluteSelectionProbeJSON(), outputMetadata}, streams: []string{sourceFrames, outputFrames}}
+	e := engine{ffprobe: "/p/ffprobe", ffmpeg: "/p/ffmpeg", run: runner}
+	var response bytes.Buffer
+	if err := e.verify(request{source: "source", output: "output", mime: "video/mp4", kind: "mp4-av1", expectedVideoStreamIndex: intPointer(2), limits: maxLimits()}, &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.streamCalls) != 2 || !containsSequence(runner.streamCalls[0], "-select_streams", "2") || !containsSequence(runner.streamCalls[1], "-select_streams", "0") || !containsSequence(runner.ffmpegCalls[0], "-map", "0:2") {
+		t.Fatalf("verifier selection calls: streams=%q ffmpeg=%q", runner.streamCalls, runner.ffmpegCalls)
+	}
+	var envelope struct {
+		Result struct {
+			Source inspection `json:"source"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(response.Bytes(), &envelope); err != nil || envelope.Result.Source.VideoStreamIndex != 2 {
+		t.Fatalf("verification response = %s, %v", response.Bytes(), err)
+	}
+}
+
 func TestPQFrameMetadataIsSelectedAndConsistent(t *testing.T) {
 	metadata := pqProbeJSON(nil)
 	complete := []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(600)}}
 	validFrames := frameJSONWithPerFrameSideData(2, complete, complete)
 	runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{validFrames}}
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
-	got, _, err := e.inspect("input", "video/mp4", maxLimits())
+	got, _, err := e.inspect("input", "video/mp4", nil, maxLimits())
 	if err != nil || !got.HDR || got.MasteringMaxNits != 1000 || got.MaxCLLNits != 600 {
 		t.Fatalf("inspection = %#v, %v", got, err)
 	}
@@ -105,28 +194,28 @@ func TestPQFrameMetadataIsSelectedAndConsistent(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			runner.runs, runner.streams = [][]byte{metadata}, []string{frameJSONWithPerFrameSideData(2, complete, test.secondData)}
-			if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
+			if _, _, err := e.inspect("input", "video/mp4", nil, maxLimits()); !isCode(err, "unsupported_input") {
 				t.Fatalf("incomplete per-frame HDR accepted: %v", err)
 			}
 		})
 	}
 
 	runner.runs, runner.streams = [][]byte{metadata}, []string{frameJSONWithSideData(1, []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(600)}})}
-	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
+	if _, _, err := e.inspect("input", "video/mp4", nil, maxLimits()); !isCode(err, "unsupported_input") {
 		t.Fatalf("secondary frame accepted: %v", err)
 	}
 
 	metadata = pqProbeJSON([]map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(600)}})
 	contradiction := frameJSONWithSideData(2, []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(500)}})
 	runner.runs, runner.streams = [][]byte{metadata}, []string{contradiction}
-	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
+	if _, _, err := e.inspect("input", "video/mp4", nil, maxLimits()); !isCode(err, "unsupported_input") {
 		t.Fatalf("contradictory frame HDR accepted: %v", err)
 	}
 
 	metadata = pqProbeJSON(nil)
 	contradiction = frameJSONWithConflictingSideData(2)
 	runner.runs, runner.streams = [][]byte{metadata}, []string{contradiction}
-	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
+	if _, _, err := e.inspect("input", "video/mp4", nil, maxLimits()); !isCode(err, "unsupported_input") {
 		t.Fatalf("later contradictory frame HDR accepted: %v", err)
 	}
 }
@@ -136,7 +225,7 @@ func TestHLGRejectsPartialOrInconsistentFrameMetadata(t *testing.T) {
 	complete := []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(600)}}
 	runner := &fakeRunner{runs: [][]byte{metadata}, streams: []string{frameJSONWithPerFrameSideData(2, nil, nil)}}
 	e := engine{ffprobe: "/p/ffprobe", run: runner}
-	if _, _, err := e.inspect("input", "video/mp4", maxLimits()); err != nil {
+	if _, _, err := e.inspect("input", "video/mp4", nil, maxLimits()); err != nil {
 		t.Fatalf("metadata-free HLG rejected: %v", err)
 	}
 	for _, frames := range []string{
@@ -145,7 +234,7 @@ func TestHLGRejectsPartialOrInconsistentFrameMetadata(t *testing.T) {
 		frameJSONWithPerFrameSideData(2, complete, []map[string]interface{}{{"max_luminance": "1000/1"}, {"max_content": float64(500)}}),
 	} {
 		runner.runs, runner.streams = [][]byte{metadata}, []string{frames}
-		if _, _, err := e.inspect("input", "video/mp4", maxLimits()); !isCode(err, "unsupported_input") {
+		if _, _, err := e.inspect("input", "video/mp4", nil, maxLimits()); !isCode(err, "unsupported_input") {
 			t.Fatalf("inconsistent HLG frame metadata accepted: %v", err)
 		}
 	}
@@ -237,6 +326,22 @@ func multistreamProbeJSON(rotation interface{}, rotateTag string) []byte {
 		selected["tags"] = map[string]string{"rotate": rotateTag}
 	}
 	document["streams"] = []interface{}{base, ordinary, selected}
+	encoded, _ := json.Marshal(document)
+	return encoded
+}
+
+func absoluteSelectionProbeJSON() []byte {
+	var document map[string]interface{}
+	_ = json.Unmarshal(probeJSON("h264", "yuv420p", 320, 180, false), &document)
+	primary := document["streams"].([]interface{})[0].(map[string]interface{})
+	data := map[string]interface{}{"index": 1, "codec_name": "bin_data", "codec_type": "data"}
+	selected := cloneJSONMap(primary)
+	selected["index"], selected["width"], selected["height"], selected["disposition"] = 2, 80, 60, map[string]int{"default": 0}
+	attached := cloneJSONMap(selected)
+	attached["index"], attached["disposition"] = 3, map[string]int{"attached_pic": 1}
+	timed := cloneJSONMap(selected)
+	timed["index"], timed["disposition"] = 4, map[string]int{"timed_thumbnails": 1}
+	document["streams"] = []interface{}{primary, data, selected, attached, timed}
 	encoded, _ := json.Marshal(document)
 	return encoded
 }

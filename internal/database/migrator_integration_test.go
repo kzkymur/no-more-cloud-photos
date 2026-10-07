@@ -36,8 +36,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 5 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version five", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 6 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version six", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -60,8 +60,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 5 || status.ExpectedVersion != 5 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version five", status)
+		if status.CurrentVersion != 6 || status.ExpectedVersion != 6 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version six", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
@@ -286,6 +286,163 @@ func TestMigratorIntegration(t *testing.T) {
 			if gotPayload != payload || gotValidator != validator || gotTrigger != trigger {
 				t.Fatal("failed concurrent migration changed profile state")
 			}
+		})
+	})
+
+	t.Run("transform publication invariant upgrade is fail-closed", func(t *testing.T) {
+		ctx := context.Background()
+		prepareVersionFive := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
+			t.Helper()
+			pool := integrationPool(t, databaseURL)
+			full, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := newMigrator(pool, full.migrations[:5]).Up(ctx); err != nil {
+				t.Fatalf("apply versions one through five: %v", err)
+			}
+			return pool, full
+		}
+		insertLegacyTransform := func(t *testing.T, pool *pgxpool.Pool, targets int) (string, string, []string) {
+			t.Helper()
+			mediaID, originalID, jobID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`,
+				originalID, mediaID, strings.Repeat(strings.ReplaceAll(originalID, "-", ""), 2), "originals/00/aggregate-"+originalID+"/original.jpg"); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			targetIDs := make([]string, targets)
+			for index := range targets {
+				targetIDs[index] = newUUIDv4(t)
+				profileID := profile.StandardV1ID
+				if index == 1 {
+					profileID = profile.ThumbnailV1ID
+				}
+				if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetIDs[index], jobID, profileID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, jobID, newUUIDv4(t)); err != nil {
+				t.Fatal(err)
+			}
+			return mediaID, jobID, targetIDs
+		}
+		publishLegacyTarget := func(t *testing.T, pool *pgxpool.Pool, mediaID, targetID string) string {
+			t.Helper()
+			renditionID := newUUIDv4(t)
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256)
+				VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',1,$5)`, renditionID, mediaID, targetID,
+				"renditions/00/legacy-"+renditionID+"/output.avif", strings.Repeat("a", 64)); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			return renditionID
+		}
+		assertVersionFiveRollback := func(t *testing.T, pool *pgxpool.Pool) {
+			t.Helper()
+			var version int64
+			var auditColumn, aggregateFunction bool
+			if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='renditions' AND column_name='processor_audit')`).Scan(&auditColumn); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT to_regprocedure('nmcp_check_transform_job_success()') IS NOT NULL`).Scan(&aggregateFunction); err != nil {
+				t.Fatal(err)
+			}
+			if version != 5 || auditColumn || aggregateFunction {
+				t.Fatalf("failed migration state: version=%d audit_column=%t aggregate_function=%t", version, auditColumn, aggregateFunction)
+			}
+		}
+
+		validPool, validMigrator := prepareVersionFive(t)
+		mediaID, jobID, targets := insertLegacyTransform(t, validPool, 2)
+		renditionID := publishLegacyTarget(t, validPool, mediaID, targets[0])
+		purgeID := newUUIDv4(t)
+		if _, err := validPool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',1)`, purgeID, newUUIDv4(t)); err != nil {
+			t.Fatal(err)
+		}
+		if err := validMigrator.Up(ctx); err != nil {
+			t.Fatalf("upgrade valid partial transform and purge job: %v", err)
+		}
+		var status, audit string
+		if err := validPool.QueryRow(ctx, `SELECT j.status,r.processor_audit::text FROM jobs j CROSS JOIN renditions r WHERE j.id=$1 AND r.id=$2`, jobID, renditionID).Scan(&status, &audit); err != nil {
+			t.Fatal(err)
+		}
+		if status != "running" || audit != "{}" {
+			t.Fatalf("valid upgrade state = status %q audit %q", status, audit)
+		}
+
+		for _, test := range []struct {
+			name   string
+			damage func(*testing.T, *pgxpool.Pool)
+		}{
+			{name: "succeeded job with pending target", damage: func(t *testing.T, pool *pgxpool.Pool) {
+				_, jobID, _ := insertLegacyTransform(t, pool, 1)
+				if _, err := pool.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, jobID); err != nil {
+					t.Fatal(err)
+				}
+			}},
+			{name: "running job with every target succeeded", damage: func(t *testing.T, pool *pgxpool.Pool) {
+				mediaID, _, targetIDs := insertLegacyTransform(t, pool, 1)
+				publishLegacyTarget(t, pool, mediaID, targetIDs[0])
+			}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				pool, migrator := prepareVersionFive(t)
+				test.damage(t, pool)
+				if err := migrator.Up(ctx); err == nil {
+					t.Fatal("migration accepted an invalid legacy transform aggregate")
+				}
+				assertVersionFiveRollback(t, pool)
+			})
+		}
+
+		t.Run("waits for earlier writer before preflight", func(t *testing.T) {
+			pool, migrator := prepareVersionFive(t)
+			_, jobID, _ := insertLegacyTransform(t, pool, 1)
+			writer, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Rollback(ctx)
+			if _, err := writer.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, jobID); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() { result <- migrator.Up(ctx) }()
+			awaitRelationLock(t, pool, ctx, 0, "jobs", "AccessExclusiveLock", false)
+			if err := writer.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := awaitContextResult(t, ctx, result); err == nil {
+				t.Fatal("migration accepted invalid aggregate committed by an earlier writer")
+			}
+			assertVersionFiveRollback(t, pool)
 		})
 	})
 

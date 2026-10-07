@@ -221,7 +221,7 @@ func insertReadHTTPRendition(t *testing.T, pool *pgxpool.Pool, mediaID, original
 		{`INSERT INTO job_targets (id,job_id,profile_id,status,updated_at) VALUES ($1,$2,'60000000-0000-4000-8000-000000000001','pending',$3)`, []any{targetID, jobID, now}},
 		{`UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=$3,started_at=$4,updated_at=$4 WHERE id=$1`, []any{jobID, leaseID, now.Add(time.Minute), now}},
 		{`UPDATE job_targets SET status='succeeded',attempts=1,updated_at=$2 WHERE id=$1`, []any{targetID, now}},
-		{`INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,created_at) VALUES ($1,$2,$3,'standard',true,$4,'image/avif',21,$5,$6)`, []any{renditionID, mediaID, targetID, path, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", now}},
+		{`INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,created_at,processor_audit) VALUES ($1,$2,$3,'standard',true,$4,'image/avif',21,$5,$6,'{"fixture":"read-http"}')`, []any{renditionID, mediaID, targetID, path, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", now}},
 		{`UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=$2,updated_at=$2 WHERE id=$1`, []any{jobID, now}},
 	}
 	for _, statement := range statements {

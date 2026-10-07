@@ -81,6 +81,13 @@ services:
     environment:
       <<: *common-environment
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
+      NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
+      NMCP_STILL_HELPER_PATH: /opt/nmcp/bin/nmcp-still-helper
+      NMCP_ANIMATION_HELPER_PATH: /opt/nmcp/bin/nmcp-animation-helper
+      NMCP_VIDEO_HELPER_PATH: /opt/nmcp/bin/nmcp-video-helper
+      NMCP_PRLIMIT_PATH: /usr/bin/prlimit
+      NMCP_SRGB_ICC_PATH: /opt/nmcp/share/sRGB2014.icc
+      NMCP_SRGB_ICC_SHA256: 384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
     depends_on:
       migrate:
         condition: service_completed_successfully
