@@ -1057,6 +1057,12 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			_, err = purgeTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID)
 		}
 		if err == nil {
+			var position int64
+			if err = purgeTx.QueryRow(ctx, `UPDATE change_feed_state SET last_position=last_position+1 WHERE id=1 RETURNING last_position`).Scan(&position); err == nil {
+				_, err = purgeTx.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id,payload) VALUES ($1,$2,'media_purged','physical_purge',$3,NULL)`, newUUIDv4(t), position, mediaID)
+			}
+		}
+		if err == nil {
 			_, err = purgeTx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, replacementPurgeID)
 		}
 		if err != nil {

@@ -135,12 +135,16 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatalf("cutover guard state=%q error=%v", state, err)
 		}
 		var version int
-		var completionTrigger bool
-		if err := pool.QueryRow(ctx, `SELECT max(version),EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgname='media_identity_retirement_completed') FROM schema_migrations WHERE NOT dirty`).Scan(&version, &completionTrigger); err != nil {
+		var completionTrigger, completionColumn, completionFunction bool
+		if err := pool.QueryRow(ctx, `SELECT max(version),
+			EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid='media_purge_identity_guard'::regclass AND tgname='media_identity_retirement_completed'),
+			EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid='media_purge_identity_guard'::regclass AND attname='purge_job_id' AND NOT attisdropped),
+			to_regprocedure('nmcp_require_completed_media_identity_retirement()') IS NOT NULL
+			FROM schema_migrations WHERE NOT dirty`).Scan(&version, &completionTrigger, &completionColumn, &completionFunction); err != nil {
 			t.Fatal(err)
 		}
-		if version != 14 || completionTrigger {
-			t.Fatalf("failed identity completion migration version=%d trigger=%t", version, completionTrigger)
+		if version != 14 || completionTrigger || completionColumn || completionFunction {
+			t.Fatalf("failed identity completion migration version=%d trigger=%t column=%t function=%t", version, completionTrigger, completionColumn, completionFunction)
 		}
 	})
 
