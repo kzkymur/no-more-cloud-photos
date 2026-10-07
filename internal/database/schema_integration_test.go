@@ -1165,7 +1165,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 				securityDefiner, ownerMatches, ownerCannotLogin, fixedSearchPath, roleCanExecute, publicCannotExecute, roleCannotUpdate)
 		}
 		var cleanupDefiner, cleanupOwner, cleanupSearchPath, cleanupWorkerExecute, cleanupPublicRevoked, cleanupRuntimeRevoked bool
-		var workerProgressLeast, runtimeProgressLeast, noDirectRenditionDelete, cleanupOwnerRights bool
+		var workerProgressLeast, runtimeProgressDenied, noDirectRenditionDelete, cleanupOwnerRights bool
 		if err := pool.QueryRow(ctx, `SELECT p.prosecdef,
 			pg_catalog.pg_get_userbyid(p.proowner)='nmcp_purge_function_owner',
 			array_to_string(p.proconfig,',') LIKE 'search_path='||current_schema()||', pg_catalog, pg_temp%',
@@ -1174,18 +1174,18 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			NOT has_function_privilege('nmcp_runtime',p.oid,'EXECUTE'),
 			has_table_privilege('nmcp_worker_runtime','rendition_cleanup_progress','SELECT') AND has_table_privilege('nmcp_worker_runtime','rendition_cleanup_progress','INSERT')
 				AND NOT has_table_privilege('nmcp_worker_runtime','rendition_cleanup_progress','UPDATE') AND NOT has_table_privilege('nmcp_worker_runtime','rendition_cleanup_progress','DELETE'),
-			has_table_privilege('nmcp_runtime','rendition_cleanup_progress','SELECT') AND NOT has_table_privilege('nmcp_runtime','rendition_cleanup_progress','INSERT')
+			NOT has_table_privilege('nmcp_runtime','rendition_cleanup_progress','SELECT') AND NOT has_table_privilege('nmcp_runtime','rendition_cleanup_progress','INSERT')
 				AND NOT has_table_privilege('nmcp_runtime','rendition_cleanup_progress','UPDATE') AND NOT has_table_privilege('nmcp_runtime','rendition_cleanup_progress','DELETE'),
 			NOT has_table_privilege('nmcp_runtime','renditions','DELETE') AND NOT has_table_privilege('nmcp_worker_runtime','renditions','DELETE'),
 			has_table_privilege('nmcp_purge_function_owner','renditions','SELECT') AND has_table_privilege('nmcp_purge_function_owner','renditions','DELETE')
 			FROM pg_catalog.pg_proc p WHERE p.oid='nmcp_complete_rendition_cleanup(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)'::regprocedure`).Scan(
 			&cleanupDefiner, &cleanupOwner, &cleanupSearchPath, &cleanupWorkerExecute, &cleanupPublicRevoked, &cleanupRuntimeRevoked,
-			&workerProgressLeast, &runtimeProgressLeast, &noDirectRenditionDelete, &cleanupOwnerRights); err != nil {
+			&workerProgressLeast, &runtimeProgressDenied, &noDirectRenditionDelete, &cleanupOwnerRights); err != nil {
 			t.Fatal(err)
 		}
-		if !cleanupDefiner || !cleanupOwner || !cleanupSearchPath || !cleanupWorkerExecute || !cleanupPublicRevoked || !cleanupRuntimeRevoked || !workerProgressLeast || !runtimeProgressLeast || !noDirectRenditionDelete || !cleanupOwnerRights {
+		if !cleanupDefiner || !cleanupOwner || !cleanupSearchPath || !cleanupWorkerExecute || !cleanupPublicRevoked || !cleanupRuntimeRevoked || !workerProgressLeast || !runtimeProgressDenied || !noDirectRenditionDelete || !cleanupOwnerRights {
 			t.Fatalf("cleanup boundary definer=%t owner=%t search_path=%t worker_execute=%t public_revoked=%t runtime_revoked=%t worker_progress=%t runtime_progress=%t no_rendition_delete=%t owner_rights=%t",
-				cleanupDefiner, cleanupOwner, cleanupSearchPath, cleanupWorkerExecute, cleanupPublicRevoked, cleanupRuntimeRevoked, workerProgressLeast, runtimeProgressLeast, noDirectRenditionDelete, cleanupOwnerRights)
+				cleanupDefiner, cleanupOwner, cleanupSearchPath, cleanupWorkerExecute, cleanupPublicRevoked, cleanupRuntimeRevoked, workerProgressLeast, runtimeProgressDenied, noDirectRenditionDelete, cleanupOwnerRights)
 		}
 		var guardsDefiner, guardsOwner, guardOwnerNoLogin, guardOwnerIsolated, guardsSearchPath, guardsPublicRevoked, guardsRuntimeRevoked, guardOwnerRights, guardOwnerNoDelete, guardOwnerEventRead, guardOwnerEventNoWrite, guardRuntimeNoRights bool
 		if err := pool.QueryRow(ctx, `SELECT

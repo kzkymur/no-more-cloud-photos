@@ -146,8 +146,7 @@ BEGIN
 END;
 $$;
 
-REVOKE INSERT,UPDATE,DELETE,TRUNCATE ON rendition_cleanup_progress FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime;
-GRANT SELECT ON rendition_cleanup_progress TO nmcp_runtime;
+REVOKE SELECT,INSERT,UPDATE,DELETE,TRUNCATE ON rendition_cleanup_progress FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime;
 GRANT SELECT,INSERT ON rendition_cleanup_progress TO nmcp_worker_runtime;
 REVOKE DELETE ON renditions FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime;
 
