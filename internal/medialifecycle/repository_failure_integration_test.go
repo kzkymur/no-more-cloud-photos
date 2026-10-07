@@ -312,6 +312,45 @@ func TestLifecycleRepositoryIntegrationPostCommitResponseLossConverges(t *testin
 			t.Fatalf("unknown-start retry = %#v, %v", retry, err)
 		}
 	})
+
+	t.Run("purge file progress", func(t *testing.T) {
+		ctx := context.Background()
+		pool, setupService := integrationService(t)
+		mediaID := integrationUUID(777)
+		insertMedia(t, pool, mediaID, integrationUUID(778))
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := setupService.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := setupService.StartPurge(ctx, enqueued.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fault := errors.New("purge progress commit response lost")
+		faultyService := lifecycleServiceWithOnePostCommitFailure(pool, fault)
+		faultyRepository := faultyService.repository.(*PostgresRepository)
+		_, err = faultyRepository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
+			return PurgeFileMissing, nil
+		})
+		assertCommitOutcomeUnknown(t, err, fault)
+		var disposition string
+		if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
+			t.Fatal(err)
+		}
+		if disposition != "missing" {
+			t.Fatalf("durable purge progress disposition = %s", disposition)
+		}
+		retry, err := faultyRepository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
+			t.Fatal("terminal progress row was invoked after unknown commit")
+			return "", nil
+		})
+		if err != nil || !retry.Done {
+			t.Fatalf("purge progress retry = %#v, %v", retry, err)
+		}
+	})
 }
 
 func TestLifecycleRepositoryIntegrationDeleteVersusTransformPublication(t *testing.T) {

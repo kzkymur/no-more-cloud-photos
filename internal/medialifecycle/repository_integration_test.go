@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	dbmigration "github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/readapi"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func TestLifecycleRepositoryIntegrationDeleteRetentionAndRestore(t *testing.T) {
@@ -594,6 +596,260 @@ func TestLifecycleRepositoryIntegrationMaintenanceEntryDrainsPurgeReclaim(t *tes
 	}
 }
 
+func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	repository.jitter = func(time.Duration) time.Duration { return 0 }
+	mediaID, originalID := integrationUUID(50), integrationUUID(150)
+	insertMedia(t, pool, mediaID, originalID)
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifestKind, manifestObjectID, manifestPath, disposition string
+	var manifestSize int64
+	if err := pool.QueryRow(ctx, `SELECT object_kind,object_id::text,relative_path,size_bytes,disposition
+		FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(
+		&manifestKind, &manifestObjectID, &manifestPath, &manifestSize, &disposition); err != nil {
+		t.Fatal(err)
+	}
+	if manifestKind != "original" || manifestObjectID != originalID || manifestSize != 10 || disposition != "pending" {
+		t.Fatalf("manifest kind=%s object=%s path=%s size=%d disposition=%s", manifestKind, manifestObjectID, manifestPath, manifestSize, disposition)
+	}
+	root := t.TempDir()
+	writePurgeFixture(t, root, manifestPath, []byte("0123456789"))
+	store, err := storage.Open(root, storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	called := false
+	if _, err := repository.RunPurgeFileStep(ctx, lease.JobID, integrationUUID(950), func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
+		called = true
+		return PurgeFileDeleted, nil
+	}); !errors.Is(err, ErrPurgeLeaseLost) || called {
+		t.Fatalf("stale-token purge step called=%t error=%#v", called, err)
+	}
+	step, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(store))
+	if err != nil || step.File == nil || step.File.ObjectID != originalID || step.Done {
+		t.Fatalf("purge file step = %#v, %v", step, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(manifestPath))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("purged file stat error = %v", err)
+	}
+	var completedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT disposition,completed_at FROM purge_file_progress WHERE job_id=$1 AND object_id=$2`, lease.JobID, originalID).Scan(&disposition, &completedAt); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "deleted" || completedAt == nil {
+		t.Fatalf("completed manifest disposition=%s completed=%v", disposition, completedAt)
+	}
+	done, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
+		t.Fatal("completed purge file was invoked again")
+		return "", nil
+	})
+	if err != nil || !done.Done || done.File != nil {
+		t.Fatalf("completed purge step = %#v, %v", done, err)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationPurgeFileExpiryAfterUnlinkConvergesMissing(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	repository.jitter = func(time.Duration) time.Duration { return 0 }
+	mediaID, originalID := integrationUUID(51), integrationUUID(151)
+	insertMedia(t, pool, mediaID, originalID)
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var relativePath string
+	var manifestCreatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT relative_path,created_at FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&relativePath, &manifestCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writePurgeFixture(t, root, relativePath, []byte("0123456789"))
+	store, err := storage.Open(root, storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repository.afterPurgeFileAction = func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID)
+		return err
+	}
+	if _, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(store)); !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("post-unlink expiry error = %#v", err)
+	}
+	repository.afterPurgeFileAction = nil
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relativePath))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("post-expiry file stat error = %v", err)
+	}
+	var disposition string
+	if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "pending" {
+		t.Fatalf("post-expiry disposition = %s", disposition)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10); err != nil || len(reclaimed) != 1 {
+		t.Fatalf("reclaim after unlink = %#v, %v", reclaimed, err)
+	}
+	retry, err := service.StartPurge(ctx, lease.JobID)
+	if err != nil || !retry.StartedAt.Equal(lease.StartedAt) || retry.Token == lease.Token {
+		t.Fatalf("retry after unlink = %#v, %v", retry, err)
+	}
+	var manifestCount int
+	var retryCreatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT count(*),min(created_at) FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&manifestCount, &retryCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if manifestCount != 1 || !retryCreatedAt.Equal(manifestCreatedAt) {
+		t.Fatalf("retry manifest count=%d created=%s want %s", manifestCount, retryCreatedAt, manifestCreatedAt)
+	}
+	step, err := repository.RunPurgeFileStep(ctx, retry.JobID, retry.Token, StoragePurgeFileAction(store))
+	if err != nil || step.File == nil {
+		t.Fatalf("missing convergence step = %#v, %v", step, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "missing" {
+		t.Fatalf("converged disposition = %s", disposition)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationPurgeManifestMismatchRollsBackRestart(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	repository.jitter = func(time.Duration) time.Duration { return 0 }
+	mediaID, originalID := integrationUUID(52), integrationUUID(152)
+	insertMedia(t, pool, mediaID, originalID)
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE purge_file_progress DISABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `ALTER TABLE purge_file_progress ENABLE TRIGGER USER`) })
+	if _, err := pool.Exec(ctx, `UPDATE purge_file_progress SET size_bytes=size_bytes+1 WHERE job_id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE purge_file_progress ENABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10); err != nil || len(reclaimed) != 1 {
+		t.Fatalf("reclaim mismatched manifest = %#v, %v", reclaimed, err)
+	}
+	if _, err := service.StartPurge(ctx, lease.JobID); !IsKind(err, KindInvariant) {
+		t.Fatalf("mismatched manifest restart error = %#v", err)
+	}
+	assertJobState(t, pool, lease.JobID, "queued", 1, true)
+}
+
+func TestLifecycleRepositoryIntegrationPurgeFileUncertainDeleteConvergesMissing(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	mediaID, originalID := integrationUUID(53), integrationUUID(153)
+	insertMedia(t, pool, mediaID, originalID)
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var relativePath string
+	if err := pool.QueryRow(ctx, `SELECT relative_path FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&relativePath); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	writePurgeFixture(t, root, relativePath, []byte("0123456789"))
+	fault := errors.New("injected post-unlink fault")
+	faultyStore, err := storage.Open(root, storage.Options{Faults: storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+		if event.Boundary == storage.BoundaryDelete && event.Phase == storage.After {
+			return fault
+		}
+		return nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = faultyStore.Close() })
+	if _, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(faultyStore)); !errors.Is(err, storage.ErrOutcomeUncertain) || errors.Is(err, fault) {
+		t.Fatalf("uncertain purge step error = %#v", err)
+	}
+	var disposition string
+	if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "pending" {
+		t.Fatalf("uncertain delete disposition = %s", disposition)
+	}
+	cleanStore, err := storage.Open(root, storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cleanStore.Close() })
+	if _, err := repository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(cleanStore)); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "missing" {
+		t.Fatalf("uncertain delete retry disposition = %s", disposition)
+	}
+}
+
+func writePurgeFixture(t *testing.T, root, relativePath string, payload []byte) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(relativePath))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLifecycleRepositoryIntegrationProjectionParityWithReadAPI(t *testing.T) {
 	ctx := context.Background()
 	pool, service := integrationService(t)
@@ -800,34 +1056,9 @@ func TestLifecycleRepositoryIntegrationStartPurgeLeaseAndEligibility(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifestTx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = manifestTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, missingLease.Token); err == nil {
-		_, err = manifestTx.Exec(ctx, `INSERT INTO purge_file_progress
-			(job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes)
-			SELECT $1::nmcp_uuid_v4,$2::nmcp_uuid_v4,'original',id,relative_path,size_bytes FROM originals WHERE media_id=$2::nmcp_uuid_v4`, missing.Job.ID, missingMediaID)
-	}
-	if err != nil {
-		_ = manifestTx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if err := manifestTx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	progressTx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = progressTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, missingLease.Token); err == nil {
-		_, err = progressTx.Exec(ctx, `UPDATE purge_file_progress SET disposition='missing' WHERE job_id=$1`, missing.Job.ID)
-	}
-	if err != nil {
-		_ = progressTx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if err := progressTx.Commit(ctx); err != nil {
+	if _, err := service.repository.(*PostgresRepository).RunPurgeFileStep(ctx, missingLease.JobID, missingLease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
+		return PurgeFileMissing, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	finalTx, err := pool.Begin(ctx)

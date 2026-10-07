@@ -715,7 +715,7 @@ func TestWriteSyncAndRenameFailuresDoNotCreateFinal(t *testing.T) {
 			count, _ := originalWrite(fd, value)
 			return count, syscall.ENOSPC
 		}
-		if written, err := temporary.Write([]byte("payload")); written != 2 || !errors.Is(err, syscall.ENOSPC) {
+		if written, err := temporary.Write([]byte("payload")); written != 2 || !errors.Is(err, ErrNoSpace) {
 			t.Fatalf("ENOSPC Write() = %d, %v", written, err)
 		}
 		store.ops.write = originalWrite
@@ -1834,8 +1834,29 @@ func TestReadOnlyDirectoryRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
-	if _, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t)); !errors.Is(err, ErrReadOnly) {
+	if _, err := store.BeginOriginal(context.Background(), testOriginalKey(t), testAttempt(t)); !errors.Is(err, ErrPermission) {
 		t.Fatalf("read-only BeginOriginal() error = %v", err)
+	}
+}
+
+func TestStableStorageResourceErrorClassification(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		kind error
+	}{
+		{name: "no space", err: syscall.ENOSPC, kind: ErrNoSpace},
+		{name: "quota", err: syscall.EDQUOT, kind: ErrQuota},
+		{name: "access", err: syscall.EACCES, kind: ErrPermission},
+		{name: "operation", err: syscall.EPERM, kind: ErrPermission},
+		{name: "read only", err: syscall.EROFS, kind: ErrReadOnly},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			classified := classifyError("test operation", test.err)
+			if !errors.Is(classified, test.kind) || errors.Is(classified, test.err) {
+				t.Fatalf("classifyError(%v) = %v", test.err, classified)
+			}
+		})
 	}
 }
 

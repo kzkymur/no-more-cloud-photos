@@ -1589,7 +1589,13 @@ func classifyError(operation string, err error) error {
 		return errors.Join(ErrUnexpectedType, fmt.Errorf("%s failed", operation))
 	case errors.Is(err, unix.EEXIST):
 		return errors.Join(ErrCollision, fmt.Errorf("%s failed", operation))
-	case errors.Is(err, unix.EROFS), errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
+	case errors.Is(err, unix.ENOSPC):
+		return errors.Join(ErrNoSpace, fmt.Errorf("%s failed", operation))
+	case errors.Is(err, unix.EDQUOT):
+		return errors.Join(ErrQuota, fmt.Errorf("%s failed", operation))
+	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
+		return errors.Join(ErrPermission, fmt.Errorf("%s failed", operation))
+	case errors.Is(err, unix.EROFS):
 		return errors.Join(ErrReadOnly, fmt.Errorf("%s failed", operation))
 	case errors.Is(err, unix.ENOENT):
 		return errors.Join(os.ErrNotExist, fmt.Errorf("%s failed", operation))

@@ -1126,6 +1126,24 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err := pool.Exec(ctx, `GRANT SELECT,INSERT,UPDATE,DELETE,TRUNCATE ON ALL TABLES IN SCHEMA `+quotedSchema+` TO `+quotedRole); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := pool.Exec(ctx, `GRANT EXECUTE ON FUNCTION `+quotedSchema+`.nmcp_complete_purge_file_progress(nmcp_uuid_v4,nmcp_uuid_v4,text,nmcp_uuid_v4,text,text) TO `+quotedRole); err != nil {
+			t.Fatal(err)
+		}
+		var securityDefiner, ownerMatches, fixedSearchPath, roleCanExecute, publicCannotExecute bool
+		if err := pool.QueryRow(ctx, `SELECT p.prosecdef,
+			pg_catalog.pg_get_userbyid(p.proowner)=current_user,
+			array_to_string(p.proconfig,',') LIKE 'search_path='||current_schema()||', pg_catalog, pg_temp%',
+			has_function_privilege($1,p.oid,'EXECUTE'),
+			NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) WHERE grantee=0 AND privilege_type='EXECUTE')
+			FROM pg_catalog.pg_proc AS p
+			WHERE p.oid='nmcp_complete_purge_file_progress(nmcp_uuid_v4,nmcp_uuid_v4,text,nmcp_uuid_v4,text,text)'::regprocedure`, roleName).Scan(
+			&securityDefiner, &ownerMatches, &fixedSearchPath, &roleCanExecute, &publicCannotExecute); err != nil {
+			t.Fatal(err)
+		}
+		if !securityDefiner || !ownerMatches || !fixedSearchPath || !roleCanExecute || !publicCannotExecute {
+			t.Fatalf("ordered purge boundary security definer=%t owner=%t search_path=%t role_execute=%t public_revoked=%t",
+				securityDefiner, ownerMatches, fixedSearchPath, roleCanExecute, publicCannotExecute)
+		}
 		execAsApp := func(query string, arguments ...any) error {
 			tx, err := pool.Begin(ctx)
 			if err != nil {
@@ -1298,6 +1316,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if err := manifestTx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
+		expectAppError(`UPDATE purge_file_progress SET disposition='deleted' WHERE job_id=$1`, purgeID)
 		unapprovedTx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -1315,15 +1334,35 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if err == nil {
 			t.Fatal("application role deleted Media before purge progress completion")
 		}
+		progressRows, err := pool.Query(ctx, `SELECT object_kind,object_id::text FROM purge_file_progress WHERE job_id=$1 ORDER BY object_kind,object_id`, purgeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		type progressIdentity struct{ kind, objectID string }
+		progressIdentities := make([]progressIdentity, 0)
+		for progressRows.Next() {
+			var identity progressIdentity
+			if err := progressRows.Scan(&identity.kind, &identity.objectID); err != nil {
+				progressRows.Close()
+				t.Fatal(err)
+			}
+			progressIdentities = append(progressIdentities, identity)
+		}
+		if err := progressRows.Err(); err != nil {
+			progressRows.Close()
+			t.Fatal(err)
+		}
+		progressRows.Close()
 		completeTx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err = completeTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
-			_, err = completeTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken)
-		}
-		if err == nil {
-			_, err = completeTx.Exec(ctx, `UPDATE purge_file_progress SET disposition='deleted' WHERE job_id=$1`, purgeID)
+			for _, identity := range progressIdentities {
+				if _, err = completeTx.Exec(ctx, `SELECT nmcp_complete_purge_file_progress($1,$2,$3,$4,$5,'deleted')`, purgeID, mediaID, identity.kind, identity.objectID, purgeToken); err != nil {
+					break
+				}
+			}
 		}
 		if err != nil {
 			_ = completeTx.Rollback(ctx)

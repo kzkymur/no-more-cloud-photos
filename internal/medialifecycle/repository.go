@@ -28,12 +28,13 @@ type transactionDatabase interface {
 }
 
 type PostgresRepository struct {
-	db                  transactionDatabase
-	fileBaseURL         string
-	newID               func() (string, error)
-	afterCommit         func(context.Context) error
-	jitter              func(time.Duration) time.Duration
-	beforeReclaimCommit func(context.Context) error
+	db                   transactionDatabase
+	fileBaseURL          string
+	newID                func() (string, error)
+	afterCommit          func(context.Context) error
+	jitter               func(time.Duration) time.Duration
+	beforeReclaimCommit  func(context.Context) error
+	afterPurgeFileAction func(context.Context, pgx.Tx) error
 }
 
 func NewPostgresRepository(pool *pgxpool.Pool, fileBaseURL string) (*PostgresRepository, error) {
@@ -457,6 +458,9 @@ func (r *PostgresRepository) StartPurge(ctx context.Context, jobID string) (Purg
 	); err != nil {
 		return PurgeLease{}, fmt.Errorf("start purge job: %w", err)
 	}
+	if err := initializePurgeManifest(ctx, tx, lease, token); err != nil {
+		return PurgeLease{}, err
+	}
 	if err := r.commit(ctx, tx); err != nil {
 		return PurgeLease{}, err
 	}
@@ -466,6 +470,128 @@ func (r *PostgresRepository) StartPurge(ctx context.Context, jobID string) (Purg
 	lease.AvailableAt = lease.AvailableAt.UTC()
 	lease.CreatedAt = lease.CreatedAt.UTC()
 	return lease, nil
+}
+
+func initializePurgeManifest(ctx context.Context, tx pgx.Tx, lease PurgeLease, token string) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, token); err != nil {
+		return fmt.Errorf("authorize purge manifest: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO purge_file_progress
+			(job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes)
+		SELECT $1::nmcp_uuid_v4,$2::nmcp_uuid_v4,'original',id,relative_path,size_bytes
+		FROM originals WHERE media_id=$2::nmcp_uuid_v4
+		UNION ALL
+		SELECT $1::nmcp_uuid_v4,$2::nmcp_uuid_v4,'rendition',id,relative_path,size_bytes
+		FROM renditions WHERE media_id=$2::nmcp_uuid_v4
+		ON CONFLICT (job_id,object_kind,object_id) DO NOTHING`, lease.JobID, lease.MediaID); err != nil {
+		return fmt.Errorf("initialize purge manifest: %w", err)
+	}
+	var mismatch bool
+	if err := tx.QueryRow(ctx, `WITH expected AS (
+			SELECT $2::nmcp_uuid_v4 AS media_id_snapshot,'original'::text AS object_kind,id AS object_id,relative_path,size_bytes
+			FROM originals WHERE media_id=$2
+			UNION ALL
+			SELECT $2::nmcp_uuid_v4,'rendition'::text,id,relative_path,size_bytes
+			FROM renditions WHERE media_id=$2
+		), actual AS (
+			SELECT media_id_snapshot,object_kind,object_id,relative_path,size_bytes
+			FROM purge_file_progress WHERE job_id=$1
+		), difference AS (
+			(SELECT * FROM expected EXCEPT SELECT * FROM actual)
+			UNION ALL
+			(SELECT * FROM actual EXCEPT SELECT * FROM expected)
+		)
+		SELECT EXISTS (SELECT 1 FROM difference)`, lease.JobID, lease.MediaID).Scan(&mismatch); err != nil {
+		return fmt.Errorf("verify purge manifest: %w", err)
+	}
+	if mismatch {
+		return newInvariant(errors.New("purge manifest does not exactly match owned files"))
+	}
+	return nil
+}
+
+func (r *PostgresRepository) RunPurgeFileStep(ctx context.Context, jobID, token string, action PurgeFileAction) (PurgeStepResult, error) {
+	if !readapi.IsUUIDv4(jobID) || !readapi.IsUUIDv4(token) || action == nil {
+		return PurgeStepResult{}, newInvariant(errors.New("invalid purge file step"))
+	}
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return PurgeStepResult{}, err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return PurgeStepResult{}, err
+	}
+	var mediaID string
+	if err := tx.QueryRow(ctx, `SELECT media_id_snapshot::text FROM jobs WHERE id=$1 AND type='purge'`, jobID).Scan(&mediaID); errors.Is(err, pgx.ErrNoRows) {
+		return PurgeStepResult{}, ErrPurgeLeaseLost
+	} else if err != nil {
+		return PurgeStepResult{}, fmt.Errorf("read purge step media: %w", err)
+	}
+	var deletedAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT deleted_at FROM media WHERE id=$1 FOR UPDATE`, mediaID).Scan(&deletedAt); errors.Is(err, pgx.ErrNoRows) {
+		return PurgeStepResult{}, ErrPurgeLeaseLost
+	} else if err != nil {
+		return PurgeStepResult{}, fmt.Errorf("lock purge step media: %w", err)
+	}
+	if deletedAt == nil {
+		return PurgeStepResult{}, ErrPurgeLeaseLost
+	}
+	var live bool
+	if err := tx.QueryRow(ctx, `SELECT status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()
+		FROM jobs WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 FOR UPDATE`, jobID, token, mediaID).Scan(&live); errors.Is(err, pgx.ErrNoRows) {
+		return PurgeStepResult{}, ErrPurgeLeaseLost
+	} else if err != nil {
+		return PurgeStepResult{}, fmt.Errorf("lock purge step job: %w", err)
+	}
+	if !live {
+		return PurgeStepResult{}, ErrPurgeLeaseLost
+	}
+	file := PurgeFile{JobID: jobID, MediaID: mediaID}
+	var kind string
+	err = tx.QueryRow(ctx, `SELECT object_kind,object_id::text,relative_path,size_bytes
+		FROM purge_file_progress WHERE job_id=$1 AND disposition='pending'
+		ORDER BY object_kind,object_id FOR UPDATE LIMIT 1`, jobID).Scan(&kind, &file.ObjectID, &file.RelativePath, &file.SizeBytes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := r.commit(ctx, tx); err != nil {
+			return PurgeStepResult{}, err
+		}
+		return PurgeStepResult{Done: true}, nil
+	}
+	if err != nil {
+		return PurgeStepResult{}, fmt.Errorf("lock pending purge file: %w", err)
+	}
+	file.Kind = PurgeFileKind(kind)
+	if file.Kind != PurgeFileOriginal && file.Kind != PurgeFileRendition {
+		return PurgeStepResult{}, newInvariant(errors.New("invalid purge file kind"))
+	}
+	disposition, err := action(ctx, file)
+	if err != nil {
+		return PurgeStepResult{}, err
+	}
+	if disposition != PurgeFileDeleted && disposition != PurgeFileMissing {
+		return PurgeStepResult{}, newInvariant(errors.New("invalid purge file disposition"))
+	}
+	if r.afterPurgeFileAction != nil {
+		if err := r.afterPurgeFileAction(ctx, tx); err != nil {
+			return PurgeStepResult{}, err
+		}
+	}
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM jobs
+		WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running'
+		  AND lease_token=$2 AND lease_expires_at>clock_timestamp())`, jobID, token, mediaID).Scan(&live); err != nil {
+		return PurgeStepResult{}, fmt.Errorf("recheck purge file lease: %w", err)
+	}
+	if !live {
+		return PurgeStepResult{}, ErrPurgeLeaseLost
+	}
+	if _, err := tx.Exec(ctx, `SELECT nmcp_complete_purge_file_progress($1,$2,$3,$4,$5,$6)`, jobID, file.MediaID, file.Kind, file.ObjectID, token, disposition); err != nil {
+		return PurgeStepResult{}, fmt.Errorf("complete purge file: %w", err)
+	}
+	if err := r.commit(ctx, tx); err != nil {
+		return PurgeStepResult{}, err
+	}
+	return PurgeStepResult{File: &file}, nil
 }
 
 func (r *PostgresRepository) begin(ctx context.Context) (pgx.Tx, error) {

@@ -3,13 +3,17 @@
 package medialifecycle
 
 import (
+	"context"
 	"errors"
 	"time"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/readapi"
 )
 
-var ErrNoPurgeWork = errors.New("no eligible purge work")
+var (
+	ErrNoPurgeWork    = errors.New("no eligible purge work")
+	ErrPurgeLeaseLost = errors.New("purge lease lost")
+)
 
 const (
 	// InitialPurgeMaxAttempts is snapshotted into each newly enqueued purge job.
@@ -63,3 +67,33 @@ type PurgeLease struct {
 	AvailableAt    time.Time
 	CreatedAt      time.Time
 }
+
+type PurgeFileKind string
+
+const (
+	PurgeFileOriginal  PurgeFileKind = "original"
+	PurgeFileRendition PurgeFileKind = "rendition"
+)
+
+type PurgeFileDisposition string
+
+const (
+	PurgeFileDeleted PurgeFileDisposition = "deleted"
+	PurgeFileMissing PurgeFileDisposition = "missing"
+)
+
+type PurgeFile struct {
+	JobID        string
+	MediaID      string
+	Kind         PurgeFileKind
+	ObjectID     string
+	RelativePath string
+	SizeBytes    int64
+}
+
+type PurgeStepResult struct {
+	File *PurgeFile
+	Done bool
+}
+
+type PurgeFileAction func(context.Context, PurgeFile) (PurgeFileDisposition, error)

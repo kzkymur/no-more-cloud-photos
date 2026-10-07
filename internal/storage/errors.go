@@ -8,6 +8,9 @@ import (
 var (
 	ErrSymlink          = errors.New("storage symlink refused")
 	ErrCollision        = errors.New("storage object collision")
+	ErrNoSpace          = errors.New("storage has no space available")
+	ErrQuota            = errors.New("storage quota exceeded")
+	ErrPermission       = errors.New("storage permission denied")
 	ErrReadOnly         = errors.New("storage is read-only")
 	ErrValidation       = errors.New("storage validation failed")
 	ErrDurability       = errors.New("storage durability operation failed")
