@@ -63,7 +63,7 @@ func (r *fakeRepository) ReclaimExpired(context.Context) (int, error) {
 	return 0, nil
 }
 
-func TestNewDefaultsLimitsAndRejectsPurgeRegistration(t *testing.T) {
+func TestNewDefaultsLimitsAndAcceptsPurgeRegistration(t *testing.T) {
 	repository := &fakeRepository{}
 	worker, err := New(repository, nil, Options{}, nil)
 	if err != nil {
@@ -82,7 +82,7 @@ func TestNewDefaultsLimitsAndRejectsPurgeRegistration(t *testing.T) {
 	if _, ok := limits.TimeoutCeiling("unknown"); ok {
 		t.Fatal("unknown family accepted")
 	}
-	if _, err := New(repository, map[job.Type]Executor{job.TypePurge: executorFunc(func(context.Context, job.Lease, ExecutionLimits) error { return nil })}, Options{}, nil); !errors.Is(err, job.ErrInvalid) {
+	if _, err := New(repository, map[job.Type]Executor{job.TypePurge: executorFunc(func(context.Context, job.Lease, ExecutionLimits) error { return nil })}, Options{}, nil); err != nil {
 		t.Fatalf("purge registration error = %v", err)
 	}
 	if _, err := New(repository, map[job.Type]Executor{job.TypeTransform: nil}, Options{}, nil); !errors.Is(err, job.ErrInvalid) {

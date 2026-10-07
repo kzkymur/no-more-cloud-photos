@@ -21,6 +21,27 @@ type startupProfileLoader struct {
 	called      bool
 }
 
+type loopFunc func(context.Context) error
+
+func (f loopFunc) Run(ctx context.Context) error { return f(ctx) }
+
+func TestRunWorkersCancelsSiblingOnFailure(t *testing.T) {
+	fault := errors.New("worker failed")
+	cancelled := make(chan struct{})
+	err := runWorkers(context.Background(), loopFunc(func(context.Context) error { return fault }), loopFunc(func(ctx context.Context) error { <-ctx.Done(); close(cancelled); return nil }))
+	if !errors.Is(err, fault) {
+		t.Fatalf("error=%v", err)
+	}
+	<-cancelled
+}
+
+func TestRunWorkersRejectsUnexpectedCleanExit(t *testing.T) {
+	err := runWorkers(context.Background(), loopFunc(func(context.Context) error { return nil }), loopFunc(func(ctx context.Context) error { <-ctx.Done(); return nil }))
+	if err == nil {
+		t.Fatal("clean early exit accepted")
+	}
+}
+
 func (loader *startupProfileLoader) ClaimableTransformProfiles(context.Context) ([]profile.Definition, error) {
 	loader.called = true
 	return loader.definitions, loader.err

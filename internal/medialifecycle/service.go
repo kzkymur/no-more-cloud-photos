@@ -13,6 +13,7 @@ import (
 )
 
 const defaultDatabaseBudget = 30 * time.Second
+const purgeFileStepBudget = 20 * time.Second
 
 type lifecycleRepository interface {
 	Delete(context.Context, string) (DeleteResult, error)
@@ -24,6 +25,10 @@ type lifecycleRepository interface {
 	DiscoverPurgeJobs(context.Context, int) ([]string, error)
 	ReclaimExpiredPurges(context.Context, int) ([]string, error)
 	StartPurge(context.Context, string) (PurgeLease, error)
+	RunPurgeFileStep(context.Context, string, string, PurgeFileAction) (PurgeStepResult, error)
+	FinalizePurge(context.Context, string, string) error
+	HeartbeatPurge(context.Context, string, string) (time.Time, error)
+	FinishPurgeAttempt(context.Context, string, string, string) error
 }
 
 type Service struct {
@@ -132,13 +137,45 @@ func (s *Service) StartPurge(ctx context.Context, jobID string) (PurgeLease, err
 	return lease, classifyError(err)
 }
 
+func (s *Service) RunPurgeFileStep(ctx context.Context, jobID, token string, action PurgeFileAction) (PurgeStepResult, error) {
+	if !readapi.IsUUIDv4(jobID) || !readapi.IsUUIDv4(token) || action == nil {
+		return PurgeStepResult{}, newInvalidID()
+	}
+	stepCtx, cancel := context.WithTimeout(ctx, purgeFileStepBudget)
+	defer cancel()
+	result, err := s.repository.RunPurgeFileStep(stepCtx, jobID, token, action)
+	return result, classifyError(err)
+}
+
+func (s *Service) FinalizePurge(ctx context.Context, jobID, token string) error {
+	if !readapi.IsUUIDv4(jobID) || !readapi.IsUUIDv4(token) {
+		return newInvalidID()
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	return classifyError(s.repository.FinalizePurge(dbCtx, jobID, token))
+}
+
+func (s *Service) HeartbeatPurge(ctx context.Context, jobID, token string) (time.Time, error) {
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	result, err := s.repository.HeartbeatPurge(dbCtx, jobID, token)
+	return result, classifyError(err)
+}
+
+func (s *Service) FinishPurgeAttempt(ctx context.Context, jobID, token, code string) error {
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	return classifyError(s.repository.FinishPurgeAttempt(dbCtx, jobID, token, code))
+}
+
 func classifyError(err error) error {
 	if err == nil {
 		return nil
 	}
 	var semantic *SemanticError
 	var unknown *CommitOutcomeUnknown
-	if errors.Is(err, ErrNoPurgeWork) || errors.As(err, &semantic) || errors.As(err, &unknown) {
+	if errors.Is(err, ErrNoPurgeWork) || errors.Is(err, ErrPurgeLeaseLost) || errors.As(err, &semantic) || errors.As(err, &unknown) {
 		return err
 	}
 	var rolledBack *CommitRolledBack

@@ -594,6 +594,195 @@ func (r *PostgresRepository) RunPurgeFileStep(ctx context.Context, jobID, token 
 	return PurgeStepResult{File: &file}, nil
 }
 
+func (r *PostgresRepository) FinalizePurge(ctx context.Context, jobID, token string) error {
+	if !readapi.IsUUIDv4(jobID) || !readapi.IsUUIDv4(token) {
+		return newInvalidID()
+	}
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return err
+	}
+	var mediaID string
+	if err := tx.QueryRow(ctx, `SELECT media_id_snapshot::text FROM jobs WHERE id=$1 AND type='purge'`, jobID).Scan(&mediaID); errors.Is(err, pgx.ErrNoRows) {
+		return ErrPurgeLeaseLost
+	} else if err != nil {
+		return fmt.Errorf("read purge finalizer media: %w", err)
+	}
+	var deletedAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT deleted_at FROM media WHERE id=$1 FOR UPDATE`, mediaID).Scan(&deletedAt); errors.Is(err, pgx.ErrNoRows) {
+		var converged bool
+		if err := tx.QueryRow(ctx, `SELECT status='succeeded' AND lease_token IS NULL AND lease_expires_at IS NULL
+			AND (SELECT count(*)=1 FROM change_events WHERE media_id=$2 AND event_type='media_purged' AND reason='physical_purge')
+			FROM jobs WHERE id=$1 AND type='purge' AND media_id_snapshot=$2`, jobID, mediaID).Scan(&converged); errors.Is(err, pgx.ErrNoRows) {
+			return ErrPurgeLeaseLost
+		} else if err != nil {
+			return fmt.Errorf("verify committed purge finalization: %w", err)
+		}
+		if !converged {
+			return ErrPurgeLeaseLost
+		}
+		return r.commit(ctx, tx)
+	} else if err != nil {
+		return fmt.Errorf("lock purge finalizer media: %w", err)
+	}
+	if deletedAt == nil {
+		return ErrPurgeLeaseLost
+	}
+	var live bool
+	if err := tx.QueryRow(ctx, `SELECT status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()
+		FROM jobs WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 FOR UPDATE`, jobID, token, mediaID).Scan(&live); errors.Is(err, pgx.ErrNoRows) {
+		return ErrPurgeLeaseLost
+	} else if err != nil {
+		return fmt.Errorf("lock purge finalizer Job: %w", err)
+	}
+	if !live {
+		return ErrPurgeLeaseLost
+	}
+	var mismatch, pending bool
+	if err := tx.QueryRow(ctx, `WITH expected AS (
+			SELECT $2::nmcp_uuid_v4 AS media_id_snapshot,'original'::text AS object_kind,id AS object_id,relative_path,size_bytes FROM originals WHERE media_id=$2
+			UNION ALL
+			SELECT $2::nmcp_uuid_v4,'rendition'::text,id,relative_path,size_bytes FROM renditions WHERE media_id=$2
+		), actual AS (
+			SELECT media_id_snapshot,object_kind,object_id,relative_path,size_bytes FROM purge_file_progress WHERE job_id=$1
+		), difference AS (
+			(SELECT * FROM expected EXCEPT SELECT * FROM actual)
+			UNION ALL (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+		)
+		SELECT EXISTS(SELECT 1 FROM difference),EXISTS(SELECT 1 FROM purge_file_progress WHERE job_id=$1 AND disposition='pending')`, jobID, mediaID).Scan(&mismatch, &pending); err != nil {
+		return fmt.Errorf("verify purge finalizer manifest: %w", err)
+	}
+	if mismatch {
+		return newInvariant(errors.New("purge manifest does not match Media-owned files"))
+	}
+	if pending {
+		return ErrNoPurgeWork
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true),pg_catalog.set_config('nmcp.purge_lease_token',$2,true)`, jobID, token); err != nil {
+		return fmt.Errorf("authorize purge finalizer: %w", err)
+	}
+	now, err := databaseNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if tag, err := tx.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID); err != nil {
+		return fmt.Errorf("delete purged Media: %w", err)
+	} else if tag.RowsAffected() != 1 {
+		return ErrPurgeLeaseLost
+	}
+	if err := r.insertEvent(ctx, tx, mediaID, "media_purged", "physical_purge", nil, now); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,
+		finished_at=$4,error_code=NULL,error_message=NULL,updated_at=$4
+		WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()`, jobID, token, mediaID, now)
+	if err != nil {
+		return fmt.Errorf("complete purge Job: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrPurgeLeaseLost
+	}
+	return r.commit(ctx, tx)
+}
+
+func (r *PostgresRepository) HeartbeatPurge(ctx context.Context, jobID, token string) (time.Time, error) {
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return time.Time{}, err
+	}
+	var mediaID string
+	if err := tx.QueryRow(ctx, `SELECT media_id_snapshot::text FROM jobs WHERE id=$1 AND type='purge'`, jobID).Scan(&mediaID); errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrPurgeLeaseLost
+	} else if err != nil {
+		return time.Time{}, fmt.Errorf("read purge heartbeat Media: %w", err)
+	}
+	var deletedAt *time.Time
+	err = tx.QueryRow(ctx, `SELECT deleted_at FROM media WHERE id=$1 FOR UPDATE`, mediaID).Scan(&deletedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrPurgeLeaseLost
+	} else if err != nil {
+		return time.Time{}, fmt.Errorf("lock purge heartbeat Media: %w", err)
+	}
+	if deletedAt == nil {
+		return time.Time{}, ErrPurgeLeaseLost
+	}
+	var expires time.Time
+	if err := tx.QueryRow(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '2 minutes',updated_at=clock_timestamp()
+		WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()
+		RETURNING lease_expires_at`, jobID, token, mediaID).Scan(&expires); errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrPurgeLeaseLost
+	} else if err != nil {
+		return time.Time{}, fmt.Errorf("update purge heartbeat: %w", err)
+	}
+	if err := r.commit(ctx, tx); err != nil {
+		return time.Time{}, err
+	}
+	return expires.UTC(), nil
+}
+
+func (r *PostgresRepository) FinishPurgeAttempt(ctx context.Context, jobID, token, code string) error {
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return err
+	}
+	var mediaID string
+	if err := tx.QueryRow(ctx, `SELECT media_id_snapshot::text FROM jobs WHERE id=$1 AND type='purge'`, jobID).Scan(&mediaID); errors.Is(err, pgx.ErrNoRows) {
+		return ErrPurgeLeaseLost
+	} else if err != nil {
+		return fmt.Errorf("read purge attempt Media: %w", err)
+	}
+	var deletedAt *time.Time
+	err = tx.QueryRow(ctx, `SELECT deleted_at FROM media WHERE id=$1 FOR UPDATE`, mediaID).Scan(&deletedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrPurgeLeaseLost
+	} else if err != nil {
+		return fmt.Errorf("lock purge attempt Media: %w", err)
+	}
+	if deletedAt == nil {
+		return ErrPurgeLeaseLost
+	}
+	var attempts, maximum int
+	if err := tx.QueryRow(ctx, `SELECT attempts,max_attempts FROM jobs WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp() FOR UPDATE`, jobID, token, mediaID).Scan(&attempts, &maximum); errors.Is(err, pgx.ErrNoRows) {
+		return ErrPurgeLeaseLost
+	} else if err != nil {
+		return fmt.Errorf("lock purge attempt Job: %w", err)
+	}
+	status := "queued"
+	var finished any
+	now, err := databaseNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	delay, err := purgeRetryDelay(r.jitter, attempts)
+	if err != nil {
+		return newInvariant(err)
+	}
+	available := now.Add(delay)
+	if attempts >= maximum {
+		status, finished = "failed", now
+	}
+	tag, err := tx.Exec(ctx, `UPDATE jobs SET status=$3,lease_token=NULL,lease_expires_at=NULL,available_at=$4,finished_at=$5,error_code=$6,error_message='purge attempt failed',updated_at=clock_timestamp() WHERE id=$1 AND lease_token=$2 AND lease_expires_at>clock_timestamp()`, jobID, token, status, available, finished, code)
+	if err != nil {
+		return fmt.Errorf("finish purge attempt: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrPurgeLeaseLost
+	}
+	return r.commit(ctx, tx)
+}
+
 func (r *PostgresRepository) begin(ctx context.Context) (pgx.Tx, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {

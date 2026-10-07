@@ -99,8 +99,7 @@ func New(repository Repository, executors map[job.Type]Executor, options Options
 	owned := make(map[job.Type]Executor, len(executors))
 	registered := make([]job.Type, 0, len(executors))
 	for jobType, executor := range executors {
-		// Purge first-start acquisition is intentionally owned by Issue #16.
-		if jobType != job.TypeTransform || executor == nil {
+		if (jobType != job.TypeTransform && jobType != job.TypePurge) || executor == nil {
 			return nil, fmt.Errorf("worker executor registration: %w", job.ErrInvalid)
 		}
 		owned[jobType] = executor

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/animationprocessor"
@@ -14,7 +15,9 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
+	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
+	"github.com/kzkymur/no-more-cloud-photos/internal/purgeexecutor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/stillprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
@@ -88,12 +91,47 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("configure job worker: %w", err)
 	}
+	purgeService, err := medialifecycle.NewService(pool, cfg.FileBaseURL)
+	if err != nil {
+		return fmt.Errorf("configure purge service: %w", err)
+	}
+	purgeWorker, err := worker.New(purgeexecutor.Repository{Service: purgeService}, map[job.Type]worker.Executor{
+		job.TypePurge: purgeexecutor.Executor{Service: purgeService, Store: store},
+	}, worker.Options{DatabaseTimeout: 30 * time.Second}, logger)
+	if err != nil {
+		return fmt.Errorf("configure purge worker: %w", err)
+	}
 	logger.LogAttrs(ctx, slog.LevelInfo, "core Worker ready", cfg.LogAttrs()...)
-	if err := jobWorker.Run(ctx); err != nil {
+	if err := runWorkers(ctx, jobWorker, purgeWorker); err != nil {
 		return fmt.Errorf("run job worker: %w", err)
 	}
 	logger.Info("core Worker stopped")
 	return nil
+}
+
+type workerLoop interface{ Run(context.Context) error }
+
+func runWorkers(ctx context.Context, loops ...workerLoop) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, len(loops))
+	for _, loop := range loops {
+		go func(loop workerLoop) { results <- loop.Run(runCtx) }(loop)
+	}
+	var first error
+	for index := range loops {
+		err := <-results
+		if index == 0 {
+			cancel()
+		}
+		if err != nil && first == nil {
+			first = err
+		}
+		if err == nil && ctx.Err() == nil && first == nil {
+			first = fmt.Errorf("worker loop exited unexpectedly")
+		}
+	}
+	return first
 }
 
 func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, repository *job.Repository, store *storage.Store) (*transformexecutor.Executor, transformcapability.Envelope, error) {

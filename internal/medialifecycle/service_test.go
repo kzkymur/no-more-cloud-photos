@@ -76,6 +76,22 @@ func (r *stubRepository) StartPurge(_ context.Context, jobID string) (PurgeLease
 	return r.startResult, r.err
 }
 
+func (r *stubRepository) RunPurgeFileStep(context.Context, string, string, PurgeFileAction) (PurgeStepResult, error) {
+	r.calls++
+	return PurgeStepResult{}, r.err
+}
+
+func (r *stubRepository) FinalizePurge(context.Context, string, string) error {
+	r.calls++
+	return r.err
+}
+func (r *stubRepository) HeartbeatPurge(context.Context, string, string) (time.Time, error) {
+	return time.Time{}, r.err
+}
+func (r *stubRepository) FinishPurgeAttempt(context.Context, string, string, string) error {
+	return r.err
+}
+
 func TestServiceRejectsInvalidIDBeforeRepository(t *testing.T) {
 	repository := &stubRepository{}
 	service := newService(repository)

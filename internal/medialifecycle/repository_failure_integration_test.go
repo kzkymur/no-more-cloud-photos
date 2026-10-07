@@ -365,6 +365,20 @@ func TestLifecycleRepositoryIntegrationPostCommitResponseLossConverges(t *testin
 		if err != nil || !retry.Done {
 			t.Fatalf("purge progress retry = %#v, %v", retry, err)
 		}
+		finalFault := errors.New("purge finalizer commit response lost")
+		finalRepository := lifecycleServiceWithOnePostCommitFailure(pool, finalFault).repository.(*PostgresRepository)
+		if err := finalRepository.FinalizePurge(ctx, lease.JobID, lease.Token); err == nil {
+			t.Fatal("lost finalizer commit response reported success")
+		} else {
+			assertCommitOutcomeUnknown(t, err, finalFault)
+		}
+		if err := finalRepository.FinalizePurge(ctx, lease.JobID, lease.Token); err != nil {
+			t.Fatalf("finalizer convergence: %v", err)
+		}
+		var events int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM change_events WHERE media_id=$1 AND event_type='media_purged' AND reason='physical_purge'`, mediaID).Scan(&events); err != nil || events != 1 {
+			t.Fatalf("finalizer events=%d error=%v", events, err)
+		}
 	})
 }
 

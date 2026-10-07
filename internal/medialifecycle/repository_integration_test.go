@@ -641,6 +641,21 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	if len(manifest) != 3 || manifest[0].objectID != renditions[0] || manifest[1].objectID != renditions[1] || manifest[2].kind != "original" || manifest[2].objectID != originalID {
 		t.Fatalf("ordered manifest = %#v", manifest)
 	}
+	if err := repository.FinalizePurge(ctx, lease.JobID, integrationUUID(999)); !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("stale finalizer error = %#v", err)
+	}
+	if err := repository.FinalizePurge(ctx, lease.JobID, lease.Token); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("incomplete finalizer error = %#v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.FinishPurgeAttempt(ctx, lease.JobID, lease.Token, "worker_shutdown"); !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("expired finish error = %#v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '2 minutes' WHERE id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
 	root := t.TempDir()
 	for _, file := range manifest {
 		writePurgeFixture(t, root, file.path, []byte(strings.Repeat("x", int(file.size))))
@@ -693,6 +708,29 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	})
 	if err != nil || !done.Done || done.File != nil {
 		t.Fatalf("completed purge step = %#v, %v", done, err)
+	}
+	if err := repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token); err != nil {
+		t.Fatalf("finalize purge: %v", err)
+	}
+	if err := repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token); err != nil {
+		t.Fatalf("converge finalized purge: %v", err)
+	}
+	var mediaCount, originalCount, renditionCount, eventCount, progressCount, targetCount, transformNullOriginals int
+	var jobStatus string
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM media WHERE id=$1),
+		(SELECT count(*) FROM originals WHERE media_id=$1),
+		(SELECT count(*) FROM renditions WHERE media_id=$1),
+		(SELECT status FROM jobs WHERE id=$2),
+		(SELECT count(*) FROM change_events WHERE media_id=$1 AND event_type='media_purged' AND reason='physical_purge' AND payload IS NULL),
+		(SELECT count(*) FROM purge_file_progress WHERE job_id=$2),
+		(SELECT count(*) FROM job_targets jt JOIN jobs j ON j.id=jt.job_id WHERE j.media_id_snapshot=$1),
+		(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='transform' AND original_id IS NULL)`, mediaID, lease.JobID).Scan(
+		&mediaCount, &originalCount, &renditionCount, &jobStatus, &eventCount, &progressCount, &targetCount, &transformNullOriginals); err != nil {
+		t.Fatal(err)
+	}
+	if mediaCount != 0 || originalCount != 0 || renditionCount != 0 || jobStatus != "succeeded" || eventCount != 1 || progressCount != 3 || targetCount != 2 || transformNullOriginals != 2 {
+		t.Fatalf("final purge media=%d originals=%d renditions=%d job=%s events=%d progress=%d targets=%d null_originals=%d", mediaCount, originalCount, renditionCount, jobStatus, eventCount, progressCount, targetCount, transformNullOriginals)
 	}
 }
 
