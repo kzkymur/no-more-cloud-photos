@@ -82,6 +82,18 @@ BEGIN
        OR pg_catalog.has_table_privilege('nmcp_api','public.purge_file_progress','INSERT') THEN
         RAISE EXCEPTION 'unsafe runtime purge progress table ACL';
     END IF;
+    IF NOT pg_catalog.has_table_privilege('nmcp_api','public.schema_migrations','SELECT')
+       OR NOT pg_catalog.has_table_privilege('nmcp_worker','public.schema_migrations','SELECT')
+       OR pg_catalog.has_table_privilege('nmcp_api','public.schema_migrations','INSERT')
+       OR pg_catalog.has_table_privilege('nmcp_api','public.schema_migrations','UPDATE')
+       OR pg_catalog.has_table_privilege('nmcp_api','public.schema_migrations','DELETE')
+       OR pg_catalog.has_table_privilege('nmcp_api','public.schema_migrations','TRUNCATE')
+       OR pg_catalog.has_table_privilege('nmcp_worker','public.schema_migrations','INSERT')
+       OR pg_catalog.has_table_privilege('nmcp_worker','public.schema_migrations','UPDATE')
+       OR pg_catalog.has_table_privilege('nmcp_worker','public.schema_migrations','DELETE')
+       OR pg_catalog.has_table_privilege('nmcp_worker','public.schema_migrations','TRUNCATE') THEN
+        RAISE EXCEPTION 'runtime migration history ACL is not read-only';
+    END IF;
     IF NOT pg_catalog.has_function_privilege('nmcp_worker',completion,'EXECUTE')
        OR pg_catalog.has_function_privilege('nmcp_api',completion,'EXECUTE') THEN
         RAISE EXCEPTION 'unsafe purge completion EXECUTE ACL';
