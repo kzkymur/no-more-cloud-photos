@@ -454,6 +454,7 @@ func TestLifecycleRepositoryIntegrationStartPurgeCancelledGuard(t *testing.T) {
 }
 
 func TestLifecycleRepositoryIntegrationOrderedLifecycleRaces(t *testing.T) {
+	pool, setupService := integrationService(t)
 	tests := []struct {
 		name               string
 		mediaValue         int
@@ -481,7 +482,6 @@ func TestLifecycleRepositoryIntegrationOrderedLifecycleRaces(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			pool, setupService := integrationService(t)
 			mediaID := integrationUUID(test.mediaValue)
 			insertMedia(t, pool, mediaID, integrationUUID(test.mediaValue+100))
 			if test.initiallyDeleted {
@@ -521,7 +521,6 @@ func TestLifecycleRepositoryIntegrationOrderedLifecycleRaces(t *testing.T) {
 	t.Run("ordered duplicate delete emits one event", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		pool, _ := integrationService(t)
 		mediaID := integrationUUID(56)
 		insertMedia(t, pool, mediaID, integrationUUID(156))
 
@@ -555,10 +554,9 @@ func TestLifecycleRepositoryIntegrationOrderedLifecycleRaces(t *testing.T) {
 	t.Run("ordered duplicate enqueue returns one job", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		pool, service := integrationService(t)
 		mediaID := integrationUUID(57)
 		insertMedia(t, pool, mediaID, integrationUUID(157))
-		if _, err := service.Delete(ctx, mediaID); err != nil {
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -592,10 +590,9 @@ func TestLifecycleRepositoryIntegrationOrderedLifecycleRaces(t *testing.T) {
 	t.Run("direct purge insert waits for restore and rejects active media", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		pool, service := integrationService(t)
-		mediaID := integrationUUID(53)
-		insertMedia(t, pool, mediaID, integrationUUID(153))
-		if _, err := service.Delete(ctx, mediaID); err != nil {
+		mediaID := integrationUUID(58)
+		insertMedia(t, pool, mediaID, integrationUUID(158))
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -619,7 +616,7 @@ func TestLifecycleRepositoryIntegrationOrderedLifecycleRaces(t *testing.T) {
 		}
 		insertResult := make(chan error, 1)
 		go func() {
-			_, err := inserter.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, integrationUUID(953), mediaID)
+			_, err := inserter.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, integrationUUID(958), mediaID)
 			insertResult <- err
 		}()
 		deadline := time.Now().Add(5 * time.Second)
