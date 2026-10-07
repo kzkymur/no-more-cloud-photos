@@ -127,21 +127,19 @@ func TestReadServiceIntegration(t *testing.T) {
 		if _, err := pool.Exec(ctx, `UPDATE renditions SET is_current=false,purge_after=$2 WHERE id=$1`, renditionID, base); err != nil {
 			t.Fatal(err)
 		}
+		insertIntegrationRendition(t, pool, media[0], integrationUUID(4002), integrationUUID(3002), integrationUUID(2002), base.Add(3*time.Hour))
 		cleanupID := integrationUUID(3101)
-		if _, err := pool.Exec(ctx, `INSERT INTO rendition_cleanup_progress
-			(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
-			SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, cleanupID, renditionID); err != nil {
-			t.Fatal(err)
-		}
 		cleanupTx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = cleanupTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID); err == nil {
-			_, err = cleanupTx.Exec(ctx, `UPDATE rendition_cleanup_progress SET disposition='missing' WHERE id=$1`, cleanupID)
+		if _, err = cleanupTx.Exec(ctx, `SET LOCAL ROLE nmcp_worker_runtime`); err == nil {
+			_, err = cleanupTx.Exec(ctx, `INSERT INTO rendition_cleanup_progress
+				(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
+				SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, cleanupID, renditionID)
 		}
 		if err == nil {
-			_, err = cleanupTx.Exec(ctx, `DELETE FROM renditions WHERE id=$1`, renditionID)
+			_, err = cleanupTx.Exec(ctx, `SELECT nmcp_complete_rendition_cleanup($1,$2,$3,'missing')`, cleanupID, media[0].ID, renditionID)
 		}
 		if err != nil {
 			_ = cleanupTx.Rollback(ctx)

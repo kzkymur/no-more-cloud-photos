@@ -42,6 +42,22 @@ func TestRunWorkersRejectsUnexpectedCleanExit(t *testing.T) {
 	}
 }
 
+func TestRunWorkersRejectsUnexpectedCleanExitFromThirdLoop(t *testing.T) {
+	cancelled := make(chan struct{}, 2)
+	wait := loopFunc(func(ctx context.Context) error {
+		<-ctx.Done()
+		cancelled <- struct{}{}
+		return nil
+	})
+	err := runWorkers(context.Background(), wait, wait, loopFunc(func(context.Context) error { return nil }))
+	if err == nil {
+		t.Fatal("clean early exit from third loop accepted")
+	}
+	if len(cancelled) != 2 {
+		t.Fatalf("cancelled siblings=%d", len(cancelled))
+	}
+}
+
 func (loader *startupProfileLoader) ClaimableTransformProfiles(context.Context) ([]profile.Definition, error) {
 	loader.called = true
 	return loader.definitions, loader.err

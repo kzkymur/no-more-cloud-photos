@@ -18,6 +18,7 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 	"github.com/kzkymur/no-more-cloud-photos/internal/purgeexecutor"
+	"github.com/kzkymur/no-more-cloud-photos/internal/renditioncleanup"
 	"github.com/kzkymur/no-more-cloud-photos/internal/stillprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
@@ -101,9 +102,13 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("configure purge worker: %w", err)
 	}
+	cleanupRunner, err := renditioncleanup.New(purgeService, store, renditioncleanup.Options{}, logger)
+	if err != nil {
+		return fmt.Errorf("configure rendition cleanup: %w", err)
+	}
 	logger.LogAttrs(ctx, slog.LevelInfo, "core Worker ready", cfg.LogAttrs()...)
-	if err := runWorkers(ctx, jobWorker, purgeWorker); err != nil {
-		return fmt.Errorf("run job worker: %w", err)
+	if err := runWorkers(ctx, jobWorker, purgeWorker, cleanupRunner); err != nil {
+		return fmt.Errorf("run core workers: %w", err)
 	}
 	logger.Info("core Worker stopped")
 	return nil

@@ -1116,7 +1116,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			if _, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID); err == nil {
 				_, err = tx.Exec(ctx, `INSERT INTO renditions
 					(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height,processor_audit)
-					VALUES ($1,$2,$3,'ignored',true,$4,'image/avif',9,$5,1,1,'{"fixture":"cleanup-guard"}')`,
+					VALUES ($1,$2,$3,'cleanup-standard',true,$4,'image/avif',9,$5,1,1,'{"fixture":"cleanup-guard"}')`,
 					renditionID, mediaID, targetID, "renditions/88/cleanup/target/output.avif", strings.Repeat("9", 64))
 			}
 			if err == nil {
@@ -1163,6 +1163,29 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if !securityDefiner || !ownerMatches || !ownerCannotLogin || !fixedSearchPath || !roleCanExecute || !publicCannotExecute || !roleCannotUpdate {
 			t.Fatalf("ordered purge boundary security definer=%t owner=%t no_login=%t search_path=%t role_execute=%t public_revoked=%t no_update=%t",
 				securityDefiner, ownerMatches, ownerCannotLogin, fixedSearchPath, roleCanExecute, publicCannotExecute, roleCannotUpdate)
+		}
+		var cleanupDefiner, cleanupOwner, cleanupSearchPath, cleanupWorkerExecute, cleanupPublicRevoked, cleanupRuntimeRevoked bool
+		var workerProgressLeast, runtimeProgressLeast, noDirectRenditionDelete, cleanupOwnerRights bool
+		if err := pool.QueryRow(ctx, `SELECT p.prosecdef,
+			pg_catalog.pg_get_userbyid(p.proowner)='nmcp_purge_function_owner',
+			array_to_string(p.proconfig,',') LIKE 'search_path='||current_schema()||', pg_catalog, pg_temp%',
+			has_function_privilege('nmcp_worker_runtime',p.oid,'EXECUTE'),
+			NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) WHERE grantee=0 AND privilege_type='EXECUTE'),
+			NOT has_function_privilege('nmcp_runtime',p.oid,'EXECUTE'),
+			has_table_privilege('nmcp_worker_runtime','rendition_cleanup_progress','SELECT') AND has_table_privilege('nmcp_worker_runtime','rendition_cleanup_progress','INSERT')
+				AND NOT has_table_privilege('nmcp_worker_runtime','rendition_cleanup_progress','UPDATE') AND NOT has_table_privilege('nmcp_worker_runtime','rendition_cleanup_progress','DELETE'),
+			has_table_privilege('nmcp_runtime','rendition_cleanup_progress','SELECT') AND NOT has_table_privilege('nmcp_runtime','rendition_cleanup_progress','INSERT')
+				AND NOT has_table_privilege('nmcp_runtime','rendition_cleanup_progress','UPDATE') AND NOT has_table_privilege('nmcp_runtime','rendition_cleanup_progress','DELETE'),
+			NOT has_table_privilege('nmcp_runtime','renditions','DELETE') AND NOT has_table_privilege('nmcp_worker_runtime','renditions','DELETE'),
+			has_table_privilege('nmcp_purge_function_owner','renditions','SELECT') AND has_table_privilege('nmcp_purge_function_owner','renditions','DELETE')
+			FROM pg_catalog.pg_proc p WHERE p.oid='nmcp_complete_rendition_cleanup(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)'::regprocedure`).Scan(
+			&cleanupDefiner, &cleanupOwner, &cleanupSearchPath, &cleanupWorkerExecute, &cleanupPublicRevoked, &cleanupRuntimeRevoked,
+			&workerProgressLeast, &runtimeProgressLeast, &noDirectRenditionDelete, &cleanupOwnerRights); err != nil {
+			t.Fatal(err)
+		}
+		if !cleanupDefiner || !cleanupOwner || !cleanupSearchPath || !cleanupWorkerExecute || !cleanupPublicRevoked || !cleanupRuntimeRevoked || !workerProgressLeast || !runtimeProgressLeast || !noDirectRenditionDelete || !cleanupOwnerRights {
+			t.Fatalf("cleanup boundary definer=%t owner=%t search_path=%t worker_execute=%t public_revoked=%t runtime_revoked=%t worker_progress=%t runtime_progress=%t no_rendition_delete=%t owner_rights=%t",
+				cleanupDefiner, cleanupOwner, cleanupSearchPath, cleanupWorkerExecute, cleanupPublicRevoked, cleanupRuntimeRevoked, workerProgressLeast, runtimeProgressLeast, noDirectRenditionDelete, cleanupOwnerRights)
 		}
 		var guardsDefiner, guardsOwner, guardOwnerNoLogin, guardOwnerIsolated, guardsSearchPath, guardsPublicRevoked, guardsRuntimeRevoked, guardOwnerRights, guardOwnerNoDelete, guardOwnerEventRead, guardOwnerEventNoWrite, guardRuntimeNoRights bool
 		if err := pool.QueryRow(ctx, `SELECT
@@ -1341,14 +1364,31 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err := pool.Exec(ctx, `UPDATE renditions SET purge_after=clock_timestamp()-interval '1 second' WHERE id=$1`, renditionID); err != nil {
 			t.Fatal(err)
 		}
-		cleanupID := newUUIDv4(t)
-		if err := execAsApp(`INSERT INTO rendition_cleanup_progress
-			(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
-			SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, cleanupID, renditionID); err != nil {
-			t.Fatalf("application role snapshot due cleanup: %v", err)
+		replacementTargetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		replacementRenditionID := newUUIDv4(t)
+		if err := func() error {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx)
+			if _, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, replacementTargetID); err == nil {
+				_, err = tx.Exec(ctx, `INSERT INTO renditions
+					(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height,processor_audit)
+					VALUES ($1,$2,$3,'cleanup-standard',true,$4,'image/avif',9,$5,1,1,'{"fixture":"cleanup-replacement"}')`,
+					replacementRenditionID, mediaID, replacementTargetID, "renditions/88/cleanup/replacement/output.avif", strings.Repeat("a", 64))
+			}
+			if err == nil {
+				_, err = tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=(SELECT job_id FROM job_targets WHERE id=$1)`, replacementTargetID)
+			}
+			if err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}(); err != nil {
+			t.Fatalf("publish cleanup replacement: %v", err)
 		}
-		expectExecError(t, pool, `UPDATE rendition_cleanup_progress SET disposition='missing' WHERE id=$1`, cleanupID)
-		expectAppError(`UPDATE rendition_cleanup_progress SET disposition='missing' WHERE id=$1`, cleanupID)
+		cleanupID := newUUIDv4(t)
 		expectExecError(t, pool, `DELETE FROM renditions WHERE id=$1`, renditionID)
 		expectAppError(`DELETE FROM renditions WHERE id=$1`, renditionID)
 		cleanupTx, err := pool.Begin(ctx)
@@ -1356,13 +1396,12 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatal(err)
 		}
 		if _, err = cleanupTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
-			_, err = cleanupTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID)
+			_, err = cleanupTx.Exec(ctx, `INSERT INTO rendition_cleanup_progress
+				(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
+				SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, cleanupID, renditionID)
 		}
 		if err == nil {
-			_, err = cleanupTx.Exec(ctx, `UPDATE rendition_cleanup_progress SET disposition='missing' WHERE id=$1`, cleanupID)
-		}
-		if err == nil {
-			_, err = cleanupTx.Exec(ctx, `DELETE FROM renditions WHERE id=$1`, renditionID)
+			_, err = cleanupTx.Exec(ctx, `SELECT nmcp_complete_rendition_cleanup($1,$2,$3,'missing')`, cleanupID, mediaID, renditionID)
 		}
 		if err != nil {
 			_ = cleanupTx.Rollback(ctx)

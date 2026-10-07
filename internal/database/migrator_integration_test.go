@@ -38,8 +38,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 15 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version fifteen", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 16 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version sixteen", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,8 +62,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 15 || status.ExpectedVersion != 15 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version fifteen", status)
+		if status.CurrentVersion != 16 || status.ExpectedVersion != 16 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version sixteen", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
@@ -311,7 +311,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 15 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 16 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
@@ -640,7 +640,7 @@ func TestMigratorIntegration(t *testing.T) {
 			if err := pool.QueryRow(raceCtx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&migratedVersion); err != nil {
 				t.Fatal(err)
 			}
-			if !deleted || migratedVersion != 15 {
+			if !deleted || migratedVersion != 16 {
 				t.Fatalf("converged state deleted=%t version=%d", deleted, migratedVersion)
 			}
 		})

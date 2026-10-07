@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -16,6 +17,7 @@ import (
 )
 
 const rollbackBudget = 5 * time.Second
+const cleanupDrainBudget = 30 * time.Second
 
 const (
 	purgeSchedulerBatchMax = 50
@@ -36,6 +38,9 @@ type PostgresRepository struct {
 	beforeReclaimCommit   func(context.Context) error
 	afterPurgeFileAction  func(context.Context, pgx.Tx) error
 	beforeHeartbeatUpdate func(context.Context, pgx.Tx) error
+	cleanupMu             sync.Mutex
+	cleanupBatch          []cleanupCandidate
+	cleanupBatchActive    bool
 }
 
 func NewPostgresRepository(pool *pgxpool.Pool, fileBaseURL string) (*PostgresRepository, error) {
@@ -288,6 +293,203 @@ func (r *PostgresRepository) DatabaseNow(ctx context.Context) (time.Time, error)
 		return time.Time{}, err
 	}
 	return now, nil
+}
+
+type cleanupCandidate struct {
+	ID, MediaID, TargetID, RelativePath string
+	SizeBytes                           int64
+	PurgeAfter                          time.Time
+}
+
+// CleanupNextRendition selects from a read-only repeatable-read snapshot, then
+// adopts all destructive locks and revalidates the exact snapshot before
+// invoking action. A committed terminal progress row is the retry witness for
+// an uncertain commit response.
+func (r *PostgresRepository) CleanupNextRendition(ctx context.Context, preferredID string, excludedIDs []string, action func(context.Context, string, string, int64) (bool, error)) (string, error) {
+	if action == nil {
+		return "", newInvariant(errors.New("rendition cleanup action is required"))
+	}
+	r.cleanupMu.Lock()
+	defer r.cleanupMu.Unlock()
+	excluded := make(map[string]struct{}, len(excludedIDs))
+	for _, id := range excludedIDs {
+		excluded[id] = struct{}{}
+	}
+	if preferredID == "" && r.cleanupBatchActive {
+		for index, cached := range r.cleanupBatch {
+			if _, skip := excluded[cached.ID]; skip {
+				continue
+			}
+			r.cleanupBatch = append(r.cleanupBatch[:index], r.cleanupBatch[index+1:]...)
+			return r.cleanupCandidate(ctx, cached, action)
+		}
+		r.cleanupBatch = nil
+		r.cleanupBatchActive = false
+		return "", nil
+	}
+	scan, err := r.begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer rollback(ctx, scan)
+	if _, err := scan.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`); err != nil {
+		return "", fmt.Errorf("start rendition cleanup snapshot: %w", err)
+	}
+	if preferredID != "" {
+		var converged bool
+		if err := scan.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM rendition_cleanup_progress p
+			WHERE p.rendition_id=$1 AND p.disposition IN ('deleted','missing')
+			  AND NOT EXISTS (SELECT 1 FROM renditions r WHERE r.id=p.rendition_id))`, preferredID).Scan(&converged); err != nil {
+			return "", fmt.Errorf("verify rendition cleanup outcome: %w", err)
+		}
+		if converged {
+			if err := scan.Commit(ctx); err != nil {
+				return preferredID, err
+			}
+			return preferredID, nil
+		}
+	}
+	var candidates []cleanupCandidate
+	var cutoff time.Time
+	if err := scan.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&cutoff); err != nil {
+		return "", fmt.Errorf("capture rendition cleanup cutoff: %w", err)
+	}
+	rows, err := scan.Query(ctx, `SELECT r.id::text,r.media_id::text,r.job_target_id::text,r.relative_path,r.size_bytes,r.purge_after
+		FROM renditions r
+		JOIN media m ON m.id=r.media_id
+		JOIN job_targets candidate_target ON candidate_target.id=r.job_target_id AND candidate_target.status='succeeded'
+		JOIN jobs candidate_job ON candidate_job.id=candidate_target.job_id AND candidate_job.type='transform' AND candidate_job.media_id_snapshot=r.media_id
+		JOIN profiles candidate_profile ON candidate_profile.id=candidate_target.profile_id AND candidate_profile.key=r.profile_key
+		JOIN renditions current_rendition ON current_rendition.media_id=r.media_id AND current_rendition.profile_key=r.profile_key AND current_rendition.is_current
+		JOIN job_targets current_target ON current_target.id=current_rendition.job_target_id AND current_target.status='succeeded'
+		JOIN jobs current_job ON current_job.id=current_target.job_id AND current_job.type='transform' AND current_job.media_id_snapshot=r.media_id
+		JOIN profiles current_profile ON current_profile.id=current_target.profile_id AND current_profile.key=current_rendition.profile_key AND current_profile.version>=candidate_profile.version
+		WHERE NOT r.is_current AND r.purge_after IS NOT NULL AND r.purge_after<=$1
+		  AND ($2='' OR r.id=$2::uuid)
+		  AND NOT EXISTS (SELECT 1 FROM jobs purge_job WHERE purge_job.type='purge' AND purge_job.media_id_snapshot=r.media_id AND purge_job.started_at IS NOT NULL)
+		ORDER BY r.purge_after,r.media_id,r.id LIMIT 50`, cutoff, preferredID)
+	if err != nil {
+		return "", fmt.Errorf("select rendition cleanup candidates: %w", err)
+	}
+	for rows.Next() {
+		var candidate cleanupCandidate
+		if err := rows.Scan(&candidate.ID, &candidate.MediaID, &candidate.TargetID, &candidate.RelativePath, &candidate.SizeBytes, &candidate.PurgeAfter); err != nil {
+			rows.Close()
+			return "", fmt.Errorf("read rendition cleanup candidate: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", fmt.Errorf("read rendition cleanup candidates: %w", err)
+	}
+	rows.Close()
+	if len(candidates) == 0 {
+		if preferredID != "" {
+			return preferredID, newInvariant(errors.New("preferred rendition cleanup outcome is not resolvable"))
+		}
+		if err := scan.Commit(ctx); err != nil {
+			return "", err
+		}
+		return "", nil
+	}
+	if err := scan.Commit(ctx); err != nil {
+		return "", err
+	}
+	if preferredID != "" {
+		return r.cleanupCandidate(ctx, candidates[0], action)
+	}
+	r.cleanupBatch = candidates
+	r.cleanupBatchActive = true
+	for index, candidate := range r.cleanupBatch {
+		if _, skip := excluded[candidate.ID]; skip {
+			continue
+		}
+		r.cleanupBatch = append(r.cleanupBatch[:index], r.cleanupBatch[index+1:]...)
+		return r.cleanupCandidate(ctx, candidate, action)
+	}
+	r.cleanupBatch = nil
+	r.cleanupBatchActive = false
+	return "", nil
+}
+
+func (r *PostgresRepository) cleanupCandidate(ctx context.Context, candidate cleanupCandidate, action func(context.Context, string, string, int64) (bool, error)) (string, error) {
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return candidate.ID, err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return candidate.ID, err
+	}
+	if _, err := lockMedia(ctx, tx, candidate.MediaID); err != nil {
+		return candidate.ID, err
+	}
+	jobs, err := lockPurgeJobs(ctx, tx, candidate.MediaID)
+	if err != nil {
+		return candidate.ID, err
+	}
+	for _, job := range jobs {
+		if job.StartedAt != nil {
+			return candidate.ID, r.commit(ctx, tx)
+		}
+	}
+	var exact cleanupCandidate
+	err = tx.QueryRow(ctx, `SELECT id::text,media_id::text,job_target_id::text,relative_path,size_bytes,purge_after
+		FROM renditions WHERE id=$1 AND media_id=$2 FOR UPDATE`, candidate.ID, candidate.MediaID).Scan(
+		&exact.ID, &exact.MediaID, &exact.TargetID, &exact.RelativePath, &exact.SizeBytes, &exact.PurgeAfter)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return candidate.ID, r.commit(ctx, tx)
+	}
+	if err != nil {
+		return candidate.ID, fmt.Errorf("lock rendition cleanup candidate: %w", err)
+	}
+	var eligible bool
+	if err := tx.QueryRow(ctx, `SELECT r.job_target_id=$2 AND r.relative_path=$3 AND r.size_bytes=$4 AND r.purge_after=$5
+		  AND NOT r.is_current AND r.purge_after<=clock_timestamp()
+		  AND EXISTS (
+			SELECT 1 FROM job_targets ct JOIN jobs cj ON cj.id=ct.job_id
+			JOIN profiles cp ON cp.id=ct.profile_id
+			JOIN renditions current_rendition ON current_rendition.media_id=r.media_id AND current_rendition.profile_key=r.profile_key AND current_rendition.is_current
+			JOIN job_targets nt ON nt.id=current_rendition.job_target_id JOIN jobs nj ON nj.id=nt.job_id JOIN profiles np ON np.id=nt.profile_id
+			WHERE ct.id=r.job_target_id AND ct.status='succeeded' AND cj.type='transform' AND cj.media_id_snapshot=r.media_id AND cp.key=r.profile_key
+			  AND nt.status='succeeded' AND nj.type='transform' AND nj.media_id_snapshot=r.media_id AND np.key=r.profile_key AND np.version>=cp.version)
+		FROM renditions r WHERE r.id=$1`, candidate.ID, candidate.TargetID, candidate.RelativePath, candidate.SizeBytes, candidate.PurgeAfter).Scan(&eligible); err != nil {
+		return candidate.ID, fmt.Errorf("recheck rendition cleanup candidate: %w", err)
+	}
+	if !eligible {
+		return candidate.ID, r.commit(ctx, tx)
+	}
+	progressID, err := r.newID()
+	if err != nil {
+		return candidate.ID, fmt.Errorf("generate rendition cleanup progress ID: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO rendition_cleanup_progress
+		(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`, progressID, candidate.MediaID, candidate.ID, candidate.TargetID, candidate.RelativePath, candidate.SizeBytes, candidate.PurgeAfter); err != nil {
+		return candidate.ID, fmt.Errorf("insert rendition cleanup progress: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return candidate.ID, err
+	}
+	missing, err := action(ctx, candidate.ID, candidate.RelativePath, candidate.SizeBytes)
+	if err != nil {
+		return candidate.ID, err
+	}
+	disposition := "deleted"
+	if missing {
+		disposition = "missing"
+	}
+	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupDrainBudget)
+	defer cancel()
+	if _, err := tx.Exec(drainCtx, `SELECT nmcp_complete_rendition_cleanup($1,$2,$3,$4)`, progressID, candidate.MediaID, candidate.ID, disposition); err != nil {
+		return candidate.ID, fmt.Errorf("complete rendition cleanup: %w", err)
+	}
+	if err := r.commit(drainCtx, tx); err != nil {
+		return candidate.ID, err
+	}
+	return candidate.ID, nil
 }
 
 func (r *PostgresRepository) DiscoverPurgeJobs(ctx context.Context, limit int) ([]string, error) {

@@ -31,8 +31,13 @@ type lifecycleRepository interface {
 	FinishPurgeAttempt(context.Context, string, string, string) error
 }
 
+type cleanupRepository interface {
+	CleanupNextRendition(context.Context, string, []string, func(context.Context, string, string, int64) (bool, error)) (string, error)
+}
+
 type Service struct {
 	repository lifecycleRepository
+	cleanup    cleanupRepository
 	dbBudget   time.Duration
 }
 
@@ -41,11 +46,34 @@ func NewService(pool *pgxpool.Pool, fileBaseURL string) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{repository: repository, dbBudget: defaultDatabaseBudget}, nil
+	return &Service{repository: repository, cleanup: repository, dbBudget: defaultDatabaseBudget}, nil
 }
 
 func newService(repository lifecycleRepository) *Service {
-	return &Service{repository: repository, dbBudget: defaultDatabaseBudget}
+	service := &Service{repository: repository, dbBudget: defaultDatabaseBudget}
+	service.cleanup, _ = repository.(cleanupRepository)
+	return service
+}
+
+// CleanupNextRendition executes one exact cleanup operation. Filesystem work is
+// synchronous inside the database transaction so its locks cover unlink and
+// parent-directory durability.
+func (s *Service) CleanupNextRendition(ctx context.Context, preferredID string, excludedIDs []string, unlink func(context.Context, string, string, int64) (bool, error)) (string, error) {
+	if s.cleanup == nil || unlink == nil {
+		return "", newInvariant(errors.New("rendition cleanup is not configured"))
+	}
+	if preferredID != "" && !readapi.IsUUIDv4(preferredID) {
+		return "", newInvalidID()
+	}
+	for _, id := range excludedIDs {
+		if !readapi.IsUUIDv4(id) {
+			return "", newInvalidID()
+		}
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	id, err := s.cleanup.CleanupNextRendition(dbCtx, preferredID, excludedIDs, unlink)
+	return id, classifyError(err)
 }
 
 func (s *Service) Delete(ctx context.Context, mediaID string) (DeleteResult, error) {
