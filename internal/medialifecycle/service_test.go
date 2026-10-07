@@ -14,6 +14,7 @@ type stubRepository struct {
 	deleteResult  DeleteResult
 	restoreResult RestoreResult
 	enqueueResult EnqueueResult
+	startResult   PurgeLease
 	err           error
 	calls         int
 }
@@ -33,6 +34,11 @@ func (r *stubRepository) EnqueuePurge(context.Context, string) (EnqueueResult, e
 	return r.enqueueResult, r.err
 }
 
+func (r *stubRepository) StartPurge(context.Context, string) (PurgeLease, error) {
+	r.calls++
+	return r.startResult, r.err
+}
+
 func TestServiceRejectsInvalidIDBeforeRepository(t *testing.T) {
 	repository := &stubRepository{}
 	service := newService(repository)
@@ -45,8 +51,18 @@ func TestServiceRejectsInvalidIDBeforeRepository(t *testing.T) {
 	if _, err := service.EnqueuePurge(context.Background(), "not-a-uuid"); !IsKind(err, KindInvalidRequest) {
 		t.Fatalf("EnqueuePurge error = %#v", err)
 	}
+	if _, err := service.StartPurge(context.Background(), "not-a-uuid"); !IsKind(err, KindInvalidRequest) {
+		t.Fatalf("StartPurge error = %#v", err)
+	}
 	if repository.calls != 0 {
 		t.Fatalf("repository calls = %d, want 0", repository.calls)
+	}
+}
+
+func TestServicePreservesNoPurgeWork(t *testing.T) {
+	repository := &stubRepository{err: ErrNoPurgeWork}
+	if _, err := newService(repository).StartPurge(context.Background(), unitMediaID); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("StartPurge error = %#v", err)
 	}
 }
 

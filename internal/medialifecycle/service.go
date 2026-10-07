@@ -18,6 +18,7 @@ type lifecycleRepository interface {
 	Delete(context.Context, string) (DeleteResult, error)
 	Restore(context.Context, string) (RestoreResult, error)
 	EnqueuePurge(context.Context, string) (EnqueueResult, error)
+	StartPurge(context.Context, string) (PurgeLease, error)
 }
 
 type Service struct {
@@ -67,13 +68,23 @@ func (s *Service) EnqueuePurge(ctx context.Context, mediaID string) (EnqueueResu
 	return result, classifyError(err)
 }
 
+func (s *Service) StartPurge(ctx context.Context, jobID string) (PurgeLease, error) {
+	if !readapi.IsUUIDv4(jobID) {
+		return PurgeLease{}, newInvalidID()
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	lease, err := s.repository.StartPurge(dbCtx, jobID)
+	return lease, classifyError(err)
+}
+
 func classifyError(err error) error {
 	if err == nil {
 		return nil
 	}
 	var semantic *SemanticError
 	var unknown *CommitOutcomeUnknown
-	if errors.As(err, &semantic) || errors.As(err, &unknown) {
+	if errors.Is(err, ErrNoPurgeWork) || errors.As(err, &semantic) || errors.As(err, &unknown) {
 		return err
 	}
 	var rolledBack *CommitRolledBack

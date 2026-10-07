@@ -176,6 +176,226 @@ func TestLifecycleRepositoryIntegrationStartedAndFailedConflicts(t *testing.T) {
 	}
 }
 
+func TestLifecycleRepositoryIntegrationStartPurgeLeaseAndEligibility(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	mediaID := integrationUUID(40)
+	insertMedia(t, pool, mediaID, integrationUUID(140))
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()+interval '1 hour',updated_at=clock_timestamp() WHERE id=$1`, enqueued.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.StartPurge(ctx, enqueued.Job.ID); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("future StartPurge error = %#v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 second',updated_at=clock_timestamp() WHERE id=$1`, enqueued.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var before time.Time
+	if err := pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after time.Time
+	if err := pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if first.JobID != enqueued.Job.ID || first.MediaID != mediaID || first.Attempts != 1 ||
+		first.MaxAttempts != InitialPurgeMaxAttempts || !readapi.IsUUIDv4(first.Token) ||
+		first.LeaseExpiresAt.Before(before.Add(DefaultPurgeLeaseDuration)) ||
+		first.LeaseExpiresAt.After(after.Add(DefaultPurgeLeaseDuration)) {
+		t.Fatalf("first purge lease = %#v, clock bounds %v..%v", first, before, after)
+	}
+	if _, err := service.StartPurge(ctx, enqueued.Job.ID); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("running StartPurge error = %#v", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE jobs SET status='queued',lease_token=NULL,lease_expires_at=NULL,
+			available_at=clock_timestamp()-interval '1 second',updated_at=clock_timestamp()
+		WHERE id=$1`, enqueued.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Attempts != 2 || second.Token == first.Token || !second.StartedAt.Equal(first.StartedAt) {
+		t.Fatalf("retry purge lease = %#v, first = %#v", second, first)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE jobs SET status='queued',lease_token=NULL,lease_expires_at=NULL,
+			available_at=clock_timestamp()-interval '1 second',updated_at=clock_timestamp()
+		WHERE id=$1`, enqueued.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	third, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil || third.Attempts != InitialPurgeMaxAttempts || !third.StartedAt.Equal(first.StartedAt) {
+		t.Fatalf("final-budget purge lease = %#v, %v", third, err)
+	}
+
+	missingMediaID := integrationUUID(41)
+	insertMedia(t, pool, missingMediaID, integrationUUID(141))
+	if _, err := service.Delete(ctx, missingMediaID); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := service.EnqueuePurge(ctx, missingMediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM media WHERE id=$1`, missingMediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.StartPurge(ctx, missing.Job.ID); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("missing Media StartPurge error = %#v", err)
+	}
+	if _, err := service.StartPurge(ctx, integrationUUID(999)); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("missing Job StartPurge error = %#v", err)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationStartPurgeRestoreRaces(t *testing.T) {
+	t.Run("restore wins", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool, service := integrationService(t)
+		mediaID := integrationUUID(42)
+		insertMedia(t, pool, mediaID, integrationUUID(142))
+		if _, err := service.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := service.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		restoreTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restoreTx.Rollback(context.Background())
+		if _, err := restoreTx.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		startConn, startService, startPID := connectionService(t, ctx, pool)
+		defer startConn.Release()
+		result := make(chan error, 1)
+		go func() {
+			_, err := startService.StartPurge(ctx, enqueued.Job.ID)
+			result <- err
+		}()
+		awaitLockWait(t, ctx, pool, startPID)
+
+		now := time.Now().UTC()
+		if _, err := restoreTx.Exec(ctx, `SELECT id FROM jobs WHERE id=$1 FOR UPDATE`, enqueued.Job.ID); err != nil {
+			t.Fatalf("StartPurge locked Job before Media: %v", err)
+		}
+		if _, err := restoreTx.Exec(ctx, `UPDATE jobs SET status='cancelled',finished_at=$2,cancelled_at=$2,cancel_reason='media_restored',updated_at=$2 WHERE id=$1`, enqueued.Job.ID, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := restoreTx.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		if err := restoreTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-result; !errors.Is(err, ErrNoPurgeWork) {
+			t.Fatalf("StartPurge after restore = %#v", err)
+		}
+		assertJobState(t, pool, enqueued.Job.ID, "cancelled", 0, false)
+	})
+
+	t.Run("start wins", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool, setupService := integrationService(t)
+		mediaID := integrationUUID(43)
+		insertMedia(t, pool, mediaID, integrationUUID(143))
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := setupService.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		blocker, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer blocker.Rollback(context.Background())
+		if _, err := blocker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		startConn, startService, startPID := connectionService(t, ctx, pool)
+		defer startConn.Release()
+		restoreConn, restoreService, restorePID := connectionService(t, ctx, pool)
+		defer restoreConn.Release()
+		startResult := make(chan error, 1)
+		go func() {
+			_, err := startService.StartPurge(ctx, enqueued.Job.ID)
+			startResult <- err
+		}()
+		awaitLockWait(t, ctx, pool, startPID)
+		restoreResult := make(chan error, 1)
+		go func() {
+			_, err := restoreService.Restore(ctx, mediaID)
+			restoreResult <- err
+		}()
+		awaitLockWait(t, ctx, pool, restorePID)
+		if err := blocker.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-startResult; err != nil {
+			t.Fatalf("winning StartPurge error = %v", err)
+		}
+		if err := <-restoreResult; !errorWithJob(err, CodePurgeAlreadyStarted, enqueued.Job.ID) {
+			t.Fatalf("losing Restore error = %#v", err)
+		}
+		assertJobState(t, pool, enqueued.Job.ID, "running", 1, true)
+	})
+}
+
+func TestLifecycleRepositoryIntegrationStartPurgeGuards(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	mediaID := integrationUUID(44)
+	insertMedia(t, pool, mediaID, integrationUUID(144))
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='test',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.StartPurge(ctx, enqueued.Job.ID); !IsKind(err, KindDatabaseUnavailable) {
+		t.Fatalf("maintenance StartPurge error = %#v", err)
+	}
+	assertJobState(t, pool, enqueued.Job.ID, "queued", 0, false)
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Restore(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.StartPurge(ctx, enqueued.Job.ID); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("cancelled StartPurge error = %#v", err)
+	}
+}
+
 func TestLifecycleRepositoryIntegrationConcurrentDeleteAndEnqueue(t *testing.T) {
 	t.Run("concurrent delete emits one event", func(t *testing.T) {
 		ctx := context.Background()
@@ -384,6 +604,52 @@ func integrationService(t *testing.T) (*pgxpool.Pool, *Service) {
 		t.Fatal(err)
 	}
 	return pool, service
+}
+
+func connectionService(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, *Service, int32) {
+	t.Helper()
+	connection, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pid int32
+	if err := connection.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		connection.Release()
+		t.Fatal(err)
+	}
+	repository := &PostgresRepository{db: connection, fileBaseURL: "https://files.example/files/", newID: newUUIDv4}
+	return connection, newService(repository), pid
+}
+
+func awaitLockWait(t *testing.T, ctx context.Context, pool *pgxpool.Pool, pid int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(wait_event_type='Lock',false) FROM pg_stat_activity WHERE pid=$1`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backend %d did not wait for a lock", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertJobState(t *testing.T, pool *pgxpool.Pool, jobID, wantStatus string, wantAttempts int, wantStarted bool) {
+	t.Helper()
+	var status string
+	var attempts int
+	var startedAt *time.Time
+	if err := pool.QueryRow(context.Background(), `SELECT status,attempts,started_at FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts, &startedAt); err != nil {
+		t.Fatal(err)
+	}
+	if status != wantStatus || attempts != wantAttempts || (startedAt != nil) != wantStarted {
+		t.Fatalf("job state = %s attempts=%d started_at=%v, want %s/%d started=%v", status, attempts, startedAt, wantStatus, wantAttempts, wantStarted)
+	}
 }
 
 func integrationPool(t *testing.T) *pgxpool.Pool {

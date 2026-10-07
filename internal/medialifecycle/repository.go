@@ -201,6 +201,79 @@ func (r *PostgresRepository) EnqueuePurge(ctx context.Context, mediaID string) (
 	return EnqueueResult{Job: job, Disposition: EnqueueCreated}, nil
 }
 
+func (r *PostgresRepository) StartPurge(ctx context.Context, jobID string) (PurgeLease, error) {
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return PurgeLease{}, err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return PurgeLease{}, err
+	}
+
+	var mediaID string
+	if err := tx.QueryRow(ctx, `SELECT media_id_snapshot::text FROM jobs WHERE id=$1`, jobID).Scan(&mediaID); errors.Is(err, pgx.ErrNoRows) {
+		return PurgeLease{}, ErrNoPurgeWork
+	} else if err != nil {
+		return PurgeLease{}, fmt.Errorf("read purge media snapshot: %w", err)
+	}
+
+	var deletedAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT deleted_at FROM media WHERE id=$1 FOR UPDATE`, mediaID).Scan(&deletedAt); errors.Is(err, pgx.ErrNoRows) {
+		return PurgeLease{}, ErrNoPurgeWork
+	} else if err != nil {
+		return PurgeLease{}, fmt.Errorf("lock purge media: %w", err)
+	}
+	if deletedAt == nil {
+		return PurgeLease{}, ErrNoPurgeWork
+	}
+
+	var lease PurgeLease
+	var jobType, status string
+	var cancelledAt *time.Time
+	var available bool
+	if err := tx.QueryRow(ctx, `
+		SELECT id::text,media_id_snapshot::text,type,status,attempts,max_attempts,
+		       available_at<=clock_timestamp(),cancelled_at,available_at,created_at
+		FROM jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(
+		&lease.JobID, &lease.MediaID, &jobType, &status, &lease.Attempts, &lease.MaxAttempts,
+		&available, &cancelledAt, &lease.AvailableAt, &lease.CreatedAt,
+	); errors.Is(err, pgx.ErrNoRows) {
+		return PurgeLease{}, ErrNoPurgeWork
+	} else if err != nil {
+		return PurgeLease{}, fmt.Errorf("lock purge job: %w", err)
+	}
+	if lease.MediaID != mediaID || jobType != "purge" || status != "queued" || !available ||
+		lease.Attempts >= lease.MaxAttempts || cancelledAt != nil {
+		return PurgeLease{}, ErrNoPurgeWork
+	}
+
+	token, err := r.newID()
+	if err != nil {
+		return PurgeLease{}, fmt.Errorf("generate purge lease token: %w", err)
+	}
+	if err := tx.QueryRow(ctx, `
+		WITH instant AS (SELECT clock_timestamp() AS now)
+		UPDATE jobs SET status='running',attempts=attempts+1,lease_token=$2,
+			lease_expires_at=instant.now+$3::interval,
+			started_at=COALESCE(started_at,instant.now),updated_at=instant.now
+		FROM instant WHERE id=$1
+		RETURNING attempts,lease_expires_at,started_at`, jobID, token, intervalText(DefaultPurgeLeaseDuration)).Scan(
+		&lease.Attempts, &lease.LeaseExpiresAt, &lease.StartedAt,
+	); err != nil {
+		return PurgeLease{}, fmt.Errorf("start purge job: %w", err)
+	}
+	if err := commit(tx, ctx); err != nil {
+		return PurgeLease{}, err
+	}
+	lease.Token = token
+	lease.LeaseExpiresAt = lease.LeaseExpiresAt.UTC()
+	lease.StartedAt = lease.StartedAt.UTC()
+	lease.AvailableAt = lease.AvailableAt.UTC()
+	lease.CreatedAt = lease.CreatedAt.UTC()
+	return lease, nil
+}
+
 func (r *PostgresRepository) begin(ctx context.Context) (pgx.Tx, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -311,6 +384,10 @@ func newUUIDv4() (string, error) {
 	encoded[23] = '-'
 	hex.Encode(encoded[24:36], value[10:16])
 	return string(encoded), nil
+}
+
+func intervalText(duration time.Duration) string {
+	return fmt.Sprintf("%d microseconds", duration.Microseconds())
 }
 
 const purgeJobsForUpdateSQL = `
