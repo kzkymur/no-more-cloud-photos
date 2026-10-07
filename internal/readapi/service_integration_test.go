@@ -136,6 +136,9 @@ func TestReadServiceIntegration(t *testing.T) {
 	t.Run("jobs pagination filters targets cleanup and purge history", func(t *testing.T) {
 		purged := integrationMedia{ID: integrationUUID(10), OriginalID: integrationUUID(1010)}
 		insertIntegrationMedia(t, pool, purged, base)
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=$2,purge_after=$2 WHERE id=$1`, purged.ID, base); err != nil {
+			t.Fatal(err)
+		}
 		created := base.Add(3 * time.Hour)
 		jobIDs := make([]string, 0, 101)
 		for index := range 101 {
@@ -200,6 +203,13 @@ func TestReadServiceIntegration(t *testing.T) {
 	})
 
 	t.Run("job lookups preserve UUID indexes", func(t *testing.T) {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after)
+			SELECT ('82000000-0000-4000-8000-' || lpad(to_hex(value),12,'0'))::uuid,
+			       'image/jpeg','unknown',$1,$1
+			FROM generate_series(1,2048) AS value`, base.Add(4*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,available_at,created_at,updated_at)
 			SELECT ('81000000-0000-4000-8000-' || lpad(to_hex(value),12,'0'))::uuid,

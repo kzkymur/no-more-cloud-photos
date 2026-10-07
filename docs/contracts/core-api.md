@@ -224,7 +224,7 @@ Each item is `MediaSummary`; `rendition` is the current successful output for th
 
 ### `GET /media/{id}`
 
-Returns `200` with `MediaDetail`, including logically deleted media, or `404 media_not_found`. Malformed UUID is `400 invalid_id`.
+Query parameters are not accepted. Returns `200` with `MediaDetail`, including logically deleted media, or `404 media_not_found`. Malformed UUID is `400 invalid_id`.
 
 ### `GET /media/{id}/display`
 
@@ -258,21 +258,21 @@ Optional `status` is one of `draft`, `active`, or `retired`. Results are ordered
 
 ## 6. Delete, restore, and purge
 
-All three operations lock the Media row. Their database state transition and change event are one transaction.
+All three operations lock the Media row. Delete and restore write their change event in the same transaction as the state transition. Purge enqueue does not emit an event because it does not change indexable Media state; physical purge emits the tombstone event.
 
 ### `DELETE /media/{id}`
 
-First deletion sets `deleted_at` and snapshots `media_retention_days` into `purge_after`; `null` means no automatic purge and `0` means eligible on the next scanner run. Repetition is idempotent and does not recalculate either field. Returns `200` with MediaDetail, `400 invalid_id`, or `404 media_not_found`.
+The request body must be absent and query parameters are not accepted. First deletion sets `deleted_at` and snapshots the canonical `deleted_media_retention_days` setting into `purge_after`. The setting is `null` or an integer from 0 through 36500 days; `null` means no automatic purge and `0` means eligible on the next scanner run. Repetition is idempotent and does not recalculate either field. Returns `200` with MediaDetail, `400 invalid_id`, or `404 media_not_found`.
 
 ### `POST /media/{id}/restore`
 
-The body must be absent or `{}`. Restore clears `deleted_at` and `purge_after` and changes every not-started queued purge job for that media to `cancelled` in the same transaction. It returns `200` with MediaDetail.
+Query parameters are not accepted. The body must be absent or an exact empty JSON object `{}`; a non-empty body requires `application/json` and is limited to 1 MiB. Null, arrays, scalars, unknown fields, trailing JSON, malformed JSON, and whitespace-only bodies are rejected. Restore clears `deleted_at` and `purge_after` and changes every not-started queued purge job for that media to `cancelled` in the same transaction. It returns `200` with MediaDetail.
 
 It returns `409 media_not_deleted` if active, and `409 purge_already_started` if any purge job has non-null `started_at`, including while that job is queued for retry or failed. It returns `404 media_not_found` after purge.
 
 ### `DELETE /media/{id}/purge`
 
-Only logically deleted media is accepted. It creates a targetless purge job and returns `202` with Job. If a queued or running purge already exists, it returns the same job with `202` and creates nothing. A failed purge returns `409 purge_failed_use_retry` with its job ID and must be retried through the administrative CLI; a cancelled purge does not block a new purge after a later delete. It returns `409 media_not_deleted` for active media and `404 media_not_found` after purge. Actual deletion is asynchronous.
+The request body must be absent and query parameters are not accepted. Only logically deleted media is accepted. It creates a targetless purge job with `max_attempts=3` and returns `202` with Job. If a queued or running purge already exists, it returns the same job with `202` and creates nothing. A failed purge returns `409 purge_failed_use_retry` with `details.job_id` and must be retried through the administrative CLI; a cancelled purge does not block a new purge after a later delete. It returns `409 media_not_deleted` for active media and `404 media_not_found` after purge. Actual deletion is asynchronous, and enqueue emits no change event.
 
 Automatic retention uses this exact same enqueue operation and duplicate prevention. Restore, explicit/automatic enqueue, and the Worker's first purge start are serialized by the same Media lock.
 

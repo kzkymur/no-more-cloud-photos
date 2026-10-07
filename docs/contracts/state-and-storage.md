@@ -24,7 +24,7 @@ All IDs are UUIDv4. Migrations are forward-only, embedded in the administrative 
 - `jobs`: `transform` or `purge`, status/attempt/availability/lease/error/audit columns, nullable `original_id ON DELETE SET NULL`, and non-null immutable `media_id_snapshot`. A transform has at least one target; purge has none. A partial unique constraint prevents more than one queued, running, or failed purge job per Media snapshot; failed purge is retried in place rather than replaced.
 - `job_targets`: profile version pinned by `profile_id`, state/error/attempt audit, `UNIQUE(job_id, profile_id)`. Target and its job must resolve to the same Media as any published rendition.
 - `renditions`: successful files only, linked to Media and `job_target_id`, with required digest/file metadata, `is_current`, and nullable `purge_after`. Index `media_id`. Historical rows may be removed by due cleanup; job/target history remains.
-- `system_config`: singleton `id=1` with typed columns. Initial values are `deleted_media_retention_days=null`, `superseded_rendition_retention_days=null`, `default_timezone='Asia/Tokyo'`, `db_backup_interval_hours=24`, and `db_backup_retention_days=30`. Retention is nullable/non-negative; interval/backup retention are positive; timezone is a validated IANA name.
+- `system_config`: singleton `id=1` with typed columns. Initial values are `deleted_media_retention_days=null`, `superseded_rendition_retention_days=null`, `default_timezone='Asia/Tokyo'`, `db_backup_interval_hours=24`, and `db_backup_retention_days=30`. Deleted-media retention is null or 0..36500 days; other retention is nullable/non-negative; interval/backup retention are positive; timezone is a validated IANA name.
 
 ### 2.2 Required additions
 

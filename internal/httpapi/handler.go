@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
+	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/readapi"
 	"github.com/kzkymur/no-more-cloud-photos/internal/upload"
 )
@@ -64,6 +65,13 @@ type ReadService interface {
 	ListProfiles(context.Context, readapi.ProfileListRequest) (readapi.ProfilePage, error)
 }
 
+// MediaLifecycle is the public mutation capability required by the HTTP API.
+type MediaLifecycle interface {
+	Delete(context.Context, string) (medialifecycle.DeleteResult, error)
+	Restore(context.Context, string) (medialifecycle.RestoreResult, error)
+	EnqueuePurge(context.Context, string) (medialifecycle.EnqueueResult, error)
+}
+
 // Dependencies contains the services used by the HTTP API.
 type Dependencies struct {
 	Database   DatabasePinger
@@ -71,6 +79,7 @@ type Dependencies struct {
 	Storage    StorageProber
 	Upload     UploadAcceptor
 	Reads      ReadService
+	Lifecycle  MediaLifecycle
 }
 
 type handler struct {
@@ -160,12 +169,33 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.upload(w, r, requestID)
 	default:
 		if route, ok := matchReadRoute(r.URL.Path); ok && r.URL.RawPath == "" {
+			if route.kind == readMedia {
+				switch r.Method {
+				case http.MethodGet:
+					h.read(w, r, requestID, route)
+				case http.MethodDelete:
+					h.lifecycle(w, r, requestID, lifecycleDelete, route.id)
+				default:
+					closeIfDeclaredBody(w, r)
+					h.methodNotAllowed(w, requestID, http.MethodGet+", "+http.MethodDelete)
+				}
+				return
+			}
 			if r.Method != http.MethodGet {
 				closeUploadConnection(w, r)
 				h.methodNotAllowed(w, requestID, http.MethodGet)
 				return
 			}
 			h.read(w, r, requestID, route)
+			return
+		}
+		if route, ok := matchLifecycleRoute(r.URL.Path); ok && r.URL.RawPath == "" {
+			if r.Method != route.method {
+				closeIfDeclaredBody(w, r)
+				h.methodNotAllowed(w, requestID, route.method)
+				return
+			}
+			h.lifecycle(w, r, requestID, route.kind, route.id)
 			return
 		}
 		closeIfDeclaredBody(w, r)

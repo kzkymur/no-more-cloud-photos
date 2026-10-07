@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/animationprocessor"
 	dbmigration "github.com/kzkymur/no-more-cloud-photos/internal/database"
+	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	profiledefinition "github.com/kzkymur/no-more-cloud-photos/internal/profile"
 	"github.com/kzkymur/no-more-cloud-photos/internal/stillprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
@@ -63,6 +64,185 @@ func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	}
 	if _, err := repository.Claim(ctx, []Type{"unsupported"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unregistered API type error = %v", err)
+	}
+}
+
+func TestClaimIntegrationSkipsDeletedMediaWithoutHeadOfLineBlocking(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx := context.Background()
+	var profileID string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM profiles WHERE key='standard' AND version=1`).Scan(&profileID); err != nil {
+		t.Fatal(err)
+	}
+
+	deletedMediaID, deletedOriginalID := insertPublicationMedia(t, pool)
+	deletedJobID, _ := insertTransformForProfile(t, pool, deletedMediaID, deletedOriginalID, profileID)
+	activeMediaID, activeOriginalID := insertPublicationMediaWithSHA(t, pool, strings.Repeat("d", 64))
+	activeJobID, _ := insertTransformForProfile(t, pool, activeMediaID, activeOriginalID, profileID)
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '2 hours' WHERE id=$1`, deletedJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 hour' WHERE id=$1`, activeJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=clock_timestamp(),purge_after=clock_timestamp()+interval '1 day' WHERE id=$1`, deletedMediaID); err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil || lease.ID != activeJobID {
+		t.Fatalf("claim past deleted oldest job = %+v, %v; want %s", lease, err, activeJobID)
+	}
+	var status Status
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, deletedJobID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusQueued || attempts != 0 {
+		t.Fatalf("deleted-media job changed: status=%s attempts=%d", status, attempts)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, deletedMediaID); err != nil {
+		t.Fatal(err)
+	}
+	restoredLease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil || restoredLease.ID != deletedJobID || restoredLease.Attempts != 1 {
+		t.Fatalf("restored-media claim = %+v, %v; want %s", restoredLease, err, deletedJobID)
+	}
+}
+
+func TestClaimIntegrationSkipsLockedDeletedAndBeingDeletedMedia(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		deleteFirst bool
+	}{
+		{name: "deleted media lock", deleteFirst: true},
+		{name: "being-deleted media lock"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool, repository := integrationRepository(t, Options{})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var profileID string
+			if err := pool.QueryRow(ctx, `SELECT id::text FROM profiles WHERE key='standard' AND version=1`).Scan(&profileID); err != nil {
+				t.Fatal(err)
+			}
+			lockedMediaID, lockedOriginalID := insertPublicationMedia(t, pool)
+			lockedJobID, _ := insertTransformForProfile(t, pool, lockedMediaID, lockedOriginalID, profileID)
+			activeMediaID, activeOriginalID := insertPublicationMediaWithSHA(t, pool, strings.Repeat("f", 64))
+			activeJobID, _ := insertTransformForProfile(t, pool, activeMediaID, activeOriginalID, profileID)
+			if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '2 hours' WHERE id=$1`, lockedJobID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 hour' WHERE id=$1`, activeJobID); err != nil {
+				t.Fatal(err)
+			}
+			if test.deleteFirst {
+				if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=clock_timestamp(),purge_after=clock_timestamp()+interval '1 day' WHERE id=$1`, lockedMediaID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			locker, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer locker.Rollback(context.Background())
+			if test.deleteFirst {
+				_, err = locker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, lockedMediaID)
+			} else {
+				_, err = locker.Exec(ctx, `UPDATE media SET deleted_at=clock_timestamp(),purge_after=clock_timestamp()+interval '1 day' WHERE id=$1`, lockedMediaID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			lease, err := repository.Claim(ctx, []Type{TypeTransform})
+			if err != nil || lease.ID != activeJobID {
+				t.Fatalf("claim past locked Media = %+v, %v; want %s", lease, err, activeJobID)
+			}
+			var status Status
+			var attempts int
+			if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, lockedJobID).Scan(&status, &attempts); err != nil {
+				t.Fatal(err)
+			}
+			if status != StatusQueued || attempts != 0 {
+				t.Fatalf("locked-Media job changed: status=%s attempts=%d", status, attempts)
+			}
+			if err := locker.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestClaimIntegrationMediaBeforeJobAvoidsLifecycleDeleteDeadlock(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	jobID, targets := insertTransformJob(t, pool, 3, 1)
+	var mediaID string
+	if err := pool.QueryRow(ctx, `SELECT media_id_snapshot::text FROM jobs WHERE id=$1`, jobID).Scan(&mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE job_targets SET status='failed',error_code='process_failed',error_message='retry fixture' WHERE id=$1`, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(context.Background())
+	if _, err := blocker.Exec(ctx, `SELECT id FROM job_targets WHERE id=$1 FOR UPDATE`, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	var blockerPID int32
+	if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+		t.Fatal(err)
+	}
+
+	claimResult := make(chan struct {
+		lease Lease
+		err   error
+	}, 1)
+	go func() {
+		lease, err := repository.Claim(ctx, []Type{TypeTransform})
+		claimResult <- struct {
+			lease Lease
+			err   error
+		}{lease: lease, err: err}
+	}()
+	waitForBlockedLockChain(t, ctx, pool, blockerPID, 1)
+
+	service, err := medialifecycle.NewService(pool, "https://files.example.test/files/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteResult := make(chan error, 1)
+	go func() {
+		_, err := service.Delete(ctx, mediaID)
+		deleteResult <- err
+	}()
+	// target blocker -> claim (holding Media and Job) -> delete (waiting for Media)
+	waitForBlockedLockChain(t, ctx, pool, blockerPID, 2)
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed := <-claimResult
+	if claimed.err != nil || claimed.lease.ID != jobID || claimed.lease.Attempts != 1 {
+		t.Fatalf("claim result = %+v, %v", claimed.lease, claimed.err)
+	}
+	if err := <-deleteResult; err != nil {
+		t.Fatalf("Delete() after claim = %v", err)
+	}
+	var deletedAt, jobUpdatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT m.deleted_at,j.updated_at FROM media m JOIN jobs j ON j.media_id_snapshot=m.id WHERE j.id=$1`, jobID).Scan(&deletedAt, &jobUpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if deletedAt.Before(jobUpdatedAt) {
+		t.Fatalf("delete committed before winning claim update: deleted_at=%s job_updated_at=%s", deletedAt, jobUpdatedAt)
 	}
 }
 
@@ -1757,6 +1937,9 @@ func insertPurgeJob(t *testing.T, pool *pgxpool.Pool, maxAttempts int, available
 	t.Helper()
 	id := newTestUUID(t)
 	mediaID := newTestUUID(t)
+	if _, err := pool.Exec(context.Background(), `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after) VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp())`, mediaID); err != nil {
+		t.Fatal(err)
+	}
 	query := fmt.Sprintf(`INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,available_at) VALUES ($1,'purge',$2,'queued',$3,%s)`, availableExpression)
 	if _, err := pool.Exec(context.Background(), query, id, mediaID, maxAttempts); err != nil {
 		t.Fatal(err)
@@ -2061,6 +2244,29 @@ func waitForBlockedChangeFeedPublication(t *testing.T, ctx context.Context, pool
 		case <-time.After(10 * time.Millisecond):
 		case <-ctx.Done():
 			t.Fatalf("publication did not block on change feed: %v", ctx.Err())
+		}
+	}
+}
+
+func waitForBlockedLockChain(t *testing.T, ctx context.Context, pool *pgxpool.Pool, blockerPID int32, want int) {
+	t.Helper()
+	for {
+		var count int
+		if err := pool.QueryRow(ctx, `WITH RECURSIVE blocked(pid) AS (
+			SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))
+			UNION
+			SELECT activity.pid FROM pg_stat_activity activity JOIN blocked ON blocked.pid=ANY(pg_blocking_pids(activity.pid))
+		)
+		SELECT count(*) FROM blocked`, blockerPID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count >= want {
+			return
+		}
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("blocked lock chain=%d, want at least %d: %v", count, want, ctx.Err())
 		}
 	}
 }

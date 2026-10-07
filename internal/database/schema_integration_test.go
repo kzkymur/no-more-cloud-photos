@@ -59,6 +59,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `INSERT INTO system_config (id, default_timezone, db_backup_interval_hours, db_backup_retention_days) VALUES (2, 'UTC', 24, 30)`)
 		expectExecError(t, pool, `UPDATE system_config SET default_timezone='Not/A_Real_Zone' WHERE id=1`)
 		expectExecError(t, pool, `UPDATE system_config SET deleted_media_retention_days=-1 WHERE id=1`)
+		expectExecError(t, pool, `UPDATE system_config SET deleted_media_retention_days=36501 WHERE id=1`)
 		expectExecError(t, pool, `UPDATE system_config SET db_backup_interval_hours=0 WHERE id=1`)
 		expectExecError(t, pool, `DELETE FROM system_config WHERE id=1`)
 		expectExecError(t, pool, `TRUNCATE system_config`)
@@ -69,7 +70,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `UPDATE change_feed_state SET last_position=4 WHERE id=1`)
 		expectExecError(t, pool, `DELETE FROM change_feed_state WHERE id=1`)
 		expectExecError(t, pool, `TRUNCATE change_feed_state`)
-		if _, err := pool.Exec(ctx, `UPDATE system_config SET default_timezone='UTC', deleted_media_retention_days=0 WHERE id=1`); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE system_config SET default_timezone='UTC', deleted_media_retention_days=36500 WHERE id=1`); err != nil {
 			t.Fatalf("valid config update: %v", err)
 		}
 	})
@@ -378,6 +379,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source,taken_at_timezone) VALUES ($1,'image/jpeg',now(),'embedded_offset','UTC')`, newUUIDv4(t))
 		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at,taken_at_source,taken_at_timezone) VALUES ($1,'image/jpeg',now(),'default_timezone','Not/A_Real_Zone')`, newUUIDv4(t))
 		expectExecError(t, pool, `UPDATE media SET purge_after=now() WHERE id=$1`, mediaOne)
+		expectExecError(t, pool, `UPDATE media SET deleted_at=now(),purge_after=now()-interval '1 second' WHERE id=$1`, mediaOne)
 		expectExecError(t, pool, `INSERT INTO media (id,media_type,taken_at_source) VALUES ('00000000-0000-0000-0000-000000000000','image/jpeg','unknown')`)
 
 		sha := strings.Repeat("a", 64)
@@ -401,6 +403,32 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 
 		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(), purge_after=now() WHERE id=$1`, mediaOne); err != nil {
 			t.Fatalf("logically delete media: %v", err)
+		}
+		expectExecError(t, pool, `UPDATE media SET deleted_at=deleted_at+interval '1 second' WHERE id=$1`, mediaOne)
+		expectExecError(t, pool, `UPDATE media SET purge_after=purge_after+interval '1 second' WHERE id=$1`, mediaOne)
+		expectExecError(t, pool, `UPDATE media SET deleted_at=NULL WHERE id=$1`, mediaOne)
+		if _, err := pool.Exec(ctx, `UPDATE media SET media_type=media_type WHERE id=$1`, mediaOne); err != nil {
+			t.Fatalf("update unrelated deleted Media field: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, mediaOne); err != nil {
+			t.Fatalf("restore deleted Media: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(),purge_after=now() WHERE id=$1`, mediaOne); err != nil {
+			t.Fatalf("delete restored Media: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, mediaOne); err != nil {
+			t.Fatalf("restore Media after snapshot regression: %v", err)
+		}
+
+		var schemaName, functionConfig string
+		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schemaName); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT array_to_string(proconfig,',') FROM pg_proc WHERE oid='nmcp_guard_media_undelete()'::regprocedure`).Scan(&functionConfig); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(functionConfig, "search_path="+schemaName+", pg_catalog, pg_temp") {
+			t.Fatalf("media deletion guard search_path = %q", functionConfig)
 		}
 		expectExecError(t, pool, `
 			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
@@ -588,6 +616,11 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		insertMedia(t, pool, otherMediaID)
 		originalID := insertOriginal(t, pool, mediaID, "c", "first")
 		otherOriginalID := insertOriginal(t, pool, otherMediaID, "d", "second")
+		expectExecError(t, pool, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, newUUIDv4(t), mediaID)
+		expectExecError(t, pool, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, newUUIDv4(t), newUUIDv4(t))
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(),purge_after=now() WHERE id IN ($1,$2)`, mediaID, otherMediaID); err != nil {
+			t.Fatalf("delete purge fixture Media: %v", err)
+		}
 		expectExecError(t, pool, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, newUUIDv4(t), otherOriginalID, mediaID)
 		expectExecError(t, pool, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,$3,'queued',3)`, newUUIDv4(t), originalID, mediaID)
 
@@ -600,6 +633,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, purgeID, mediaID); err != nil {
 			t.Fatalf("insert purge job: %v", err)
 		}
+		expectExecError(t, pool, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, mediaID)
 		expectTxCommitError(t, pool, func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, newUUIDv4(t), purgeID, profileID)
 			return err
@@ -607,6 +641,12 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectExecError(t, pool, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, newUUIDv4(t), mediaID)
 		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='cancelled', finished_at=now(), cancelled_at=now(), cancel_reason='media_restored' WHERE id=$1`, purgeID); err != nil {
 			t.Fatalf("cancel purge: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, mediaID); err != nil {
+			t.Fatalf("restore after cancelling purge: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(),purge_after=now() WHERE id=$1`, mediaID); err != nil {
+			t.Fatalf("re-delete after cancelling purge: %v", err)
 		}
 		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, newUUIDv4(t), mediaID); err != nil {
 			t.Fatalf("new purge after cancellation: %v", err)
@@ -621,6 +661,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running', attempts=1, lease_token=$2, lease_expires_at=now()+interval '1 minute', started_at=now() WHERE id=$1`, lifecycleJobID, leaseOne); err != nil {
 			t.Fatalf("claim lifecycle purge: %v", err)
 		}
+		expectExecError(t, pool, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, otherMediaID)
 		expectExecError(t, pool, `UPDATE jobs SET status='cancelled', started_at=NULL, lease_token=NULL, lease_expires_at=NULL, finished_at=now(), cancelled_at=now(), cancel_reason='media_restored' WHERE id=$1`, lifecycleJobID)
 		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='queued', lease_token=NULL, lease_expires_at=NULL WHERE id=$1`, lifecycleJobID); err != nil {
 			t.Fatalf("backoff lifecycle purge: %v", err)
@@ -640,6 +681,10 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 
 		budgetJobID := newUUIDv4(t)
 		budgetMediaID := newUUIDv4(t)
+		insertMedia(t, pool, budgetMediaID)
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(),purge_after=now() WHERE id=$1`, budgetMediaID); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',1)`, budgetJobID, budgetMediaID); err != nil {
 			t.Fatalf("insert attempt-budget job: %v", err)
 		}

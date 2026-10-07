@@ -16,6 +16,7 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/httpapi"
 	"github.com/kzkymur/no-more-cloud-photos/internal/lifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
+	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/metadata"
 	"github.com/kzkymur/no-more-cloud-photos/internal/readapi"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
@@ -76,10 +77,14 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("configure read service: %w", err)
 	}
+	lifecycleService, err := medialifecycle.NewService(pool, cfg.FileBaseURL)
+	if err != nil {
+		return fmt.Errorf("configure media lifecycle service: %w", err)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           httpapi.NewHandler(httpapi.Dependencies{Database: pool, Migrations: migrator, Storage: store, Upload: uploadService, Reads: readService}),
+		Handler:           httpapi.NewHandler(httpapi.Dependencies{Database: pool, Migrations: migrator, Storage: store, Upload: uploadService, Reads: readService, Lifecycle: lifecycleService}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    64 << 10,
