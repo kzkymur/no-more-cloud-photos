@@ -25,6 +25,7 @@ const (
 	DefaultMaxTransientBackoff = 30 * time.Second
 	DefaultPoisonCooldown      = time.Minute
 	DefaultMaxPoisonCooldown   = time.Hour
+	maxTrackedPoisonCandidates = 1000
 )
 
 // Service owns candidate selection and the database operation boundary. It
@@ -128,10 +129,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			case id != "" && isPoison(err):
 				preferredID = ""
 				transientFailures = 0
-				state := r.poison[id]
-				state.failures++
-				state.until = r.options.Now().Add(r.backoff(r.options.PoisonCooldown, r.options.MaxPoisonCooldown, state.failures))
-				r.poison[id] = state
+				state := r.deferPoison(id)
 				r.logger.ErrorContext(ctx, "rendition cleanup candidate deferred", slog.String("rendition_id", id), slog.Any("error", err), slog.Time("retry_at", state.until))
 			default:
 				return fmt.Errorf("rendition cleanup failed: %w", err)
@@ -147,6 +145,24 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+func (r *Runner) deferPoison(id string) poisonState {
+	state, tracked := r.poison[id]
+	if !tracked && len(r.poison) >= maxTrackedPoisonCandidates {
+		var oldestID string
+		var oldest time.Time
+		for candidateID, candidate := range r.poison {
+			if oldestID == "" || candidate.until.Before(oldest) || candidate.until.Equal(oldest) && candidateID < oldestID {
+				oldestID, oldest = candidateID, candidate.until
+			}
+		}
+		delete(r.poison, oldestID)
+	}
+	state.failures++
+	state.until = r.options.Now().Add(r.backoff(r.options.PoisonCooldown, r.options.MaxPoisonCooldown, state.failures))
+	r.poison[id] = state
+	return state
 }
 
 func (r *Runner) unlink(ctx context.Context, renditionID, relativePath string, sizeBytes int64) (bool, error) {

@@ -138,6 +138,21 @@ func TestBackoffCapsPoisonCooldownAndInjectedRandom(t *testing.T) {
 	}
 }
 
+func TestRunnerBoundsTrackedPoisonCandidates(t *testing.T) {
+	now := time.Unix(100, 0)
+	var sleeps []time.Duration
+	runner, _ := New(serviceFunc(func(context.Context, string, []string, func(context.Context, string, string, int64) (bool, error)) (string, error) {
+		return "", nil
+	}), &fakeStore{}, testOptions(&now, &sleeps), nil)
+	for index := range maxTrackedPoisonCandidates + 1 {
+		id := string(rune(index + 1))
+		runner.deferPoison(id)
+	}
+	if len(runner.poison) != maxTrackedPoisonCandidates {
+		t.Fatalf("tracked poison candidates=%d, want %d", len(runner.poison), maxTrackedPoisonCandidates)
+	}
+}
+
 func TestRunnerPoisonCooldownDoesNotBlockOtherCandidates(t *testing.T) {
 	now := time.Unix(100, 0)
 	var sleeps []time.Duration
