@@ -42,8 +42,9 @@ type Repository struct {
 // TransformClaimer binds every transform claim to one validated startup
 // capability snapshot. Repository intentionally has no unrestricted Claim.
 type TransformClaimer struct {
-	*Repository
+	repository *Repository
 	profileIDs []string
+	bound      bool
 }
 
 func NewRepository(pool *pgxpool.Pool, options Options) (*Repository, error) {
@@ -74,17 +75,23 @@ func (r *Repository) BindTransformClaims(envelope transformcapability.Envelope) 
 	if r == nil || !envelope.Validated() {
 		return nil, ErrInvalid
 	}
-	return &TransformClaimer{Repository: r, profileIDs: profileIDs}, nil
+	if profileIDs == nil {
+		profileIDs = make([]string, 0)
+	}
+	return &TransformClaimer{repository: r, profileIDs: profileIDs, bound: true}, nil
 }
 
 func (r *TransformClaimer) Claim(ctx context.Context, registeredTypes []Type) (Lease, error) {
-	if r == nil || r.Repository == nil {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
 		return Lease{}, ErrInvalid
 	}
-	return r.Repository.claim(ctx, registeredTypes, r.profileIDs)
+	return r.repository.claim(ctx, registeredTypes, r.profileIDs)
 }
 
 func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedProfileIDs []string) (Lease, error) {
+	if r == nil || allowedProfileIDs == nil {
+		return Lease{}, ErrInvalid
+	}
 	types, err := validateTypes(registeredTypes)
 	if err != nil {
 		return Lease{}, err
@@ -111,7 +118,7 @@ func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedP
 			  AND NOT EXISTS (
 				SELECT 1 FROM job_targets AS jt
 				WHERE jt.job_id=jobs.id AND jt.status<>'succeeded'
-				  AND NOT (jt.profile_id=ANY($4::uuid[]))
+				  AND NOT COALESCE(jt.profile_id=ANY($4::uuid[]),false)
 			  )
 			ORDER BY available_at,created_at,id
 			FOR UPDATE SKIP LOCKED LIMIT 1
@@ -151,6 +158,48 @@ func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedP
 	}
 	normalizeLease(&lease)
 	return lease, nil
+}
+
+func (r *TransformClaimer) Heartbeat(ctx context.Context, jobID, token string) (time.Time, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return time.Time{}, ErrInvalid
+	}
+	return r.repository.Heartbeat(ctx, jobID, token)
+}
+
+func (r *TransformClaimer) FinishAttempt(ctx context.Context, jobID, token string, code FailureCode) error {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return ErrInvalid
+	}
+	return r.repository.FinishAttempt(ctx, jobID, token, code)
+}
+
+func (r *TransformClaimer) ReclaimExpired(ctx context.Context) (int, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return 0, ErrInvalid
+	}
+	return r.repository.ReclaimExpired(ctx)
+}
+
+func (r *TransformClaimer) BeginTarget(ctx context.Context, jobID, token, targetID string) error {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return ErrInvalid
+	}
+	return r.repository.BeginTarget(ctx, jobID, token, targetID)
+}
+
+func (r *TransformClaimer) MarkTargetFailed(ctx context.Context, jobID, token, targetID string, code FailureCode) error {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return ErrInvalid
+	}
+	return r.repository.MarkTargetFailed(ctx, jobID, token, targetID, code)
+}
+
+func (r *TransformClaimer) PublishRendition(ctx context.Context, candidate Rendition) (Publication, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return Publication{}, ErrInvalid
+	}
+	return r.repository.PublishRendition(ctx, candidate)
 }
 
 // ClaimableTransformProfiles returns the exact profile definitions that this

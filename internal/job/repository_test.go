@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,27 @@ func TestBindTransformClaimsRejectsEmptyEnvelope(t *testing.T) {
 	repository := &Repository{}
 	if _, err := repository.BindTransformClaims(transformcapability.Envelope{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("empty envelope error = %v", err)
+	}
+}
+
+func TestTransformClaimerRejectsUnboundConstruction(t *testing.T) {
+	typeOfClaimer := reflect.TypeOf(TransformClaimer{})
+	for index := 0; index < typeOfClaimer.NumField(); index++ {
+		if typeOfClaimer.Field(index).IsExported() {
+			t.Fatalf("TransformClaimer exposes forgeable field %q", typeOfClaimer.Field(index).Name)
+		}
+	}
+	for _, claimer := range []*TransformClaimer{
+		{},
+		{repository: &Repository{}, bound: true},
+		{repository: &Repository{}, profileIDs: []string{}},
+	} {
+		if _, err := claimer.Claim(context.Background(), []Type{TypeTransform}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("unbound claimer error = %v", err)
+		}
+	}
+	if _, err := (&Repository{}).claim(context.Background(), []Type{TypeTransform}, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nil profile snapshot error = %v", err)
 	}
 }
 

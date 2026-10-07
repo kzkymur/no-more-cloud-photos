@@ -146,8 +146,25 @@ func TestBoundTransformClaimsExcludeProfilesAddedAfterStartupIntegration(t *test
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 hour' WHERE id=$1`, unsupportedJobID); err != nil {
 		t.Fatal(err)
 	}
+	mixedMediaID, mixedOriginalID := insertPublicationMediaWithSHA(t, pool, strings.Repeat("e", 64))
+	mixedJobID, _ := insertTransformForProfiles(t, pool, mixedMediaID, mixedOriginalID, []string{definitions[0].ID, unsupportedProfileID})
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '2 hours' WHERE id=$1`, mixedJobID); err != nil {
+		t.Fatal(err)
+	}
 	supportedMediaID, supportedOriginalID := insertPublicationMediaWithSHA(t, pool, strings.Repeat("d", 64))
 	supportedJobID, _ := insertTransformForProfile(t, pool, supportedMediaID, supportedOriginalID, definitions[0].ID)
+
+	emptyEnvelope, err := transformcapability.ValidateEnvelope(nil, still, animation, video)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyClaimer, err := repository.Repository.BindTransformClaims(emptyEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := emptyClaimer.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("validated-empty envelope claimed work: %v", err)
+	}
 
 	lease, err := claimer.Claim(ctx, []Type{TypeTransform})
 	if err != nil || lease.ID != supportedJobID {
@@ -156,13 +173,15 @@ func TestBoundTransformClaimsExcludeProfilesAddedAfterStartupIntegration(t *test
 	if _, err := claimer.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
 		t.Fatalf("unsupported post-start profile was claimable: %v", err)
 	}
-	var status Status
-	var attempts int
-	if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, unsupportedJobID).Scan(&status, &attempts); err != nil {
-		t.Fatal(err)
-	}
-	if status != StatusQueued || attempts != 0 {
-		t.Fatalf("unsupported job changed: status=%s attempts=%d", status, attempts)
+	for _, jobID := range []string{unsupportedJobID, mixedJobID} {
+		var status Status
+		var attempts int
+		if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts); err != nil {
+			t.Fatal(err)
+		}
+		if status != StatusQueued || attempts != 0 {
+			t.Fatalf("unvalidated job %s changed: status=%s attempts=%d", jobID, status, attempts)
+		}
 	}
 }
 
@@ -1917,9 +1936,14 @@ func insertVersionTransform(t *testing.T, pool *pgxpool.Pool, mediaID, originalI
 }
 
 func insertTransformForProfile(t *testing.T, pool *pgxpool.Pool, mediaID, originalID, profileID string) (string, string) {
+	jobID, targetIDs := insertTransformForProfiles(t, pool, mediaID, originalID, []string{profileID})
+	return jobID, targetIDs[0]
+}
+
+func insertTransformForProfiles(t *testing.T, pool *pgxpool.Pool, mediaID, originalID string, profileIDs []string) (string, []string) {
 	t.Helper()
 	ctx := context.Background()
-	jobID, targetID := newTestUUID(t), newTestUUID(t)
+	jobID := newTestUUID(t)
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1929,13 +1953,18 @@ func insertTransformForProfile(t *testing.T, pool *pgxpool.Pool, mediaID, origin
 		VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profileID); err != nil {
-		t.Fatal(err)
+	targetIDs := make([]string, 0, len(profileIDs))
+	for _, profileID := range profileIDs {
+		targetID := newTestUUID(t)
+		if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profileID); err != nil {
+			t.Fatal(err)
+		}
+		targetIDs = append(targetIDs, targetID)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	return jobID, targetID
+	return jobID, targetIDs
 }
 
 func ensureVersionProfile(t *testing.T, pool *pgxpool.Pool, key string, version int, activate bool) string {
