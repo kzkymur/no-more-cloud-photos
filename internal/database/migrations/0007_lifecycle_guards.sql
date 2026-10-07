@@ -11,9 +11,36 @@ BEGIN
 END;
 $$;
 
--- Close the gap between preflight and constraint/trigger installation. Media
--- precedes Jobs to match the runtime lifecycle lock order.
-LOCK TABLE system_config, media, jobs IN ACCESS EXCLUSIVE MODE;
+-- Close the gap between preflight and constraint/trigger installation. Acquire
+-- coordination tables in the same global order as runtime lifecycle writers:
+-- maintenance prefix, Media, Jobs, then configuration.
+LOCK TABLE maintenance_state IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE media IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE system_config IN ACCESS EXCLUSIVE MODE;
+
+DO $$
+DECLARE
+    invalid_job_id text;
+    invalid_media_id text;
+    invalid_status text;
+BEGIN
+    SELECT j.id::text, j.media_id_snapshot::text, j.status
+    INTO invalid_job_id, invalid_media_id, invalid_status
+    FROM jobs AS j
+    LEFT JOIN media AS m ON m.id = j.media_id_snapshot
+    WHERE j.type = 'purge'
+      AND j.status IN ('queued', 'running', 'failed')
+      AND (m.id IS NULL OR m.deleted_at IS NULL)
+    ORDER BY j.id
+    LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'unfinished purge job requires existing deleted Media: job=% media=% status=%',
+            invalid_job_id, invalid_media_id, invalid_status
+            USING ERRCODE = '23514';
+    END IF;
+END;
+$$;
 
 DO $$
 DECLARE invalid_retention integer;

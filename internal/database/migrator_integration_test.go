@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 )
 
@@ -68,7 +70,7 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("lifecycle guard upgrade rejects invalid retention without clamping", func(t *testing.T) {
+	t.Run("lifecycle guard upgrade validates legacy state and lock order", func(t *testing.T) {
 		ctx := context.Background()
 		prepareVersionSix := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
 			t.Helper()
@@ -82,13 +84,84 @@ func TestMigratorIntegration(t *testing.T) {
 			}
 			return pool, full
 		}
+		insertMedia := func(t *testing.T, pool *pgxpool.Pool, deleted bool) string {
+			t.Helper()
+			mediaID := newUUIDv4(t)
+			if deleted {
+				if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after)
+					VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp()+interval '1 day')`, mediaID); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			return mediaID
+		}
+		insertPurge := func(t *testing.T, pool *pgxpool.Pool, mediaID, status string) string {
+			t.Helper()
+			jobID := newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, jobID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			switch status {
+			case "queued":
+			case "cancelled":
+				if _, err := pool.Exec(ctx, `UPDATE jobs SET status='cancelled',finished_at=clock_timestamp(),cancelled_at=clock_timestamp(),cancel_reason='media_restored' WHERE id=$1`, jobID); err != nil {
+					t.Fatal(err)
+				}
+			case "running", "failed", "succeeded":
+				if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, jobID, newUUIDv4(t)); err != nil {
+					t.Fatal(err)
+				}
+				if status != "running" {
+					if _, err := pool.Exec(ctx, `UPDATE jobs SET status=$2,lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, jobID, status); err != nil {
+						t.Fatal(err)
+					}
+				}
+			default:
+				t.Fatalf("unsupported purge fixture status %q", status)
+			}
+			return jobID
+		}
+		assertVersionSixRollback := func(t *testing.T, pool *pgxpool.Pool, jobID, wantStatus string) {
+			t.Helper()
+			var version int64
+			var status string
+			var upperBound, purgeGuard bool
+			if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, jobID).Scan(&status); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT EXISTS (
+				SELECT 1 FROM pg_constraint
+				WHERE conrelid='system_config'::regclass
+				  AND conname='system_config_deleted_media_retention_max_check'
+			)`).Scan(&upperBound); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT to_regprocedure('nmcp_guard_purge_job_insert()') IS NOT NULL`).Scan(&purgeGuard); err != nil {
+				t.Fatal(err)
+			}
+			if version != 6 || status != wantStatus || upperBound || purgeGuard {
+				t.Fatalf("failed lifecycle migration state: version=%d status=%q upper_bound=%t purge_guard=%t", version, status, upperBound, purgeGuard)
+			}
+		}
 
 		validPool, validMigrator := prepareVersionSix(t)
 		if _, err := validPool.Exec(ctx, `UPDATE system_config SET deleted_media_retention_days=36500 WHERE id=1`); err != nil {
 			t.Fatal(err)
 		}
+		insertPurge(t, validPool, insertMedia(t, validPool, true), "queued")
+		cancelledID := insertPurge(t, validPool, insertMedia(t, validPool, false), "cancelled")
+		succeededID := insertPurge(t, validPool, newUUIDv4(t), "succeeded")
 		if err := validMigrator.Up(ctx); err != nil {
-			t.Fatalf("upgrade maximum valid retention: %v", err)
+			t.Fatalf("upgrade valid retention, unfinished work, and terminal history: %v", err)
+		}
+		var terminalCount int
+		if err := validPool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE (id=$1 AND status='cancelled') OR (id=$2 AND status='succeeded')`, cancelledID, succeededID).Scan(&terminalCount); err != nil || terminalCount != 2 {
+			t.Fatalf("terminal purge history after upgrade = %d, err=%v", terminalCount, err)
 		}
 
 		invalidPool, invalidMigrator := prepareVersionSix(t)
@@ -120,6 +193,84 @@ func TestMigratorIntegration(t *testing.T) {
 		if version != 6 || retention != 36501 || upperBound || purgeGuard {
 			t.Fatalf("failed lifecycle migration state: version=%d retention=%d upper_bound=%t purge_guard=%t", version, retention, upperBound, purgeGuard)
 		}
+
+		for _, mediaState := range []string{"active", "absent"} {
+			for _, jobStatus := range []string{"queued", "running", "failed"} {
+				t.Run("rejects "+mediaState+" Media for "+jobStatus+" purge", func(t *testing.T) {
+					pool, migrator := prepareVersionSix(t)
+					mediaID := newUUIDv4(t)
+					if mediaState == "active" {
+						mediaID = insertMedia(t, pool, false)
+					}
+					jobID := insertPurge(t, pool, mediaID, jobStatus)
+					err := migrator.Up(ctx)
+					var databaseError *pgconn.PgError
+					if !errors.As(err, &databaseError) || databaseError.Code != "23514" {
+						t.Fatalf("migration error = %#v, want SQLSTATE 23514", err)
+					}
+					assertVersionSixRollback(t, pool, jobID, jobStatus)
+				})
+			}
+		}
+
+		t.Run("Delete and migration converge without lock inversion", func(t *testing.T) {
+			pool, migrator := prepareVersionSix(t)
+			raceCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			mediaID := insertMedia(t, pool, false)
+			originalID := newUUIDv4(t)
+			if _, err := pool.Exec(raceCtx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes,width,height)
+				VALUES ($1,$2,$3,$4,'image/jpeg',1,1,1)`, originalID, mediaID, strings.Repeat("b", 64), "originals/00/migration-delete-"+originalID+"/original.jpg"); err != nil {
+				t.Fatal(err)
+			}
+			repository, err := medialifecycle.NewPostgresRepository(pool, "https://files.example/files")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			configBlocker, err := pool.Begin(raceCtx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer configBlocker.Rollback(context.Background())
+			if _, err := configBlocker.Exec(raceCtx, `LOCK TABLE system_config IN ACCESS EXCLUSIVE MODE`); err != nil {
+				t.Fatal(err)
+			}
+			deleteResult := make(chan error, 1)
+			go func() {
+				_, err := repository.Delete(raceCtx, mediaID)
+				deleteResult <- err
+			}()
+			// Waiting for config proves Delete acquired the maintenance prefix and
+			// Media row before migration begins.
+			awaitRelationLock(t, pool, raceCtx, 0, "system_config", "RowShareLock", false)
+			awaitRelationLock(t, pool, raceCtx, 0, "maintenance_state", "RowShareLock", true)
+			awaitRelationLock(t, pool, raceCtx, 0, "media", "RowShareLock", true)
+
+			migrationResult := make(chan error, 1)
+			go func() { migrationResult <- migrator.Up(raceCtx) }()
+			awaitRelationLock(t, pool, raceCtx, 0, "maintenance_state", "AccessExclusiveLock", false)
+			if err := configBlocker.Commit(raceCtx); err != nil {
+				t.Fatal(err)
+			}
+			if err := awaitContextResult(t, raceCtx, deleteResult); err != nil {
+				t.Fatalf("Delete after config release: %v", err)
+			}
+			if err := awaitContextResult(t, raceCtx, migrationResult); err != nil {
+				t.Fatalf("migration after Delete: %v", err)
+			}
+			var deleted bool
+			var migratedVersion int64
+			if err := pool.QueryRow(raceCtx, `SELECT deleted_at IS NOT NULL FROM media WHERE id=$1`, mediaID).Scan(&deleted); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(raceCtx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&migratedVersion); err != nil {
+				t.Fatal(err)
+			}
+			if !deleted || migratedVersion != 7 {
+				t.Fatalf("converged state deleted=%t version=%d", deleted, migratedVersion)
+			}
+		})
 	})
 
 	t.Run("profile dimension correction upgrades only untouched unreferenced bundled drafts", func(t *testing.T) {
@@ -437,7 +588,12 @@ func TestMigratorIntegration(t *testing.T) {
 		mediaID, jobID, targets := insertLegacyTransform(t, validPool, 2)
 		renditionID := publishLegacyTarget(t, validPool, mediaID, targets[0])
 		purgeID := newUUIDv4(t)
-		if _, err := validPool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',1)`, purgeID, newUUIDv4(t)); err != nil {
+		purgeMediaID := newUUIDv4(t)
+		if _, err := validPool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after)
+			VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp()+interval '1 day')`, purgeMediaID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := validPool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',1)`, purgeID, purgeMediaID); err != nil {
 			t.Fatal(err)
 		}
 		if err := validMigrator.Up(ctx); err != nil {
@@ -516,8 +672,13 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 		insertExhausted := func(t *testing.T, pool *pgxpool.Pool, finalStatus string) string {
 			t.Helper()
+			mediaID := newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after)
+				VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp()+interval '1 day')`, mediaID); err != nil {
+				t.Fatal(err)
+			}
 			jobID := newUUIDv4(t)
-			if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',1)`, jobID, newUUIDv4(t)); err != nil {
+			if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',1)`, jobID, mediaID); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, jobID, newUUIDv4(t)); err != nil {
