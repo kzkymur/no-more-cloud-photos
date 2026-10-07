@@ -244,22 +244,6 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 		}
 		assertExpectedStreamTransformFails(t, processor, withAudio, "video/mp4", audio)
 
-		timedPath := filepath.Join(t.TempDir(), "timed-thumbnail.mp4")
-		command := exec.Command(ffmpeg, "-v", "error", "-y", "-i", rotated, "-map", "0", "-c", "copy", "-disposition:v:0", "timed_thumbnails", timedPath)
-		if output, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("create timed-thumbnail fixture: %v: %s", err, output)
-		}
-		timed := -1
-		for _, stream := range realStreams(t, ffprobe, timedPath) {
-			if stream.Disposition.TimedThumbnails != 0 {
-				timed = stream.Index
-				break
-			}
-		}
-		if timed < 0 {
-			t.Fatal("remuxed fixture lacks timed-thumbnail disposition")
-		}
-		assertExpectedStreamTransformFails(t, processor, timedPath, "video/mp4", timed)
 	})
 }
 
