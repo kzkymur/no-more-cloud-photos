@@ -78,6 +78,10 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request, requestID string,
 		writeError(w, http.StatusNotAcceptable, "not_acceptable", "JSON response is not acceptable", requestID)
 		return
 	}
+	if route.kind == readMedia && (r.URL.RawQuery != "" || r.URL.ForceQuery) {
+		h.writeReadError(w, requestID, readapi.NewInvalidRequest(map[string]string{"query": "invalid"}))
+		return
+	}
 
 	query, err := parseReadQuery(r.URL.RawQuery, route.kind)
 	if err != nil {

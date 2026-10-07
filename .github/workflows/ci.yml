@@ -331,3 +331,7 @@ jobs:
         run: go test -v -count=1 -run '^TestReadServiceIntegration$' ./internal/readapi
       - name: Explicit read HTTP and PostgreSQL integration evidence
         run: go test -v -count=1 -run '^TestReadHTTPPostgreSQLIntegration$' ./internal/httpapi
+      - name: Explicit lifecycle PostgreSQL integration evidence
+        run: go test -v -count=1 -run '^TestLifecycleRepositoryIntegration' ./internal/medialifecycle
+      - name: Explicit lifecycle HTTP and PostgreSQL integration evidence
+        run: go test -v -count=1 -run '^TestLifecycleHTTPPostgreSQLIntegration$' ./internal/httpapi

@@ -139,7 +139,7 @@ func TestReadRoutesDispatchExactly(t *testing.T) {
 func TestReadRoutesRejectMethodsAndInexactPaths(t *testing.T) {
 	reads := &recordingReadService{}
 	handler := NewHandler(Dependencies{Reads: reads})
-	for _, path := range []string{"/media/id", "/media/id/original", "/renditions/id", "/jobs", "/jobs/id", "/profiles"} {
+	for _, path := range []string{"/media/id/original", "/renditions/id", "/jobs", "/jobs/id", "/profiles"} {
 		response := serve(handler, http.MethodPost, path, "method-request")
 		assertResponse(t, response, http.StatusMethodNotAllowed, "method-request")
 		if got := response.Header().Get("Allow"); got != http.MethodGet {
@@ -235,7 +235,7 @@ func TestReadQueriesAreStrict(t *testing.T) {
 		{path: "/profiles?status=active&extra=x", fields: map[string]string{"extra": "invalid"}},
 		{path: "/profiles?status=", fields: map[string]string{"status": "invalid"}},
 		{path: "/profiles?status=disabled", fields: map[string]string{"status": "invalid"}},
-		{path: "/media/id?x=1", fields: map[string]string{"x": "invalid"}},
+		{path: "/media/id?x=1", fields: map[string]string{"query": "invalid"}},
 		{path: "/jobs/id?cursor=x", fields: map[string]string{"cursor": "invalid"}},
 		{path: "/profiles?bad;query=x", fields: map[string]string{"query": "invalid"}},
 	}
