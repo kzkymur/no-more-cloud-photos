@@ -118,6 +118,137 @@ func TestLifecycleRepositoryIntegrationPurgeSemanticsAndCancellation(t *testing.
 	}
 }
 
+func TestLifecycleRepositoryIntegrationDuePurgeScanRechecksCurrentDeadline(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	mediaID := integrationUUID(23)
+	insertMedia(t, pool, mediaID, integrationUUID(123))
+	if _, err := pool.Exec(ctx, `UPDATE system_config SET deleted_media_retention_days=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	dueThrough, err := service.DatabaseNow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := service.ScanDuePurges(ctx, dueThrough, nil, 10)
+	if err != nil || len(candidates) != 1 || candidates[0].MediaID != mediaID {
+		t.Fatalf("due candidates = %#v, %v", candidates, err)
+	}
+
+	if _, err := service.Restore(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE system_config SET deleted_media_retention_days=30 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.EnqueueDuePurge(ctx, candidates[0].MediaID); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("stale automatic enqueue error = %#v", err)
+	}
+	var purgeJobs int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='purge'`, mediaID).Scan(&purgeJobs); err != nil {
+		t.Fatal(err)
+	}
+	if purgeJobs != 0 {
+		t.Fatalf("purge job count after stale scan = %d, want 0", purgeJobs)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationExplicitAndAutomaticEnqueueConverge(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, service := integrationService(t)
+	mediaID := integrationUUID(24)
+	insertMedia(t, pool, mediaID, integrationUUID(124))
+	if _, err := pool.Exec(ctx, `UPDATE system_config SET deleted_media_retention_days=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+
+	type outcome struct {
+		result EnqueueResult
+		err    error
+	}
+	start := make(chan struct{})
+	outcomes := make(chan outcome, 2)
+	go func() {
+		<-start
+		result, err := service.EnqueuePurge(ctx, mediaID)
+		outcomes <- outcome{result: result, err: err}
+	}()
+	go func() {
+		<-start
+		result, err := service.EnqueueDuePurge(ctx, mediaID)
+		outcomes <- outcome{result: result, err: err}
+	}()
+	close(start)
+	first, second := <-outcomes, <-outcomes
+	if first.err != nil || second.err != nil || first.result.Job.ID != second.result.Job.ID {
+		t.Fatalf("enqueue outcomes = %#v / %#v", first, second)
+	}
+	created := 0
+	for _, result := range []EnqueueResult{first.result, second.result} {
+		if result.Disposition == EnqueueCreated {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("created dispositions = %d, want 1", created)
+	}
+	var purgeJobs int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='purge'`, mediaID).Scan(&purgeJobs); err != nil {
+		t.Fatal(err)
+	}
+	if purgeJobs != 1 {
+		t.Fatalf("purge job count = %d, want 1", purgeJobs)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationDuePurgeScanBoundariesAndKeyset(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	ids := []string{
+		integrationUUID(25),
+		integrationUUID(26),
+		integrationUUID(27),
+		integrationUUID(28),
+		integrationUUID(29),
+		integrationUUID(30),
+	}
+	for index, mediaID := range ids {
+		insertMedia(t, pool, mediaID, integrationUUID(125+index))
+	}
+	boundary := time.Date(2026, time.October, 7, 12, 0, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=$1,purge_after=NULL WHERE id=$2`, boundary, ids[1]); err != nil {
+		t.Fatal(err)
+	}
+	for _, mediaID := range ids[2:5] {
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=$1,purge_after=$1 WHERE id=$2`, boundary, mediaID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=$1,purge_after=$2 WHERE id=$3`, boundary, boundary.Add(time.Nanosecond), ids[5]); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := service.ScanDuePurges(ctx, boundary, nil, 2)
+	if err != nil || len(first) != 2 || first[0].MediaID != ids[2] || first[1].MediaID != ids[3] {
+		t.Fatalf("first due page = %#v, %v", first, err)
+	}
+	cursor := &DuePurgeCursor{PurgeAfter: first[1].PurgeAfter, MediaID: first[1].MediaID}
+	second, err := service.ScanDuePurges(ctx, boundary, cursor, 2)
+	if err != nil || len(second) != 1 || second[0].MediaID != ids[4] {
+		t.Fatalf("second due page = %#v, %v", second, err)
+	}
+}
+
 func TestLifecycleRepositoryIntegrationProjectionParityWithReadAPI(t *testing.T) {
 	ctx := context.Background()
 	pool, service := integrationService(t)

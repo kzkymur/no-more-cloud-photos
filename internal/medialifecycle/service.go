@@ -18,6 +18,9 @@ type lifecycleRepository interface {
 	Delete(context.Context, string) (DeleteResult, error)
 	Restore(context.Context, string) (RestoreResult, error)
 	EnqueuePurge(context.Context, string) (EnqueueResult, error)
+	EnqueueDuePurge(context.Context, string) (EnqueueResult, error)
+	ScanDuePurges(context.Context, time.Time, *DuePurgeCursor, int) ([]DuePurgeCandidate, error)
+	DatabaseNow(context.Context) (time.Time, error)
 	StartPurge(context.Context, string) (PurgeLease, error)
 }
 
@@ -65,6 +68,30 @@ func (s *Service) EnqueuePurge(ctx context.Context, mediaID string) (EnqueueResu
 	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
 	defer cancel()
 	result, err := s.repository.EnqueuePurge(dbCtx, mediaID)
+	return result, classifyError(err)
+}
+
+func (s *Service) EnqueueDuePurge(ctx context.Context, mediaID string) (EnqueueResult, error) {
+	if !readapi.IsUUIDv4(mediaID) {
+		return EnqueueResult{}, newInvalidID()
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	result, err := s.repository.EnqueueDuePurge(dbCtx, mediaID)
+	return result, classifyError(err)
+}
+
+func (s *Service) ScanDuePurges(ctx context.Context, dueThrough time.Time, after *DuePurgeCursor, limit int) ([]DuePurgeCandidate, error) {
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	result, err := s.repository.ScanDuePurges(dbCtx, dueThrough, after, limit)
+	return result, classifyError(err)
+}
+
+func (s *Service) DatabaseNow(ctx context.Context) (time.Time, error) {
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	result, err := s.repository.DatabaseNow(dbCtx)
 	return result, classifyError(err)
 }
 

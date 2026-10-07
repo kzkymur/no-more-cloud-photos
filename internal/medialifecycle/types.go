@@ -42,6 +42,16 @@ type EnqueueResult struct {
 	Disposition EnqueueDisposition
 }
 
+type DuePurgeCursor struct {
+	PurgeAfter time.Time
+	MediaID    string
+}
+
+type DuePurgeCandidate struct {
+	MediaID    string
+	PurgeAfter time.Time
+}
+
 type PurgeLease struct {
 	JobID          string
 	MediaID        string

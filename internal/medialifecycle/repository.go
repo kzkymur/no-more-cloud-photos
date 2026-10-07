@@ -141,6 +141,14 @@ func (r *PostgresRepository) Restore(ctx context.Context, mediaID string) (Resto
 }
 
 func (r *PostgresRepository) EnqueuePurge(ctx context.Context, mediaID string) (EnqueueResult, error) {
+	return r.enqueuePurge(ctx, mediaID, false)
+}
+
+func (r *PostgresRepository) EnqueueDuePurge(ctx context.Context, mediaID string) (EnqueueResult, error) {
+	return r.enqueuePurge(ctx, mediaID, true)
+}
+
+func (r *PostgresRepository) enqueuePurge(ctx context.Context, mediaID string, automatic bool) (EnqueueResult, error) {
 	tx, err := r.begin(ctx)
 	if err != nil {
 		return EnqueueResult{}, err
@@ -149,11 +157,24 @@ func (r *PostgresRepository) EnqueuePurge(ctx context.Context, mediaID string) (
 	if err := lockMaintenance(ctx, tx); err != nil {
 		return EnqueueResult{}, err
 	}
-	deletedAt, err := lockMedia(ctx, tx, mediaID)
-	if err != nil {
-		return EnqueueResult{}, err
+	var deletedAt *time.Time
+	var due bool
+	err = tx.QueryRow(ctx, `SELECT deleted_at,
+		deleted_at IS NOT NULL AND purge_after IS NOT NULL AND purge_after<=clock_timestamp()
+		FROM media WHERE id=$1 FOR UPDATE`, mediaID).Scan(&deletedAt, &due)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if automatic {
+			return EnqueueResult{}, ErrNoPurgeWork
+		}
+		return EnqueueResult{}, newMediaNotFound()
 	}
-	if deletedAt == nil {
+	if err != nil {
+		return EnqueueResult{}, fmt.Errorf("lock media for purge enqueue: %w", err)
+	}
+	if automatic && !due {
+		return EnqueueResult{}, ErrNoPurgeWork
+	}
+	if !automatic && deletedAt == nil {
 		return EnqueueResult{}, newMediaNotDeleted()
 	}
 	jobs, err := lockPurgeJobs(ctx, tx, mediaID)
@@ -200,6 +221,63 @@ func (r *PostgresRepository) EnqueuePurge(ctx context.Context, mediaID string) (
 		return EnqueueResult{}, err
 	}
 	return EnqueueResult{Job: job, Disposition: EnqueueCreated}, nil
+}
+
+func (r *PostgresRepository) ScanDuePurges(ctx context.Context, dueThrough time.Time, after *DuePurgeCursor, limit int) ([]DuePurgeCandidate, error) {
+	if dueThrough.IsZero() || limit <= 0 || limit > 100 || after != nil && (!readapi.IsUUIDv4(after.MediaID) || after.PurgeAfter.IsZero()) {
+		return nil, newInvariant(errors.New("invalid due purge scan"))
+	}
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rollback(ctx, tx)
+	var afterTime any
+	var afterID any
+	if after != nil {
+		afterTime, afterID = after.PurgeAfter, after.MediaID
+	}
+	rows, err := tx.Query(ctx, `SELECT id::text,purge_after
+		FROM media
+		WHERE deleted_at IS NOT NULL AND purge_after IS NOT NULL AND purge_after<=$1
+		  AND ($2::timestamptz IS NULL OR (purge_after,id)>($2,$3::uuid))
+		ORDER BY purge_after,id LIMIT $4`, dueThrough, afterTime, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("scan due purge media: %w", err)
+	}
+	defer rows.Close()
+	candidates := make([]DuePurgeCandidate, 0, limit)
+	for rows.Next() {
+		var candidate DuePurgeCandidate
+		if err := rows.Scan(&candidate.MediaID, &candidate.PurgeAfter); err != nil {
+			return nil, fmt.Errorf("read due purge media: %w", err)
+		}
+		candidate.PurgeAfter = candidate.PurgeAfter.UTC()
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read due purge media: %w", err)
+	}
+	if err := r.commit(ctx, tx); err != nil {
+		return nil, err
+	}
+	return candidates, nil
+}
+
+func (r *PostgresRepository) DatabaseNow(ctx context.Context) (time.Time, error) {
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rollback(ctx, tx)
+	now, err := databaseNow(ctx, tx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := r.commit(ctx, tx); err != nil {
+		return time.Time{}, err
+	}
+	return now, nil
 }
 
 func (r *PostgresRepository) StartPurge(ctx context.Context, jobID string) (PurgeLease, error) {
