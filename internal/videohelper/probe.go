@@ -45,8 +45,9 @@ type probeStream struct {
 	ChannelLayout  string `json:"channel_layout"`
 	SampleRate     string `json:"sample_rate"`
 	Disposition    struct {
-		Default     int `json:"default"`
-		AttachedPic int `json:"attached_pic"`
+		Default         int `json:"default"`
+		AttachedPic     int `json:"attached_pic"`
+		TimedThumbnails int `json:"timed_thumbnails"`
 	} `json:"disposition"`
 	Tags         map[string]string        `json:"tags"`
 	SideDataList []map[string]interface{} `json:"side_data_list"`
@@ -64,7 +65,7 @@ type mediaProbe struct {
 	displayHeight *big.Rat
 }
 
-func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaProbe, error) {
+func (e *engine) inspect(path, mime string, expectedVideoStreamIndex *int, limit limits) (inspection, *mediaProbe, error) {
 	if !oneOf(mime, "video/mp4", "video/quicktime") {
 		return inspection{}, nil, fail("unsupported_input")
 	}
@@ -84,7 +85,13 @@ func (e *engine) inspect(path, mime string, limit limits) (inspection, *mediaPro
 	if len(document.Streams) > limit.Streams {
 		return inspection{}, nil, fail("resource_limit")
 	}
-	videoIndex, ok := selectStream(document.Streams, "video")
+	var videoIndex int
+	var ok bool
+	if expectedVideoStreamIndex == nil {
+		videoIndex, ok = selectStream(document.Streams, "video")
+	} else {
+		videoIndex, ok = *expectedVideoStreamIndex, validVideoStream(document.Streams, *expectedVideoStreamIndex)
+	}
 	if !ok {
 		return inspection{}, nil, fail("unsupported_input")
 	}
@@ -366,7 +373,7 @@ func parseJSONInt(value json.RawMessage) (int64, error) {
 func selectStream(streams []probeStream, kind string) (int, bool) {
 	selected, found, selectedDefault := 0, false, false
 	for _, stream := range streams {
-		if stream.Index < 0 || stream.CodecType != kind || kind == "video" && stream.Disposition.AttachedPic != 0 {
+		if stream.Index < 0 || stream.CodecType != kind || kind == "video" && auxiliaryVideoStream(stream) {
 			continue
 		}
 		isDefault := stream.Disposition.Default != 0
@@ -375,6 +382,15 @@ func selectStream(streams []probeStream, kind string) (int, bool) {
 		}
 	}
 	return selected, found
+}
+
+func validVideoStream(streams []probeStream, index int) bool {
+	stream, found := streamByIndex(streams, index)
+	return found && stream.Index >= 0 && stream.CodecType == "video" && !auxiliaryVideoStream(stream)
+}
+
+func auxiliaryVideoStream(stream probeStream) bool {
+	return stream.Disposition.AttachedPic != 0 || stream.Disposition.TimedThumbnails != 0
 }
 
 func streamByIndex(streams []probeStream, index int) (probeStream, bool) {

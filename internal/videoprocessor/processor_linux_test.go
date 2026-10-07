@@ -69,8 +69,8 @@ func TestTransformUsesDescriptorProtocolAndIndependentVerifier(t *testing.T) {
 	script := `#!/bin/sh
 set -eu
 case "$1" in
-transform) /bin/cat '` + physical + `' >&4; printf '%s' '` + transform + `' ;;
-verify-output) printf '%s' '` + verification + `' ;;
+transform) [ "${24}" = "--expected-video-stream-index" ] && [ "${25}" = "0" ]; /bin/cat '` + physical + `' >&4; printf '%s' '` + transform + `' ;;
+verify-output) [ "${12}" = "--expected-video-stream-index" ] && [ "${13}" = "0" ]; printf '%s' '` + verification + `' ;;
 *) exit 9 ;;
 esac
 `
@@ -80,7 +80,7 @@ esac
 	output := regularFile(t, nil)
 	defer output.Close()
 	recipe := profile.StandardV1Parameters().Recipes["video/mp4"]
-	got, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: recipe})
+	got, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: recipe, ExpectedVideoStreamIndex: testIntPointer(0)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ esac
 	defer input.Close()
 	output := regularFile(t, nil)
 	defer output.Close()
-	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"]})
+	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"], ExpectedVideoStreamIndex: testIntPointer(0)})
 	if !errors.Is(err, ErrProcess) {
 		t.Fatalf("error = %v", err)
 	}
@@ -190,7 +190,7 @@ func TestOperationTimeoutUsesPrivateCause(t *testing.T) {
 	defer input.Close()
 	output := regularFile(t, nil)
 	defer output.Close()
-	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"]})
+	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"], ExpectedVideoStreamIndex: testIntPointer(0)})
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("error = %v", err)
 	}
@@ -224,7 +224,7 @@ func TestOperationTimeoutReapsDetachedCodecDescendant(t *testing.T) {
 	defer input.Close()
 	output := regularFile(t, nil)
 	defer output.Close()
-	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"]})
+	_, err := p.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"], ExpectedVideoStreamIndex: testIntPointer(0)})
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("error=%v", err)
 	}
@@ -257,8 +257,10 @@ func inspectionJSON(i Inspection) string {
 
 func auditJSON(i Inspection, digest string) string {
 	versions := `{"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libaom":"v3.8.2"}`
-	return fmt.Sprintf(`{"tool_version":"nmcp-video-helper/1","build_manifest":"%s","library_versions":%s,"icc_sha256":"%s","demuxer":"mov","video_decoder":"h264","audio_decoder":"none","video_encoder":"libsvtav1","audio_encoder":"none","muxer":"mp4","selected_video_stream":%d,"selected_audio_stream":%d,"stream_selection":"default-first-then-index","rotation_source":"none","rotation_degrees_applied":0,"orientation":"identity","geometry":"display-aspect-square-pixel-even-floor-no-upscale","timing":"preserve-presentation-order-vfr-rebase-zero","video_filter_graph":"zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=limited,scale=320:180:flags=lanczos,setsar=1,format=yuv420p10le,setpts=PTS-STARTPTS","audio_filter_graph":"none","input_color":"bt709/bt709/bt709/limited","output_color":"bt709-sdr-100nit","output_primaries":"bt709","output_transfer":"bt709","output_matrix":"bt709","output_range":"limited","hdr_disposition":"sdr-normalized","tone_map":"not-needed","target_nits":100,"source_peak_nits":0,"input_audio_layout":"none","output_audio_layout":"none","input_audio_sample_rate":0,"output_audio_sample_rate":0,"metadata":"strip-after-normalization-keep-color-tags"}`, BuildManifest, versions, digest, i.VideoStreamIndex, i.AudioStreamIndex)
+	return fmt.Sprintf(`{"tool_version":"nmcp-video-helper/1","build_manifest":"%s","library_versions":%s,"icc_sha256":"%s","demuxer":"mov","video_decoder":"h264","audio_decoder":"none","video_encoder":"libsvtav1","audio_encoder":"none","muxer":"mp4","selected_video_stream":%d,"selected_audio_stream":%d,"stream_selection":"expected-absolute-index","rotation_source":"none","rotation_degrees_applied":0,"orientation":"identity","geometry":"display-aspect-square-pixel-even-floor-no-upscale","timing":"preserve-presentation-order-vfr-rebase-zero","video_filter_graph":"zscale=primaries=bt709:transfer=bt709:matrix=bt709:range=limited,scale=320:180:flags=lanczos,setsar=1,format=yuv420p10le,setpts=PTS-STARTPTS","audio_filter_graph":"none","input_color":"bt709/bt709/bt709/limited","output_color":"bt709-sdr-100nit","output_primaries":"bt709","output_transfer":"bt709","output_matrix":"bt709","output_range":"limited","hdr_disposition":"sdr-normalized","tone_map":"not-needed","target_nits":100,"source_peak_nits":0,"input_audio_layout":"none","output_audio_layout":"none","input_audio_sample_rate":0,"output_audio_sample_rate":0,"metadata":"strip-after-normalization-keep-color-tags"}`, BuildManifest, versions, digest, i.VideoStreamIndex, i.AudioStreamIndex)
 }
+
+func testIntPointer(value int) *int { return &value }
 
 func capabilityJSON(digest string) string {
 	return fmt.Sprintf(`#!/bin/sh

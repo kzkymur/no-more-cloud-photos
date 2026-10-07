@@ -262,7 +262,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 	arguments := []string{"transform", "--protocol", "1", "--input", "/proc/self/fd/3", "--output", "/proc/self/fd/4",
 		"--input-mime", request.MIMEType, "--output-kind", kind, "--max-long-edge", strconv.Itoa(request.Recipe.MaxLongEdge),
 		"--quality", strconv.Itoa(quality), "--bit-depth", strconv.Itoa(bitDepth), "--threads", "1", "--srgb-icc", "/proc/self/fd/5",
-		"--generated-bytes-before", strconv.FormatInt(request.GeneratedBytesBefore, 10)}
+		"--generated-bytes-before", strconv.FormatInt(request.GeneratedBytesBefore, 10), "--expected-video-stream-index", strconv.Itoa(*request.ExpectedVideoStreamIndex)}
 	arguments = append(arguments, p.limitArguments()...)
 	operationRunner := p.runner
 	if kind == "first-frame-avif" {
@@ -355,7 +355,7 @@ func (p *Processor) verifyOutput(ctx context.Context, runner *processrunner.Runn
 	}
 	defer output.Close()
 	arguments := append([]string{"verify-output", "--protocol", "1", "--source", "/proc/self/fd/3", "--output", "/proc/self/fd/4",
-		"--source-mime", request.MIMEType, "--output-kind", transformed.Kind}, p.limitArguments()...)
+		"--source-mime", request.MIMEType, "--output-kind", transformed.Kind, "--expected-video-stream-index", strconv.Itoa(*request.ExpectedVideoStreamIndex)}, p.limitArguments()...)
 	result, err := runner.Run(ctx, processrunner.Command{Executable: p.helper, Arguments: arguments, Files: []*os.File{source, output}})
 	if err != nil {
 		return 0, err
@@ -404,7 +404,7 @@ func validateInput(file *os.File, mime string) error {
 }
 
 func validateRequest(request Request) error {
-	if validateInput(request.Input, request.MIMEType) != nil || request.Output == nil || request.GeneratedBytesBefore < 0 || request.GeneratedBytesBefore > MaxGeneratedOutputBytes || request.ExpectedVideoStreamIndex != nil && *request.ExpectedVideoStreamIndex < 0 || validateRecipe(request.Recipe, request.MIMEType) != nil {
+	if validateInput(request.Input, request.MIMEType) != nil || request.Output == nil || request.GeneratedBytesBefore < 0 || request.GeneratedBytesBefore > MaxGeneratedOutputBytes || request.ExpectedVideoStreamIndex == nil || *request.ExpectedVideoStreamIndex < 0 || validateRecipe(request.Recipe, request.MIMEType) != nil {
 		return ErrInvalid
 	}
 	inputInfo, err := request.Input.Stat()
@@ -507,7 +507,7 @@ func validateTransform(r transformWire, request Request, p Policy, digest string
 	if kind == "mp4-av1" && r.Source.AudioPresent {
 		expectedOutputLayout = r.Source.AudioChannelLayout
 	}
-	if a.ToolVersion != "nmcp-video-helper/1" || a.BuildManifest != BuildManifest || validateVersionMap(a.LibraryVersions) != nil || a.ICCSHA256 != digest || a.Demuxer != "mov" || a.VideoDecoder != r.Source.VideoCodec || a.AudioDecoder != expectedAudioDecoder || a.SelectedVideoStream != r.Source.VideoStreamIndex || a.SelectedAudioStream != r.Source.AudioStreamIndex || a.StreamSelection != "default-first-then-index" || !oneOf(a.RotationSource, "none", "display-matrix", "rotate-tag", "display-matrix+rotate") || a.RotationDegreesApplied != r.Source.RotationDegrees || a.Orientation != "identity" || a.Geometry != geometry || a.Timing != "preserve-presentation-order-vfr-rebase-zero" || a.VideoFilterGraph != auditVideoFilter(r.Source, r.Width, r.Height, r.BitDepth, kind) || a.AudioFilterGraph != expectedAudioFilter || a.VideoEncoder != videoEncoder || a.AudioEncoder != expectedAudioEncoder || a.Muxer != muxer || a.InputColor != auditInputColor(r.Source) || a.OutputColor != outputColor || a.OutputPrimaries != "bt709" || a.OutputTransfer != outputTransfer || a.OutputMatrix != "bt709" || a.OutputRange != "limited" || a.InputAudioLayout != r.Source.AudioChannelLayout || a.OutputAudioLayout != expectedOutputLayout || a.InputAudioSampleRate != r.Source.AudioSampleRate || a.OutputAudioSampleRate != expectedAudioRate || a.Metadata != "strip-after-normalization-keep-color-tags" {
+	if a.ToolVersion != "nmcp-video-helper/1" || a.BuildManifest != BuildManifest || validateVersionMap(a.LibraryVersions) != nil || a.ICCSHA256 != digest || a.Demuxer != "mov" || a.VideoDecoder != r.Source.VideoCodec || a.AudioDecoder != expectedAudioDecoder || a.SelectedVideoStream != r.Source.VideoStreamIndex || a.SelectedAudioStream != r.Source.AudioStreamIndex || a.StreamSelection != "expected-absolute-index" || !oneOf(a.RotationSource, "none", "display-matrix", "rotate-tag", "display-matrix+rotate") || a.RotationDegreesApplied != r.Source.RotationDegrees || a.Orientation != "identity" || a.Geometry != geometry || a.Timing != "preserve-presentation-order-vfr-rebase-zero" || a.VideoFilterGraph != auditVideoFilter(r.Source, r.Width, r.Height, r.BitDepth, kind) || a.AudioFilterGraph != expectedAudioFilter || a.VideoEncoder != videoEncoder || a.AudioEncoder != expectedAudioEncoder || a.Muxer != muxer || a.InputColor != auditInputColor(r.Source) || a.OutputColor != outputColor || a.OutputPrimaries != "bt709" || a.OutputTransfer != outputTransfer || a.OutputMatrix != "bt709" || a.OutputRange != "limited" || a.InputAudioLayout != r.Source.AudioChannelLayout || a.OutputAudioLayout != expectedOutputLayout || a.InputAudioSampleRate != r.Source.AudioSampleRate || a.OutputAudioSampleRate != expectedAudioRate || a.Metadata != "strip-after-normalization-keep-color-tags" {
 		return ErrProcess
 	}
 	if r.Source.HDR {

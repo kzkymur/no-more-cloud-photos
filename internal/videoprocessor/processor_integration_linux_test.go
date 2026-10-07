@@ -163,7 +163,7 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer output.Close()
-			_, err = processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: test.mime, Recipe: profile.StandardV1Parameters().Recipes[test.mime]})
+			_, err = processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: test.mime, Recipe: profile.StandardV1Parameters().Recipes[test.mime], ExpectedVideoStreamIndex: &test.videoIndex})
 			if err == nil {
 				t.Fatal("Transform accepted recoverably corrupt input")
 			}
@@ -175,6 +175,140 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 				t.Fatalf("failed Transform output size = %d", info.Size())
 			}
 		})
+	}
+
+	t.Run("persisted nondefault lower-area absolute stream", func(t *testing.T) {
+		path := requiredAbsoluteEnv(t, "TEST_VIDEO_MULTISTREAM_ROTATED_PATH")
+		streams := realStreams(t, ffprobe, path)
+		selected, selectedArea := -1, 0
+		defaultArea := 0
+		for _, stream := range streams {
+			if stream.CodecType != "video" || stream.Disposition.AttachedPic != 0 || stream.Disposition.TimedThumbnails != 0 {
+				continue
+			}
+			area := stream.Width * stream.Height
+			if stream.Disposition.Default != 0 {
+				defaultArea = area
+			} else if selected < 0 || area < selectedArea {
+				selected, selectedArea = stream.Index, area
+			}
+		}
+		if selected < 0 || defaultArea <= 0 || selectedArea >= defaultArea {
+			t.Fatalf("fixture lacks lower-area nondefault video: %#v", streams)
+		}
+		input, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer input.Close()
+		output, err := os.CreateTemp(t.TempDir(), "nondefault-output-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer output.Close()
+		result, err := processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: "video/mp4", Recipe: profile.StandardV1Parameters().Recipes["video/mp4"], ExpectedVideoStreamIndex: &selected})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Source.VideoStreamIndex != selected || result.Audit.SelectedVideoStream != selected || result.Source.CodedWidth*result.Source.CodedHeight != selectedArea {
+			t.Fatalf("result selected default instead of persisted stream %d: %#v", selected, result)
+		}
+	})
+
+	t.Run("invalid persisted absolute streams fail closed", func(t *testing.T) {
+		rotated := requiredAbsoluteEnv(t, "TEST_VIDEO_MULTISTREAM_ROTATED_PATH")
+		streams := realStreams(t, ffprobe, rotated)
+		attached, maximum := -1, -1
+		for _, stream := range streams {
+			maximum = max(maximum, stream.Index)
+			if stream.CodecType == "video" && stream.Disposition.AttachedPic != 0 {
+				attached = stream.Index
+			}
+		}
+		if attached < 0 {
+			t.Fatalf("fixture lacks attached picture: %#v", streams)
+		}
+		assertExpectedStreamTransformFails(t, processor, rotated, "video/mp4", maximum+1)
+		assertExpectedStreamTransformFails(t, processor, rotated, "video/mp4", attached)
+
+		withAudio := requiredAbsoluteEnv(t, "TEST_VIDEO_MULTISTREAM_PATH")
+		audio := -1
+		for _, stream := range realStreams(t, ffprobe, withAudio) {
+			if stream.CodecType == "audio" {
+				audio = stream.Index
+				break
+			}
+		}
+		if audio < 0 {
+			t.Fatal("fixture lacks audio stream")
+		}
+		assertExpectedStreamTransformFails(t, processor, withAudio, "video/mp4", audio)
+
+		timedPath := filepath.Join(t.TempDir(), "timed-thumbnail.mp4")
+		command := exec.Command(ffmpeg, "-v", "error", "-y", "-i", rotated, "-map", "0", "-c", "copy", "-disposition:v:0", "timed_thumbnails", timedPath)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("create timed-thumbnail fixture: %v: %s", err, output)
+		}
+		timed := -1
+		for _, stream := range realStreams(t, ffprobe, timedPath) {
+			if stream.Disposition.TimedThumbnails != 0 {
+				timed = stream.Index
+				break
+			}
+		}
+		if timed < 0 {
+			t.Fatal("remuxed fixture lacks timed-thumbnail disposition")
+		}
+		assertExpectedStreamTransformFails(t, processor, timedPath, "video/mp4", timed)
+	})
+}
+
+type realProbeStream struct {
+	Index, Width, Height int
+	CodecType            string
+	Disposition          struct {
+		Default         int `json:"default"`
+		AttachedPic     int `json:"attached_pic"`
+		TimedThumbnails int `json:"timed_thumbnails"`
+	} `json:"disposition"`
+}
+
+func realStreams(t *testing.T, ffprobe, path string) []realProbeStream {
+	t.Helper()
+	data, err := exec.Command(ffprobe, "-v", "error", "-show_streams", "-of", "json", path).Output()
+	if err != nil {
+		t.Fatalf("probe streams: %v", err)
+	}
+	var document struct {
+		Streams []realProbeStream `json:"streams"`
+	}
+	if json.Unmarshal(data, &document) != nil || len(document.Streams) == 0 {
+		t.Fatalf("invalid stream probe: %s", data)
+	}
+	return document.Streams
+}
+
+func assertExpectedStreamTransformFails(t *testing.T, processor *Processor, path, mime string, index int) {
+	t.Helper()
+	input, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	output, err := os.CreateTemp(t.TempDir(), "rejected-output-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	if _, err := processor.Transform(context.Background(), Request{Input: input, Output: output, MIMEType: mime, Recipe: profile.StandardV1Parameters().Recipes[mime], ExpectedVideoStreamIndex: &index}); err == nil {
+		t.Fatalf("accepted invalid absolute stream %d", index)
+	}
+	info, err := output.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("rejected output retained bytes: size=%d", info.Size())
 	}
 }
 

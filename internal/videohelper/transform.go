@@ -27,7 +27,7 @@ func (e *engine) transform(r request, out io.Writer) (returnErr error) {
 			}
 		}
 	}()
-	source, probe, err := e.inspect(r.input, r.mime, r.limits)
+	source, probe, err := e.inspect(r.input, r.mime, r.expectedVideoStreamIndex, r.limits)
 	if err != nil {
 		return err
 	}
@@ -139,7 +139,7 @@ func makeAudit(source inspection, probe *mediaProbe, digest, videoFilter, audioF
 		ToolVersion: helperVersion, BuildManifest: buildManifest, LibraryVersions: versions, ICCSHA256: digest,
 		Demuxer: firstFormat(probe.document.Format.FormatName), VideoDecoder: source.VideoCodec, AudioDecoder: audioDecoder,
 		VideoEncoder: map[bool]string{true: "libsvtav1", false: "libaom-av1"}[kind == "mp4-av1"], AudioEncoder: audioEncoder, Muxer: muxer,
-		SelectedVideoStream: source.VideoStreamIndex, SelectedAudioStream: source.AudioStreamIndex, StreamSelection: "default-first-then-index",
+		SelectedVideoStream: source.VideoStreamIndex, SelectedAudioStream: source.AudioStreamIndex, StreamSelection: "expected-absolute-index",
 		RotationSource: probe.rotation, RotationDegreesApplied: source.RotationDegrees, Orientation: "identity", Geometry: geometry,
 		Timing: "preserve-presentation-order-vfr-rebase-zero", VideoFilterGraph: videoFilter, AudioFilterGraph: audioFilter,
 		InputColor: source.ColorPrimaries + "/" + source.ColorTransfer + "/" + source.ColorMatrix + "/" + source.ColorRange, OutputColor: outputColor,
@@ -274,7 +274,7 @@ func (e *engine) probeOutput(path, kind string, limit limits) (*outputProbe, err
 }
 
 func (e *engine) verify(r request, out io.Writer) error {
-	source, sourceProbe, err := e.inspect(r.source, r.mime, r.limits)
+	source, sourceProbe, err := e.inspect(r.source, r.mime, r.expectedVideoStreamIndex, r.limits)
 	if err != nil {
 		return err
 	}
