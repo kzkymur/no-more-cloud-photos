@@ -36,8 +36,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 6 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version six", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 7 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version seven", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -60,11 +60,65 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 6 || status.ExpectedVersion != 6 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version six", status)
+		if status.CurrentVersion != 7 || status.ExpectedVersion != 7 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version seven", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
+		}
+	})
+
+	t.Run("lifecycle guard upgrade rejects invalid retention without clamping", func(t *testing.T) {
+		ctx := context.Background()
+		prepareVersionSix := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
+			t.Helper()
+			pool := integrationPool(t, databaseURL)
+			full, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := newMigrator(pool, full.migrations[:6]).Up(ctx); err != nil {
+				t.Fatalf("apply versions one through six: %v", err)
+			}
+			return pool, full
+		}
+
+		validPool, validMigrator := prepareVersionSix(t)
+		if _, err := validPool.Exec(ctx, `UPDATE system_config SET deleted_media_retention_days=36500 WHERE id=1`); err != nil {
+			t.Fatal(err)
+		}
+		if err := validMigrator.Up(ctx); err != nil {
+			t.Fatalf("upgrade maximum valid retention: %v", err)
+		}
+
+		invalidPool, invalidMigrator := prepareVersionSix(t)
+		if _, err := invalidPool.Exec(ctx, `UPDATE system_config SET deleted_media_retention_days=36501 WHERE id=1`); err != nil {
+			t.Fatal(err)
+		}
+		if err := invalidMigrator.Up(ctx); err == nil {
+			t.Fatal("migration accepted retention above the lifecycle maximum")
+		}
+		var version int64
+		var retention int
+		var upperBound, purgeGuard bool
+		if err := invalidPool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if err := invalidPool.QueryRow(ctx, `SELECT deleted_media_retention_days FROM system_config WHERE id=1`).Scan(&retention); err != nil {
+			t.Fatal(err)
+		}
+		if err := invalidPool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conrelid='system_config'::regclass
+			  AND conname='system_config_deleted_media_retention_max_check'
+		)`).Scan(&upperBound); err != nil {
+			t.Fatal(err)
+		}
+		if err := invalidPool.QueryRow(ctx, `SELECT to_regprocedure('nmcp_guard_purge_job_insert()') IS NOT NULL`).Scan(&purgeGuard); err != nil {
+			t.Fatal(err)
+		}
+		if version != 6 || retention != 36501 || upperBound || purgeGuard {
+			t.Fatalf("failed lifecycle migration state: version=%d retention=%d upper_bound=%t purge_guard=%t", version, retention, upperBound, purgeGuard)
 		}
 	})
 

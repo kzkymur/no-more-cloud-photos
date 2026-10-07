@@ -1757,6 +1757,9 @@ func insertPurgeJob(t *testing.T, pool *pgxpool.Pool, maxAttempts int, available
 	t.Helper()
 	id := newTestUUID(t)
 	mediaID := newTestUUID(t)
+	if _, err := pool.Exec(context.Background(), `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after) VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp())`, mediaID); err != nil {
+		t.Fatal(err)
+	}
 	query := fmt.Sprintf(`INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts,available_at) VALUES ($1,'purge',$2,'queued',$3,%s)`, availableExpression)
 	if _, err := pool.Exec(context.Background(), query, id, mediaID, maxAttempts); err != nil {
 		t.Fatal(err)
