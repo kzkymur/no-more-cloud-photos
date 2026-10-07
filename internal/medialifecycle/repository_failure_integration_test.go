@@ -270,6 +270,48 @@ func TestLifecycleRepositoryIntegrationPostCommitResponseLossConverges(t *testin
 			t.Fatalf("StartNextPurge retry = %#v, %v", retry, err)
 		}
 	})
+
+	t.Run("initial purge start", func(t *testing.T) {
+		ctx := context.Background()
+		pool, setupService := integrationService(t)
+		mediaID := integrationUUID(775)
+		insertMedia(t, pool, mediaID, integrationUUID(776))
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := setupService.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fault := errors.New("initial purge start response lost")
+		faultyService := lifecycleServiceWithOnePostCommitFailure(pool, fault)
+		_, err = faultyService.StartPurge(ctx, enqueued.Job.ID)
+		assertCommitOutcomeUnknown(t, err, fault)
+		var durableToken string
+		var firstStartedAt time.Time
+		var attempts int
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status,attempts,lease_token::text,started_at FROM jobs WHERE id=$1`, enqueued.Job.ID).Scan(
+			&status, &attempts, &durableToken, &firstStartedAt); err != nil {
+			t.Fatal(err)
+		}
+		if status != "running" || attempts != 1 || durableToken == "" || firstStartedAt.IsZero() {
+			t.Fatalf("durable initial purge status=%s attempts=%d token=%q started=%s", status, attempts, durableToken, firstStartedAt)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, enqueued.Job.ID); err != nil {
+			t.Fatal(err)
+		}
+		repository := setupService.repository.(*PostgresRepository)
+		repository.jitter = func(time.Duration) time.Duration { return 0 }
+		reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10)
+		if err != nil || len(reclaimed) != 1 || reclaimed[0] != enqueued.Job.ID {
+			t.Fatalf("reclaim unknown-start purge = %#v, %v", reclaimed, err)
+		}
+		retry, err := setupService.StartNextPurge(ctx, 10)
+		if err != nil || retry.JobID != enqueued.Job.ID || retry.Attempts != 2 || !retry.StartedAt.Equal(firstStartedAt) || retry.Token == durableToken {
+			t.Fatalf("unknown-start retry = %#v, %v", retry, err)
+		}
+	})
 }
 
 func TestLifecycleRepositoryIntegrationDeleteVersusTransformPublication(t *testing.T) {

@@ -434,6 +434,53 @@ func TestLifecycleRepositoryIntegrationPurgeDiscoverySkipsLockedMedia(t *testing
 	}
 }
 
+func TestLifecycleRepositoryIntegrationPurgeReclaimSkipsLockedJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	repository.jitter = func(time.Duration) time.Duration { return 0 }
+	mediaIDs := []string{integrationUUID(38), integrationUUID(39)}
+	leases := make([]PurgeLease, 0, len(mediaIDs))
+	for index, mediaID := range mediaIDs {
+		insertMedia(t, pool, mediaID, integrationUUID(138+index))
+		if _, err := service.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := service.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leases = append(leases, lease)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()-$2::interval WHERE id=$1`, lease.JobID, fmt.Sprintf("%d seconds", 2-index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobBlocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jobBlocker.Rollback(context.Background())
+	if _, err := jobBlocker.Exec(ctx, `SELECT 1 FROM jobs WHERE id=$1 FOR UPDATE`, leases[0].JobID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0] != leases[1].JobID {
+		t.Fatalf("reclaim behind locked Job = %#v, %v", reclaimed, err)
+	}
+	if err := jobBlocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err = repository.ReclaimExpiredPurges(ctx, 10)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0] != leases[0].JobID {
+		t.Fatalf("reclaim after Job unlock = %#v, %v", reclaimed, err)
+	}
+}
+
 func TestLifecycleRepositoryIntegrationPurgeSchedulerMaintenanceBoundary(t *testing.T) {
 	ctx := context.Background()
 	pool, service := integrationService(t)
@@ -471,6 +518,79 @@ func TestLifecycleRepositoryIntegrationPurgeSchedulerMaintenanceBoundary(t *test
 	}
 	if retainedStatus != "running" || retainedToken != lease.Token {
 		t.Fatalf("maintenance mutated purge status=%s token=%s", retainedStatus, retainedToken)
+	}
+}
+
+func TestLifecycleRepositoryIntegrationMaintenanceEntryDrainsPurgeReclaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, service := integrationService(t)
+	repository := service.repository.(*PostgresRepository)
+	repository.jitter = func(time.Duration) time.Duration { return 0 }
+	mediaID := integrationUUID(40)
+	insertMedia(t, pool, mediaID, integrationUUID(140))
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := service.EnqueuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	reclaimAtCommit := make(chan struct{})
+	releaseReclaim := make(chan struct{})
+	repository.beforeReclaimCommit = func(ctx context.Context) error {
+		close(reclaimAtCommit)
+		select {
+		case <-releaseReclaim:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	reclaimResult := make(chan error, 1)
+	go func() {
+		_, err := repository.ReclaimExpiredPurges(ctx, 10)
+		reclaimResult <- err
+	}()
+	<-reclaimAtCommit
+	maintenanceConn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenanceConn.Release()
+	var maintenancePID int32
+	if err := maintenanceConn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&maintenancePID); err != nil {
+		t.Fatal(err)
+	}
+	maintenanceResult := make(chan error, 1)
+	go func() {
+		_, err := maintenanceConn.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='test',owner='test',entered_at=clock_timestamp() WHERE id=1`)
+		maintenanceResult <- err
+	}()
+	awaitLockWait(t, ctx, pool, maintenancePID)
+	close(releaseReclaim)
+	if err := <-reclaimResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-maintenanceResult; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.StartNextPurge(ctx, 10); !IsKind(err, KindDatabaseUnavailable) {
+		t.Fatalf("post-maintenance scheduler error = %#v", err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, lease.JobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("drained reclaim status = %s, want queued", status)
 	}
 }
 

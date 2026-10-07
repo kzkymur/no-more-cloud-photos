@@ -142,6 +142,44 @@ func TestStartNextPurgeFeedsDiscoveredIDsOnlyThroughStartPurge(t *testing.T) {
 	}
 }
 
+func TestPurgeRetryBackoffAndInvalidJitter(t *testing.T) {
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: 0, want: 5 * time.Second},
+		{attempt: 1, want: 5 * time.Second},
+		{attempt: 2, want: 10 * time.Second},
+		{attempt: 3, want: 20 * time.Second},
+		{attempt: 8, want: 10*time.Minute + 40*time.Second},
+		{attempt: 9, want: 15 * time.Minute},
+		{attempt: 100, want: 15 * time.Minute},
+	}
+	for _, test := range tests {
+		maximum := purgeBackoffMaximum(test.attempt)
+		if maximum != test.want {
+			t.Fatalf("attempt %d maximum = %s, want %s", test.attempt, maximum, test.want)
+		}
+		got, err := purgeRetryDelay(func(value time.Duration) time.Duration { return value }, test.attempt)
+		if err != nil || got != test.want {
+			t.Fatalf("attempt %d delay = %s, %v", test.attempt, got, err)
+		}
+	}
+	for name, jitter := range map[string]func(time.Duration) time.Duration{
+		"nil":      nil,
+		"negative": func(time.Duration) time.Duration { return -time.Nanosecond },
+		"over maximum": func(maximum time.Duration) time.Duration {
+			return maximum + time.Nanosecond
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := purgeRetryDelay(jitter, 3); !IsKind(err, KindInvariant) {
+				t.Fatalf("invalid jitter error = %#v", err)
+			}
+		})
+	}
+}
+
 func TestDatabaseErrorClassification(t *testing.T) {
 	tests := []struct {
 		name string

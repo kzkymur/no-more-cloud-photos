@@ -28,11 +28,12 @@ type transactionDatabase interface {
 }
 
 type PostgresRepository struct {
-	db          transactionDatabase
-	fileBaseURL string
-	newID       func() (string, error)
-	afterCommit func(context.Context) error
-	jitter      func(time.Duration) time.Duration
+	db                  transactionDatabase
+	fileBaseURL         string
+	newID               func() (string, error)
+	afterCommit         func(context.Context) error
+	jitter              func(time.Duration) time.Duration
+	beforeReclaimCommit func(context.Context) error
 }
 
 func NewPostgresRepository(pool *pgxpool.Pool, fileBaseURL string) (*PostgresRepository, error) {
@@ -363,9 +364,9 @@ func (r *PostgresRepository) ReclaimExpiredPurges(ctx context.Context, limit int
 		if err != nil {
 			return nil, fmt.Errorf("lock expired purge job: %w", err)
 		}
-		delay := r.jitter(purgeBackoffMaximum(attempts))
-		if delay < 0 || delay > purgeBackoffMaximum(attempts) {
-			return nil, newInvariant(errors.New("invalid purge retry jitter"))
+		delay, err := purgeRetryDelay(r.jitter, attempts)
+		if err != nil {
+			return nil, err
 		}
 		tag, err := tx.Exec(ctx, `UPDATE jobs SET
 			status=CASE WHEN attempts<max_attempts THEN 'queued' ELSE 'failed' END,
@@ -381,6 +382,11 @@ func (r *PostgresRepository) ReclaimExpiredPurges(ctx context.Context, limit int
 			reclaimed = append(reclaimed, jobID)
 		} else {
 			excludedJobIDs = append(excludedJobIDs, jobID)
+		}
+	}
+	if r.beforeReclaimCommit != nil {
+		if err := r.beforeReclaimCommit(ctx); err != nil {
+			return nil, err
 		}
 	}
 	if err := r.commit(ctx, tx); err != nil {
@@ -595,6 +601,18 @@ func purgeBackoffMaximum(attempt int) time.Duration {
 		return purgeBackoffCap
 	}
 	return maximum
+}
+
+func purgeRetryDelay(jitter func(time.Duration) time.Duration, attempt int) (time.Duration, error) {
+	if jitter == nil {
+		return 0, newInvariant(errors.New("purge retry jitter is required"))
+	}
+	maximum := purgeBackoffMaximum(attempt)
+	delay := jitter(maximum)
+	if delay < 0 || delay > maximum {
+		return 0, newInvariant(errors.New("invalid purge retry jitter"))
+	}
+	return delay, nil
 }
 
 func cryptoJitter(maximum time.Duration) time.Duration {
