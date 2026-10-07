@@ -419,6 +419,68 @@ func TestLifecycleRepositoryIntegrationPurgeReclaimLocksMediaBeforeJob(t *testin
 	if err != nil || len(reclaimed) != 1 || reclaimed[0] != lease.JobID {
 		t.Fatalf("post-lock reclaim = %#v, %v", reclaimed, err)
 	}
+
+	raceMediaID := integrationUUID(36)
+	insertMedia(t, pool, raceMediaID, integrationUUID(136))
+	if _, err := service.Delete(ctx, raceMediaID); err != nil {
+		t.Fatal(err)
+	}
+	raceEnqueued, err := service.EnqueuePurge(ctx, raceMediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raceLease, err := service.StartPurge(ctx, raceEnqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '1 second' WHERE id=$1`, raceLease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	jobBlocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobBlocker.Exec(ctx, `SELECT 1 FROM jobs WHERE id=$1 FOR UPDATE`, raceLease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	var jobBlockerPID int32
+	if err := jobBlocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&jobBlockerPID); err != nil {
+		t.Fatal(err)
+	}
+	heartbeatResult := make(chan error, 1)
+	go func() {
+		_, heartbeatErr := repository.HeartbeatPurge(ctx, raceLease.JobID, raceLease.Token)
+		heartbeatResult <- heartbeatErr
+	}()
+	awaitBlockedMediaLockCount(t, ctx, pool, jobBlockerPID, 1)
+	finalizerResult := make(chan error, 1)
+	go func() { finalizerResult <- repository.FinalizePurge(ctx, raceLease.JobID, raceLease.Token) }()
+	awaitBlockedMediaLockCount(t, ctx, pool, jobBlockerPID, 2)
+	for {
+		var expired bool
+		if err := pool.QueryRow(ctx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, raceLease.JobID).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if skipped, err := repository.ReclaimExpiredPurges(ctx, 10); err != nil || len(skipped) != 0 {
+		t.Fatalf("reclaim did not skip heartbeat-locked Media: %#v, %v", skipped, err)
+	}
+	if err := jobBlocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-heartbeatResult; !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("expired blocked heartbeat error = %#v", err)
+	}
+	if err := <-finalizerResult; !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("finalizer behind heartbeat error = %#v", err)
+	}
+	if reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10); err != nil || len(reclaimed) != 1 || reclaimed[0] != raceLease.JobID {
+		t.Fatalf("post-race reclaim = %#v, %v", reclaimed, err)
+	}
 }
 
 func TestLifecycleRepositoryIntegrationPurgeDiscoverySkipsLockedMedia(t *testing.T) {
@@ -724,12 +786,54 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	if err != nil || !done.Done || done.File != nil {
 		t.Fatalf("completed purge step = %#v, %v", done, err)
 	}
+	reuseTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reuseTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, activeLease.JobID); err == nil {
+		_, err = reuseTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, activeLease.Token)
+	}
+	if err == nil {
+		_, err = reuseTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID)
+	}
+	if err != nil {
+		_ = reuseTx.Rollback(ctx)
+		t.Fatalf("authorized purge delete: %v", err)
+	}
+	concurrentReuseTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var concurrentReusePID int32
+	if err := concurrentReuseTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&concurrentReusePID); err != nil {
+		t.Fatal(err)
+	}
+	concurrentReuse := make(chan error, 1)
+	go func() {
+		_, insertErr := concurrentReuseTx.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID)
+		concurrentReuse <- insertErr
+	}()
+	awaitLockWait(t, ctx, pool, concurrentReusePID)
+	if _, err = reuseTx.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err == nil {
+		_ = reuseTx.Rollback(ctx)
+		t.Fatal("authorized DELETE then same-transaction INSERT reused Media identity")
+	}
+	_ = reuseTx.Rollback(ctx)
+	if err := <-concurrentReuse; err == nil {
+		t.Fatal("concurrent Media identity reuse succeeded after authorized delete rollback")
+	}
+	_ = concurrentReuseTx.Rollback(ctx)
+	var liveAfterReuseRollback bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM media WHERE id=$1) AND (SELECT state='live' FROM media_purge_identity_guard WHERE media_id=$1)`, mediaID).Scan(&liveAfterReuseRollback); err != nil || !liveAfterReuseRollback {
+		t.Fatalf("failed identity reuse rollback=%t error=%v", liveAfterReuseRollback, err)
+	}
 	assertFinalizerRollback := func(stage string) {
 		t.Helper()
 		var intact bool
 		if err := pool.QueryRow(ctx, `SELECT
 			EXISTS(SELECT 1 FROM media WHERE id=$1)
 			AND (SELECT status='running' FROM jobs WHERE id=$2)
+			AND (SELECT state='live' FROM media_purge_identity_guard WHERE media_id=$1)
 			AND NOT EXISTS(SELECT 1 FROM change_events WHERE media_id=$1 AND event_type='media_purged' AND reason='physical_purge')`, mediaID, activeLease.JobID).Scan(&intact); err != nil || !intact {
 			t.Fatalf("%s finalizer rollback=%t error=%v", stage, intact, err)
 		}
@@ -816,14 +920,40 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	if _, err := pool.Exec(ctx, `ALTER TABLE change_events ENABLE TRIGGER USER`); err != nil {
 		t.Fatal(err)
 	}
-	if err := repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token); err != nil {
-		t.Fatalf("finalize purge: %v", err)
+	finalBlocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := finalBlocker.Exec(ctx, `SELECT 1 FROM media WHERE id=$1 FOR UPDATE`, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	var finalBlockerPID int32
+	if err := finalBlocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&finalBlockerPID); err != nil {
+		t.Fatal(err)
+	}
+	finalHeartbeat := make(chan error, 1)
+	go func() {
+		_, err := repository.HeartbeatPurge(ctx, activeLease.JobID, activeLease.Token)
+		finalHeartbeat <- err
+	}()
+	awaitBlockedMediaLockCount(t, ctx, pool, finalBlockerPID, 1)
+	finalizeResult := make(chan error, 1)
+	go func() { finalizeResult <- repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token) }()
+	awaitBlockedMediaLockCount(t, ctx, pool, finalBlockerPID, 2)
+	if err := finalBlocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-finalHeartbeat; err != nil {
+		t.Fatalf("heartbeat serialized before finalizer: %v", err)
+	}
+	if err := <-finalizeResult; err != nil {
+		t.Fatalf("finalize after heartbeat: %v", err)
 	}
 	if err := repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token); err != nil {
 		t.Fatalf("converge finalized purge: %v", err)
 	}
 	var mediaCount, originalCount, renditionCount, eventCount, progressCount, targetCount, transformNullOriginals int
-	var jobStatus string
+	var jobStatus, identityState string
 	if err := pool.QueryRow(ctx, `SELECT
 		(SELECT count(*) FROM media WHERE id=$1),
 		(SELECT count(*) FROM originals WHERE media_id=$1),
@@ -832,12 +962,13 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 		(SELECT count(*) FROM change_events WHERE media_id=$1 AND event_type='media_purged' AND reason='physical_purge' AND payload IS NULL),
 		(SELECT count(*) FROM purge_file_progress WHERE job_id=$2),
 		(SELECT count(*) FROM job_targets jt JOIN jobs j ON j.id=jt.job_id WHERE j.media_id_snapshot=$1),
-		(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='transform' AND original_id IS NULL)`, mediaID, lease.JobID).Scan(
-		&mediaCount, &originalCount, &renditionCount, &jobStatus, &eventCount, &progressCount, &targetCount, &transformNullOriginals); err != nil {
+		(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='transform' AND original_id IS NULL),
+		(SELECT state FROM media_purge_identity_guard WHERE media_id=$1)`, mediaID, lease.JobID).Scan(
+		&mediaCount, &originalCount, &renditionCount, &jobStatus, &eventCount, &progressCount, &targetCount, &transformNullOriginals, &identityState); err != nil {
 		t.Fatal(err)
 	}
-	if mediaCount != 0 || originalCount != 0 || renditionCount != 0 || jobStatus != "succeeded" || eventCount != 1 || progressCount != 3 || targetCount != 2 || transformNullOriginals != 2 {
-		t.Fatalf("final purge media=%d originals=%d renditions=%d job=%s events=%d progress=%d targets=%d null_originals=%d", mediaCount, originalCount, renditionCount, jobStatus, eventCount, progressCount, targetCount, transformNullOriginals)
+	if mediaCount != 0 || originalCount != 0 || renditionCount != 0 || jobStatus != "succeeded" || eventCount != 1 || progressCount != 3 || targetCount != 2 || transformNullOriginals != 2 || identityState != "purged" {
+		t.Fatalf("final purge media=%d originals=%d renditions=%d job=%s events=%d progress=%d targets=%d null_originals=%d identity=%s", mediaCount, originalCount, renditionCount, jobStatus, eventCount, progressCount, targetCount, transformNullOriginals, identityState)
 	}
 }
 

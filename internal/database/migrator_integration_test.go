@@ -38,8 +38,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 13 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version thirteen", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 14 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version fourteen", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,8 +62,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 13 || status.ExpectedVersion != 13 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version thirteen", status)
+		if status.CurrentVersion != 14 || status.ExpectedVersion != 14 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version fourteen", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
@@ -133,6 +133,40 @@ func TestMigratorIntegration(t *testing.T) {
 		var state string
 		if err := pool.QueryRow(ctx, `SELECT state FROM media_purge_identity_guard WHERE media_id=$1`, mediaID).Scan(&state); err != nil || state != "purged" {
 			t.Fatalf("cutover guard state=%q error=%v", state, err)
+		}
+	})
+
+	t.Run("identity retirement cutover drains Media writer before guard alteration", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:13]).Up(ctx); err != nil {
+			t.Fatal(err)
+		}
+		mediaID := newUUIDv4(t)
+		writer, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(ctx) }()
+		awaitRelationLock(t, pool, ctx, 0, "media", "ShareLock", false)
+		if err := writer.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-migrationResult; err != nil {
+			t.Fatal(err)
+		}
+		var state string
+		if err := pool.QueryRow(ctx, `SELECT state FROM media_purge_identity_guard WHERE media_id=$1`, mediaID).Scan(&state); err != nil || state != "live" {
+			t.Fatalf("cutover Media guard state=%q error=%v", state, err)
 		}
 	})
 
@@ -217,7 +251,7 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := <-migrationResult; err != nil {
-			t.Fatalf("upgrade versions nine through thirteen: %v", err)
+			t.Fatalf("upgrade versions nine through fourteen: %v", err)
 		}
 
 		var securityDefiner, ownerNoLogin, fixedSearchPath, workerExecute, publicRevoked, workerSelect, workerInsert, workerNoUpdate bool
@@ -265,7 +299,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 13 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 14 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
@@ -594,7 +628,7 @@ func TestMigratorIntegration(t *testing.T) {
 			if err := pool.QueryRow(raceCtx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&migratedVersion); err != nil {
 				t.Fatal(err)
 			}
-			if !deleted || migratedVersion != 13 {
+			if !deleted || migratedVersion != 14 {
 				t.Fatalf("converged state deleted=%t version=%d", deleted, migratedVersion)
 			}
 		})

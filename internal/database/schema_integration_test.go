@@ -1158,6 +1158,32 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("ordered purge boundary security definer=%t owner=%t no_login=%t search_path=%t role_execute=%t public_revoked=%t no_update=%t",
 				securityDefiner, ownerMatches, ownerCannotLogin, fixedSearchPath, roleCanExecute, publicCannotExecute, roleCannotUpdate)
 		}
+		var guardsDefiner, guardsOwner, guardOwnerNoLogin, guardOwnerIsolated, guardsSearchPath, guardsPublicRevoked, guardsRuntimeRevoked, guardOwnerRights, guardOwnerNoDelete, guardRuntimeNoRights bool
+		if err := pool.QueryRow(ctx, `SELECT
+			bool_and(p.prosecdef),
+			bool_and(pg_catalog.pg_get_userbyid(p.proowner)='nmcp_purge_function_owner'),
+			bool_and((SELECT NOT rolcanlogin FROM pg_catalog.pg_roles WHERE rolname='nmcp_purge_function_owner')),
+			bool_and(NOT pg_catalog.pg_has_role($1,'nmcp_purge_function_owner','MEMBER')),
+			bool_and(array_to_string(p.proconfig,',') LIKE 'search_path='||current_schema()||', pg_catalog, pg_temp%'),
+			bool_and(NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) WHERE grantee=0 AND privilege_type='EXECUTE')),
+			bool_and(NOT has_function_privilege($1,p.oid,'EXECUTE')),
+			bool_and(has_table_privilege('nmcp_purge_function_owner','media_purge_identity_guard','SELECT')
+				AND has_table_privilege('nmcp_purge_function_owner','media_purge_identity_guard','INSERT')
+				AND has_table_privilege('nmcp_purge_function_owner','media_purge_identity_guard','UPDATE')),
+			bool_and(NOT has_table_privilege('nmcp_purge_function_owner','media_purge_identity_guard','DELETE')
+				AND NOT has_table_privilege('nmcp_purge_function_owner','media_purge_identity_guard','TRUNCATE')),
+			bool_and(NOT has_table_privilege($1,'media_purge_identity_guard','SELECT')
+				AND NOT has_table_privilege($1,'media_purge_identity_guard','INSERT')
+				AND NOT has_table_privilege($1,'media_purge_identity_guard','UPDATE'))
+		FROM pg_catalog.pg_proc AS p
+		WHERE p.oid IN ('nmcp_guard_media_without_purge_tombstone()'::regprocedure,'nmcp_guard_physical_purge_tombstone()'::regprocedure)`, roleName).Scan(
+			&guardsDefiner, &guardsOwner, &guardOwnerNoLogin, &guardOwnerIsolated, &guardsSearchPath, &guardsPublicRevoked, &guardsRuntimeRevoked, &guardOwnerRights, &guardOwnerNoDelete, &guardRuntimeNoRights); err != nil {
+			t.Fatal(err)
+		}
+		if !guardsDefiner || !guardsOwner || !guardOwnerNoLogin || !guardOwnerIsolated || !guardsSearchPath || !guardsPublicRevoked || !guardsRuntimeRevoked || !guardOwnerRights || !guardOwnerNoDelete || !guardRuntimeNoRights {
+			t.Fatalf("identity guards definer=%t owner=%t no_login=%t isolated=%t search_path=%t public_revoked=%t runtime_revoked=%t owner_rights=%t owner_no_delete=%t runtime_no_rights=%t",
+				guardsDefiner, guardsOwner, guardOwnerNoLogin, guardOwnerIsolated, guardsSearchPath, guardsPublicRevoked, guardsRuntimeRevoked, guardOwnerRights, guardOwnerNoDelete, guardRuntimeNoRights)
+		}
 		execAsApp := func(query string, arguments ...any) error {
 			tx, err := pool.Begin(ctx)
 			if err != nil {
@@ -1180,8 +1206,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		expectAppError(`INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999999,'media_purged','physical_purge',$2)`, newUUIDv4(t), mediaID)
 		absentMediaID := newUUIDv4(t)
-		if err := execAsApp(`INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999998,'media_purged','physical_purge',$2)`, newUUIDv4(t), absentMediaID); err != nil {
-			t.Fatalf("insert absent Media tombstone: %v", err)
+		expectAppError(`INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999998,'media_purged','physical_purge',$2)`, newUUIDv4(t), absentMediaID)
+		if err := execAsApp(`INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, absentMediaID); err != nil {
+			t.Fatalf("brand-new Media creation: %v", err)
 		}
 		expectAppError(`INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, absentMediaID)
 		mediaHolder, err := pool.Begin(ctx)
@@ -1243,41 +1270,6 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		_ = tombstoneContender.Rollback(ctx)
 
-		tombstoneWinsID := newUUIDv4(t)
-		tombstoneWins, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err = tombstoneWins.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
-			_, err = tombstoneWins.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999996,'media_purged','physical_purge',$2)`, newUUIDv4(t), tombstoneWinsID)
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		mediaResult := make(chan error, 1)
-		mediaContender, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := mediaContender.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err != nil {
-			t.Fatal(err)
-		}
-		var mediaPID int32
-		if err := mediaContender.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&mediaPID); err != nil {
-			t.Fatal(err)
-		}
-		go func() {
-			_, err := mediaContender.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, tombstoneWinsID)
-			mediaResult <- err
-		}()
-		awaitBackendLock(t, pool, ctx, mediaPID)
-		if err := tombstoneWins.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if err := <-mediaResult; err == nil {
-			t.Fatal("Media succeeded after concurrent tombstone creation")
-		}
-		_ = mediaContender.Rollback(ctx)
 		repeatableTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 		if err != nil {
 			t.Fatal(err)
