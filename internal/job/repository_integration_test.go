@@ -16,9 +16,12 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/animationprocessor"
 	dbmigration "github.com/kzkymur/no-more-cloud-photos/internal/database"
 	profiledefinition "github.com/kzkymur/no-more-cloud-photos/internal/profile"
+	"github.com/kzkymur/no-more-cloud-photos/internal/stillprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
 	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 )
 
@@ -118,6 +121,69 @@ func TestClaimableTransformProfilesIntegration(t *testing.T) {
 			t.Fatalf("ClaimableTransformProfiles() invalid definition error = %v", err)
 		}
 	})
+}
+
+func TestBoundTransformClaimsExcludeProfilesAddedAfterStartupIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx := context.Background()
+	definitions, err := repository.ClaimableTransformProfiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	still, animation, video := integrationCapabilities()
+	envelope, err := transformcapability.ValidateEnvelope(definitions, still, animation, video)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimer, err := repository.Repository.BindTransformClaims(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unsupportedProfileID := ensureVersionProfile(t, pool, "post_start", 1, true)
+	unsupportedMediaID, unsupportedOriginalID := insertPublicationMedia(t, pool)
+	unsupportedJobID, _ := insertTransformForProfile(t, pool, unsupportedMediaID, unsupportedOriginalID, unsupportedProfileID)
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 hour' WHERE id=$1`, unsupportedJobID); err != nil {
+		t.Fatal(err)
+	}
+	supportedMediaID, supportedOriginalID := insertPublicationMedia(t, pool)
+	supportedJobID, _ := insertTransformForProfile(t, pool, supportedMediaID, supportedOriginalID, definitions[0].ID)
+
+	lease, err := claimer.Claim(ctx, []Type{TypeTransform})
+	if err != nil || lease.ID != supportedJobID {
+		t.Fatalf("bound claim = %+v, %v; want supported job %s", lease, err, supportedJobID)
+	}
+	if _, err := claimer.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("unsupported post-start profile was claimable: %v", err)
+	}
+	var status Status
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, unsupportedJobID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusQueued || attempts != 0 {
+		t.Fatalf("unsupported job changed: status=%s attempts=%d", status, attempts)
+	}
+}
+
+func integrationCapabilities() (stillprocessor.Capabilities, animationprocessor.Capabilities, videoprocessor.Capabilities) {
+	still := stillprocessor.Capabilities{
+		ProtocolVersion: stillprocessor.ProtocolVersion, HelperVersion: "test", LibraryVersions: map[string]string{"libvips": "test"},
+		DecoderMIMETypes: []string{"image/bmp", "image/dng", "image/heic", "image/heif", "image/jpeg", "image/png", "image/webp", "image/x-canon-cr2", "image/x-canon-cr3", "image/x-fuji-raf", "image/x-nikon-nef", "image/x-olympus-orf", "image/x-panasonic-rw2", "image/x-sony-arw"},
+		AVIFEncoder:      "aom", ICCSHA256: strings.Repeat("a", 64), Threads: stillprocessor.RequiredThreads,
+	}
+	animation := animationprocessor.Capabilities{
+		ProtocolVersion: animationprocessor.ProtocolVersion, HelperVersion: "test", LibraryVersions: map[string]string{"libwebp": "test"},
+		DecoderMIMETypes: []string{"image/gif", "image/webp"}, Encoders: []string{"animated-webp", "avif"},
+		ICCSHA256: still.ICCSHA256, Threads: animationprocessor.RequiredThreads, BuildManifest: animationprocessor.BuildManifest,
+	}
+	video := videoprocessor.Capabilities{
+		ProtocolVersion: videoprocessor.ProtocolVersion, HelperVersion: "test", LibraryVersions: map[string]string{"ffmpeg": "test"},
+		DecoderMIMETypes: []string{"video/mp4", "video/quicktime"}, OutputKinds: []string{"first-frame-avif", "mp4-av1"},
+		VideoEncoder: "libsvtav1", AudioEncoder: "aac-lc", VideoMuxer: "mp4", ToneMap: "zscale+hable",
+		ICCSHA256: still.ICCSHA256, Threads: videoprocessor.RequiredThreads, BuildManifest: videoprocessor.BuildManifest,
+	}
+	return still, animation, video
 }
 
 func TestClaimRejectsOriginalExtensionMIMEContradictionIntegration(t *testing.T) {
@@ -1380,7 +1446,20 @@ func TestJobClaimProcessHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repository.Claim(ctx, []Type{TypeTransform}); err != nil {
+	rows, err := pool.Query(ctx, `SELECT id::text FROM profiles ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profileIDs []string
+	for rows.Next() {
+		var profileID string
+		if err := rows.Scan(&profileID); err != nil {
+			t.Fatal(err)
+		}
+		profileIDs = append(profileIDs, profileID)
+	}
+	rows.Close()
+	if _, err := repository.claim(ctx, []Type{TypeTransform}, profileIDs); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(readyPath, []byte("claimed"), 0o600); err != nil {
@@ -1566,7 +1645,31 @@ func TestQueuedAttemptInvariantCounterexamplesIntegration(t *testing.T) {
 	}
 }
 
-func integrationRepository(t *testing.T, options Options) (*pgxpool.Pool, *Repository) {
+type integrationTestRepository struct {
+	*Repository
+}
+
+func (r *integrationTestRepository) Claim(ctx context.Context, registeredTypes []Type) (Lease, error) {
+	rows, err := r.pool.Query(ctx, `SELECT id::text FROM profiles ORDER BY id`)
+	if err != nil {
+		return Lease{}, err
+	}
+	defer rows.Close()
+	var profileIDs []string
+	for rows.Next() {
+		var profileID string
+		if err := rows.Scan(&profileID); err != nil {
+			return Lease{}, err
+		}
+		profileIDs = append(profileIDs, profileID)
+	}
+	if err := rows.Err(); err != nil {
+		return Lease{}, err
+	}
+	return r.Repository.claim(ctx, registeredTypes, profileIDs)
+}
+
+func integrationRepository(t *testing.T, options Options) (*pgxpool.Pool, *integrationTestRepository) {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -1628,7 +1731,7 @@ func integrationRepository(t *testing.T, options Options) (*pgxpool.Pool, *Repos
 	if err != nil {
 		t.Fatal(err)
 	}
-	return pool, repository
+	return pool, &integrationTestRepository{Repository: repository}
 }
 
 func insertPurgeJob(t *testing.T, pool *pgxpool.Pool, maxAttempts int, availableExpression string) string {

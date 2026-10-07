@@ -76,11 +76,15 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("configure job repository: %w", err)
 	}
-	executor, err := configureTransformExecutor(ctx, cfg, repository, store)
+	executor, envelope, err := configureTransformExecutor(ctx, cfg, repository, store)
 	if err != nil {
 		return err
 	}
-	jobWorker, err := worker.New(repository, map[job.Type]worker.Executor{job.TypeTransform: executor}, worker.Options{}, logger)
+	claimRepository, err := repository.BindTransformClaims(envelope)
+	if err != nil {
+		return fmt.Errorf("bind transform claims: %w", err)
+	}
+	jobWorker, err := worker.New(claimRepository, map[job.Type]worker.Executor{job.TypeTransform: executor}, worker.Options{}, logger)
 	if err != nil {
 		return fmt.Errorf("configure job worker: %w", err)
 	}
@@ -92,61 +96,63 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, repository *job.Repository, store *storage.Store) (*transformexecutor.Executor, error) {
+func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, repository *job.Repository, store *storage.Store) (*transformexecutor.Executor, transformcapability.Envelope, error) {
 	still, err := stillprocessor.New(stillprocessor.Config{
 		Helper: cfg.StillHelperPath, Prlimit: cfg.PrlimitPath, SRGBICC: cfg.SRGBICCPath,
 		SRGBICCSHA256: cfg.SRGBICCSHA256, Policy: stillprocessor.DefaultPolicy(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("configure still processor: %w", err)
+		return nil, transformcapability.Envelope{}, fmt.Errorf("configure still processor: %w", err)
 	}
 	animation, err := animationprocessor.New(animationprocessor.Config{
 		Helper: cfg.AnimationHelperPath, Prlimit: cfg.PrlimitPath, SRGBICC: cfg.SRGBICCPath,
 		SRGBICCSHA256: cfg.SRGBICCSHA256, Policy: animationprocessor.DefaultPolicy(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("configure animation processor: %w", err)
+		return nil, transformcapability.Envelope{}, fmt.Errorf("configure animation processor: %w", err)
 	}
 	video, err := videoprocessor.New(videoprocessor.Config{
 		Helper: cfg.VideoHelperPath, Prlimit: cfg.PrlimitPath, SRGBICC: cfg.SRGBICCPath,
 		SRGBICCSHA256: cfg.SRGBICCSHA256, Policy: videoprocessor.DefaultPolicy(),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("configure video processor: %w", err)
+		return nil, transformcapability.Envelope{}, fmt.Errorf("configure video processor: %w", err)
 	}
 	stillCapabilities, err := still.Capabilities(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("check still processor capabilities: %w", err)
+		return nil, transformcapability.Envelope{}, fmt.Errorf("check still processor capabilities: %w", err)
 	}
 	animationCapabilities, err := animation.Capabilities(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("check animation processor capabilities: %w", err)
+		return nil, transformcapability.Envelope{}, fmt.Errorf("check animation processor capabilities: %w", err)
 	}
 	videoCapabilities, err := video.Capabilities(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("check video processor capabilities: %w", err)
+		return nil, transformcapability.Envelope{}, fmt.Errorf("check video processor capabilities: %w", err)
 	}
-	if err := validateTransformStartup(ctx, repository, stillCapabilities, animationCapabilities, videoCapabilities); err != nil {
-		return nil, err
+	envelope, err := validateTransformStartup(ctx, repository, stillCapabilities, animationCapabilities, videoCapabilities)
+	if err != nil {
+		return nil, transformcapability.Envelope{}, err
 	}
 	executor, err := transformexecutor.New(repository, transformexecutor.StoreAdapter{Store: store}, still, animation, video, transformexecutor.Options{})
 	if err != nil {
-		return nil, fmt.Errorf("configure transform executor: %w", err)
+		return nil, transformcapability.Envelope{}, fmt.Errorf("configure transform executor: %w", err)
 	}
-	return executor, nil
+	return executor, envelope, nil
 }
 
 type claimableProfileLoader interface {
 	ClaimableTransformProfiles(context.Context) ([]profile.Definition, error)
 }
 
-func validateTransformStartup(ctx context.Context, repository claimableProfileLoader, still stillprocessor.Capabilities, animation animationprocessor.Capabilities, video videoprocessor.Capabilities) error {
+func validateTransformStartup(ctx context.Context, repository claimableProfileLoader, still stillprocessor.Capabilities, animation animationprocessor.Capabilities, video videoprocessor.Capabilities) (transformcapability.Envelope, error) {
 	definitions, err := repository.ClaimableTransformProfiles(ctx)
 	if err != nil {
-		return fmt.Errorf("load claimable transform profiles: %w", err)
+		return transformcapability.Envelope{}, fmt.Errorf("load claimable transform profiles: %w", err)
 	}
-	if err := transformcapability.Validate(definitions, still, animation, video); err != nil {
-		return fmt.Errorf("validate transform capability envelope: %w", err)
+	envelope, err := transformcapability.ValidateEnvelope(definitions, still, animation, video)
+	if err != nil {
+		return transformcapability.Envelope{}, fmt.Errorf("validate transform capability envelope: %w", err)
 	}
-	return nil
+	return envelope, nil
 }

@@ -72,6 +72,36 @@ func TestValidateAllowsHelperCapabilitySuperset(t *testing.T) {
 	}
 }
 
+func TestValidateEnvelopeHandlesEmptyAndRejectsDuplicateAndInvalidProfileIDs(t *testing.T) {
+	still, animation, video := exactCapabilities()
+	empty, err := ValidateEnvelope(nil, still, animation, video)
+	if err != nil || !empty.Validated() || len(empty.ProfileIDs()) != 0 {
+		t.Fatalf("empty definitions envelope = %#v, %v", empty, err)
+	}
+	definition := profile.StandardV1()
+	if _, err := ValidateEnvelope([]profile.Definition{definition, definition}, still, animation, video); !errors.Is(err, ErrIncompatible) {
+		t.Fatalf("duplicate profile ID error = %v", err)
+	}
+	definition.ID = "not-a-uuid"
+	if _, err := ValidateEnvelope([]profile.Definition{definition}, still, animation, video); !errors.Is(err, ErrIncompatible) {
+		t.Fatalf("invalid profile ID error = %v", err)
+	}
+}
+
+func TestEnvelopeProfileIDsReturnsCopy(t *testing.T) {
+	still, animation, video := exactCapabilities()
+	envelope, err := ValidateEnvelope(profile.BundledDefinitions(), still, animation, video)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := envelope.ProfileIDs()
+	first := ids[0]
+	ids[0] = "mutated"
+	if got := envelope.ProfileIDs()[0]; got != first {
+		t.Fatalf("envelope profile IDs were mutable: %q", got)
+	}
+}
+
 func TestValidateRequiresStaticWebPStillBranch(t *testing.T) {
 	definition := onlyRecipe(t, profile.StandardV1(), "image/webp")
 	still, animation, video := fixedCapabilities()

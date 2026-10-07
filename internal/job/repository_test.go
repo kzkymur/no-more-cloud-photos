@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	profiledefinition "github.com/kzkymur/no-more-cloud-photos/internal/profile"
+	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
 )
 
 func TestNewRepositoryOptions(t *testing.T) {
@@ -33,6 +34,13 @@ func TestNewRepositoryOptions(t *testing.T) {
 	repository, err := NewRepository(pool, Options{FileBaseURL: fileBaseURL})
 	if err != nil || repository.leaseDuration != 2*time.Minute || repository.reclaimBatch != 50 || repository.jitter == nil || repository.uuid == nil {
 		t.Fatalf("default repository = %+v, %v", repository, err)
+	}
+}
+
+func TestBindTransformClaimsRejectsEmptyEnvelope(t *testing.T) {
+	repository := &Repository{}
+	if _, err := repository.BindTransformClaims(transformcapability.Envelope{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty envelope error = %v", err)
 	}
 }
 

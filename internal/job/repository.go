@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	profiledefinition "github.com/kzkymur/no-more-cloud-photos/internal/profile"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
 )
 
 const (
@@ -36,6 +37,13 @@ type Repository struct {
 	uuid          func() (string, error)
 	fileBaseURL   string
 	checkpoint    func(context.Context, storage.Boundary, string) error
+}
+
+// TransformClaimer binds every transform claim to one validated startup
+// capability snapshot. Repository intentionally has no unrestricted Claim.
+type TransformClaimer struct {
+	*Repository
+	profileIDs []string
 }
 
 func NewRepository(pool *pgxpool.Pool, options Options) (*Repository, error) {
@@ -61,7 +69,22 @@ func NewRepository(pool *pgxpool.Pool, options Options) (*Repository, error) {
 	}, nil
 }
 
-func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, error) {
+func (r *Repository) BindTransformClaims(envelope transformcapability.Envelope) (*TransformClaimer, error) {
+	profileIDs := envelope.ProfileIDs()
+	if r == nil || !envelope.Validated() {
+		return nil, ErrInvalid
+	}
+	return &TransformClaimer{Repository: r, profileIDs: profileIDs}, nil
+}
+
+func (r *TransformClaimer) Claim(ctx context.Context, registeredTypes []Type) (Lease, error) {
+	if r == nil || r.Repository == nil {
+		return Lease{}, ErrInvalid
+	}
+	return r.Repository.claim(ctx, registeredTypes, r.profileIDs)
+}
+
+func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedProfileIDs []string) (Lease, error) {
 	types, err := validateTypes(registeredTypes)
 	if err != nil {
 		return Lease{}, err
@@ -85,6 +108,11 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 		WITH candidate AS (
 			SELECT id FROM jobs
 			WHERE status='queued' AND type=ANY($1::text[]) AND available_at<=clock_timestamp() AND attempts<max_attempts
+			  AND NOT EXISTS (
+				SELECT 1 FROM job_targets AS jt
+				WHERE jt.job_id=jobs.id AND jt.status<>'succeeded'
+				  AND NOT (jt.profile_id=ANY($4::uuid[]))
+			  )
 			ORDER BY available_at,created_at,id
 			FOR UPDATE SKIP LOCKED LIMIT 1
 		)
@@ -93,7 +121,7 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 			updated_at=clock_timestamp()
 		FROM candidate WHERE j.id=candidate.id
 		RETURNING j.id::text,j.type,j.original_id::text,j.media_id_snapshot::text,j.attempts,j.max_attempts,
-			j.lease_expires_at,j.started_at,j.available_at,j.created_at`, types, token, intervalText(r.leaseDuration)).Scan(
+			j.lease_expires_at,j.started_at,j.available_at,j.created_at`, types, token, intervalText(r.leaseDuration), allowedProfileIDs).Scan(
 		&lease.ID, &lease.Type, &originalID, &lease.MediaID, &lease.Attempts, &lease.MaxAttempts,
 		&lease.LeaseExpiresAt, &lease.StartedAt, &lease.AvailableAt, &lease.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

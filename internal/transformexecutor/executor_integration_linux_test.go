@@ -15,10 +15,14 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/animationprocessor"
 	dbmigration "github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
+	"github.com/kzkymur/no-more-cloud-photos/internal/stillprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
+	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 )
 
 func TestExecutorRealPostgreSQLCommitBoundariesIntegration(t *testing.T) {
@@ -148,7 +152,7 @@ func TestExecutorPartialRetryOnlyRunsFailedTargetIntegration(t *testing.T) {
 
 type jobCheckpoint func(context.Context, storage.Boundary, string) error
 
-func executorIntegrationDependencies(t *testing.T, checkpoint func(*storage.Store) jobCheckpoint) (*pgxpool.Pool, *job.Repository, *storage.Store, string) {
+func executorIntegrationDependencies(t *testing.T, checkpoint func(*storage.Store) jobCheckpoint) (*pgxpool.Pool, *job.TransformClaimer, *storage.Store, string) {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -214,7 +218,41 @@ func executorIntegrationDependencies(t *testing.T, checkpoint func(*storage.Stor
 	if err != nil {
 		t.Fatal(err)
 	}
-	return pool, repository, store, root
+	definitions, err := repository.ClaimableTransformProfiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	still, animation, video := executorIntegrationCapabilities()
+	envelope, err := transformcapability.ValidateEnvelope(definitions, still, animation, video)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimer, err := repository.BindTransformClaims(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pool, claimer, store, root
+}
+
+func executorIntegrationCapabilities() (stillprocessor.Capabilities, animationprocessor.Capabilities, videoprocessor.Capabilities) {
+	icc := strings.Repeat("a", 64)
+	still := stillprocessor.Capabilities{
+		ProtocolVersion: stillprocessor.ProtocolVersion, HelperVersion: "test", LibraryVersions: map[string]string{"libvips": "test"},
+		DecoderMIMETypes: []string{"image/bmp", "image/dng", "image/heic", "image/heif", "image/jpeg", "image/png", "image/webp", "image/x-canon-cr2", "image/x-canon-cr3", "image/x-fuji-raf", "image/x-nikon-nef", "image/x-olympus-orf", "image/x-panasonic-rw2", "image/x-sony-arw"},
+		AVIFEncoder:      "aom", ICCSHA256: icc, Threads: stillprocessor.RequiredThreads,
+	}
+	animation := animationprocessor.Capabilities{
+		ProtocolVersion: animationprocessor.ProtocolVersion, HelperVersion: "test", LibraryVersions: map[string]string{"libwebp": "test"},
+		DecoderMIMETypes: []string{"image/gif", "image/webp"}, Encoders: []string{"animated-webp", "avif"},
+		ICCSHA256: icc, Threads: animationprocessor.RequiredThreads, BuildManifest: animationprocessor.BuildManifest,
+	}
+	video := videoprocessor.Capabilities{
+		ProtocolVersion: videoprocessor.ProtocolVersion, HelperVersion: "test", LibraryVersions: map[string]string{"ffmpeg": "test"},
+		DecoderMIMETypes: []string{"video/mp4", "video/quicktime"}, OutputKinds: []string{"first-frame-avif", "mp4-av1"},
+		VideoEncoder: "libsvtav1", AudioEncoder: "aac-lc", VideoMuxer: "mp4", ToneMap: "zscale+hable",
+		ICCSHA256: icc, Threads: videoprocessor.RequiredThreads, BuildManifest: videoprocessor.BuildManifest,
+	}
+	return still, animation, video
 }
 
 func seedExecutorTransform(t *testing.T, pool *pgxpool.Pool, store *storage.Store, targetCount int) (string, []string) {
