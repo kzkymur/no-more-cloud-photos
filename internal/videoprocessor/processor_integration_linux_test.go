@@ -264,9 +264,11 @@ func TestVideoHelperRealCodecMatrix(t *testing.T) {
 }
 
 type realProbeStream struct {
-	Index, Width, Height int
-	CodecType            string
-	Disposition          struct {
+	Index       int    `json:"index"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	CodecType   string `json:"codec_type"`
+	Disposition struct {
 		Default         int `json:"default"`
 		AttachedPic     int `json:"attached_pic"`
 		TimedThumbnails int `json:"timed_thumbnails"`
