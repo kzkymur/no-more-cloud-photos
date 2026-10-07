@@ -684,6 +684,15 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	if _, err := service.Delete(ctx, mediaID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := service.EnqueuePurge(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Restore(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
 	enqueued, err := service.EnqueuePurge(ctx, mediaID)
 	if err != nil {
 		t.Fatal(err)
@@ -953,7 +962,7 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 		t.Fatalf("converge finalized purge: %v", err)
 	}
 	var mediaCount, originalCount, renditionCount, eventCount, progressCount, targetCount, transformNullOriginals int
-	var jobStatus, identityState string
+	var jobStatus, identityState, identityJobID string
 	if err := pool.QueryRow(ctx, `SELECT
 		(SELECT count(*) FROM media WHERE id=$1),
 		(SELECT count(*) FROM originals WHERE media_id=$1),
@@ -963,12 +972,13 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 		(SELECT count(*) FROM purge_file_progress WHERE job_id=$2),
 		(SELECT count(*) FROM job_targets jt JOIN jobs j ON j.id=jt.job_id WHERE j.media_id_snapshot=$1),
 		(SELECT count(*) FROM jobs WHERE media_id_snapshot=$1 AND type='transform' AND original_id IS NULL),
-		(SELECT state FROM media_purge_identity_guard WHERE media_id=$1)`, mediaID, lease.JobID).Scan(
-		&mediaCount, &originalCount, &renditionCount, &jobStatus, &eventCount, &progressCount, &targetCount, &transformNullOriginals, &identityState); err != nil {
+		(SELECT state FROM media_purge_identity_guard WHERE media_id=$1),
+		(SELECT purge_job_id::text FROM media_purge_identity_guard WHERE media_id=$1)`, mediaID, lease.JobID).Scan(
+		&mediaCount, &originalCount, &renditionCount, &jobStatus, &eventCount, &progressCount, &targetCount, &transformNullOriginals, &identityState, &identityJobID); err != nil {
 		t.Fatal(err)
 	}
-	if mediaCount != 0 || originalCount != 0 || renditionCount != 0 || jobStatus != "succeeded" || eventCount != 1 || progressCount != 3 || targetCount != 2 || transformNullOriginals != 2 || identityState != "purged" {
-		t.Fatalf("final purge media=%d originals=%d renditions=%d job=%s events=%d progress=%d targets=%d null_originals=%d identity=%s", mediaCount, originalCount, renditionCount, jobStatus, eventCount, progressCount, targetCount, transformNullOriginals, identityState)
+	if mediaCount != 0 || originalCount != 0 || renditionCount != 0 || jobStatus != "succeeded" || eventCount != 1 || progressCount != 3 || targetCount != 2 || transformNullOriginals != 2 || identityState != "purged" || identityJobID != activeLease.JobID {
+		t.Fatalf("final purge media=%d originals=%d renditions=%d job=%s events=%d progress=%d targets=%d null_originals=%d identity=%s identity_job=%s", mediaCount, originalCount, renditionCount, jobStatus, eventCount, progressCount, targetCount, transformNullOriginals, identityState, identityJobID)
 	}
 }
 

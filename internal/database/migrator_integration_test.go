@@ -38,8 +38,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 14 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version fourteen", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 15 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version fifteen", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,8 +62,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 14 || status.ExpectedVersion != 14 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version fourteen", status)
+		if status.CurrentVersion != 15 || status.ExpectedVersion != 15 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version fifteen", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
@@ -102,7 +102,7 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("identity guard cutover waits for and backfills in-flight tombstone", func(t *testing.T) {
+	t.Run("identity completion rejects noncanonical in-flight legacy tombstone atomically", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		pool := integrationPool(t, databaseURL)
@@ -127,12 +127,20 @@ func TestMigratorIntegration(t *testing.T) {
 		if err := writer.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if err := <-migrationResult; err != nil {
-			t.Fatal(err)
+		if err := <-migrationResult; err == nil {
+			t.Fatal("identity completion accepted noncanonical legacy tombstone")
 		}
 		var state string
 		if err := pool.QueryRow(ctx, `SELECT state FROM media_purge_identity_guard WHERE media_id=$1`, mediaID).Scan(&state); err != nil || state != "purged" {
 			t.Fatalf("cutover guard state=%q error=%v", state, err)
+		}
+		var version int
+		var completionTrigger bool
+		if err := pool.QueryRow(ctx, `SELECT max(version),EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgname='media_identity_retirement_completed') FROM schema_migrations WHERE NOT dirty`).Scan(&version, &completionTrigger); err != nil {
+			t.Fatal(err)
+		}
+		if version != 14 || completionTrigger {
+			t.Fatalf("failed identity completion migration version=%d trigger=%t", version, completionTrigger)
 		}
 	})
 
@@ -251,7 +259,7 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := <-migrationResult; err != nil {
-			t.Fatalf("upgrade versions nine through fourteen: %v", err)
+			t.Fatalf("upgrade versions nine through fifteen: %v", err)
 		}
 
 		var securityDefiner, ownerNoLogin, fixedSearchPath, workerExecute, publicRevoked, workerSelect, workerInsert, workerNoUpdate bool
@@ -299,7 +307,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 14 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 15 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
@@ -628,7 +636,7 @@ func TestMigratorIntegration(t *testing.T) {
 			if err := pool.QueryRow(raceCtx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&migratedVersion); err != nil {
 				t.Fatal(err)
 			}
-			if !deleted || migratedVersion != 14 {
+			if !deleted || migratedVersion != 15 {
 				t.Fatalf("converged state deleted=%t version=%d", deleted, migratedVersion)
 			}
 		})

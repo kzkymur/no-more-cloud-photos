@@ -1158,7 +1158,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("ordered purge boundary security definer=%t owner=%t no_login=%t search_path=%t role_execute=%t public_revoked=%t no_update=%t",
 				securityDefiner, ownerMatches, ownerCannotLogin, fixedSearchPath, roleCanExecute, publicCannotExecute, roleCannotUpdate)
 		}
-		var guardsDefiner, guardsOwner, guardOwnerNoLogin, guardOwnerIsolated, guardsSearchPath, guardsPublicRevoked, guardsRuntimeRevoked, guardOwnerRights, guardOwnerNoDelete, guardRuntimeNoRights bool
+		var guardsDefiner, guardsOwner, guardOwnerNoLogin, guardOwnerIsolated, guardsSearchPath, guardsPublicRevoked, guardsRuntimeRevoked, guardOwnerRights, guardOwnerNoDelete, guardOwnerEventRead, guardOwnerEventNoWrite, guardRuntimeNoRights bool
 		if err := pool.QueryRow(ctx, `SELECT
 			bool_and(p.prosecdef),
 			bool_and(pg_catalog.pg_get_userbyid(p.proowner)='nmcp_purge_function_owner'),
@@ -1172,17 +1172,25 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 				AND has_table_privilege('nmcp_purge_function_owner','media_purge_identity_guard','UPDATE')),
 			bool_and(NOT has_table_privilege('nmcp_purge_function_owner','media_purge_identity_guard','DELETE')
 				AND NOT has_table_privilege('nmcp_purge_function_owner','media_purge_identity_guard','TRUNCATE')),
+			bool_and(has_table_privilege('nmcp_purge_function_owner','change_events','SELECT')),
+			bool_and(NOT has_table_privilege('nmcp_purge_function_owner','change_events','INSERT')
+				AND NOT has_table_privilege('nmcp_purge_function_owner','change_events','UPDATE')
+				AND NOT has_table_privilege('nmcp_purge_function_owner','change_events','DELETE')),
 			bool_and(NOT has_table_privilege($1,'media_purge_identity_guard','SELECT')
 				AND NOT has_table_privilege($1,'media_purge_identity_guard','INSERT')
 				AND NOT has_table_privilege($1,'media_purge_identity_guard','UPDATE'))
 		FROM pg_catalog.pg_proc AS p
-		WHERE p.oid IN ('nmcp_guard_media_without_purge_tombstone()'::regprocedure,'nmcp_guard_physical_purge_tombstone()'::regprocedure)`, roleName).Scan(
-			&guardsDefiner, &guardsOwner, &guardOwnerNoLogin, &guardOwnerIsolated, &guardsSearchPath, &guardsPublicRevoked, &guardsRuntimeRevoked, &guardOwnerRights, &guardOwnerNoDelete, &guardRuntimeNoRights); err != nil {
+		WHERE p.oid IN ('nmcp_guard_media_without_purge_tombstone()'::regprocedure,'nmcp_guard_physical_purge_tombstone()'::regprocedure,'nmcp_require_completed_media_identity_retirement()'::regprocedure)`, roleName).Scan(
+			&guardsDefiner, &guardsOwner, &guardOwnerNoLogin, &guardOwnerIsolated, &guardsSearchPath, &guardsPublicRevoked, &guardsRuntimeRevoked, &guardOwnerRights, &guardOwnerNoDelete, &guardOwnerEventRead, &guardOwnerEventNoWrite, &guardRuntimeNoRights); err != nil {
 			t.Fatal(err)
 		}
-		if !guardsDefiner || !guardsOwner || !guardOwnerNoLogin || !guardOwnerIsolated || !guardsSearchPath || !guardsPublicRevoked || !guardsRuntimeRevoked || !guardOwnerRights || !guardOwnerNoDelete || !guardRuntimeNoRights {
-			t.Fatalf("identity guards definer=%t owner=%t no_login=%t isolated=%t search_path=%t public_revoked=%t runtime_revoked=%t owner_rights=%t owner_no_delete=%t runtime_no_rights=%t",
-				guardsDefiner, guardsOwner, guardOwnerNoLogin, guardOwnerIsolated, guardsSearchPath, guardsPublicRevoked, guardsRuntimeRevoked, guardOwnerRights, guardOwnerNoDelete, guardRuntimeNoRights)
+		if !guardsDefiner || !guardsOwner || !guardOwnerNoLogin || !guardOwnerIsolated || !guardsSearchPath || !guardsPublicRevoked || !guardsRuntimeRevoked || !guardOwnerRights || !guardOwnerNoDelete || !guardOwnerEventRead || !guardOwnerEventNoWrite || !guardRuntimeNoRights {
+			t.Fatalf("identity guards definer=%t owner=%t no_login=%t isolated=%t search_path=%t public_revoked=%t runtime_revoked=%t owner_rights=%t owner_no_delete=%t owner_event_read=%t owner_event_no_write=%t runtime_no_rights=%t",
+				guardsDefiner, guardsOwner, guardOwnerNoLogin, guardOwnerIsolated, guardsSearchPath, guardsPublicRevoked, guardsRuntimeRevoked, guardOwnerRights, guardOwnerNoDelete, guardOwnerEventRead, guardOwnerEventNoWrite, guardRuntimeNoRights)
+		}
+		var retirementDeferred bool
+		if err := pool.QueryRow(ctx, `SELECT tgdeferrable AND tginitdeferred AND tgenabled='O' FROM pg_catalog.pg_trigger WHERE tgrelid='media_purge_identity_guard'::regclass AND tgname='media_identity_retirement_completed'`).Scan(&retirementDeferred); err != nil || !retirementDeferred {
+			t.Fatalf("identity retirement deferred trigger=%t error=%v", retirementDeferred, err)
 		}
 		execAsApp := func(query string, arguments ...any) error {
 			tx, err := pool.Begin(ctx)
@@ -1489,6 +1497,34 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if err := completeTx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
+		deleteOnlyTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = deleteOnlyTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = deleteOnlyTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true)`, purgeID)
+		}
+		if err == nil {
+			_, err = deleteOnlyTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken)
+		}
+		if err == nil {
+			_, err = deleteOnlyTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID)
+		}
+		if err != nil {
+			_ = deleteOnlyTx.Rollback(ctx)
+			t.Fatalf("application role authorized delete statement: %v", err)
+		}
+		if err := deleteOnlyTx.Commit(ctx); err == nil {
+			t.Fatal("application role DELETE-only purge committed incomplete identity retirement")
+		}
+		var deleteOnlyRolledBack bool
+		if err := pool.QueryRow(ctx, `SELECT
+			EXISTS(SELECT 1 FROM media WHERE id=$1)
+			AND (SELECT state='live' FROM media_purge_identity_guard WHERE media_id=$1)
+			AND (SELECT status='running' FROM jobs WHERE id=$2)
+			AND NOT EXISTS(SELECT 1 FROM change_events WHERE media_id=$1 AND event_type='media_purged' AND reason='physical_purge')`, mediaID, purgeID).Scan(&deleteOnlyRolledBack); err != nil || !deleteOnlyRolledBack {
+			t.Fatalf("DELETE-only retirement rollback=%t error=%v", deleteOnlyRolledBack, err)
+		}
 		purgeTx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -1501,6 +1537,12 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		if err == nil {
 			_, err = purgeTx.Exec(ctx, `DELETE FROM media WHERE id=$1`, mediaID)
+		}
+		if err == nil {
+			var position int64
+			if err = purgeTx.QueryRow(ctx, `UPDATE change_feed_state SET last_position=last_position+1 WHERE id=1 RETURNING last_position`).Scan(&position); err == nil {
+				_, err = purgeTx.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id,payload) VALUES ($1,$2,'media_purged','physical_purge',$3,NULL)`, newUUIDv4(t), position, mediaID)
+			}
 		}
 		if err == nil {
 			_, err = purgeTx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, purgeID)
