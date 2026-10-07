@@ -70,6 +70,192 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("rendition cleanup boundary upgrade drains legacy state", func(t *testing.T) {
+		prepareVersionFifteen := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
+			t.Helper()
+			pool := integrationPool(t, databaseURL)
+			full, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := newMigrator(pool, full.migrations[:15]).Up(context.Background()); err != nil {
+				t.Fatalf("apply versions one through fifteen: %v", err)
+			}
+			return pool, full
+		}
+		insertLegacyCleanup := func(t *testing.T, pool *pgxpool.Pool, disposition string) (string, string, string) {
+			t.Helper()
+			ctx := context.Background()
+			mediaID := newUUIDv4(t)
+			insertMedia(t, pool, mediaID)
+			originalID := insertOriginal(t, pool, mediaID, "7", "v16-cutover-"+mediaID)
+			oldTargetID := insertPendingTransform(t, pool, mediaID, originalID, profile.StandardV1ID)
+			oldRenditionID := newUUIDv4(t)
+			oldPath := "renditions/77/v16-cutover-" + oldRenditionID + "/output.avif"
+			publish := func(targetID, renditionID, path string, current bool) {
+				t.Helper()
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				if _, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID); err == nil {
+					_, err = tx.Exec(ctx, `INSERT INTO renditions
+						(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height,processor_audit)
+						VALUES ($1,$2,$3,'ignored',$4,$5,'image/avif',7,$6,1,1,'{"fixture":"v16-cutover"}')`,
+						renditionID, mediaID, targetID, current, path, strings.Repeat("7", 64))
+				}
+				if err == nil {
+					_, err = tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp()
+						WHERE id=(SELECT job_id FROM job_targets WHERE id=$1)`, targetID)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			publish(oldTargetID, oldRenditionID, oldPath, true)
+			if _, err := pool.Exec(ctx, `UPDATE renditions SET is_current=false,purge_after=clock_timestamp()-interval '1 second' WHERE id=$1`, oldRenditionID); err != nil {
+				t.Fatal(err)
+			}
+			currentTargetID := insertPendingTransform(t, pool, mediaID, originalID, profile.StandardV1ID)
+			publish(currentTargetID, newUUIDv4(t), "renditions/77/v16-current-"+currentTargetID+"/output.avif", true)
+
+			cleanupID := newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO rendition_cleanup_progress
+				(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
+				SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, cleanupID, oldRenditionID); err != nil {
+				t.Fatal(err)
+			}
+			if disposition != "pending" {
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = tx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID); err == nil {
+					_, err = tx.Exec(ctx, `UPDATE rendition_cleanup_progress SET disposition=$2 WHERE id=$1`, cleanupID, disposition)
+				}
+				if err != nil {
+					_ = tx.Rollback(ctx)
+					t.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return mediaID, oldRenditionID, cleanupID
+		}
+
+		t.Run("in-flight guarded delete completes before cutover", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			pool, full := prepareVersionFifteen(t)
+			mediaID, renditionID, cleanupID := insertLegacyCleanup(t, pool, "missing")
+			barrier, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer barrier.Release()
+			const barrierKey = int64(0x4e4d435030303136) // "NMCP0016"
+			if _, err := barrier.Exec(ctx, `SELECT pg_catalog.pg_advisory_lock($1)`, barrierKey); err != nil {
+				t.Fatal(err)
+			}
+			defer barrier.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, barrierKey)
+
+			migrations := append([]migration(nil), full.migrations...)
+			const lockStatement = "LOCK TABLE rendition_cleanup_progress IN SHARE ROW EXCLUSIVE MODE;"
+			instrumentedSQL := strings.Replace(migrations[15].sql, lockStatement,
+				lockStatement+fmt.Sprintf("\nSELECT pg_catalog.pg_advisory_xact_lock(%d);", barrierKey), 1)
+			if instrumentedSQL == migrations[15].sql {
+				t.Fatal("version sixteen progress lock was not found for instrumentation")
+			}
+			migrations[15].sql = instrumentedSQL
+			migrations[15].checksum = checksumSQL([]byte(instrumentedSQL))
+			migrationResult := make(chan error, 1)
+			go func() { migrationResult <- newMigrator(pool, migrations).Up(ctx) }()
+			awaitRelationLock(t, pool, ctx, 0, "rendition_cleanup_progress", "ShareRowExclusiveLock", true)
+
+			deleteResult := make(chan error, 1)
+			go func() {
+				tx, err := pool.Begin(ctx)
+				if err == nil {
+					_, err = tx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID)
+				}
+				if err == nil {
+					_, err = tx.Exec(ctx, `DELETE FROM renditions WHERE id=$1 AND media_id=$2`, renditionID, mediaID)
+				}
+				if err == nil {
+					err = tx.Commit(ctx)
+				} else if tx != nil {
+					_ = tx.Rollback(context.Background())
+				}
+				deleteResult <- err
+			}()
+			if err := awaitContextResult(t, ctx, deleteResult); err != nil {
+				t.Fatalf("legacy guarded delete while cutover held progress lock: %v", err)
+			}
+			if _, err := barrier.Exec(ctx, `SELECT pg_catalog.pg_advisory_unlock($1)`, barrierKey); err != nil {
+				t.Fatal(err)
+			}
+			if err := awaitContextResult(t, ctx, migrationResult); err != nil {
+				t.Fatalf("version sixteen after legacy delete: %v", err)
+			}
+			var version int64
+			var renditionRows int
+			if err := pool.QueryRow(ctx, `SELECT max(version),(SELECT count(*) FROM renditions WHERE id=$1) FROM schema_migrations WHERE NOT dirty`, renditionID).Scan(&version, &renditionRows); err != nil {
+				t.Fatal(err)
+			}
+			if version != 16 || renditionRows != 0 {
+				t.Fatalf("cutover result version=%d rendition_rows=%d", version, renditionRows)
+			}
+			var ownerAfter, configAfter string
+			var securityDefiner, publicRevoked bool
+			if err := pool.QueryRow(ctx, `SELECT pg_catalog.pg_get_userbyid(proowner),prosecdef,COALESCE(array_to_string(proconfig,','),''),
+				NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(proacl,acldefault('f',proowner))) WHERE grantee=0 AND privilege_type='EXECUTE')
+				FROM pg_catalog.pg_proc WHERE oid='nmcp_check_target_rendition()'::regprocedure`).Scan(&ownerAfter, &securityDefiner, &configAfter, &publicRevoked); err != nil {
+				t.Fatal(err)
+			}
+			if ownerAfter != "nmcp_purge_function_owner" || !securityDefiner || !strings.Contains(configAfter, "search_path=") || !publicRevoked {
+				t.Fatalf("cardinality function owner=%q security_definer=%t config=%q public_revoked=%t", ownerAfter, securityDefiner, configAfter, publicRevoked)
+			}
+		})
+
+		for _, disposition := range []string{"pending", "missing"} {
+			t.Run("rejects and rolls back "+disposition+" legacy progress", func(t *testing.T) {
+				pool, full := prepareVersionFifteen(t)
+				_, renditionID, cleanupID := insertLegacyCleanup(t, pool, disposition)
+				var functionBefore string
+				if err := pool.QueryRow(context.Background(), `SELECT pg_catalog.pg_get_functiondef('nmcp_check_target_rendition()'::regprocedure)`).Scan(&functionBefore); err != nil {
+					t.Fatal(err)
+				}
+				if err := full.Up(context.Background()); err == nil {
+					t.Fatalf("version sixteen accepted %s legacy progress", disposition)
+				}
+				var version int64
+				var completionFunction, completionTrigger bool
+				var functionAfter, storedDisposition string
+				if err := pool.QueryRow(context.Background(), `SELECT max(version),
+					to_regprocedure('nmcp_complete_rendition_cleanup(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)') IS NOT NULL,
+					EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid='rendition_cleanup_progress'::regclass AND tgname='rendition_cleanup_progress_completed'),
+					pg_catalog.pg_get_functiondef('nmcp_check_target_rendition()'::regprocedure),
+					(SELECT disposition FROM rendition_cleanup_progress WHERE id=$1)
+					FROM schema_migrations WHERE NOT dirty`, cleanupID).Scan(&version, &completionFunction, &completionTrigger, &functionAfter, &storedDisposition); err != nil {
+					t.Fatal(err)
+				}
+				var renditionRows int
+				if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM renditions WHERE id=$1`, renditionID).Scan(&renditionRows); err != nil {
+					t.Fatal(err)
+				}
+				if version != 15 || completionFunction || completionTrigger || functionAfter != functionBefore || storedDisposition != disposition || renditionRows != 1 {
+					t.Fatalf("rollback disposition=%q version=%d function=%t trigger=%t cardinality_changed=%t stored=%q rendition_rows=%d",
+						disposition, version, completionFunction, completionTrigger, functionAfter != functionBefore, storedDisposition, renditionRows)
+				}
+			})
+		}
+	})
+
 	t.Run("physical purge tombstone upgrade rejects duplicate legacy history atomically", func(t *testing.T) {
 		ctx := context.Background()
 		pool := integrationPool(t, databaseURL)

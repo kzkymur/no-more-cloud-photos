@@ -148,6 +148,9 @@ func TestReadServiceIntegration(t *testing.T) {
 		if err := cleanupTx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := pool.Exec(ctx, `UPDATE renditions SET is_current=false,purge_after=$2 WHERE id=$1`, integrationUUID(2002), base.Add(24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
 		job, err := service.GetJob(ctx, integrationUUID(4001))
 		if err != nil || len(job.Targets) != 1 || job.Targets[0].RenditionID != nil {
 			t.Fatalf("cleaned rendition target = %#v, %v", job, err)

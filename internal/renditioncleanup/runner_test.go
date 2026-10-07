@@ -3,6 +3,9 @@ package renditioncleanup
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -151,6 +154,55 @@ func TestRunnerBoundsTrackedPoisonCandidates(t *testing.T) {
 	if len(runner.poison) != maxTrackedPoisonCandidates {
 		t.Fatalf("tracked poison candidates=%d, want %d", len(runner.poison), maxTrackedPoisonCandidates)
 	}
+	if _, retained := runner.poison[string(rune(1))]; retained {
+		t.Fatal("deterministic oldest candidate was not evicted")
+	}
+	if _, retained := runner.poison[string(rune(maxTrackedPoisonCandidates+1))]; !retained {
+		t.Fatal("new poison candidate was not retained")
+	}
+}
+
+func TestRunnerMoreThanTrackedPoisonCandidatesReachesHealthySuccessor(t *testing.T) {
+	now := time.Unix(100, 0)
+	var sleeps []time.Duration
+	const poisonCount = maxTrackedPoisonCandidates + 1
+	calls := 0
+	maxExcluded := 0
+	healthySeen := false
+	ctx, cancel := context.WithCancel(context.Background())
+	service := serviceFunc(func(_ context.Context, _ string, excluded []string, _ func(context.Context, string, string, int64) (bool, error)) (string, error) {
+		calls++
+		if len(excluded) > maxExcluded {
+			maxExcluded = len(excluded)
+		}
+		if calls <= poisonCount {
+			id := fmt.Sprintf("poison-%04d", calls)
+			for _, skipped := range excluded {
+				if skipped == id {
+					t.Fatalf("forward candidate %q was already excluded", id)
+				}
+			}
+			return id, storage.ErrValidation
+		}
+		healthySeen = true
+		cancel()
+		return testOtherID, nil
+	})
+	options := testOptions(&now, &sleeps)
+	options.SweepLimit = 50
+	runner, err := New(service, &fakeStore{}, options, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !healthySeen || calls != poisonCount+1 {
+		t.Fatalf("healthy successor seen=%t after %d calls, want %d", healthySeen, calls, poisonCount+1)
+	}
+	if len(runner.poison) != maxTrackedPoisonCandidates || maxExcluded != maxTrackedPoisonCandidates {
+		t.Fatalf("tracked poison=%d max exclusions=%d, want %d", len(runner.poison), maxExcluded, maxTrackedPoisonCandidates)
+	}
 }
 
 func TestRunnerPoisonCooldownDoesNotBlockOtherCandidates(t *testing.T) {
@@ -270,6 +322,74 @@ func TestUnlinkValidatesIdentityAndWaitsForStore(t *testing.T) {
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUnlinkRejectsTypedKeyIdentityAndSizeMismatchesWithoutDeleting(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.Open(root, storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	originalID, err := storage.ParseOriginalID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetID, err := storage.ParseJobTargetID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renditionID, err := storage.ParseRenditionID(testRenditionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := storage.NewRenditionKey(originalID, targetID, renditionID, storage.RenditionAVIF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptID, err := storage.ParseAttemptID(testOtherID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary, err := store.BeginRendition(context.Background(), key, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("exact payload")
+	if _, err := temporary.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Publish(context.Background(), storage.Validation{ExpectedSize: int64(len(payload))}); err != nil {
+		t.Fatal(err)
+	}
+	runner, err := New(serviceFunc(func(context.Context, string, []string, Unlink) (string, error) {
+		return "", nil
+	}), store, Options{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		id   string
+		path string
+		size int64
+	}{
+		{name: "malformed typed key", id: testRenditionID, path: "renditions/not-a-key.avif", size: int64(len(payload))},
+		{name: "key and callback ID differ", id: testOtherID, path: key.String(), size: int64(len(payload))},
+		{name: "negative expected size", id: testRenditionID, path: key.String(), size: -1},
+		{name: "stored size differs", id: testRenditionID, path: key.String(), size: int64(len(payload) + 1)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := runner.unlink(context.Background(), test.id, test.path, test.size); !errors.Is(err, storage.ErrValidation) {
+				t.Fatalf("unlink error = %v, want validation", err)
+			}
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(key.String()))); err != nil {
+				t.Fatalf("mismatched unlink changed object: %v", err)
+			}
+		})
 	}
 }
 

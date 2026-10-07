@@ -1421,6 +1421,39 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if targetRows != 1 || renditionRows != 0 || cleanupRows != 1 {
 			t.Fatalf("cleanup history target=%d rendition=%d progress=%d", targetRows, renditionRows, cleanupRows)
 		}
+		alternateRenditionID := newUUIDv4(t)
+		for _, runtimeRole := range []struct{ label, sql string }{{"API", pgx.Identifier{"nmcp_runtime"}.Sanitize()}, {"Worker", quotedRole}} {
+			for _, resurrection := range []struct {
+				name string
+				id   string
+				path string
+			}{
+				{name: "same ID and path", id: renditionID, path: "renditions/88/cleanup/target/output.avif"},
+				{name: "same ID alternate path", id: renditionID, path: "renditions/88/cleanup/resurrected/output.avif"},
+				{name: "alternate ID same path", id: alternateRenditionID, path: "renditions/88/cleanup/target/output.avif"},
+				{name: "alternate ID and path", id: alternateRenditionID, path: "renditions/88/cleanup/resurrected/output.avif"},
+			} {
+				t.Run(runtimeRole.label+" rejects "+resurrection.name+" resurrection", func(t *testing.T) {
+					tx, err := pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer tx.Rollback(context.Background())
+					if _, err = tx.Exec(ctx, `SET LOCAL ROLE `+runtimeRole.sql); err == nil {
+						_, err = tx.Exec(ctx, `INSERT INTO renditions
+							(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height,processor_audit)
+							VALUES ($1,$2,$3,'ignored',false,$4,'image/avif',9,$5,1,1,'{"fixture":"cleanup-resurrection"}')`,
+							resurrection.id, mediaID, targetID, resurrection.path, strings.Repeat("b", 64))
+					}
+					if err != nil {
+						t.Fatalf("stage resurrection as %s: %v", runtimeRole.label, err)
+					}
+					if err := tx.Commit(ctx); err == nil {
+						t.Fatalf("%s committed %s", runtimeRole.label, resurrection.name)
+					}
+				})
+			}
+		}
 		expectExecError(t, pool, `UPDATE rendition_cleanup_progress SET disposition='deleted' WHERE id=$1`, cleanupID)
 		expectExecError(t, pool, `DELETE FROM rendition_cleanup_progress WHERE id=$1`, cleanupID)
 		expectAppError(`UPDATE rendition_cleanup_progress SET disposition='deleted' WHERE id=$1`, cleanupID)
@@ -1432,6 +1465,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		expectAppError(`TRUNCATE renditions`)
 		expectAppError(`TRUNCATE media CASCADE`)
 
+		if _, err := pool.Exec(ctx, `UPDATE renditions SET is_current=false,purge_after=clock_timestamp()+interval '1 hour' WHERE id=$1`, replacementRenditionID); err != nil {
+			t.Fatalf("supersede cleanup replacement: %v", err)
+		}
 		cascadeRenditionIDs := []string{newUUIDv4(t), newUUIDv4(t)}
 		cascadeTargetIDs := make([]string, 0, len(cascadeRenditionIDs))
 		for index, cascadeRenditionID := range cascadeRenditionIDs {
@@ -1618,7 +1654,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			mediaID, cascadeRenditionIDs, targetID, cascadeTargetIDs, purgeID, cleanupID).Scan(&mediaRows, &originalRows, &cascadeRenditionRows, &jobRows, &preservedTargets, &purgeProgress, &cleanupHistory); err != nil {
 			t.Fatal(err)
 		}
-		if mediaRows != 0 || originalRows != 0 || cascadeRenditionRows != 0 || jobRows != 4 || preservedTargets != 3 || purgeProgress != 3 || cleanupHistory != 1 {
+		if mediaRows != 0 || originalRows != 0 || cascadeRenditionRows != 0 || jobRows != 5 || preservedTargets != 3 || purgeProgress != 4 || cleanupHistory != 1 {
 			t.Fatalf("application role purge history media=%d originals=%d renditions=%d jobs=%d targets=%d purge_progress=%d cleanup_progress=%d",
 				mediaRows, originalRows, cascadeRenditionRows, jobRows, preservedTargets, purgeProgress, cleanupHistory)
 		}

@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/job"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func TestCleanupRepositoryIntegrationRollsBackBeforeCommitAndConvergesUnknownCommit(t *testing.T) {
@@ -73,6 +75,134 @@ func TestCleanupRepositoryIntegrationRollsBackBeforeCommitAndConvergesUnknownCom
 			t.Fatalf("disposition=%q, want missing", disposition)
 		}
 	})
+}
+
+func TestCleanupRepositoryIntegrationPreferredRetryUsesCandidateOrDurableHandoff(t *testing.T) {
+	tests := []struct {
+		name     string
+		start    bool
+		finalize bool
+	}{
+		{name: "unchanged candidate retries first"},
+		{name: "started purge manifest", start: true},
+		{name: "completed canonical purge", start: true, finalize: true},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := cleanupIntegrationPool(t)
+			repository := newCleanupTestRepository(t, pool)
+			service, err := NewService(pool, "https://files.example/files")
+			if err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+			fixture := insertCleanupRenditions(t, pool, 3200+index*20, &deadline, 1, 1, false)
+			uncertain := storage.ErrOutcomeUncertain
+			id, err := repository.CleanupNextRendition(ctx, "", nil, func(context.Context, string, string, int64) (bool, error) {
+				return false, uncertain
+			})
+			if id != fixture.renditionID || !errors.Is(err, uncertain) {
+				t.Fatalf("uncertain CleanupNextRendition() = %q, %v", id, err)
+			}
+
+			if test.start {
+				if _, err := service.Delete(ctx, fixture.mediaID); err != nil {
+					t.Fatalf("delete cleanup fixture: %v: %v", err, errors.Unwrap(err))
+				}
+				enqueued, err := service.EnqueuePurge(ctx, fixture.mediaID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if test.finalize {
+					completeCleanupTestPurge(t, ctx, service, lease)
+				}
+			}
+
+			calls := 0
+			id, err = repository.CleanupNextRendition(ctx, fixture.renditionID, nil, func(context.Context, string, string, int64) (bool, error) {
+				calls++
+				return false, nil
+			})
+			if !test.start {
+				if id != fixture.renditionID || err != nil || calls != 1 {
+					t.Fatalf("preferred candidate retry = %q, %v; calls=%d", id, err, calls)
+				}
+				return
+			}
+			if err != nil || id != fixture.renditionID || calls != 0 {
+				t.Fatalf("evidenced preferred retry = %q, %v; calls=%d", id, err, calls)
+			}
+		})
+	}
+}
+
+func TestCleanupRepositoryIntegrationFrozenCandidateConvergesAfterCanonicalPurge(t *testing.T) {
+	ctx := context.Background()
+	pool := cleanupIntegrationPool(t)
+	repository := newCleanupTestRepository(t, pool)
+	service, err := NewService(pool, "https://files.example/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	first := insertCleanupRenditions(t, pool, 3300, &deadline, 1, 1, false)
+	stale := insertCleanupRenditions(t, pool, 3320, &deadline, 1, 1, false)
+	if id, err := repository.CleanupNextRendition(ctx, "", nil, func(context.Context, string, string, int64) (bool, error) {
+		return false, nil
+	}); err != nil || id != first.renditionID {
+		t.Fatalf("initial frozen cleanup = %q, %v", id, err)
+	}
+	if _, err := service.Delete(ctx, stale.mediaID); err != nil {
+		t.Fatalf("delete stale cleanup fixture: %v: %v", err, errors.Unwrap(err))
+	}
+	enqueued, err := service.EnqueuePurge(ctx, stale.mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := service.StartPurge(ctx, enqueued.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeCleanupTestPurge(t, ctx, service, lease)
+
+	calls := 0
+	id, err := repository.CleanupNextRendition(ctx, "", nil, func(context.Context, string, string, int64) (bool, error) {
+		calls++
+		return false, nil
+	})
+	if err != nil || id != stale.renditionID || calls != 0 {
+		t.Fatalf("stale frozen cleanup = %q, %v; calls=%d", id, err, calls)
+	}
+}
+
+func TestCleanupRepositoryIntegrationSQLExclusionsDoNotStarveNextCandidate(t *testing.T) {
+	ctx := context.Background()
+	pool := cleanupIntegrationPool(t)
+	repository := newCleanupTestRepository(t, pool)
+	deadline := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	excluded := make([]string, 0, purgeSchedulerBatchMax)
+	var healthy cleanupRenditionFixture
+	for index := 0; index <= purgeSchedulerBatchMax; index++ {
+		fixture := insertCleanupRenditions(t, pool, 3400+index*20, &deadline, 1, 1, false)
+		if index < purgeSchedulerBatchMax {
+			excluded = append(excluded, fixture.renditionID)
+		} else {
+			healthy = fixture
+		}
+	}
+	calls := 0
+	id, err := repository.CleanupNextRendition(ctx, "", excluded, func(context.Context, string, string, int64) (bool, error) {
+		calls++
+		return false, nil
+	})
+	if err != nil || id != healthy.renditionID || calls != 1 {
+		t.Fatalf("cleanup after 50 SQL exclusions = %q, %v; calls=%d, want %q", id, err, calls, healthy.renditionID)
+	}
 }
 
 func TestCleanupRepositoryIntegrationCompletesExactHistoricalSnapshot(t *testing.T) {
@@ -308,6 +438,60 @@ func TestCleanupRepositoryIntegrationFrozenBatchHonorsLimitAndPublicationBoundar
 	}
 }
 
+func TestCleanupRepositoryIntegrationPublicationCurrentSwitchOrdering(t *testing.T) {
+	tests := []struct {
+		name         string
+		cleanupFirst bool
+	}{
+		{name: "cleanup observes no stale Rendition before current switch", cleanupFirst: true},
+		{name: "publication current switch precedes cleanup"},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := cleanupIntegrationPool(t)
+			cleanupRepository := newCleanupTestRepository(t, pool)
+			publicationRepository, first := lifecyclePublicationFixture(t, pool, 3600+index*40)
+			if _, err := pool.Exec(ctx, `UPDATE system_config SET superseded_rendition_retention_days=0 WHERE id=1`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := publicationRepository.PublishRendition(ctx, first); err != nil {
+				t.Fatal(err)
+			}
+			second := nextCleanupPublication(t, pool, first, 3620+index*40)
+
+			calls := 0
+			action := func(_ context.Context, id, path string, size int64) (bool, error) {
+				calls++
+				if id != first.ID || path != first.RelativePath || size != first.SizeBytes {
+					t.Fatalf("cleanup callback = %s/%s/%d, want %s/%s/%d", id, path, size, first.ID, first.RelativePath, first.SizeBytes)
+				}
+				return false, nil
+			}
+			if test.cleanupFirst {
+				id, err := cleanupRepository.CleanupNextRendition(ctx, "", nil, action)
+				if err != nil || id != "" || calls != 0 {
+					t.Fatalf("cleanup before current switch = %q, %v; callback calls=%d", id, err, calls)
+				}
+			}
+			if publication, err := publicationRepository.PublishRendition(ctx, second); err != nil || !publication.Current {
+				t.Fatalf("second PublishRendition() = %#v, %v", publication, err)
+			}
+			id, err := cleanupRepository.CleanupNextRendition(ctx, "", nil, action)
+			if err != nil || id != first.ID || calls != 1 {
+				t.Fatalf("cleanup after current switch = %q, %v; callback calls=%d", id, err, calls)
+			}
+			var currentID string
+			if err := pool.QueryRow(ctx, `SELECT id::text FROM renditions WHERE media_id=$1 AND is_current`, first.MediaID).Scan(&currentID); err != nil {
+				t.Fatal(err)
+			}
+			if currentID != second.ID {
+				t.Fatalf("current Rendition = %s, want %s", currentID, second.ID)
+			}
+		})
+	}
+}
+
 func TestCleanupRepositoryIntegrationTwoCleanersInvokeActionExactlyOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -448,6 +632,49 @@ func cleanupConnectionRepository(t *testing.T, ctx context.Context, pool *pgxpoo
 	return connection, &PostgresRepository{db: connection, fileBaseURL: "https://files.example/files/", newID: newUUIDv4}, pid
 }
 
+func completeCleanupTestPurge(t *testing.T, ctx context.Context, service *Service, lease PurgeLease) {
+	t.Helper()
+	for {
+		step, err := service.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
+			return PurgeFileMissing, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if step.Done {
+			break
+		}
+	}
+	if err := service.FinalizePurge(ctx, lease.JobID, lease.Token); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func nextCleanupPublication(t *testing.T, pool *pgxpool.Pool, previous job.Rendition, seed int) job.Rendition {
+	t.Helper()
+	ctx := context.Background()
+	next := previous
+	next.JobID = integrationUUID(seed)
+	next.TargetID = integrationUUID(seed + 1)
+	next.LeaseToken = integrationUUID(seed + 2)
+	next.ID = integrationUUID(seed + 3)
+	next.RelativePath = "renditions/" + next.OriginalID[:2] + "/" + next.OriginalID + "/" + next.TargetID + "/" + next.ID + ".avif"
+	next.SHA256 = strings.Repeat("c", 64)
+	if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts)
+		VALUES ($1,'transform',$2,$3,'queued',3)`, next.JobID, next.OriginalID, next.MediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, next.TargetID, next.JobID, next.ProfileID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,
+		lease_expires_at=clock_timestamp()+interval '1 hour',started_at=clock_timestamp(),updated_at=clock_timestamp()
+		WHERE id=$1`, next.JobID, next.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	return next
+}
+
 func insertCleanupRenditions(t *testing.T, pool *pgxpool.Pool, seed int, candidateDeadline *time.Time, candidateVersion, currentVersion int, candidateCurrent bool) cleanupRenditionFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -485,9 +712,11 @@ func insertCleanupRenditions(t *testing.T, pool *pgxpool.Pool, seed int, candida
 	}
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
+	targetID := integrationUUID(seed + 6)
+	renditionID := integrationUUID(seed + 8)
 	fixture := cleanupRenditionFixture{
-		mediaID: mediaID, renditionID: integrationUUID(seed + 8), targetID: integrationUUID(seed + 6),
-		relativePath: "renditions/cleanup/" + integrationUUID(seed+8) + ".avif", sizeBytes: int64(seed + 17),
+		mediaID: mediaID, renditionID: renditionID, targetID: targetID,
+		relativePath: "renditions/" + originalID[:2] + "/" + originalID + "/" + targetID + "/" + renditionID + ".avif", sizeBytes: int64(seed + 17),
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -510,8 +739,8 @@ func insertCleanupRenditions(t *testing.T, pool *pgxpool.Pool, seed int, candida
 			t.Fatal(err)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO renditions
-			(id,media_id,job_target_id,is_current,purge_after,relative_path,mime_type,size_bytes,width,height,sha256,created_at)
-			VALUES ($1,$2,$3,$4,$5,$6,'image/avif',$7,1,1,$8,$9)`, renditionID, mediaID, targetID, current, purgeAfter, relativePath, fixture.sizeBytes, sha, now); err != nil {
+			(id,media_id,job_target_id,is_current,purge_after,relative_path,mime_type,size_bytes,width,height,sha256,processor_audit,created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,'image/avif',$7,1,1,$8,'{"schema_version":1,"family":"still","result":{"processor":"cleanup-fixture"}}',$9)`, renditionID, mediaID, targetID, current, purgeAfter, relativePath, fixture.sizeBytes, sha, now); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=$2,updated_at=$2 WHERE id=$1`, jobID, now); err != nil {
@@ -520,7 +749,10 @@ func insertCleanupRenditions(t *testing.T, pool *pgxpool.Pool, seed int, candida
 	}
 	insert(integrationUUID(seed+4), fixture.targetID, fixture.renditionID, profileIDs[candidateVersion], fixture.relativePath, candidateCurrent, candidateDeadline, strings.Repeat("a", 64))
 	if !candidateCurrent {
-		insert(integrationUUID(seed+5), integrationUUID(seed+7), integrationUUID(seed+9), profileIDs[currentVersion], "renditions/cleanup/"+integrationUUID(seed+9)+".avif", true, nil, strings.Repeat("b", 64))
+		currentTargetID := integrationUUID(seed + 7)
+		currentRenditionID := integrationUUID(seed + 9)
+		currentPath := "renditions/" + originalID[:2] + "/" + originalID + "/" + currentTargetID + "/" + currentRenditionID + ".avif"
+		insert(integrationUUID(seed+5), currentTargetID, currentRenditionID, profileIDs[currentVersion], currentPath, true, nil, strings.Repeat("b", 64))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)

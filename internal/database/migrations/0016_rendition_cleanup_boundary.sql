@@ -18,8 +18,9 @@ END;
 $$;
 
 -- The legacy direct insert path acquired this table before its trigger took
--- Media/Rendition locks. Drain it first during the one-time cutover.
-LOCK TABLE rendition_cleanup_progress IN ACCESS EXCLUSIVE MODE;
+-- Media/Rendition locks. Drain its DML first while allowing an in-flight
+-- Rendition delete guard to finish its read of cleanup progress.
+LOCK TABLE rendition_cleanup_progress IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE maintenance_state IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE media IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE;
@@ -33,6 +34,45 @@ BEGIN
     IF EXISTS (SELECT 1 FROM rendition_cleanup_progress p JOIN renditions r ON r.id=p.rendition_id) THEN
         RAISE EXCEPTION 'completed cleanup progress still has a Rendition';
     END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION nmcp_check_target_rendition()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    checked_target_id nmcp_uuid_v4;
+    target_status text;
+    rendition_count bigint;
+    live_media boolean;
+    authorized_cleanup boolean;
+BEGIN
+    IF TG_TABLE_NAME = 'job_targets' THEN
+        checked_target_id := COALESCE(NEW.id, OLD.id);
+    ELSE
+        checked_target_id := COALESCE(NEW.job_target_id, OLD.job_target_id);
+    END IF;
+    SELECT jt.status,
+           EXISTS (SELECT 1 FROM jobs AS j JOIN media AS m ON m.id=j.media_id_snapshot WHERE j.id=jt.job_id),
+           EXISTS (SELECT 1 FROM rendition_cleanup_progress AS p WHERE p.job_target_id=jt.id AND p.disposition IN ('deleted','missing'))
+    INTO target_status, live_media, authorized_cleanup
+    FROM job_targets AS jt
+    WHERE jt.id = checked_target_id;
+    IF target_status IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT count(*) INTO rendition_count FROM renditions WHERE job_target_id = checked_target_id;
+    IF target_status = 'succeeded'
+       AND rendition_count <> (CASE WHEN live_media AND NOT authorized_cleanup THEN 1 ELSE 0 END) THEN
+        RAISE EXCEPTION 'succeeded target requires one retained or authorized-removed rendition'
+            USING ERRCODE = '23514';
+    ELSIF target_status <> 'succeeded' AND rendition_count <> 0 THEN
+        RAISE EXCEPTION 'only a succeeded target may own a rendition'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NULL;
 END;
 $$;
 
@@ -140,6 +180,8 @@ BEGIN
     EXECUTE format('ALTER FUNCTION %I.nmcp_require_completed_rendition_cleanup_progress() SET search_path=%I,pg_catalog,pg_temp',target_schema,target_schema);
     EXECUTE format('ALTER FUNCTION %I.nmcp_require_ordered_rendition_cleanup_boundary() SET search_path=%I,pg_catalog,pg_temp',target_schema,target_schema);
     EXECUTE format('GRANT USAGE,CREATE ON SCHEMA %I TO nmcp_purge_function_owner',target_schema);
+    EXECUTE format('ALTER FUNCTION %I.nmcp_check_target_rendition() OWNER TO nmcp_purge_function_owner',target_schema);
+    EXECUTE format('ALTER FUNCTION %I.nmcp_check_target_rendition() SET search_path=%I,pg_catalog,pg_temp',target_schema,target_schema);
     EXECUTE format('ALTER FUNCTION %I.nmcp_complete_rendition_cleanup(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) OWNER TO nmcp_purge_function_owner',target_schema);
     EXECUTE format('ALTER FUNCTION %I.nmcp_complete_rendition_cleanup(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) SET search_path=%I,pg_catalog,pg_temp',target_schema,target_schema);
     EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM nmcp_purge_function_owner',target_schema);
@@ -158,3 +200,4 @@ GRANT DELETE ON renditions TO nmcp_purge_function_owner;
 REVOKE ALL ON FUNCTION nmcp_complete_rendition_cleanup(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime;
 GRANT EXECUTE ON FUNCTION nmcp_complete_rendition_cleanup(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) TO nmcp_worker_runtime;
 REVOKE ALL ON FUNCTION nmcp_require_completed_rendition_cleanup_progress(),nmcp_require_ordered_rendition_cleanup_boundary() FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime;
+REVOKE ALL ON FUNCTION nmcp_check_target_rendition() FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime;
