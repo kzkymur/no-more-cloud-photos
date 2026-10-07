@@ -229,7 +229,7 @@ func TestReadServiceIntegration(t *testing.T) {
 		if _, err = manifestTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeToken); err == nil {
 			_, err = manifestTx.Exec(ctx, `INSERT INTO purge_file_progress
 				(job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes)
-				SELECT $1,$2,'original',id,relative_path,size_bytes FROM originals WHERE media_id=$2`, purgeJobID, purged.ID)
+				SELECT $1::nmcp_uuid_v4,$2::nmcp_uuid_v4,'original',id,relative_path,size_bytes FROM originals WHERE media_id=$2::nmcp_uuid_v4`, purgeJobID, purged.ID)
 		}
 		if err != nil {
 			_ = manifestTx.Rollback(ctx)

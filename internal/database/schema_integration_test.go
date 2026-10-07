@@ -987,9 +987,9 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err = manifestTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, purgeLease); err == nil {
 			_, err = manifestTx.Exec(ctx, `INSERT INTO purge_file_progress
 				(job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes)
-				SELECT $1,$2,'original',id,relative_path,size_bytes FROM originals WHERE media_id=$2
+				SELECT $1::nmcp_uuid_v4,$2::nmcp_uuid_v4,'original',id,relative_path,size_bytes FROM originals WHERE media_id=$2::nmcp_uuid_v4
 				UNION ALL
-				SELECT $1,$2,'rendition',id,relative_path,size_bytes FROM renditions WHERE media_id=$2`, replacementPurgeID, mediaID)
+				SELECT $1::nmcp_uuid_v4,$2::nmcp_uuid_v4,'rendition',id,relative_path,size_bytes FROM renditions WHERE media_id=$2::nmcp_uuid_v4`, replacementPurgeID, mediaID)
 		}
 		if err != nil {
 			_ = manifestTx.Rollback(ctx)

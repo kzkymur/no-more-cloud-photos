@@ -93,10 +93,18 @@ func TestMigratorIntegration(t *testing.T) {
 			if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`, originalID, mediaID, strings.Repeat("a", 64), "originals/aa/v8-preflight/original.jpg"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := pool.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := pool.Exec(ctx, `ALTER TABLE job_targets DISABLE TRIGGER USER`); err != nil {
@@ -141,10 +149,18 @@ func TestMigratorIntegration(t *testing.T) {
 			if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`, originalID, mediaID, strings.Repeat("b", 64), "originals/bb/v8-lock/original.jpg"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+			setupTx, err := pool.Begin(ctx)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := pool.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+			defer setupTx.Rollback(ctx)
+			if _, err := setupTx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := setupTx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := setupTx.Commit(ctx); err != nil {
 				t.Fatal(err)
 			}
 			writer, err := pool.Begin(ctx)
@@ -371,7 +387,7 @@ func TestMigratorIntegration(t *testing.T) {
 			if err := pool.QueryRow(raceCtx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&migratedVersion); err != nil {
 				t.Fatal(err)
 			}
-			if !deleted || migratedVersion != 7 {
+			if !deleted || migratedVersion != 8 {
 				t.Fatalf("converged state deleted=%t version=%d", deleted, migratedVersion)
 			}
 		})
