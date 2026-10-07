@@ -111,35 +111,64 @@ func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedP
 
 	var lease Lease
 	var originalID *string
-	err = tx.QueryRow(ctx, `
-		WITH candidate AS (
-			SELECT id FROM jobs
-			WHERE status='queued' AND type=ANY($1::text[]) AND available_at<=clock_timestamp() AND attempts<max_attempts
-			  AND EXISTS (
-				SELECT 1 FROM media AS m
-				WHERE m.id=jobs.media_id_snapshot AND m.deleted_at IS NULL
-			  )
+	excludedJobIDs := make([]string, 0)
+	for {
+		var candidateJobID, candidateMediaID string
+		err = tx.QueryRow(ctx, `
+			SELECT j.id::text,m.id::text
+			FROM jobs AS j JOIN media AS m ON m.id=j.media_id_snapshot
+			WHERE j.status='queued' AND j.type=ANY($1::text[])
+			  AND j.available_at<=clock_timestamp() AND j.attempts<j.max_attempts
+			  AND m.deleted_at IS NULL AND NOT (j.id=ANY($3::uuid[]))
 			  AND NOT EXISTS (
 				SELECT 1 FROM job_targets AS jt
-				WHERE jt.job_id=jobs.id AND jt.status<>'succeeded'
-				  AND NOT COALESCE(jt.profile_id=ANY($4::uuid[]),false)
+				WHERE jt.job_id=j.id AND jt.status<>'succeeded'
+				  AND NOT COALESCE(jt.profile_id=ANY($2::uuid[]),false)
 			  )
-			ORDER BY available_at,created_at,id
-			FOR UPDATE SKIP LOCKED LIMIT 1
-		)
-		UPDATE jobs AS j SET status='running',attempts=j.attempts+1,lease_token=$2,
-			lease_expires_at=clock_timestamp()+$3::interval,started_at=COALESCE(j.started_at,clock_timestamp()),
-			updated_at=clock_timestamp()
-		FROM candidate WHERE j.id=candidate.id
-		RETURNING j.id::text,j.type,j.original_id::text,j.media_id_snapshot::text,j.attempts,j.max_attempts,
-			j.lease_expires_at,j.started_at,j.available_at,j.created_at`, types, token, intervalText(r.leaseDuration), allowedProfileIDs).Scan(
-		&lease.ID, &lease.Type, &originalID, &lease.MediaID, &lease.Attempts, &lease.MaxAttempts,
-		&lease.LeaseExpiresAt, &lease.StartedAt, &lease.AvailableAt, &lease.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Lease{}, ErrNoWork
-	}
-	if err != nil {
-		return Lease{}, classifyDatabaseError(err)
+			ORDER BY j.available_at,j.created_at,j.id
+			FOR UPDATE OF m SKIP LOCKED LIMIT 1`, types, allowedProfileIDs, excludedJobIDs).Scan(
+			&candidateJobID, &candidateMediaID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Lease{}, ErrNoWork
+		}
+		if err != nil {
+			return Lease{}, classifyDatabaseError(err)
+		}
+
+		// The preceding statement locks only Media. Lock and recheck Job in a
+		// later statement so lifecycle operations and publication share the
+		// same Media-before-Job order. A concurrently claimed/locked Job is
+		// skipped, then discovery continues without head-of-line blocking.
+		err = tx.QueryRow(ctx, `
+			WITH candidate AS (
+				SELECT j.id FROM jobs AS j JOIN media AS m ON m.id=j.media_id_snapshot
+				WHERE j.id=$1 AND m.id=$2 AND m.deleted_at IS NULL
+				  AND j.status='queued' AND j.type=ANY($3::text[])
+				  AND j.available_at<=clock_timestamp() AND j.attempts<j.max_attempts
+				  AND NOT EXISTS (
+					SELECT 1 FROM job_targets AS jt
+					WHERE jt.job_id=j.id AND jt.status<>'succeeded'
+					  AND NOT COALESCE(jt.profile_id=ANY($4::uuid[]),false)
+				  )
+				FOR UPDATE OF j SKIP LOCKED
+			)
+			UPDATE jobs AS j SET status='running',attempts=j.attempts+1,lease_token=$5,
+				lease_expires_at=clock_timestamp()+$6::interval,started_at=COALESCE(j.started_at,clock_timestamp()),
+				updated_at=clock_timestamp()
+			FROM candidate WHERE j.id=candidate.id
+			RETURNING j.id::text,j.type,j.original_id::text,j.media_id_snapshot::text,j.attempts,j.max_attempts,
+				j.lease_expires_at,j.started_at,j.available_at,j.created_at`, candidateJobID, candidateMediaID,
+			types, allowedProfileIDs, token, intervalText(r.leaseDuration)).Scan(
+			&lease.ID, &lease.Type, &originalID, &lease.MediaID, &lease.Attempts, &lease.MaxAttempts,
+			&lease.LeaseExpiresAt, &lease.StartedAt, &lease.AvailableAt, &lease.CreatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			excludedJobIDs = append(excludedJobIDs, candidateJobID)
+			continue
+		}
+		if err != nil {
+			return Lease{}, classifyDatabaseError(err)
+		}
+		break
 	}
 	lease.Token = token
 	lease.Original, err = loadOriginal(ctx, tx, lease.Type, originalID, lease.MediaID)
