@@ -96,8 +96,11 @@ profile pinned by queued/running transform work, strictly decodes every recipe,
 and fails closed unless every reachable MIME, source mode, and output kind is
 supported. Recipe validation also fixes the quality, CRF, bit-depth, geometry,
 color, metadata, audio, and stream-selection settings accepted by the helpers.
-Dependency or capability-envelope failures return only the stable `unavailable`
-error and do not expose DSNs, paths, or SQL details.
+Startup logs identify the failed stage and may include safe profile key/version
+and reported-versus-required capability values so an operator can correct the
+deployment. They never include DSNs, configured paths, helper stderr, or SQL
+details; lower-level dependency errors remain classified rather than copied
+verbatim.
 
 For example, with `NMCP_FILE_BASE_URL=https://photos.example.ts.net/files`,
 the stored key `originals/ab/<original-id>/original.jpg` is returned as
