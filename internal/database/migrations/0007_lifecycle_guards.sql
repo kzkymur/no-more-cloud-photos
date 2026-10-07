@@ -82,7 +82,16 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF OLD.deleted_at IS NULL OR NEW.deleted_at IS NOT NULL THEN
+    IF OLD.deleted_at IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.deleted_at IS NOT NULL OR NEW.purge_after IS NOT NULL THEN
+        IF NEW.deleted_at IS DISTINCT FROM OLD.deleted_at
+           OR NEW.purge_after IS DISTINCT FROM OLD.purge_after THEN
+            RAISE EXCEPTION 'deleted Media snapshot is immutable: %', OLD.id
+                USING ERRCODE = '23514';
+        END IF;
         RETURN NEW;
     END IF;
 
@@ -109,7 +118,7 @@ END;
 $$;
 
 CREATE TRIGGER media_undelete_guard
-BEFORE UPDATE OF deleted_at ON media
+BEFORE UPDATE OF deleted_at, purge_after ON media
 FOR EACH ROW EXECUTE FUNCTION nmcp_guard_media_undelete();
 
 DO $$

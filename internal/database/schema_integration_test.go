@@ -404,6 +404,29 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(), purge_after=now() WHERE id=$1`, mediaOne); err != nil {
 			t.Fatalf("logically delete media: %v", err)
 		}
+		expectExecError(t, pool, `UPDATE media SET deleted_at=deleted_at+interval '1 second' WHERE id=$1`, mediaOne)
+		expectExecError(t, pool, `UPDATE media SET purge_after=purge_after+interval '1 second' WHERE id=$1`, mediaOne)
+		expectExecError(t, pool, `UPDATE media SET deleted_at=NULL WHERE id=$1`, mediaOne)
+		if _, err := pool.Exec(ctx, `UPDATE media SET media_type='image/png' WHERE id=$1`, mediaOne); err != nil {
+			t.Fatalf("update unrelated deleted Media field: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, mediaOne); err != nil {
+			t.Fatalf("restore deleted Media: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=now(),purge_after=now() WHERE id=$1`, mediaOne); err != nil {
+			t.Fatalf("delete restored Media: %v", err)
+		}
+
+		var schemaName, functionConfig string
+		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schemaName); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT array_to_string(proconfig,',') FROM pg_proc WHERE oid='nmcp_guard_media_undelete()'::regprocedure`).Scan(&functionConfig); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(functionConfig, "search_path="+schemaName+", pg_catalog, pg_temp") {
+			t.Fatalf("media deletion guard search_path = %q", functionConfig)
+		}
 		expectExecError(t, pool, `
 			INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes)
 			VALUES ($1,$2,$3,$4,'image/jpeg',1)`, newUUIDv4(t), mediaTwo, sha, "originals/bb/two/original.jpg")

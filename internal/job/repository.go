@@ -115,6 +115,10 @@ func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedP
 		WITH candidate AS (
 			SELECT id FROM jobs
 			WHERE status='queued' AND type=ANY($1::text[]) AND available_at<=clock_timestamp() AND attempts<max_attempts
+			  AND EXISTS (
+				SELECT 1 FROM media AS m
+				WHERE m.id=jobs.media_id_snapshot AND m.deleted_at IS NULL
+			  )
 			  AND NOT EXISTS (
 				SELECT 1 FROM job_targets AS jt
 				WHERE jt.job_id=jobs.id AND jt.status<>'succeeded'

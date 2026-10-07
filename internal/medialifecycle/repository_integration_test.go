@@ -2,9 +2,11 @@ package medialifecycle
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -115,6 +117,72 @@ func TestLifecycleRepositoryIntegrationPurgeSemanticsAndCancellation(t *testing.
 	if err != nil || second.Disposition != EnqueueCreated || second.Job.ID == created.Job.ID {
 		t.Fatalf("enqueue after cancelled history = %#v, %v", second, err)
 	}
+}
+
+func TestLifecycleRepositoryIntegrationProjectionParityWithReadAPI(t *testing.T) {
+	ctx := context.Background()
+	pool, service := integrationService(t)
+	mediaID, originalID := integrationUUID(21), integrationUUID(121)
+	transformJobID, targetID := integrationUUID(221), integrationUUID(321)
+	renditionID, leaseID := integrationUUID(421), integrationUUID(521)
+	insertMedia(t, pool, mediaID, originalID)
+	var profileID, profileKey string
+	if err := pool.QueryRow(ctx, `SELECT id::text,key FROM profiles WHERE key='standard' AND version=1`).Scan(&profileID, &profileKey); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	renderPath := "renditions/" + originalID[:2] + "/" + originalID + "/" + targetID + "/" + renditionID + ".avif"
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	statements := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts,available_at,created_at,updated_at) VALUES ($1,'transform',$2,$3,'queued',3,$4,$4,$4)`, []any{transformJobID, originalID, mediaID, now}},
+		{`INSERT INTO job_targets (id,job_id,profile_id,status,updated_at) VALUES ($1,$2,$3,'pending',$4)`, []any{targetID, transformJobID, profileID, now}},
+		{`UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=$3,started_at=$4,updated_at=$4 WHERE id=$1`, []any{transformJobID, leaseID, now.Add(time.Minute), now}},
+		{`UPDATE job_targets SET status='succeeded',attempts=1,updated_at=$2 WHERE id=$1`, []any{targetID, now}},
+		{`INSERT INTO renditions (id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,width,height,sha256,created_at,processor_audit) VALUES ($1,$2,$3,$4,true,$5,'image/avif',21,1,1,$6,$7,'{"fixture":"lifecycle-parity"}')`, []any{renditionID, mediaID, targetID, profileKey, renderPath, strings.Repeat("a", 64), now}},
+		{`UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=$2,updated_at=$2 WHERE id=$1`, []any{transformJobID, now}},
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(ctx, statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.EnqueuePurge(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := service.Restore(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	codec, err := readapi.NewCursorCodec([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	readService, err := readapi.NewService(pool, codec, "https://files.example/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDetail, err := readService.GetMedia(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.Media.CurrentRenditions) != 1 || len(restored.Media.Jobs) != 2 {
+		t.Fatalf("representative lifecycle projection = %#v", restored.Media)
+	}
+	assertSemanticJSONEqual(t, restored.Media, readDetail)
 }
 
 func TestLifecycleRepositoryIntegrationStartedAndFailedConflicts(t *testing.T) {
@@ -751,4 +819,23 @@ func errorCodeIs(err error, code ErrorCode) bool {
 func errorWithJob(err error, code ErrorCode, jobID string) bool {
 	var semantic *SemanticError
 	return errors.As(err, &semantic) && semantic.Code() == code && semantic.Details()["job_id"] == jobID
+}
+
+func assertSemanticJSONEqual(t *testing.T, first, second any) {
+	t.Helper()
+	decode := func(value any) any {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded any
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	firstJSON, secondJSON := decode(first), decode(second)
+	if !reflect.DeepEqual(firstJSON, secondJSON) {
+		t.Fatalf("semantic JSON differs:\nlifecycle: %#v\nread API: %#v", firstJSON, secondJSON)
+	}
 }

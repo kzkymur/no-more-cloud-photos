@@ -66,6 +66,50 @@ func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	}
 }
 
+func TestClaimIntegrationSkipsDeletedMediaWithoutHeadOfLineBlocking(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx := context.Background()
+	var profileID string
+	if err := pool.QueryRow(ctx, `SELECT id::text FROM profiles WHERE key='standard' AND version=1`).Scan(&profileID); err != nil {
+		t.Fatal(err)
+	}
+
+	deletedMediaID, deletedOriginalID := insertPublicationMedia(t, pool)
+	deletedJobID, _ := insertTransformForProfile(t, pool, deletedMediaID, deletedOriginalID, profileID)
+	activeMediaID, activeOriginalID := insertPublicationMediaWithSHA(t, pool, strings.Repeat("d", 64))
+	activeJobID, _ := insertTransformForProfile(t, pool, activeMediaID, activeOriginalID, profileID)
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '2 hours' WHERE id=$1`, deletedJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 hour' WHERE id=$1`, activeJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=clock_timestamp(),purge_after=clock_timestamp()+interval '1 day' WHERE id=$1`, deletedMediaID); err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil || lease.ID != activeJobID {
+		t.Fatalf("claim past deleted oldest job = %+v, %v; want %s", lease, err, activeJobID)
+	}
+	var status Status
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1`, deletedJobID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusQueued || attempts != 0 {
+		t.Fatalf("deleted-media job changed: status=%s attempts=%d", status, attempts)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE media SET deleted_at=NULL,purge_after=NULL WHERE id=$1`, deletedMediaID); err != nil {
+		t.Fatal(err)
+	}
+	restoredLease, err := repository.Claim(ctx, []Type{TypeTransform})
+	if err != nil || restoredLease.ID != deletedJobID || restoredLease.Attempts != 1 {
+		t.Fatalf("restored-media claim = %+v, %v; want %s", restoredLease, err, deletedJobID)
+	}
+}
+
 func TestClaimableTransformProfilesIntegration(t *testing.T) {
 	t.Run("active and retired queued profiles", func(t *testing.T) {
 		pool, repository := integrationRepository(t, Options{})

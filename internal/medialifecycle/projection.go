@@ -76,24 +76,30 @@ func (r *PostgresRepository) currentRenditions(ctx context.Context, tx pgx.Tx, m
 	}
 	defer rows.Close()
 	result := make([]readapi.Rendition, 0)
+	seenProfileKeys := make(map[string]struct{})
 	for rows.Next() {
 		var rendition readapi.Rendition
-		var originalID, relativePath string
+		var originalID, storedProfileKey, relativePath string
 		if err := rows.Scan(&rendition.ID, &rendition.MediaID, &rendition.JobTargetID, &originalID,
-			&rendition.Profile.ID, &rendition.Profile.Key, &rendition.Profile.Version, &rendition.MIMEType,
+			&storedProfileKey, &rendition.Profile.ID, &rendition.Profile.Key, &rendition.Profile.Version, &rendition.MIMEType,
 			&rendition.SizeBytes, &rendition.Width, &rendition.Height, &rendition.DurationMS, &rendition.SHA256,
 			&relativePath, &rendition.CreatedAt); err != nil {
 			return nil, newInvariant(errors.New("invalid current rendition row"))
 		}
 		key, err := storage.ParseRenditionKey(relativePath)
 		if err != nil || !readapi.IsUUIDv4(rendition.ID) || !readapi.IsUUIDv4(rendition.MediaID) ||
-			!readapi.IsUUIDv4(rendition.JobTargetID) || !readapi.IsUUIDv4(rendition.Profile.ID) ||
-			rendition.Profile.Key == "" || rendition.Profile.Version < 1 || rendition.SizeBytes < 0 ||
+			!readapi.IsUUIDv4(rendition.JobTargetID) || !readapi.IsUUIDv4(originalID) || !readapi.IsUUIDv4(rendition.Profile.ID) ||
+			!validProfileKey(storedProfileKey) || storedProfileKey != rendition.Profile.Key || rendition.Profile.Version < 1 ||
+			!validSHA256(rendition.SHA256) || rendition.SizeBytes < 0 ||
 			(rendition.Width == nil) != (rendition.Height == nil) || rendition.DurationMS != nil && *rendition.DurationMS < 0 ||
 			key.OriginalID().String() != originalID || key.JobTargetID().String() != rendition.JobTargetID ||
 			key.RenditionID().String() != rendition.ID || rendition.MediaID != mediaID {
 			return nil, newInvariant(errors.New("inconsistent current rendition"))
 		}
+		if _, duplicate := seenProfileKeys[storedProfileKey]; duplicate {
+			return nil, newInvariant(errors.New("duplicate current rendition key"))
+		}
+		seenProfileKeys[storedProfileKey] = struct{}{}
 		rendition.FileURL = r.fileBaseURL + key.String()
 		rendition.CreatedAt = rendition.CreatedAt.UTC()
 		result = append(result, rendition)
@@ -110,12 +116,18 @@ func loadJobs(ctx context.Context, tx pgx.Tx, mediaID string) ([]readapi.Job, er
 		return nil, fmt.Errorf("read media jobs: %w", err)
 	}
 	jobs := make([]readapi.Job, 0)
+	seenJobs := make(map[string]struct{})
 	for rows.Next() {
 		job, err := scanJob(rows)
 		if err != nil {
 			rows.Close()
 			return nil, err
 		}
+		if _, duplicate := seenJobs[job.ID]; duplicate {
+			rows.Close()
+			return nil, newInvariant(errors.New("duplicate job row"))
+		}
+		seenJobs[job.ID] = struct{}{}
 		jobs = append(jobs, job)
 	}
 	if err := rows.Err(); err != nil {
@@ -136,6 +148,7 @@ func loadJobs(ctx context.Context, tx pgx.Tx, mediaID string) ([]readapi.Job, er
 		return nil, fmt.Errorf("read media job targets: %w", err)
 	}
 	defer targetRows.Close()
+	seenTargets := make(map[string]struct{})
 	for targetRows.Next() {
 		var target readapi.JobTarget
 		var jobID string
@@ -145,9 +158,16 @@ func loadJobs(ctx context.Context, tx pgx.Tx, mediaID string) ([]readapi.Job, er
 			return nil, newInvariant(errors.New("invalid job target row"))
 		}
 		index, ok := indexes[jobID]
-		if !ok {
-			return nil, newInvariant(errors.New("job target has unknown parent"))
+		if !ok || !readapi.IsUUIDv4(target.ID) || !readapi.IsUUIDv4(jobID) || !readapi.IsUUIDv4(target.Profile.ID) ||
+			!validProfileKey(target.Profile.Key) || target.Profile.Version < 1 || !validTargetStatus(target.Status) ||
+			target.Attempts < 0 || target.RenditionID != nil && !readapi.IsUUIDv4(*target.RenditionID) ||
+			(errorCode == nil) != (errorMessage == nil) || target.Status != readapi.TargetFailed && errorCode != nil {
+			return nil, newInvariant(errors.New("inconsistent job target row"))
 		}
+		if _, duplicate := seenTargets[target.ID]; duplicate {
+			return nil, newInvariant(errors.New("duplicate job target row"))
+		}
+		seenTargets[target.ID] = struct{}{}
 		if errorCode != nil {
 			target.Error = &readapi.ResourceError{Code: *errorCode, Message: *errorMessage}
 		}
@@ -156,6 +176,12 @@ func loadJobs(ctx context.Context, tx pgx.Tx, mediaID string) ([]readapi.Job, er
 	}
 	if err := targetRows.Err(); err != nil {
 		return nil, fmt.Errorf("read media job target rows: %w", err)
+	}
+	for index := range jobs {
+		if jobs[index].Type == readapi.JobPurge && len(jobs[index].Targets) != 0 ||
+			jobs[index].Type == readapi.JobTransform && len(jobs[index].Targets) == 0 {
+			return nil, newInvariant(errors.New("job target cardinality is inconsistent"))
+		}
 	}
 	return jobs, nil
 }
@@ -218,6 +244,38 @@ func validCapture(takenAt *time.Time, source readapi.TakenAtSource, timezone *st
 	}
 }
 
+func validProfileKey(value string) bool {
+	if len(value) < 1 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, character := range value[1:] {
+		if character < 'a' || character > 'z' {
+			if character < '0' || character > '9' {
+				if character != '_' && character != '-' {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+func validTargetStatus(status readapi.JobTargetStatus) bool {
+	return status == readapi.TargetPending || status == readapi.TargetSucceeded || status == readapi.TargetFailed
+}
+
 type eventMedia struct {
 	ID                string                `json:"id"`
 	MIMEType          string                `json:"mime_type"`
@@ -250,10 +308,10 @@ const mediaDetailSQL = `
 	FROM media m LEFT JOIN originals o ON o.media_id=m.id WHERE m.id=$1`
 
 const currentRenditionsSQL = `
-	SELECT r.id::text,r.media_id::text,r.job_target_id::text,j.original_id::text,p.id::text,p.key,p.version,
+	SELECT r.id::text,r.media_id::text,r.job_target_id::text,j.original_id::text,r.profile_key,p.id::text,p.key,p.version,
 	       r.mime_type,r.size_bytes,r.width,r.height,r.duration_ms,r.sha256,r.relative_path,r.created_at
 	FROM renditions r
-	JOIN job_targets jt ON jt.id=r.job_target_id JOIN jobs j ON j.id=jt.job_id JOIN profiles p ON p.id=jt.profile_id
+	LEFT JOIN job_targets jt ON jt.id=r.job_target_id LEFT JOIN jobs j ON j.id=jt.job_id LEFT JOIN profiles p ON p.id=jt.profile_id
 	WHERE r.media_id=$1 AND r.is_current ORDER BY r.profile_key`
 
 const mediaJobsSQL = `
@@ -264,5 +322,5 @@ const mediaJobsSQL = `
 const jobTargetsSQL = `
 	SELECT jt.id::text,jt.job_id::text,p.id::text,p.key,p.version,jt.status,jt.attempts,
 	       jt.error_code,jt.error_message,r.id::text,jt.updated_at
-	FROM job_targets jt JOIN profiles p ON p.id=jt.profile_id LEFT JOIN renditions r ON r.job_target_id=jt.id
-	WHERE jt.job_id=ANY($1::uuid[]) ORDER BY p.key,p.version DESC,jt.id`
+	FROM job_targets jt LEFT JOIN profiles p ON p.id=jt.profile_id LEFT JOIN renditions r ON r.job_target_id=jt.id
+	WHERE jt.job_id=ANY($1::uuid[]) ORDER BY jt.job_id,p.key,p.version DESC,jt.id`
