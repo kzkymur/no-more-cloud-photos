@@ -14,8 +14,10 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
+	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 	"github.com/kzkymur/no-more-cloud-photos/internal/stillprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
+	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
 	"github.com/kzkymur/no-more-cloud-photos/internal/transformexecutor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/worker"
@@ -112,18 +114,39 @@ func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, re
 	if err != nil {
 		return nil, fmt.Errorf("configure video processor: %w", err)
 	}
-	if _, err := still.Capabilities(ctx); err != nil {
+	stillCapabilities, err := still.Capabilities(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("check still processor capabilities: %w", err)
 	}
-	if _, err := animation.Capabilities(ctx); err != nil {
+	animationCapabilities, err := animation.Capabilities(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("check animation processor capabilities: %w", err)
 	}
-	if _, err := video.Capabilities(ctx); err != nil {
+	videoCapabilities, err := video.Capabilities(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("check video processor capabilities: %w", err)
+	}
+	if err := validateTransformStartup(ctx, repository, stillCapabilities, animationCapabilities, videoCapabilities); err != nil {
+		return nil, err
 	}
 	executor, err := transformexecutor.New(repository, transformexecutor.StoreAdapter{Store: store}, still, animation, video, transformexecutor.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("configure transform executor: %w", err)
 	}
 	return executor, nil
+}
+
+type claimableProfileLoader interface {
+	ClaimableTransformProfiles(context.Context) ([]profile.Definition, error)
+}
+
+func validateTransformStartup(ctx context.Context, repository claimableProfileLoader, still stillprocessor.Capabilities, animation animationprocessor.Capabilities, video videoprocessor.Capabilities) error {
+	definitions, err := repository.ClaimableTransformProfiles(ctx)
+	if err != nil {
+		return fmt.Errorf("load claimable transform profiles: %w", err)
+	}
+	if err := transformcapability.Validate(definitions, still, animation, video); err != nil {
+		return fmt.Errorf("validate transform capability envelope: %w", err)
+	}
+	return nil
 }

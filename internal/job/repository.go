@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	profiledefinition "github.com/kzkymur/no-more-cloud-photos/internal/profile"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
@@ -122,6 +123,56 @@ func (r *Repository) Claim(ctx context.Context, registeredTypes []Type) (Lease, 
 	}
 	normalizeLease(&lease)
 	return lease, nil
+}
+
+// ClaimableTransformProfiles returns the exact profile definitions that this
+// repository may expose through a transform claim. Active profiles are joined
+// by retired profiles already pinned by queued or running work.
+func (r *Repository) ClaimableTransformProfiles(ctx context.Context) ([]profiledefinition.Definition, error) {
+	if r == nil || r.pool == nil || ctx == nil {
+		return nil, ErrInvalid
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, classifyDatabaseError(err)
+	}
+	defer rollback(tx)
+	rows, err := tx.Query(ctx, `
+		SELECT DISTINCT p.id::text,p.key,p.version,p.processor,p.parameters_schema_version,p.input_mime_types,p.parameters
+		FROM profiles AS p
+		WHERE p.status='active' OR EXISTS (
+			SELECT 1 FROM job_targets AS jt JOIN jobs AS j ON j.id=jt.job_id
+			WHERE jt.profile_id=p.id AND jt.status<>'succeeded'
+			  AND j.type='transform' AND j.status IN ('queued','running')
+		)
+		ORDER BY p.key,p.version,p.id::text`)
+	if err != nil {
+		return nil, classifyDatabaseError(err)
+	}
+	definitions := make([]profiledefinition.Definition, 0)
+	for rows.Next() {
+		var definition profiledefinition.Definition
+		if err := rows.Scan(&definition.ID, &definition.Key, &definition.Version, &definition.Processor,
+			&definition.ParametersSchemaVersion, &definition.InputMIMETypes, &definition.Parameters); err != nil {
+			rows.Close()
+			return nil, classifyDatabaseError(err)
+		}
+		definition.Parameters = append(json.RawMessage(nil), definition.Parameters...)
+		if err := profiledefinition.ValidateDraft(definition); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("validate claimable profile %q version %d: %w", definition.Key, definition.Version, ErrInvariant)
+		}
+		definitions = append(definitions, definition)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, classifyDatabaseError(err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, classifyDatabaseError(err)
+	}
+	return definitions, nil
 }
 
 func (r *Repository) Heartbeat(ctx context.Context, jobID, token string) (time.Time, error) {

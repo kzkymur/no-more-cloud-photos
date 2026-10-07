@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	dbmigration "github.com/kzkymur/no-more-cloud-photos/internal/database"
+	profiledefinition "github.com/kzkymur/no-more-cloud-photos/internal/profile"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 )
@@ -60,6 +61,63 @@ func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	if _, err := repository.Claim(ctx, []Type{"unsupported"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unregistered API type error = %v", err)
 	}
+}
+
+func TestClaimableTransformProfilesIntegration(t *testing.T) {
+	t.Run("active and retired queued profiles", func(t *testing.T) {
+		pool, repository := integrationRepository(t, Options{})
+		ctx := context.Background()
+		var standardID string
+		if err := pool.QueryRow(ctx, `SELECT id::text FROM profiles WHERE key='standard'`).Scan(&standardID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='retired' WHERE key='standard'`); err != nil {
+			t.Fatal(err)
+		}
+		mediaID, originalID := insertPublicationMedia(t, pool)
+		insertTransformForProfile(t, pool, mediaID, originalID, standardID)
+
+		definitions, err := repository.ClaimableTransformProfiles(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(definitions) != 2 || definitions[0].Key != "standard" || definitions[1].Key != "thumbnail" {
+			t.Fatalf("claimable definitions = %#v", definitions)
+		}
+		for _, definition := range definitions {
+			if err := profiledefinition.ValidateDraft(definition); err != nil {
+				t.Fatalf("returned definition %s is invalid: %v", definition.Key, err)
+			}
+		}
+
+		if _, err := pool.Exec(ctx, `UPDATE profiles SET status='retired' WHERE key='thumbnail'`); err != nil {
+			t.Fatal(err)
+		}
+		definitions, err = repository.ClaimableTransformProfiles(ctx)
+		if err != nil || len(definitions) != 1 || definitions[0].Key != "standard" {
+			t.Fatalf("retired queued definitions = %#v, %v", definitions, err)
+		}
+		if _, err := repository.Claim(ctx, []Type{TypeTransform}); err != nil {
+			t.Fatal(err)
+		}
+		definitions, err = repository.ClaimableTransformProfiles(ctx)
+		if err != nil || len(definitions) != 1 || definitions[0].Key != "standard" {
+			t.Fatalf("retired running definitions = %#v, %v", definitions, err)
+		}
+	})
+
+	t.Run("exact definition validation", func(t *testing.T) {
+		pool, repository := integrationRepository(t, Options{})
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx, `ALTER TABLE profiles DISABLE TRIGGER USER;
+			UPDATE profiles SET parameters=jsonb_set(parameters,'{recipes,image/jpeg,still_output,quality}','0') WHERE key='standard';
+			ALTER TABLE profiles ENABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repository.ClaimableTransformProfiles(ctx); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("ClaimableTransformProfiles() invalid definition error = %v", err)
+		}
+	})
 }
 
 func TestClaimRejectsOriginalExtensionMIMEContradictionIntegration(t *testing.T) {
