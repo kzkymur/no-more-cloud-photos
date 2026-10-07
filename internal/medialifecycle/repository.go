@@ -662,6 +662,13 @@ func (r *PostgresRepository) FinalizePurge(ctx context.Context, jobID, token str
 	if pending {
 		return ErrNoPurgeWork
 	}
+	var existingTombstones int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM change_events WHERE media_id=$1 AND event_type='media_purged' AND reason='physical_purge'`, mediaID).Scan(&existingTombstones); err != nil {
+		return fmt.Errorf("check physical purge tombstone history: %w", err)
+	}
+	if existingTombstones != 0 {
+		return newInvariant(errors.New("physical purge tombstone already exists"))
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_job_id',$1,true),pg_catalog.set_config('nmcp.purge_lease_token',$2,true)`, jobID, token); err != nil {
 		return fmt.Errorf("authorize purge finalizer: %w", err)
 	}

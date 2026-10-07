@@ -1178,6 +1178,23 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 				t.Fatalf("application role statement unexpectedly succeeded: %s", query)
 			}
 		}
+		expectAppError(`INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999999,'media_purged','physical_purge',$2)`, newUUIDv4(t), mediaID)
+		absentMediaID := newUUIDv4(t)
+		if err := execAsApp(`INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,999998,'media_purged','physical_purge',$2)`, newUUIDv4(t), absentMediaID); err != nil {
+			t.Fatalf("insert absent Media tombstone: %v", err)
+		}
+		expectAppError(`INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, absentMediaID)
+		repeatableTx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = repeatableTx.Exec(ctx, `SET LOCAL ROLE `+quotedRole); err == nil {
+			_, err = repeatableTx.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, newUUIDv4(t))
+		}
+		_ = repeatableTx.Rollback(ctx)
+		if err == nil {
+			t.Fatal("repeatable-read Media creation bypassed tombstone serialization")
+		}
 		roleTx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)

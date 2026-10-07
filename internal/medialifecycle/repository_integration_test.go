@@ -709,6 +709,32 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	if err != nil || !done.Done || done.File != nil {
 		t.Fatalf("completed purge step = %#v, %v", done, err)
 	}
+	injectedEventID := integrationUUID(998)
+	if _, err := pool.Exec(ctx, `ALTER TABLE change_events DISABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id) SELECT $1,last_position+100,'media_purged','physical_purge',$2 FROM change_feed_state WHERE id=1`, injectedEventID, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE change_events ENABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token); !IsKind(err, KindInvariant) {
+		t.Fatalf("preexisting tombstone finalizer error = %#v", err)
+	}
+	var stillRunning bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM media WHERE id=$1) AND (SELECT status='running' FROM jobs WHERE id=$2)`, mediaID, lease.JobID).Scan(&stillRunning); err != nil || !stillRunning {
+		t.Fatalf("preexisting rollback=%t error=%v", stillRunning, err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE change_events DISABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM change_events WHERE id=$1`, injectedEventID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE change_events ENABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
 	if err := repository.FinalizePurge(ctx, activeLease.JobID, activeLease.Token); err != nil {
 		t.Fatalf("finalize purge: %v", err)
 	}

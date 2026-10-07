@@ -38,8 +38,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 11 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version eleven", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 12 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version twelve", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,11 +62,43 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 11 || status.ExpectedVersion != 11 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version eleven", status)
+		if status.CurrentVersion != 12 || status.ExpectedVersion != 12 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version twelve", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
+		}
+	})
+
+	t.Run("physical purge tombstone upgrade rejects duplicate legacy history atomically", func(t *testing.T) {
+		ctx := context.Background()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:11]).Up(ctx); err != nil {
+			t.Fatal(err)
+		}
+		mediaID := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		for position := 1; position <= 2; position++ {
+			if _, err := pool.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,$2,'media_purged','physical_purge',$3)`, newUUIDv4(t), position, mediaID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := full.Up(ctx); err == nil {
+			t.Fatal("duplicate legacy tombstones accepted")
+		}
+		var version int
+		var indexExists bool
+		if err := pool.QueryRow(ctx, `SELECT max(version),to_regclass('change_events_one_physical_purge_per_media') IS NOT NULL FROM schema_migrations WHERE NOT dirty`).Scan(&version, &indexExists); err != nil {
+			t.Fatal(err)
+		}
+		if version != 11 || indexExists {
+			t.Fatalf("rollback version=%d index=%t", version, indexExists)
 		}
 	})
 
@@ -151,7 +183,7 @@ func TestMigratorIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := <-migrationResult; err != nil {
-			t.Fatalf("upgrade versions nine through eleven: %v", err)
+			t.Fatalf("upgrade versions nine through twelve: %v", err)
 		}
 
 		var securityDefiner, ownerNoLogin, fixedSearchPath, workerExecute, publicRevoked, workerSelect, workerInsert, workerNoUpdate bool
@@ -199,7 +231,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 11 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 12 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
@@ -528,7 +560,7 @@ func TestMigratorIntegration(t *testing.T) {
 			if err := pool.QueryRow(raceCtx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&migratedVersion); err != nil {
 				t.Fatal(err)
 			}
-			if !deleted || migratedVersion != 11 {
+			if !deleted || migratedVersion != 12 {
 				t.Fatalf("converged state deleted=%t version=%d", deleted, migratedVersion)
 			}
 		})
