@@ -28,13 +28,14 @@ type transactionDatabase interface {
 }
 
 type PostgresRepository struct {
-	db                   transactionDatabase
-	fileBaseURL          string
-	newID                func() (string, error)
-	afterCommit          func(context.Context) error
-	jitter               func(time.Duration) time.Duration
-	beforeReclaimCommit  func(context.Context) error
-	afterPurgeFileAction func(context.Context, pgx.Tx) error
+	db                    transactionDatabase
+	fileBaseURL           string
+	newID                 func() (string, error)
+	afterCommit           func(context.Context) error
+	jitter                func(time.Duration) time.Duration
+	beforeReclaimCommit   func(context.Context) error
+	afterPurgeFileAction  func(context.Context, pgx.Tx) error
+	beforeHeartbeatUpdate func(context.Context, pgx.Tx) error
 }
 
 func NewPostgresRepository(pool *pgxpool.Pool, fileBaseURL string) (*PostgresRepository, error) {
@@ -736,9 +737,14 @@ func (r *PostgresRepository) HeartbeatPurge(ctx context.Context, jobID, token st
 	if !previousExpiry.After(now) {
 		return time.Time{}, ErrPurgeLeaseLost
 	}
+	if r.beforeHeartbeatUpdate != nil {
+		if err := r.beforeHeartbeatUpdate(ctx, tx); err != nil {
+			return time.Time{}, fmt.Errorf("before purge heartbeat update: %w", err)
+		}
+	}
 	var expires time.Time
 	if err := tx.QueryRow(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '2 minutes',updated_at=clock_timestamp()
-		WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running' AND lease_token=$2
+		WHERE id=$1 AND type='purge' AND media_id_snapshot=$3 AND status='running' AND lease_token=$2 AND lease_expires_at>clock_timestamp()
 		RETURNING lease_expires_at`, jobID, token, mediaID).Scan(&expires); errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, ErrPurgeLeaseLost
 	} else if err != nil {

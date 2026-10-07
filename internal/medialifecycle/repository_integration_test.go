@@ -356,6 +356,34 @@ func TestLifecycleRepositoryIntegrationPurgeReclaimLocksMediaBeforeJob(t *testin
 	if _, err := repository.HeartbeatPurge(ctx, lease.JobID, integrationUUID(997)); !errors.Is(err, ErrPurgeLeaseLost) {
 		t.Fatalf("stale purge heartbeat error = %#v", err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '2 seconds' WHERE id=$1`, lease.JobID); err != nil {
+		t.Fatal(err)
+	}
+	hookCalled, hookObservedExpiry := false, false
+	repository.beforeHeartbeatUpdate = func(hookCtx context.Context, tx pgx.Tx) error {
+		hookCalled = true
+		if _, hookErr := tx.Exec(hookCtx, `SELECT pg_sleep(2.2)`); hookErr != nil {
+			return hookErr
+		}
+		if hookErr := tx.QueryRow(hookCtx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, lease.JobID).Scan(&hookObservedExpiry); hookErr != nil {
+			return hookErr
+		}
+		if !hookObservedExpiry {
+			return fmt.Errorf("heartbeat hook did not cross the database lease expiry")
+		}
+		return nil
+	}
+	if _, err := repository.HeartbeatPurge(ctx, lease.JobID, lease.Token); !errors.Is(err, ErrPurgeLeaseLost) {
+		t.Fatalf("heartbeat crossing expiry before terminal update error = %#v", err)
+	}
+	repository.beforeHeartbeatUpdate = nil
+	if !hookCalled || !hookObservedExpiry {
+		t.Fatalf("heartbeat expiry hook called=%t observed_expiry=%t", hookCalled, hookObservedExpiry)
+	}
+	var remainedExpired bool
+	if err := pool.QueryRow(ctx, `SELECT lease_expires_at<=clock_timestamp() FROM jobs WHERE id=$1`, lease.JobID).Scan(&remainedExpired); err != nil || !remainedExpired {
+		t.Fatalf("heartbeat resurrected expired lease=%t error=%v", !remainedExpired, err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID); err != nil {
 		t.Fatal(err)
 	}
