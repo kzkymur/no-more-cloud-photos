@@ -63,7 +63,7 @@ credential directory. Nginx receives only `CAP_NET_BIND_SERVICE` for low ports.
 1. Install Ubuntu 24.04 runtime packages listed in
    `infra/ubuntu/packages.txt`. Do not use `latest` as evidence: preserve
    `dpkg-query` package/version output with the deployment record.
-2. Provision PostgreSQL with a least-privilege application role and a database.
+2. Provision PostgreSQL with the documented role split and an `nmcp` database.
    Keep PostgreSQL on literal loopback; do not expose port 5432. Record the
    concrete Ubuntu cluster unit (for example `postgresql@16-main.service`); the
    `postgresql.service` meta-unit is not an acceptable dependency.
@@ -81,6 +81,25 @@ credential directory. Nginx receives only `CAP_NET_BIND_SERVICE` for low ports.
 
 ## Configuration and install
 
+Before the first migration, run the reviewed role bootstrap as the local
+PostgreSQL cluster administrator while connected to the empty `nmcp` database:
+
+```sh
+sudo -u postgres psql --dbname nmcp --file infra/ubuntu/postgresql-roles.sql
+sudo -u postgres psql --dbname nmcp
+# In the interactive psql session; passwords never enter shell history/argv:
+\password nmcp_migrator
+\password nmcp_api
+\password nmcp_worker
+```
+
+The script creates credential-free `nmcp_runtime`, `nmcp_worker_runtime`, and
+`nmcp_purge_function_owner` roles, grants API and Worker only their reviewed
+memberships, transfers database/schema ownership to `nmcp_migrator`, and
+removes PUBLIC schema creation. Embedded migrations own all application object
+grants; the bootstrap deliberately does not grant table or function access
+after the fact. Migration fails closed if stable roles are absent or unsafe.
+
 Create separate files from `infra/ubuntu/env/*.example`. Replace every marker,
 use a random HMAC value of at least 32 bytes, and keep the API address exactly
 `127.0.0.1:8080`. `NMCP_FILE_BASE_URL` must name the separate File Server TLS
@@ -88,8 +107,9 @@ listener and end in `/files/`.
 The three files and TLS inputs must be regular root-owned files below normalized,
 root-owned paths with no group/world-writable parent. The installer captures
 them through `O_NOFOLLOW` file descriptors before validation/copy, rejects
-duplicates or extra/missing environment keys, requires all DSNs to match and use
-literal loopback port 5432 and database `nmcp`, permits only `sslmode=disable`
+duplicates or extra/missing environment keys, requires the exact
+`nmcp_migrator`/`nmcp_api`/`nmcp_worker` identities with distinct passwords and
+the same literal-loopback port 5432 `nmcp` database, permits only `sslmode=disable`
 as a DSN option, and rejects query routing overrides, fragments, wildcard API
 binds, or a mismatched files-root URL. Environment values use a deliberately
 literal subset: quotes, backslashes, and whitespace are rejected so validation

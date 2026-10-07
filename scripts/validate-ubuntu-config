@@ -88,37 +88,48 @@ def main() -> int:
     for item in (api, worker):
         if item["NMCP_STORAGE_ROOT"] != "/var/lib/nmcp/media":
             fail("NMCP_STORAGE_ROOT must be exactly /var/lib/nmcp/media")
-    database_urls = {api["NMCP_DATABASE_URL"], worker["NMCP_DATABASE_URL"], admin["NMCP_DATABASE_URL"]}
-    if len(database_urls) != 1:
-        fail("all processes must use the same NMCP_DATABASE_URL")
-    database_text = next(iter(database_urls))
-    if not database_text.startswith(("postgres://", "postgresql://")):
-        fail("NMCP_DATABASE_URL requires a canonical lowercase PostgreSQL URI scheme")
-    if re.search(r"%(?![0-9A-Fa-f]{2})", database_text):
-        fail("NMCP_DATABASE_URL contains an invalid percent escape")
-    if database_text.count("@") != 1:
-        fail("NMCP_DATABASE_URL must contain exactly one authority delimiter")
-    database = urllib.parse.urlsplit(database_text)
-    try:
-        database_port = database.port
-        query = urllib.parse.parse_qsl(database.query, keep_blank_values=True, strict_parsing=True)
-    except ValueError as error:
-        raise ValueError("NMCP_DATABASE_URL is malformed") from error
-    decoded_user = urllib.parse.unquote(database.username or "")
-    decoded_password = urllib.parse.unquote(database.password or "")
-    if (
-        database.scheme not in ("postgres", "postgresql")
-        or database.hostname not in ("127.0.0.1", "::1")
-        or "," in database.netloc
-        or "%" in (database.hostname or "")
-        or database_port != 5432
-        or database.path != "/nmcp"
-        or not decoded_user or not decoded_password
-        or any(character in decoded_user + decoded_password for character in ("\x00", "\n", "\r"))
-        or database.fragment
-        or query != [("sslmode", "disable")]
-    ):
-        fail("NMCP_DATABASE_URL must use the reviewed local PostgreSQL endpoint and sslmode only")
+    database_configs = {"admin": admin, "api": api, "worker": worker}
+    required_database_users = {
+        "admin": "nmcp_migrator", "api": "nmcp_api", "worker": "nmcp_worker",
+    }
+    endpoints: set[tuple[object, ...]] = set()
+    passwords: set[str] = set()
+    for process, item in database_configs.items():
+        database_text = item["NMCP_DATABASE_URL"]
+        if not database_text.startswith(("postgres://", "postgresql://")):
+            fail(f"{process} NMCP_DATABASE_URL requires a canonical lowercase PostgreSQL URI scheme")
+        if re.search(r"%(?![0-9A-Fa-f]{2})", database_text):
+            fail(f"{process} NMCP_DATABASE_URL contains an invalid percent escape")
+        if database_text.count("@") != 1:
+            fail(f"{process} NMCP_DATABASE_URL must contain exactly one authority delimiter")
+        database = urllib.parse.urlsplit(database_text)
+        try:
+            database_port = database.port
+            query = urllib.parse.parse_qsl(database.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as error:
+            raise ValueError(f"{process} NMCP_DATABASE_URL is malformed") from error
+        decoded_user = urllib.parse.unquote(database.username or "")
+        decoded_password = urllib.parse.unquote(database.password or "")
+        if (
+            database.scheme not in ("postgres", "postgresql")
+            or database.hostname not in ("127.0.0.1", "::1")
+            or "," in database.netloc
+            or "%" in (database.hostname or "")
+            or database_port != 5432
+            or database.path != "/nmcp"
+            or decoded_user != required_database_users[process]
+            or not decoded_password
+            or any(character in decoded_user + decoded_password for character in ("\x00", "\n", "\r"))
+            or database.fragment
+            or query != [("sslmode", "disable")]
+        ):
+            fail(f"{process} NMCP_DATABASE_URL must use its reviewed role and local PostgreSQL endpoint")
+        endpoints.add((database.scheme, database.hostname, database_port, database.path, tuple(query)))
+        passwords.add(decoded_password)
+    if len(endpoints) != 1:
+        fail("all processes must use the same PostgreSQL endpoint, database, and options")
+    if len(passwords) != len(database_configs):
+        fail("migration, API, and Worker database passwords must be distinct")
     if len(api["NMCP_CURSOR_HMAC_KEY"].encode()) < 32:
         fail("NMCP_CURSOR_HMAC_KEY must contain at least 32 bytes")
     combined = "\n".join(item for process in values.values() for item in process.values())
