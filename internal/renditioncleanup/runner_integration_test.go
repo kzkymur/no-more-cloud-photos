@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	integrationPoisonCount  = maxTrackedPoisonCandidates + 1
+	integrationPoisonCount  = maxTrackedPoisonCandidates + DefaultSweepLimit + 1
 	integrationHealthyIndex = integrationPoisonCount + 1
 	integrationCurrentIndex = integrationHealthyIndex + 1
 )

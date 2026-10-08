@@ -472,6 +472,8 @@ func TestCleanupRepositoryIntegrationPublicationCurrentSwitchOrdering(t *testing
 			var calls atomic.Int32
 			cleanupResult := make(chan error, 1)
 			publicationResult := make(chan error, 1)
+			var cleanupErr, publicationErr error
+			cleanupReturned, publicationReturned := false, false
 
 			if !test.publicationFirst {
 				storageStarted := make(chan struct{})
@@ -497,8 +499,13 @@ func TestCleanupRepositoryIntegrationPublicationCurrentSwitchOrdering(t *testing
 				}()
 				select {
 				case <-storageStarted:
+				case cleanupErr = <-cleanupResult:
+					cleanupReturned = true
 				case <-ctx.Done():
 					t.Fatal(ctx.Err())
+				}
+				if cleanupReturned {
+					t.Fatalf("CleanupNextRendition() returned before storage callback: %v", cleanupErr)
 				}
 				go func() {
 					publication, err := publicationRepository.PublishRendition(ctx, third)
@@ -507,7 +514,9 @@ func TestCleanupRepositoryIntegrationPublicationCurrentSwitchOrdering(t *testing
 					}
 					publicationResult <- err
 				}()
-				awaitBlockedMediaLockCount(t, ctx, pool, cleanupPID, 1)
+				awaitCleanupRaceState(t, ctx, func() (bool, error) {
+					return cleanupBlockedMediaLockCount(ctx, pool, cleanupPID, 1)
+				}, publicationResult, cleanupResult)
 				close(releaseStorage)
 			} else {
 				blocker, err := pool.Begin(ctx)
@@ -529,7 +538,9 @@ func TestCleanupRepositoryIntegrationPublicationCurrentSwitchOrdering(t *testing
 					}
 					publicationResult <- err
 				}()
-				awaitBlockedMediaLockCount(t, ctx, pool, blockerPID, 1)
+				awaitCleanupRaceState(t, ctx, func() (bool, error) {
+					return cleanupBlockedMediaLockCount(ctx, pool, blockerPID, 1)
+				}, publicationResult, nil)
 				go func() {
 					_, err := cleanupRepository.CleanupNextRendition(ctx, "", nil, func(callbackCtx context.Context, id, path string, size int64) (bool, error) {
 						calls.Add(1)
@@ -537,18 +548,38 @@ func TestCleanupRepositoryIntegrationPublicationCurrentSwitchOrdering(t *testing
 					})
 					cleanupResult <- err
 				}()
-				awaitLockWait(t, ctx, pool, cleanupPID)
-				awaitBlockedMediaLockCount(t, ctx, pool, blockerPID, 2)
+				awaitCleanupRaceState(t, ctx, func() (bool, error) {
+					return cleanupBackendWaitsForLock(ctx, pool, cleanupPID)
+				}, publicationResult, cleanupResult)
+				awaitCleanupRaceState(t, ctx, func() (bool, error) {
+					return cleanupBlockedMediaLockCount(ctx, pool, blockerPID, 2)
+				}, publicationResult, cleanupResult)
 				if err := blocker.Commit(ctx); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			if err := <-publicationResult; err != nil {
-				t.Fatalf("PublishRendition() error = %v", err)
+			if !publicationReturned {
+				select {
+				case publicationErr = <-publicationResult:
+					publicationReturned = true
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
 			}
-			if err := <-cleanupResult; err != nil {
-				t.Fatalf("CleanupNextRendition() error = %v", err)
+			if publicationErr != nil {
+				t.Fatalf("PublishRendition() error = %v", publicationErr)
+			}
+			if !cleanupReturned {
+				select {
+				case cleanupErr = <-cleanupResult:
+					cleanupReturned = true
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			}
+			if cleanupErr != nil {
+				t.Fatalf("CleanupNextRendition() error = %v", cleanupErr)
 			}
 			if calls.Load() != 1 {
 				t.Fatalf("cleanup callback calls = %d, want 1", calls.Load())
@@ -566,6 +597,47 @@ func TestCleanupRepositoryIntegrationPublicationCurrentSwitchOrdering(t *testing
 			}, "deleted")
 		})
 	}
+}
+
+func awaitCleanupRaceState(t *testing.T, ctx context.Context, ready func() (bool, error), publicationResult, cleanupResult <-chan error) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ok, err := ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			return
+		}
+		select {
+		case err := <-publicationResult:
+			t.Fatalf("PublishRendition() returned before expected lock state: %v", err)
+		case err := <-cleanupResult:
+			t.Fatalf("CleanupNextRendition() returned before expected lock state: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func cleanupBlockedMediaLockCount(ctx context.Context, pool *pgxpool.Pool, blockerPID int32, want int) (bool, error) {
+	var count int
+	err := pool.QueryRow(ctx, `WITH RECURSIVE blocked(pid) AS (
+		SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid))
+		UNION
+		SELECT activity.pid FROM pg_stat_activity activity JOIN blocked ON blocked.pid=ANY(pg_blocking_pids(activity.pid))
+	)
+	SELECT count(*) FROM blocked`, blockerPID).Scan(&count)
+	return count >= want, err
+}
+
+func cleanupBackendWaitsForLock(ctx context.Context, pool *pgxpool.Pool, pid int32) (bool, error) {
+	var waiting bool
+	err := pool.QueryRow(ctx, `SELECT COALESCE(wait_event_type='Lock',false) FROM pg_stat_activity WHERE pid=$1`, pid).Scan(&waiting)
+	return waiting, err
 }
 
 func publishCleanupRenditionFile(t *testing.T, ctx context.Context, store *storage.Store, rendition job.Rendition, seed int) {
