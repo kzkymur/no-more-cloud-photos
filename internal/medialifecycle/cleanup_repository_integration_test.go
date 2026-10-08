@@ -440,56 +440,169 @@ func TestCleanupRepositoryIntegrationFrozenBatchHonorsLimitAndPublicationBoundar
 
 func TestCleanupRepositoryIntegrationPublicationCurrentSwitchOrdering(t *testing.T) {
 	tests := []struct {
-		name         string
-		cleanupFirst bool
+		name             string
+		publicationFirst bool
 	}{
-		{name: "cleanup observes no stale Rendition before current switch", cleanupFirst: true},
-		{name: "publication current switch precedes cleanup"},
+		{name: "cleanup holds Media through storage while publication waits"},
+		{name: "publication queues first and cleanup follows", publicationFirst: true},
 	}
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 			pool := cleanupIntegrationPool(t)
-			cleanupRepository := newCleanupTestRepository(t, pool)
-			publicationRepository, first := lifecyclePublicationFixture(t, pool, 3600+index*40)
+			publicationRepository, first := lifecyclePublicationFixture(t, pool, 3600+index*60)
 			if _, err := pool.Exec(ctx, `UPDATE system_config SET superseded_rendition_retention_days=0 WHERE id=1`); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := publicationRepository.PublishRendition(ctx, first); err != nil {
 				t.Fatal(err)
 			}
-			second := nextCleanupPublication(t, pool, first, 3620+index*40)
+			second := nextCleanupPublication(t, pool, first, 3620+index*60)
+			if _, err := publicationRepository.PublishRendition(ctx, second); err != nil {
+				t.Fatal(err)
+			}
+			third := nextCleanupPublication(t, pool, second, 3640+index*60)
+			root := t.TempDir()
+			store := openCleanupFailureStore(t, root, nil)
+			publishCleanupRenditionFile(t, ctx, store, first, 3660+index*60)
 
-			calls := 0
-			action := func(_ context.Context, id, path string, size int64) (bool, error) {
-				calls++
-				if id != first.ID || path != first.RelativePath || size != first.SizeBytes {
-					t.Fatalf("cleanup callback = %s/%s/%d, want %s/%s/%d", id, path, size, first.ID, first.RelativePath, first.SizeBytes)
+			cleanupConnection, cleanupRepository, cleanupPID := cleanupConnectionRepository(t, ctx, pool)
+			defer cleanupConnection.Release()
+			var calls atomic.Int32
+			cleanupResult := make(chan error, 1)
+			publicationResult := make(chan error, 1)
+
+			if !test.publicationFirst {
+				storageStarted := make(chan struct{})
+				releaseStorage := make(chan struct{})
+				var blocked atomic.Bool
+				blockingStore := openCleanupFailureStore(t, root, storage.FaultInjectorFunc(func(callbackCtx context.Context, event storage.FaultEvent) error {
+					if event.Boundary == storage.BoundaryDelete && event.Phase == storage.Before && blocked.CompareAndSwap(false, true) {
+						close(storageStarted)
+						select {
+						case <-releaseStorage:
+						case <-callbackCtx.Done():
+							return callbackCtx.Err()
+						}
+					}
+					return nil
+				}))
+				go func() {
+					_, err := cleanupRepository.CleanupNextRendition(ctx, "", nil, func(callbackCtx context.Context, id, path string, size int64) (bool, error) {
+						calls.Add(1)
+						return cleanupDeleteRendition(blockingStore)(callbackCtx, id, path, size)
+					})
+					cleanupResult <- err
+				}()
+				select {
+				case <-storageStarted:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
 				}
-				return false, nil
-			}
-			if test.cleanupFirst {
-				id, err := cleanupRepository.CleanupNextRendition(ctx, "", nil, action)
-				if err != nil || id != "" || calls != 0 {
-					t.Fatalf("cleanup before current switch = %q, %v; callback calls=%d", id, err, calls)
+				go func() {
+					publication, err := publicationRepository.PublishRendition(ctx, third)
+					if err == nil && !publication.Current {
+						err = errors.New("third publication was not current")
+					}
+					publicationResult <- err
+				}()
+				awaitBlockedMediaLockCount(t, ctx, pool, cleanupPID, 1)
+				close(releaseStorage)
+			} else {
+				blocker, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer blocker.Rollback(context.Background())
+				if _, err := blocker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, first.MediaID); err != nil {
+					t.Fatal(err)
+				}
+				var blockerPID int32
+				if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+					t.Fatal(err)
+				}
+				go func() {
+					publication, err := publicationRepository.PublishRendition(ctx, third)
+					if err == nil && !publication.Current {
+						err = errors.New("third publication was not current")
+					}
+					publicationResult <- err
+				}()
+				awaitBlockedMediaLockCount(t, ctx, pool, blockerPID, 1)
+				go func() {
+					_, err := cleanupRepository.CleanupNextRendition(ctx, "", nil, func(callbackCtx context.Context, id, path string, size int64) (bool, error) {
+						calls.Add(1)
+						return cleanupDeleteRendition(store)(callbackCtx, id, path, size)
+					})
+					cleanupResult <- err
+				}()
+				awaitLockWait(t, ctx, pool, cleanupPID)
+				awaitBlockedMediaLockCount(t, ctx, pool, blockerPID, 2)
+				if err := blocker.Commit(ctx); err != nil {
+					t.Fatal(err)
 				}
 			}
-			if publication, err := publicationRepository.PublishRendition(ctx, second); err != nil || !publication.Current {
-				t.Fatalf("second PublishRendition() = %#v, %v", publication, err)
+
+			if err := <-publicationResult; err != nil {
+				t.Fatalf("PublishRendition() error = %v", err)
 			}
-			id, err := cleanupRepository.CleanupNextRendition(ctx, "", nil, action)
-			if err != nil || id != first.ID || calls != 1 {
-				t.Fatalf("cleanup after current switch = %q, %v; callback calls=%d", id, err, calls)
+			if err := <-cleanupResult; err != nil {
+				t.Fatalf("CleanupNextRendition() error = %v", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("cleanup callback calls = %d, want 1", calls.Load())
 			}
 			var currentID string
 			if err := pool.QueryRow(ctx, `SELECT id::text FROM renditions WHERE media_id=$1 AND is_current`, first.MediaID).Scan(&currentID); err != nil {
 				t.Fatal(err)
 			}
-			if currentID != second.ID {
-				t.Fatalf("current Rendition = %s, want %s", currentID, second.ID)
+			if currentID != third.ID {
+				t.Fatalf("current Rendition = %s, want %s", currentID, third.ID)
 			}
+			assertCleanupTerminalHistory(t, pool, cleanupRenditionFixture{
+				mediaID: first.MediaID, renditionID: first.ID, targetID: first.TargetID,
+				relativePath: first.RelativePath, sizeBytes: first.SizeBytes,
+			}, "deleted")
 		})
 	}
+}
+
+func publishCleanupRenditionFile(t *testing.T, ctx context.Context, store *storage.Store, rendition job.Rendition, seed int) {
+	t.Helper()
+	key, err := storage.ParseRenditionKey(rendition.RelativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := storage.ParseAttemptID(integrationUUID(seed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary, err := store.BeginRendition(ctx, key, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Write(make([]byte, rendition.SizeBytes)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := temporary.Publish(ctx, storage.Validation{ExpectedSize: rendition.SizeBytes}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertCleanupTerminalHistory(t *testing.T, pool *pgxpool.Pool, fixture cleanupRenditionFixture, disposition string) {
+	t.Helper()
+	var matches int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM rendition_cleanup_progress
+		WHERE media_id_snapshot=$1 AND rendition_id=$2 AND job_target_id=$3 AND relative_path=$4 AND size_bytes=$5
+		  AND disposition=$6 AND completed_at IS NOT NULL`, fixture.mediaID, fixture.renditionID, fixture.targetID,
+		fixture.relativePath, fixture.sizeBytes, disposition).Scan(&matches); err != nil {
+		t.Fatal(err)
+	}
+	if matches != 1 {
+		t.Fatalf("exact terminal cleanup history rows=%d, want 1", matches)
+	}
+	assertCleanupFailureState(t, pool, fixture.renditionID, false, disposition)
 }
 
 func TestCleanupRepositoryIntegrationTwoCleanersInvokeActionExactlyOnce(t *testing.T) {
@@ -660,16 +773,24 @@ func nextCleanupPublication(t *testing.T, pool *pgxpool.Pool, previous job.Rendi
 	next.ID = integrationUUID(seed + 3)
 	next.RelativePath = "renditions/" + next.OriginalID[:2] + "/" + next.OriginalID + "/" + next.TargetID + "/" + next.ID + ".avif"
 	next.SHA256 = strings.Repeat("c", 64)
-	if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts)
 		VALUES ($1,'transform',$2,$3,'queued',3)`, next.JobID, next.OriginalID, next.MediaID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, next.TargetID, next.JobID, next.ProfileID); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, next.TargetID, next.JobID, next.ProfileID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,
 		lease_expires_at=clock_timestamp()+interval '1 hour',started_at=clock_timestamp(),updated_at=clock_timestamp()
 		WHERE id=$1`, next.JobID, next.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	return next

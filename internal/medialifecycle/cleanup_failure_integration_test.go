@@ -157,60 +157,6 @@ func TestCleanupFailureIntegrationCommittedResponseConvergesWithoutSecondDelete(
 	}
 }
 
-func TestCleanupFailureIntegrationServiceTimeoutAndCancellationBoundaries(t *testing.T) {
-	t.Run("deadline before unlink invokes no storage", func(t *testing.T) {
-		pool := cleanupIntegrationPool(t)
-		service, err := NewService(pool, "https://files.example/files")
-		if err != nil {
-			t.Fatal(err)
-		}
-		fixture, root := cleanupFailureFixture(t, pool, 4250, true)
-		store := openCleanupFailureStore(t, root, nil)
-		blocker, err := pool.Begin(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer blocker.Rollback(context.Background())
-		if _, err := blocker.Exec(context.Background(), `UPDATE maintenance_state SET reason='cleanup timeout blocker' WHERE id=1`); err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		calls := 0
-		_, err = service.CleanupNextRendition(ctx, "", nil, func(ctx context.Context, id, path string, size int64) (bool, error) {
-			calls++
-			return cleanupDeleteRendition(store)(ctx, id, path, size)
-		})
-		if err == nil || calls != 0 {
-			t.Fatalf("pre-unlink timeout error=%v calls=%d", err, calls)
-		}
-		assertCleanupFailureState(t, pool, fixture.renditionID, true, "")
-	})
-
-	t.Run("cancellation after unlink drains terminal state", func(t *testing.T) {
-		pool := cleanupIntegrationPool(t)
-		service, err := NewService(pool, "https://files.example/files")
-		if err != nil {
-			t.Fatal(err)
-		}
-		fixture, root := cleanupFailureFixture(t, pool, 4270, true)
-		store := openCleanupFailureStore(t, root, nil)
-		ctx, cancel := context.WithCancel(context.Background())
-		action := cleanupDeleteRendition(store)
-		id, err := service.CleanupNextRendition(ctx, "", nil, func(ctx context.Context, id, path string, size int64) (bool, error) {
-			missing, err := action(ctx, id, path, size)
-			if err == nil {
-				cancel()
-			}
-			return missing, err
-		})
-		if err != nil || id != fixture.renditionID {
-			t.Fatalf("post-unlink cancelled cleanup = %q, %v", id, err)
-		}
-		assertCleanupFailureState(t, pool, fixture.renditionID, false, "deleted")
-	})
-}
-
 func TestCleanupFailureIntegrationRetainsLocksThroughStorageCallback(t *testing.T) {
 	t.Run("maintenance waits for delete and database terminal state", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -238,7 +184,18 @@ func TestCleanupFailureIntegrationRetainsLocksThroughStorageCallback(t *testing.
 			})
 			cleanupResult <- err
 		}()
-		<-storageDone
+		var cleanupErr error
+		cleanupReturned := false
+		select {
+		case <-storageDone:
+		case cleanupErr = <-cleanupResult:
+			cleanupReturned = true
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if cleanupReturned {
+			t.Fatalf("cleanup returned before storage callback: %v", cleanupErr)
+		}
 
 		maintenance, err := pool.Acquire(ctx)
 		if err != nil {
@@ -256,11 +213,23 @@ func TestCleanupFailureIntegrationRetainsLocksThroughStorageCallback(t *testing.
 		}()
 		awaitLockWait(t, ctx, pool, pid)
 		close(release)
-		if err := <-cleanupResult; err != nil {
-			t.Fatal(err)
+		if !cleanupReturned {
+			select {
+			case cleanupErr = <-cleanupResult:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
 		}
-		if err := <-maintenanceResult; err != nil {
-			t.Fatal(err)
+		if cleanupErr != nil {
+			t.Fatal(cleanupErr)
+		}
+		select {
+		case err := <-maintenanceResult:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
 		assertCleanupFailureState(t, pool, fixture.renditionID, false, "deleted")
 	})
@@ -303,7 +272,18 @@ func TestCleanupFailureIntegrationRetainsLocksThroughStorageCallback(t *testing.
 			})
 			cleanupResult <- err
 		}()
-		<-storageDone
+		var cleanupErr error
+		cleanupReturned := false
+		select {
+		case <-storageDone:
+		case cleanupErr = <-cleanupResult:
+			cleanupReturned = true
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if cleanupReturned {
+			t.Fatalf("cleanup returned before storage callback: %v", cleanupErr)
+		}
 
 		connection, startService, pid := connectionService(t, ctx, pool)
 		defer connection.Release()
@@ -318,10 +298,22 @@ func TestCleanupFailureIntegrationRetainsLocksThroughStorageCallback(t *testing.
 		}()
 		awaitLockWait(t, ctx, pool, pid)
 		close(release)
-		if err := <-cleanupResult; err != nil {
-			t.Fatal(err)
+		if !cleanupReturned {
+			select {
+			case cleanupErr = <-cleanupResult:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
 		}
-		started := <-startResult
+		if cleanupErr != nil {
+			t.Fatal(cleanupErr)
+		}
+		var started startOutcome
+		select {
+		case started = <-startResult:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
 		if started.err != nil || started.lease.JobID != enqueued.Job.ID {
 			t.Fatalf("StartPurge() = %#v, %v", started.lease, started.err)
 		}
@@ -334,6 +326,102 @@ func TestCleanupFailureIntegrationRetainsLocksThroughStorageCallback(t *testing.
 			t.Fatalf("started purge retained %d manifest rows for cleaned Rendition", manifestRows)
 		}
 	})
+}
+
+func TestCleanupFailureIntegrationStartPurgeQueuesFirstAndOwnsExactRendition(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool := cleanupIntegrationPool(t)
+	setupService, err := NewService(pool, "https://files.example/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, _ := cleanupFailureFixture(t, pool, 4330, false)
+	if _, err := setupService.Delete(ctx, fixture.mediaID); err != nil {
+		t.Fatal(err)
+	}
+	enqueued, err := setupService.EnqueuePurge(ctx, fixture.mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(context.Background())
+	if _, err := blocker.Exec(ctx, `SELECT id FROM media WHERE id=$1 FOR UPDATE`, fixture.mediaID); err != nil {
+		t.Fatal(err)
+	}
+	var blockerPID int32
+	if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+		t.Fatal(err)
+	}
+	startConnection, startService, startPID := connectionService(t, ctx, pool)
+	defer startConnection.Release()
+	type startOutcome struct {
+		lease PurgeLease
+		err   error
+	}
+	startResult := make(chan startOutcome, 1)
+	go func() {
+		lease, err := startService.StartPurge(ctx, enqueued.Job.ID)
+		startResult <- startOutcome{lease: lease, err: err}
+	}()
+	awaitLockWait(t, ctx, pool, startPID)
+
+	cleanupConnection, cleanupRepository, cleanupPID := cleanupConnectionRepository(t, ctx, pool)
+	defer cleanupConnection.Release()
+	var calls atomic.Int32
+	cleanupResult := make(chan error, 1)
+	go func() {
+		_, err := cleanupRepository.CleanupNextRendition(ctx, "", nil, func(context.Context, string, string, int64) (bool, error) {
+			calls.Add(1)
+			return false, nil
+		})
+		cleanupResult <- err
+	}()
+	awaitLockWait(t, ctx, pool, cleanupPID)
+	awaitBlockedMediaLockCount(t, ctx, pool, blockerPID, 2)
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var started startOutcome
+	select {
+	case started = <-startResult:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if started.err != nil || started.lease.JobID != enqueued.Job.ID {
+		t.Fatalf("StartPurge() = %#v, %v", started.lease, started.err)
+	}
+	select {
+	case err := <-cleanupResult:
+		if err != nil {
+			t.Fatalf("cleanup after purge takeover: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("cleanup callback calls=%d, want 0 after purge ownership", calls.Load())
+	}
+	var path string
+	var size int64
+	var disposition string
+	if err := pool.QueryRow(ctx, `SELECT relative_path,size_bytes,disposition FROM purge_file_progress
+		WHERE job_id=$1 AND object_kind='rendition' AND object_id=$2`, enqueued.Job.ID, fixture.renditionID).Scan(&path, &size, &disposition); err != nil {
+		t.Fatal(err)
+	}
+	if path != fixture.relativePath || size != fixture.sizeBytes || disposition != "pending" {
+		t.Fatalf("purge manifest path=%q size=%d disposition=%q", path, size, disposition)
+	}
+	var cleanupRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM rendition_cleanup_progress WHERE rendition_id=$1`, fixture.renditionID).Scan(&cleanupRows); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupRows != 0 {
+		t.Fatalf("cleanup progress rows=%d after purge takeover", cleanupRows)
+	}
 }
 
 func TestCleanupFailureIntegrationRestoreOrdering(t *testing.T) {
@@ -369,7 +457,18 @@ func TestCleanupFailureIntegrationRestoreOrdering(t *testing.T) {
 			_, err := cleanupService.CleanupNextRendition(ctx, "", nil, cleanupDeleteRendition(store))
 			cleanupResult <- err
 		}()
-		<-storageStarted
+		var cleanupErr error
+		cleanupReturned := false
+		select {
+		case <-storageStarted:
+		case cleanupErr = <-cleanupResult:
+			cleanupReturned = true
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		if cleanupReturned {
+			t.Fatalf("cleanup returned before storage callback: %v", cleanupErr)
+		}
 
 		restoreConnection, restoreService, restorePID := connectionService(t, ctx, pool)
 		defer restoreConnection.Release()
@@ -380,11 +479,23 @@ func TestCleanupFailureIntegrationRestoreOrdering(t *testing.T) {
 		}()
 		awaitLockWait(t, ctx, pool, restorePID)
 		close(releaseStorage)
-		if err := <-cleanupResult; err != nil {
-			t.Fatalf("CleanupNextRendition() error = %v", err)
+		if !cleanupReturned {
+			select {
+			case cleanupErr = <-cleanupResult:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
 		}
-		if err := <-restoreResult; err != nil {
-			t.Fatalf("Restore() error = %v", err)
+		if cleanupErr != nil {
+			t.Fatalf("CleanupNextRendition() error = %v", cleanupErr)
+		}
+		select {
+		case err := <-restoreResult:
+			if err != nil {
+				t.Fatalf("Restore() error = %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
 		assertCleanupFailureState(t, pool, fixture.renditionID, false, "deleted")
 		assertCleanupMediaRestored(t, pool, fixture.mediaID)
@@ -440,11 +551,21 @@ func TestCleanupFailureIntegrationRestoreOrdering(t *testing.T) {
 		if err := blocker.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if err := <-restoreResult; err != nil {
-			t.Fatalf("winning Restore() error = %v", err)
+		select {
+		case err := <-restoreResult:
+			if err != nil {
+				t.Fatalf("winning Restore() error = %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
-		if err := <-cleanupResult; err != nil {
-			t.Fatalf("CleanupNextRendition() after Restore = %v", err)
+		select {
+		case err := <-cleanupResult:
+			if err != nil {
+				t.Fatalf("CleanupNextRendition() after Restore = %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
 		if calls.Load() != 1 {
 			t.Fatalf("cleanup callback calls = %d, want 1", calls.Load())
@@ -478,7 +599,7 @@ func TestCleanupFailureIntegrationServiceCancellationBoundary(t *testing.T) {
 			calls.Add(1)
 			return false, nil
 		})
-		if id != fixture.renditionID || !IsKind(err, KindDatabaseUnavailable) || calls.Load() != 0 {
+		if id != "" || !IsKind(err, KindDatabaseUnavailable) || calls.Load() != 0 {
 			t.Fatalf("CleanupNextRendition() = %q, %#v; callback calls=%d", id, err, calls.Load())
 		}
 		assertCleanupFailureState(t, pool, fixture.renditionID, true, "")
