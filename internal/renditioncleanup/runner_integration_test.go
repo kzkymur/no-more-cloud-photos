@@ -174,38 +174,38 @@ func insertCleanupRunnerFixture(t *testing.T, pool *pgxpool.Pool) cleanupRunnerF
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts)
-		SELECT ('31000000-0000-4000-8000-' || lpad(to_hex(n),12,'0'))::uuid,'transform',$1,$2,'queued',3
-		FROM generate_series(1,$3) AS generated(n)`, originalID, mediaID, integrationCurrentIndex); err != nil {
+		SELECT ('31000000-0000-4000-8000-' || lpad(to_hex(n::bigint),12,'0'))::uuid,'transform',$1,$2,'queued',3
+		FROM generate_series(1,$3::integer) AS generated(n)`, originalID, mediaID, integrationCurrentIndex); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status)
-		SELECT ('32000000-0000-4000-8000-' || lpad(to_hex(n),12,'0'))::uuid,
-		       ('31000000-0000-4000-8000-' || lpad(to_hex(n),12,'0'))::uuid,$1,'pending'
-		FROM generate_series(1,$2) AS generated(n)`, profileID, integrationCurrentIndex); err != nil {
+		SELECT ('32000000-0000-4000-8000-' || lpad(to_hex(n::bigint),12,'0'))::uuid,
+		       ('31000000-0000-4000-8000-' || lpad(to_hex(n::bigint),12,'0'))::uuid,$1,'pending'
+		FROM generate_series(1,$2::integer) AS generated(n)`, profileID, integrationCurrentIndex); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,
 		lease_token=('36000000-0000-4000-8000-' || right(id::text,12))::uuid,
 		lease_expires_at=statement_timestamp()+interval '1 hour',started_at=statement_timestamp(),updated_at=statement_timestamp()
 		WHERE id>='31000000-0000-4000-8000-000000000001'::uuid
-		  AND id<=('31000000-0000-4000-8000-' || lpad(to_hex($1),12,'0'))::uuid`, integrationCurrentIndex); err != nil {
+		  AND id<=('31000000-0000-4000-8000-' || lpad(to_hex($1::bigint),12,'0'))::uuid`, integrationCurrentIndex); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='succeeded',attempts=1,updated_at=statement_timestamp()
 		WHERE id>='32000000-0000-4000-8000-000000000001'::uuid
-		  AND id<=('32000000-0000-4000-8000-' || lpad(to_hex($1),12,'0'))::uuid`, integrationCurrentIndex); err != nil {
+		  AND id<=('32000000-0000-4000-8000-' || lpad(to_hex($1::bigint),12,'0'))::uuid`, integrationCurrentIndex); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO renditions
 		(id,media_id,job_target_id,is_current,purge_after,relative_path,mime_type,size_bytes,width,height,sha256,processor_audit)
 		SELECT rendition_id,$1,target_id,false,statement_timestamp()-interval '1 hour',
 		       'renditions/30/' || $2 || '/' || target_id || '/' ||
-		       CASE WHEN n=$3 THEN rendition_id::text ELSE ('34000000-0000-4000-8000-' || lpad(to_hex(n),12,'0')) END || '.avif',
-		       'image/avif',1,1,1,lpad(to_hex(n),64,'0'),'{"fixture":"cleanup-runner"}'::jsonb
-		FROM generate_series(1,$3) AS generated(n)
+		       CASE WHEN n=$3::integer THEN rendition_id::text ELSE ('34000000-0000-4000-8000-' || lpad(to_hex(n::bigint),12,'0')) END || '.avif',
+		       'image/avif',1,1,1,lpad(to_hex(n::bigint),64,'0'),'{"fixture":"cleanup-runner"}'::jsonb
+		FROM generate_series(1,$3::integer) AS generated(n)
 		CROSS JOIN LATERAL (SELECT
-			('32000000-0000-4000-8000-' || lpad(to_hex(n),12,'0'))::uuid AS target_id,
-			('33000000-0000-4000-8000-' || lpad(to_hex(n),12,'0'))::uuid AS rendition_id
+			('32000000-0000-4000-8000-' || lpad(to_hex(n::bigint),12,'0'))::uuid AS target_id,
+			('33000000-0000-4000-8000-' || lpad(to_hex(n::bigint),12,'0'))::uuid AS rendition_id
 		) AS ids`, mediaID, originalID, integrationHealthyIndex); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func insertCleanupRunnerFixture(t *testing.T, pool *pgxpool.Pool) cleanupRunnerF
 	if _, err := tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,
 		finished_at=statement_timestamp(),updated_at=statement_timestamp()
 		WHERE id>='31000000-0000-4000-8000-000000000001'::uuid
-		  AND id<=('31000000-0000-4000-8000-' || lpad(to_hex($1),12,'0'))::uuid`, integrationCurrentIndex); err != nil {
+		  AND id<=('31000000-0000-4000-8000-' || lpad(to_hex($1::bigint),12,'0'))::uuid`, integrationCurrentIndex); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
