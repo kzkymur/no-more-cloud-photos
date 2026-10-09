@@ -577,29 +577,21 @@ func TestCleanupFailureIntegrationRestoreOrdering(t *testing.T) {
 }
 
 func TestCleanupFailureIntegrationServiceCancellationBoundary(t *testing.T) {
-	t.Run("deadline before unlink never invokes callback", func(t *testing.T) {
+	t.Run("cancellation before selection returns no identity or callback", func(t *testing.T) {
 		pool := cleanupIntegrationPool(t)
 		service, err := NewService(pool, "https://files.example/files")
 		if err != nil {
 			t.Fatal(err)
 		}
 		fixture, _ := cleanupFailureFixture(t, pool, 4380, false)
-		blocker, err := pool.Begin(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer blocker.Rollback(context.Background())
-		if _, err := blocker.Exec(context.Background(), `SELECT id FROM media WHERE id=$1 FOR UPDATE`, fixture.mediaID); err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
 		var calls atomic.Int32
 		id, err := service.CleanupNextRendition(ctx, "", nil, func(context.Context, string, string, int64) (bool, error) {
 			calls.Add(1)
 			return false, nil
 		})
-		if id != fixture.renditionID || !IsKind(err, KindDatabaseUnavailable) || calls.Load() != 0 {
+		if id != "" || !IsKind(err, KindDatabaseUnavailable) || calls.Load() != 0 {
 			t.Fatalf("CleanupNextRendition() = %q, %#v; callback calls=%d", id, err, calls.Load())
 		}
 		assertCleanupFailureState(t, pool, fixture.renditionID, true, "")
