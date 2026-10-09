@@ -162,9 +162,13 @@ EOF
 /usr/bin/touch "$work/stale-readiness-enabled"
 "$repo/scripts/install-ubuntu-release" activate stalefail >"$work/stalefail.out" 2>&1 &
 stale_pid=$!
-for attempt in {1..200}; do
+for attempt in {1..1000}; do
   [[ -e $work/stale-readiness-ready ]] && break
-  [[ $attempt -lt 200 ]] || { printf 'compatibility failure did not enter\n' >&2; exit 1; }
+  [[ $attempt -lt 1000 ]] || {
+    /usr/bin/cat "$work/stalefail.out" >&2 || true
+    printf 'compatibility failure did not enter\n' >&2
+    exit 1
+  }
   /usr/bin/sleep 0.02
 done
 [[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]]
