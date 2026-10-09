@@ -7,6 +7,7 @@ current_admin=$(/usr/bin/readlink -f -- "$1")
 v16_admin=$(/usr/bin/readlink -f -- "$2")
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 work=$(/usr/bin/mktemp -d /var/tmp/nmcp-role-compatibility.XXXXXX)
+/usr/bin/chmod 0755 "$work"
 for path in /usr/local/libexec/nmcp /var/lib/nmcp /opt/nmcp-role-compatibility; do
   [[ ! -e $path ]] || { printf 'refusing existing path: %s\n' "$path" >&2; exit 1; }
 done
