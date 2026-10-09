@@ -309,3 +309,71 @@ BEGIN
     END IF;
 END;
 $$;
+
+DO $$
+DECLARE
+    evidence_table text;
+    target_search_path text := 'search_path=public, pg_catalog, pg_temp';
+BEGIN
+    FOREACH evidence_table IN ARRAY ARRAY[
+        'reconciliation_reports','reconciliation_check_reports','reconciliation_check_findings',
+        'reconciliation_check_report_seals','reconciliation_repair_runs',
+        'reconciliation_repair_manifest_items','reconciliation_repair_attempts',
+        'reconciliation_repair_events','reconciliation_repair_results','storage_attempts','storage_attempt_events'
+    ] LOOP
+        IF pg_catalog.has_table_privilege('nmcp_runtime','public.'||evidence_table,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
+           OR pg_catalog.has_table_privilege('nmcp_worker_runtime','public.'||evidence_table,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
+           OR pg_catalog.has_table_privilege('nmcp_check_runtime','public.'||evidence_table,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
+           OR pg_catalog.has_table_privilege('nmcp_repair_runtime','public.'||evidence_table,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
+           OR pg_catalog.has_table_privilege('nmcp_api','public.'||evidence_table,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
+           OR pg_catalog.has_table_privilege('nmcp_worker','public.'||evidence_table,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE') THEN
+            RAISE EXCEPTION 'runtime has direct reconciliation evidence privilege on %',evidence_table;
+        END IF;
+    END LOOP;
+    IF pg_catalog.has_table_privilege('nmcp_runtime','public.maintenance_state','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
+       OR pg_catalog.has_table_privilege('nmcp_worker_runtime','public.maintenance_state','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
+       OR pg_catalog.has_table_privilege('nmcp_api','public.maintenance_state','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
+       OR pg_catalog.has_table_privilege('nmcp_worker','public.maintenance_state','SELECT,INSERT,UPDATE,DELETE,TRUNCATE') THEN
+        RAISE EXCEPTION 'runtime has direct maintenance privilege';
+    END IF;
+    IF NOT pg_catalog.has_function_privilege('nmcp_check_runtime','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_check_runtime','public.nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_check_runtime','public.nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)','EXECUTE')
+       OR pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE')
+       OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc p CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) a
+           WHERE p.oid='public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)'::regprocedure
+             AND a.grantee=0 AND a.privilege_type='EXECUTE') THEN
+        RAISE EXCEPTION 'unsafe check publication EXECUTE ACL';
+    END IF;
+    IF NOT pg_catalog.has_function_privilege('nmcp_runtime','public.nmcp_require_normal_maintenance()','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_runtime','public.nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_runtime','public.nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_runtime','public.nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_runtime','public.nmcp_complete_upload_attempt(nmcp_uuid_v4,text)','EXECUTE')
+       OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc p CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) a
+           WHERE p.oid='public.nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)'::regprocedure
+             AND a.grantee=0 AND a.privilege_type='EXECUTE') THEN
+        RAISE EXCEPTION 'unsafe upload attempt boundary EXECUTE ACL';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc
+        WHERE oid IN (
+            'public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)'::regprocedure,
+            'public.nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)'::regprocedure,
+            'public.nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)'::regprocedure
+        ) AND (pg_catalog.pg_get_userbyid(proowner)<>'nmcp_check_function_owner' OR proconfig IS DISTINCT FROM ARRAY[target_search_path])
+    ) OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc
+        WHERE oid IN (
+            'public.nmcp_require_normal_maintenance()'::regprocedure,
+            'public.nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)'::regprocedure,
+            'public.nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)'::regprocedure,
+            'public.nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)'::regprocedure,
+            'public.nmcp_complete_upload_attempt(nmcp_uuid_v4,text)'::regprocedure,
+            'public.nmcp_record_transform_storage_attempt()'::regprocedure
+        ) AND (pg_catalog.pg_get_userbyid(proowner)<>'nmcp_repair_function_owner' OR proconfig IS DISTINCT FROM ARRAY[target_search_path])
+    ) THEN
+        RAISE EXCEPTION 'unsafe reconciliation function owner or search_path';
+    END IF;
+END;
+$$;

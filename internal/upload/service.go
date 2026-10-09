@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,10 +19,11 @@ import (
 )
 
 const (
-	MaxOriginalBytes = int64(20 * 1024 * 1024 * 1024)
-	defaultDBBudget  = 30 * time.Second
-	abortBudget      = 5 * time.Second
-	maxTimezoneTries = 3
+	MaxOriginalBytes        = int64(20 * 1024 * 1024 * 1024)
+	defaultDBBudget         = 30 * time.Second
+	abortBudget             = 5 * time.Second
+	maxTimezoneTries        = 3
+	uploadHeartbeatInterval = 30 * time.Second
 )
 
 // Request is the validated upload part passed by the HTTP layer. Filename must
@@ -52,13 +54,62 @@ type metadataProber interface {
 // Service streams and probes uploads outside a transaction and delegates the
 // short, ordered acceptance transaction to its repository.
 type Service struct {
-	store         originalStore
-	prober        metadataProber
-	repository    acceptanceRepository
-	newID         func() (string, error)
-	maxBytes      int64
-	dbBudget      time.Duration
-	timezoneTries int
+	store             originalStore
+	prober            metadataProber
+	repository        acceptanceRepository
+	newID             func() (string, error)
+	maxBytes          int64
+	dbBudget          time.Duration
+	heartbeatInterval time.Duration
+	timezoneTries     int
+}
+
+type uploadHeartbeat struct {
+	stop chan struct{}
+	done chan struct{}
+	once sync.Once
+	mu   sync.Mutex
+	err  error
+}
+
+func (heartbeat *uploadHeartbeat) Stop() {
+	heartbeat.once.Do(func() { close(heartbeat.stop) })
+	<-heartbeat.done
+}
+
+func (heartbeat *uploadHeartbeat) Err() error {
+	heartbeat.mu.Lock()
+	defer heartbeat.mu.Unlock()
+	return heartbeat.err
+}
+
+func (s *Service) startAttemptHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, attemptID string) *uploadHeartbeat {
+	heartbeat := &uploadHeartbeat{stop: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(heartbeat.done)
+		ticker := time.NewTicker(s.heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeat.stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				heartbeatCtx, heartbeatCancel := context.WithTimeout(context.WithoutCancel(ctx), abortBudget)
+				err := s.repository.HeartbeatAttempt(heartbeatCtx, attemptID)
+				heartbeatCancel()
+				if err != nil {
+					heartbeat.mu.Lock()
+					heartbeat.err = err
+					heartbeat.mu.Unlock()
+					cancel(err)
+					return
+				}
+			}
+		}
+	}()
+	return heartbeat
 }
 
 // NewService constructs the production upload service.
@@ -72,11 +123,13 @@ func NewService(db *pgxpool.Pool, store *storage.Store, prober *metadata.Prober)
 func newService(store originalStore, prober metadataProber, repository acceptanceRepository) *Service {
 	return &Service{
 		store: store, prober: prober, repository: repository, newID: NewUUIDv4,
-		maxBytes: MaxOriginalBytes, dbBudget: defaultDBBudget, timezoneTries: maxTimezoneTries,
+		maxBytes: MaxOriginalBytes, dbBudget: defaultDBBudget,
+		heartbeatInterval: uploadHeartbeatInterval, timezoneTries: maxTimezoneTries,
 	}
 }
 
 func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) {
+	requestCtx := ctx
 	if err := validateRequest(request); err != nil {
 		return Outcome{}, err
 	}
@@ -92,27 +145,64 @@ func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) 
 	if err != nil {
 		return Outcome{}, internalFailure(err)
 	}
+	published := false
+	registerCtx, cancelRegister := context.WithTimeout(ctx, s.dbBudget)
+	err = s.repository.RegisterAttempt(registerCtx, attemptID, originalID)
+	cancelRegister()
+	if err != nil {
+		return Outcome{}, s.databaseFailure(ctx, registerCtx, err)
+	}
+	operationCtx, cancelOperation := context.WithCancelCause(ctx)
+	heartbeat := s.startAttemptHeartbeat(operationCtx, cancelOperation, attemptID)
+	ctx = operationCtx
+	attemptFinished := false
+	defer func() {
+		if attemptFinished {
+			return
+		}
+		finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortBudget)
+		defer cancel()
+		terminal := "aborted"
+		if published {
+			terminal = "published"
+		}
+		_ = s.repository.CompleteAttempt(finishCtx, attemptID, terminal)
+	}()
 
 	temporary, err := s.store.Begin(ctx, originalID, attemptID)
 	if err != nil {
+		cancelOperation(nil)
+		heartbeat.Stop()
+		if heartbeatErr := heartbeat.Err(); heartbeatErr != nil {
+			return Outcome{}, dependencyFailure(heartbeatErr)
+		}
 		if ctx.Err() != nil {
 			return Outcome{}, timeoutFailure(err)
 		}
 		return Outcome{}, dependencyFailure(err)
 	}
-	published := false
 	defer func() {
 		if !published {
 			abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortBudget)
 			defer cancel()
-			_ = temporary.Abort(abortCtx)
+			if temporary.Abort(abortCtx) == nil {
+				_ = s.repository.CompleteAttempt(abortCtx, attemptID, "aborted")
+				attemptFinished = true
+			}
 		}
+	}()
+	defer func() {
+		cancelOperation(nil)
+		heartbeat.Stop()
 	}()
 
 	digest := sha256.New()
 	destination := &streamDestination{temporary: temporary, digest: digest}
 	written, copyErr := io.Copy(destination, io.LimitReader(request.Body, s.maxBytes+1))
 	if copyErr != nil {
+		if heartbeatErr := heartbeat.Err(); heartbeatErr != nil {
+			return Outcome{}, dependencyFailure(heartbeatErr)
+		}
 		if ctx.Err() != nil || errors.Is(copyErr, context.Canceled) || errors.Is(copyErr, context.DeadlineExceeded) {
 			return Outcome{}, timeoutFailure(copyErr)
 		}
@@ -130,6 +220,9 @@ func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) 
 	var contentSHA [sha256.Size]byte
 	copy(contentSHA[:], digest.Sum(nil))
 	if err := temporary.Seal(ctx, storage.Validation{ExpectedSize: written, ExpectedSHA256: &contentSHA}); err != nil {
+		if heartbeatErr := heartbeat.Err(); heartbeatErr != nil {
+			return Outcome{}, dependencyFailure(heartbeatErr)
+		}
 		return Outcome{}, classifySealError(ctx, err)
 	}
 
@@ -137,7 +230,10 @@ func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) 
 	timezone, err := s.repository.DefaultTimezone(timezoneCtx)
 	cancelTimezone()
 	if err != nil {
-		return Outcome{}, s.databaseFailure(ctx, timezoneCtx, err)
+		if heartbeatErr := heartbeat.Err(); heartbeatErr != nil {
+			return Outcome{}, dependencyFailure(heartbeatErr)
+		}
+		return Outcome{}, s.databaseFailure(requestCtx, timezoneCtx, err)
 	}
 	var probed metadata.Result
 	err = temporary.UseReadOnlyFile(func(file *os.File) error {
@@ -146,6 +242,9 @@ func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) 
 		return probeErr
 	})
 	if err != nil {
+		if heartbeatErr := heartbeat.Err(); heartbeatErr != nil {
+			return Outcome{}, dependencyFailure(heartbeatErr)
+		}
 		return Outcome{}, classifyProbeError(ctx, err)
 	}
 	extension, err := storage.OriginalExtensionForMIME(probed.MIMEType)
@@ -168,7 +267,7 @@ func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) 
 			Key: request.IdempotencyKey, RequestID: request.RequestID,
 			RequestHash: CanonicalRequestHashV1(contentSHA, uint64(written), request.Filename),
 			SHA256:      contentSHA, Size: written, Filename: request.Filename,
-			OriginalID: originalID, MediaID: mediaID, Timezone: timezone, Metadata: probed,
+			OriginalID: originalID, AttemptID: attemptID, MediaID: mediaID, Timezone: timezone, Metadata: probed,
 			EXIFJSON: exifJSON, SourceJSON: sourceJSON,
 		}
 		outcome, finalizeErr := s.repository.Finalize(dbCtx, input, func() (string, error) {
@@ -184,6 +283,7 @@ func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) 
 			return key, publishErr
 		})
 		if finalizeErr == nil {
+			attemptFinished = true
 			return outcome, nil
 		}
 		var changed *timezoneChangedError
@@ -215,7 +315,10 @@ func (s *Service) Accept(ctx context.Context, request Request) (Outcome, error) 
 			errors.Is(finalizeErr, storage.ErrInvalidKey) || errors.Is(finalizeErr, storage.ErrUnexpectedType) {
 			return Outcome{}, internalFailure(finalizeErr)
 		}
-		return Outcome{}, s.databaseFailure(ctx, dbCtx, finalizeErr)
+		if heartbeatErr := heartbeat.Err(); heartbeatErr != nil {
+			return Outcome{}, dependencyFailure(heartbeatErr)
+		}
+		return Outcome{}, s.databaseFailure(requestCtx, dbCtx, finalizeErr)
 	}
 	return Outcome{}, dependencyFailure(errTimezoneChanged)
 }

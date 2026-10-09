@@ -1128,12 +1128,12 @@ func (r *PostgresRepository) begin(ctx context.Context) (pgx.Tx, error) {
 }
 
 func lockMaintenance(ctx context.Context, tx pgx.Tx) error {
-	var mode string
-	if err := tx.QueryRow(ctx, `SELECT mode FROM maintenance_state WHERE id=1 FOR SHARE`).Scan(&mode); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT nmcp_require_normal_maintenance()`); err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "55000" {
+			return newUnavailable(errors.New("maintenance mode is active"))
+		}
 		return fmt.Errorf("lock maintenance state: %w", err)
-	}
-	if mode != "normal" {
-		return newUnavailable(errors.New("maintenance mode is active"))
 	}
 	return nil
 }

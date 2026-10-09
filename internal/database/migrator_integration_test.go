@@ -38,7 +38,7 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 16 || status.Ready() || !status.Pending {
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 17 || status.Ready() || !status.Pending {
 			t.Fatalf("Status() = %+v, want pending version sixteen", status)
 		}
 		var historyExists bool
@@ -62,12 +62,43 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 16 || status.ExpectedVersion != 16 || !status.Ready() {
+		if status.CurrentVersion != 17 || status.ExpectedVersion != 17 || !status.Ready() {
 			t.Fatalf("Status() after Up = %+v, want ready version sixteen", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
 		}
+	})
+
+	t.Run("reconciliation evidence upgrade preserves legacy as non executable", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:16]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one through sixteen: %v", err)
+		}
+		legacyID := newUUIDv4(t)
+		if _, err := pool.Exec(context.Background(), `INSERT INTO reconciliation_reports
+			(id,scope,findings,repair_disposition) VALUES ($1,'all','[]','{}')`, legacyID); err != nil {
+			t.Fatalf("insert v16 legacy report: %v", err)
+		}
+		if err := full.Up(context.Background()); err != nil {
+			t.Fatalf("apply reconciliation evidence boundary: %v", err)
+		}
+		var version int64
+		var format string
+		if err := pool.QueryRow(context.Background(), `SELECT
+			(SELECT max(version) FROM schema_migrations WHERE NOT dirty),
+			(SELECT format FROM reconciliation_reports WHERE id=$1)`, legacyID).Scan(&version, &format); err != nil {
+			t.Fatal(err)
+		}
+		if version != 17 || format != "legacy" {
+			t.Fatalf("upgrade version/legacy format=%d/%q, want 17/legacy", version, format)
+		}
+		expectExecError(t, pool, `INSERT INTO reconciliation_reports
+			(id,scope,findings,repair_disposition) VALUES ($1,'all','[]','{}')`, newUUIDv4(t))
 	})
 
 	t.Run("rendition cleanup boundary upgrade drains legacy state", func(t *testing.T) {
@@ -164,7 +195,7 @@ func TestMigratorIntegration(t *testing.T) {
 			}
 			defer barrier.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, barrierKey)
 
-			migrations := append([]migration(nil), full.migrations...)
+			migrations := append([]migration(nil), full.migrations[:16]...)
 			const lockStatement = "LOCK TABLE rendition_cleanup_progress IN SHARE ROW EXCLUSIVE MODE;"
 			instrumentedSQL := strings.Replace(migrations[15].sql, lockStatement,
 				lockStatement+fmt.Sprintf("\nSELECT pg_catalog.pg_advisory_xact_lock(%d);", barrierKey), 1)
@@ -497,7 +528,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 16 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 17 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {

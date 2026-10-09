@@ -472,6 +472,33 @@ func (p *fakeMetadataProber) Probe(_ context.Context, file *os.File, _ string) (
 	return p.result, p.err
 }
 
+func TestUploadAttemptHeartbeatCancelsOperationOnLeaseFailure(t *testing.T) {
+	want := errors.New("lease heartbeat failed")
+	called := make(chan struct{}, 1)
+	repository := &fakeAcceptanceRepository{heartbeat: func(context.Context, string) error {
+		called <- struct{}{}
+		return want
+	}}
+	service := newService(&fakeOriginalStore{}, &fakeMetadataProber{}, repository)
+	service.heartbeatInterval = time.Millisecond
+	ctx, cancel := context.WithCancelCause(context.Background())
+	heartbeat := service.startAttemptHeartbeat(ctx, cancel, testUUIDs[1])
+	defer heartbeat.Stop()
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat was not attempted")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat failure did not cancel operation")
+	}
+	if !errors.Is(context.Cause(ctx), want) || !errors.Is(heartbeat.Err(), want) {
+		t.Fatalf("heartbeat cause/context = %v/%v, want %v", heartbeat.Err(), context.Cause(ctx), want)
+	}
+}
+
 type fakeAcceptanceRepository struct {
 	timezone      string
 	err           error
@@ -479,7 +506,17 @@ type fakeAcceptanceRepository struct {
 	timezoneCalls int
 	finalizeCalls int
 	finalize      func(context.Context, acceptance, func() (string, error)) (Outcome, error)
+	heartbeat     func(context.Context, string) error
 }
+
+func (r *fakeAcceptanceRepository) RegisterAttempt(context.Context, string, string) error { return nil }
+func (r *fakeAcceptanceRepository) HeartbeatAttempt(ctx context.Context, attemptID string) error {
+	if r.heartbeat != nil {
+		return r.heartbeat(ctx, attemptID)
+	}
+	return nil
+}
+func (r *fakeAcceptanceRepository) CompleteAttempt(context.Context, string, string) error { return nil }
 
 func (r *fakeAcceptanceRepository) DefaultTimezone(context.Context) (string, error) {
 	appendEvent(r.events, "timezone")

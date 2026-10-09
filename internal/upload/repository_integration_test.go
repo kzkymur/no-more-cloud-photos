@@ -25,6 +25,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatal(err)
 	}
 	input := integrationAcceptance(t, "first-key", "first-request", timezone, []byte("same-content"), testUUIDs[0], testUUIDs[1])
+	registerIntegrationAcceptance(t, repository, input)
 	publishes := 0
 	outcome, err := repository.Finalize(ctx, input, func() (string, error) {
 		publishes++
@@ -66,6 +67,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 	}
 
 	duplicateInput := integrationAcceptance(t, "duplicate-key", "duplicate-request", timezone, []byte("same-content"), testUUIDs[2], testUUIDs[3])
+	registerIntegrationAcceptance(t, repository, duplicateInput)
 	duplicate, err := repository.Finalize(ctx, duplicateInput, func() (string, error) {
 		t.Fatal("duplicate published")
 		return "", nil
@@ -88,6 +90,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatal(err)
 	}
 	deletedDuplicate := integrationAcceptance(t, "deleted-duplicate-key", "deleted-request", timezone, []byte("same-content"), testUUIDs[3], testUUIDs[4])
+	registerIntegrationAcceptance(t, repository, deletedDuplicate)
 	deletedOutcome, err := repository.Finalize(ctx, deletedDuplicate, func() (string, error) {
 		t.Fatal("deleted duplicate published")
 		return "", nil
@@ -114,6 +117,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 	originalID, _ := NewUUIDv4()
 	mediaID, _ := NewUUIDv4()
 	profileInput := integrationAcceptance(t, "profile-key", "profile-request", timezone, []byte("different-content"), originalID, mediaID)
+	registerIntegrationAcceptance(t, repository, profileInput)
 	profileOutcome, err := repository.Finalize(ctx, profileInput, func() (string, error) {
 		return "originals/11/11111111-1111-4111-8111-111111111111/original.jpg", nil
 	})
@@ -145,6 +149,7 @@ func TestRepositoryIntegrationConcurrentSameKeyReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := integrationAcceptance(t, "concurrent-replay", "replay-request", timezone, []byte("concurrent-replay-content"), testUUIDs[0], testUUIDs[1])
+	registerIntegrationAcceptance(t, repository, input)
 	type result struct {
 		outcome Outcome
 		err     error
@@ -201,6 +206,9 @@ func TestRepositoryIntegrationConcurrentDifferentKeysSameSHA(t *testing.T) {
 	inputs := []acceptance{
 		integrationAcceptance(t, "sha-key-a", "sha-request-a", timezone, []byte("shared-sha-content"), testUUIDs[0], testUUIDs[1]),
 		integrationAcceptance(t, "sha-key-b", "sha-request-b", timezone, []byte("shared-sha-content"), testUUIDs[2], testUUIDs[3]),
+	}
+	for _, input := range inputs {
+		registerIntegrationAcceptance(t, repository, input)
 	}
 	type result struct {
 		outcome Outcome
@@ -287,6 +295,7 @@ func TestRepositoryIntegrationMaintenanceAndTimezoneRejection(t *testing.T) {
 			t.Fatal(err)
 		}
 		input := integrationAcceptance(t, "timezone-key", "timezone-request", timezone, []byte("timezone-content"), testUUIDs[0], testUUIDs[1])
+		registerIntegrationAcceptance(t, repository, input)
 		_, err = repository.Finalize(ctx, input, func() (string, error) {
 			t.Fatal("timezone-change request published")
 			return "", nil
@@ -399,8 +408,15 @@ func integrationAcceptance(t *testing.T, key, requestID, timezone string, conten
 	filename := "photo.jpg"
 	return acceptance{
 		Key: key, RequestID: requestID, RequestHash: CanonicalRequestHashV1(digest, uint64(len(content)), &filename),
-		SHA256: digest, Size: int64(len(content)), Filename: &filename, OriginalID: originalID, MediaID: mediaID,
+		SHA256: digest, Size: int64(len(content)), Filename: &filename, OriginalID: originalID, AttemptID: mediaID, MediaID: mediaID,
 		Timezone: timezone, Metadata: result, EXIFJSON: json.RawMessage(exif), SourceJSON: json.RawMessage(source),
+	}
+}
+
+func registerIntegrationAcceptance(t *testing.T, repository *pgRepository, input acceptance) {
+	t.Helper()
+	if err := repository.RegisterAttempt(context.Background(), input.AttemptID, input.OriginalID); err != nil {
+		t.Fatalf("register upload attempt: %v", err)
 	}
 }
 

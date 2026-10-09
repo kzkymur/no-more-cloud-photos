@@ -1718,17 +1718,68 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 			t.Fatalf("enter maintenance: %v", err)
 		}
 		expectExecError(t, pool, `INSERT INTO reconciliation_reports (id,scope,findings,repair_disposition,quarantine_paths) VALUES ($1,'all','{}','{}',ARRAY['../escape'])`, newUUIDv4(t))
-		checkReportID, repairReportID := newUUIDv4(t), newUUIDv4(t)
-		if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_reports (id,scope,findings,repair_disposition) VALUES ($1,'all','[]','{}')`, checkReportID); err != nil {
-			t.Fatalf("insert check report: %v", err)
+		expectExecError(t, pool, `INSERT INTO reconciliation_reports (id,scope,findings,repair_disposition) VALUES ($1,'all','[]','{}')`, newUUIDv4(t))
+	})
+
+	t.Run("reconciliation evidence and upload attempts are append only", func(t *testing.T) {
+		pool := migratedIntegrationPool(t, databaseURL)
+		ctx := context.Background()
+		reportID, findingID := newUUIDv4(t), newUUIDv4(t)
+		snapshotStarted := time.Now().UTC().Add(-4 * time.Second)
+		cutoff := snapshotStarted.Add(time.Second)
+		snapshotEnded := cutoff.Add(time.Second)
+		scanStarted := snapshotEnded.Add(time.Second)
+		if _, err := pool.Exec(ctx, `SELECT nmcp_begin_check_report($1,'all',1,$2,$3,$4,$5)`,
+			reportID, snapshotStarted, cutoff, snapshotEnded, scanStarted); err != nil {
+			t.Fatalf("begin normalized check report: %v", err)
 		}
-		if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_reports (id,scope,findings,repair_disposition,report_kind,source_report_id) VALUES ($1,'all','[]','{}','repair',$2)`, repairReportID, checkReportID); err != nil {
-			t.Fatalf("insert linked repair report: %v", err)
+		var ordinal int64
+		if err := pool.QueryRow(ctx, `SELECT nmcp_append_check_finding(
+			$1,$2,'final_orphan','stable_unreferenced_final','repairable','original',$3,
+			NULL,NULL,NULL,NULL,NULL,$4,'unreferenced',1,$5,'regular',1,$5,$6,$6,$6)`,
+			findingID, reportID, newUUIDv4(t),
+			"originals/00/00000000-0000-4000-8000-000000000001/original.jpg", strings.Repeat("a", 64), cutoff).Scan(&ordinal); err != nil {
+			t.Fatalf("append normalized finding: %v", err)
 		}
-		if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_reports (id,scope,findings,repair_disposition,report_kind,source_report_id) VALUES ($1,'all','[]','{}','repair',$2)`, newUUIDv4(t), checkReportID); err != nil {
-			t.Fatalf("insert retry repair report: %v", err)
+		if ordinal != 1 {
+			t.Fatalf("finding ordinal=%d, want 1", ordinal)
 		}
-		expectExecError(t, pool, `INSERT INTO reconciliation_reports (id,scope,findings,repair_disposition,report_kind,source_report_id) VALUES ($1,'all','[]','{}','repair',$2)`, newUUIDv4(t), repairReportID)
+		if _, err := pool.Exec(ctx, `SELECT nmcp_seal_check_report($1,1,$2)`, reportID, scanStarted.Add(time.Second)); err != nil {
+			t.Fatalf("seal normalized check report: %v", err)
+		}
+		expectExecError(t, pool, `INSERT INTO reconciliation_check_findings
+			(id,report_id,ordinal,kind,reason_code,actionability,subject_type,relative_key,observed_type,observed_at)
+			VALUES ($1,$2,2,'unexpected_path','malformed_key','non_actionable','path','bad','unknown',now())`, newUUIDv4(t), reportID)
+		expectExecError(t, pool, `UPDATE reconciliation_check_reports SET scope='db' WHERE id=$1`, reportID)
+		expectExecError(t, pool, `DELETE FROM reconciliation_check_report_seals WHERE report_id=$1`, reportID)
+
+		attemptID, originalID := newUUIDv4(t), newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `SELECT nmcp_register_upload_attempt($1,$2)`, attemptID, originalID); err != nil {
+			t.Fatalf("register upload attempt: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `SELECT nmcp_heartbeat_upload_attempt($1)`, attemptID); err != nil {
+			t.Fatalf("heartbeat upload attempt: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `SELECT nmcp_complete_upload_attempt($1,'aborted')`, attemptID); err != nil {
+			t.Fatalf("complete upload attempt: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `SELECT nmcp_complete_upload_attempt($1,'aborted')`, attemptID); err != nil {
+			t.Fatalf("repeat upload completion: %v", err)
+		}
+		expectExecError(t, pool, `SELECT nmcp_complete_upload_attempt($1,'published')`, attemptID)
+		var key string
+		var eventCount int
+		if err := pool.QueryRow(ctx, `SELECT a.temp_relative_key,count(e.id)
+			FROM storage_attempts a JOIN storage_attempt_events e ON e.attempt_id=a.id
+			WHERE a.id=$1 GROUP BY a.temp_relative_key`, attemptID).Scan(&key, &eventCount); err != nil {
+			t.Fatal(err)
+		}
+		wantKey := "originals/" + originalID[:2] + "/" + originalID + "/.original." + attemptID + ".tmp"
+		if key != wantKey || eventCount != 3 {
+			t.Fatalf("attempt key/events=%q/%d, want %q/3", key, eventCount, wantKey)
+		}
+		expectExecError(t, pool, `UPDATE storage_attempts SET coverage='legacy_active' WHERE id=$1`, attemptID)
+		expectExecError(t, pool, `DELETE FROM storage_attempt_events WHERE attempt_id=$1`, attemptID)
 	})
 
 	t.Run("required indexes are present and usable", func(t *testing.T) {
