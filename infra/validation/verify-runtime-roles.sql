@@ -310,6 +310,118 @@ BEGIN
 END;
 $$;
 
+-- Treat every reconciliation/upload/repair SECURITY DEFINER entry point as one
+-- catalog allowlist.  Checking only representative functions lets ownership,
+-- invoker mode, search_path, or EXECUTE drift hide elsewhere in the boundary.
+DO $$
+DECLARE
+    boundary record;
+    boundary_oid oid;
+    boundary_owner name;
+    boundary_security_definer boolean;
+    boundary_config text[];
+    unintended_role text;
+    target_search_path text[] := ARRAY['search_path=public, pg_catalog, pg_temp'];
+BEGIN
+    FOR boundary IN
+        SELECT * FROM (VALUES
+            ('nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)',
+             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
+            ('nmcp_complete_check_source(nmcp_uuid_v4,text,text)',
+             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
+            ('nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)',
+             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
+            ('nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)',
+             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
+            ('nmcp_require_normal_maintenance()',
+             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
+            ('nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)',
+             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
+            ('nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)',
+             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
+            ('nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)',
+             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
+            ('nmcp_complete_upload_attempt(nmcp_uuid_v4,text)',
+             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
+            ('nmcp_record_transform_storage_attempt()',
+             'nmcp_repair_function_owner',NULL,ARRAY[]::text[]),
+            ('nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)',
+             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
+            ('nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
+             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
+            ('nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
+             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
+            ('nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)',
+             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
+            ('nmcp_finish_repair_run(nmcp_uuid_v4)',
+             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
+            ('nmcp_require_terminal_repair_attempt()',
+             'nmcp_repair_function_owner',NULL,ARRAY[]::text[])
+        ) AS expected(signature,owner_name,acl_grantee,effective_grantees)
+    LOOP
+        boundary_oid := pg_catalog.to_regprocedure('public.'||boundary.signature);
+        IF boundary_oid IS NULL THEN
+            RAISE EXCEPTION 'reconciliation boundary function is absent: %',boundary.signature;
+        END IF;
+        SELECT pg_catalog.pg_get_userbyid(p.proowner),p.prosecdef,p.proconfig
+        INTO boundary_owner,boundary_security_definer,boundary_config
+        FROM pg_catalog.pg_proc AS p WHERE p.oid=boundary_oid;
+        IF boundary_owner<>boundary.owner_name
+           OR NOT boundary_security_definer
+           OR boundary_config IS DISTINCT FROM target_search_path THEN
+            RAISE EXCEPTION 'unsafe owner, SECURITY DEFINER, or search_path on %',boundary.signature;
+        END IF;
+
+        IF boundary.acl_grantee IS NOT NULL AND NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_proc AS p
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))
+            ) AS acl
+            WHERE p.oid=boundary_oid
+              AND acl.grantee=boundary.acl_grantee::pg_catalog.regrole::oid
+              AND acl.privilege_type='EXECUTE'
+        ) THEN
+            RAISE EXCEPTION 'missing intended EXECUTE ACL on %',boundary.signature;
+        END IF;
+        SELECT CASE WHEN acl.grantee=0 THEN 'PUBLIC'
+                    ELSE pg_catalog.pg_get_userbyid(acl.grantee)::text END
+        INTO unintended_role
+        FROM pg_catalog.pg_proc AS p
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))
+        ) AS acl
+        WHERE p.oid=boundary_oid
+          AND acl.privilege_type='EXECUTE'
+          AND acl.grantee<>p.proowner
+          AND (boundary.acl_grantee IS NULL
+               OR acl.grantee<>boundary.acl_grantee::pg_catalog.regrole::oid)
+        LIMIT 1;
+        IF unintended_role IS NOT NULL THEN
+            RAISE EXCEPTION 'unintended EXECUTE ACL for % on %',unintended_role,boundary.signature;
+        END IF;
+
+        SELECT candidate.role_name INTO unintended_role
+        FROM unnest(ARRAY[
+            'nmcp_runtime','nmcp_worker_runtime','nmcp_check_runtime','nmcp_repair_runtime',
+            'nmcp_api','nmcp_worker'
+        ]) AS candidate(role_name)
+        WHERE NOT candidate.role_name=ANY(boundary.effective_grantees)
+          AND pg_catalog.has_function_privilege(candidate.role_name,boundary_oid,'EXECUTE')
+        LIMIT 1;
+        IF unintended_role IS NOT NULL THEN
+            RAISE EXCEPTION 'unintended effective EXECUTE for % on %',unintended_role,boundary.signature;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM unnest(boundary.effective_grantees) AS intended(role_name)
+            WHERE NOT pg_catalog.has_function_privilege(intended.role_name,boundary_oid,'EXECUTE')
+        ) THEN
+            RAISE EXCEPTION 'missing intended effective EXECUTE on %',boundary.signature;
+        END IF;
+    END LOOP;
+END;
+$$;
+
 DO $$
 DECLARE
     evidence_table text;
