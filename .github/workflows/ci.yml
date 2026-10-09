@@ -3,18 +3,53 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "43 3 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  quick:
     runs-on: ubuntu-24.04
-    # Source-building the isolated video codec closure is distinct from the
-    # processor's two-hour media-operation deadline. Individual video build and
-    # fixture commands below retain tighter timeout(1) boundaries.
-    timeout-minutes: 60
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Run quick validation
+        run: scripts/run-validation quick
+
+  race:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Run race validation
+        run: scripts/run-validation race
+
+  postgres:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:17-alpine
@@ -40,11 +75,33 @@ jobs:
         with:
           go-version: 1.27.1
           cache: true
-      - name: Provision stable PostgreSQL runtime roles
-        run: >-
-          psql "$TEST_DATABASE_URL" --set ON_ERROR_STOP=1
-          --set nmcp_migrator_role=nmcp
-          --file infra/postgresql/runtime-roles.sql
+      - name: Run real PostgreSQL validation
+        run: scripts/run-validation postgres
+
+  native-codecs:
+    runs-on: ubuntu-24.04
+    # Source-building the isolated video codec closure is distinct from the
+    # processor's two-hour media-operation deadline. Individual video build and
+    # fixture commands below retain tighter timeout(1) boundaries.
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Restore pinned native source downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            .tools/*.tar.gz
+            .tools/*.tar.xz
+            .native-work/**/downloads
+          key: native-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('internal/**/helper/build-pinned-*.sh', '.github/workflows/ci.yml') }}
       - name: Install metadata probe tools
         run: |
           mkdir -p .tools
@@ -98,8 +155,8 @@ jobs:
             "${RUNNER_TEMP}/canon-a410.dng" | sha256sum --check
           chmod +x internal/stillprocessor/helper/build-pinned-toolchain.sh
           internal/stillprocessor/helper/build-pinned-toolchain.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/still-toolchain-work"
-          heic_fixture="${RUNNER_TEMP}/still-toolchain-work/source/libheif-1.23.5/examples/example.heic"
+            "${RUNNER_TEMP}/still-toolchain" "${GITHUB_WORKSPACE}/.native-work/still"
+          heic_fixture="${GITHUB_WORKSPACE}/.native-work/still/source/libheif-1.23.5/examples/example.heic"
           printf '%s  %s\n' \
             7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2 \
             "${heic_fixture}" | sha256sum --check
@@ -139,7 +196,7 @@ jobs:
         run: |
           chmod +x internal/animationprocessor/helper/build-pinned-codecs.sh
           internal/animationprocessor/helper/build-pinned-codecs.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/animation-toolchain-work"
+            "${RUNNER_TEMP}/still-toolchain" "${GITHUB_WORKSPACE}/.native-work/animation"
           export PKG_CONFIG_PATH="${RUNNER_TEMP}/still-toolchain/lib/pkgconfig:${RUNNER_TEMP}/still-toolchain/lib64/pkgconfig"
           export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
           cmake -S internal/animationprocessor/helper \
@@ -169,7 +226,7 @@ jobs:
       - name: Build isolated pinned video toolchain and fixtures
         run: |
           timeout 20m internal/videoprocessor/helper/build-pinned-toolchain.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/video-toolchain-work"
+            "${RUNNER_TEMP}/still-toolchain" "${GITHUB_WORKSPACE}/.native-work/video"
           timeout 2m go build -o "${RUNNER_TEMP}/still-toolchain/bin/nmcp-video-helper" \
             ./cmd/nmcp-video-helper
           export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
@@ -287,59 +344,22 @@ jobs:
             "${fixtures}/multistream.mp4" "${fixtures}/multistream-rotated.mp4" \
             "${fixtures}/vfr-sar.mp4" \
             "${fixtures}/audio-resample.mov" >> "${GITHUB_ENV}"
-      - name: Verify modules
-        run: go mod verify
-      - name: Check formatting
-        run: test -z "$(gofmt -l .)"
-      - name: Vet
-        run: go vet ./...
-      - name: Build all three Core binaries
-        run: go build ./cmd/core-api ./cmd/core-worker ./cmd/nmcp-admin
-      - name: Unit and local integration tests
-        # Package test binaries share one PostgreSQL service. Run them serially
-        # so their isolated-schema setup/teardown cannot deadlock on the
-        # intentionally database-wide migration advisory lock and PG catalogs.
-        run: go test -p 1 -count=1 ./...
-      - name: Explicit profile schema and bundled recipe evidence
-        run: go test -v -count=1 ./internal/profile
-      - name: Explicit metadata detector and real probe evidence
+      - name: Run native codec evidence
+        run: scripts/run-validation native
+
+  full-gate:
+    if: always()
+    needs: [quick, race, postgres, native-codecs]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation lane
         env:
-          TEST_METADATA_TOOLS: "1"
-          TEST_EXIFTOOL_PATH: ${{ github.workspace }}/.tools/exiftool-13.36/exiftool
-          TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
-          TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
-        run: go test -v -count=1 ./internal/mediaformat ./internal/metadata
-      - name: Explicit native still codec evidence
-        env:
-          TEST_STILL_HELPER: "1"
-          TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
-          TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
-        run: go test -v -count=1 ./internal/stillprocessor
-      - name: Explicit native animation codec evidence
-        env:
-          TEST_ANIMATION_HELPER: "1"
-        run: go test -v -count=1 ./internal/animationprocessor
-      - name: Explicit native video codec evidence
-        env:
-          TEST_VIDEO_HELPER: "1"
-          TEST_FFPROBE_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffprobe
-          TEST_FFMPEG_PATH: ${{ github.workspace }}/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg
-        run: timeout 10m go test -v -count=1 -run '^TestVideoHelperRealCodecMatrix$' ./internal/videoprocessor
-      - name: Explicit Linux storage durability evidence
-        run: go test -v -count=1 ./internal/storage
-      - name: Race tests
-        run: go test -p 1 -race -count=1 ./...
-      - name: Explicit PostgreSQL migration integration evidence
-        run: go test -v -count=1 -run '^TestMigratorIntegration$' ./internal/database
-      - name: Explicit job lease, Worker, and process supervision evidence
-        run: go test -v -count=1 ./internal/job ./internal/worker ./internal/processrunner
-      - name: Explicit upload PostgreSQL integration evidence
-        run: go test -v -count=1 -run '^TestRepositoryIntegration' ./internal/upload
-      - name: Explicit read PostgreSQL integration evidence
-        run: go test -v -count=1 -run '^TestReadServiceIntegration$' ./internal/readapi
-      - name: Explicit read HTTP and PostgreSQL integration evidence
-        run: go test -v -count=1 -run '^TestReadHTTPPostgreSQLIntegration$' ./internal/httpapi
-      - name: Explicit lifecycle PostgreSQL integration evidence
-        run: go test -v -count=1 -run '^TestLifecycleRepositoryIntegration' ./internal/medialifecycle
-      - name: Explicit lifecycle HTTP and PostgreSQL integration evidence
-        run: go test -v -count=1 -run '^TestLifecycleHTTPPostgreSQLIntegration$' ./internal/httpapi
+          QUICK: ${{ needs.quick.result }}
+          RACE: ${{ needs.race.result }}
+          POSTGRES: ${{ needs.postgres.result }}
+          NATIVE_CODECS: ${{ needs.native-codecs.result }}
+        run: |
+          for result in "$QUICK" "$RACE" "$POSTGRES" "$NATIVE_CODECS"; do
+            test "$result" = success
+          done

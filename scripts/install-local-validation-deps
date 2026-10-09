@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  printf 'This installer does not self-escalate. Run exactly:\n' >&2
+  printf '  sudo scripts/install-local-validation-deps\n' >&2
+  exit 1
+fi
+
+# Fixed host-contract path.
+# shellcheck disable=SC1091
+source /etc/os-release
+[[ ${ID:-} == ubuntu && ${VERSION_ID:-} == 26.04 ]] || {
+  printf 'Supported host is Ubuntu 26.04; found %s %s\n' "${ID:-unknown}" "${VERSION_ID:-unknown}" >&2
+  exit 1
+}
+
+packages=(
+  docker.io=29.1.3-0ubuntu4.1
+  docker-compose-v2=2.40.3+ds1-0ubuntu1
+  postgresql=18+290ubuntu1
+  postgresql-client=18+290ubuntu1
+  autoconf=2.72-3.1ubuntu2 automake=1:1.18.1-3build1 cmake=4.2.3-2ubuntu2
+  curl=8.18.0-1ubuntu2.7 git=1:2.53.0-1ubuntu1 libtool=2.5.4-9 make=4.4.1-3
+  meson=1.10.1-1ubuntu2 nasm=3.01-1 ninja-build=1.13.2-1 pkg-config=2.5.1-4
+  libglib2.0-dev=2.88.0-1ubuntu0.1 libjpeg-turbo8-dev=2.1.5-4ubuntu4
+  libpng-dev=1.6.57-1ubuntu0.1 libwebp-dev=1.5.0-0.1build1
+  libexif-dev=0.6.25-2ubuntu0.1 libde265-dev=1.0.16-1build1
+  zlib1g-dev=1:1.3.dfsg+really1.3.1-1ubuntu3.1 ffmpeg=7:8.0.1-3ubuntu2
+  libimage-exiftool-perl=13.50+dfsg-1 nginx-core=1.28.3-2ubuntu1.11
+  shellcheck=0.11.0-2 util-linux=2.41.3-3ubuntu2.2 xz-utils=5.8.3-1
+)
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install --yes --no-install-recommends "${packages[@]}"
+
+[[ $(dpkg --print-architecture) == amd64 ]] || {
+  printf 'Pinned Go bootstrap currently supports amd64 only\n' >&2
+  exit 1
+}
+if [[ ! -x /usr/local/go/bin/go ]] || \
+  [[ $(/usr/local/go/bin/go version) != 'go version go1.27.1 linux/amd64' ]]; then
+  go_archive=$(mktemp /var/tmp/go1.27.1.linux-amd64.XXXXXX.tar.gz)
+  trap 'rm -f -- "$go_archive"' EXIT
+  curl --fail --location --silent --show-error \
+    https://go.dev/dl/go1.27.1.linux-amd64.tar.gz --output "$go_archive"
+  printf '%s  %s\n' \
+    63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445 \
+    "$go_archive" | sha256sum --check
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "$go_archive"
+fi
+/usr/local/go/bin/go version
+
+printf 'Installed local validation dependencies. Docker access is deliberately not granted here.\n'
+printf 'Verify group/socket policy separately, then run scripts/local-validation-preflight infra.\n'

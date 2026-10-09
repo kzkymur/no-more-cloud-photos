@@ -1,0 +1,87 @@
+# Local validation and CI gates
+
+The repository owns the validation entrypoints. GitHub Actions calls the same
+commands; it is not the only place they can run.
+
+## Supported workstation
+
+The one-command dependency installer supports Ubuntu 26.04 amd64 and pins every
+explicitly requested distro package plus Go 1.27.1. It intentionally does not invoke
+`sudo`, alter Docker group membership, change credentials, or enable a daemon.
+An administrator runs:
+
+```sh
+sudo scripts/install-local-validation-deps
+```
+
+Then log out/in if the administrator separately granted an approved Docker
+socket policy, and verify the host before spending time on builds:
+
+```sh
+scripts/local-validation-preflight quick
+scripts/local-validation-preflight postgres
+scripts/local-validation-preflight infra
+```
+
+Preflight errors name the missing tool or resource. At least 5 GiB must be free
+on the checkout filesystem. Keep `TMPDIR` on that filesystem when `/tmp` is
+small. Docker validation requires a reachable Engine and Compose v2; a host
+with `no_new_privs`, disabled user namespaces, and no Docker socket cannot run
+the Compose lane and is not silently weakened or emulated.
+
+## Commands
+
+```sh
+scripts/run-validation quick       # modules, format, vet, binaries, unit/local tests
+scripts/run-validation race        # complete Go race run
+scripts/run-validation postgres    # isolated local cluster, or TEST_DATABASE_URL
+scripts/run-validation native      # evidence after native helpers/fixtures are prepared
+scripts/run-validation infra       # Compose clean/retained lifecycle and native images
+scripts/run-validation full        # quick + race + postgres + infra
+sudo env "PATH=$PATH" scripts/run-validation ubuntu  # privileged Ubuntu evidence
+sudo env "PATH=$PATH" scripts/run-validation all     # full plus privileged evidence
+scripts/run-validation cleanup     # checkout-owned state only
+```
+
+`postgres` starts an isolated socket-only cluster beneath `.validation/` when
+`TEST_DATABASE_URL` is absent. It chooses server tools using `pg_config`. A
+portable installation can instead set `NMCP_POSTGRES_BIN`,
+`NMCP_POSTGRES_SHARE`, and (when needed) `NMCP_POSTGRES_LIB`. It creates only
+the `nmcp_test` database, stops the server on every exit path, removes its short
+socket directory, and retains the cluster for faster reruns. Set
+`TEST_DATABASE_URL` to use an already managed disposable database instead.
+
+Compose uses checkout-hashed project, volume, and ownership labels. Its verify
+command guarantees cleanup, while Docker's image/build cache is retained.
+`cleanup` delegates to that ownership-checked reset and removes only
+`.validation/`; it never traverses arbitrary host paths.
+
+The Ubuntu lane is intentionally separate. It requires root, systemd as PID 1,
+PostgreSQL, Nginx, and the other packages installed by the installer. Run it in
+a disposable Ubuntu VM or an equivalent dedicated runner—not in a developer
+container that merely happens to expose `sudo`.
+
+## CI topology and timing baseline
+
+Before the split, successful run `37915296604` took 29m10s end to end. Its
+largest serial steps were native still build 5m43s, native video build 8m18s,
+unit/integration tests 3m41s, and race tests 7m25s. Compose run `37911551976`
+took 17m48s (17m38s in `scripts/validation-env verify`). Privileged Ubuntu run
+`37911923533` took 2m39s.
+
+CI now runs four independent lanes: `quick`, `race`, `postgres`, and
+`native-codecs`. `full-gate` succeeds only when all four succeed and is the
+single required merge check. Superseded branch runs are cancelled. Setup Go
+caches modules and build objects; the native lane caches checksum-verified
+source archives using OS, architecture, build-script, and workflow content in
+the key. Native binaries are deliberately rebuilt: their absolute rpaths and
+runner package closure make cross-run binary reuse less trustworthy than source
+download reuse. This trades several build minutes for stronger provenance.
+
+`CI` and privileged Ubuntu also run weekly and on manual dispatch. Ubuntu PR
+path selection is conservative: every shared `scripts/**` change triggers it,
+so migration or privileged validation cannot be skipped by editing a shared
+entrypoint. Main-branch pushes always run the privileged workflow. Compare the
+first run after a cache-key change (cold) with the next unchanged run (warm) and
+record both job durations in the pull request; local hardware and Docker cache
+state make a universal wall-clock promise misleading.

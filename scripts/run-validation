@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+mode=${1:-quick}
+
+quick() {
+  scripts/local-validation-preflight quick
+  go mod verify
+  test -z "$(gofmt -l .)"
+  go vet ./...
+  go build ./cmd/core-api ./cmd/core-worker ./cmd/nmcp-admin
+  env -u TEST_DATABASE_URL go test -p 1 -count=1 ./...
+}
+
+race() {
+  scripts/local-validation-preflight race
+  env -u TEST_DATABASE_URL go test -p 1 -race -count=1 ./...
+}
+
+postgres_tests() {
+  psql "$TEST_DATABASE_URL" --set ON_ERROR_STOP=1 \
+    --set nmcp_migrator_role=nmcp --file infra/postgresql/runtime-roles.sql
+  go test -p 1 -count=1 ./...
+}
+
+postgres() {
+  scripts/local-validation-preflight postgres
+  if [[ -n ${TEST_DATABASE_URL:-} ]]; then
+    postgres_tests
+  else
+    scripts/with-local-postgres "$0" postgres-existing
+  fi
+}
+
+native() {
+  scripts/local-validation-preflight native
+  : "${TEST_STILL_HELPER_PATH:?native helper environment has not been prepared}"
+  : "${TEST_ANIMATION_HELPER_PATH:?native helper environment has not been prepared}"
+  : "${TEST_VIDEO_HELPER_PATH:?native helper environment has not been prepared}"
+  TEST_METADATA_TOOLS=1 \
+    TEST_EXIFTOOL_PATH="${TEST_EXIFTOOL_PATH:-$repo/.tools/exiftool-13.36/exiftool}" \
+    TEST_FFPROBE_PATH="${TEST_FFPROBE_PATH:-$repo/.tools/ffmpeg-6.0.1-amd64-static/ffprobe}" \
+    TEST_FFMPEG_PATH="${TEST_FFMPEG_PATH:-$repo/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg}" \
+    go test -v -count=1 ./internal/mediaformat ./internal/metadata
+  TEST_STILL_HELPER=1 \
+    TEST_FFPROBE_PATH="${TEST_FFPROBE_PATH:-$repo/.tools/ffmpeg-6.0.1-amd64-static/ffprobe}" \
+    TEST_FFMPEG_PATH="${TEST_FFMPEG_PATH:-$repo/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg}" \
+    go test -v -count=1 ./internal/stillprocessor
+  TEST_ANIMATION_HELPER=1 go test -v -count=1 ./internal/animationprocessor
+  TEST_VIDEO_HELPER=1 \
+    TEST_FFPROBE_PATH="${TEST_FFPROBE_PATH:-$repo/.tools/ffmpeg-6.0.1-amd64-static/ffprobe}" \
+    TEST_FFMPEG_PATH="${TEST_FFMPEG_PATH:-$repo/.tools/ffmpeg-6.0.1-amd64-static/ffmpeg}" \
+    timeout 10m go test -v -count=1 -run '^TestVideoHelperRealCodecMatrix$' ./internal/videoprocessor
+}
+
+infra() {
+  scripts/local-validation-preflight infra
+  trap 'scripts/validation-env reset' EXIT INT TERM
+  scripts/validation-env verify
+  trap - EXIT INT TERM
+}
+
+case "$mode" in
+  quick) quick ;;
+  race) race ;;
+  postgres) postgres ;;
+  postgres-existing) postgres_tests ;;
+  native) native ;;
+  infra) infra ;;
+  ubuntu) scripts/local-validation-preflight ubuntu; scripts/run-ubuntu-validation ;;
+  full) quick; race; postgres; infra ;;
+  all) quick; race; postgres; infra; scripts/local-validation-preflight ubuntu; scripts/run-ubuntu-validation ;;
+  cleanup)
+    scripts/validation-env reset 2>/dev/null || true
+    rm -rf -- .validation
+    ;;
+  *) printf 'usage: %s {quick|race|postgres|native|infra|ubuntu|full|all|cleanup}\n' "$0" >&2; exit 2 ;;
+esac

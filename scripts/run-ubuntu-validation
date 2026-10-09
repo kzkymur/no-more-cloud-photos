@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+[[ $EUID -eq 0 ]] || { printf 'run-ubuntu-validation must run as root\n' >&2; exit 1; }
+
+cleanup() {
+  if [[ -n ${release_id:-} ]]; then
+    rm -rf -- "/opt/nmcp/releases/$release_id" \
+      "/opt/nmcp/releases/$release_id-bad-mode" \
+      "/opt/nmcp/releases/$release_id-locked" \
+      "/opt/nmcp/releases/$release_id-orphan-migration" \
+      "/opt/nmcp/releases/$release_id-spoofed"
+  fi
+  rm -rf -- /tmp/nmcp-release /tmp/nmcp-v16-source
+  rm -f -- /tmp/nmcp-admin-current /tmp/nmcp-admin-v16 \
+    /tmp/nmcp-deploy-lock-held /tmp/nmcp-orphan-migration-held
+  ip address delete 100.64.0.10/32 dev lo >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
+  scripts/install-local-validation-deps scripts/local-validation-preflight \
+  scripts/run-validation scripts/run-ubuntu-validation scripts/with-local-postgres \
+  scripts/check-ubuntu-tls-expiry scripts/renew-ubuntu-tls \
+  scripts/run-ubuntu-migration scripts/run-ubuntu-migration-compatibility \
+  scripts/set-ubuntu-migration-role-mode scripts/verify-ubuntu-migration-lock \
+  scripts/verify-ubuntu-migration-role-compatibility \
+  scripts/verify-ubuntu-config-boundaries scripts/verify-ubuntu-firewall-fixtures \
+  scripts/verify-ubuntu-installed-nginx scripts/verify-ubuntu-nginx-http \
+  scripts/verify-ubuntu-postgresql-dependency scripts/verify-ubuntu-release-failures \
+  scripts/verify-ubuntu-service-gate scripts/verify-ubuntu-tls-certificate \
+  scripts/verify-ubuntu-systemd-environment scripts/verify-ubuntu-systemd-mounts \
+  scripts/verify-ubuntu-trusted-inputs
+
+scripts/verify-ubuntu-deployment
+scripts/verify-ubuntu-config-boundaries
+scripts/verify-ubuntu-firewall-fixtures
+scripts/verify-ubuntu-trusted-inputs
+scripts/verify-ubuntu-systemd-environment
+ip address add 100.64.0.10/32 dev lo
+scripts/verify-ubuntu-nginx-http
+scripts/verify-ubuntu-installed-nginx
+scripts/verify-ubuntu-systemd-mounts
+scripts/verify-ubuntu-postgresql-dependency
+scripts/verify-ubuntu-service-gate
+scripts/verify-ubuntu-migration-lock
+
+go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
+mkdir /tmp/nmcp-v16-source
+git archive 97938b5031e48320330b8add8da1f77d8e801d68 | tar -x -C /tmp/nmcp-v16-source
+(cd /tmp/nmcp-v16-source && go build -o /tmp/nmcp-admin-v16 ./cmd/nmcp-admin)
+scripts/verify-ubuntu-migration-role-compatibility \
+  /tmp/nmcp-admin-current /tmp/nmcp-admin-v16
+scripts/verify-ubuntu-release-failures
+
+release_id=${RELEASE_ID:-local-$(date -u +%Y%m%d%H%M%S)-$$}
+mkdir -p /tmp/nmcp-release/bin
+for binary in core-api core-worker nmcp-admin; do
+  printf '#!/bin/sh\nexit 0\n' >"/tmp/nmcp-release/bin/$binary"
+  chmod 0755 "/tmp/nmcp-release/bin/$binary"
+done
+(cd /tmp/nmcp-release && sha256sum bin/* >MANIFEST.sha256)
+chmod 0700 /tmp/nmcp-release/bin/core-api
+if scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id-bad-mode"; then
+  printf '0700 runtime binary unexpectedly staged\n' >&2
+  exit 1
+fi
+chmod 0755 /tmp/nmcp-release/bin/core-api
+systemd-run --quiet --unit=nmcp-orphan-migration \
+  /usr/bin/flock /run/nmcp-deploy/migration-execution.lock \
+  /bin/sh -c 'touch /tmp/nmcp-orphan-migration-held; sleep 3'
+for attempt in {1..30}; do
+  [[ -e /tmp/nmcp-orphan-migration-held ]] && break
+  [[ $attempt -lt 30 ]] || exit 1
+  sleep 0.1
+done
+if scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id-orphan-migration"; then
+  printf 'new deployment overlapped an ownerless migration execution\n' >&2
+  exit 1
+fi
+for attempt in {1..50}; do
+  state=$(systemctl show --property=ActiveState --value nmcp-orphan-migration.service)
+  [[ $state == inactive ]] && break
+  [[ $state =~ ^(active|activating|deactivating)$ && $attempt -lt 50 ]] || exit 1
+  sleep 0.1
+done
+[[ $(systemctl show --property=Result --value nmcp-orphan-migration.service) == success ]]
+flock /run/nmcp-deploy/deploy.lock -c 'touch /tmp/nmcp-deploy-lock-held; sleep 3' &
+lock_pid=$!
+for attempt in {1..30}; do
+  [[ -e /tmp/nmcp-deploy-lock-held ]] && break
+  [[ $attempt -lt 30 ]] || exit 1
+  sleep 0.1
+done
+if scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id-locked"; then
+  printf 'concurrent deployment operation unexpectedly staged\n' >&2
+  exit 1
+fi
+if env NMCP_DEPLOY_LOCKED=1 scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id-spoofed"; then
+  printf 'caller-controlled lock sentinel bypassed serialization\n' >&2
+  exit 1
+fi
+wait "$lock_pid"
+scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id"
+[[ $(stat -c '%U:%G' "/opt/nmcp/releases/$release_id/bin/core-api") == root:root ]]
+[[ $(stat -c '%a' "/opt/nmcp/releases/$release_id/bin/core-api") == 755 ]]
+sudo -u nmcp test -x "/opt/nmcp/releases/$release_id/bin/core-api"

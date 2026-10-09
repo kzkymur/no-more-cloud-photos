@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/ubuntu-deployment.yml"
+      - "docs/local-validation.md"
       - "docs/ubuntu-deployment.md"
       - "infra/ubuntu/**"
       - "infra/postgresql/**"
@@ -11,77 +12,13 @@ on:
       - "internal/database/**"
       - "go.mod"
       - "go.sum"
-      - "scripts/assert-ubuntu-files-endpoint"
-      - "scripts/capture-trusted-inputs"
-      - "scripts/check-ubuntu-services"
-      - "scripts/check-ubuntu-tls-expiry"
-      - "scripts/install-ubuntu-host"
-      - "scripts/install-ubuntu-release"
-      - "scripts/acquire-ubuntu-deployment-locks"
-      - "scripts/handoff-ubuntu-migration-lock"
-      - "scripts/render-ubuntu-nginx"
-      - "scripts/render-ubuntu-postgresql-dependency"
-      - "scripts/renew-ubuntu-tls"
-      - "scripts/run-ubuntu-migration"
-      - "scripts/run-ubuntu-migration-compatibility"
-      - "scripts/set-ubuntu-migration-role-mode"
-      - "scripts/validate-ubuntu-config"
-      - "scripts/verify-ubuntu-deployment"
-      - "scripts/verify-ubuntu-config-boundaries"
-      - "scripts/verify-ubuntu-firewall"
-      - "scripts/verify-ubuntu-firewall-fixtures"
-      - "scripts/verify-ubuntu-installed-nginx"
-      - "scripts/verify-ubuntu-migration-lock"
-      - "scripts/verify-ubuntu-migration-role-compatibility"
-      - "scripts/verify-ubuntu-nginx-http"
-      - "scripts/verify-ubuntu-postgresql-dependency"
-      - "scripts/verify-ubuntu-service-gate"
-      - "scripts/verify-ubuntu-release-failures"
-      - "scripts/verify-ubuntu-tls-certificate"
-      - "scripts/verify-ubuntu-systemd-mounts"
-      - "scripts/verify-ubuntu-systemd-environment"
-      - "scripts/verify-ubuntu-trusted-inputs"
+      # Deliberately conservative: changes to shared validation dispatch or any
+      # deployment verifier must never bypass the privileged gate.
+      - "scripts/**"
   push:
     branches: [main]
-    paths:
-      - ".github/workflows/ubuntu-deployment.yml"
-      - "docs/ubuntu-deployment.md"
-      - "infra/ubuntu/**"
-      - "infra/postgresql/**"
-      - "cmd/nmcp-admin/**"
-      - "internal/database/**"
-      - "go.mod"
-      - "go.sum"
-      - "scripts/assert-ubuntu-files-endpoint"
-      - "scripts/capture-trusted-inputs"
-      - "scripts/check-ubuntu-services"
-      - "scripts/check-ubuntu-tls-expiry"
-      - "scripts/install-ubuntu-host"
-      - "scripts/install-ubuntu-release"
-      - "scripts/acquire-ubuntu-deployment-locks"
-      - "scripts/handoff-ubuntu-migration-lock"
-      - "scripts/render-ubuntu-nginx"
-      - "scripts/render-ubuntu-postgresql-dependency"
-      - "scripts/renew-ubuntu-tls"
-      - "scripts/run-ubuntu-migration"
-      - "scripts/run-ubuntu-migration-compatibility"
-      - "scripts/set-ubuntu-migration-role-mode"
-      - "scripts/validate-ubuntu-config"
-      - "scripts/verify-ubuntu-deployment"
-      - "scripts/verify-ubuntu-config-boundaries"
-      - "scripts/verify-ubuntu-firewall"
-      - "scripts/verify-ubuntu-firewall-fixtures"
-      - "scripts/verify-ubuntu-installed-nginx"
-      - "scripts/verify-ubuntu-migration-lock"
-      - "scripts/verify-ubuntu-migration-role-compatibility"
-      - "scripts/verify-ubuntu-nginx-http"
-      - "scripts/verify-ubuntu-postgresql-dependency"
-      - "scripts/verify-ubuntu-service-gate"
-      - "scripts/verify-ubuntu-release-failures"
-      - "scripts/verify-ubuntu-tls-certificate"
-      - "scripts/verify-ubuntu-systemd-mounts"
-      - "scripts/verify-ubuntu-systemd-environment"
-      - "scripts/verify-ubuntu-trusted-inputs"
+  schedule:
+    - cron: "17 4 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -95,149 +32,26 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
       - name: Install parser and HTTP test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             ffmpeg libimage-exiftool-perl nginx-core postgresql shellcheck
-
-      - name: Check shell scripts
-        run: |
-          shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
-            scripts/check-ubuntu-tls-expiry scripts/renew-ubuntu-tls \
-            scripts/run-ubuntu-migration scripts/run-ubuntu-migration-compatibility \
-            scripts/set-ubuntu-migration-role-mode scripts/verify-ubuntu-migration-lock \
-            scripts/verify-ubuntu-migration-role-compatibility \
-            scripts/verify-ubuntu-config-boundaries scripts/verify-ubuntu-firewall-fixtures \
-            scripts/verify-ubuntu-installed-nginx scripts/verify-ubuntu-nginx-http \
-            scripts/verify-ubuntu-postgresql-dependency scripts/verify-ubuntu-release-failures \
-            scripts/verify-ubuntu-service-gate scripts/verify-ubuntu-tls-certificate \
-            scripts/verify-ubuntu-systemd-environment scripts/verify-ubuntu-systemd-mounts \
-            scripts/verify-ubuntu-trusted-inputs
-
-      - name: Verify deployment assets
-        run: scripts/verify-ubuntu-deployment
-
-      - name: Verify configuration and firewall counterexamples
-        run: |
-          scripts/verify-ubuntu-config-boundaries
-          scripts/verify-ubuntu-firewall-fixtures
-
-      - name: Verify privileged input capture counterexamples
-        run: sudo scripts/verify-ubuntu-trusted-inputs
-
-      - name: Verify systemd EnvironmentFile effective values
-        run: sudo scripts/verify-ubuntu-systemd-environment
-
-      - name: Verify production Nginx HTTP contract
-        run: |
-          sudo ip address add 100.64.0.10/32 dev lo
-          scripts/verify-ubuntu-nginx-http
-
-      - name: Verify exact installed Nginx service and TLS renewal
-        run: sudo scripts/verify-ubuntu-installed-nginx
-
-      - name: Verify systemd read-only storage namespace
-        run: sudo scripts/verify-ubuntu-systemd-mounts
-
-      - name: Verify concrete PostgreSQL stopped-instance recovery
-        run: sudo scripts/verify-ubuntu-postgresql-dependency
-
-      - name: Verify whole-service activation failure counterexamples
-        run: sudo scripts/verify-ubuntu-service-gate
-
-      - name: Verify migration serialization races
-        run: sudo scripts/verify-ubuntu-migration-lock
-
-      - name: Verify migration role compatibility and hardening
-        run: |
-          go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
-          mkdir /tmp/nmcp-v16-source
-          git archive 97938b5031e48320330b8add8da1f77d8e801d68 | tar -x -C /tmp/nmcp-v16-source
-          (cd /tmp/nmcp-v16-source && go build -o /tmp/nmcp-admin-v16 ./cmd/nmcp-admin)
-          sudo scripts/verify-ubuntu-migration-role-compatibility \
-            /tmp/nmcp-admin-current /tmp/nmcp-admin-v16
-
-      - name: Verify release activation and rollback failure transactions
-        run: sudo scripts/verify-ubuntu-release-failures
-
-      - name: Verify immutable release staging
+      - name: Run privileged Ubuntu validation
         env:
           RELEASE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          mkdir -p /tmp/nmcp-release/bin
-          for binary in core-api core-worker nmcp-admin; do
-            printf '#!/bin/sh\nexit 0\n' > "/tmp/nmcp-release/bin/$binary"
-            chmod 0755 "/tmp/nmcp-release/bin/$binary"
-          done
-          (cd /tmp/nmcp-release && sha256sum bin/* > MANIFEST.sha256)
-          chmod 0700 /tmp/nmcp-release/bin/core-api
-          if sudo scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID-bad-mode"; then
-            echo '0700 runtime binary unexpectedly staged' >&2
-            exit 1
-          fi
-          chmod 0755 /tmp/nmcp-release/bin/core-api
-          sudo systemd-run --quiet --unit=nmcp-orphan-migration \
-            /usr/bin/flock /run/nmcp-deploy/migration-execution.lock \
-            /bin/sh -c 'touch /tmp/nmcp-orphan-migration-held; sleep 3'
-          for attempt in {1..30}; do
-            test -e /tmp/nmcp-orphan-migration-held && break
-            test "$attempt" -lt 30 || exit 1
-            sleep 0.1
-          done
-          if sudo scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID-orphan-migration"; then
-            echo 'new deployment overlapped an ownerless migration execution' >&2
-            exit 1
-          fi
-          for attempt in {1..50}; do
-            orphan_state=$(sudo systemctl show --property=ActiveState --value nmcp-orphan-migration.service)
-            case "$orphan_state" in
-              inactive) break ;;
-              active|activating|deactivating) ;;
-              *) echo "unexpected orphan migration state: $orphan_state" >&2; exit 1 ;;
-            esac
-            test "$attempt" -lt 50 || exit 1
-            sleep 0.1
-          done
-          test "$(sudo systemctl show --property=Result --value nmcp-orphan-migration.service)" = success
-          sudo flock /run/nmcp-deploy/deploy.lock -c 'touch /tmp/nmcp-deploy-lock-held; sleep 3' &
-          lock_pid=$!
-          for attempt in {1..30}; do
-            test -e /tmp/nmcp-deploy-lock-held && break
-            test "$attempt" -lt 30 || exit 1
-            sleep 0.1
-          done
-          if sudo scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID-locked"; then
-            echo 'concurrent deployment operation unexpectedly staged' >&2
-            exit 1
-          fi
-          if sudo env NMCP_DEPLOY_LOCKED=1 scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID-spoofed"; then
-            echo 'caller-controlled lock sentinel bypassed serialization' >&2
-            exit 1
-          fi
-          wait "$lock_pid"
-          sudo scripts/install-ubuntu-release stage /tmp/nmcp-release "$RELEASE_ID"
-          sudo test "$(stat -c '%U:%G' "/opt/nmcp/releases/$RELEASE_ID/bin/core-api")" = root:root
-          sudo test "$(stat -c '%a' "/opt/nmcp/releases/$RELEASE_ID/bin/core-api")" = 755
-          sudo -u nmcp test -x "/opt/nmcp/releases/$RELEASE_ID/bin/core-api"
-
-      - name: Remove staged release
-        if: always()
-        env:
-          RELEASE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          sudo rm -rf -- "/opt/nmcp/releases/$RELEASE_ID" \
-            "/opt/nmcp/releases/$RELEASE_ID-bad-mode" \
-            "/opt/nmcp/releases/$RELEASE_ID-locked" \
-            "/opt/nmcp/releases/$RELEASE_ID-orphan-migration" \
-            "/opt/nmcp/releases/$RELEASE_ID-spoofed" /tmp/nmcp-release
-          sudo rm -f /tmp/nmcp-deploy-lock-held /tmp/nmcp-orphan-migration-held
-
-      - name: Remove test Tailnet address
-        if: always()
-        run: sudo ip address delete 100.64.0.10/32 dev lo || true
+        run: >-
+          sudo env PATH="$PATH" GOTOOLCHAIN=local RELEASE_ID="$RELEASE_ID"
+          scripts/run-validation ubuntu
