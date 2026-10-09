@@ -302,6 +302,100 @@ func TestServiceAcceptDoesNotAbortPublishedPublishFailure(t *testing.T) {
 	}
 }
 
+func TestServiceAcceptRetriesTerminalAttemptPersistence(t *testing.T) {
+	terminalErr := errors.New("terminal persistence unavailable")
+	for _, test := range []struct {
+		name      string
+		published bool
+	}{
+		{name: "aborted"},
+		{name: "published uncertain", published: true},
+	} {
+		t.Run(test.name+" transient", func(t *testing.T) {
+			temporary := &fakeStagedOriginal{}
+			repository := &fakeAcceptanceRepository{timezone: "UTC"}
+			repository.complete = func(context.Context, string, string) error {
+				if repository.completeCalls == 1 {
+					return terminalErr
+				}
+				return nil
+			}
+			if test.published {
+				repository.finalize = func(_ context.Context, _ acceptance, publish func() (string, error)) (Outcome, error) {
+					_, _ = publish()
+					return Outcome{}, &OutcomeUnknown{Cause: errors.New("lost commit response")}
+				}
+			} else {
+				temporary.sealErr = storage.ErrDurability
+			}
+			service := testService(&fakeOriginalStore{temporary: temporary}, &fakeMetadataProber{result: validMetadata()}, repository)
+			_, err := service.Accept(context.Background(), validRequest(bytes.NewBufferString("body")))
+			if repository.completeCalls != 2 || errors.Is(err, terminalErr) {
+				t.Fatalf("terminal calls/error = %d/%#v, want retry success without leaked first error", repository.completeCalls, err)
+			}
+			if test.published && (!temporary.published || temporary.aborted) {
+				t.Fatalf("published=%v aborted=%v", temporary.published, temporary.aborted)
+			}
+		})
+
+		t.Run(test.name+" permanent", func(t *testing.T) {
+			temporary := &fakeStagedOriginal{}
+			repository := &fakeAcceptanceRepository{timezone: "UTC", complete: func(context.Context, string, string) error { return terminalErr }}
+			if test.published {
+				repository.finalize = func(_ context.Context, _ acceptance, publish func() (string, error)) (Outcome, error) {
+					_, _ = publish()
+					return Outcome{}, &OutcomeUnknown{Cause: errors.New("lost commit response")}
+				}
+			} else {
+				temporary.sealErr = storage.ErrDurability
+			}
+			service := testService(&fakeOriginalStore{temporary: temporary}, &fakeMetadataProber{result: validMetadata()}, repository)
+			_, err := service.Accept(context.Background(), validRequest(bytes.NewBufferString("body")))
+			if repository.completeCalls != 2 || !errors.Is(err, terminalErr) {
+				t.Fatalf("terminal calls/error = %d/%#v, want two failures surfaced", repository.completeCalls, err)
+			}
+			if test.published && (!temporary.published || temporary.aborted) {
+				t.Fatalf("published=%v aborted=%v", temporary.published, temporary.aborted)
+			}
+		})
+	}
+}
+
+func TestServiceAcceptClassifiesDatabaseErrorBeforeCancel(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		register   error
+		timezone   error
+		wantStatus int
+	}{
+		{name: "missing registration function", register: &pgconn.PgError{Code: "42883"}, wantStatus: 500},
+		{name: "timezone invariant", timezone: &pgconn.PgError{Code: "23514"}, wantStatus: 500},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			repository := &fakeAcceptanceRepository{timezone: "UTC", registerErr: test.register, err: test.timezone}
+			service := testService(&fakeOriginalStore{temporary: &fakeStagedOriginal{}}, &fakeMetadataProber{result: validMetadata()}, repository)
+			_, err := service.Accept(context.Background(), validRequest(bytes.NewBufferString("body")))
+			var failure *Failure
+			if !errors.As(err, &failure) || failure.Status != test.wantStatus {
+				t.Fatalf("Accept() error = %#v, want status %d", err, test.wantStatus)
+			}
+		})
+	}
+	t.Run("registration deadline", func(t *testing.T) {
+		repository := &fakeAcceptanceRepository{register: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+		service := testService(&fakeOriginalStore{}, &fakeMetadataProber{}, repository)
+		service.dbBudget = time.Millisecond
+		_, err := service.Accept(context.Background(), validRequest(bytes.NewBufferString("body")))
+		var failure *Failure
+		if !errors.As(err, &failure) || failure.Status != 503 {
+			t.Fatalf("Accept() error = %#v, want database deadline status 503", err)
+		}
+	})
+}
+
 func TestDatabaseFailureClassification(t *testing.T) {
 	service := &Service{}
 	tests := []struct {
@@ -385,6 +479,7 @@ type fakeStagedOriginal struct {
 	writeErr        error
 	sealErr         error
 	publishErr      error
+	publishKey      string
 	sealCalls       int
 	publishCalls    int
 	validationReads int
@@ -444,10 +539,14 @@ func (f *fakeStagedOriginal) PublishSealed(_ context.Context, _ storage.Original
 		return "", storage.ErrValidation
 	}
 	f.published = true
-	if f.publishErr != nil {
-		return "originals/00/id/original.jpg", f.publishErr
+	key := f.publishKey
+	if key == "" {
+		key = "originals/00/id/original.jpg"
 	}
-	return "originals/00/id/original.jpg", nil
+	if f.publishErr != nil {
+		return key, f.publishErr
+	}
+	return key, nil
 }
 
 func (f *fakeStagedOriginal) Abort(context.Context) error {
@@ -502,21 +601,36 @@ func TestUploadAttemptHeartbeatCancelsOperationOnLeaseFailure(t *testing.T) {
 type fakeAcceptanceRepository struct {
 	timezone      string
 	err           error
+	registerErr   error
+	register      func(context.Context) error
 	events        *[]string
 	timezoneCalls int
 	finalizeCalls int
 	finalize      func(context.Context, acceptance, func() (string, error)) (Outcome, error)
 	heartbeat     func(context.Context, string) error
+	complete      func(context.Context, string, string) error
+	completeCalls int
 }
 
-func (r *fakeAcceptanceRepository) RegisterAttempt(context.Context, string, string) error { return nil }
+func (r *fakeAcceptanceRepository) RegisterAttempt(ctx context.Context, _, _ string) error {
+	if r.register != nil {
+		return r.register(ctx)
+	}
+	return r.registerErr
+}
 func (r *fakeAcceptanceRepository) HeartbeatAttempt(ctx context.Context, attemptID string) error {
 	if r.heartbeat != nil {
 		return r.heartbeat(ctx, attemptID)
 	}
 	return nil
 }
-func (r *fakeAcceptanceRepository) CompleteAttempt(context.Context, string, string) error { return nil }
+func (r *fakeAcceptanceRepository) CompleteAttempt(ctx context.Context, attemptID, terminal string) error {
+	r.completeCalls++
+	if r.complete != nil {
+		return r.complete(ctx, attemptID, terminal)
+	}
+	return nil
+}
 
 func (r *fakeAcceptanceRepository) DefaultTimezone(context.Context) (string, error) {
 	appendEvent(r.events, "timezone")
