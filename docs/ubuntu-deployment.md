@@ -72,10 +72,11 @@ Upgrades from a revision that created the legacy dotless
 path is empty or populated. Stop NMCP, inspect the path without following
 symlinks, and preserve any unexpected contents before changing it. If it is
 empty, remove it with `sudo rmdir /var/lib/nmcp/media/quarantine`. If populated,
-move the entire directory to reviewed operator-controlled storage outside
-`/var/lib/nmcp/media`, record its owner/mode/content inventory, and only then
-remove the now-empty legacy directory. Do not recursively delete or blindly
-merge contents. Re-run host installation to create canonical `.quarantine`,
+record its owner/mode/content inventory, then either move the entire directory
+to reviewed operator-controlled storage outside `/var/lib/nmcp/media` (so the
+source path is absent), or move each reviewed entry through a controlled
+operator procedure and use `rmdir` after the source is empty. Do not recursively
+delete or blindly merge contents. Re-run host installation to create canonical `.quarantine`,
 then adjudicate preserved entries under the reconciliation manifest procedure
 when that application workflow lands. Installation also rejects a symlink,
 unsafe owner/mode, or separate filesystem mounted at canonical `.quarantine`.

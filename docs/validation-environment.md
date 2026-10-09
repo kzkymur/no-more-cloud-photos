@@ -77,7 +77,13 @@ segment and encoded-separator rejection against existing control objects,
 canonical shard equality, canonical-name Original and Rendition symlink denial,
 and existing non-public backup and `.quarantine` sentinels. It asserts that
 Nginx has only its isolated network, shares no network with PostgreSQL, and
-receives exactly two read-only Original/Rendition subpath mounts. It also
+receives exactly two read-only Original/Rendition subpath volume mounts and
+three read-write tmpfs mounts at `/var/cache/nginx`, `/var/run`, and `/tmp`,
+with the exact configured size/mode/UID/GID option map. The inspection treats
+only equivalent Engine renderings as normalization: size suffixes are converted
+to bytes, and a leading-zero octal mode or Engine's decimal mode are compared as
+the same numeric value. Missing, extra, wrong-type, or wrong-RW live mounts fail.
+It also
 records the live PostgreSQL, Nginx,
 ExifTool, FFprobe, and `prlimit`
 versions. It builds the merged issue #11 source-pinned native still toolchain

@@ -161,7 +161,8 @@ def main() -> int:
         'container["HostConfig"].get("Mounts")' in validation_script
         and 'container["HostConfig"].get("Tmpfs")' in validation_script
         and 'mount.get("Type") == "volume"' in validation_script
-        and 'mount.get("Type") == "tmpfs"' in validation_script,
+        and 'normalized_tmpfs(options) == expected_tmpfs[destination]' in validation_script
+        and 'actual_set == expected_actual' in validation_script,
         "validation does not inspect every configured File Server mount type",
     )
 
