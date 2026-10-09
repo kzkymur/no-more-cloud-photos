@@ -29,6 +29,10 @@ type scanner interface {
 	Scan(context.Context) ([]storage.Observation, error)
 }
 
+type quarantineScanner interface {
+	ScanWithQuarantine(context.Context, []string) ([]storage.Observation, error)
+}
+
 type Checker struct {
 	repository repository
 	scanner    scanner
@@ -116,7 +120,22 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 		return result, errors.Join(capture.DatabaseReferencesError, capture.AttemptOwnersError)
 	}
 
-	observations, scanErr := checker.scanner.Scan(ctx)
+	var observations []storage.Observation
+	var scanErr error
+	keys := make([]string, 0)
+	for _, reference := range snapshot.References {
+		if reference.Kind == "quarantine" && reference.RelativeKey != nil {
+			keys = append(keys, *reference.RelativeKey)
+		}
+	}
+	if journalScanner, ok := checker.scanner.(quarantineScanner); ok {
+		sort.Strings(keys)
+		observations, scanErr = journalScanner.ScanWithQuarantine(ctx, keys)
+	} else if len(keys) > 0 {
+		scanErr = errors.New("storage scanner cannot reconcile journaled quarantine objects")
+	} else {
+		observations, scanErr = checker.scanner.Scan(ctx)
+	}
 	if scanErr != nil {
 		failureCode = "storage_scan"
 		return result, scanErr
@@ -211,7 +230,11 @@ func (checker *Checker) completeSource(parent context.Context, reportID, source 
 func (checker *Checker) recordMissingSourceErrors(parent context.Context, reportID, code string) error {
 	outcome, err := checker.readOutcomeDetached(parent, reportID)
 	if err != nil {
-		return err
+		var recoveryErr error
+		for _, source := range []string{"database_references", "attempt_owners", "storage_scan"} {
+			recoveryErr = errors.Join(recoveryErr, checker.completeSourceDetached(parent, reportID, source, &code))
+		}
+		return errors.Join(err, recoveryErr)
 	}
 	var result error
 	if outcome.DatabaseResult == nil {
@@ -235,7 +258,15 @@ func (checker *Checker) readOutcomeDetached(parent context.Context, reportID str
 func (checker *Checker) completeSourceDetached(parent context.Context, reportID, source string, code *string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
 	defer cancel()
-	return checker.completeSource(ctx, reportID, source, code)
+	err := checker.repository.CompleteSource(ctx, reportID, source, code)
+	if err == nil {
+		return nil
+	}
+	outcome, outcomeErr := checker.repository.ReportOutcome(ctx, reportID)
+	if outcomeErr == nil && sourceMatches(outcome, source, code) {
+		return nil
+	}
+	return errors.Join(err, outcomeErr)
 }
 
 func sourceMatches(outcome ReportOutcome, source string, code *string) bool {
@@ -270,6 +301,7 @@ func classify(snapshot Snapshot, observations []storage.Observation, observedAt 
 	expected := make(map[string]Reference)
 	targets := make(map[string]Reference)
 	terminal := make(map[string]Reference)
+	quarantine := make(map[string]Reference)
 	owners := make(map[string]AttemptOwner, len(snapshot.Attempts))
 	for _, owner := range snapshot.Attempts {
 		owners[owner.AttemptID] = owner
@@ -305,6 +337,10 @@ func classify(snapshot Snapshot, observations []storage.Observation, observedAt 
 			if reference.RelativeKey != nil {
 				terminal[*reference.RelativeKey] = reference
 			}
+		case "quarantine":
+			if reference.RelativeKey != nil {
+				quarantine[*reference.RelativeKey] = reference
+			}
 		}
 	}
 
@@ -316,6 +352,23 @@ func classify(snapshot Snapshot, observations []storage.Observation, observedAt 
 	for _, observation := range observations {
 		seen[observation.RelativeKey] = true
 		if observation.Type == storage.ObservationDirectory && expectedStorageDirectory(observation.RelativeKey) && observation.Stable {
+			continue
+		}
+		if strings.HasPrefix(observation.RelativeKey, ".quarantine/") {
+			reference, tracked := quarantine[observation.RelativeKey]
+			if !tracked {
+				// Quarantine is reconciled only against durable repair evidence;
+				// unrelated contents are not ordinary storage orphans.
+				continue
+			}
+			mismatch := !observation.Stable || observation.Type != storage.ObservationRegular || observation.LinkCount > 1
+			mismatch = mismatch || reference.SizeBytes != nil && (observation.Size == nil || *reference.SizeBytes != *observation.Size)
+			mismatch = mismatch || reference.SHA256 != nil && (observation.SHA256 == nil || *reference.SHA256 != hex.EncodeToString(observation.SHA256[:]))
+			if mismatch {
+				finding := findingFromReference(reference, "quarantine_mismatch", "quarantine_evidence_mismatch", observedAt)
+				applyObservation(&finding, observation)
+				findings = append(findings, finding)
+			}
 			continue
 		}
 		if !observation.Stable {
@@ -384,6 +437,14 @@ func classify(snapshot Snapshot, observations []storage.Observation, observedAt 
 			continue
 		}
 		finding := findingFromReference(reference, "referenced_missing", "referenced_file_absent", observedAt)
+		finding.ObservedType = "missing"
+		findings = append(findings, finding)
+	}
+	for path, reference := range quarantine {
+		if seen[path] || pointerValue(reference.ExpectedState) != "quarantined" {
+			continue
+		}
+		finding := findingFromReference(reference, "quarantine_missing", "journaled_quarantine_absent", observedAt)
 		finding.ObservedType = "missing"
 		findings = append(findings, finding)
 	}

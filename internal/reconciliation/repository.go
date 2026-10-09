@@ -53,8 +53,12 @@ func (repository *PostgresRepository) CaptureSnapshot(ctx context.Context) (Snap
 		defer rows.Close()
 		for rows.Next() {
 			var row Reference
-			if scanErr := rows.Scan(&row.Kind, &row.SubjectID, &row.MediaID, &row.OriginalID, &row.JobID, &row.TargetID, &row.RelativeKey, &row.ExpectedState, &row.SizeBytes, &row.SHA256, &row.IsCurrent, &row.ProvenanceValid, &row.CurrentValid, &row.DueAt); scanErr != nil {
+			var mediaID *string
+			if scanErr := rows.Scan(&row.Kind, &row.SubjectID, &mediaID, &row.OriginalID, &row.JobID, &row.TargetID, &row.RelativeKey, &row.ExpectedState, &row.SizeBytes, &row.SHA256, &row.IsCurrent, &row.ProvenanceValid, &row.CurrentValid, &row.DueAt); scanErr != nil {
 				return fmt.Errorf("scan reconciliation database reference: %w", scanErr)
+			}
+			if mediaID != nil {
+				row.MediaID = *mediaID
 			}
 			snapshot.References = append(snapshot.References, row)
 		}

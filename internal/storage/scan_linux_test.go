@@ -119,7 +119,7 @@ func TestScanRejectsRealBindMountBoundary(t *testing.T) {
 	}
 }
 
-func TestScanExcludesQuarantineDescendants(t *testing.T) {
+func TestScanOnlyHashesJournaledQuarantineDescendants(t *testing.T) {
 	root := t.TempDir()
 	store := openTestStore(t, root, Options{})
 	quarantine := filepath.Join(root, ".quarantine")
@@ -136,6 +136,15 @@ func TestScanExcludesQuarantineDescendants(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(observations) != 1 || observations[0].RelativeKey != ".quarantine" || observations[0].Type != ObservationDirectory {
+		t.Fatalf("default quarantine observations = %+v", observations)
+	}
+	journaled := ".quarantine/01234567-89ab-4cde-8f01-23456789abcd"
+	observations, err = store.ScanWithQuarantine(context.Background(), []string{journaled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != 2 || observations[0].RelativeKey != ".quarantine" || observations[0].Type != ObservationDirectory ||
+		observations[1].RelativeKey != journaled || observations[1].SHA256 == nil {
 		t.Fatalf("quarantine observations = %+v", observations)
 	}
 }

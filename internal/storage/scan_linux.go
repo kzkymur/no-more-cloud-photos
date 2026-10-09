@@ -73,16 +73,35 @@ type scanState struct {
 	hashedBytes int64
 	limits      scanLimits
 	mounts      []byte
+	quarantine  map[string]struct{}
 }
 
 // Scan walks the pinned storage root descriptor-relatively and without
 // following symlinks. It performs no filesystem mutation. Results are sorted
 // by raw relative-key bytes so creation order never affects reconciliation.
 func (store *Store) Scan(ctx context.Context) ([]Observation, error) {
-	return store.scanWithLimits(ctx, productionScanLimits)
+	return store.scan(ctx, productionScanLimits, nil)
 }
 
 func (store *Store) scanWithLimits(ctx context.Context, limits scanLimits) ([]Observation, error) {
+	return store.scan(ctx, limits, nil)
+}
+
+// ScanWithQuarantine inspects only quarantine objects authorized by durable
+// journal keys. Untracked quarantine contents are never opened or hashed.
+func (store *Store) ScanWithQuarantine(ctx context.Context, keys []string) ([]Observation, error) {
+	quarantine := make(map[string]struct{}, len(keys))
+	for _, value := range keys {
+		key, err := ParseQuarantineKey(value)
+		if err != nil || key.String() != value {
+			return nil, ErrValidation
+		}
+		quarantine[value] = struct{}{}
+	}
+	return store.scan(ctx, productionScanLimits, quarantine)
+}
+
+func (store *Store) scan(ctx context.Context, limits scanLimits, quarantine map[string]struct{}) ([]Observation, error) {
 	if ctx == nil {
 		return nil, ErrValidation
 	}
@@ -116,7 +135,7 @@ func (store *Store) scanWithLimits(ctx context.Context, limits scanLimits) ([]Ob
 	if err != nil {
 		return nil, classifyError("capture storage scan mount topology", err)
 	}
-	state := &scanState{rootDevice: rootBefore.Dev, watchFD: watchFD, limits: limits, mounts: mounts}
+	state := &scanState{rootDevice: rootBefore.Dev, watchFD: watchFD, limits: limits, mounts: mounts, quarantine: quarantine}
 	if err := state.watchDirectory(rootFD); err != nil {
 		return nil, err
 	}
@@ -339,17 +358,6 @@ func (store *Store) scanDirectory(ctx context.Context, state *scanState, directo
 		entryType := observationType(namespaceStat.Mode)
 		if entryType == ObservationDirectory {
 			*observations = append(*observations, metadataObservation(relativeKey, entryType, namespaceStat, true, time.Now()))
-			if prefix == "" && name == ".quarantine" {
-				quarantineFD, quarantineStat, openErr := store.openScanAt(directoryFD, name, unix.O_RDONLY|unix.O_DIRECTORY, state.rootDevice)
-				if openErr != nil {
-					return classifyError("validate quarantine scan boundary", openErr)
-				}
-				_ = unix.Close(quarantineFD)
-				if !sameScanIdentity(namespaceStat, quarantineStat) {
-					(*observations)[len(*observations)-1].Stable = false
-				}
-				continue
-			}
 			if depth == state.limits.depth {
 				return ErrScanLimit
 			}
@@ -372,7 +380,12 @@ func (store *Store) scanDirectory(ctx context.Context, state *scanState, directo
 				_ = unix.Close(childFD)
 				return err
 			}
-			scanErr := store.scanDirectory(ctx, state, childFD, relativeKey, depth+1, observations)
+			var scanErr error
+			if relativeKey == ".quarantine" {
+				scanErr = store.scanQuarantineDirectory(ctx, state, childFD, observations)
+			} else {
+				scanErr = store.scanDirectory(ctx, state, childFD, relativeKey, depth+1, observations)
+			}
 			if scanErr != nil {
 				_ = unix.Close(childFD)
 				return scanErr
@@ -407,6 +420,45 @@ func (store *Store) scanDirectory(ctx context.Context, state *scanState, directo
 		observation, inspectErr := store.inspectScanRegular(ctx, state, directoryFD, name, relativeKey, namespaceStat)
 		if inspectErr != nil {
 			return inspectErr
+		}
+		*observations = append(*observations, observation)
+	}
+	return nil
+}
+
+func (store *Store) scanQuarantineDirectory(ctx context.Context, state *scanState, directoryFD int, observations *[]Observation) error {
+	keys := make([]string, 0, len(state.quarantine))
+	for key := range state.quarantine {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, relativeKey := range keys {
+		if err := scanContextError(ctx); err != nil {
+			return err
+		}
+		if state.entries == state.limits.entries {
+			return ErrScanLimit
+		}
+		state.entries++
+		name := strings.TrimPrefix(relativeKey, ".quarantine/")
+		var namespaceStat unix.Stat_t
+		if err := store.ops.fstatat(directoryFD, name, &namespaceStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return classifyError("stat journaled quarantine entry", err)
+		}
+		if namespaceStat.Dev != state.rootDevice {
+			return ErrScanBoundary
+		}
+		entryType := observationType(namespaceStat.Mode)
+		if entryType != ObservationRegular {
+			*observations = append(*observations, metadataObservation(relativeKey, entryType, namespaceStat, true, time.Now()))
+			continue
+		}
+		observation, err := store.inspectScanRegular(ctx, state, directoryFD, name, relativeKey, namespaceStat)
+		if err != nil {
+			return err
 		}
 		*observations = append(*observations, observation)
 	}

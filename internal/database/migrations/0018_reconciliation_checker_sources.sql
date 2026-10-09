@@ -92,6 +92,24 @@ BEGIN
           AND NOT EXISTS (SELECT 1 FROM jobs AS purge_job
               WHERE purge_job.type='purge' AND purge_job.media_id_snapshot=r.media_id
                 AND purge_job.started_at IS NOT NULL)
+    ), repair_quarantine AS (
+        SELECT m.quarantine_id,m.media_id,m.job_id,m.job_target_id,m.destination_relative_key,
+               CASE WHEN latest.event_type='completed' THEN 'quarantined'::text ELSE NULL::text END AS expected_state,
+               COALESCE(latest.observed_size_bytes,m.expected_size_bytes) AS expected_size_bytes,
+               COALESCE(latest.observed_sha256,m.report_observed_sha256) AS expected_sha256,
+               latest.occurred_at
+        FROM reconciliation_repair_manifest_items AS m
+        JOIN LATERAL (
+            SELECT e.attempt_id,e.event_type,e.outcome_code,e.error_code,e.observed_size_bytes,e.observed_sha256,e.occurred_at
+            FROM reconciliation_repair_attempts AS a
+            JOIN reconciliation_repair_events AS e ON e.attempt_id=a.id
+            WHERE a.manifest_item_id=m.id
+            ORDER BY a.attempt_number DESC,e.sequence DESC LIMIT 1
+        ) AS latest ON true
+        WHERE (latest.event_type='completed' AND latest.outcome_code='quarantined')
+           OR (latest.event_type='failed' AND latest.error_code='outcome_uncertain'
+               AND EXISTS (SELECT 1 FROM reconciliation_repair_events AS renamed
+                   WHERE renamed.attempt_id=latest.attempt_id AND renamed.event_type='rename'))
     )
     SELECT 'original'::text,o.id::uuid,o.media_id::uuid,o.id::uuid,NULL::uuid,NULL::uuid,
            o.relative_path,'referenced'::text,o.size_bytes,o.sha256,
@@ -148,6 +166,11 @@ BEGIN
     JOIN jobs AS j ON j.id=t.job_id
     WHERE p.disposition IN ('deleted','missing')
       AND NOT EXISTS (SELECT 1 FROM renditions AS r WHERE r.id=p.rendition_id)
+    UNION ALL
+    SELECT 'quarantine',q.quarantine_id::uuid,q.media_id::uuid,NULL::uuid,q.job_id::uuid,q.job_target_id::uuid,
+           q.destination_relative_key,q.expected_state,q.expected_size_bytes,q.expected_sha256,
+           NULL::boolean,true,true,q.occurred_at
+    FROM repair_quarantine AS q
     ORDER BY 1,7 NULLS FIRST,2;
 END;
 $$;
@@ -341,8 +364,14 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON change_events FROM nmcp_check_function_owner;
+REVOKE ALL ON change_events,reconciliation_repair_manifest_items,reconciliation_repair_attempts,reconciliation_repair_events
+    FROM nmcp_check_function_owner;
 GRANT SELECT(position,event_type,reason,media_id,payload,occurred_at) ON change_events TO nmcp_check_function_owner;
+GRANT SELECT(id,quarantine_id,media_id,job_id,job_target_id,destination_relative_key,expected_size_bytes,report_observed_sha256)
+    ON reconciliation_repair_manifest_items TO nmcp_check_function_owner;
+GRANT SELECT(id,manifest_item_id,attempt_number) ON reconciliation_repair_attempts TO nmcp_check_function_owner;
+GRANT SELECT(attempt_id,sequence,event_type,outcome_code,error_code,observed_size_bytes,observed_sha256,occurred_at)
+    ON reconciliation_repair_events TO nmcp_check_function_owner;
 
 REVOKE ALL ON FUNCTION nmcp_read_check_database_references(timestamptz),
     nmcp_read_check_attempt_owners(),nmcp_read_check_report_outcome(nmcp_uuid_v4)
