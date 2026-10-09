@@ -25,8 +25,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ubuntu-deployment-${{ github.ref }}
-  cancel-in-progress: true
+  group: ubuntu-deployment-${{ github.event_name == 'push' && format('push-{0}', github.ref_name) || github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -50,8 +50,4 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             ffmpeg libimage-exiftool-perl nginx-core postgresql shellcheck
       - name: Run privileged Ubuntu validation
-        env:
-          RELEASE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
-        run: >-
-          sudo env PATH="$PATH" GOTOOLCHAIN=local RELEASE_ID="$RELEASE_ID"
-          scripts/run-validation ubuntu
+        run: scripts/run-validation ubuntu

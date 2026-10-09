@@ -52,9 +52,11 @@ case "$mode" in
 esac
 
 if [[ $mode == ubuntu || $mode == all ]]; then
-  [[ $EUID -eq 0 ]] || fail "ubuntu mode is privileged; run it in the documented Ubuntu VM/runner as root"
+  [[ $EUID -ne 0 ]] || fail "ubuntu dispatcher must start unprivileged and elevates only audited commands"
   [[ -d /run/systemd/system ]] || fail "ubuntu mode requires systemd as PID 1"
   need shellcheck
+  need sudo
+  sudo -n true >/dev/null 2>&1 || fail "ubuntu mode requires passwordless command-scoped sudo"
 fi
 
 printf 'preflight: %s mode prerequisites satisfied\n' "$mode"

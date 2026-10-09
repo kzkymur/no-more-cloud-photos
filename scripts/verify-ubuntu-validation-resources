@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -ne 0 ]] || { printf 'resource isolation verifier must start unprivileged\n' >&2; exit 1; }
+sudo -n true
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+helper=$repo/scripts/ubuntu-validation-resources
+mkdir -p "$repo/.validation"
+work=$(mktemp -d "$repo/.validation/resource-test.XXXXXXXX")
+token1=$(printf '%s' "$work-one-$$-$RANDOM" | sha256sum | cut -d' ' -f1)
+token2=$(printf '%s' "$work-two-$$-$RANDOM" | sha256sum | cut -d' ' -f1)
+path1='' path2='' existing='' release1='' release2=''
+cleanup() {
+  [[ -n $path1 ]] && sudo "$helper" cleanup "$path1" "$token1" || true
+  [[ -n $path2 ]] && sudo "$helper" cleanup "$path2" "$token2" || true
+  [[ -n $existing ]] && sudo rm -rf --one-file-system -- "/opt/nmcp/releases/$existing"
+  rm -rf -- "$work"
+}
+trap cleanup EXIT INT TERM
+
+# Redirections intentionally remain under the unprivileged test owner.
+# shellcheck disable=SC2024
+sudo "$helper" create "$token1" >"$work/path1" & pid1=$!
+# shellcheck disable=SC2024
+sudo "$helper" create "$token2" >"$work/path2" & pid2=$!
+create_status=0
+wait "$pid1" || create_status=1
+wait "$pid2" || create_status=1
+[[ -s $work/path1 ]] && path1=$(<"$work/path1")
+[[ -s $work/path2 ]] && path2=$(<"$work/path2")
+[[ $create_status == 0 ]] || exit 1
+[[ $path1 != "$path2" ]]
+
+if sudo "$helper" cleanup /var/tmp "$token1"; then
+  printf 'traversal/non-run cleanup unexpectedly succeeded\n' >&2; exit 1
+fi
+if sudo "$helper" cleanup "$path1" "$token2"; then
+  printf 'foreign-token cleanup unexpectedly succeeded\n' >&2; exit 1
+fi
+
+suffix=${token1:0:12}
+existing=validation-existing-$suffix
+sudo test ! -e "/opt/nmcp/releases/$existing"
+sudo install -d -m 0700 "/opt/nmcp/releases/$existing"
+sudo touch "/opt/nmcp/releases/$existing/sentinel"
+if sudo "$helper" register-release "$path1" "$token1" "$existing"; then
+  printf 'pre-existing release registration unexpectedly succeeded\n' >&2; exit 1
+fi
+sudo test -e "/opt/nmcp/releases/$existing/sentinel"
+
+release1=validation-a-$suffix
+release2=validation-b-${token2:0:12}
+sudo "$helper" register-release "$path1" "$token1" "$release1"
+sudo "$helper" register-release "$path2" "$token2" "$release2"
+sudo install -d -m 0700 "/opt/nmcp/releases/$release1" "/opt/nmcp/releases/$release2"
+sudo touch "/opt/nmcp/releases/$release1/owned" "/opt/nmcp/releases/$release2/owned"
+sudo "$helper" cleanup "$path1" "$token1"; path1=
+sudo test -e "/opt/nmcp/releases/$release2/owned"
+sudo test -e "/opt/nmcp/releases/$existing/sentinel"
+sudo "$helper" cleanup "$path2" "$token2"; path2=
+sudo test ! -e "/opt/nmcp/releases/$release2"
+sudo test -e "/opt/nmcp/releases/$existing/sentinel"
+printf 'Ubuntu validation concurrent resource isolation passed\n'

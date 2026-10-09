@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'ubuntu-validation-resources requires root\n' >&2; exit 1; }
+action=${1:-}
+path=${2:-}
+token=${3:-}
+
+valid_token() { [[ $1 =~ ^[a-f0-9]{64}$ ]]; }
+valid_release() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+valid_unit() { [[ $1 =~ ^nmcp-validation-[a-z]+-[a-f0-9]{16}$ ]]; }
+
+check_run() {
+  local canonical owner mode marker
+  valid_token "$token" || { printf 'invalid validation owner token\n' >&2; exit 1; }
+  [[ $path =~ ^/var/tmp/nmcp-validation\.[A-Za-z0-9]{8}$ ]] || {
+    printf 'invalid validation resource path\n' >&2; exit 1;
+  }
+  canonical=$(readlink -f -- "$path")
+  [[ $canonical == "$path" && ! -L $path ]] || { printf 'non-canonical validation resource path\n' >&2; exit 1; }
+  read -r owner mode < <(stat -c '%U:%G %a' -- "$path")
+  [[ $owner == root:root && $mode == 700 ]] || { printf 'unsafe validation resource ownership/mode\n' >&2; exit 1; }
+  marker=$path/.owner-token
+  [[ -f $marker && ! -L $marker ]] || { printf 'validation owner marker missing\n' >&2; exit 1; }
+  [[ $(stat -c '%U:%G %a' -- "$marker") == 'root:root 600' ]] || {
+    printf 'unsafe validation owner marker\n' >&2; exit 1;
+  }
+  [[ $(<"$marker") == "$token" ]] || { printf 'validation owner token mismatch\n' >&2; exit 1; }
+}
+
+case "$action" in
+  create)
+    token=$path
+    valid_token "$token" || { printf 'invalid validation owner token\n' >&2; exit 1; }
+    path=$(mktemp -d /var/tmp/nmcp-validation.XXXXXXXX)
+    chmod 0700 "$path"
+    install -m 0600 /dev/null "$path/.owner-token"
+    printf '%s\n' "$token" >"$path/.owner-token"
+    mkdir -m 0700 "$path/releases" "$path/units"
+    printf '%s\n' "$path"
+    ;;
+  register-release)
+    release=${4:-}
+    check_run
+    valid_release "$release" || { printf 'invalid validation release ID\n' >&2; exit 1; }
+    release_path=/opt/nmcp/releases/$release
+    [[ $(readlink -m -- "$release_path") == "$release_path" && ! -e $release_path && ! -L $release_path ]] || {
+      printf 'validation release already exists: %s\n' "$release" >&2; exit 1;
+    }
+    install -m 0600 /dev/null "$path/releases/$release"
+    ;;
+  register-unit)
+    unit=${4:-}
+    check_run
+    valid_unit "$unit" || { printf 'invalid validation unit name\n' >&2; exit 1; }
+    [[ ! -e $path/units/$unit ]] || { printf 'validation unit already registered\n' >&2; exit 1; }
+    install -m 0600 /dev/null "$path/units/$unit"
+    ;;
+  cleanup)
+    check_run
+    for marker in "$path"/units/*; do
+      [[ -e $marker ]] || continue
+      unit=${marker##*/}
+      valid_unit "$unit" || { printf 'invalid registered validation unit\n' >&2; exit 1; }
+      timeout 10s systemctl stop "$unit.service" >/dev/null 2>&1 || true
+      for attempt in {1..50}; do
+        state=$(systemctl show --property=ActiveState --value "$unit.service" 2>/dev/null || true)
+        [[ -z $state || $state == inactive || $state == failed ]] && break
+        [[ $attempt -lt 50 ]] || { printf 'validation unit did not stop: %s\n' "$unit" >&2; exit 1; }
+        sleep 0.1
+      done
+      systemctl reset-failed "$unit.service" >/dev/null 2>&1 || true
+    done
+    for marker in "$path"/releases/*; do
+      [[ -e $marker ]] || continue
+      release=${marker##*/}
+      valid_release "$release" || { printf 'invalid registered validation release\n' >&2; exit 1; }
+      release_path=/opt/nmcp/releases/$release
+      [[ $(readlink -m -- "$release_path") == "$release_path" ]] || exit 1
+      rm -rf --one-file-system -- "$release_path"
+    done
+    rm -rf --one-file-system -- "$path"
+    ;;
+  *) printf 'usage: %s {create TOKEN|register-release PATH TOKEN ID|register-unit PATH TOKEN UNIT|cleanup PATH TOKEN}\n' "$0" >&2; exit 2 ;;
+esac
