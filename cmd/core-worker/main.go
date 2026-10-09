@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -126,14 +127,19 @@ func runWorkers(ctx context.Context, loops ...workerLoop) error {
 	var first error
 	for index := range loops {
 		err := <-results
-		if index == 0 {
-			cancel()
-		}
-		if err != nil && first == nil {
+		// A loop reporting the shared run context's terminal cause is a normal
+		// consequence of either process shutdown or sibling cancellation. Keep
+		// the originating loop failure, if any, rather than converting graceful
+		// SIGTERM into a non-zero process exit.
+		expectedCancellation := runCtx.Err() != nil && errors.Is(err, runCtx.Err())
+		if err != nil && !expectedCancellation && first == nil {
 			first = err
 		}
-		if err == nil && ctx.Err() == nil && first == nil {
+		if err == nil && index == 0 && ctx.Err() == nil && first == nil {
 			first = fmt.Errorf("worker loop exited unexpectedly")
+		}
+		if index == 0 {
+			cancel()
 		}
 	}
 	return first

@@ -58,6 +58,18 @@ func TestRunWorkersRejectsUnexpectedCleanExitFromThirdLoop(t *testing.T) {
 	}
 }
 
+func TestRunWorkersAcceptsParentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	wait := loopFunc(func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if err := runWorkers(ctx, wait, wait, wait); err != nil {
+		t.Fatalf("runWorkers() graceful shutdown error = %v", err)
+	}
+}
+
 func (loader *startupProfileLoader) ClaimableTransformProfiles(context.Context) ([]profile.Definition, error) {
 	loader.called = true
 	return loader.definitions, loader.err
