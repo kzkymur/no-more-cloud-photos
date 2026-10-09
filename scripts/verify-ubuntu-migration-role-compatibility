@@ -129,8 +129,26 @@ assert_hardened
 # INT and TERM are delivered only to the wrapper. The migration child ignores
 # both, proving each dedicated handler terminates the child and hardens rather
 # than passing because the entire process group received the signal.
+cat > "$work/signal-launch.py" <<'PY'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+
+def reset_signals():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+environment = os.environ.copy()
+environment["NMCP_TEST_SIGNAL_GRACE_ATTEMPTS"] = "5"
+process = subprocess.Popen(sys.argv[2:], env=environment, preexec_fn=reset_signals)
+pathlib.Path(sys.argv[1]).write_text(f"{process.pid}\n", encoding="ascii")
+status = process.wait()
+raise SystemExit(status if status >= 0 else 128 - status)
+PY
 test_signal() {
-  local name=$1 signal=$2 expected=$3 wrapper_pid status
+  local name=$1 signal=$2 expected=$3 launcher_pid wrapper_pid status
   /usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/$name"
   cat > "$work/$name/nmcp-admin" <<EOF
 #!/bin/sh
@@ -140,14 +158,16 @@ exec sleep 300
 EOF
   /usr/bin/chown -R nmcp:nmcp "$work/$name"
   /usr/bin/chmod 0700 "$work/$name/nmcp-admin"
-  NMCP_TEST_SIGNAL_GRACE_ATTEMPTS=5 \
+  /usr/bin/python3 "$work/signal-launch.py" "$work/$name/wrapper.pid" \
     /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
     "$work/$name/nmcp-admin" migrate up --json &
-  wrapper_pid=$!
+  launcher_pid=$!
+  wait_for_path "$work/$name/wrapper.pid"
+  wrapper_pid=$(/usr/bin/cat "$work/$name/wrapper.pid")
   wait_for_path "$work/$name/ready"
   /usr/bin/kill -s "$signal" "$wrapper_pid"
   set +e
-  wait "$wrapper_pid"
+  wait "$launcher_pid"
   status=$?
   set -e
   [[ $status -eq $expected ]]
