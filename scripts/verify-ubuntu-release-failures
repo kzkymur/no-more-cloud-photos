@@ -9,6 +9,7 @@ installer_pid=
 registration_pid=
 cancel_pid=
 pretransfer_pid=
+stale_pid=
 cleanup() {
   /usr/bin/touch "$work/ownerdeath-proceed" 2>/dev/null || true
   /usr/bin/touch /run/nmcp-deploy/test-runner-record.go \
@@ -23,6 +24,7 @@ cleanup() {
   [[ -z $registration_pid ]] || /usr/bin/kill "$registration_pid" 2>/dev/null || true
   [[ -z $cancel_pid ]] || /usr/bin/kill "$cancel_pid" 2>/dev/null || true
   [[ -z $pretransfer_pid ]] || /usr/bin/kill "$pretransfer_pid" 2>/dev/null || true
+  [[ -z $stale_pid ]] || /usr/bin/kill "$stale_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$installer_pid-1.service" >/dev/null 2>&1 || true
   [[ -z $registration_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$registration_pid-1.service" >/dev/null 2>&1 || true
   for _attempt in {1..50}; do
@@ -54,9 +56,16 @@ done
 # Release-transaction tests use deterministic admin stubs. Model the production
 # wrapper's non-root execution here; role graph transitions are covered by the
 # dedicated migration compatibility verifier.
-cat > /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility <<'EOF'
+cat > /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility <<EOF
 #!/bin/sh
-exec /usr/sbin/runuser -u nmcp -- "$@"
+if test -e '$work/stale-readiness-enabled'; then
+  if /usr/bin/mkdir '$work/stale-readiness-owner' 2>/dev/null; then
+    /usr/bin/touch '$work/stale-readiness-ready'
+    while test ! -e '$work/stale-readiness-go'; do /usr/bin/sleep 0.02; done
+  fi
+  exit 1
+fi
+exec /usr/sbin/runuser -u nmcp -- "\$@"
 EOF
 /usr/bin/chown root:root /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
 /usr/bin/chmod 0755 /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
@@ -106,6 +115,7 @@ make_release cancelrace
 make_release ownerpretransfer
 make_release predispatch
 make_release ownerdeath
+make_release stalefail
 /usr/bin/printf '#!/bin/sh\nexit 1\n' > /opt/nmcp/releases/migratefail/bin/nmcp-admin
 /usr/bin/chmod 0755 /opt/nmcp/releases/migratefail/bin/nmcp-admin
 (cd /opt/nmcp/releases/migratefail && /usr/bin/sha256sum bin/* > MANIFEST.sha256)
@@ -140,6 +150,43 @@ Requires=nmcp-api.service nmcp-worker.service nmcp-files.service
 EOF
 /usr/bin/systemctl daemon-reload
 /usr/bin/systemctl start postgresql@nmcp-test.service
+
+# Seed a retained successful migration, then begin a new activation whose
+# compatibility/hardening wrapper pauses and fails. Production activation must
+# invalidate the stale RemainAfterExit state before the transition; an explicit
+# API/Worker start during the pause must fail through nmcp-migrate rather than
+# consume stale readiness.
+/usr/bin/systemctl start nmcp-migrate.service
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == active ]]
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=SubState --value) == exited ]]
+/usr/bin/touch "$work/stale-readiness-enabled"
+"$repo/scripts/install-ubuntu-release" activate stalefail >"$work/stalefail.out" 2>&1 &
+stale_pid=$!
+for attempt in {1..200}; do
+  [[ -e $work/stale-readiness-ready ]] && break
+  [[ $attempt -lt 200 ]] || { printf 'compatibility failure did not enter\n' >&2; exit 1; }
+  /usr/bin/sleep 0.02
+done
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]]
+if /usr/bin/systemctl start nmcp-api.service nmcp-worker.service >/dev/null 2>&1; then
+  printf 'API/Worker consumed stale migration readiness during compatibility failure\n' >&2
+  exit 1
+fi
+for unit in nmcp-api.service nmcp-worker.service; do
+  ! /usr/bin/systemctl is-active --quiet "$unit" || {
+    printf 'service started during compatibility failure: %s\n' "$unit" >&2; exit 1;
+  }
+done
+/usr/bin/touch "$work/stale-readiness-go"
+if wait "$stale_pid"; then
+  printf 'hardening failure unexpectedly activated release\n' >&2; exit 1
+fi
+stale_pid=
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]]
+/usr/bin/rm -rf "$work/stale-readiness-enabled" "$work/stale-readiness-owner" \
+  "$work/stale-readiness-ready" "$work/stale-readiness-go"
+/usr/bin/systemctl reset-failed nmcp-migrate.service nmcp-api.service nmcp-worker.service >/dev/null 2>&1 || true
 
 if "$repo/scripts/install-ubuntu-release" activate migratefail; then
   printf 'migration failure unexpectedly activated release\n' >&2; exit 1

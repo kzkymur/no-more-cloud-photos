@@ -172,9 +172,19 @@ SELECT 1 / ((
                       AND allowed.member=:'nmcp_migrator_role'::pg_catalog.regrole
                       AND NOT actual.inherit_option
                   )
-              )
+            )
         )
-    )
+    ) AND (
+        SELECT pg_catalog.count(*)
+        FROM pg_catalog.pg_auth_members AS actual
+        WHERE actual.member=:'nmcp_migrator_role'::pg_catalog.regrole
+          AND actual.roleid IN (
+              'nmcp_purge_function_owner'::pg_catalog.regrole,
+              'nmcp_check_function_owner'::pg_catalog.regrole,
+              'nmcp_repair_function_owner'::pg_catalog.regrole
+          )
+          AND actual.inherit_option
+    ) IN (0,3)
 ))::integer AS nmcp_safe_pre_migration_role_graph;
 \endif
 
