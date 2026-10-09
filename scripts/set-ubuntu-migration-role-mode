@@ -34,7 +34,12 @@ done
 
 compatibility=FALSE
 [[ $mode == hardened ]] || compatibility=TRUE
-/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+psql_local() {
+  /usr/bin/env -i /usr/sbin/runuser -u postgres -- \
+    /usr/bin/psql --no-psqlrc --host=/var/run/postgresql --port=5432 \
+    --username=postgres --dbname=nmcp "$@"
+}
+psql_local \
   --set=nmcp_migrator_role=nmcp_migrator \
   --set=nmcp_api_role=nmcp_api \
   --set=nmcp_worker_role=nmcp_worker \
@@ -42,6 +47,11 @@ compatibility=FALSE
   --file="$bootstrap"
 
 if [[ $mode == hardened ]]; then
-  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
-    --file="$verifier"
+  if [[ ${NMCP_TEST_PAUSE_BEFORE_GRAPH_VERIFY:-} == 1 ]]; then
+    /usr/bin/touch /run/nmcp-test-before-role-graph-verify.ready
+    while [[ ! -e /run/nmcp-test-before-role-graph-verify.go ]]; do
+      /usr/bin/sleep 0.05
+    done
+  fi
+  psql_local --file="$verifier"
 fi
