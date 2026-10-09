@@ -353,6 +353,34 @@ func (r *Repository) FinishAttempt(ctx context.Context, jobID, token string, cod
 	if !ok {
 		return ErrInvalid
 	}
+	if code == FailureMaintenancePaused {
+		return r.transitionLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
+			// The claim already consumed an attempt before maintenance won the
+			// publication fence. Preserve monotonic attempt history and compensate
+			// exactly one retry allowance rather than decrementing attempts or
+			// requiring an administrative retry.
+			tag, err := tx.Exec(ctx, `UPDATE jobs SET status='queued',max_attempts=max_attempts+1,
+				available_at=clock_timestamp(),lease_token=NULL,lease_expires_at=NULL,
+				error_code=$2,error_message=$3,finished_at=NULL,updated_at=clock_timestamp()
+				WHERE id=$1 AND status='running' AND lease_token=$4 AND lease_expires_at>clock_timestamp()
+				  AND max_attempts<2147483647`, jobID, code, message, token)
+			if err != nil {
+				return classifyDatabaseError(err)
+			}
+			if tag.RowsAffected() != 1 {
+				var live bool
+				if err := tx.QueryRow(ctx, `SELECT status='running' AND lease_token=$2
+					AND lease_expires_at>clock_timestamp() FROM jobs WHERE id=$1`, jobID, token).Scan(&live); err != nil {
+					return classifyDatabaseError(err)
+				}
+				if !live {
+					return ErrLeaseLost
+				}
+				return ErrInvariant
+			}
+			return nil
+		})
+	}
 	return r.transitionLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
 		var attempts int
 		if err := tx.QueryRow(ctx, `SELECT attempts FROM jobs WHERE id=$1`, jobID).Scan(&attempts); err != nil {

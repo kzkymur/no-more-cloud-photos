@@ -202,6 +202,9 @@ func (w *Worker) runLease(parent context.Context, lease job.Lease) error {
 			if errors.Is(executionErr, job.ErrDatabaseUnavailable) {
 				return executionErr
 			}
+			if errors.Is(executionErr, job.ErrMaintenance) {
+				return w.finish(parent, lease, job.FailureMaintenancePaused)
+			}
 			return w.finish(parent, lease, processFailureCode(executionErr))
 		case <-heartbeat.C:
 			if parent.Err() != nil {

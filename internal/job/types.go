@@ -17,6 +17,7 @@ var (
 	ErrInvalid             = errors.New("invalid job repository input")
 	ErrDatabaseUnavailable = errors.New("job database unavailable")
 	ErrInvariant           = errors.New("job database invariant violated")
+	ErrMaintenance         = errors.New("job publication paused by maintenance")
 )
 
 type Type string
@@ -51,6 +52,7 @@ const (
 	FailureProcessOutputLimit FailureCode = "process_output_limit"
 	FailureLeaseExpired       FailureCode = "lease_expired"
 	FailureWorkerShutdown     FailureCode = "worker_shutdown"
+	FailureMaintenancePaused  FailureCode = "maintenance_paused"
 )
 
 var safeFailureMessages = map[FailureCode]string{
@@ -59,6 +61,7 @@ var safeFailureMessages = map[FailureCode]string{
 	FailureProcessOutputLimit: "processing output limit exceeded",
 	FailureLeaseExpired:       "job lease expired",
 	FailureWorkerShutdown:     "worker shut down before completion",
+	FailureMaintenancePaused:  "job publication paused by maintenance",
 }
 
 type Profile struct {

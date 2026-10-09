@@ -114,6 +114,7 @@ func TestRunLeaseMapsProcessFailuresToDurableCodes(t *testing.T) {
 		{name: "deadline", err: context.DeadlineExceeded, code: job.FailureProcessTimeout},
 		{name: "output", err: processrunner.ErrOutputLimit, code: job.FailureProcessOutputLimit},
 		{name: "failure", err: errors.New("stderr /private/secret"), code: job.FailureProcessFailed},
+		{name: "maintenance", err: job.ErrMaintenance, code: job.FailureMaintenancePaused},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

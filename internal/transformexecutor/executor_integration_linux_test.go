@@ -249,6 +249,7 @@ func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 type observingTransformWorkerRepository struct {
 	*job.TransformClaimer
 	maintenanceNoWork chan struct{}
+	claims            chan job.Lease
 }
 
 func (repository *observingTransformWorkerRepository) Claim(ctx context.Context, types []job.Type) (job.Lease, error) {
@@ -259,6 +260,9 @@ func (repository *observingTransformWorkerRepository) Claim(ctx context.Context,
 		default:
 		}
 	}
+	if err == nil {
+		repository.claims <- lease
+	}
 	return lease, err
 }
 
@@ -267,6 +271,21 @@ func TestWorkerTransformMaintenanceRetryIntegration(t *testing.T) {
 	defer cancel()
 	pool, repository, store, root := executorIntegrationDependencies(t, nil)
 	jobID, targets := seedExecutorTransform(t, pool, store, 1)
+	// Consume the first two allowed attempts without touching the Target so the
+	// Worker below claims the final configured attempt. Maintenance must grant
+	// exactly one compensating retry rather than require AdminRetryFailed.
+	for attempt := 1; attempt < 3; attempt++ {
+		lease, err := repository.Claim(ctx, []job.Type{job.TypeTransform})
+		if err != nil {
+			t.Fatalf("seed prior attempt %d Claim: %v", attempt, err)
+		}
+		if err := repository.FinishAttempt(ctx, jobID, lease.Token, job.FailureProcessFailed); err != nil {
+			t.Fatalf("seed prior attempt %d FinishAttempt: %v", attempt, err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp() WHERE id=$1`, jobID); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='claim fence',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -299,7 +318,7 @@ func TestWorkerTransformMaintenanceRetryIntegration(t *testing.T) {
 	}}
 	executor := integrationExecutor(t, repository, store, processors, []string{renderOne, renderTwo})
 	observedRepository := &observingTransformWorkerRepository{
-		TransformClaimer: repository, maintenanceNoWork: make(chan struct{}, 8),
+		TransformClaimer: repository, maintenanceNoWork: make(chan struct{}, 8), claims: make(chan job.Lease, 2),
 	}
 	transformWorker, err := worker.New(observedRepository, map[job.Type]worker.Executor{job.TypeTransform: executor}, worker.Options{
 		PollInterval: 10 * time.Millisecond, HeartbeatInterval: time.Second, DatabaseTimeout: 5 * time.Second,
@@ -318,6 +337,12 @@ func TestWorkerTransformMaintenanceRetryIntegration(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("Worker did not start transform: %v", ctx.Err())
 	}
+	var maintenanceLease job.Lease
+	select {
+	case maintenanceLease = <-observedRepository.claims:
+	case <-ctx.Done():
+		t.Fatalf("observe final configured lease: %v", ctx.Err())
+	}
 	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='publication winner',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -331,21 +356,83 @@ func TestWorkerTransformMaintenanceRetryIntegration(t *testing.T) {
 			t.Fatalf("Worker did not observe maintenance-blocked Claim %d: %v", count+1, ctx.Err())
 		}
 	}
-	assertTransformRetryState(t, pool, jobID, targets[0], "queued", "pending", 1, 1)
+	assertTransformRetryState(t, pool, jobID, targets[0], "queued", "pending", 3, 4, 1)
+	assertTransformAttemptHistory(t, pool, jobID, 3, 3, 0)
+	assertTransformMaintenanceError(t, pool, jobID)
+	assertTransformAttemptSequence(t, pool, maintenanceLease.Token, []string{"claimed", "released"}, "queued")
+	paused := transformMaintenanceSnapshot(t, pool, jobID)
+	if err := repository.FinishAttempt(ctx, jobID, integrationUUID(t), job.FailureMaintenancePaused); !errors.Is(err, job.ErrLeaseLost) {
+		t.Fatalf("stale maintenance pause error = %v, want ErrLeaseLost", err)
+	}
+	if after := transformMaintenanceSnapshot(t, pool, jobID); after != paused {
+		t.Fatalf("stale maintenance pause mutated state\nbefore: %s\nafter:  %s", paused, after)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	awaitTransformRetrySuccess(t, ctx, pool, jobID, workerResult)
+	var resumedLease job.Lease
+	select {
+	case resumedLease = <-observedRepository.claims:
+	case <-ctx.Done():
+		t.Fatalf("observe resumed lease: %v", ctx.Err())
+	}
 	stopWorker()
 	if err := awaitExecutorRaceResult(t, ctx, "Worker shutdown after maintenance retry", workerResult); err != nil {
 		t.Fatalf("Worker error = %v", err)
 	}
-	assertTransformRetryState(t, pool, jobID, targets[0], "succeeded", "succeeded", 2, 2)
+	assertTransformRetryState(t, pool, jobID, targets[0], "succeeded", "succeeded", 4, 4, 2)
+	assertTransformAttemptHistory(t, pool, jobID, 4, 3, 1)
+	assertTransformAttemptSequence(t, pool, resumedLease.Token, []string{"claimed", "published"}, "succeeded")
 	var originalID string
 	if err := pool.QueryRow(ctx, `SELECT original_id::text FROM jobs WHERE id=$1`, jobID).Scan(&originalID); err != nil {
 		t.Fatal(err)
 	}
 	assertIntegrationRendition(t, root, originalID, targets[0], renderTwo, "still")
+}
+
+func assertTransformMaintenanceError(t *testing.T, pool *pgxpool.Pool, jobID string) {
+	t.Helper()
+	var code, message string
+	if err := pool.QueryRow(context.Background(), `SELECT error_code,error_message FROM jobs WHERE id=$1`, jobID).Scan(&code, &message); err != nil {
+		t.Fatal(err)
+	}
+	if code != string(job.FailureMaintenancePaused) || message != "job publication paused by maintenance" {
+		t.Fatalf("maintenance error = %q/%q", code, message)
+	}
+}
+
+func assertTransformAttemptSequence(t *testing.T, pool *pgxpool.Pool, attemptID string, wantEvents []string, wantStatus string) {
+	t.Helper()
+	var events []string
+	var terminalStatus string
+	if err := pool.QueryRow(context.Background(), `SELECT array_agg(event_type ORDER BY sequence),
+		(array_agg(job_status ORDER BY sequence DESC))[1]
+		FROM storage_attempt_events WHERE attempt_id=$1`, attemptID).Scan(&events, &terminalStatus); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(events, ",") != strings.Join(wantEvents, ",") || terminalStatus != wantStatus {
+		t.Fatalf("attempt %s events/status=%v/%s, want %v/%s", attemptID, events, terminalStatus, wantEvents, wantStatus)
+	}
+}
+
+func assertTransformAttemptHistory(t *testing.T, pool *pgxpool.Pool, jobID string, wantAttempts, wantReleased, wantPublished int) {
+	t.Helper()
+	var attempts, released, published int
+	err := pool.QueryRow(context.Background(), `SELECT count(*),
+		count(*) FILTER (WHERE latest.event_type='released'),
+		count(*) FILTER (WHERE latest.event_type='published')
+		FROM storage_attempts AS attempt
+		JOIN LATERAL (SELECT event_type FROM storage_attempt_events
+			WHERE attempt_id=attempt.id ORDER BY sequence DESC LIMIT 1) AS latest ON true
+		WHERE attempt.job_id=$1`, jobID).Scan(&attempts, &released, &published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != wantAttempts || released != wantReleased || published != wantPublished {
+		t.Fatalf("storage attempt history total/released/published=%d/%d/%d, want %d/%d/%d",
+			attempts, released, published, wantAttempts, wantReleased, wantPublished)
+	}
 }
 
 func transformMaintenanceSnapshot(t *testing.T, pool *pgxpool.Pool, jobID string) string {
@@ -363,18 +450,18 @@ func transformMaintenanceSnapshot(t *testing.T, pool *pgxpool.Pool, jobID string
 	return snapshot
 }
 
-func assertTransformRetryState(t *testing.T, pool *pgxpool.Pool, jobID, targetID, wantJob, wantTarget string, wantJobAttempts, wantTargetAttempts int) {
+func assertTransformRetryState(t *testing.T, pool *pgxpool.Pool, jobID, targetID, wantJob, wantTarget string, wantJobAttempts, wantMaxAttempts, wantTargetAttempts int) {
 	t.Helper()
 	var jobStatus, targetStatus string
-	var jobAttempts, targetAttempts int
-	if err := pool.QueryRow(context.Background(), `SELECT j.status,j.attempts,jt.status,jt.attempts
+	var jobAttempts, maxAttempts, targetAttempts int
+	if err := pool.QueryRow(context.Background(), `SELECT j.status,j.attempts,j.max_attempts,jt.status,jt.attempts
 		FROM jobs AS j JOIN job_targets AS jt ON jt.job_id=j.id WHERE j.id=$1 AND jt.id=$2`, jobID, targetID).Scan(
-		&jobStatus, &jobAttempts, &targetStatus, &targetAttempts); err != nil {
+		&jobStatus, &jobAttempts, &maxAttempts, &targetStatus, &targetAttempts); err != nil {
 		t.Fatal(err)
 	}
-	if jobStatus != wantJob || targetStatus != wantTarget || jobAttempts != wantJobAttempts || targetAttempts != wantTargetAttempts {
-		t.Fatalf("retry state job=%s/%d target=%s/%d, want job=%s/%d target=%s/%d",
-			jobStatus, jobAttempts, targetStatus, targetAttempts, wantJob, wantJobAttempts, wantTarget, wantTargetAttempts)
+	if jobStatus != wantJob || targetStatus != wantTarget || jobAttempts != wantJobAttempts || maxAttempts != wantMaxAttempts || targetAttempts != wantTargetAttempts {
+		t.Fatalf("retry state job=%s/%d/%d target=%s/%d, want job=%s/%d/%d target=%s/%d",
+			jobStatus, jobAttempts, maxAttempts, targetStatus, targetAttempts, wantJob, wantJobAttempts, wantMaxAttempts, wantTarget, wantTargetAttempts)
 	}
 }
 

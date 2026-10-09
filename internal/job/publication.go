@@ -45,6 +45,10 @@ func (r *Repository) publishRendition(ctx context.Context, candidate Rendition, 
 	// This row share lock is the outer publication fence. Entering maintenance
 	// must drain it before repair can revalidate or move any path.
 	if _, err := tx.Exec(ctx, `SELECT nmcp_require_normal_maintenance()`); err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == "55000" {
+			return Publication{}, ErrMaintenance
+		}
 		return Publication{}, classifyDatabaseError(err)
 	}
 

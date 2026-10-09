@@ -107,6 +107,7 @@ func TestFailureCodesHaveOnlyFixedSafeMessages(t *testing.T) {
 		FailureProcessOutputLimit: "processing output limit exceeded",
 		FailureLeaseExpired:       "job lease expired",
 		FailureWorkerShutdown:     "worker shut down before completion",
+		FailureMaintenancePaused:  "job publication paused by maintenance",
 	}
 	if len(safeFailureMessages) != len(want) {
 		t.Fatalf("safe message count = %d, want %d", len(safeFailureMessages), len(want))
