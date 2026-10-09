@@ -2207,6 +2207,111 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 	})
 }
 
+func TestCheckerDefinerCatalogFreshAndV17Upgrade(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	for _, mode := range []string{"fresh", "v17_upgrade"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pool := integrationPool(t, databaseURL)
+			migrator, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "v17_upgrade" {
+				partial := *migrator
+				partial.migrations = nil
+				for _, candidate := range migrator.migrations {
+					if candidate.version <= 17 {
+						partial.migrations = append(partial.migrations, candidate)
+					}
+				}
+				if err := partial.Up(ctx); err != nil {
+					t.Fatalf("apply exact v17 prefix: %v", err)
+				}
+			}
+			if err := migrator.Up(ctx); err != nil {
+				t.Fatalf("apply migration 18: %v", err)
+			}
+			assertCheckerDefinerCatalog(t, ctx, pool)
+			assertCheckerTempShadowCannotIntercept(t, ctx, pool)
+		})
+	}
+}
+
+func assertCheckerDefinerCatalog(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	var schema string
+	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	signatures := []string{
+		"nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)",
+		"nmcp_complete_check_source(nmcp_uuid_v4,text,text)",
+		"nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)",
+		"nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)",
+		"nmcp_read_check_database_references(timestamptz)",
+		"nmcp_read_check_attempt_owners()",
+		"nmcp_read_check_report_outcome(nmcp_uuid_v4)",
+	}
+	wantConfig := "search_path=" + schema + ", pg_catalog, pg_temp"
+	for _, signature := range signatures {
+		var owner, config string
+		var securityDefiner, exactACL bool
+		err := pool.QueryRow(ctx, `SELECT owner.rolname,p.prosecdef,array_to_string(p.proconfig,','),(
+			SELECT count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee=checker.oid AND NOT acl.is_grantable)=1
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee<>p.proowner)=1
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee NOT IN (p.proowner,checker.oid))=0
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee<>p.proowner AND acl.is_grantable)=0
+			   AND count(*) FILTER (WHERE acl.privilege_type<>'EXECUTE')=0
+			FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) AS acl
+			CROSS JOIN pg_catalog.pg_roles AS checker WHERE checker.rolname='nmcp_check_runtime')
+		FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_roles AS owner ON owner.oid=p.proowner
+		WHERE p.oid=pg_catalog.to_regprocedure($1)`, signature).Scan(&owner, &securityDefiner, &config, &exactACL)
+		if err != nil {
+			t.Fatalf("checker catalog %s: %v", signature, err)
+		}
+		if owner != "nmcp_check_function_owner" || !securityDefiner || config != wantConfig || !exactACL {
+			t.Fatalf("checker catalog %s owner/definer/config/exact-acl = %s/%t/%q/%t", signature, owner, securityDefiner, config, exactACL)
+		}
+	}
+}
+
+func assertCheckerTempShadowCannotIntercept(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE schema_migrations(version bigint,name text,checksum text,transactional boolean,idempotent boolean,dirty boolean); INSERT INTO schema_migrations VALUES(999,'shadow','shadow',true,false,false)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE nmcp_check_runtime`); err != nil {
+		t.Fatal(err)
+	}
+	reportID := newUUIDv4(t)
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `SELECT nmcp_begin_check_report($1,'all',1::smallint,$2,$2,$2,$2)`, reportID, now); err != nil {
+		t.Fatalf("temp shadow intercepted checker definer: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `RESET ROLE`); err != nil {
+		t.Fatal(err)
+	}
+	var version int64
+	if err := tx.QueryRow(ctx, `SELECT migration_version FROM reconciliation_check_reports WHERE id=$1`, reportID).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 18 {
+		t.Fatalf("checker definer used shadow migration history version %d", version)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func backendHasAdvisoryLocks(t *testing.T, ctx context.Context, verifier *pgxpool.Conn, pid int32) bool {
 	t.Helper()
 	if pid <= 0 || uint32(pid) == verifier.Conn().PgConn().PID() {

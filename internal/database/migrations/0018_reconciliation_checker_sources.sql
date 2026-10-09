@@ -350,7 +350,9 @@ BEGIN
     FOREACH function_signature IN ARRAY ARRAY[
         'nmcp_read_check_database_references(timestamptz)',
         'nmcp_read_check_attempt_owners()',
-        'nmcp_read_check_report_outcome(nmcp_uuid_v4)'
+        'nmcp_read_check_report_outcome(nmcp_uuid_v4)',
+        'nmcp_complete_check_source(nmcp_uuid_v4,text,text)',
+        'nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)'
     ] LOOP
         EXECUTE format('ALTER FUNCTION %I.%s OWNER TO nmcp_check_function_owner',target_schema,function_signature);
         EXECUTE format('ALTER FUNCTION %I.%s SET search_path=%I,pg_catalog,pg_temp',target_schema,function_signature,target_schema);
@@ -369,8 +371,12 @@ GRANT SELECT(attempt_id,sequence,event_type,outcome_code,error_code,observed_siz
     ON reconciliation_repair_events TO nmcp_check_function_owner;
 
 REVOKE ALL ON FUNCTION nmcp_read_check_database_references(timestamptz),
-    nmcp_read_check_attempt_owners(),nmcp_read_check_report_outcome(nmcp_uuid_v4)
+    nmcp_read_check_attempt_owners(),nmcp_read_check_report_outcome(nmcp_uuid_v4),
+    nmcp_complete_check_source(nmcp_uuid_v4,text,text),
+    nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)
 FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_repair_runtime;
 GRANT EXECUTE ON FUNCTION nmcp_read_check_database_references(timestamptz),
-    nmcp_read_check_attempt_owners(),nmcp_read_check_report_outcome(nmcp_uuid_v4)
+    nmcp_read_check_attempt_owners(),nmcp_read_check_report_outcome(nmcp_uuid_v4),
+    nmcp_complete_check_source(nmcp_uuid_v4,text,text),
+    nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)
 TO nmcp_check_runtime;
