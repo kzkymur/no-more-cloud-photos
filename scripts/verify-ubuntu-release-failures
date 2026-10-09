@@ -51,6 +51,15 @@ done
 /usr/bin/printf 'NMCP_DATABASE_URL=postgres://nmcp_worker:worker-secret@127.0.0.1:5432/nmcp?sslmode=disable\nNMCP_LOG_LEVEL=info\nNMCP_SHUTDOWN_TIMEOUT=30s\n' > /etc/nmcp/worker.env
 /usr/bin/chmod 0600 /etc/nmcp/*
 /usr/bin/install -m 0755 "$repo/scripts/run-ubuntu-migration" /usr/local/libexec/nmcp/run-ubuntu-migration
+# Release-transaction tests use deterministic admin stubs. Model the production
+# wrapper's non-root execution here; role graph transitions are covered by the
+# dedicated migration compatibility verifier.
+cat > /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility <<'EOF'
+#!/bin/sh
+exec /usr/sbin/runuser -u nmcp -- "$@"
+EOF
+/usr/bin/chown root:root /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
+/usr/bin/chmod 0755 /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
 /usr/bin/install -m 0755 "$repo/scripts/acquire-ubuntu-deployment-locks" \
   /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks
 /usr/bin/install -m 0755 "$repo/scripts/handoff-ubuntu-migration-lock" \
