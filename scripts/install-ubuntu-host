@@ -171,6 +171,7 @@ tls_link=/etc/nmcp/tls-current.new.$$
 /usr/bin/chown root:root /etc/nmcp-nginx/nginx.conf
 /usr/bin/chmod 0644 /etc/nmcp-nginx/nginx.conf
 
+/usr/bin/install -d -o root -g root -m 0755 /etc/sysusers.d /etc/tmpfiles.d
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf" /etc/sysusers.d/nmcp.conf
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/tmpfiles.d/nmcp.conf" /etc/tmpfiles.d/nmcp.conf
 /usr/bin/systemd-sysusers /etc/sysusers.d/nmcp.conf
