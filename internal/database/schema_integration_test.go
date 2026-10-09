@@ -1729,7 +1729,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		cutoff := snapshotStarted.Add(time.Second)
 		snapshotEnded := cutoff.Add(time.Second)
 		scanStarted := snapshotEnded.Add(time.Second)
-		if _, err := pool.Exec(ctx, `SELECT nmcp_begin_check_report($1,'all',1,$2,$3,$4,$5)`,
+		if _, err := pool.Exec(ctx, `SELECT nmcp_begin_check_report($1,'all',1::smallint,$2,$3,$4,$5)`,
 			reportID, snapshotStarted, cutoff, snapshotEnded, scanStarted); err != nil {
 			t.Fatalf("begin normalized check report: %v", err)
 		}

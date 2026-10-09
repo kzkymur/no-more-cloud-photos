@@ -916,7 +916,7 @@ func insertCleanupRenditions(t *testing.T, pool *pgxpool.Pool, seed int, candida
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	insert := func(jobID, targetID, renditionID, profileID, relativePath string, current bool, purgeAfter *time.Time, sha string) {
+	insert := func(jobID, targetID, renditionID, profileID, leaseToken, relativePath string, current bool, purgeAfter *time.Time, sha string) {
 		t.Helper()
 		if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts,available_at,created_at,updated_at)
 			VALUES ($1,'transform',$2,$3,'queued',3,$4,$4,$4)`, jobID, originalID, mediaID, now); err != nil {
@@ -925,7 +925,7 @@ func insertCleanupRenditions(t *testing.T, pool *pgxpool.Pool, seed int, candida
 		if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status,updated_at) VALUES ($1,$2,$3,'pending',$4)`, targetID, jobID, profileID, now); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=$3,started_at=$4,updated_at=$4 WHERE id=$1`, jobID, integrationUUID(seed+9+len(relativePath)), now.Add(time.Hour), now); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=$3,started_at=$4,updated_at=$4 WHERE id=$1`, jobID, leaseToken, now.Add(time.Hour), now); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE job_targets SET status='succeeded',attempts=1,updated_at=$2 WHERE id=$1`, targetID, now); err != nil {
@@ -940,12 +940,12 @@ func insertCleanupRenditions(t *testing.T, pool *pgxpool.Pool, seed int, candida
 			t.Fatal(err)
 		}
 	}
-	insert(integrationUUID(seed+4), fixture.targetID, fixture.renditionID, profileIDs[candidateVersion], fixture.relativePath, candidateCurrent, candidateDeadline, strings.Repeat("a", 64))
+	insert(integrationUUID(seed+4), fixture.targetID, fixture.renditionID, profileIDs[candidateVersion], integrationUUID(seed+10), fixture.relativePath, candidateCurrent, candidateDeadline, strings.Repeat("a", 64))
 	if !candidateCurrent {
 		currentTargetID := integrationUUID(seed + 7)
 		currentRenditionID := integrationUUID(seed + 9)
 		currentPath := "renditions/" + originalID[:2] + "/" + originalID + "/" + currentTargetID + "/" + currentRenditionID + ".avif"
-		insert(integrationUUID(seed+5), currentTargetID, currentRenditionID, profileIDs[currentVersion], currentPath, true, nil, strings.Repeat("b", 64))
+		insert(integrationUUID(seed+5), currentTargetID, currentRenditionID, profileIDs[currentVersion], integrationUUID(seed+11), currentPath, true, nil, strings.Repeat("b", 64))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)

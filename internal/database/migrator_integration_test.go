@@ -826,9 +826,26 @@ func TestMigratorIntegration(t *testing.T) {
 			if _, err := configBlocker.Exec(raceCtx, `LOCK TABLE system_config IN ACCESS EXCLUSIVE MODE`); err != nil {
 				t.Fatal(err)
 			}
+			// Version six predates the narrow maintenance function used by the
+			// current repository. Model the legacy Delete lock prefix explicitly;
+			// the migration race under test is maintenance -> Media -> config.
 			deleteResult := make(chan error, 1)
 			go func() {
-				_, err := repository.Delete(raceCtx, mediaID)
+				tx, err := pool.Begin(raceCtx)
+				if err == nil {
+					_, err = tx.Exec(raceCtx, `SELECT 1 FROM maintenance_state WHERE id=1 AND mode='normal' FOR SHARE`)
+				}
+				if err == nil {
+					_, err = tx.Exec(raceCtx, `SELECT 1 FROM media WHERE id=$1 FOR UPDATE`, mediaID)
+				}
+				if err == nil {
+					_, err = tx.Exec(raceCtx, `SELECT 1 FROM system_config WHERE id=1 FOR SHARE`)
+				}
+				if err == nil {
+					err = tx.Commit(raceCtx)
+				} else if tx != nil {
+					_ = tx.Rollback(context.Background())
+				}
 				deleteResult <- err
 			}()
 			// Waiting for config proves Delete acquired the maintenance prefix and
@@ -844,10 +861,13 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := awaitContextResult(t, raceCtx, deleteResult); err != nil {
-				t.Fatalf("Delete after config release: %v", err)
+				t.Fatalf("legacy Delete lock prefix after config release: %v", err)
 			}
 			if err := awaitContextResult(t, raceCtx, migrationResult); err != nil {
 				t.Fatalf("migration after Delete: %v", err)
+			}
+			if _, err := repository.Delete(raceCtx, mediaID); err != nil {
+				t.Fatalf("Delete after migration: %v", err)
 			}
 			var deleted bool
 			var migratedVersion int64

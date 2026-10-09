@@ -452,7 +452,9 @@ func insertIntegrationRenditionForProfile(t *testing.T, pool *pgxpool.Pool, medi
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	leaseID := integrationUUID(9001)
+	// A storage-attempt token identifies one exact transform claim globally;
+	// using the same fixture token for multiple Jobs hides that invariant.
+	leaseID := jobID
 	path := "renditions/" + media.OriginalID[:2] + "/" + media.OriginalID + "/" + targetID + "/" + renditionID + ".avif"
 	statements := []struct {
 		query string

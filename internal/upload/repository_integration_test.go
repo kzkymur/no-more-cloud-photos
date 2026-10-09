@@ -48,7 +48,8 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatalf("row counts media/original/job/event = %d/%d/%d/%d", mediaCount, originalCount, jobCount, eventCount)
 	}
 
-	replay, err := repository.Finalize(ctx, input, func() (string, error) {
+	replayInput := freshReplayAcceptance(t, repository, input)
+	replay, err := repository.Finalize(ctx, replayInput, func() (string, error) {
 		t.Fatal("replay published")
 		return "", nil
 	})
@@ -56,7 +57,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatalf("replay=%+v err=%v", replay, err)
 	}
 
-	conflictInput := input
+	conflictInput := freshReplayAcceptance(t, repository, input)
 	conflictInput.RequestHash = sha256.Sum256([]byte("different request"))
 	conflict, err := repository.Finalize(ctx, conflictInput, func() (string, error) {
 		t.Fatal("conflict published")
@@ -76,8 +77,9 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		!bytesContain(duplicate.Body, `"request_id":"duplicate-request"`) {
 		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
 	}
-	duplicateInput.RequestID = "current-replay-request"
-	duplicateReplay, err := repository.Finalize(ctx, duplicateInput, func() (string, error) {
+	duplicateReplayInput := freshReplayAcceptance(t, repository, duplicateInput)
+	duplicateReplayInput.RequestID = "current-replay-request"
+	duplicateReplay, err := repository.Finalize(ctx, duplicateReplayInput, func() (string, error) {
 		t.Fatal("duplicate replay published")
 		return "", nil
 	})
@@ -148,8 +150,13 @@ func TestRepositoryIntegrationConcurrentSameKeyReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := integrationAcceptance(t, "concurrent-replay", "replay-request", timezone, []byte("concurrent-replay-content"), testUUIDs[0], testUUIDs[1])
-	registerIntegrationAcceptance(t, repository, input)
+	inputs := []acceptance{
+		integrationAcceptance(t, "concurrent-replay", "replay-request", timezone, []byte("concurrent-replay-content"), testUUIDs[0], testUUIDs[1]),
+		integrationAcceptance(t, "concurrent-replay", "replay-request", timezone, []byte("concurrent-replay-content"), testUUIDs[2], testUUIDs[3]),
+	}
+	for _, input := range inputs {
+		registerIntegrationAcceptance(t, repository, input)
+	}
 	type result struct {
 		outcome Outcome
 		err     error
@@ -162,19 +169,19 @@ func TestRepositoryIntegrationConcurrentSameKeyReplay(t *testing.T) {
 	var publishes atomic.Int32
 	var ready sync.WaitGroup
 	ready.Add(2)
-	for range 2 {
-		go func() {
+	for index := range inputs {
+		go func(index int) {
 			ready.Done()
 			<-start
 			calling <- struct{}{}
-			outcome, err := repository.Finalize(ctx, input, func() (string, error) {
+			outcome, err := repository.Finalize(ctx, inputs[index], func() (string, error) {
 				publishes.Add(1)
 				publishReached <- struct{}{}
 				<-releasePublish
 				return "originals/00/concurrent-replay/original.jpg", nil
 			})
 			results <- result{outcome: outcome, err: err}
-		}()
+		}(index)
 	}
 	ready.Wait()
 	close(start)
@@ -418,6 +425,22 @@ func registerIntegrationAcceptance(t *testing.T, repository *pgRepository, input
 	if err := repository.RegisterAttempt(context.Background(), input.AttemptID, input.OriginalID); err != nil {
 		t.Fatalf("register upload attempt: %v", err)
 	}
+}
+
+func freshReplayAcceptance(t *testing.T, repository *pgRepository, input acceptance) acceptance {
+	t.Helper()
+	var err error
+	if input.OriginalID, err = NewUUIDv4(); err != nil {
+		t.Fatal(err)
+	}
+	if input.AttemptID, err = NewUUIDv4(); err != nil {
+		t.Fatal(err)
+	}
+	if input.MediaID, err = NewUUIDv4(); err != nil {
+		t.Fatal(err)
+	}
+	registerIntegrationAcceptance(t, repository, input)
+	return input
 }
 
 func bytesContain(body []byte, value string) bool { return strings.Contains(string(body), value) }
