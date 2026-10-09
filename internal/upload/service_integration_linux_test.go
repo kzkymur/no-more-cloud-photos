@@ -5,13 +5,50 @@ package upload
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 type notifyingFinalizeRepository struct {
 	acceptanceRepository
 	started chan struct{}
+}
+
+func TestServiceSurfacesRealStoreAbortDirectorySyncUncertaintyIntegration(t *testing.T) {
+	fault := errors.New("injected abort directory sync failure")
+	store, err := storage.Open(t.TempDir(), storage.Options{Faults: storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+		if event.Boundary == storage.BoundaryDeleteDirectorySync && event.Phase == storage.Before {
+			return fault
+		}
+		return nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	terminals := make([]string, 0, 1)
+	repository := &fakeAcceptanceRepository{
+		timezone: "UTC",
+		finalize: func(context.Context, acceptance, func() (string, error)) (Outcome, error) {
+			return Outcome{Status: 201, Replayed: true}, nil
+		},
+		complete: func(_ context.Context, _ string, terminal string) error {
+			terminals = append(terminals, terminal)
+			return nil
+		},
+	}
+	service := testService(storageAdapter{store}, &fakeMetadataProber{result: validMetadata()}, repository)
+	outcome, err := service.Accept(context.Background(), validRequest(bytes.NewBufferString("abort-uncertainty")))
+	if outcome.Status != 201 || !outcome.Replayed || !errors.Is(err, fault) ||
+		!errors.Is(err, storage.ErrOutcomeUncertain) || !errors.Is(err, storage.ErrDurability) {
+		t.Fatalf("Accept() = %+v, %#v; want surfaced real-store abort uncertainty", outcome, err)
+	}
+	if len(terminals) != 1 || terminals[0] != "aborted" {
+		t.Fatalf("terminal history = %v, want aborted", terminals)
+	}
 }
 
 func (r notifyingFinalizeRepository) Finalize(ctx context.Context, input acceptance, publish func() (string, error)) (Outcome, error) {

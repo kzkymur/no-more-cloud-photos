@@ -11,6 +11,8 @@ import (
 	"io"
 	"os"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,6 +134,40 @@ func TestServiceAcceptReplayAbortsWithoutPublish(t *testing.T) {
 	}
 	if !outcome.Replayed || string(outcome.Body) != `{"future":1}` || !temporary.aborted || temporary.published {
 		t.Fatalf("outcome/temp = %+v, aborted=%v published=%v", outcome, temporary.aborted, temporary.published)
+	}
+}
+
+func TestServiceAcceptSurfacesAbortFailuresAndCompletesAttempt(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "definite unlink failure", err: errors.Join(storage.ErrPermission, errors.New("unlink denied"))},
+		{name: "directory fsync outcome uncertain", err: errors.Join(storage.ErrOutcomeUncertain, storage.ErrDurability, errors.New("directory fsync failed"))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			temporary := &fakeStagedOriginal{abortErr: test.err}
+			terminals := make([]string, 0, 1)
+			repository := &fakeAcceptanceRepository{
+				timezone: "UTC",
+				finalize: func(context.Context, acceptance, func() (string, error)) (Outcome, error) {
+					return Outcome{Status: 201, Replayed: true}, nil
+				},
+				complete: func(_ context.Context, _ string, terminal string) error {
+					terminals = append(terminals, terminal)
+					return nil
+				},
+			}
+			service := testService(&fakeOriginalStore{temporary: temporary}, &fakeMetadataProber{result: validMetadata()}, repository)
+			outcome, err := service.Accept(context.Background(), validRequest(strings.NewReader("payload")))
+			var failure *Failure
+			if outcome.Status != 201 || !outcome.Replayed || !errors.Is(err, test.err) || !errors.As(err, &failure) || failure.Code != "unavailable" {
+				t.Fatalf("Accept() = %+v, %#v; want replay plus surfaced abort failure", outcome, err)
+			}
+			if !temporary.aborted || temporary.published || !slices.Equal(terminals, []string{"aborted"}) {
+				t.Fatalf("temporary/terminal = aborted=%v published=%v terminals=%v", temporary.aborted, temporary.published, terminals)
+			}
+		})
 	}
 }
 
@@ -479,6 +515,7 @@ type fakeStagedOriginal struct {
 	writeErr        error
 	sealErr         error
 	publishErr      error
+	abortErr        error
 	publishKey      string
 	sealCalls       int
 	publishCalls    int
@@ -552,7 +589,7 @@ func (f *fakeStagedOriginal) PublishSealed(_ context.Context, _ storage.Original
 func (f *fakeStagedOriginal) Abort(context.Context) error {
 	appendEvent(f.events, "abort")
 	f.aborted = true
-	return nil
+	return f.abortErr
 }
 
 type fakeMetadataProber struct {

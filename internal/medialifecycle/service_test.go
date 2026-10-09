@@ -20,6 +20,7 @@ type stubRepository struct {
 	reclaimed     []string
 	startErrors   []error
 	startedIDs    []string
+	cleanupID     string
 	err           error
 	calls         int
 }
@@ -90,6 +91,21 @@ func (r *stubRepository) HeartbeatPurge(context.Context, string, string) (time.T
 }
 func (r *stubRepository) FinishPurgeAttempt(context.Context, string, string, string) error {
 	return r.err
+}
+func (r *stubRepository) CleanupNextRendition(context.Context, string, []string, func(context.Context, string, string, int64) (bool, error)) (string, error) {
+	r.calls++
+	return r.cleanupID, r.err
+}
+
+func TestCleanupNextRenditionPreservesSelectedIDOnDatabaseFailure(t *testing.T) {
+	repository := &stubRepository{cleanupID: unitMediaID, err: &pgconn.PgError{Code: "08006"}}
+	service := newService(repository)
+	id, err := service.CleanupNextRendition(context.Background(), "", nil, func(context.Context, string, string, int64) (bool, error) {
+		return false, nil
+	})
+	if id != unitMediaID || !IsKind(err, KindDatabaseUnavailable) {
+		t.Fatalf("CleanupNextRendition() = %q, %#v; want selected ID and database unavailable", id, err)
+	}
 }
 
 func TestServiceRejectsInvalidIDBeforeRepository(t *testing.T) {

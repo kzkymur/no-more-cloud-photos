@@ -235,6 +235,13 @@ func (r *TransformClaimer) PublishRendition(ctx context.Context, candidate Rendi
 	return r.repository.PublishRendition(ctx, candidate)
 }
 
+func (r *TransformClaimer) PublishRenditionFile(ctx context.Context, candidate Rendition, publish func() (int64, string, error)) (Publication, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return Publication{}, ErrInvalid
+	}
+	return r.repository.PublishRenditionFile(ctx, candidate, publish)
+}
+
 // ClaimableTransformProfiles returns the exact profile definitions that this
 // repository may expose through a transform claim. Active profiles are joined
 // by retired profiles already pinned by queued or running work.

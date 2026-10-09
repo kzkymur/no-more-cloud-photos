@@ -35,7 +35,7 @@ const (
 type Repository interface {
 	BeginTarget(context.Context, string, string, string) error
 	MarkTargetFailed(context.Context, string, string, string, job.FailureCode) error
-	PublishRendition(context.Context, job.Rendition) (job.Publication, error)
+	PublishRenditionFile(context.Context, job.Rendition, func() (int64, string, error)) (job.Publication, error)
 }
 
 type Temporary interface {
@@ -271,24 +271,28 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 	if err := original.Verify(ctx); err != nil {
 		return true, 0, cancellationCause(ctx, err)
 	}
-	info, err := temporary.Publish(ctx, storage.Validation{ExpectedSize: -1})
-	if err != nil {
-		var publishError *storage.PublishError
-		if errors.As(err, &publishError) && publishError.Published {
-			published = true
-		}
-		return true, 0, err
-	}
-	published = true
-	if info.Size < 0 || generatedBytes > math.MaxInt64-info.Size {
-		return false, info.Size, job.ErrInvariant
-	}
 	width, height := transformed.width, transformed.height
-	_, err = executor.repository.PublishRendition(ctx, job.Rendition{
+	var info storage.ObjectInfo
+	_, err = executor.repository.PublishRenditionFile(ctx, job.Rendition{
 		ID: renditionIDText, JobID: lease.ID, LeaseToken: lease.Token, TargetID: target.ID,
 		OriginalID: lease.Original.ID, MediaID: lease.MediaID, ProfileID: target.Profile.ID,
 		RelativePath: key.String(), MIMEType: transformed.mimeType, Width: &width, Height: &height,
-		DurationMS: transformed.durationMS, SizeBytes: info.Size, SHA256: hex.EncodeToString(info.SHA256[:]), ProcessorAudit: audit,
+		DurationMS: transformed.durationMS, ProcessorAudit: audit,
+	}, func() (int64, string, error) {
+		var publishErr error
+		info, publishErr = temporary.Publish(ctx, storage.Validation{ExpectedSize: -1})
+		if publishErr != nil {
+			var storageError *storage.PublishError
+			if errors.As(publishErr, &storageError) && storageError.Published {
+				published = true
+			}
+			return 0, "", publishErr
+		}
+		published = true
+		if info.Size < 0 || generatedBytes > math.MaxInt64-info.Size {
+			return 0, "", job.ErrInvariant
+		}
+		return info.Size, hex.EncodeToString(info.SHA256[:]), nil
 	})
 	if err != nil {
 		return false, info.Size, cancellationCause(ctx, err)

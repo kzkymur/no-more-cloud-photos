@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +91,240 @@ func TestExecutorRealPostgreSQLCommitBoundariesIntegration(t *testing.T) {
 	})
 }
 
+func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
+	t.Run("publication share lock drains before maintenance", func(t *testing.T) {
+		enteredRename := make(chan struct{})
+		releaseRename := make(chan struct{})
+		var armed atomic.Bool
+		faults := storage.FaultInjectorFunc(func(ctx context.Context, event storage.FaultEvent) error {
+			if armed.Load() && event.Boundary == storage.BoundaryRename && event.Phase == storage.Before {
+				select {
+				case <-enteredRename:
+				default:
+					close(enteredRename)
+				}
+				select {
+				case <-releaseRename:
+					return nil
+				case <-ctx.Done():
+					return context.Cause(ctx)
+				}
+			}
+			return nil
+		})
+		pool, repository, store, root := executorIntegrationDependenciesWithFault(t, nil, faults)
+		jobID, targets := seedExecutorTransform(t, pool, store, 1)
+		lease, err := repository.Claim(context.Background(), []job.Type{job.TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		executor := integrationExecutor(t, repository, store, &fakeProcessors{}, []string{renderOne})
+		repair := prepareRenditionRepair(t, pool, lease, targets[0], renderOne, []byte("still"))
+		armed.Store(true)
+		publication := make(chan error, 1)
+		go func() { publication <- executor.Execute(context.Background(), lease, executionLimits()) }()
+		select {
+		case <-enteredRename:
+		case <-time.After(5 * time.Second):
+			t.Fatal("publication did not reach filesystem callback")
+		}
+		maintenance := make(chan error, 1)
+		go func() {
+			_, err := pool.Exec(context.Background(), `UPDATE maintenance_state SET mode='maintenance',reason='publication drain',owner='test',entered_at=clock_timestamp() WHERE id=1`)
+			maintenance <- err
+		}()
+		select {
+		case err := <-maintenance:
+			t.Fatalf("maintenance did not drain publication share holder: %v", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+		close(releaseRename)
+		if err := <-publication; err != nil {
+			t.Fatalf("publication error = %v", err)
+		}
+		if err := <-maintenance; err != nil {
+			t.Fatalf("enter maintenance: %v", err)
+		}
+		assertIntegrationRendition(t, root, lease.Original.ID, targets[0], renderOne, "still")
+		assertExecutorPublicationState(t, pool, jobID, targets[0], 1, 1, "succeeded", "succeeded")
+		beginRepairAttempt(t, pool, repair)
+		tx, err := pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, applyErr := tx.Exec(context.Background(), `SELECT nmcp_append_repair_event($1,$2,'applying','applying',NULL,NULL,NULL)`, integrationUUID(t), repair.attemptID)
+		_ = tx.Rollback(context.Background())
+		if applyErr == nil {
+			t.Fatal("repair applying ignored the newly committed rendition reference")
+		}
+	})
+
+	t.Run("maintenance winner rejects before filesystem rename", func(t *testing.T) {
+		renameCalled := make(chan struct{}, 1)
+		var armed atomic.Bool
+		faults := storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+			if armed.Load() && event.Boundary == storage.BoundaryRename && event.Phase == storage.Before {
+				renameCalled <- struct{}{}
+			}
+			return nil
+		})
+		pool, repository, store, root := executorIntegrationDependenciesWithFault(t, nil, faults)
+		jobID, targets := seedExecutorTransform(t, pool, store, 1)
+		lease, err := repository.Claim(context.Background(), []job.Type{job.TypeTransform})
+		if err != nil {
+			t.Fatal(err)
+		}
+		orphanKey := renditionIntegrationKey(t, lease.Original.ID, targets[0], renderOne)
+		orphanPayload := []byte("orphan")
+		orphanTemp, err := store.BeginRendition(context.Background(), orphanKey, mustIntegrationAttempt(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := orphanTemp.Write(orphanPayload); err != nil {
+			t.Fatal(err)
+		}
+		orphanDigest := sha256.Sum256(orphanPayload)
+		if _, err := orphanTemp.Publish(context.Background(), storage.Validation{ExpectedSize: int64(len(orphanPayload)), ExpectedSHA256: &orphanDigest}); err != nil {
+			t.Fatal(err)
+		}
+		repair := prepareRenditionRepair(t, pool, lease, targets[0], renderOne, orphanPayload)
+		if _, err := pool.Exec(context.Background(), `UPDATE maintenance_state SET mode='maintenance',reason='repair wins',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+			t.Fatal(err)
+		}
+		armed.Store(true)
+		executor := integrationExecutor(t, repository, store, &fakeProcessors{}, []string{renderOne})
+		if err := executor.Execute(context.Background(), lease, executionLimits()); err == nil {
+			t.Fatal("publication succeeded while maintenance held the barrier")
+		}
+		select {
+		case <-renameCalled:
+			t.Fatal("maintenance winner allowed filesystem rename")
+		default:
+		}
+		assertExecutorPublicationState(t, pool, jobID, targets[0], 0, 0, "running", "pending")
+		beginRepairAttempt(t, pool, repair)
+		tx, err := pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(context.Background())
+		appendRepairEvent(t, tx, repair.attemptID, "applying", "applying", nil, nil)
+		size := int64(len(orphanPayload))
+		shaText := hex.EncodeToString(orphanDigest[:])
+		appendRepairEvent(t, tx, repair.attemptID, "revalidated", "matched", &size, &shaText)
+		quarantine, err := storage.ParseQuarantineKey(".quarantine/" + repair.quarantineID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.QuarantineRendition(context.Background(), orphanKey, storage.DeleteExpectation{ExpectedSize: size}, quarantine); err != nil {
+			t.Fatal(err)
+		}
+		appendRepairEvent(t, tx, repair.attemptID, "rename", "renamed", nil, nil)
+		appendRepairEvent(t, tx, repair.attemptID, "source_directory_fsync", "durable", nil, nil)
+		appendRepairEvent(t, tx, repair.attemptID, "destination_directory_fsync", "durable", nil, nil)
+		appendRepairEvent(t, tx, repair.attemptID, "completed", "quarantined", &size, &shaText)
+		if err := tx.Commit(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(root, "renditions", lease.Original.ID[:2], lease.Original.ID, targets[0], renderOne+".avif")
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("repair source still exists: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(root, ".quarantine", repair.quarantineID)); err != nil {
+			t.Fatalf("read quarantined orphan: %v", err)
+		}
+	})
+}
+
+type integrationRepair struct {
+	runID, itemID, attemptID, quarantineID string
+}
+
+func prepareRenditionRepair(t *testing.T, pool *pgxpool.Pool, lease job.Lease, targetID, renditionID string, payload []byte) integrationRepair {
+	t.Helper()
+	repair := integrationRepair{runID: integrationUUID(t), itemID: integrationUUID(t), attemptID: integrationUUID(t), quarantineID: integrationUUID(t)}
+	reportID, findingID := integrationUUID(t), integrationUUID(t)
+	path := "renditions/" + lease.Original.ID[:2] + "/" + lease.Original.ID + "/" + targetID + "/" + renditionID + ".avif"
+	digest := sha256.Sum256(payload)
+	shaText := hex.EncodeToString(digest[:])
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_reports(
+		id,format_version,classifier_version,scope,migration_version,migration_name,migration_checksum,
+		db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at)
+		SELECT $1,1,1,'all',version,name,checksum,statement_timestamp()-interval '5 seconds',statement_timestamp()-interval '4 seconds',
+		statement_timestamp()-interval '3 seconds',statement_timestamp()-interval '2 seconds',statement_timestamp()-interval '48 hours 4 seconds'
+		FROM schema_migrations ORDER BY version DESC LIMIT 1`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_source_results(report_id,source,result)
+		SELECT $1,source,'complete' FROM unnest(ARRAY['database_references','attempt_owners','storage_scan']) AS source`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_findings(
+		id,report_id,ordinal,kind,reason_code,actionability,subject_type,subject_id,media_id,job_id,job_target_id,
+		relative_key,expected_state,observed_type,observed_size_bytes,observed_sha256,observed_mtime,observed_ctime,observed_at)
+		VALUES($1,$2,1,'final_orphan','publication_race','repairable','rendition',$3,$4,$5,$6,$7,'unreferenced','regular',$8,$9,
+		clock_timestamp()-interval '3 seconds',clock_timestamp()-interval '3 seconds',clock_timestamp()-interval '1 second')`,
+		findingID, reportID, renditionID, lease.MediaID, lease.ID, targetID, path, len(payload), shaText); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at)
+		VALUES($1,1,clock_timestamp()-interval '1 second')`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT nmcp_begin_repair_run($1,$2,$3,'integration-test')`, repair.runID, reportID, integrationUUID(t)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT nmcp_prepare_repair_manifest_item($1,$2,$3,$4)`, repair.itemID, repair.runID, findingID, repair.quarantineID); err != nil {
+		t.Fatal(err)
+	}
+	return repair
+}
+
+func beginRepairAttempt(t *testing.T, pool *pgxpool.Pool, repair integrationRepair) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `SELECT nmcp_begin_repair_attempt($1,$2,$3)`, repair.attemptID, repair.itemID, integrationUUID(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendRepairEvent(t *testing.T, tx pgx.Tx, attemptID, eventType, outcome string, size *int64, sha *string) {
+	t.Helper()
+	if _, err := tx.Exec(context.Background(), `SELECT nmcp_append_repair_event($1,$2,$3,$4,NULL,$5,$6)`, integrationUUID(t), attemptID, eventType, outcome, size, sha); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func renditionIntegrationKey(t *testing.T, originalID, targetID, renditionID string) storage.RenditionKey {
+	t.Helper()
+	original, err := storage.ParseOriginalID(originalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := storage.ParseJobTargetID(targetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendition, err := storage.ParseRenditionID(renditionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := storage.NewRenditionKey(original, target, rendition, storage.RenditionAVIF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func mustIntegrationAttempt(t *testing.T) storage.AttemptID {
+	t.Helper()
+	attempt, err := storage.ParseAttemptID(integrationUUID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return attempt
+}
+
 func TestExecutorPartialRetryOnlyRunsFailedTargetIntegration(t *testing.T) {
 	pool, repository, store, root := executorIntegrationDependencies(t, nil)
 	jobID, targets := seedExecutorTransform(t, pool, store, 2)
@@ -153,6 +388,10 @@ func TestExecutorPartialRetryOnlyRunsFailedTargetIntegration(t *testing.T) {
 type jobCheckpoint func(context.Context, storage.Boundary, string) error
 
 func executorIntegrationDependencies(t *testing.T, checkpoint func(*storage.Store) jobCheckpoint) (*pgxpool.Pool, *job.TransformClaimer, *storage.Store, string) {
+	return executorIntegrationDependenciesWithFault(t, checkpoint, nil)
+}
+
+func executorIntegrationDependenciesWithFault(t *testing.T, checkpoint func(*storage.Store) jobCheckpoint, faults storage.FaultInjector) (*pgxpool.Pool, *job.TransformClaimer, *storage.Store, string) {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -204,7 +443,7 @@ func executorIntegrationDependencies(t *testing.T, checkpoint func(*storage.Stor
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	store := openExecutorStore(t, root, nil)
+	store := openExecutorStore(t, root, faults)
 	options := job.Options{
 		FileBaseURL: "https://files.example.test/files/",
 		Jitter:      func(time.Duration) time.Duration { return 0 },

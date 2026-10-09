@@ -117,6 +117,12 @@ CREATE TABLE reconciliation_check_findings (
     )),
     CHECK (actionability<>'repairable' OR kind<>'final_orphan' OR (
         expected_state='unreferenced' AND subject_type IN ('original','rendition') AND attempt_id IS NULL
+    )),
+    CHECK (actionability<>'repairable' OR subject_type<>'rendition' OR (
+        media_id IS NOT NULL AND job_id IS NOT NULL AND job_target_id IS NOT NULL
+    )),
+    CHECK (actionability<>'repairable' OR subject_type<>'rendition_attempt_temp' OR (
+        media_id IS NOT NULL AND job_id IS NOT NULL AND job_target_id IS NOT NULL AND attempt_id IS NOT NULL
     ))
 );
 CREATE INDEX reconciliation_check_findings_page_idx ON reconciliation_check_findings(report_id,ordinal);
@@ -157,6 +163,10 @@ CREATE TABLE reconciliation_repair_manifest_items (
     source_report_id nmcp_uuid_v4 NOT NULL,
     finding_id nmcp_uuid_v4 NOT NULL,
     quarantine_id nmcp_uuid_v4 NOT NULL UNIQUE,
+    media_id nmcp_uuid_v4,
+    job_id nmcp_uuid_v4,
+    job_target_id nmcp_uuid_v4,
+    storage_attempt_id nmcp_uuid_v4,
     source_type text NOT NULL CHECK (source_type IN (
         'original_final','rendition_final','original_attempt_temp','rendition_attempt_temp'
     )),
@@ -171,7 +181,13 @@ CREATE TABLE reconciliation_repair_manifest_items (
     UNIQUE(source_relative_key),
     FOREIGN KEY(run_id,source_report_id) REFERENCES reconciliation_repair_runs(id,source_report_id) ON DELETE RESTRICT,
     FOREIGN KEY(source_report_id,finding_id) REFERENCES reconciliation_check_findings(report_id,id) ON DELETE RESTRICT,
-    CHECK (destination_relative_key='.quarantine/'||quarantine_id::text)
+    CHECK (destination_relative_key='.quarantine/'||quarantine_id::text),
+    CHECK ((source_type='original_final' AND storage_attempt_id IS NULL)
+        OR (source_type='rendition_final' AND media_id IS NOT NULL AND job_id IS NOT NULL
+            AND job_target_id IS NOT NULL AND storage_attempt_id IS NULL)
+        OR (source_type='original_attempt_temp' AND storage_attempt_id IS NOT NULL)
+        OR (source_type='rendition_attempt_temp' AND media_id IS NOT NULL AND job_id IS NOT NULL
+            AND job_target_id IS NOT NULL AND storage_attempt_id IS NOT NULL))
 );
 CREATE INDEX reconciliation_repair_manifest_report_idx
 ON reconciliation_repair_manifest_items(source_report_id,finding_id);
@@ -306,6 +322,10 @@ BEGIN
       WHEN 'rendition_attempt_temp' THEN 'rendition_attempt_temp'
       ELSE NULL END;
     IF NEW.source_type IS DISTINCT FROM expected_source_type
+       OR NEW.media_id IS DISTINCT FROM finding.media_id
+       OR NEW.job_id IS DISTINCT FROM finding.job_id
+       OR NEW.job_target_id IS DISTINCT FROM finding.job_target_id
+       OR NEW.storage_attempt_id IS DISTINCT FROM finding.attempt_id
        OR NEW.source_relative_key IS DISTINCT FROM finding.relative_key
        OR NEW.expected_size_bytes IS DISTINCT FROM finding.observed_size_bytes
        OR NEW.report_observed_sha256 IS DISTINCT FROM finding.observed_sha256
@@ -372,20 +392,24 @@ BEGIN
     IF NEW.event_type IN ('applying','completed') THEN
         PERFORM 1 FROM maintenance_state WHERE id=1 AND mode='maintenance' FOR SHARE;
         IF NOT FOUND THEN RAISE EXCEPTION 'repair applying requires maintenance mode' USING ERRCODE='55000'; END IF;
-        IF EXISTS (SELECT 1 FROM reconciliation_check_findings WHERE id=item.finding_id AND media_id IS NOT NULL) THEN
-            PERFORM 1 FROM media WHERE id=(SELECT media_id FROM reconciliation_check_findings WHERE id=item.finding_id) FOR UPDATE;
+        IF item.media_id IS NOT NULL THEN
+            PERFORM 1 FROM media WHERE id=item.media_id FOR UPDATE;
+            IF NOT FOUND THEN RAISE EXCEPTION 'repair media authority disappeared' USING ERRCODE='23514'; END IF;
         END IF;
-        PERFORM 1 FROM jobs WHERE id IN (
-            SELECT f.job_id FROM reconciliation_check_findings AS f WHERE f.id=item.finding_id AND f.job_id IS NOT NULL
-            UNION
-            SELECT a.job_id FROM reconciliation_check_findings AS f
-              JOIN storage_attempts AS a ON a.id=f.attempt_id
-              WHERE f.id=item.finding_id AND a.job_id IS NOT NULL
-            UNION
-            SELECT j.id FROM reconciliation_check_findings AS f
-              JOIN jobs AS j ON j.media_id_snapshot=f.media_id
-              WHERE f.id=item.finding_id AND f.media_id IS NOT NULL
-        ) ORDER BY id FOR UPDATE;
+        IF item.job_id IS NOT NULL THEN
+            PERFORM 1 FROM jobs WHERE id=item.job_id FOR UPDATE;
+            IF NOT FOUND THEN RAISE EXCEPTION 'repair job authority disappeared' USING ERRCODE='23514'; END IF;
+        END IF;
+        IF item.job_target_id IS NOT NULL THEN
+            PERFORM 1 FROM job_targets WHERE id=item.job_target_id
+              AND (item.job_id IS NULL OR job_id=item.job_id) FOR UPDATE;
+            IF NOT FOUND THEN RAISE EXCEPTION 'repair target authority disappeared' USING ERRCODE='23514'; END IF;
+        END IF;
+        IF item.storage_attempt_id IS NOT NULL THEN
+            PERFORM 1 FROM storage_attempts WHERE id=item.storage_attempt_id
+              AND (item.job_id IS NULL OR job_id=item.job_id) FOR UPDATE;
+            IF NOT FOUND THEN RAISE EXCEPTION 'repair storage attempt authority disappeared' USING ERRCODE='23514'; END IF;
+        END IF;
         PERFORM 1 FROM originals WHERE relative_path=item.source_relative_key FOR UPDATE;
         IF FOUND THEN RAISE EXCEPTION 'repair source became referenced' USING ERRCODE='23514'; END IF;
         PERFORM 1 FROM renditions WHERE relative_path=item.source_relative_key FOR UPDATE;
@@ -396,7 +420,8 @@ BEGIN
              JOIN storage_attempts AS a ON a.id=f.attempt_id AND a.coverage='native'
              JOIN LATERAL (SELECT event_type FROM storage_attempt_events
                WHERE attempt_id=a.id ORDER BY sequence DESC LIMIT 1) AS latest ON true
-             WHERE f.id=item.finding_id AND latest.event_type IN ('aborted','released','expired')
+          WHERE f.id=item.finding_id AND a.id=item.storage_attempt_id
+            AND latest.event_type IN ('aborted','released','expired')
                AND ((a.kind='upload' AND f.subject_type='original_attempt_temp'
                      AND a.temp_relative_key=item.source_relative_key)
                  OR (a.kind='transform' AND f.subject_type='rendition_attempt_temp'
@@ -712,13 +737,20 @@ BEGIN
        AND ((finding_subject_type='original' AND finding_subject_id IS NOT NULL
              AND finding_relative_key ~ ('^originals/'||left(finding_subject_id::text,2)||'/'||finding_subject_id::text||
                '/original\.(jpg|png|gif|heic|heif|webp|bmp|mp4|mov|dng|nef|cr2|cr3|arw|raf|orf|rw2)$'))
-         OR (finding_subject_type='rendition' AND finding_subject_id IS NOT NULL AND finding_target_id IS NOT NULL
-             AND cardinality(string_to_array(finding_relative_key,'/'))=5
+          OR (finding_subject_type='rendition' AND finding_subject_id IS NOT NULL
+              AND finding_media_id IS NOT NULL AND finding_job_id IS NOT NULL AND finding_target_id IS NOT NULL
+              AND cardinality(string_to_array(finding_relative_key,'/'))=5
              AND split_part(finding_relative_key,'/',1)='renditions'
              AND split_part(finding_relative_key,'/',2)=left(split_part(finding_relative_key,'/',3),2)
-             AND split_part(finding_relative_key,'/',3) ~ ('^'||uuid_v4_pattern||'$')
-             AND split_part(finding_relative_key,'/',4)=finding_target_id::text
-             AND split_part(finding_relative_key,'/',5) ~ ('^'||finding_subject_id::text||'\.(avif|webp|mp4)$')))
+              AND split_part(finding_relative_key,'/',3) ~ ('^'||uuid_v4_pattern||'$')
+              AND split_part(finding_relative_key,'/',4)=finding_target_id::text
+              AND split_part(finding_relative_key,'/',5) ~ ('^'||finding_subject_id::text||'\.(avif|webp|mp4)$')
+              AND EXISTS (SELECT 1 FROM job_targets AS t
+                JOIN jobs AS j ON j.id=t.job_id
+                JOIN originals AS o ON o.id=j.original_id
+                WHERE t.id=finding_target_id AND j.id=finding_job_id
+                  AND j.media_id_snapshot=finding_media_id AND o.media_id=finding_media_id
+                  AND o.id::text=split_part(finding_relative_key,'/',3))))
        AND EXISTS (SELECT 1 FROM reconciliation_check_source_results
           WHERE report_id=finding_report_id AND source='database_references' AND result='complete')
        AND NOT EXISTS (SELECT 1 FROM originals
@@ -744,10 +776,12 @@ BEGIN
              AND latest.occurred_at<=report_row.temp_cutoff_at
              AND ((a.kind='upload' AND finding_subject_type='original_attempt_temp'
                    AND a.temp_relative_key=finding_relative_key)
-               OR (a.kind='transform' AND finding_subject_type='rendition_attempt_temp'
-                   AND finding_job_id=a.job_id
-                   AND EXISTS (SELECT 1 FROM job_targets AS t
-                     WHERE t.id=finding_target_id AND t.job_id=a.job_id)
+                OR (a.kind='transform' AND finding_subject_type='rendition_attempt_temp'
+                    AND finding_media_id IS NOT NULL AND finding_job_id=a.job_id
+                    AND EXISTS (SELECT 1 FROM job_targets AS t
+                      JOIN jobs AS j ON j.id=t.job_id
+                      WHERE t.id=finding_target_id AND t.job_id=a.job_id
+                        AND j.media_id_snapshot=finding_media_id)
                    AND finding_relative_key ~ ('^renditions/'||left(a.original_id::text,2)||'/'||a.original_id::text||'/'||finding_target_id::text||
                      '/\.'||uuid_v4_pattern||'\.(avif|webp|mp4)\.'||a.id::text||'\.tmp$')))
        ) THEN
@@ -833,10 +867,12 @@ BEGIN
       WHEN 'original_attempt_temp' THEN 'original_attempt_temp'
       WHEN 'rendition_attempt_temp' THEN 'rendition_attempt_temp' END;
     INSERT INTO reconciliation_repair_manifest_items(
-      id,run_id,source_report_id,finding_id,quarantine_id,source_type,source_relative_key,
+      id,run_id,source_report_id,finding_id,quarantine_id,media_id,job_id,job_target_id,storage_attempt_id,
+      source_type,source_relative_key,
       expected_size_bytes,report_observed_sha256,destination_relative_key,planned_action
     ) VALUES(
       repair_item_id,repair_run_id,run_row.source_report_id,repair_finding_id,repair_quarantine_id,
+      finding.media_id,finding.job_id,finding.job_target_id,finding.attempt_id,
       source_type,finding.relative_key,finding.observed_size_bytes,finding.observed_sha256,
       '.quarantine/'||repair_quarantine_id::text,'quarantine'
     );

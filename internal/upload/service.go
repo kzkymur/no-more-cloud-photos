@@ -201,12 +201,13 @@ func (s *Service) Accept(ctx context.Context, request Request) (outcome Outcome,
 		if !published {
 			abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortBudget)
 			defer cancel()
-			if temporary.Abort(abortCtx) == nil {
-				if err := s.repository.CompleteAttempt(abortCtx, attemptID, "aborted"); err == nil {
-					attemptFinished = true
-				} else {
-					terminalErr = err
-				}
+			if abortErr := temporary.Abort(abortCtx); abortErr != nil {
+				returnErr = errors.Join(returnErr, dependencyFailure(abortErr))
+			}
+			if err := s.repository.CompleteAttempt(abortCtx, attemptID, "aborted"); err == nil {
+				attemptFinished = true
+			} else {
+				terminalErr = err
 			}
 		}
 	}()

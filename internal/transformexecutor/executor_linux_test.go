@@ -62,8 +62,13 @@ func (repository *fakeRepository) MarkTargetFailed(_ context.Context, _, _, _ st
 	return nil
 }
 
-func (repository *fakeRepository) PublishRendition(_ context.Context, candidate job.Rendition) (job.Publication, error) {
+func (repository *fakeRepository) PublishRenditionFile(_ context.Context, candidate job.Rendition, publish func() (int64, string, error)) (job.Publication, error) {
 	*repository.events = append(*repository.events, "db-publish")
+	size, sha256, err := publish()
+	if err != nil {
+		return job.Publication{}, err
+	}
+	candidate.SizeBytes, candidate.SHA256 = size, sha256
 	repository.candidates = append(repository.candidates, candidate)
 	if repository.publishHook != nil {
 		return job.Publication{}, repository.publishHook(candidate)
@@ -281,7 +286,7 @@ func TestExecutorDispatchesByMIMEAndWebPInspection(t *testing.T) {
 			if test.mime == "video/mp4" && (len(processors.videoRequests) != 1 || processors.videoRequests[0].ExpectedVideoStreamIndex == nil || *processors.videoRequests[0].ExpectedVideoStreamIndex != 2) {
 				t.Fatalf("expected video stream propagation = %+v", processors.videoRequests)
 			}
-			if !slices.Equal(*store.events, []string{"begin-target", "storage-publish", "db-publish"}) {
+			if !slices.Equal(*store.events, []string{"begin-target", "db-publish", "storage-publish"}) {
 				t.Fatalf("events = %v", *store.events)
 			}
 		})

@@ -20,7 +20,20 @@ var mimePattern = regexp.MustCompile(`^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$`)
 // PublishRendition atomically references an already durable rendition file,
 // completes its target, and promotes it when its pinned profile version wins.
 func (r *Repository) PublishRendition(ctx context.Context, candidate Rendition) (Publication, error) {
-	if !validRendition(candidate) {
+	return r.publishRendition(ctx, candidate, nil)
+}
+
+// PublishRenditionFile holds the maintenance, Media, Job, and Target locks
+// across durable filesystem publication and the database reference commit.
+func (r *Repository) PublishRenditionFile(ctx context.Context, candidate Rendition, publish func() (int64, string, error)) (Publication, error) {
+	if publish == nil {
+		return Publication{}, ErrInvalid
+	}
+	return r.publishRendition(ctx, candidate, publish)
+}
+
+func (r *Repository) publishRendition(ctx context.Context, candidate Rendition, publish func() (int64, string, error)) (Publication, error) {
+	if publish == nil && !validRendition(candidate) || publish != nil && !validRenditionIdentity(candidate) {
 		return Publication{}, ErrInvalid
 	}
 	tx, err := r.pool.Begin(ctx)
@@ -28,6 +41,12 @@ func (r *Repository) PublishRendition(ctx context.Context, candidate Rendition) 
 		return Publication{}, classifyDatabaseError(err)
 	}
 	defer rollback(tx)
+
+	// This row share lock is the outer publication fence. Entering maintenance
+	// must drain it before repair can revalidate or move any path.
+	if _, err := tx.Exec(ctx, `SELECT nmcp_require_normal_maintenance()`); err != nil {
+		return Publication{}, classifyDatabaseError(err)
+	}
 
 	// Media is always the first database lock. Purge/delete operations use the
 	// same parent lock, making the deleted check and publication indivisible.
@@ -43,17 +62,27 @@ func (r *Repository) PublishRendition(ctx context.Context, candidate Rendition) 
 
 	var jobType Type
 	var jobStatus Status
-	var targetStatus TargetStatus
-	var originalID, mediaID, profileStatus string
-	var pinned Profile
+	var originalID, mediaID string
 	var token *string
 	var leaseLive bool
-	err = tx.QueryRow(ctx, `SELECT j.type,j.status,j.original_id::text,j.media_id_snapshot::text,j.lease_token::text,
-		COALESCE(j.lease_expires_at>clock_timestamp(),false),jt.status,p.id::text,p.key,p.version,p.status,p.processor,
+	err = tx.QueryRow(ctx, `SELECT type,status,original_id::text,media_id_snapshot::text,lease_token::text,
+		COALESCE(lease_expires_at>clock_timestamp(),false) FROM jobs WHERE id=$1 FOR UPDATE`, candidate.JobID).Scan(
+		&jobType, &jobStatus, &originalID, &mediaID, &token, &leaseLive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Publication{}, ErrNotFound
+	}
+	if err != nil {
+		return Publication{}, classifyDatabaseError(err)
+	}
+
+	var targetStatus TargetStatus
+	var profileStatus string
+	var pinned Profile
+	err = tx.QueryRow(ctx, `SELECT jt.status,p.id::text,p.key,p.version,p.status,p.processor,
 		p.parameters_schema_version,p.input_mime_types,p.parameters
-		FROM jobs j JOIN job_targets jt ON jt.job_id=j.id JOIN profiles p ON p.id=jt.profile_id
-		WHERE j.id=$1 AND jt.id=$2 FOR UPDATE OF j,jt`, candidate.JobID, candidate.TargetID).Scan(
-		&jobType, &jobStatus, &originalID, &mediaID, &token, &leaseLive, &targetStatus,
+		FROM job_targets jt JOIN profiles p ON p.id=jt.profile_id
+		WHERE jt.job_id=$1 AND jt.id=$2 FOR UPDATE OF jt`, candidate.JobID, candidate.TargetID).Scan(
+		&targetStatus,
 		&pinned.ID, &pinned.Key, &pinned.Version, &profileStatus, &pinned.Processor,
 		&pinned.ParametersSchemaVersion, &pinned.InputMIMETypes, &pinned.Parameters)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -82,6 +111,16 @@ func (r *Repository) PublishRendition(ctx context.Context, candidate Rendition) 
 	}
 	if err := validatePinnedOutput(pinned, profileStatus, originalMIME, candidate.MIMEType, candidate.RelativePath); err != nil {
 		return Publication{}, err
+	}
+	if publish != nil {
+		sizeBytes, sha256, err := publish()
+		if err != nil {
+			return Publication{}, err
+		}
+		candidate.SizeBytes, candidate.SHA256 = sizeBytes, sha256
+		if !validRendition(candidate) {
+			return Publication{}, ErrInvariant
+		}
 	}
 
 	var retentionDays *int
@@ -184,6 +223,12 @@ func (r *Repository) PublishRendition(ctx context.Context, candidate Rendition) 
 		}
 	}
 	return Publication{RenditionID: candidate.ID, Current: promote, JobFinished: jobFinished, CreatedAt: createdAt.UTC()}, nil
+}
+
+func validRenditionIdentity(candidate Rendition) bool {
+	candidate.SizeBytes = 0
+	candidate.SHA256 = strings.Repeat("0", 64)
+	return validRendition(candidate)
 }
 
 func validatePinnedOutput(pinned Profile, status, originalMIME, candidateMIME, relativePath string) error {
