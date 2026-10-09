@@ -435,16 +435,16 @@ BEGIN
        OR (NEW.sequence>1 AND NEW.event_type='prepared') THEN
         RAISE EXCEPTION 'invalid repair event transition: % to %',previous_type,NEW.event_type USING ERRCODE='23514';
     END IF;
-    IF NEW.event_type<>'failed' AND NEW.outcome_code IS DISTINCT FROM CASE NEW.event_type
+    IF NEW.event_type<>'failed' AND NEW.outcome_code IS DISTINCT FROM (CASE NEW.event_type
          WHEN 'prepared' THEN 'prepared' WHEN 'applying' THEN 'applying'
          WHEN 'revalidated' THEN 'matched' WHEN 'rename' THEN 'renamed'
          WHEN 'source_directory_fsync' THEN 'durable'
          WHEN 'destination_directory_fsync' THEN 'durable'
-         WHEN 'completed' THEN 'quarantined' END THEN
+         WHEN 'completed' THEN 'quarantined' END) THEN
         RAISE EXCEPTION 'repair event outcome does not match its transition' USING ERRCODE='23514';
     END IF;
     IF NEW.event_type='failed' AND NEW.outcome_code IS DISTINCT FROM
-         CASE WHEN NEW.error_code='outcome_uncertain' THEN 'unknown' ELSE 'failed' END THEN
+         (CASE WHEN NEW.error_code='outcome_uncertain' THEN 'unknown' ELSE 'failed' END) THEN
         RAISE EXCEPTION 'failed repair outcome contradicts its error' USING ERRCODE='23514';
     END IF;
     IF NEW.event_type='failed' AND previous_type IN ('rename','source_directory_fsync','destination_directory_fsync')
@@ -507,9 +507,9 @@ BEGIN
        OR NEW.manifest_count<>actual_manifest OR NEW.quarantined_count<>actual_quarantined
        OR NEW.stale_count<>0 OR NEW.resolved_count<>0 OR NEW.failed_count<>actual_failed
        OR NEW.unknown_count<>actual_unknown
-       OR NEW.result<>CASE WHEN actual_unknown>0 THEN 'unknown'
-            WHEN actual_failed=0 THEN 'succeeded'
-            WHEN actual_failed=actual_manifest THEN 'failed' ELSE 'partial' END THEN
+       OR NEW.result<>(CASE WHEN actual_unknown>0 THEN 'unknown'
+             WHEN actual_failed=0 THEN 'succeeded'
+             WHEN actual_failed=actual_manifest THEN 'failed' ELSE 'partial' END) THEN
         RAISE EXCEPTION 'repair result is not derived from terminal manifest attempts' USING ERRCODE='23514';
     END IF;
     RETURN NEW;
