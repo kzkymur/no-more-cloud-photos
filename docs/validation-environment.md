@@ -32,7 +32,10 @@ Storage initialization creates the sole canonical quarantine directory at
 has the same device ID as the storage root. There is no dotless `quarantine`
 fixture and no quarantine-path environment override. A private sentinel proves
 the File Server cannot address the directory, while mount inspection continues
-to require exactly the read-only `originals` and `renditions` subpaths. Because
+to inspect every live mount and require exactly the two read-only volume
+subpaths `originals` and `renditions`. Retained-volume upgrade evidence rejects
+both empty and populated legacy dotless directories without deleting them.
+Because
 the disposable API and Worker deliberately share UID/GID 10001 and the media
 volume, this is serving/layout evidence rather than OS-level process isolation.
 

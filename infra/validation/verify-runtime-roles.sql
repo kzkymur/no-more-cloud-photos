@@ -80,87 +80,70 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'unsafe runtime login role attributes';
     END IF;
-    IF NOT pg_catalog.pg_has_role('nmcp_api','nmcp_runtime','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_api','nmcp_worker_runtime','MEMBER')
-       OR NOT pg_catalog.pg_has_role('nmcp_worker','nmcp_runtime','MEMBER')
-       OR NOT pg_catalog.pg_has_role('nmcp_worker','nmcp_worker_runtime','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_api','nmcp_purge_function_owner','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_purge_function_owner','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_api','nmcp_check_runtime','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_api','nmcp_repair_runtime','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_check_runtime','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_repair_runtime','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_api','nmcp_check_function_owner','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_api','nmcp_repair_function_owner','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_check_function_owner','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_repair_function_owner','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_migrator','nmcp_check_runtime','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_migrator','nmcp_repair_runtime','MEMBER')
-       OR NOT pg_catalog.pg_has_role('nmcp_migrator','nmcp_check_function_owner','MEMBER')
-       OR NOT pg_catalog.pg_has_role('nmcp_migrator','nmcp_repair_function_owner','MEMBER') THEN
-        RAISE EXCEPTION 'unsafe runtime role membership';
-    END IF;
     IF EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.member IN (
-            'nmcp_check_runtime'::pg_catalog.regrole,
-            'nmcp_repair_runtime'::pg_catalog.regrole,
-            'nmcp_check_function_owner'::pg_catalog.regrole,
-            'nmcp_repair_function_owner'::pg_catalog.regrole
+        WITH managed(roleid) AS (VALUES
+            ('nmcp_runtime'::pg_catalog.regrole::oid),
+            ('nmcp_worker_runtime'::pg_catalog.regrole::oid),
+            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid),
+            ('nmcp_check_runtime'::pg_catalog.regrole::oid),
+            ('nmcp_repair_runtime'::pg_catalog.regrole::oid),
+            ('nmcp_check_function_owner'::pg_catalog.regrole::oid),
+            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid),
+            ('nmcp_migrator'::pg_catalog.regrole::oid),
+            ('nmcp_api'::pg_catalog.regrole::oid),
+            ('nmcp_worker'::pg_catalog.regrole::oid)
+        ), allowed(roleid,member,admin_option,inherit_option,set_option) AS (VALUES
+            ('nmcp_runtime'::pg_catalog.regrole::oid,
+             'nmcp_worker_runtime'::pg_catalog.regrole::oid,false,true,false),
+            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_check_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_runtime'::pg_catalog.regrole::oid,
+             'nmcp_api'::pg_catalog.regrole::oid,false,true,false),
+            ('nmcp_worker_runtime'::pg_catalog.regrole::oid,
+             'nmcp_worker'::pg_catalog.regrole::oid,false,true,false)
         )
-    ) THEN
-        RAISE EXCEPTION 'reconciliation stable roles must not inherit other roles';
-    END IF;
-    IF EXISTS (
         SELECT 1
-        FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.roleid IN (
-            'nmcp_check_runtime'::pg_catalog.regrole,
-            'nmcp_repair_runtime'::pg_catalog.regrole
-        )
+        FROM pg_catalog.pg_auth_members AS actual
+        WHERE (actual.roleid IN (SELECT roleid FROM managed)
+               OR actual.member IN (SELECT roleid FROM managed))
+          AND NOT EXISTS (
+              SELECT 1 FROM allowed
+              WHERE allowed.roleid=actual.roleid
+                AND allowed.member=actual.member
+                AND allowed.admin_option=actual.admin_option
+                AND allowed.inherit_option=actual.inherit_option
+                AND allowed.set_option=actual.set_option
+          )
     ) OR EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.roleid IN (
-            'nmcp_check_function_owner'::pg_catalog.regrole,
-            'nmcp_repair_function_owner'::pg_catalog.regrole
-        ) AND membership.member<>'nmcp_migrator'::pg_catalog.regrole
+        WITH allowed(roleid,member,admin_option,inherit_option,set_option) AS (VALUES
+            ('nmcp_runtime'::pg_catalog.regrole::oid,
+             'nmcp_worker_runtime'::pg_catalog.regrole::oid,false,true,false),
+            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_check_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_runtime'::pg_catalog.regrole::oid,
+             'nmcp_api'::pg_catalog.regrole::oid,false,true,false),
+            ('nmcp_worker_runtime'::pg_catalog.regrole::oid,
+             'nmcp_worker'::pg_catalog.regrole::oid,false,true,false)
+        )
+        SELECT 1 FROM allowed
+        WHERE NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_auth_members AS actual
+            WHERE actual.roleid=allowed.roleid
+              AND actual.member=allowed.member
+              AND actual.admin_option=allowed.admin_option
+              AND actual.inherit_option=allowed.inherit_option
+              AND actual.set_option=allowed.set_option
+        )
     ) THEN
-        RAISE EXCEPTION 'unexpected reconciliation role member';
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.roleid='nmcp_runtime'::pg_catalog.regrole
-          AND membership.member='nmcp_worker_runtime'::pg_catalog.regrole
-          AND NOT membership.admin_option AND membership.inherit_option
-          AND NOT membership.set_option
-    ) OR NOT EXISTS (
-        SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.roleid='nmcp_runtime'::pg_catalog.regrole
-          AND membership.member='nmcp_api'::pg_catalog.regrole
-          AND NOT membership.admin_option AND membership.inherit_option
-          AND NOT membership.set_option
-    ) OR NOT EXISTS (
-        SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.roleid='nmcp_worker_runtime'::pg_catalog.regrole
-          AND membership.member='nmcp_worker'::pg_catalog.regrole
-          AND NOT membership.admin_option AND membership.inherit_option
-          AND NOT membership.set_option
-    ) OR NOT EXISTS (
-        SELECT 1 FROM pg_catalog.pg_auth_members AS membership
-        WHERE membership.roleid IN (
-            'nmcp_purge_function_owner'::pg_catalog.regrole,
-            'nmcp_check_function_owner'::pg_catalog.regrole,
-            'nmcp_repair_function_owner'::pg_catalog.regrole
-        ) AND membership.member='nmcp_migrator'::pg_catalog.regrole
-        GROUP BY membership.member
-        HAVING pg_catalog.count(*)=3
-           AND pg_catalog.bool_and(NOT membership.admin_option)
-           AND pg_catalog.bool_and(NOT membership.inherit_option)
-           AND pg_catalog.bool_and(membership.set_option)
-    ) THEN
-        RAISE EXCEPTION 'unsafe PostgreSQL membership options';
+        RAISE EXCEPTION 'managed PostgreSQL role graph differs from exact allowlist';
     END IF;
 
     SELECT pg_catalog.pg_get_userbyid(c.relowner)
