@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode=${1:-quick}
+
+fail() { printf 'preflight: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "missing '$1'; see docs/local-validation.md"; }
+
+case "$mode" in
+  quick|race|postgres|native|infra|ubuntu|full|all) ;;
+  *) fail "unknown mode '$mode' (quick, race, postgres, native, infra, ubuntu, full, all)" ;;
+esac
+
+[[ $(uname -s) == Linux ]] || fail "Linux is required (found $(uname -s))"
+available_kib=$(df -Pk . | awk 'NR == 2 {print $4}')
+[[ $available_kib =~ ^[0-9]+$ && $available_kib -ge 5242880 ]] ||
+  fail "at least 5 GiB free space is required in the checkout filesystem"
+
+case "$mode" in
+  quick|race|postgres|native|full|all)
+    need go
+    [[ $(go env GOVERSION) == go1.27.1 ]] || fail "Go 1.27.1 is required (found $(go env GOVERSION))"
+    ;;
+esac
+
+case "$mode" in
+  postgres|full|all)
+    if [[ -z ${TEST_DATABASE_URL:-} ]]; then
+      if [[ -n ${NMCP_POSTGRES_BIN:-} ]]; then
+        [[ -x $NMCP_POSTGRES_BIN/initdb && -x $NMCP_POSTGRES_BIN/pg_ctl && \
+          -x $NMCP_POSTGRES_BIN/psql && -x $NMCP_POSTGRES_BIN/createdb ]] ||
+          fail "NMCP_POSTGRES_BIN does not contain initdb, pg_ctl, psql, and createdb"
+      else
+        need pg_config
+        bindir=$(pg_config --bindir)
+        [[ -x $bindir/initdb && -x $bindir/pg_ctl && -x $bindir/psql && -x $bindir/createdb ]] ||
+          fail "PostgreSQL server binaries are missing from $bindir"
+      fi
+    else
+      need psql
+    fi
+    need flock
+    ;;
+esac
+
+case "$mode" in
+  infra|full|all)
+    need docker
+    docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable; check socket access and no_new_privs/user-namespace policy"
+    docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is unavailable"
+    ;;
+esac
+
+if [[ $mode == ubuntu || $mode == all ]]; then
+  [[ $EUID -eq 0 ]] || fail "ubuntu mode is privileged; run it in the documented Ubuntu VM/runner as root"
+  [[ -d /run/systemd/system ]] || fail "ubuntu mode requires systemd as PID 1"
+  need shellcheck
+fi
+
+printf 'preflight: %s mode prerequisites satisfied\n' "$mode"

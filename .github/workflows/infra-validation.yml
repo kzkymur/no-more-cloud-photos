@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: infra-validation-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   compose:
     runs-on: ubuntu-24.04
@@ -20,7 +24,7 @@ jobs:
           docker version
           docker compose version
       - name: Build and verify isolated Core environment
-        run: scripts/validation-env verify
+        run: scripts/run-validation infra
       - name: Always remove validation resources
         if: always()
         run: scripts/validation-env reset
