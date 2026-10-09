@@ -18,13 +18,13 @@ cleanup() {
     /run/nmcp-deploy/test-receiver-exec-check.go \
     /run/nmcp-deploy/test-wrapper-launched.go \
     /run/nmcp-deploy/test-registration-paused.go \
-    /run/nmcp-deploy/test-before-launcher-reap.go \
-    /run/nmcp-deploy/test-stale-readiness-go 2>/dev/null || true
+    /run/nmcp-deploy/test-before-launcher-reap.go 2>/dev/null || true
   [[ -z $predispatch_pid ]] || /usr/bin/kill "$predispatch_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/kill "$installer_pid" 2>/dev/null || true
   [[ -z $registration_pid ]] || /usr/bin/kill "$registration_pid" 2>/dev/null || true
   [[ -z $cancel_pid ]] || /usr/bin/kill "$cancel_pid" 2>/dev/null || true
   [[ -z $pretransfer_pid ]] || /usr/bin/kill "$pretransfer_pid" 2>/dev/null || true
+  [[ -z $stale_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$stale_pid-1.service" >/dev/null 2>&1 || true
   [[ -z $stale_pid ]] || /usr/bin/kill "$stale_pid" 2>/dev/null || true
   [[ -z $installer_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$installer_pid-1.service" >/dev/null 2>&1 || true
   [[ -z $registration_pid ]] || /usr/bin/systemctl stop "nmcp-deploy-admin-$registration_pid-1.service" >/dev/null 2>&1 || true
@@ -59,13 +59,10 @@ done
 # dedicated migration compatibility verifier.
 cat > /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility <<EOF
 #!/bin/sh
-/usr/bin/printf '%s\n' "\$*" >> /run/nmcp-deploy/test-stale-wrapper-invocations
 if test "\${1:-}" = /opt/nmcp/releases/stalefail/bin/nmcp-admin; then
-  if /usr/bin/mkdir /run/nmcp-deploy/test-stale-readiness-owner 2>/dev/null; then
-    /usr/bin/touch /run/nmcp-deploy/test-stale-readiness-ready
-    while test ! -e /run/nmcp-deploy/test-stale-readiness-go; do /usr/bin/sleep 0.02; done
-  fi
-  exit 1
+  trap 'exit 1' INT TERM
+  /usr/bin/printf 'NMCP_TEST_STALE_COMPATIBILITY_ENTERED\n'
+  while :; do /usr/bin/sleep 1; done
 fi
 exec /usr/sbin/runuser -u nmcp -- "\$@"
 EOF
@@ -179,10 +176,9 @@ EOF
 "$repo/scripts/install-ubuntu-release" activate stalefail >"$work/stalefail.out" 2>&1 &
 stale_pid=$!
 for attempt in {1..1000}; do
-  [[ -e /run/nmcp-deploy/test-stale-readiness-ready ]] && break
+  /usr/bin/grep -q '^NMCP_TEST_STALE_COMPATIBILITY_ENTERED$' "$work/stalefail.out" && break
   [[ $attempt -lt 1000 ]] || {
     /usr/bin/cat "$work/stalefail.out" >&2 || true
-    /usr/bin/cat /run/nmcp-deploy/test-stale-wrapper-invocations >&2 || true
     printf 'compatibility failure did not enter\n' >&2
     exit 1
   }
@@ -197,15 +193,13 @@ for unit in nmcp-api.service nmcp-worker.service; do
   }
 done
 /usr/bin/systemctl stop nmcp-api.service nmcp-worker.service nmcp-migrate.service >/dev/null 2>&1 || true
-/usr/bin/touch /run/nmcp-deploy/test-stale-readiness-go
+/usr/bin/systemctl kill --signal=TERM --kill-whom=all "nmcp-deploy-admin-$stale_pid-1.service"
 if wait "$stale_pid"; then
   printf 'hardening failure unexpectedly activated release\n' >&2; exit 1
 fi
 stale_pid=
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
 [[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]]
-/usr/bin/rm -rf /run/nmcp-deploy/test-stale-readiness-owner \
-  /run/nmcp-deploy/test-stale-readiness-ready /run/nmcp-deploy/test-stale-readiness-go
 /usr/bin/systemctl reset-failed nmcp-migrate.service nmcp-api.service nmcp-worker.service >/dev/null 2>&1 || true
 
 if "$repo/scripts/install-ubuntu-release" activate migratefail; then
