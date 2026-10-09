@@ -167,8 +167,13 @@ EOF
 # deliberately failed activation.
 /usr/bin/touch "$work/seed-stale-readiness"
 /usr/bin/systemctl start nmcp-migrate.service
-[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == active ]]
-[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=SubState --value) == exited ]]
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == active ]] || {
+  printf 'failed to seed active migration readiness\n' >&2; exit 1;
+}
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=SubState --value) == exited ]] || {
+  printf 'seeded migration readiness did not retain exited state\n' >&2; exit 1;
+}
+printf 'stale readiness evidence: retained prior success\n'
 "$repo/scripts/install-ubuntu-release" activate stalefail >"$work/stalefail.out" 2>&1 &
 stale_pid=$!
 for attempt in {1..1000}; do
@@ -180,7 +185,10 @@ for attempt in {1..1000}; do
   }
   /usr/bin/sleep 0.02
 done
-[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]]
+printf 'stale readiness evidence: exact candidate compatibility entered\n'
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]] || {
+  printf 'activation did not invalidate stale migration readiness\n' >&2; exit 1;
+}
 /usr/bin/systemctl start --no-block nmcp-api.service nmcp-worker.service
 /usr/bin/sleep 0.1
 for unit in nmcp-api.service nmcp-worker.service; do
@@ -188,14 +196,20 @@ for unit in nmcp-api.service nmcp-worker.service; do
     printf 'service started during compatibility failure: %s\n' "$unit" >&2; exit 1;
   }
 done
+printf 'stale readiness evidence: API and Worker remained blocked\n'
 /usr/bin/systemctl stop nmcp-api.service nmcp-worker.service nmcp-migrate.service >/dev/null 2>&1 || true
 /usr/bin/systemctl kill --signal=TERM --kill-whom=all "nmcp-deploy-admin-$stale_pid-1.service"
 if wait "$stale_pid"; then
   printf 'hardening failure unexpectedly activated release\n' >&2; exit 1
 fi
 stale_pid=
-[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]]
-[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]]
+[[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]] || {
+  printf 'failed candidate did not restore prior release link\n' >&2; exit 1;
+}
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]] || {
+  printf 'failed candidate left migration readiness active\n' >&2; exit 1;
+}
+printf 'stale readiness evidence: failed candidate rolled back inactive\n'
 /usr/bin/systemctl reset-failed nmcp-migrate.service nmcp-api.service nmcp-worker.service >/dev/null 2>&1 || true
 
 if "$repo/scripts/install-ubuntu-release" activate migratefail; then
