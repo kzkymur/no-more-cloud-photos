@@ -362,6 +362,12 @@ func uploadIntegrationPool(t *testing.T, configure func(*pgxpool.Config, *pgxpoo
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Integration races may need an operation, an explicit blocker, and an
+	// independent observer connection at the same time. Do not inherit a
+	// single-connection DSN that turns lock evidence into pool starvation.
+	if config.MaxConns < 4 {
+		config.MaxConns = 4
+	}
 	config.AfterConnect = func(ctx context.Context, connection *pgx.Conn) error {
 		_, err := connection.Exec(ctx, `SELECT pg_catalog.set_config('search_path',$1,false)`, schema+",pg_catalog,pg_temp")
 		return err

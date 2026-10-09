@@ -99,15 +99,25 @@ func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedP
 	if len(types) == 0 {
 		return Lease{}, ErrNoWork
 	}
-	token, err := r.uuid()
-	if err != nil {
-		return Lease{}, fmt.Errorf("generate lease token: %w", err)
-	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return Lease{}, classifyDatabaseError(err)
 	}
 	defer rollback(tx)
+	// Claim participates in the normal-write barrier before allocating a lease
+	// or touching Job/Target/attempt history. The share lock remains held until
+	// commit, so maintenance entry cannot interleave with claim mutation.
+	if _, err := tx.Exec(ctx, `SELECT nmcp_require_normal_maintenance()`); err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == "55000" {
+			return Lease{}, ErrNoWork
+		}
+		return Lease{}, classifyDatabaseError(err)
+	}
+	token, err := r.uuid()
+	if err != nil {
+		return Lease{}, fmt.Errorf("generate lease token: %w", err)
+	}
 
 	var lease Lease
 	var originalID *string

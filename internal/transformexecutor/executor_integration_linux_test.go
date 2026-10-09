@@ -24,6 +24,7 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
 	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
+	"github.com/kzkymur/no-more-cloud-photos/internal/worker"
 )
 
 func TestExecutorRealPostgreSQLCommitBoundariesIntegration(t *testing.T) {
@@ -93,6 +94,8 @@ func TestExecutorRealPostgreSQLCommitBoundariesIntegration(t *testing.T) {
 
 func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 	t.Run("publication share lock drains before maintenance", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 		enteredRename := make(chan struct{})
 		releaseRename := make(chan struct{})
 		var armed atomic.Bool
@@ -122,27 +125,34 @@ func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 		repair := prepareRenditionRepair(t, pool, lease, targets[0], renderOne, []byte("still"))
 		armed.Store(true)
 		publication := make(chan error, 1)
-		go func() { publication <- executor.Execute(context.Background(), lease, executionLimits()) }()
+		go func() { publication <- executor.Execute(ctx, lease, executionLimits()) }()
 		select {
 		case <-enteredRename:
-		case <-time.After(5 * time.Second):
-			t.Fatal("publication did not reach filesystem callback")
+		case err := <-publication:
+			t.Fatalf("publication returned before filesystem barrier: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("publication did not reach filesystem callback: %v", ctx.Err())
+		}
+		maintenanceConnection, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer maintenanceConnection.Release()
+		var maintenancePID int32
+		if err := maintenanceConnection.QueryRow(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&maintenancePID); err != nil {
+			t.Fatal(err)
 		}
 		maintenance := make(chan error, 1)
 		go func() {
-			_, err := pool.Exec(context.Background(), `UPDATE maintenance_state SET mode='maintenance',reason='publication drain',owner='test',entered_at=clock_timestamp() WHERE id=1`)
+			_, err := maintenanceConnection.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='publication drain',owner='test',entered_at=clock_timestamp() WHERE id=1`)
 			maintenance <- err
 		}()
-		select {
-		case err := <-maintenance:
-			t.Fatalf("maintenance did not drain publication share holder: %v", err)
-		case <-time.After(150 * time.Millisecond):
-		}
+		awaitExecutorMaintenanceWait(t, ctx, pool, maintenancePID, publication, maintenance)
 		close(releaseRename)
-		if err := <-publication; err != nil {
+		if err := awaitExecutorRaceResult(t, ctx, "publication after filesystem release", publication); err != nil {
 			t.Fatalf("publication error = %v", err)
 		}
-		if err := <-maintenance; err != nil {
+		if err := awaitExecutorRaceResult(t, ctx, "maintenance after publication commit", maintenance); err != nil {
 			t.Fatalf("enter maintenance: %v", err)
 		}
 		assertIntegrationRendition(t, root, lease.Original.ID, targets[0], renderOne, "still")
@@ -234,6 +244,204 @@ func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 			t.Fatalf("read quarantined orphan: %v", err)
 		}
 	})
+}
+
+type observingTransformWorkerRepository struct {
+	*job.TransformClaimer
+	maintenanceNoWork chan struct{}
+}
+
+func (repository *observingTransformWorkerRepository) Claim(ctx context.Context, types []job.Type) (job.Lease, error) {
+	lease, err := repository.TransformClaimer.Claim(ctx, types)
+	if errors.Is(err, job.ErrNoWork) {
+		select {
+		case repository.maintenanceNoWork <- struct{}{}:
+		default:
+		}
+	}
+	return lease, err
+}
+
+func TestWorkerTransformMaintenanceRetryIntegration(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, repository, store, root := executorIntegrationDependencies(t, nil)
+	jobID, targets := seedExecutorTransform(t, pool, store, 1)
+
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='claim fence',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	before := transformMaintenanceSnapshot(t, pool, jobID)
+	if _, err := repository.Claim(ctx, []job.Type{job.TypeTransform}); !errors.Is(err, job.ErrNoWork) {
+		t.Fatalf("Claim() during maintenance error = %v, want ErrNoWork", err)
+	}
+	if after := transformMaintenanceSnapshot(t, pool, jobID); after != before {
+		t.Fatalf("maintenance Claim mutated Job/Target/attempt history\nbefore: %s\nafter:  %s", before, after)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	enteredProcessor := make(chan struct{})
+	releaseProcessor := make(chan struct{})
+	var processorCalls atomic.Int32
+	processors := &fakeProcessors{stillHook: func(processCtx context.Context) error {
+		if processorCalls.Add(1) != 1 {
+			return nil
+		}
+		close(enteredProcessor)
+		select {
+		case <-releaseProcessor:
+			return nil
+		case <-processCtx.Done():
+			return context.Cause(processCtx)
+		}
+	}}
+	executor := integrationExecutor(t, repository, store, processors, []string{renderOne, renderTwo})
+	observedRepository := &observingTransformWorkerRepository{
+		TransformClaimer: repository, maintenanceNoWork: make(chan struct{}, 8),
+	}
+	transformWorker, err := worker.New(observedRepository, map[job.Type]worker.Executor{job.TypeTransform: executor}, worker.Options{
+		PollInterval: 10 * time.Millisecond, HeartbeatInterval: time.Second, DatabaseTimeout: 5 * time.Second,
+		ShutdownReleaseTimeout: 5 * time.Second, ExecutionLimits: executionLimits(),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	workerResult := make(chan error, 1)
+	go func() { workerResult <- transformWorker.Run(workerCtx) }()
+	select {
+	case <-enteredProcessor:
+	case err := <-workerResult:
+		t.Fatalf("Worker returned before first processor barrier: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("Worker did not start transform: %v", ctx.Err())
+	}
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='publication winner',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseProcessor)
+	for count := 0; count < 3; count++ {
+		select {
+		case <-observedRepository.maintenanceNoWork:
+		case err := <-workerResult:
+			t.Fatalf("Worker returned while maintenance blocked retry: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("Worker did not observe maintenance-blocked Claim %d: %v", count+1, ctx.Err())
+		}
+	}
+	assertTransformRetryState(t, pool, jobID, targets[0], "queued", "pending", 1, 1)
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	awaitTransformRetrySuccess(t, ctx, pool, jobID, workerResult)
+	stopWorker()
+	if err := awaitExecutorRaceResult(t, ctx, "Worker shutdown after maintenance retry", workerResult); err != nil {
+		t.Fatalf("Worker error = %v", err)
+	}
+	assertTransformRetryState(t, pool, jobID, targets[0], "succeeded", "succeeded", 2, 2)
+	var originalID string
+	if err := pool.QueryRow(ctx, `SELECT original_id::text FROM jobs WHERE id=$1`, jobID).Scan(&originalID); err != nil {
+		t.Fatal(err)
+	}
+	assertIntegrationRendition(t, root, originalID, targets[0], renderTwo, "still")
+}
+
+func transformMaintenanceSnapshot(t *testing.T, pool *pgxpool.Pool, jobID string) string {
+	t.Helper()
+	var snapshot string
+	err := pool.QueryRow(context.Background(), `SELECT jsonb_build_object(
+		'job',to_jsonb(j),
+		'targets',(SELECT COALESCE(jsonb_agg(to_jsonb(jt) ORDER BY jt.id),'[]'::jsonb) FROM job_targets AS jt WHERE jt.job_id=j.id),
+		'attempts',(SELECT COALESCE(jsonb_agg(to_jsonb(sa) ORDER BY sa.id),'[]'::jsonb) FROM storage_attempts AS sa WHERE sa.job_id=j.id),
+		'attempt_events',(SELECT COALESCE(jsonb_agg(to_jsonb(se) ORDER BY se.id),'[]'::jsonb) FROM storage_attempt_events AS se JOIN storage_attempts AS sa ON sa.id=se.attempt_id WHERE sa.job_id=j.id)
+	)::text FROM jobs AS j WHERE j.id=$1`, jobID).Scan(&snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func assertTransformRetryState(t *testing.T, pool *pgxpool.Pool, jobID, targetID, wantJob, wantTarget string, wantJobAttempts, wantTargetAttempts int) {
+	t.Helper()
+	var jobStatus, targetStatus string
+	var jobAttempts, targetAttempts int
+	if err := pool.QueryRow(context.Background(), `SELECT j.status,j.attempts,jt.status,jt.attempts
+		FROM jobs AS j JOIN job_targets AS jt ON jt.job_id=j.id WHERE j.id=$1 AND jt.id=$2`, jobID, targetID).Scan(
+		&jobStatus, &jobAttempts, &targetStatus, &targetAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != wantJob || targetStatus != wantTarget || jobAttempts != wantJobAttempts || targetAttempts != wantTargetAttempts {
+		t.Fatalf("retry state job=%s/%d target=%s/%d, want job=%s/%d target=%s/%d",
+			jobStatus, jobAttempts, targetStatus, targetAttempts, wantJob, wantJobAttempts, wantTarget, wantTargetAttempts)
+	}
+}
+
+func awaitTransformRetrySuccess(t *testing.T, ctx context.Context, pool *pgxpool.Pool, jobID string, workerResult <-chan error) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1`, jobID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == "succeeded" {
+			return
+		}
+		if status == "failed" {
+			t.Fatal("maintenance retry exhausted transform permanently")
+		}
+		select {
+		case err := <-workerResult:
+			t.Fatalf("Worker returned before maintenance retry succeeded: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("maintenance retry did not succeed: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func awaitExecutorMaintenanceWait(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maintenancePID int32, publication, maintenance <-chan error) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		err := pool.QueryRow(ctx, `SELECT COALESCE(
+			wait_event_type='Lock'
+			AND cardinality(pg_catalog.pg_blocking_pids(pid))>0
+			AND position('UPDATE maintenance_state SET mode=''maintenance''' in query)>0,
+			false)
+			FROM pg_catalog.pg_stat_activity WHERE pid=$1`, maintenancePID).Scan(&waiting)
+		if err != nil {
+			t.Fatalf("observe maintenance publication waiter: %v", err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case err := <-publication:
+			t.Fatalf("publication returned before maintenance lock wait: %v", err)
+		case err := <-maintenance:
+			t.Fatalf("maintenance returned before publication released: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("maintenance backend %d did not wait for publication fence: %v", maintenancePID, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func awaitExecutorRaceResult(t *testing.T, ctx context.Context, operation string, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		t.Fatalf("%s: %v", operation, ctx.Err())
+		return ctx.Err()
+	}
 }
 
 type integrationRepair struct {

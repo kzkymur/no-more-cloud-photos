@@ -26,6 +26,11 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 )
 
+type maintenanceClaimOutcome struct {
+	lease Lease
+	err   error
+}
+
 func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{})
 	ctx := context.Background()
@@ -64,6 +69,125 @@ func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	}
 	if _, err := repository.Claim(ctx, []Type{"unsupported"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unregistered API type error = %v", err)
+	}
+}
+
+func TestClaimIntegrationMaintenanceBarrierNoMutationAndDrain(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	jobID, targets := insertTransformJob(t, pool, 3, 1)
+	if _, err := pool.Exec(ctx, `UPDATE job_targets SET status='failed',error_code='process_failed',error_message='retry fixture' WHERE id=$1`, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='claim blocked',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	before := claimMaintenanceSnapshot(t, pool, jobID)
+	if _, err := repository.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("Claim() during maintenance error = %v, want ErrNoWork", err)
+	}
+	if after := claimMaintenanceSnapshot(t, pool, jobID); after != before {
+		t.Fatalf("maintenance Claim mutated Job/Target/attempt history\nbefore: %s\nafter:  %s", before, after)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(context.Background())
+	if _, err := blocker.Exec(ctx, `SELECT id FROM job_targets WHERE id=$1 FOR UPDATE`, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	var blockerPID int32
+	if err := blocker.QueryRow(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&blockerPID); err != nil {
+		t.Fatal(err)
+	}
+	claimResult := make(chan maintenanceClaimOutcome, 1)
+	go func() {
+		lease, err := repository.Claim(ctx, []Type{TypeTransform})
+		claimResult <- maintenanceClaimOutcome{lease: lease, err: err}
+	}()
+	waitForBlockedLockChain(t, ctx, pool, blockerPID, 1)
+
+	maintenanceConnection, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenanceConnection.Release()
+	var maintenancePID int32
+	if err := maintenanceConnection.QueryRow(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&maintenancePID); err != nil {
+		t.Fatal(err)
+	}
+	maintenanceResult := make(chan error, 1)
+	go func() {
+		_, err := maintenanceConnection.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='claim drain',owner='test',entered_at=clock_timestamp() WHERE id=1`)
+		maintenanceResult <- err
+	}()
+	awaitClaimMaintenanceWait(t, ctx, pool, maintenancePID, claimResult, maintenanceResult)
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var claimed maintenanceClaimOutcome
+	select {
+	case claimed = <-claimResult:
+	case <-ctx.Done():
+		t.Fatalf("await Claim after target release: %v", ctx.Err())
+	}
+	if claimed.err != nil || claimed.lease.ID != jobID || claimed.lease.Attempts != 1 {
+		t.Fatalf("Claim() after target release = %+v, %v", claimed.lease, claimed.err)
+	}
+	select {
+	case err := <-maintenanceResult:
+		if err != nil {
+			t.Fatalf("enter maintenance after Claim commit: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("await maintenance after Claim commit: %v", ctx.Err())
+	}
+}
+
+func claimMaintenanceSnapshot(t *testing.T, pool *pgxpool.Pool, jobID string) string {
+	t.Helper()
+	var snapshot string
+	if err := pool.QueryRow(context.Background(), `SELECT jsonb_build_object(
+		'job',to_jsonb(j),
+		'targets',(SELECT COALESCE(jsonb_agg(to_jsonb(jt) ORDER BY jt.id),'[]'::jsonb) FROM job_targets AS jt WHERE jt.job_id=j.id),
+		'attempts',(SELECT COALESCE(jsonb_agg(to_jsonb(sa) ORDER BY sa.id),'[]'::jsonb) FROM storage_attempts AS sa WHERE sa.job_id=j.id),
+		'attempt_events',(SELECT COALESCE(jsonb_agg(to_jsonb(se) ORDER BY se.id),'[]'::jsonb) FROM storage_attempt_events AS se JOIN storage_attempts AS sa ON sa.id=se.attempt_id WHERE sa.job_id=j.id)
+	)::text FROM jobs AS j WHERE j.id=$1`, jobID).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func awaitClaimMaintenanceWait(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maintenancePID int32, claim <-chan maintenanceClaimOutcome, maintenance <-chan error) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(wait_event_type='Lock'
+			AND cardinality(pg_catalog.pg_blocking_pids(pid))>0
+			AND position('UPDATE maintenance_state SET mode=''maintenance''' in query)>0,false)
+			FROM pg_catalog.pg_stat_activity WHERE pid=$1`, maintenancePID).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case result := <-claim:
+			t.Fatalf("Claim returned before target release: lease=%+v error=%v", result.lease, result.err)
+		case err := <-maintenance:
+			t.Fatalf("maintenance returned before Claim commit: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("maintenance backend %d did not wait for Claim share fence: %v", maintenancePID, ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
