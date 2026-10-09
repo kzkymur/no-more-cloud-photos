@@ -95,7 +95,8 @@ jobs:
       - name: Install parser and HTTP test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends nginx-core postgresql shellcheck
+          sudo apt-get install --yes --no-install-recommends \
+            ffmpeg libimage-exiftool-perl nginx-core postgresql shellcheck
 
       - name: Check shell scripts
         run: |
