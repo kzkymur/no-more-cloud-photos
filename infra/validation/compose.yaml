@@ -15,11 +15,11 @@ services:
       retries: 30
     volumes:
       - database:/var/lib/postgresql/data
-      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-nmcp-roles.sql:ro
-      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
-      - ../ubuntu/postgresql-roles.sql:/opt/nmcp-infra/ubuntu/postgresql-roles.sql:ro
-      - ../postgresql/verify-runtime-role-graph.sql:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
-      - ./verify-runtime-roles.sql:/opt/nmcp-infra/validation/verify-runtime-roles.sql:ro
+      - ${NMCP_POSTGRES_INIT_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/docker-entrypoint-initdb.d/10-nmcp-roles.sql:ro
+      - ${NMCP_RUNTIME_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+      - ${NMCP_UBUNTU_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/ubuntu/postgresql-roles.sql:ro
+      - ${NMCP_VERIFY_ROLE_GRAPH_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
+      - ${NMCP_VERIFY_RUNTIME_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/validation/verify-runtime-roles.sql:ro
     networks: [backend]
     labels: *validation-labels
 
@@ -69,7 +69,7 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+      - ${NMCP_RUNTIME_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
     networks: [backend]
     labels: *validation-labels
 
@@ -90,8 +90,8 @@ services:
       migrate:
         condition: service_completed_successfully
     volumes:
-      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
-      - ../postgresql/verify-runtime-role-graph.sql:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
+      - ${NMCP_RUNTIME_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+      - ${NMCP_VERIFY_ROLE_GRAPH_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
     networks: [backend]
     labels: *validation-labels
 
