@@ -17,6 +17,8 @@ var (
 	ErrOutcomeUncertain = errors.New("storage outcome is uncertain")
 	ErrUnexpectedType   = errors.New("unexpected storage object type")
 	ErrUnstableScan     = errors.New("storage scan observed concurrent namespace mutation")
+	ErrScanBoundary     = errors.New("storage scan crossed its pinned filesystem boundary")
+	ErrScanLimit        = errors.New("storage scan resource limit exceeded")
 	ErrClosed           = errors.New("storage is closed")
 )
 

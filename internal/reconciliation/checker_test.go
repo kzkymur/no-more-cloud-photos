@@ -60,6 +60,27 @@ func TestCheckRecordsDatabaseSnapshotErrorsWithoutScanningOrSealing(t *testing.T
 	}
 }
 
+func TestCheckPreservesIndependentDatabaseSourceOutcomes(t *testing.T) {
+	cutoff := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	repository := &recordingRepository{snapshot: Snapshot{StartedAt: cutoff, CutoffAt: cutoff, EndedAt: cutoff}, now: cutoff, attemptErr: errors.New("attempt reader failed")}
+	scan := &countingScanner{}
+	checker, _ := NewChecker(repository, scan)
+	checker.newID = func() (string, error) { return "01234567-89ab-4cde-8f01-23456789abcd", nil }
+	result, err := checker.Check(context.Background(), ScopeAll)
+	if err == nil || result.ReportID == "" || scan.calls != 0 || repository.sealed {
+		t.Fatalf("Check() = %+v, %v; scans=%d sealed=%v", result, err, scan.calls, repository.sealed)
+	}
+	if code, ok := repository.sources["database_references"]; !ok || code != nil {
+		t.Fatalf("database outcome = %v, %v", code, ok)
+	}
+	if code := repository.sources["attempt_owners"]; code == nil || *code != "attempt_owners" {
+		t.Fatalf("attempt outcome = %v", code)
+	}
+	if code := repository.sources["storage_scan"]; code == nil || *code != "database_source_failed" {
+		t.Fatalf("storage outcome = %v", code)
+	}
+}
+
 func TestCheckResolvesSuccessfulFinalizationCommitReplyLoss(t *testing.T) {
 	cutoff := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 	repository := &recordingRepository{
@@ -71,6 +92,41 @@ func TestCheckResolvesSuccessfulFinalizationCommitReplyLoss(t *testing.T) {
 	result, err := checker.Check(context.Background(), ScopeAll)
 	if err != nil || !result.Sealed || result.FindingCount != 0 {
 		t.Fatalf("Check() = %+v, %v", result, err)
+	}
+}
+
+func TestCheckRetriesIdempotentBeginAfterReplyLoss(t *testing.T) {
+	cutoff := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	repository := &recordingRepository{snapshot: Snapshot{StartedAt: cutoff, CutoffAt: cutoff, EndedAt: cutoff}, now: cutoff, beginReplyLoss: true}
+	checker, _ := NewChecker(repository, &countingScanner{})
+	checker.newID = func() (string, error) { return "01234567-89ab-4cde-8f01-23456789abcd", nil }
+	result, err := checker.Check(context.Background(), ScopeAll)
+	if err != nil || !result.Sealed || repository.beginCalls != 2 {
+		t.Fatalf("Check() = %+v, %v; begin calls=%d", result, err, repository.beginCalls)
+	}
+}
+
+func TestCheckRetriesIdempotentFindingAfterReplyLoss(t *testing.T) {
+	cutoff := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	repository := &recordingRepository{snapshot: Snapshot{StartedAt: cutoff, CutoffAt: cutoff, EndedAt: cutoff}, now: cutoff, appendReplyLoss: true}
+	checker, _ := NewChecker(repository, staticObservationScanner{observations: []storage.Observation{{RelativeKey: "unexpected", Type: storage.ObservationRegular, Stable: true}}})
+	ids := []string{"01234567-89ab-4cde-8f01-23456789abcd", "12345678-9abc-4def-8012-3456789abcde"}
+	checker.newID = func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }
+	result, err := checker.Check(context.Background(), ScopeAll)
+	if err != nil || !result.Sealed || result.FindingCount != 1 || repository.appendCalls != 2 {
+		t.Fatalf("Check() = %+v, %v; append calls=%d", result, err, repository.appendCalls)
+	}
+}
+
+func TestMissingSourceRecoveryUsesIndependentBudgets(t *testing.T) {
+	repository := &recordingRepository{sources: make(map[string]*string), blockSource: "database_references"}
+	checker, _ := NewChecker(repository, &countingScanner{})
+	err := checker.recordMissingSourceErrors(context.Background(), "01234567-89ab-4cde-8f01-23456789abcd", "check_failed")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("recordMissingSourceErrors() error = %v", err)
+	}
+	if repository.sources["attempt_owners"] == nil || repository.sources["storage_scan"] == nil {
+		t.Fatalf("later source recovery was starved: %+v", repository.sources)
 	}
 }
 
@@ -181,6 +237,15 @@ func TestClassifyScopeFiltersFindingsButNotSourceCapture(t *testing.T) {
 	}
 }
 
+func TestClassifyStableHardlinkAsLocalFinding(t *testing.T) {
+	observedAt := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	observation := storage.Observation{RelativeKey: "unexpected", Type: storage.ObservationRegular, Stable: true, LinkCount: 2}
+	findings, err := classify(Snapshot{CutoffAt: observedAt}, []storage.Observation{observation}, observedAt, ScopeAll)
+	if err != nil || len(findings) != 1 || findings[0].Kind != "unexpected_hardlink" || findings[0].ObservedSHA != nil {
+		t.Fatalf("classify() = %+v, %v", findings, err)
+	}
+}
+
 func regularObservation(path string, size int64, digest [sha256.Size]byte, timestamp time.Time) storage.Observation {
 	return storage.Observation{RelativeKey: path, Type: storage.ObservationRegular, Size: &size, SHA256: &digest, ModifiedAt: &timestamp, ChangedAt: &timestamp, Stable: true}
 }
@@ -195,27 +260,45 @@ func encodeDigest(digest [sha256.Size]byte) string {
 }
 
 type recordingRepository struct {
-	snapshot    Snapshot
-	snapshotErr error
-	now         time.Time
-	sources     map[string]*string
-	sealed      bool
-	sealedCount int64
-	sealedEnd   time.Time
-	finalizeErr error
+	snapshot        Snapshot
+	snapshotErr     error
+	now             time.Time
+	sources         map[string]*string
+	sealed          bool
+	sealedCount     int64
+	sealedEnd       time.Time
+	finalizeErr     error
+	databaseErr     error
+	attemptErr      error
+	blockSource     string
+	beginReplyLoss  bool
+	beginCalls      int
+	appendReplyLoss bool
+	appendCalls     int
+	appended        map[string]int64
 }
 
-func (repository *recordingRepository) CaptureSnapshot(context.Context) (Snapshot, error) {
-	return repository.snapshot, repository.snapshotErr
+func (repository *recordingRepository) CaptureSnapshot(context.Context) (SnapshotCapture, error) {
+	return SnapshotCapture{Snapshot: repository.snapshot, DatabaseReferencesError: repository.databaseErr, AttemptOwnersError: repository.attemptErr}, repository.snapshotErr
 }
 func (repository *recordingRepository) DatabaseNow(context.Context) (time.Time, error) {
 	return repository.now, nil
 }
 func (repository *recordingRepository) BeginReport(context.Context, string, Scope, Snapshot, time.Time) error {
-	repository.sources = make(map[string]*string)
+	repository.beginCalls++
+	if repository.sources == nil {
+		repository.sources = make(map[string]*string)
+	}
+	if repository.beginReplyLoss && repository.beginCalls == 1 {
+		return errors.New("begin reply lost")
+	}
 	return nil
 }
-func (repository *recordingRepository) CompleteSource(_ context.Context, _, source string, code *string) error {
+func (repository *recordingRepository) CompleteSource(ctx context.Context, _, source string, code *string) error {
+	if source == repository.blockSource {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	if code == nil {
 		repository.sources[source] = nil
 		return nil
@@ -247,8 +330,21 @@ func (repository *recordingRepository) ReportOutcome(context.Context, string) (R
 	set("storage_scan", &outcome.StorageResult, &outcome.StorageError)
 	return outcome, nil
 }
-func (*recordingRepository) AppendFinding(context.Context, string, Finding) (int64, error) {
-	return 1, nil
+func (repository *recordingRepository) AppendFinding(_ context.Context, _ string, finding Finding) (int64, error) {
+	repository.appendCalls++
+	if repository.appended == nil {
+		repository.appended = make(map[string]int64)
+	}
+	if ordinal, ok := repository.appended[finding.ID]; ok {
+		return ordinal, nil
+	}
+	ordinal := int64(len(repository.appended) + 1)
+	repository.appended[finding.ID] = ordinal
+	if repository.appendReplyLoss {
+		repository.appendReplyLoss = false
+		return 0, errors.New("append reply lost")
+	}
+	return ordinal, nil
 }
 func (repository *recordingRepository) FinalizeReport(_ context.Context, _ string, count int64, ended time.Time) error {
 	repository.sources["storage_scan"] = nil
@@ -269,4 +365,10 @@ type countingScanner struct{ calls int }
 func (scanner *countingScanner) Scan(context.Context) ([]storage.Observation, error) {
 	scanner.calls++
 	return nil, nil
+}
+
+type staticObservationScanner struct{ observations []storage.Observation }
+
+func (scanner staticObservationScanner) Scan(context.Context) ([]storage.Observation, error) {
+	return scanner.observations, nil
 }

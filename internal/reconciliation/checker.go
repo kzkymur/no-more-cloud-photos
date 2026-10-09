@@ -16,7 +16,7 @@ import (
 const evidenceDrainBudget = 5 * time.Second
 
 type repository interface {
-	CaptureSnapshot(context.Context) (Snapshot, error)
+	CaptureSnapshot(context.Context) (SnapshotCapture, error)
 	DatabaseNow(context.Context) (time.Time, error)
 	BeginReport(context.Context, string, Scope, Snapshot, time.Time) error
 	CompleteSource(context.Context, string, string, *string) error
@@ -52,7 +52,8 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 	if err != nil {
 		return Result{}, fmt.Errorf("generate reconciliation report ID: %w", err)
 	}
-	snapshot, snapshotErr := checker.repository.CaptureSnapshot(ctx)
+	capture, snapshotErr := checker.repository.CaptureSnapshot(ctx)
+	snapshot := capture.Snapshot
 	if snapshot.StartedAt.IsZero() || snapshot.CutoffAt.IsZero() {
 		if snapshotErr == nil {
 			snapshotErr = errors.New("reconciliation snapshot omitted its chronology")
@@ -80,7 +81,7 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 	if scanStarted.Before(snapshot.EndedAt) {
 		return Result{}, errors.New("reconciliation database clock regressed before storage scan")
 	}
-	if err := checker.repository.BeginReport(setupCtx, reportID, scope, snapshot, scanStarted); err != nil {
+	if err := checker.beginReport(setupCtx, reportID, scope, snapshot, scanStarted); err != nil {
 		return Result{}, err
 	}
 	result := Result{ReportID: reportID, StartedAt: scanStarted}
@@ -97,11 +98,22 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 		failureCode = "database_snapshot"
 		return result, snapshotErr
 	}
-	if err := checker.completeSource(ctx, reportID, "database_references", nil); err != nil {
+	var databaseCode, attemptCode *string
+	if capture.DatabaseReferencesError != nil {
+		databaseCode = stringPointer("database_references")
+	}
+	if capture.AttemptOwnersError != nil {
+		attemptCode = stringPointer("attempt_owners")
+	}
+	if err := checker.completeSource(ctx, reportID, "database_references", databaseCode); err != nil {
 		return result, err
 	}
-	if err := checker.completeSource(ctx, reportID, "attempt_owners", nil); err != nil {
+	if err := checker.completeSource(ctx, reportID, "attempt_owners", attemptCode); err != nil {
 		return result, err
+	}
+	if capture.DatabaseReferencesError != nil || capture.AttemptOwnersError != nil {
+		failureCode = "database_source_failed"
+		return result, errors.Join(capture.DatabaseReferencesError, capture.AttemptOwnersError)
 	}
 
 	observations, scanErr := checker.scanner.Scan(ctx)
@@ -130,7 +142,7 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 			failureCode = "finding_id"
 			return result, err
 		}
-		ordinal, appendErr := checker.repository.AppendFinding(ctx, reportID, findings[index])
+		ordinal, appendErr := checker.appendFinding(ctx, reportID, findings[index])
 		if appendErr != nil {
 			failureCode = "finding_persist"
 			return result, appendErr
@@ -155,6 +167,33 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 	return result, nil
 }
 
+func (checker *Checker) appendFinding(parent context.Context, reportID string, finding Finding) (int64, error) {
+	ordinal, err := checker.repository.AppendFinding(parent, reportID, finding)
+	if err == nil {
+		return ordinal, nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
+	defer cancel()
+	retryOrdinal, retryErr := checker.repository.AppendFinding(ctx, reportID, finding)
+	if retryErr != nil {
+		return 0, errors.Join(err, retryErr)
+	}
+	return retryOrdinal, nil
+}
+
+func (checker *Checker) beginReport(parent context.Context, reportID string, scope Scope, snapshot Snapshot, scanStarted time.Time) error {
+	err := checker.repository.BeginReport(parent, reportID, scope, snapshot, scanStarted)
+	if err == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
+	defer cancel()
+	if retryErr := checker.repository.BeginReport(ctx, reportID, scope, snapshot, scanStarted); retryErr != nil {
+		return errors.Join(err, retryErr)
+	}
+	return nil
+}
+
 func (checker *Checker) completeSource(parent context.Context, reportID, source string, code *string) error {
 	err := checker.repository.CompleteSource(parent, reportID, source, code)
 	if err == nil {
@@ -170,23 +209,33 @@ func (checker *Checker) completeSource(parent context.Context, reportID, source 
 }
 
 func (checker *Checker) recordMissingSourceErrors(parent context.Context, reportID, code string) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
-	defer cancel()
-	outcome, err := checker.repository.ReportOutcome(ctx, reportID)
+	outcome, err := checker.readOutcomeDetached(parent, reportID)
 	if err != nil {
 		return err
 	}
 	var result error
 	if outcome.DatabaseResult == nil {
-		result = errors.Join(result, checker.repository.CompleteSource(ctx, reportID, "database_references", &code))
+		result = errors.Join(result, checker.completeSourceDetached(parent, reportID, "database_references", &code))
 	}
 	if outcome.AttemptResult == nil {
-		result = errors.Join(result, checker.repository.CompleteSource(ctx, reportID, "attempt_owners", &code))
+		result = errors.Join(result, checker.completeSourceDetached(parent, reportID, "attempt_owners", &code))
 	}
 	if outcome.StorageResult == nil {
-		result = errors.Join(result, checker.repository.CompleteSource(ctx, reportID, "storage_scan", &code))
+		result = errors.Join(result, checker.completeSourceDetached(parent, reportID, "storage_scan", &code))
 	}
 	return result
+}
+
+func (checker *Checker) readOutcomeDetached(parent context.Context, reportID string) (ReportOutcome, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
+	defer cancel()
+	return checker.repository.ReportOutcome(ctx, reportID)
+}
+
+func (checker *Checker) completeSourceDetached(parent context.Context, reportID, source string, code *string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
+	defer cancel()
+	return checker.completeSource(ctx, reportID, source, code)
 }
 
 func sourceMatches(outcome ReportOutcome, source string, code *string) bool {
@@ -275,6 +324,10 @@ func classify(snapshot Snapshot, observations []storage.Observation, observedAt 
 		}
 		if observation.Type == storage.ObservationSymlink {
 			findings = append(findings, observationFinding(observation, "symlink", "symlink_refused", "path", observedAt))
+			continue
+		}
+		if observation.Type == storage.ObservationRegular && observation.LinkCount > 1 {
+			findings = append(findings, observationFinding(observation, "unexpected_hardlink", "regular_inode_has_multiple_links", "path", observedAt))
 			continue
 		}
 		if observation.Type != storage.ObservationRegular {

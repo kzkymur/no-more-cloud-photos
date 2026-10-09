@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	dbmigrate "github.com/kzkymur/no-more-cloud-photos/internal/database"
+	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
@@ -237,6 +239,244 @@ func TestCheckerIntegrationDerivesRepairableTempOnlyFromExactOldTerminalOwner(t 
 	}
 	if kind != "aged_attempt_temp" || reason != "terminal_owner" || actionability != "repairable" {
 		t.Fatalf("temp finding = %s/%s/%s", kind, reason, actionability)
+	}
+}
+
+func TestCheckerIntegrationRejectsOlderSameVersionCurrent(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, schema := reconciliationIntegrationPool(t, databaseURL)
+	migrator, err := dbmigrate.NewMigrator(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mediaID := "56789abc-def0-4123-8456-789abcdef012"
+	originalID := "01234567-89ab-4cde-8f01-23456789abcd"
+	profileID := "11111111-1111-4111-8111-111111111111"
+	jobs := []string{"22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"}
+	targets := []string{"44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"}
+	renditions := []string{"66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777"}
+	times := []time.Time{time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC)}
+	parameters := profile.StandardV1Parameters()
+	jpegRecipe := parameters.Recipes["image/jpeg"]
+	parameters.Recipes = map[string]profile.Recipe{"image/jpeg": jpegRecipe}
+	profileParameters, err := json.Marshal(parameters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, err := admin.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fixture.Rollback(ctx) }()
+	statements := []struct {
+		sql  string
+		args []any
+	}{
+		{`ALTER TABLE jobs DISABLE TRIGGER USER`, nil}, {`ALTER TABLE job_targets DISABLE TRIGGER USER`, nil}, {`ALTER TABLE renditions DISABLE TRIGGER USER`, nil},
+		{`INSERT INTO profile_processor_certifications(id,processor,parameters_schema_version,input_mime_type,source_mode,output_kind,max_long_edge,minimum_setting,maximum_setting,evidence) VALUES('70000000-0000-4000-8000-000000000001','nmcp-media',1,'image/jpeg','still','still-avif',4096,1,100,'reconciliation test')`, nil},
+		{`INSERT INTO media(id,media_type,taken_at_source) VALUES($1,'image/jpeg','unknown')`, []any{mediaID}},
+		{`INSERT INTO originals(id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES($1::nmcp_uuid_v4,$2,repeat('0',64),'originals/01/'||$1::nmcp_uuid_v4::text||'/original.jpg','image/jpeg',1)`, []any{originalID, mediaID}},
+		{`INSERT INTO profiles(id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters) VALUES($1,'same',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, []any{profileID, profileParameters}},
+		{`INSERT INTO jobs(id,type,original_id,media_id_snapshot,status,attempts,max_attempts,started_at,finished_at) VALUES($1,'transform',$2,$3,'succeeded',1,3,$4,$4),($5,'transform',$2,$3,'succeeded',1,3,$6,$6)`, []any{jobs[0], originalID, mediaID, times[0], jobs[1], times[1]}},
+		{`INSERT INTO job_targets(id,job_id,profile_id,status,attempts) VALUES($1,$2,$3,'succeeded',1),($4,$5,$3,'succeeded',1)`, []any{targets[0], jobs[0], profileID, targets[1], jobs[1]}},
+		{`INSERT INTO renditions(id,media_id,job_target_id,profile_key,is_current,purge_after,relative_path,mime_type,size_bytes,sha256,created_at,processor_audit) VALUES ($1::nmcp_uuid_v4,$2,$3::nmcp_uuid_v4,'same',false,$4::timestamptz+interval '1 day','renditions/01/'||$5::nmcp_uuid_v4::text||'/'||$3::nmcp_uuid_v4::text||'/'||$1::nmcp_uuid_v4::text||'.webp','image/webp',1,repeat('1',64),$6,'{"fixture":"reconciliation"}'), ($7::nmcp_uuid_v4,$2,$8::nmcp_uuid_v4,'same',true,NULL,'renditions/01/'||$5::nmcp_uuid_v4::text||'/'||$8::nmcp_uuid_v4::text||'/'||$7::nmcp_uuid_v4::text||'.webp','image/webp',1,repeat('2',64),$4,'{"fixture":"reconciliation"}')`, []any{renditions[0], mediaID, targets[0], times[1], originalID, times[0], renditions[1], targets[1]}},
+		{`INSERT INTO change_events(id,position,event_type,reason,media_id,payload,occurred_at) VALUES ('88888888-8888-4888-8888-888888888888',1,'media_upsert','rendition_current',$1,jsonb_build_object('current_renditions',jsonb_build_array(jsonb_build_object('id',$2::text,'profile',jsonb_build_object('key','same')))),$3), ('99999999-9999-4999-8999-999999999999',2,'media_upsert','rendition_current',$1,jsonb_build_object('current_renditions',jsonb_build_array(jsonb_build_object('id',$4::text,'profile',jsonb_build_object('key','same')))),$5)`, []any{mediaID, renditions[0], times[0], renditions[1], times[1]}},
+		{`ALTER TABLE jobs ENABLE TRIGGER USER`, nil}, {`ALTER TABLE job_targets ENABLE TRIGGER USER`, nil}, {`ALTER TABLE renditions ENABLE TRIGGER USER`, nil},
+	}
+	for _, statement := range statements {
+		if _, err := fixture.Exec(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatalf("fixture statement %q: %v", statement.sql, err)
+		}
+	}
+	if err := fixture.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkPool := reconciliationRolePool(t, databaseURL, schema, "nmcp_check_runtime")
+	readValidity := func() map[string]bool {
+		tx, err := checkPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		rows, err := tx.Query(ctx, `SELECT subject_id::text,current_valid FROM nmcp_read_check_database_references(clock_timestamp()) WHERE row_kind='rendition' ORDER BY subject_id`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		result := map[string]bool{}
+		for rows.Next() {
+			var id string
+			var valid bool
+			if err := rows.Scan(&id, &valid); err != nil {
+				t.Fatal(err)
+			}
+			result[id] = valid
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	valid := readValidity()
+	if !valid[renditions[0]] || !valid[renditions[1]] {
+		t.Fatalf("newer same-version current validity = %+v", valid)
+	}
+	corrupt, err := admin.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corrupt.Exec(ctx, `UPDATE renditions SET is_current=false,purge_after=clock_timestamp() WHERE id=$1`, renditions[1]); err == nil {
+		_, err = corrupt.Exec(ctx, `UPDATE renditions SET is_current=true,purge_after=NULL WHERE id=$1`, renditions[0])
+	}
+	if err != nil {
+		_ = corrupt.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := corrupt.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	invalid := readValidity()
+	if invalid[renditions[0]] || invalid[renditions[1]] {
+		t.Fatalf("older same-version current validity = %+v", invalid)
+	}
+	if _, err := admin.Exec(ctx, `DROP INDEX renditions_one_current_key_idx`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `UPDATE renditions SET is_current=true,purge_after=NULL WHERE id=$1`, renditions[1]); err != nil {
+		t.Fatal(err)
+	}
+	multiple := readValidity()
+	if multiple[renditions[0]] || multiple[renditions[1]] {
+		t.Fatalf("multiple-current validity = %+v", multiple)
+	}
+	var tableSelect, requiredColumn, forbiddenColumn bool
+	if err := admin.QueryRow(ctx, `SELECT has_table_privilege('nmcp_check_function_owner','change_events','SELECT'),has_column_privilege('nmcp_check_function_owner','change_events','position','SELECT'),has_column_privilege('nmcp_check_function_owner','change_events','id','SELECT')`).Scan(&tableSelect, &requiredColumn, &forbiddenColumn); err != nil {
+		t.Fatal(err)
+	}
+	if tableSelect || !requiredColumn || forbiddenColumn {
+		t.Fatalf("change_events privileges table/required/unused = %t/%t/%t", tableSelect, requiredColumn, forbiddenColumn)
+	}
+}
+
+func TestCheckerIntegrationPreservesPartialDatabaseSourceFailure(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, schema := reconciliationIntegrationPool(t, databaseURL)
+	migrator, err := dbmigrate.NewMigrator(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `CREATE OR REPLACE FUNCTION nmcp_read_check_attempt_owners() RETURNS TABLE(attempt_id uuid,attempt_kind text,coverage text,original_id uuid,job_id uuid,temp_relative_key text,event_type text,lease_expires_at timestamptz,event_occurred_at timestamptz) LANGUAGE plpgsql SECURITY DEFINER SET search_path=`+pgx.Identifier{schema}.Sanitize()+`,pg_catalog,pg_temp AS $$ BEGIN RAISE EXCEPTION 'injected attempt reader failure' USING ERRCODE='58000'; END; $$`); err != nil {
+		t.Fatal(err)
+	}
+	checkPool := reconciliationRolePool(t, databaseURL, schema, "nmcp_check_runtime")
+	repository, _ := NewPostgresRepository(checkPool)
+	capture, err := repository.CaptureSnapshot(ctx)
+	if err != nil || capture.DatabaseReferencesError != nil || capture.AttemptOwnersError == nil || capture.EndedAt.IsZero() {
+		t.Fatalf("CaptureSnapshot() = %+v, %v", capture, err)
+	}
+	scan := &countingScanner{}
+	checker, _ := NewChecker(repository, scan)
+	result, checkErr := checker.Check(ctx, ScopeAll)
+	if checkErr == nil || result.ReportID == "" || result.Sealed || scan.calls != 0 {
+		t.Fatalf("Check() = %+v, %v; scans=%d", result, checkErr, scan.calls)
+	}
+	rows, err := admin.Query(ctx, `SELECT source,result,error_code FROM reconciliation_check_source_results WHERE report_id=$1 ORDER BY source`, result.ReportID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var source, result string
+		var code *string
+		if err := rows.Scan(&source, &result, &code); err != nil {
+			t.Fatal(err)
+		}
+		if code == nil {
+			got[source] = result
+		} else {
+			got[source] = result + ":" + *code
+		}
+	}
+	if got["database_references"] != "complete" || got["attempt_owners"] != "error:attempt_owners" || got["storage_scan"] != "error:database_source_failed" {
+		t.Fatalf("source outcomes = %+v; Check error = %v", got, checkErr)
+	}
+	if err := repository.CompleteSource(ctx, result.ReportID, "attempt_owners", stringPointer("attempt_owners")); err != nil {
+		t.Fatalf("exact source replay: %v", err)
+	}
+	if err := repository.CompleteSource(ctx, result.ReportID, "attempt_owners", stringPointer("different_error")); err == nil {
+		t.Fatal("contradictory source replay succeeded")
+	}
+}
+
+func TestCheckerIntegrationSealsStableHardlinkFinding(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, schema := reconciliationIntegrationPool(t, databaseURL)
+	migrator, err := dbmigrate.NewMigrator(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	store, err := storage.Open(root, storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	mediaID := "56789abc-def0-4123-8456-789abcdef012"
+	originalText := "01234567-89ab-4cde-8f01-23456789abcd"
+	originalID, _ := storage.ParseOriginalID(originalText)
+	key, _ := storage.NewOriginalKey(originalID, storage.OriginalJPEG)
+	payload := []byte("linked original")
+	digest := sha256.Sum256(payload)
+	publishIntegrationOriginal(t, store, key, "3456789a-bcde-4f01-8234-56789abcdef0", payload)
+	if _, err := admin.Exec(ctx, `INSERT INTO media(id,media_type,taken_at_source) VALUES($1,'image/jpeg','unknown')`, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `INSERT INTO originals(id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES($1,$2,$3,$4,'image/jpeg',$5)`, originalText, mediaID, hex.EncodeToString(digest[:]), key.String(), len(payload)); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside-link")
+	if err := os.Link(filepath.Join(root, filepath.FromSlash(key.String())), outside); err != nil {
+		t.Fatal(err)
+	}
+	checkPool := reconciliationRolePool(t, databaseURL, schema, "nmcp_check_runtime")
+	repository, _ := NewPostgresRepository(checkPool)
+	checker, _ := NewChecker(repository, store)
+	result, err := checker.Check(ctx, ScopeAll)
+	if err != nil || !result.Sealed || result.FindingCount != 1 {
+		t.Fatalf("Check() = %+v, %v", result, err)
+	}
+	var kind string
+	var observedSHA *string
+	if err := admin.QueryRow(ctx, `SELECT kind,observed_sha256 FROM reconciliation_check_findings WHERE report_id=$1`, result.ReportID).Scan(&kind, &observedSHA); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "unexpected_hardlink" || observedSHA != nil {
+		t.Fatalf("hardlink finding = %s/%v", kind, observedSHA)
 	}
 }
 

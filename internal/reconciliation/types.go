@@ -32,6 +32,14 @@ type Snapshot struct {
 	Attempts                     []AttemptOwner
 }
 
+// SnapshotCapture preserves the outcome of each independently readable source
+// inside one repeatable-read database snapshot.
+type SnapshotCapture struct {
+	Snapshot
+	DatabaseReferencesError error
+	AttemptOwnersError      error
+}
+
 type Finding struct {
 	ID, Kind, Reason, SubjectType string
 	SubjectID, MediaID, JobID     *string

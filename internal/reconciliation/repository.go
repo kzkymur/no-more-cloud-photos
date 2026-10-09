@@ -33,66 +33,75 @@ func (repository *PostgresRepository) DatabaseNow(ctx context.Context) (time.Tim
 	return now.UTC(), nil
 }
 
-func (repository *PostgresRepository) CaptureSnapshot(ctx context.Context) (Snapshot, error) {
+func (repository *PostgresRepository) CaptureSnapshot(ctx context.Context) (SnapshotCapture, error) {
 	tx, err := repository.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return Snapshot{}, fmt.Errorf("begin reconciliation snapshot: %w", err)
+		return SnapshotCapture{}, fmt.Errorf("begin reconciliation snapshot: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
-	var snapshot Snapshot
+	var capture SnapshotCapture
+	snapshot := &capture.Snapshot
 	if err := tx.QueryRow(ctx, `SELECT transaction_timestamp(),clock_timestamp()`).Scan(&snapshot.StartedAt, &snapshot.CutoffAt); err != nil {
-		return snapshot, fmt.Errorf("capture reconciliation cutoff: %w", err)
+		return capture, fmt.Errorf("capture reconciliation cutoff: %w", err)
 	}
-	rows, err := tx.Query(ctx, `SELECT * FROM nmcp_read_check_database_references($1)`, snapshot.CutoffAt)
-	if err != nil {
-		return snapshot, fmt.Errorf("read reconciliation database references: %w", err)
-	}
-	for rows.Next() {
-		var row Reference
-		if err := rows.Scan(&row.Kind, &row.SubjectID, &row.MediaID, &row.OriginalID, &row.JobID, &row.TargetID,
-			&row.RelativeKey, &row.ExpectedState, &row.SizeBytes, &row.SHA256,
-			&row.IsCurrent, &row.ProvenanceValid, &row.CurrentValid, &row.DueAt); err != nil {
-			rows.Close()
-			return snapshot, fmt.Errorf("scan reconciliation database reference: %w", err)
+	capture.DatabaseReferencesError = readSnapshotSource(ctx, tx, func(source pgx.Tx) error {
+		rows, queryErr := source.Query(ctx, `SELECT * FROM nmcp_read_check_database_references($1)`, snapshot.CutoffAt)
+		if queryErr != nil {
+			return fmt.Errorf("read reconciliation database references: %w", queryErr)
 		}
-		snapshot.References = append(snapshot.References, row)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return snapshot, fmt.Errorf("iterate reconciliation database references: %w", err)
-	}
-	rows.Close()
-
-	rows, err = tx.Query(ctx, `SELECT * FROM nmcp_read_check_attempt_owners()`)
-	if err != nil {
-		return snapshot, fmt.Errorf("read reconciliation attempt owners: %w", err)
-	}
-	for rows.Next() {
-		var owner AttemptOwner
-		if err := rows.Scan(&owner.AttemptID, &owner.Kind, &owner.Coverage, &owner.OriginalID,
-			&owner.JobID, &owner.TempRelativeKey, &owner.EventType,
-			&owner.LeaseExpiresAt, &owner.EventOccurredAt); err != nil {
-			rows.Close()
-			return snapshot, fmt.Errorf("scan reconciliation attempt owner: %w", err)
+		defer rows.Close()
+		for rows.Next() {
+			var row Reference
+			if scanErr := rows.Scan(&row.Kind, &row.SubjectID, &row.MediaID, &row.OriginalID, &row.JobID, &row.TargetID, &row.RelativeKey, &row.ExpectedState, &row.SizeBytes, &row.SHA256, &row.IsCurrent, &row.ProvenanceValid, &row.CurrentValid, &row.DueAt); scanErr != nil {
+				return fmt.Errorf("scan reconciliation database reference: %w", scanErr)
+			}
+			snapshot.References = append(snapshot.References, row)
 		}
-		snapshot.Attempts = append(snapshot.Attempts, owner)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return snapshot, fmt.Errorf("iterate reconciliation attempt owners: %w", err)
-	}
-	rows.Close()
+		return rows.Err()
+	})
+	capture.AttemptOwnersError = readSnapshotSource(ctx, tx, func(source pgx.Tx) error {
+		rows, queryErr := source.Query(ctx, `SELECT * FROM nmcp_read_check_attempt_owners()`)
+		if queryErr != nil {
+			return fmt.Errorf("read reconciliation attempt owners: %w", queryErr)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var owner AttemptOwner
+			if scanErr := rows.Scan(&owner.AttemptID, &owner.Kind, &owner.Coverage, &owner.OriginalID, &owner.JobID, &owner.TempRelativeKey, &owner.EventType, &owner.LeaseExpiresAt, &owner.EventOccurredAt); scanErr != nil {
+				return fmt.Errorf("scan reconciliation attempt owner: %w", scanErr)
+			}
+			snapshot.Attempts = append(snapshot.Attempts, owner)
+		}
+		return rows.Err()
+	})
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&snapshot.EndedAt); err != nil {
-		return snapshot, fmt.Errorf("capture reconciliation snapshot end: %w", err)
+		return capture, fmt.Errorf("capture reconciliation snapshot end: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return snapshot, fmt.Errorf("commit reconciliation snapshot: %w", err)
+		return capture, fmt.Errorf("commit reconciliation snapshot: %w", err)
 	}
 	snapshot.StartedAt = snapshot.StartedAt.UTC()
 	snapshot.CutoffAt = snapshot.CutoffAt.UTC()
 	snapshot.EndedAt = snapshot.EndedAt.UTC()
-	return snapshot, nil
+	return capture, nil
+}
+
+func readSnapshotSource(ctx context.Context, tx pgx.Tx, read func(pgx.Tx) error) error {
+	savepoint, err := tx.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin reconciliation source savepoint: %w", err)
+	}
+	if err := read(savepoint); err != nil {
+		if rollbackErr := savepoint.Rollback(context.WithoutCancel(ctx)); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+		return err
+	}
+	if err := savepoint.Commit(ctx); err != nil {
+		return fmt.Errorf("release reconciliation source savepoint: %w", err)
+	}
+	return nil
 }
 
 func (repository *PostgresRepository) BeginReport(ctx context.Context, reportID string, scope Scope, snapshot Snapshot, scanStarted time.Time) error {

@@ -20,6 +20,7 @@ import (
 
 type systemOperations struct {
 	openat    func(int, string, int, uint32) (int, error)
+	openat2   func(int, string, *unix.OpenHow) (int, error)
 	mkdirat   func(int, string, uint32) error
 	read      func(int, []byte) (int, error)
 	write     func(int, []byte) (int, error)
@@ -32,6 +33,7 @@ type systemOperations struct {
 
 var linuxOperations = systemOperations{
 	openat:    unix.Openat,
+	openat2:   unix.Openat2,
 	mkdirat:   unix.Mkdirat,
 	read:      unix.Read,
 	write:     unix.Write,
