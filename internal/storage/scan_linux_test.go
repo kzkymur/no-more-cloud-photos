@@ -86,6 +86,9 @@ func TestScanRejectsFilesystemBoundaryWithoutReadingDescendant(t *testing.T) {
 	}
 	originalOpenat2 := store.ops.openat2
 	store.ops.openat2 = func(fd int, name string, how *unix.OpenHow) (int, error) {
+		if how.Resolve&unix.RESOLVE_NO_XDEV == 0 {
+			t.Fatal("scan open omitted RESOLVE_NO_XDEV")
+		}
 		if name == "mounted" {
 			return -1, unix.EXDEV
 		}
@@ -93,6 +96,40 @@ func TestScanRejectsFilesystemBoundaryWithoutReadingDescendant(t *testing.T) {
 	}
 	if _, err := store.Scan(context.Background()); !errors.Is(err, ErrScanBoundary) {
 		t.Fatalf("Scan() error = %v, want ErrScanBoundary", err)
+	}
+}
+
+func TestScanDeadlineExpiringDuringFinalFenceCannotReturnSuccess(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root, Options{})
+	originalReadFile := store.ops.readFile
+	enteredFinalFence := make(chan struct{})
+	releaseFinalFence := make(chan struct{})
+	reads := 0
+	store.ops.readFile = func(path string) ([]byte, error) {
+		reads++
+		if reads == 2 {
+			close(enteredFinalFence)
+			<-releaseFinalFence
+		}
+		return originalReadFile(path)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := store.Scan(ctx)
+		result <- err
+	}()
+	select {
+	case <-enteredFinalFence:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scan did not reach final mount fence")
+	}
+	<-ctx.Done()
+	close(releaseFinalFence)
+	if err := <-result; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Scan() final-fence deadline error = %v", err)
 	}
 }
 

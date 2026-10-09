@@ -34,16 +34,17 @@ type quarantineScanner interface {
 }
 
 type Checker struct {
-	repository repository
-	scanner    scanner
-	newID      func() (string, error)
+	repository  repository
+	scanner     scanner
+	newID       func() (string, error)
+	drainBudget time.Duration
 }
 
 func NewChecker(repository repository, scanner scanner) (*Checker, error) {
 	if repository == nil || scanner == nil {
 		return nil, errors.New("reconciliation repository and scanner are required")
 	}
-	return &Checker{repository: repository, scanner: scanner, newID: newUUIDv4}, nil
+	return &Checker{repository: repository, scanner: scanner, newID: newUUIDv4, drainBudget: evidenceDrainBudget}, nil
 }
 
 // Check executes a read-only database/filesystem comparison and publishes an
@@ -65,7 +66,7 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 		return Result{}, snapshotErr
 	}
 	if snapshot.EndedAt.IsZero() {
-		drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), evidenceDrainBudget)
+		drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checker.drainBudget)
 		snapshot.EndedAt, err = checker.repository.DatabaseNow(drainCtx)
 		cancel()
 		if err != nil {
@@ -75,7 +76,7 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 	setupCtx := ctx
 	var setupCancel context.CancelFunc
 	if snapshotErr != nil {
-		setupCtx, setupCancel = context.WithTimeout(context.WithoutCancel(ctx), evidenceDrainBudget)
+		setupCtx, setupCancel = context.WithTimeout(context.WithoutCancel(ctx), checker.drainBudget)
 		defer setupCancel()
 	}
 	scanStarted, err := checker.repository.DatabaseNow(setupCtx)
@@ -173,7 +174,7 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 	}
 	if err := checker.repository.FinalizeReport(ctx, reportID, int64(len(findings)), scanEnded); err != nil {
 		failureCode = "finalize"
-		drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), evidenceDrainBudget)
+		drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checker.drainBudget)
 		outcome, outcomeErr := checker.repository.ReportOutcome(drainCtx, reportID)
 		cancel()
 		if outcomeErr != nil || !exactSeal(outcome, int64(len(findings)), scanEnded) {
@@ -191,7 +192,7 @@ func (checker *Checker) appendFinding(parent context.Context, reportID string, f
 	if err == nil {
 		return ordinal, nil
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), checker.drainBudget)
 	defer cancel()
 	retryOrdinal, retryErr := checker.repository.AppendFinding(ctx, reportID, finding)
 	if retryErr != nil {
@@ -205,7 +206,7 @@ func (checker *Checker) beginReport(parent context.Context, reportID string, sco
 	if err == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), checker.drainBudget)
 	defer cancel()
 	if retryErr := checker.repository.BeginReport(ctx, reportID, scope, snapshot, scanStarted); retryErr != nil {
 		return errors.Join(err, retryErr)
@@ -214,17 +215,13 @@ func (checker *Checker) beginReport(parent context.Context, reportID string, sco
 }
 
 func (checker *Checker) completeSource(parent context.Context, reportID, source string, code *string) error {
-	err := checker.repository.CompleteSource(parent, reportID, source, code)
+	operationCtx, operationCancel := context.WithTimeout(parent, checker.drainBudget)
+	err := checker.repository.CompleteSource(operationCtx, reportID, source, code)
+	operationCancel()
 	if err == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
-	defer cancel()
-	outcome, outcomeErr := checker.repository.ReportOutcome(ctx, reportID)
-	if outcomeErr == nil && sourceMatches(outcome, source, code) {
-		return nil
-	}
-	return errors.Join(err, outcomeErr)
+	return checker.recoverSourceCompletion(parent, reportID, source, code, err)
 }
 
 func (checker *Checker) recordMissingSourceErrors(parent context.Context, reportID, code string) error {
@@ -250,23 +247,37 @@ func (checker *Checker) recordMissingSourceErrors(parent context.Context, report
 }
 
 func (checker *Checker) readOutcomeDetached(parent context.Context, reportID string) (ReportOutcome, error) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), checker.drainBudget)
 	defer cancel()
 	return checker.repository.ReportOutcome(ctx, reportID)
 }
 
 func (checker *Checker) completeSourceDetached(parent context.Context, reportID, source string, code *string) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), evidenceDrainBudget)
-	defer cancel()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), checker.drainBudget)
 	err := checker.repository.CompleteSource(ctx, reportID, source, code)
+	cancel()
 	if err == nil {
 		return nil
 	}
-	outcome, outcomeErr := checker.repository.ReportOutcome(ctx, reportID)
-	if outcomeErr == nil && sourceMatches(outcome, source, code) {
+	return checker.recoverSourceCompletion(parent, reportID, source, code, err)
+}
+
+func (checker *Checker) recoverSourceCompletion(parent context.Context, reportID, source string, code *string, firstErr error) error {
+	outcome, confirmErr := checker.readOutcomeDetached(parent, reportID)
+	if confirmErr == nil && sourceMatches(outcome, source, code) {
 		return nil
 	}
-	return errors.Join(err, outcomeErr)
+	replayCtx, replayCancel := context.WithTimeout(context.WithoutCancel(parent), checker.drainBudget)
+	replayErr := checker.repository.CompleteSource(replayCtx, reportID, source, code)
+	replayCancel()
+	if replayErr == nil {
+		return nil
+	}
+	outcome, finalConfirmErr := checker.readOutcomeDetached(parent, reportID)
+	if finalConfirmErr == nil && sourceMatches(outcome, source, code) {
+		return nil
+	}
+	return errors.Join(firstErr, confirmErr, replayErr, finalConfirmErr)
 }
 
 func sourceMatches(outcome ReportOutcome, source string, code *string) bool {

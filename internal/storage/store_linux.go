@@ -29,6 +29,7 @@ type systemOperations struct {
 	unlinkat  func(int, string, int) error
 	fstat     func(int, *unix.Stat_t) error
 	fstatat   func(int, string, *unix.Stat_t, int) error
+	readFile  func(string) ([]byte, error)
 }
 
 var linuxOperations = systemOperations{
@@ -42,6 +43,7 @@ var linuxOperations = systemOperations{
 	unlinkat:  unix.Unlinkat,
 	fstat:     unix.Fstat,
 	fstatat:   unix.Fstatat,
+	readFile:  os.ReadFile,
 }
 
 type Options struct {

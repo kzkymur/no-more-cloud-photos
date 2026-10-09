@@ -118,9 +118,56 @@ func TestCheckRetriesIdempotentFindingAfterReplyLoss(t *testing.T) {
 	}
 }
 
+func TestCheckReplaysSourceCompletionAfterPrecommitAndOutcomeFailures(t *testing.T) {
+	cutoff := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	repository := &recordingRepository{snapshot: Snapshot{StartedAt: cutoff, CutoffAt: cutoff, EndedAt: cutoff}, now: cutoff, completeFailures: 1, outcomeFailures: 1}
+	checker, _ := NewChecker(repository, &countingScanner{})
+	checker.newID = func() (string, error) { return "01234567-89ab-4cde-8f01-23456789abcd", nil }
+	result, err := checker.Check(context.Background(), ScopeAll)
+	if err != nil || !result.Sealed || repository.completeCalls != 3 {
+		t.Fatalf("Check() = %+v, %v; completion calls=%d", result, err, repository.completeCalls)
+	}
+}
+
+func TestCheckConfirmsSourceCompletionReplyLossWithoutDuplicate(t *testing.T) {
+	cutoff := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	repository := &recordingRepository{snapshot: Snapshot{StartedAt: cutoff, CutoffAt: cutoff, EndedAt: cutoff}, now: cutoff, completeReplyLosses: 1}
+	checker, _ := NewChecker(repository, &countingScanner{})
+	checker.newID = func() (string, error) { return "01234567-89ab-4cde-8f01-23456789abcd", nil }
+	result, err := checker.Check(context.Background(), ScopeAll)
+	if err != nil || !result.Sealed || repository.completeCalls != 2 {
+		t.Fatalf("Check() = %+v, %v; completion calls=%d", result, err, repository.completeCalls)
+	}
+}
+
+func TestSourceCompletionUsesIndependentConfirmationAndReplayBudgets(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		repository *recordingRepository
+		wantCalls  int
+	}{
+		{name: "write budget exhausted after commit", repository: &recordingRepository{sources: make(map[string]*string), completeExhaustAfterCommit: 1}, wantCalls: 1},
+		{name: "confirmation budget exhausted then exact replay", repository: &recordingRepository{sources: make(map[string]*string), completeReplyLosses: 1, blockOutcomeAttempts: 1}, wantCalls: 2},
+		{name: "replay budget exhausted after commit then final confirmation", repository: &recordingRepository{sources: make(map[string]*string), completeFailures: 1, blockOutcomeAttempts: 1, completeExhaustAfterCommit: 1}, wantCalls: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			checker, _ := NewChecker(test.repository, &countingScanner{})
+			checker.drainBudget = 10 * time.Millisecond
+			if err := checker.completeSourceDetached(context.Background(), "01234567-89ab-4cde-8f01-23456789abcd", "database_references", nil); err != nil {
+				t.Fatal(err)
+			}
+			code, recorded := test.repository.sources["database_references"]
+			if test.repository.completeCalls != test.wantCalls || !recorded || code != nil {
+				t.Fatalf("completion calls/sources = %d/%+v", test.repository.completeCalls, test.repository.sources)
+			}
+		})
+	}
+}
+
 func TestMissingSourceRecoveryUsesIndependentBudgets(t *testing.T) {
 	repository := &recordingRepository{sources: make(map[string]*string), blockSource: "database_references"}
 	checker, _ := NewChecker(repository, &countingScanner{})
+	checker.drainBudget = 10 * time.Millisecond
 	err := checker.recordMissingSourceErrors(context.Background(), "01234567-89ab-4cde-8f01-23456789abcd", "check_failed")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("recordMissingSourceErrors() error = %v", err)
@@ -298,23 +345,28 @@ func encodeDigest(digest [sha256.Size]byte) string {
 }
 
 type recordingRepository struct {
-	snapshot        Snapshot
-	snapshotErr     error
-	now             time.Time
-	sources         map[string]*string
-	sealed          bool
-	sealedCount     int64
-	sealedEnd       time.Time
-	finalizeErr     error
-	databaseErr     error
-	attemptErr      error
-	blockSource     string
-	beginReplyLoss  bool
-	beginCalls      int
-	appendReplyLoss bool
-	appendCalls     int
-	appended        map[string]int64
-	outcomeFailures int
+	snapshot                   Snapshot
+	snapshotErr                error
+	now                        time.Time
+	sources                    map[string]*string
+	sealed                     bool
+	sealedCount                int64
+	sealedEnd                  time.Time
+	finalizeErr                error
+	databaseErr                error
+	attemptErr                 error
+	blockSource                string
+	beginReplyLoss             bool
+	beginCalls                 int
+	appendReplyLoss            bool
+	appendCalls                int
+	appended                   map[string]int64
+	outcomeFailures            int
+	blockOutcomeAttempts       int
+	completeCalls              int
+	completeFailures           int
+	completeReplyLosses        int
+	completeExhaustAfterCommit int
 }
 
 func (repository *recordingRepository) CaptureSnapshot(context.Context) (SnapshotCapture, error) {
@@ -334,19 +386,41 @@ func (repository *recordingRepository) BeginReport(context.Context, string, Scop
 	return nil
 }
 func (repository *recordingRepository) CompleteSource(ctx context.Context, _, source string, code *string) error {
+	repository.completeCalls++
 	if source == repository.blockSource {
 		<-ctx.Done()
 		return ctx.Err()
 	}
+	if repository.completeFailures > 0 {
+		repository.completeFailures--
+		return errors.New("source completion failed before commit")
+	}
+	if repository.sources == nil {
+		repository.sources = make(map[string]*string)
+	}
 	if code == nil {
 		repository.sources[source] = nil
-		return nil
+	} else {
+		copy := *code
+		repository.sources[source] = &copy
 	}
-	copy := *code
-	repository.sources[source] = &copy
+	if repository.completeExhaustAfterCommit > 0 {
+		repository.completeExhaustAfterCommit--
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if repository.completeReplyLosses > 0 {
+		repository.completeReplyLosses--
+		return errors.New("source completion reply lost")
+	}
 	return nil
 }
-func (repository *recordingRepository) ReportOutcome(context.Context, string) (ReportOutcome, error) {
+func (repository *recordingRepository) ReportOutcome(ctx context.Context, _ string) (ReportOutcome, error) {
+	if repository.blockOutcomeAttempts > 0 {
+		repository.blockOutcomeAttempts--
+		<-ctx.Done()
+		return ReportOutcome{}, ctx.Err()
+	}
 	if repository.outcomeFailures > 0 {
 		repository.outcomeFailures--
 		return ReportOutcome{}, errors.New("outcome read failed")

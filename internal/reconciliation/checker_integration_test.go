@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -286,7 +287,7 @@ func TestCheckerIntegrationRejectsOlderSameVersionCurrent(t *testing.T) {
 		{`INSERT INTO profiles(id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters) VALUES($1,'same',1,'draft',ARRAY['image/jpeg'],'nmcp-media',1,$2::jsonb)`, []any{profileID, profileParameters}},
 		{`INSERT INTO jobs(id,type,original_id,media_id_snapshot,status,attempts,max_attempts,started_at,finished_at) VALUES($1,'transform',$2,$3,'succeeded',1,3,$4,$4),($5,'transform',$2,$3,'succeeded',1,3,$6,$6)`, []any{jobs[0], originalID, mediaID, times[0], jobs[1], times[1]}},
 		{`INSERT INTO job_targets(id,job_id,profile_id,status,attempts) VALUES($1,$2,$3,'succeeded',1),($4,$5,$3,'succeeded',1)`, []any{targets[0], jobs[0], profileID, targets[1], jobs[1]}},
-		{`INSERT INTO renditions(id,media_id,job_target_id,profile_key,is_current,purge_after,relative_path,mime_type,size_bytes,sha256,created_at,processor_audit) VALUES ($1::nmcp_uuid_v4,$2,$3::nmcp_uuid_v4,'same',false,$4::timestamptz+interval '1 day','renditions/01/'||$5::nmcp_uuid_v4::text||'/'||$3::nmcp_uuid_v4::text||'/'||$1::nmcp_uuid_v4::text||'.webp','image/webp',1,repeat('1',64),$6,'{"fixture":"reconciliation"}'), ($7::nmcp_uuid_v4,$2,$8::nmcp_uuid_v4,'same',true,NULL,'renditions/01/'||$5::nmcp_uuid_v4::text||'/'||$8::nmcp_uuid_v4::text||'/'||$7::nmcp_uuid_v4::text||'.webp','image/webp',1,repeat('2',64),$4,'{"fixture":"reconciliation"}')`, []any{renditions[0], mediaID, targets[0], times[1], originalID, times[0], renditions[1], targets[1]}},
+		{`INSERT INTO renditions(id,media_id,job_target_id,profile_key,is_current,purge_after,relative_path,mime_type,size_bytes,sha256,created_at,processor_audit) VALUES ($7::nmcp_uuid_v4,$2,$8::nmcp_uuid_v4,'same',true,NULL,'renditions/01/'||$5::nmcp_uuid_v4::text||'/'||$8::nmcp_uuid_v4::text||'/'||$7::nmcp_uuid_v4::text||'.webp','image/webp',1,repeat('2',64),$4,'{"fixture":"reconciliation"}'), ($1::nmcp_uuid_v4,$2,$3::nmcp_uuid_v4,'same',false,$4::timestamptz+interval '1 day','renditions/01/'||$5::nmcp_uuid_v4::text||'/'||$3::nmcp_uuid_v4::text||'/'||$1::nmcp_uuid_v4::text||'.webp','image/webp',1,repeat('1',64),$6,'{"fixture":"reconciliation"}')`, []any{renditions[0], mediaID, targets[0], times[1], originalID, times[0], renditions[1], targets[1]}},
 		{`INSERT INTO change_events(id,position,event_type,reason,media_id,payload,occurred_at) VALUES ('88888888-8888-4888-8888-888888888888',1,'media_upsert','rendition_current',$1,jsonb_build_object('current_renditions',jsonb_build_array(jsonb_build_object('id',$2::text,'profile',jsonb_build_object('key','same')))),$3), ('99999999-9999-4999-8999-999999999999',2,'media_upsert','rendition_current',$1,jsonb_build_object('current_renditions',jsonb_build_array(jsonb_build_object('id',$4::text,'profile',jsonb_build_object('key','same')))),$5)`, []any{mediaID, renditions[0], times[0], renditions[1], times[1]}},
 		{`ALTER TABLE jobs ENABLE TRIGGER USER`, nil}, {`ALTER TABLE job_targets ENABLE TRIGGER USER`, nil}, {`ALTER TABLE renditions ENABLE TRIGGER USER`, nil},
 	}
@@ -340,9 +341,6 @@ func TestCheckerIntegrationRejectsOlderSameVersionCurrent(t *testing.T) {
 		_ = dueTx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	if err := dueTx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
 	if dueRenditions != 1 {
 		t.Fatalf("due rendition rows = %d, want 1", dueRenditions)
 	}
@@ -359,6 +357,32 @@ func TestCheckerIntegrationRejectsOlderSameVersionCurrent(t *testing.T) {
 	}
 	if err := corrupt.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+	var frozenOlderDue, frozenAuthoritativeDue int
+	if err := dueTx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE subject_id=$1),count(*) FILTER (WHERE subject_id=$2) FROM nmcp_read_check_database_references(clock_timestamp()) WHERE row_kind='expired_rendition'`, renditions[0], renditions[1]).Scan(&frozenOlderDue, &frozenAuthoritativeDue); err != nil {
+		_ = dueTx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := dueTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if frozenOlderDue != 1 || frozenAuthoritativeDue != 0 {
+		t.Fatalf("repeatable-read cleanup authority changed concurrently: older/newer=%d/%d", frozenOlderDue, frozenAuthoritativeDue)
+	}
+	var corruptedAuthoritativeDue int
+	readDue, err := checkPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := readDue.QueryRow(ctx, `SELECT count(*) FROM nmcp_read_check_database_references(clock_timestamp()) WHERE row_kind='expired_rendition' AND subject_id=$1`, renditions[1]).Scan(&corruptedAuthoritativeDue); err != nil {
+		_ = readDue.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := readDue.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if corruptedAuthoritativeDue != 0 {
+		t.Fatalf("authoritative newer same-version rendition became cleanup candidate: %d", corruptedAuthoritativeDue)
 	}
 	invalid := readValidity()
 	if invalid[renditions[0]] || invalid[renditions[1]] {
@@ -803,6 +827,66 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 	assertSingleCheckFinding(t, ctx, admin, checker, "quarantine_missing")
 }
 
+func TestCheckerIntegrationRecoversSourceCompletionUncertainty(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	admin, schema := reconciliationIntegrationPool(t, databaseURL)
+	migrator, err := dbmigrate.NewMigrator(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkPool := reconciliationRolePool(t, databaseURL, schema, "nmcp_check_runtime")
+	base, _ := NewPostgresRepository(checkPool)
+	now, err := base.DatabaseNow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := Snapshot{StartedAt: now, CutoffAt: now, EndedAt: now}
+	for _, test := range []struct {
+		name, id                        string
+		failBefore, loseReply           bool
+		exhaustAfterCommit              bool
+		outcomeFailures, wantFirstCalls int
+	}{
+		{name: "precommit failure and outcome error", id: "11111111-1111-4111-8111-111111111111", failBefore: true, outcomeFailures: 1, wantFirstCalls: 2},
+		{name: "committed response loss", id: "22222222-2222-4222-8222-222222222222", loseReply: true, wantFirstCalls: 1},
+		{name: "replay budget exhausted after commit", id: "33333333-3333-4333-8333-333333333333", failBefore: true, exhaustAfterCommit: true, outcomeFailures: 1, wantFirstCalls: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := base.BeginReport(ctx, test.id, ScopeAll, snapshot, now); err != nil {
+				t.Fatal(err)
+			}
+			faults := &sourceFaultRepository{repository: base, failBefore: test.failBefore, loseReply: test.loseReply, exhaustAfterCommit: test.exhaustAfterCommit, outcomeFailures: test.outcomeFailures}
+			checker, _ := NewChecker(faults, &countingScanner{})
+			if test.exhaustAfterCommit {
+				checker.drainBudget = 20 * time.Millisecond
+			}
+			if err := checker.completeSource(ctx, test.id, "database_references", nil); err != nil {
+				t.Fatal(err)
+			}
+			if faults.completeCalls != test.wantFirstCalls {
+				t.Fatalf("first completion calls=%d, want %d", faults.completeCalls, test.wantFirstCalls)
+			}
+			if err := checker.completeSource(ctx, test.id, "database_references", nil); err != nil {
+				t.Fatalf("exact repeated completion: %v", err)
+			}
+			var rows int
+			if err := admin.QueryRow(ctx, `SELECT count(*) FROM reconciliation_check_source_results WHERE report_id=$1 AND source='database_references'`, test.id).Scan(&rows); err != nil {
+				t.Fatal(err)
+			}
+			if rows != 1 {
+				t.Fatalf("durable source rows=%d, want 1", rows)
+			}
+		})
+	}
+}
+
 func assertSingleCheckFinding(t *testing.T, ctx context.Context, admin *pgxpool.Pool, checker *Checker, wantKind string) {
 	t.Helper()
 	result, err := checker.Check(ctx, ScopeAll)
@@ -835,6 +919,42 @@ func publishIntegrationOriginal(t *testing.T, store *storage.Store, key storage.
 	if _, err := temporary.Publish(context.Background(), storage.Validation{ExpectedSize: int64(len(payload)), ExpectedSHA256: &digest}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type sourceFaultRepository struct {
+	repository
+	failBefore         bool
+	loseReply          bool
+	exhaustAfterCommit bool
+	outcomeFailures    int
+	completeCalls      int
+}
+
+func (repository *sourceFaultRepository) CompleteSource(ctx context.Context, reportID, source string, code *string) error {
+	repository.completeCalls++
+	if repository.failBefore {
+		repository.failBefore = false
+		return errors.New("injected precommit source failure")
+	}
+	err := repository.repository.CompleteSource(ctx, reportID, source, code)
+	if err == nil && repository.exhaustAfterCommit {
+		repository.exhaustAfterCommit = false
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if err == nil && repository.loseReply {
+		repository.loseReply = false
+		return errors.New("injected source response loss")
+	}
+	return err
+}
+
+func (repository *sourceFaultRepository) ReportOutcome(ctx context.Context, reportID string) (ReportOutcome, error) {
+	if repository.outcomeFailures > 0 {
+		repository.outcomeFailures--
+		return ReportOutcome{}, errors.New("injected outcome read failure")
+	}
+	return repository.repository.ReportOutcome(ctx, reportID)
 }
 
 func reconciliationIntegrationPool(t *testing.T, databaseURL string) (*pgxpool.Pool, string) {

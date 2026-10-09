@@ -74,6 +74,7 @@ type scanState struct {
 	limits      scanLimits
 	mounts      []byte
 	quarantine  map[string]struct{}
+	readMounts  func(string) ([]byte, error)
 }
 
 // Scan walks the pinned storage root descriptor-relatively and without
@@ -131,11 +132,11 @@ func (store *Store) scan(ctx context.Context, limits scanLimits, quarantine map[
 		return nil, classifyError("create storage scan mutation fence", err)
 	}
 	defer unix.Close(watchFD)
-	mounts, err := os.ReadFile("/proc/self/mountinfo")
+	mounts, err := store.ops.readFile("/proc/self/mountinfo")
 	if err != nil {
 		return nil, classifyError("capture storage scan mount topology", err)
 	}
-	state := &scanState{rootDevice: rootBefore.Dev, watchFD: watchFD, limits: limits, mounts: mounts, quarantine: quarantine}
+	state := &scanState{rootDevice: rootBefore.Dev, watchFD: watchFD, limits: limits, mounts: mounts, quarantine: quarantine, readMounts: store.ops.readFile}
 	if err := state.watchDirectory(rootFD); err != nil {
 		return nil, err
 	}
@@ -167,14 +168,26 @@ func (store *Store) scan(ctx context.Context, limits scanLimits, quarantine map[
 		markObservationsUnstable(observations)
 		return observations, ErrUnstableScan
 	}
-	if err := state.checkMutationFence(); err != nil {
+	if err := scanContextError(ctx); err != nil {
+		markObservationsUnstable(observations)
+		return observations, err
+	}
+	if err := state.checkMutationFence(ctx); err != nil {
 		markObservationsUnstable(observations)
 		return observations, err
 	}
 	for _, observation := range observations {
+		if err := scanContextError(ctx); err != nil {
+			markObservationsUnstable(observations)
+			return observations, err
+		}
 		if !observation.Stable {
 			return observations, ErrUnstableScan
 		}
+	}
+	if err := scanContextError(ctx); err != nil {
+		markObservationsUnstable(observations)
+		return observations, err
 	}
 	return observations, nil
 }
@@ -197,19 +210,32 @@ func (state *scanState) watchRegular(fd int) error {
 	return nil
 }
 
-func (state *scanState) checkMutationFence() error {
-	mounts, err := os.ReadFile("/proc/self/mountinfo")
+func (state *scanState) checkMutationFence(ctx context.Context) error {
+	// Linux filesystem syscalls are not generally context-interruptible. Bracket
+	// every final fence syscall and the success return with deadline checks so a
+	// syscall that returns after expiry can never produce sealable evidence; a
+	// permanently stuck kernel/filesystem operation still requires OS isolation.
+	if err := scanContextError(ctx); err != nil {
+		return err
+	}
+	mounts, err := state.readMounts("/proc/self/mountinfo")
 	if err != nil {
 		return classifyError("revalidate storage scan mount topology", err)
+	}
+	if err := scanContextError(ctx); err != nil {
+		return err
 	}
 	if !bytes.Equal(state.mounts, mounts) {
 		return ErrUnstableScan
 	}
 	buffer := make([]byte, 64*1024)
 	for {
+		if err := scanContextError(ctx); err != nil {
+			return err
+		}
 		count, err := unix.Read(state.watchFD, buffer)
 		if errors.Is(err, unix.EAGAIN) {
-			return nil
+			return scanContextError(ctx)
 		}
 		if errors.Is(err, unix.EINTR) {
 			continue

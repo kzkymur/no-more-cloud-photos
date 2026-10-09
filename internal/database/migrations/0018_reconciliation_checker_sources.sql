@@ -74,23 +74,18 @@ BEGIN
         FROM rendition_base AS b
         LEFT JOIN expected_current AS expected ON expected.media_id=b.media_id AND expected.profile_key=b.profile_key
     ), due_cleanup AS (
-        SELECT r.id
-        FROM renditions AS r
-        JOIN media AS m ON m.id=r.media_id
-        JOIN job_targets AS candidate_target ON candidate_target.id=r.job_target_id AND candidate_target.status='succeeded'
-        JOIN jobs AS candidate_job ON candidate_job.id=candidate_target.job_id
-          AND candidate_job.type='transform' AND candidate_job.media_id_snapshot=r.media_id
-        JOIN profiles AS candidate_profile ON candidate_profile.id=candidate_target.profile_id AND candidate_profile.key=r.profile_key
-        JOIN renditions AS current_rendition ON current_rendition.media_id=r.media_id
-          AND current_rendition.profile_key=r.profile_key AND current_rendition.is_current
-        JOIN job_targets AS current_target ON current_target.id=current_rendition.job_target_id AND current_target.status='succeeded'
-        JOIN jobs AS current_job ON current_job.id=current_target.job_id
-          AND current_job.type='transform' AND current_job.media_id_snapshot=r.media_id
-        JOIN profiles AS current_profile ON current_profile.id=current_target.profile_id
-          AND current_profile.key=r.profile_key AND current_profile.version>=candidate_profile.version
-        WHERE NOT r.is_current AND r.purge_after IS NOT NULL AND r.purge_after<=check_cutoff
+        SELECT candidate.id
+        FROM rendition_base AS candidate
+        JOIN media AS m ON m.id=candidate.media_id
+        JOIN expected_current AS authority ON authority.media_id=candidate.media_id
+          AND authority.profile_key=candidate.profile_key AND authority.id<>candidate.id
+        JOIN rendition_base AS authoritative ON authoritative.id=authority.id
+          AND authoritative.provenance_valid
+          AND authoritative.profile_version>=candidate.profile_version
+        WHERE candidate.provenance_valid AND NOT candidate.is_current
+          AND candidate.purge_after IS NOT NULL AND candidate.purge_after<=check_cutoff
           AND NOT EXISTS (SELECT 1 FROM jobs AS purge_job
-              WHERE purge_job.type='purge' AND purge_job.media_id_snapshot=r.media_id
+              WHERE purge_job.type='purge' AND purge_job.media_id_snapshot=candidate.media_id
                 AND purge_job.started_at IS NOT NULL)
     ), repair_quarantine AS (
         SELECT m.quarantine_id,m.media_id,m.job_id,m.job_target_id,m.destination_relative_key,
