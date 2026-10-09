@@ -358,6 +358,7 @@ CREATE FUNCTION nmcp_guard_repair_event_insert()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE expected_sequence integer; previous_type text; parent_run nmcp_uuid_v4;
   applying_transaction xid8; item reconciliation_repair_manifest_items%ROWTYPE;
+  uuid_v4_pattern constant text:='[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 BEGIN
     SELECT m.* INTO item FROM reconciliation_repair_attempts AS a
       JOIN reconciliation_repair_manifest_items AS m ON m.id=a.manifest_item_id
@@ -401,7 +402,8 @@ BEGIN
                  OR (a.kind='transform' AND f.subject_type='rendition_attempt_temp'
                      AND f.job_id=a.job_id
                      AND EXISTS (SELECT 1 FROM job_targets AS t WHERE t.id=f.job_target_id AND t.job_id=a.job_id)
-                     AND item.source_relative_key ~ ('^renditions/'||left(a.original_id::text,2)||'/'||a.original_id::text||'/'||f.job_target_id::text||'/\.[^/]+\.'||a.id::text||'\.tmp$')))
+                     AND item.source_relative_key ~ ('^renditions/'||left(a.original_id::text,2)||'/'||a.original_id::text||'/'||f.job_target_id::text||
+                         '/\.'||uuid_v4_pattern||'\.(avif|webp|mp4)\.'||a.id::text||'\.tmp$')))
            ) THEN
             RAISE EXCEPTION 'repair attempt owner is no longer terminal and unambiguous' USING ERRCODE='23514';
         END IF;
@@ -461,6 +463,24 @@ $$;
 CREATE TRIGGER reconciliation_repair_events_insert_guard
 BEFORE INSERT ON reconciliation_repair_events
 FOR EACH ROW EXECUTE FUNCTION nmcp_guard_repair_event_insert();
+
+CREATE FUNCTION nmcp_require_terminal_repair_attempt()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE latest_type text;
+BEGIN
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_events WHERE attempt_id=NEW.attempt_id AND event_type='applying') THEN
+        SELECT event_type INTO latest_type FROM reconciliation_repair_events
+          WHERE attempt_id=NEW.attempt_id ORDER BY sequence DESC LIMIT 1;
+        IF latest_type NOT IN ('completed','failed') THEN
+            RAISE EXCEPTION 'applying repair attempt must become terminal in the same transaction' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE CONSTRAINT TRIGGER reconciliation_repair_attempt_terminal
+AFTER INSERT ON reconciliation_repair_events DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION nmcp_require_terminal_repair_attempt();
 
 CREATE FUNCTION nmcp_guard_repair_result_insert()
 RETURNS trigger LANGUAGE plpgsql AS $$
@@ -674,6 +694,7 @@ CREATE FUNCTION nmcp_append_check_finding(
     finding_observed_mtime timestamptz,finding_observed_ctime timestamptz,finding_observed_at timestamptz
 ) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE next_ordinal bigint; derived_actionability text:='non_actionable'; report_row reconciliation_check_reports%ROWTYPE;
+  uuid_v4_pattern constant text:='[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 BEGIN
     SELECT * INTO report_row FROM reconciliation_check_reports WHERE id=finding_report_id FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'check report is absent' USING ERRCODE='23514'; END IF;
@@ -688,6 +709,16 @@ BEGIN
     IF finding_kind='final_orphan'
        AND finding_expected_state='unreferenced'
        AND finding_subject_type IN ('original','rendition')
+       AND ((finding_subject_type='original' AND finding_subject_id IS NOT NULL
+             AND finding_relative_key ~ ('^originals/'||left(finding_subject_id::text,2)||'/'||finding_subject_id::text||
+               '/original\.(jpg|png|gif|heic|heif|webp|bmp|mp4|mov|dng|nef|cr2|cr3|arw|raf|orf|rw2)$'))
+         OR (finding_subject_type='rendition' AND finding_subject_id IS NOT NULL AND finding_target_id IS NOT NULL
+             AND cardinality(string_to_array(finding_relative_key,'/'))=5
+             AND split_part(finding_relative_key,'/',1)='renditions'
+             AND split_part(finding_relative_key,'/',2)=left(split_part(finding_relative_key,'/',3),2)
+             AND split_part(finding_relative_key,'/',3) ~ ('^'||uuid_v4_pattern||'$')
+             AND split_part(finding_relative_key,'/',4)=finding_target_id::text
+             AND split_part(finding_relative_key,'/',5) ~ ('^'||finding_subject_id::text||'\.(avif|webp|mp4)$')))
        AND EXISTS (SELECT 1 FROM reconciliation_check_source_results
           WHERE report_id=finding_report_id AND source='database_references' AND result='complete')
        AND NOT EXISTS (SELECT 1 FROM originals
@@ -717,7 +748,8 @@ BEGIN
                    AND finding_job_id=a.job_id
                    AND EXISTS (SELECT 1 FROM job_targets AS t
                      WHERE t.id=finding_target_id AND t.job_id=a.job_id)
-                   AND finding_relative_key ~ ('^renditions/'||left(a.original_id::text,2)||'/'||a.original_id::text||'/'||finding_target_id::text||'/\.[^/]+\.'||a.id::text||'\.tmp$')))
+                   AND finding_relative_key ~ ('^renditions/'||left(a.original_id::text,2)||'/'||a.original_id::text||'/'||finding_target_id::text||
+                     '/\.'||uuid_v4_pattern||'\.(avif|webp|mp4)\.'||a.id::text||'\.tmp$')))
        ) THEN
         derived_actionability:='repairable';
     ELSIF finding_kind IN ('referenced_missing','size_mismatch','sha256_mismatch','invalid_current','invalid_provenance',
@@ -906,7 +938,8 @@ BEGIN
         'nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
         'nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
         'nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)',
-        'nmcp_finish_repair_run(nmcp_uuid_v4)'
+        'nmcp_finish_repair_run(nmcp_uuid_v4)',
+        'nmcp_require_terminal_repair_attempt()'
     ] LOOP
         EXECUTE format('ALTER FUNCTION %I.%s OWNER TO nmcp_repair_function_owner',target_schema,function_signature);
         EXECUTE format('ALTER FUNCTION %I.%s SET search_path=%I,pg_catalog,pg_temp',target_schema,function_signature,target_schema);
@@ -915,6 +948,7 @@ BEGIN
         'nmcp_reject_legacy_reconciliation_insert()','nmcp_guard_check_finding_insert()',
         'nmcp_guard_repair_manifest_insert()','nmcp_guard_repair_attempt_insert()',
         'nmcp_guard_repair_event_insert()','nmcp_guard_repair_result_insert()',
+        'nmcp_require_terminal_repair_attempt()',
         'nmcp_guard_storage_attempt_event_insert()'
     ] LOOP
         EXECUTE format('ALTER FUNCTION %I.%s SET search_path=%I,pg_catalog,pg_temp',target_schema,function_signature,target_schema);
@@ -992,5 +1026,5 @@ TO nmcp_repair_runtime;
 
 REVOKE ALL ON FUNCTION nmcp_reject_legacy_reconciliation_insert(),nmcp_guard_check_finding_insert(),
     nmcp_guard_repair_manifest_insert(),nmcp_guard_repair_attempt_insert(),nmcp_guard_repair_event_insert(),
-    nmcp_guard_repair_result_insert(),nmcp_guard_storage_attempt_event_insert()
+    nmcp_guard_repair_result_insert(),nmcp_require_terminal_repair_attempt(),nmcp_guard_storage_attempt_event_insert()
 FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime,nmcp_repair_runtime;

@@ -1737,12 +1737,14 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if _, err := pool.Exec(ctx, `SELECT nmcp_complete_check_source($1,'database_references',NULL)`, reportID); err != nil {
 			t.Fatalf("complete database reference source: %v", err)
 		}
+		findingSubjectID := newUUIDv4(t)
+		findingPath := "originals/" + findingSubjectID[:2] + "/" + findingSubjectID + "/original.jpg"
 		var ordinal int64
 		if err := pool.QueryRow(ctx, `SELECT nmcp_append_check_finding(
 			$1,$2,'final_orphan','stable_unreferenced_final','original',$3,
 			NULL,NULL,NULL,NULL,NULL,$4,'unreferenced',1,$5,'regular',1,$5,$6,$6,$6)`,
-			findingID, reportID, newUUIDv4(t),
-			"originals/00/00000000-0000-4000-8000-000000000001/original.jpg", strings.Repeat("a", 64), observedAt).Scan(&ordinal); err != nil {
+			findingID, reportID, findingSubjectID,
+			findingPath, strings.Repeat("a", 64), observedAt).Scan(&ordinal); err != nil {
 			t.Fatalf("append normalized finding: %v", err)
 		}
 		if ordinal != 1 {
@@ -1959,6 +1961,13 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		if err := execAsReconciliationRole("nmcp_repair_runtime", `SELECT nmcp_begin_repair_attempt($1,$2,$3)`, repairAttemptID, repairItemID, newUUIDv4(t)); err != nil {
 			t.Fatalf("repair role begins contiguous attempt: %v", err)
 		}
+		expectTxCommitError(t, pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+pgx.Identifier{"nmcp_repair_runtime"}.Sanitize()); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,'applying','applying',NULL,NULL,NULL)`, newUUIDv4(t), repairAttemptID)
+			return err
+		})
 		eventRace := make(chan error, 2)
 		for index := 0; index < 2; index++ {
 			go func() {
