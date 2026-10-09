@@ -1895,10 +1895,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		transformMediaID := newUUIDv4(t)
 		insertMedia(t, pool, transformMediaID)
 		transformOriginalID := insertOriginal(t, pool, transformMediaID, "e", newUUIDv4(t))
-		var transformProfileID string
-		if err := pool.QueryRow(ctx, `SELECT id::text FROM profiles WHERE status='active' ORDER BY key LIMIT 1`).Scan(&transformProfileID); err != nil {
-			t.Fatalf("read active transform profile: %v", err)
-		}
+		transformProfileID := insertDraftProfile(t, pool, "reconciliation-transform-attempt-history", 1)
 		transformTargetID := insertPendingTransform(t, pool, transformMediaID, transformOriginalID, transformProfileID)
 		var transformJobID, firstTransformLease string
 		if err := pool.QueryRow(ctx, `SELECT j.id::text,j.lease_token::text FROM jobs AS j JOIN job_targets AS t ON t.job_id=j.id WHERE t.id=$1`, transformTargetID).Scan(&transformJobID, &firstTransformLease); err != nil {
