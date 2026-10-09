@@ -36,6 +36,9 @@ fi
   "$repo_root/infra/postgresql/runtime-roles.sql" \
   "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \
   /usr/local/libexec/nmcp/postgresql/
+/usr/bin/install -o root -g root -m 0644 \
+  "$repo_root/infra/ubuntu/postgresql-roles.sql" \
+  /usr/local/libexec/nmcp/postgresql/postgresql-roles.sql
 /usr/bin/install -o root -g root -m 0755 "$current_admin" \
   /opt/nmcp-role-compatibility/current/bin/nmcp-admin
 /usr/bin/install -o root -g root -m 0755 "$v16_admin" \
@@ -56,7 +59,7 @@ reset_database() {
   /usr/sbin/runuser -u postgres -- /usr/bin/dropdb --if-exists nmcp
   /usr/sbin/runuser -u postgres -- /usr/bin/createdb nmcp
   /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
-    --file="$repo_root/infra/ubuntu/postgresql-roles.sql"
+    --file=/usr/local/libexec/nmcp/postgresql/postgresql-roles.sql
   /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
     --set=ON_ERROR_STOP=1 --command "ALTER ROLE nmcp_migrator PASSWORD 'nmcp-migrator-wrapper-test'"
 }
