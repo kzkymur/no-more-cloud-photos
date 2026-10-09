@@ -26,7 +26,7 @@ services:
       context: ../..
       dockerfile: infra/validation/core.Dockerfile
     user: "0:0"
-    command: ["sh", "-eu", "-c", "mkdir -p /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/backups /var/lib/nmcp/media/quarantine /var/lib/nmcp/media/tmp && chown -R 10001:10001 /var/lib/nmcp/media && chmod 0700 /var/lib/nmcp/media /var/lib/nmcp/media/*"]
+    command: ["sh", "-eu", "-c", "install -d -o 10001 -g 10001 -m 0700 /var/lib/nmcp/media /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/backups /var/lib/nmcp/media/tmp /var/lib/nmcp/media/.quarantine"]
     volumes:
       - media:/var/lib/nmcp/media
     network_mode: none

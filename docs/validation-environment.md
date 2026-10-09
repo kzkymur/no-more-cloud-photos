@@ -27,6 +27,15 @@ non-secret and must never be copied into deployment configuration. Production
 secrets belong in root-owned systemd credentials/environment files readable by
 the service manager and service identity, not in the repository or arguments.
 
+Storage initialization creates the sole canonical quarantine directory at
+`/var/lib/nmcp/media/.quarantine` as UID/GID 10001 mode 0700 and verifies that it
+has the same device ID as the storage root. There is no dotless `quarantine`
+fixture and no quarantine-path environment override. A private sentinel proves
+the File Server cannot address the directory, while mount inspection continues
+to require exactly the read-only `originals` and `renditions` subpaths. Because
+the disposable API and Worker deliberately share UID/GID 10001 and the media
+volume, this is serving/layout evidence rather than OS-level process isolation.
+
 ## Commands
 
 Docker Engine, Docker Compose v2, `curl`, `python3`, and `sha256sum` are required
@@ -63,9 +72,10 @@ immutable cache, and nosniff independently for both Nginx storage locations.
 It also proves non-GET rejection (`405`), directory-listing denial, raw dot
 segment and encoded-separator rejection against existing control objects,
 canonical shard equality, canonical-name Original and Rendition symlink denial,
-and an existing non-public backup sentinel. It asserts that Nginx has only its isolated
-network, shares no network with PostgreSQL, and receives exactly two read-only
-Original/Rendition subpath mounts. It also records the live PostgreSQL, Nginx,
+and existing non-public backup and `.quarantine` sentinels. It asserts that
+Nginx has only its isolated network, shares no network with PostgreSQL, and
+receives exactly two read-only Original/Rendition subpath mounts. It also
+records the live PostgreSQL, Nginx,
 ExifTool, FFprobe, and `prlimit`
 versions. It builds the merged issue #11 source-pinned native still toolchain
 through its single canonical build script, runs `nmcp-still-helper capabilities`,

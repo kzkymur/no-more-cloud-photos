@@ -39,6 +39,26 @@ BEGIN
         WHERE rolname='nmcp_purge_function_owner' AND NOT rolcanlogin
           AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
           AND NOT rolreplication AND NOT rolbypassrls
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles
+        WHERE rolname='nmcp_check_runtime' AND NOT rolcanlogin AND NOT rolinherit
+          AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+          AND NOT rolreplication AND NOT rolbypassrls
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles
+        WHERE rolname='nmcp_repair_runtime' AND NOT rolcanlogin AND NOT rolinherit
+          AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+          AND NOT rolreplication AND NOT rolbypassrls
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles
+        WHERE rolname='nmcp_check_function_owner' AND NOT rolcanlogin AND NOT rolinherit
+          AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+          AND NOT rolreplication AND NOT rolbypassrls
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles
+        WHERE rolname='nmcp_repair_function_owner' AND NOT rolcanlogin AND NOT rolinherit
+          AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole
+          AND NOT rolreplication AND NOT rolbypassrls
     ) THEN
         RAISE EXCEPTION 'unsafe stable role attributes';
     END IF;
@@ -65,8 +85,82 @@ BEGIN
        OR NOT pg_catalog.pg_has_role('nmcp_worker','nmcp_runtime','MEMBER')
        OR NOT pg_catalog.pg_has_role('nmcp_worker','nmcp_worker_runtime','MEMBER')
        OR pg_catalog.pg_has_role('nmcp_api','nmcp_purge_function_owner','MEMBER')
-       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_purge_function_owner','MEMBER') THEN
+       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_purge_function_owner','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_api','nmcp_check_runtime','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_api','nmcp_repair_runtime','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_check_runtime','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_repair_runtime','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_api','nmcp_check_function_owner','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_api','nmcp_repair_function_owner','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_check_function_owner','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_worker','nmcp_repair_function_owner','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_migrator','nmcp_check_runtime','MEMBER')
+       OR pg_catalog.pg_has_role('nmcp_migrator','nmcp_repair_runtime','MEMBER')
+       OR NOT pg_catalog.pg_has_role('nmcp_migrator','nmcp_check_function_owner','MEMBER')
+       OR NOT pg_catalog.pg_has_role('nmcp_migrator','nmcp_repair_function_owner','MEMBER') THEN
         RAISE EXCEPTION 'unsafe runtime role membership';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.member IN (
+            'nmcp_check_runtime'::pg_catalog.regrole,
+            'nmcp_repair_runtime'::pg_catalog.regrole,
+            'nmcp_check_function_owner'::pg_catalog.regrole,
+            'nmcp_repair_function_owner'::pg_catalog.regrole
+        )
+    ) THEN
+        RAISE EXCEPTION 'reconciliation stable roles must not inherit other roles';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.roleid IN (
+            'nmcp_check_runtime'::pg_catalog.regrole,
+            'nmcp_repair_runtime'::pg_catalog.regrole
+        )
+    ) OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.roleid IN (
+            'nmcp_check_function_owner'::pg_catalog.regrole,
+            'nmcp_repair_function_owner'::pg_catalog.regrole
+        ) AND membership.member<>'nmcp_migrator'::pg_catalog.regrole
+    ) THEN
+        RAISE EXCEPTION 'unexpected reconciliation role member';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.roleid='nmcp_runtime'::pg_catalog.regrole
+          AND membership.member='nmcp_worker_runtime'::pg_catalog.regrole
+          AND NOT membership.admin_option AND membership.inherit_option
+          AND NOT membership.set_option
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.roleid='nmcp_runtime'::pg_catalog.regrole
+          AND membership.member='nmcp_api'::pg_catalog.regrole
+          AND NOT membership.admin_option AND membership.inherit_option
+          AND NOT membership.set_option
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.roleid='nmcp_worker_runtime'::pg_catalog.regrole
+          AND membership.member='nmcp_worker'::pg_catalog.regrole
+          AND NOT membership.admin_option AND membership.inherit_option
+          AND NOT membership.set_option
+    ) OR NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_auth_members AS membership
+        WHERE membership.roleid IN (
+            'nmcp_purge_function_owner'::pg_catalog.regrole,
+            'nmcp_check_function_owner'::pg_catalog.regrole,
+            'nmcp_repair_function_owner'::pg_catalog.regrole
+        ) AND membership.member='nmcp_migrator'::pg_catalog.regrole
+        GROUP BY membership.member
+        HAVING pg_catalog.count(*)=3
+           AND pg_catalog.bool_and(NOT membership.admin_option)
+           AND pg_catalog.bool_and(NOT membership.inherit_option)
+           AND pg_catalog.bool_and(membership.set_option)
+    ) THEN
+        RAISE EXCEPTION 'unsafe PostgreSQL membership options';
     END IF;
 
     SELECT pg_catalog.pg_get_userbyid(c.relowner)
@@ -173,7 +267,11 @@ BEGIN
     END IF;
     IF pg_catalog.has_schema_privilege('nmcp_api','public','CREATE')
        OR pg_catalog.has_schema_privilege('nmcp_worker','public','CREATE')
-       OR pg_catalog.has_schema_privilege('nmcp_purge_function_owner','public','CREATE') THEN
+       OR pg_catalog.has_schema_privilege('nmcp_purge_function_owner','public','CREATE')
+       OR pg_catalog.has_schema_privilege('nmcp_check_runtime','public','CREATE')
+       OR pg_catalog.has_schema_privilege('nmcp_repair_runtime','public','CREATE')
+       OR pg_catalog.has_schema_privilege('nmcp_check_function_owner','public','CREATE')
+       OR pg_catalog.has_schema_privilege('nmcp_repair_function_owner','public','CREATE') THEN
         RAISE EXCEPTION 'runtime or function owner can create schema objects';
     END IF;
     IF pg_catalog.has_table_privilege('nmcp_purge_function_owner','public.purge_file_progress','UPDATE')

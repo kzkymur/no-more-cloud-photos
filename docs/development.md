@@ -111,6 +111,19 @@ objects. Runtime roles have no schema DDL or table `TRUNCATE`; the Worker can
 only `SELECT`/`INSERT` purge progress and invoke the ordered completion
 function, never update or delete progress directly.
 
+Reconciliation reserves separate NOLOGIN/NOINHERIT capabilities
+`nmcp_check_runtime` and `nmcp_repair_runtime` plus isolated
+`nmcp_check_function_owner` and `nmcp_repair_function_owner` roles. They do not
+nest into the common API/Worker graph, and no current application login inherits
+either capability. The migrator is a member of the owner roles solely to
+transfer narrow SECURITY DEFINER functions in forward migrations. Future
+operational check and repair credentials and units remain issue #20 work; they
+must not reuse the migrator login or collapse both capabilities into one login.
+This role bootstrap must run before migration 0017. That migration, not the
+bootstrap, owns any reconciliation table or function privileges and must fail
+closed when the stable roles are absent; no such application objects are
+assumed by the current validation fixture.
+
 For example, with `NMCP_FILE_BASE_URL=https://photos.example.ts.net/files`,
 the stored key `originals/ab/<original-id>/original.jpg` is returned as
 `https://photos.example.ts.net/files/originals/ab/<original-id>/original.jpg`.

@@ -95,14 +95,36 @@ def main() -> int:
             "Requires=nmcp-migrate.service" in dependent_text and "After=nmcp-migrate.service" in dependent_text,
             f"{dependent} lost its production migration dependency edge",
         )
+    tmpfiles_text = text(UBUNTU / "tmpfiles.d" / "nmcp.conf")
     require(
-        "d /run/nmcp-deploy 0700 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf")
-        and "f /run/nmcp-deploy/deploy.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "d /run/nmcp-deploy 0700 root root" in tmpfiles_text
+        and "f /run/nmcp-deploy/deploy.lock 0600 root root" in tmpfiles_text,
         "shared migration lock ownership/mode is missing",
     )
     require(
-        "f /run/nmcp-deploy/migration-execution.lock 0600 root root" in text(UBUNTU / "tmpfiles.d" / "nmcp.conf"),
+        "f /run/nmcp-deploy/migration-execution.lock 0600 root root" in tmpfiles_text,
         "owner-death migration execution lease is missing",
+    )
+    require(
+        tmpfiles_text.count("d /var/lib/nmcp/media/.quarantine 0700 nmcp nmcp -") == 1
+        and "/var/lib/nmcp/media/quarantine" not in tmpfiles_text,
+        "canonical private .quarantine tmpfiles entry is missing or duplicated",
+    )
+    compose_text = text(ROOT / "infra" / "validation" / "compose.yaml")
+    require(
+        "install -d -o 10001 -g 10001 -m 0700" in compose_text
+        and "/var/lib/nmcp/media/.quarantine" in compose_text
+        and "/var/lib/nmcp/media/quarantine" not in compose_text,
+        "validation storage does not explicitly create only private .quarantine",
+    )
+    environment_examples = "\n".join(text(path) for path in sorted((UBUNTU / "env").glob("*.example")))
+    require("NMCP_QUARANTINE" not in environment_examples, "quarantine path became environment-configurable")
+    cli_contract = text(ROOT / "docs" / "contracts" / "core-api.md")
+    storage_contract = text(ROOT / "docs" / "contracts" / "state-and-storage.md")
+    require("--quarantine-dir" not in cli_contract, "CLI contract still permits a quarantine path override")
+    require(
+        "${NMCP_STORAGE_ROOT}/.quarantine" in storage_contract,
+        "storage contract lost the canonical quarantine path",
     )
     host_install = text(ROOT / "scripts" / "install-ubuntu-host")
     require(
@@ -126,11 +148,13 @@ def main() -> int:
     ):
         require(required in files_unit, f"Nginx boundary missing: {required}")
     require("ReadWritePaths=" not in files_unit, "Nginx received a writable host path")
+    require(".quarantine" not in files_unit, "Nginx received the quarantine path")
 
     nginx_template = text(UBUNTU / "nginx.conf.in")
     require(nginx_template.count("alias ") == 2, "Nginx must expose exactly two aliases")
     require("alias /srv/nmcp/originals/" in nginx_template, "originals alias missing")
     require("alias /srv/nmcp/renditions/" in nginx_template, "renditions alias missing")
+    require(".quarantine" not in nginx_template, "Nginx template exposes quarantine")
     require("proxy_pass http://127.0.0.1:8080" in nginx_template, "API upstream is not loopback")
     require("autoindex off" in nginx_template and "Accept-Ranges" in nginx_template, "file response boundary missing")
     require("private, max-age=31536000, immutable" in nginx_template, "private cache contract missing")

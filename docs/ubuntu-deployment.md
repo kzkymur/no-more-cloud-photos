@@ -47,6 +47,7 @@ boundary.
 | `/etc/nmcp/tls-current` | root-owned atomic symlink | active certificate/key pair |
 | `/etc/nmcp-nginx/nginx.conf` | `root:root 0644` below 0755 parent | non-secret config readable by Nginx |
 | `/var/lib/nmcp/media` | `nmcp:nmcp 0700` | Core writable storage |
+| `/var/lib/nmcp/media/.quarantine` | `nmcp:nmcp 0700` | canonical same-filesystem repair quarantine; never served |
 | `/var/lib/nmcp/backups` | `nmcp:nmcp 0700` | reserved, never mounted into Nginx |
 | `/var/lib/nmcp/deployment` | `root:root 0700` | package and activation evidence |
 
@@ -57,6 +58,14 @@ and only `originals` and `renditions` are bind-mounted read-only at `/srv/nmcp`.
 It cannot see backup, temporary, quarantine, database, environment, or source
 TLS-key paths. systemd exposes the TLS files only in the Nginx service's private
 credential directory. Nginx receives only `CAP_NET_BIND_SERVICE` for low ports.
+
+`.quarantine` is a fixed child of `NMCP_STORAGE_ROOT`; there is no separate
+quarantine environment variable, caller-selected path, or mount. Operators must
+verify it has the same device ID as `/var/lib/nmcp/media` before repair is wired.
+The API and Worker currently share the `nmcp` Unix identity and a writable media
+root, so this layout prevents accidental serving but does not claim OS-level
+quarantine isolation from either Core process. Issue #20 owns any future
+administrative unit, credential, and sandbox boundary; none is installed here.
 
 ## Host prerequisites
 
@@ -93,12 +102,21 @@ sudo -u postgres psql --dbname nmcp
 \password nmcp_worker
 ```
 
-The script creates credential-free `nmcp_runtime`, `nmcp_worker_runtime`, and
-`nmcp_purge_function_owner` roles, grants API and Worker only their reviewed
-memberships, transfers database/schema ownership to `nmcp_migrator`, and
-removes PUBLIC schema creation. Embedded migrations own all application object
-grants; the bootstrap deliberately does not grant table or function access
-after the fact. Migration fails closed if stable roles are absent or unsafe.
+The script creates credential-free `nmcp_runtime`, `nmcp_worker_runtime`,
+`nmcp_purge_function_owner`, `nmcp_check_runtime`, `nmcp_repair_runtime`,
+`nmcp_check_function_owner`, and `nmcp_repair_function_owner` roles. The two
+reconciliation capability roles and two function owners are NOINHERIT and
+isolated from the common runtime graph. API and Worker receive only their
+reviewed existing memberships; no check/repair login or capability member is
+created. The migrator is a member of the three function-owner roles only so
+forward migrations can transfer narrowly scoped SECURITY DEFINER functions.
+Issue #20 will provision future operational check/repair credentials after the
+CLI contract lands; the root migration credential must not be reused. The
+bootstrap transfers database/schema ownership to `nmcp_migrator` and removes
+PUBLIC schema creation. Embedded migrations own all application object grants;
+the bootstrap deliberately does not grant table or function access after the
+fact. Run it before migration 0017, which owns those future grants and must fail
+closed if stable roles are absent or unsafe.
 
 Create separate files from `infra/ubuntu/env/*.example`. Replace every marker,
 use a random HMAC value of at least 32 bytes, and keep the API address exactly
@@ -316,7 +334,10 @@ sudo systemctl show "<CONCRETE_POSTGRESQL_UNIT>" nmcp-api.service nmcp-worker.se
 sudo ss -lntup
 sudo stat -c '%U:%G %a %n' /etc/nmcp /etc/nmcp/*.env /etc/nmcp-nginx \
   /etc/nmcp-nginx/nginx.conf /etc/nmcp/tls-current \
-  /etc/nmcp/tls-current/*.pem /var/lib/nmcp/media /var/lib/nmcp/backups
+  /etc/nmcp/tls-current/*.pem /var/lib/nmcp/media \
+  /var/lib/nmcp/media/.quarantine /var/lib/nmcp/backups
+test "$(stat -c %d /var/lib/nmcp/media)" = \
+  "$(stat -c %d /var/lib/nmcp/media/.quarantine)"
 curl --fail --show-error http://127.0.0.1:8080/readyz
 ```
 
