@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 0077
+
+[[ $EUID -eq 0 ]] || {
+  printf 'run-ubuntu-migration-compatibility: must run as root\n' >&2
+  exit 1
+}
+[[ $# -ge 3 ]] || {
+  printf 'usage: run-ubuntu-migration-compatibility ADMIN migrate SUBCOMMAND [ARG...]\n' >&2
+  exit 2
+}
+admin=$1
+shift
+[[ -f $admin && ! -L $admin && -x $admin ]] || {
+  printf 'run-ubuntu-migration-compatibility: unsafe admin binary\n' >&2
+  exit 1
+}
+
+role_mode=/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode
+migration_status=0
+signal_status=0
+finalized=false
+finalize() {
+  local exit_status=$1 harden_status=0 result
+  [[ $finalized == false ]] || return
+  finalized=true
+  trap - EXIT INT TERM
+  "$role_mode" hardened || harden_status=$?
+  if ((signal_status != 0)); then
+    result=$signal_status
+  elif ((migration_status != 0)); then
+    result=$migration_status
+  elif ((exit_status != 0)); then
+    result=$exit_status
+  else
+    result=$harden_status
+  fi
+  exit "$result"
+}
+on_int() { signal_status=130; exit 130; }
+on_term() { signal_status=143; exit 143; }
+
+# Arm cleanup before the first compatibility transition. Hardened mode is
+# idempotent, so even a failed preflight takes the same fail-closed exit path.
+trap 'finalize "$?"' EXIT
+trap on_int INT
+trap on_term TERM
+"$role_mode" compatibility
+
+set +e
+/usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+  "$admin" "$@"
+migration_status=$?
+set -e
+exit "$migration_status"

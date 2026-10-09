@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'must run as root\n' >&2; exit 1; }
+[[ $# -eq 2 ]] || { printf 'usage: %s CURRENT_ADMIN V16_ADMIN\n' "$0" >&2; exit 2; }
+current_admin=$(/usr/bin/readlink -f -- "$1")
+v16_admin=$(/usr/bin/readlink -f -- "$2")
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+work=$(/usr/bin/mktemp -d /var/tmp/nmcp-role-compatibility.XXXXXX)
+for path in /usr/local/libexec/nmcp /var/lib/nmcp /opt/nmcp-role-compatibility; do
+  [[ ! -e $path ]] || { printf 'refusing existing path: %s\n' "$path" >&2; exit 1; }
+done
+
+cleanup() {
+  /usr/bin/pkill -TERM -f '/opt/nmcp-role-compatibility/.*/nmcp-admin' >/dev/null 2>&1 || true
+  /usr/sbin/runuser -u postgres -- /usr/bin/dropdb --if-exists nmcp >/dev/null 2>&1 || true
+  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=postgres \
+    --set=ON_ERROR_STOP=1 --command \
+    'DROP ROLE IF EXISTS nmcp_graph_probe,nmcp_graph_bridge,nmcp_api,nmcp_worker,nmcp_migrator,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner' \
+    >/dev/null 2>&1 || true
+  /usr/bin/rm -rf -- /usr/local/libexec/nmcp /var/lib/nmcp /opt/nmcp-role-compatibility "$work"
+}
+trap cleanup EXIT
+
+/usr/bin/systemctl start postgresql
+if ! /usr/bin/id nmcp >/dev/null 2>&1; then
+  /usr/bin/systemd-sysusers "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf"
+fi
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp/postgresql \
+  /opt/nmcp-role-compatibility/current/bin /opt/nmcp-role-compatibility/v16/bin
+/usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
+/usr/bin/install -o root -g root -m 0755 \
+  "$repo_root/scripts/set-ubuntu-migration-role-mode" \
+  "$repo_root/scripts/run-ubuntu-migration-compatibility" /usr/local/libexec/nmcp/
+/usr/bin/install -o root -g root -m 0644 \
+  "$repo_root/infra/postgresql/runtime-roles.sql" \
+  "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \
+  /usr/local/libexec/nmcp/postgresql/
+/usr/bin/install -o root -g root -m 0755 "$current_admin" \
+  /opt/nmcp-role-compatibility/current/bin/nmcp-admin
+/usr/bin/install -o root -g root -m 0755 "$v16_admin" \
+  /opt/nmcp-role-compatibility/v16/bin/nmcp-admin
+
+write_checksums() {
+  local temporary
+  temporary=$(/usr/bin/mktemp /var/lib/nmcp/deployment/postgresql-role-bootstrap.XXXXXX)
+  (cd /usr/local/libexec/nmcp/postgresql && \
+    /usr/bin/sha256sum runtime-roles.sql verify-runtime-role-graph.sql) > "$temporary"
+  /usr/bin/chown root:root "$temporary"
+  /usr/bin/chmod 0600 "$temporary"
+  /usr/bin/mv -f "$temporary" /var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256
+}
+write_checksums
+
+reset_database() {
+  /usr/sbin/runuser -u postgres -- /usr/bin/dropdb --if-exists nmcp
+  /usr/sbin/runuser -u postgres -- /usr/bin/createdb nmcp
+  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+    --file="$repo_root/infra/ubuntu/postgresql-roles.sql"
+  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+    --set=ON_ERROR_STOP=1 --command "ALTER ROLE nmcp_migrator PASSWORD 'nmcp-migrator-wrapper-test'"
+}
+assert_hardened() {
+  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+    --file=/usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql >/dev/null
+}
+assert_compatibility() {
+  [[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+    --tuples-only --no-align --set=ON_ERROR_STOP=1 --command \
+    "SELECT count(*) FROM pg_catalog.pg_auth_members WHERE member='nmcp_migrator'::regrole AND roleid IN ('nmcp_purge_function_owner'::regrole,'nmcp_check_function_owner'::regrole,'nmcp_repair_function_owner'::regrole) AND NOT admin_option AND inherit_option AND set_option") == 3 ]]
+}
+run_wrapper() {
+  /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility "$@"
+}
+export NMCP_DATABASE_URL='postgres://nmcp_migrator:nmcp-migrator-wrapper-test@127.0.0.1:5432/nmcp?sslmode=disable'
+export NMCP_LOG_LEVEL=info NMCP_SHUTDOWN_TIMEOUT=10s
+
+# Fresh v0 migration and a normal rerun both finish in the hardened graph.
+reset_database
+run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
+assert_hardened
+run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
+assert_hardened
+
+# A stale compatibility state from an interrupted attempt is an accepted input,
+# but no other graph drift is; the next wrapper run hardens it again.
+/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode compatibility
+assert_compatibility
+run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
+assert_hardened
+
+# Migration failure preserves its status after mandatory hardening.
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/fail"
+cat > "$work/fail/nmcp-admin" <<'EOF'
+#!/bin/sh
+exit 42
+EOF
+/usr/bin/chown nmcp:nmcp "$work/fail/nmcp-admin"
+/usr/bin/chmod 0700 "$work/fail/nmcp-admin"
+set +e
+run_wrapper "$work/fail/nmcp-admin" migrate up --json
+status=$?
+set -e
+[[ $status -eq 42 ]]
+assert_hardened
+
+# A normal termination signal is trapped and hardening still completes.
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/term"
+cat > "$work/term/nmcp-admin" <<EOF
+#!/bin/sh
+touch '$work/term/ready'
+sleep 300
+EOF
+/usr/bin/chown -R nmcp:nmcp "$work/term"
+/usr/bin/chmod 0700 "$work/term/nmcp-admin"
+/usr/bin/setsid /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
+  "$work/term/nmcp-admin" migrate up --json &
+wrapper_pid=$!
+for attempt in {1..100}; do [[ -e $work/term/ready ]] && break; /usr/bin/sleep 0.05; done
+[[ -e $work/term/ready ]]
+/usr/bin/kill -TERM -- "-$wrapper_pid"
+set +e
+wait "$wrapper_pid"
+status=$?
+set -e
+[[ $status -eq 143 ]]
+assert_hardened
+
+# SIGKILL is the one untrappable interruption. It may leave compatibility TRUE,
+# but a restart accepts that exact state and must harden before success.
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/kill"
+cat > "$work/kill/nmcp-admin" <<EOF
+#!/bin/sh
+touch '$work/kill/ready'
+sleep 300
+EOF
+/usr/bin/chown -R nmcp:nmcp "$work/kill"
+/usr/bin/chmod 0700 "$work/kill/nmcp-admin"
+/usr/bin/setsid /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
+  "$work/kill/nmcp-admin" migrate up --json &
+wrapper_pid=$!
+for attempt in {1..100}; do [[ -e $work/kill/ready ]] && break; /usr/bin/sleep 0.05; done
+[[ -e $work/kill/ready ]]
+/usr/bin/kill -KILL -- "-$wrapper_pid"
+wait "$wrapper_pid" >/dev/null 2>&1 || true
+assert_compatibility
+run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
+assert_hardened
+
+# A post-migrate integrity failure returns nonzero and never reports readiness.
+/usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/harden"
+cat > "$work/harden/nmcp-admin" <<EOF
+#!/bin/sh
+touch '$work/harden/ready'
+while [ ! -e '$work/harden/go' ]; do sleep 0.05; done
+exit 0
+EOF
+/usr/bin/chown -R nmcp:nmcp "$work/harden"
+/usr/bin/chmod 0700 "$work/harden/nmcp-admin"
+run_wrapper "$work/harden/nmcp-admin" migrate up --json &
+wrapper_pid=$!
+for attempt in {1..100}; do [[ -e $work/harden/ready ]] && break; /usr/bin/sleep 0.05; done
+[[ -e $work/harden/ready ]]
+/usr/bin/printf '\n-- integrity failure\n' >> /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
+/usr/bin/touch "$work/harden/go"
+set +e
+wait "$wrapper_pid"
+status=$?
+set -e
+[[ $status -ne 0 ]]
+assert_compatibility
+/usr/bin/install -o root -g root -m 0644 \
+  "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \
+  /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
+write_checksums
+/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode hardened
+assert_hardened
+
+# Upgrade evidence uses the exact pre-0017 admin binary for v0→16, followed by
+# the candidate binary for v16→17 under the same production wrapper.
+reset_database
+run_wrapper /opt/nmcp-role-compatibility/v16/bin/nmcp-admin migrate up --json
+[[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+  --tuples-only --no-align --command 'SELECT max(version) FROM schema_migrations WHERE NOT dirty') == 16 ]]
+run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
+[[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+  --tuples-only --no-align --command 'SELECT max(version) FROM schema_migrations WHERE NOT dirty') == 17 ]]
+assert_hardened
+
+printf 'Ubuntu migration role compatibility verification passed\n'

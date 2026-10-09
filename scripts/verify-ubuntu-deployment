@@ -138,9 +138,22 @@ def main() -> int:
         "migration execution-lease handoff helper is not installed",
     )
     require("User=root" in migrate_unit, "migration serializer must own the root-only lock")
+    migration_runner = text(ROOT / "scripts" / "run-ubuntu-migration")
+    migration_compatibility = text(ROOT / "scripts" / "run-ubuntu-migration-compatibility")
+    role_mode = text(ROOT / "scripts" / "set-ubuntu-migration-role-mode")
+    release_installer = text(ROOT / "scripts" / "install-ubuntu-release")
     require(
-        "setpriv --reuid=nmcp --regid=nmcp" in text(ROOT / "scripts" / "run-ubuntu-migration"),
-        "migration body does not drop permanently to nmcp",
+        "run-ubuntu-migration-compatibility" in migration_runner
+        and "setpriv --reuid=nmcp --regid=nmcp" in migration_compatibility
+        and 'trap \'finalize "$?"\' EXIT' in migration_compatibility,
+        "migration compatibility wrapper does not drop to nmcp and harden on exit",
+    )
+    require(
+        "postgresql-role-bootstrap.sha256" in role_mode
+        and "/usr/sbin/runuser -u postgres" in role_mode
+        and "verify-runtime-role-graph.sql" in role_mode
+        and "systemctl stop nmcp-migrate.service" in release_installer,
+        "migration role bootstrap is not pinned, peer-authenticated, verified, and readiness-gated",
     )
     role_bootstrap = text(UBUNTU / "postgresql-roles.sql")
     shared_roles = text(ROOT / "infra" / "postgresql" / "runtime-roles.sql")

@@ -198,10 +198,27 @@ done
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp /usr/share/doc/nmcp
 for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
   acquire-ubuntu-deployment-locks capture-trusted-inputs handoff-ubuntu-migration-lock \
-  run-ubuntu-migration validate-ubuntu-config \
+  run-ubuntu-migration run-ubuntu-migration-compatibility set-ubuntu-migration-role-mode \
+  validate-ubuntu-config \
   verify-ubuntu-firewall verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp/postgresql
+/usr/bin/install -o root -g root -m 0644 \
+  "$repo_root/infra/postgresql/runtime-roles.sql" \
+  /usr/local/libexec/nmcp/postgresql/runtime-roles.sql
+/usr/bin/install -o root -g root -m 0644 \
+  "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \
+  /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
+bootstrap_checksums=$(/usr/bin/mktemp /var/lib/nmcp/deployment/postgresql-role-bootstrap.XXXXXX)
+(
+  cd /usr/local/libexec/nmcp/postgresql
+  /usr/bin/sha256sum runtime-roles.sql verify-runtime-role-graph.sql
+) > "$bootstrap_checksums"
+/usr/bin/chown root:root "$bootstrap_checksums"
+/usr/bin/chmod 0600 "$bootstrap_checksums"
+/usr/bin/mv -f "$bootstrap_checksums" \
+  /var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256
 /usr/bin/install -o root -g root -m 0644 "$repo_root/docs/ubuntu-deployment.md" /usr/share/doc/nmcp/ubuntu-deployment.md
 
 /usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' \

@@ -111,7 +111,13 @@ write_fixture() {
 
 start_environment() {
   prepare_storage
-  compose up --build --detach --wait
+  if ! compose up --build --detach --wait; then
+    # Compose cannot express an always-run dependency. Force the same hardened
+    # exact graph after a failed migration before cleanup destroys the fixture.
+    compose run --rm --no-deps role-harden || true
+    compose logs migrate role-compatibility role-harden >&2 || true
+    return 1
+  fi
   write_fixture
 }
 
@@ -188,8 +194,10 @@ runtime_migration_command() {
 }
 
 run_ubuntu_role_bootstrap() {
+  local mode=${1:-FALSE}
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
-    --set ON_ERROR_STOP=1 --file /opt/nmcp-infra/ubuntu/postgresql-roles.sql
+    --set ON_ERROR_STOP=1 --set "nmcp_migration_compatibility=$mode" \
+    --file /opt/nmcp-infra/ubuntu/postgresql-roles.sql
 }
 
 expect_ubuntu_role_bootstrap_denied() {
@@ -215,6 +223,25 @@ check_role_bootstrap_rerun() {
 GRANT nmcp_worker_runtime TO nmcp_worker WITH ADMIN TRUE, INHERIT FALSE, SET TRUE; \
 GRANT nmcp_purge_function_owner,nmcp_check_function_owner,nmcp_repair_function_owner \
 TO nmcp_migrator WITH ADMIN TRUE, INHERIT TRUE, SET FALSE;"
+  run_ubuntu_role_bootstrap
+
+  # Compatibility mode changes only the three owner-edge inherit bits and is
+  # rerunnable from an exact interrupted compatibility state.
+  run_ubuntu_role_bootstrap TRUE
+  [ "$(bootstrap_catalog_value "SELECT count(*) FROM pg_auth_members WHERE member='nmcp_migrator'::regrole AND roleid IN ('nmcp_purge_function_owner'::regrole,'nmcp_check_function_owner'::regrole,'nmcp_repair_function_owner'::regrole) AND NOT admin_option AND inherit_option AND set_option")" = 3 ]
+  run_ubuntu_role_bootstrap TRUE
+  run_ubuntu_role_bootstrap
+
+  # Compatibility preflight rejects and transactionally preserves even a
+  # poison on an otherwise allowed edge; it never normalizes before widening.
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT nmcp_runtime TO nmcp_api WITH ADMIN TRUE, INHERIT FALSE, SET TRUE"
+  if run_ubuntu_role_bootstrap TRUE >/dev/null 2>&1; then
+    echo "error: compatibility preflight normalized a poisoned edge" >&2
+    exit 1
+  fi
+  [ "$(bootstrap_catalog_value "SELECT admin_option::int || ':' || inherit_option::int || ':' || set_option::int FROM pg_auth_members WHERE roleid='nmcp_runtime'::regrole AND member='nmcp_api'::regrole")" = "1:0:1" ]
   run_ubuntu_role_bootstrap
 
   # Unsafe attributes fail without being normalized behind the operator's back.

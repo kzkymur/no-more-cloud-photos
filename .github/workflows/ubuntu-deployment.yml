@@ -6,6 +6,7 @@ on:
       - ".github/workflows/ubuntu-deployment.yml"
       - "docs/ubuntu-deployment.md"
       - "infra/ubuntu/**"
+      - "infra/postgresql/**"
       - "scripts/assert-ubuntu-files-endpoint"
       - "scripts/capture-trusted-inputs"
       - "scripts/check-ubuntu-services"
@@ -18,6 +19,8 @@ on:
       - "scripts/render-ubuntu-postgresql-dependency"
       - "scripts/renew-ubuntu-tls"
       - "scripts/run-ubuntu-migration"
+      - "scripts/run-ubuntu-migration-compatibility"
+      - "scripts/set-ubuntu-migration-role-mode"
       - "scripts/validate-ubuntu-config"
       - "scripts/verify-ubuntu-deployment"
       - "scripts/verify-ubuntu-config-boundaries"
@@ -25,6 +28,7 @@ on:
       - "scripts/verify-ubuntu-firewall-fixtures"
       - "scripts/verify-ubuntu-installed-nginx"
       - "scripts/verify-ubuntu-migration-lock"
+      - "scripts/verify-ubuntu-migration-role-compatibility"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
       - "scripts/verify-ubuntu-service-gate"
@@ -39,6 +43,7 @@ on:
       - ".github/workflows/ubuntu-deployment.yml"
       - "docs/ubuntu-deployment.md"
       - "infra/ubuntu/**"
+      - "infra/postgresql/**"
       - "scripts/assert-ubuntu-files-endpoint"
       - "scripts/capture-trusted-inputs"
       - "scripts/check-ubuntu-services"
@@ -51,6 +56,8 @@ on:
       - "scripts/render-ubuntu-postgresql-dependency"
       - "scripts/renew-ubuntu-tls"
       - "scripts/run-ubuntu-migration"
+      - "scripts/run-ubuntu-migration-compatibility"
+      - "scripts/set-ubuntu-migration-role-mode"
       - "scripts/validate-ubuntu-config"
       - "scripts/verify-ubuntu-deployment"
       - "scripts/verify-ubuntu-config-boundaries"
@@ -58,6 +65,7 @@ on:
       - "scripts/verify-ubuntu-firewall-fixtures"
       - "scripts/verify-ubuntu-installed-nginx"
       - "scripts/verify-ubuntu-migration-lock"
+      - "scripts/verify-ubuntu-migration-role-compatibility"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
       - "scripts/verify-ubuntu-service-gate"
@@ -81,17 +89,21 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Install parser and HTTP test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends nginx-core shellcheck
+          sudo apt-get install --yes --no-install-recommends nginx-core postgresql shellcheck
 
       - name: Check shell scripts
         run: |
           shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
             scripts/check-ubuntu-tls-expiry scripts/renew-ubuntu-tls \
-            scripts/run-ubuntu-migration scripts/verify-ubuntu-migration-lock \
+            scripts/run-ubuntu-migration scripts/run-ubuntu-migration-compatibility \
+            scripts/set-ubuntu-migration-role-mode scripts/verify-ubuntu-migration-lock \
+            scripts/verify-ubuntu-migration-role-compatibility \
             scripts/verify-ubuntu-config-boundaries scripts/verify-ubuntu-firewall-fixtures \
             scripts/verify-ubuntu-installed-nginx scripts/verify-ubuntu-nginx-http \
             scripts/verify-ubuntu-postgresql-dependency scripts/verify-ubuntu-release-failures \
@@ -132,6 +144,15 @@ jobs:
 
       - name: Verify migration serialization races
         run: sudo scripts/verify-ubuntu-migration-lock
+
+      - name: Verify migration role compatibility and hardening
+        run: |
+          go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
+          mkdir /tmp/nmcp-v16-source
+          git archive 97938b5031e48320330b8add8da1f77d8e801d68 | tar -x -C /tmp/nmcp-v16-source
+          (cd /tmp/nmcp-v16-source && go build -o /tmp/nmcp-admin-v16 ./cmd/nmcp-admin)
+          sudo scripts/verify-ubuntu-migration-role-compatibility \
+            /tmp/nmcp-admin-current /tmp/nmcp-admin-v16
 
       - name: Verify release activation and rollback failure transactions
         run: sudo scripts/verify-ubuntu-release-failures

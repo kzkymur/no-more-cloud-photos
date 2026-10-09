@@ -129,6 +129,28 @@ these stable roles or the three managed logins as a closed allowlist; this also
 blocks an external login from reaching the migrator or an owner transitively.
 Membership normalization and the final graph check run in one transaction, so
 an unsafe extra edge cannot leave a partially rewritten graph.
+
+Old embedded migrations transfer a function to its stable owner and then harden
+it in the same migration session. The production migration wrapper therefore
+uses a two-phase role transition while API and Worker are stopped. Its root-only
+pinned bootstrap first verifies the complete safe graph and role attributes,
+then transactionally changes only the three function-owner-to-`nmcp_migrator`
+edges from `INHERIT FALSE` to `INHERIT TRUE`; their `ADMIN FALSE` and `SET TRUE`
+options and every other edge remain exact. An EXIT/INT/TERM handler always runs
+the default bootstrap and an independent graph verifier to restore `INHERIT
+FALSE`, whether migration succeeds or fails. Temporary inheritance benefits
+only the isolated migration login: the exact bilateral graph forbids API,
+Worker, or a rogue role from reaching the migrator or function owners.
+
+The wrapper runs the checksum-verified SQL installed under
+`/usr/local/libexec/nmcp/postgresql` through local `postgres` peer
+authentication; it does not use or pass the admin DSN to an application
+process. Release activation first invalidates any prior `nmcp-migrate.service`
+success. API and Worker require a fresh successful migration unit, so a failed
+hardening/verifier, normal signal, or interrupted compatibility phase prevents
+service start. A power loss or SIGKILL can leave the database in compatibility
+mode, but the next mandatory wrapper attempt accepts only that exact interrupted
+state, reruns migration idempotently, and hardens before reporting readiness.
 Issue #20 will provision future operational check/repair credentials after the
 CLI contract lands; the root migration credential must not be reused. The
 bootstrap transfers database/schema ownership to `nmcp_migrator` and removes

@@ -18,6 +18,7 @@ services:
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-nmcp-roles.sql:ro
       - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
       - ../ubuntu/postgresql-roles.sql:/opt/nmcp-infra/ubuntu/postgresql-roles.sql:ro
+      - ../postgresql/verify-runtime-role-graph.sql:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
       - ./verify-runtime-roles.sql:/opt/nmcp-infra/validation/verify-runtime-roles.sql:ro
     networks: [backend]
     labels: *validation-labels
@@ -43,8 +44,54 @@ services:
       NMCP_LOG_LEVEL: info
       NMCP_SHUTDOWN_TIMEOUT: 10s
     depends_on:
+      role-compatibility:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+    networks: [backend]
+    labels: *validation-labels
+
+  role-compatibility:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    entrypoint: ["psql"]
+    command:
+      - --host=postgres
+      - --username=nmcp_bootstrap
+      - --dbname=nmcp
+      - --set=nmcp_migrator_role=nmcp_migrator
+      - --set=nmcp_api_role=nmcp_api
+      - --set=nmcp_worker_role=nmcp_worker
+      - --set=nmcp_migration_compatibility=TRUE
+      - --file=/opt/nmcp-infra/postgresql/runtime-roles.sql
+    environment:
+      PGPASSWORD: nmcp-bootstrap-validation-only
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+    networks: [backend]
+    labels: *validation-labels
+
+  role-harden:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    entrypoint: ["sh", "-eu", "-c"]
+    command:
+      - >-
+        psql --host=postgres --username=nmcp_bootstrap --dbname=nmcp
+        --set=nmcp_migrator_role=nmcp_migrator
+        --set=nmcp_api_role=nmcp_api --set=nmcp_worker_role=nmcp_worker
+        --file=/opt/nmcp-infra/postgresql/runtime-roles.sql &&
+        psql --host=postgres --username=nmcp_bootstrap --dbname=nmcp
+        --file=/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql
+    environment:
+      PGPASSWORD: nmcp-bootstrap-validation-only
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+      - ../postgresql/verify-runtime-role-graph.sql:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
     networks: [backend]
     labels: *validation-labels
 
@@ -61,7 +108,7 @@ services:
       NMCP_CURSOR_HMAC_KEY: validation-only-cursor-key-32-bytes-minimum
       NMCP_API_ADDR: 0.0.0.0:8080
     depends_on:
-      migrate:
+      role-harden:
         condition: service_completed_successfully
       storage-init:
         condition: service_completed_successfully
@@ -95,7 +142,7 @@ services:
       NMCP_SRGB_ICC_PATH: /opt/nmcp/share/sRGB2014.icc
       NMCP_SRGB_ICC_SHA256: 384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
     depends_on:
-      migrate:
+      role-harden:
         condition: service_completed_successfully
       storage-init:
         condition: service_completed_successfully

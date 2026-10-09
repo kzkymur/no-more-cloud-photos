@@ -26,6 +26,14 @@ The validation-only password and cursor key in `compose.yaml` are intentionally
 non-secret and must never be copied into deployment configuration. Production
 secrets belong in root-owned systemd credentials/environment files readable by
 the service manager and service identity, not in the repository or arguments.
+Validation migrations run as the non-superuser `nmcp_migrator`. A dedicated
+bootstrap-only container first verifies the closed role graph and enables
+inheritance on exactly the three function-owner memberships. A second
+bootstrap-only container always restores the hardened `INHERIT FALSE` graph and
+runs the independent graph verifier before Compose may start API or Worker; the
+validation driver invokes that hardener explicitly after a failed startup as
+well. The bootstrap password is present only in those disposable administrator
+containers and is not inherited by application services.
 
 Storage initialization creates the sole canonical quarantine directory at
 `/var/lib/nmcp/media/.quarantine` as UID/GID 10001 mode 0700 and verifies that it

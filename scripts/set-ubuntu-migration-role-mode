@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 0077
+
+[[ $EUID -eq 0 ]] || {
+  printf 'set-ubuntu-migration-role-mode: must run as root\n' >&2
+  exit 1
+}
+mode=${1:-}
+[[ $# -eq 1 && ( $mode == compatibility || $mode == hardened ) ]] || {
+  printf 'usage: set-ubuntu-migration-role-mode compatibility|hardened\n' >&2
+  exit 2
+}
+
+bootstrap_dir=/usr/local/libexec/nmcp/postgresql
+bootstrap=$bootstrap_dir/runtime-roles.sql
+verifier=$bootstrap_dir/verify-runtime-role-graph.sql
+checksums=/var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256
+for path in "$bootstrap" "$verifier"; do
+  [[ -f $path && ! -L $path && $(/usr/bin/stat -c '%U:%G:%a' "$path") == root:root:644 ]] || {
+    printf 'set-ubuntu-migration-role-mode: unsafe pinned SQL asset: %s\n' "$path" >&2
+    exit 1
+  }
+done
+[[ -f $checksums && ! -L $checksums \
+  && $(/usr/bin/stat -c '%U:%G:%a' "$checksums") == root:root:600 ]] || {
+  printf 'set-ubuntu-migration-role-mode: unsafe checksum evidence\n' >&2
+  exit 1
+}
+(cd -- "$bootstrap_dir" && /usr/bin/sha256sum --check --status "$checksums") || {
+  printf 'set-ubuntu-migration-role-mode: pinned SQL checksum mismatch\n' >&2
+  exit 1
+}
+
+compatibility=FALSE
+[[ $mode == hardened ]] || compatibility=TRUE
+/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+  --set=nmcp_migrator_role=nmcp_migrator \
+  --set=nmcp_api_role=nmcp_api \
+  --set=nmcp_worker_role=nmcp_worker \
+  --set="nmcp_migration_compatibility=$compatibility" \
+  --file="$bootstrap"
+
+if [[ $mode == hardened ]]; then
+  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+    --file="$verifier"
+fi

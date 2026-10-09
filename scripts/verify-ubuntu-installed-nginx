@@ -270,6 +270,21 @@ fi
 [[ -d /var/lib/nmcp/media/.quarantine && ! -L /var/lib/nmcp/media/.quarantine ]]
 [[ $(/usr/bin/stat -c '%u:%g:%a' /var/lib/nmcp/media/.quarantine) == "$nmcp_uid:$nmcp_gid:700" ]]
 [[ $(/usr/bin/stat -c '%d' /var/lib/nmcp/media/.quarantine) == "$media_device" ]]
+for path in /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
+  /usr/local/libexec/nmcp/set-ubuntu-migration-role-mode; do
+  [[ $(/usr/bin/stat -c '%U:%G:%a' "$path") == root:root:755 ]]
+done
+for path in /usr/local/libexec/nmcp/postgresql/runtime-roles.sql \
+  /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql; do
+  [[ $(/usr/bin/stat -c '%U:%G:%a' "$path") == root:root:644 ]]
+done
+[[ $(/usr/bin/stat -c '%U:%G:%a' \
+  /var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256) == root:root:600 ]]
+(
+  cd /usr/local/libexec/nmcp/postgresql
+  /usr/bin/sha256sum --check --status \
+    /var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256
+)
 guard_link=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
 guard_config=$(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf)
 
