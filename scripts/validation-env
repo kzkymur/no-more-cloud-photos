@@ -214,6 +214,77 @@ bootstrap_catalog_value() {
     --tuples-only --no-align --set ON_ERROR_STOP=1 --command "$1"
 }
 
+run_runtime_role_verifier() {
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --file /opt/nmcp-infra/validation/verify-runtime-roles.sql
+}
+
+expect_runtime_role_verifier_denied() {
+  label=$1
+  if verifier_output=$(run_runtime_role_verifier 2>&1); then
+    echo "error: runtime role verifier accepted $label" >&2
+    exit 1
+  fi
+  # The catalog error contains no connection string or credential. Keep its
+  # SQLSTATE/cause visible so a rejected counterexample remains auditable.
+  printf 'expected runtime role verifier rejection (%s):\n%s\n' \
+    "$label" "$verifier_output" >&2
+}
+
+check_runtime_role_verifier_negatives() {
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER FUNCTION public.nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz) SECURITY INVOKER"
+  expect_runtime_role_verifier_denied "check API SECURITY INVOKER drift"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER FUNCTION public.nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz) SECURITY DEFINER"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT EXECUTE ON FUNCTION public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) TO PUBLIC"
+  expect_runtime_role_verifier_denied "repair API PUBLIC EXECUTE drift"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE EXECUTE ON FUNCTION public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) FROM PUBLIC"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER FUNCTION public.nmcp_finish_repair_run(nmcp_uuid_v4) OWNER TO nmcp_check_function_owner"
+  expect_runtime_role_verifier_denied "repair API owner drift"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER FUNCTION public.nmcp_finish_repair_run(nmcp_uuid_v4) OWNER TO nmcp_repair_function_owner; \
+REVOKE ALL ON FUNCTION public.nmcp_finish_repair_run(nmcp_uuid_v4) FROM nmcp_check_function_owner; \
+GRANT EXECUTE ON FUNCTION public.nmcp_finish_repair_run(nmcp_uuid_v4) TO nmcp_repair_runtime"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER FUNCTION public.nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4) SET search_path=pg_catalog,pg_temp"
+  expect_runtime_role_verifier_denied "repair API search_path drift"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER FUNCTION public.nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4) SET search_path=public,pg_catalog,pg_temp"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT EXECUTE ON FUNCTION public.nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz) TO nmcp_repair_runtime"
+  expect_runtime_role_verifier_denied "check API unintended repair EXECUTE drift"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE EXECUTE ON FUNCTION public.nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz) FROM nmcp_repair_runtime"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE EXECUTE ON FUNCTION public.nmcp_complete_check_source(nmcp_uuid_v4,text,text) FROM nmcp_check_runtime"
+  expect_runtime_role_verifier_denied "check API missing intended EXECUTE"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT EXECUTE ON FUNCTION public.nmcp_complete_check_source(nmcp_uuid_v4,text,text) TO nmcp_check_runtime"
+
+  run_runtime_role_verifier
+}
+
 check_role_bootstrap_rerun() {
   # Execute the actual production bootstrap twice and prove it normalizes every
   # membership edge it owns, including concrete API and Worker logins.
@@ -338,8 +409,8 @@ check_database_role_boundary() {
     [ "$actual" = "$user" ] || { echo "error: expected database role $user, got $actual" >&2; exit 1; }
   done
   check_role_bootstrap_rerun
-  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
-    --set ON_ERROR_STOP=1 --file /opt/nmcp-infra/validation/verify-runtime-roles.sql
+  run_runtime_role_verifier
+  check_runtime_role_verifier_negatives
   expect_database_denied nmcp_worker nmcp-worker-validation-only \
     "UPDATE purge_file_progress SET disposition=disposition WHERE false"
   expect_database_denied nmcp_worker nmcp-worker-validation-only \
@@ -375,7 +446,33 @@ check_processes_and_isolation() {
   assert_running worker
   assert_running files
   assert_running postgres
+
+  # The bootstrap counterexamples intentionally commit poisoned membership
+  # graphs between independent verifier calls. Never expose a live API/Worker
+  # connection pool to those states: stop and prove both processes exited
+  # cleanly, restore and independently verify the graph, then restart them.
+  api_id=$(compose ps --all --quiet api)
+  worker_id=$(compose ps --all --quiet worker)
+  compose stop api worker
+  for service_id in "api:$api_id" "worker:$worker_id"; do
+    service=${service_id%%:*}
+    id=${service_id#*:}
+    [ "$(docker inspect --format '{{.State.Running}}' "$id")" = false ] || {
+      echo "error: $service remained live during destructive role probes: $id" >&2
+      exit 1
+    }
+    exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$id")
+    if [ "$exit_code" != 0 ]; then
+      compose logs --no-color "$service" >&2 || true
+      echo "error: $service process did not shut down cleanly before role probes (exit $exit_code): $id" >&2
+      exit 1
+    fi
+  done
   check_database_role_boundary
+  compose start api worker
+  compose up --detach --wait api worker
+  assert_running api
+  assert_running worker
 
   files_id=$(compose ps --quiet files)
   postgres_id=$(compose ps --quiet postgres)
@@ -468,23 +565,6 @@ for destination, (filesystem, writable) in actual.items():
     assert writable is expected_writable, (destination, writable)
 '
 
-  api_id=$(compose ps --all --quiet api)
-  worker_id=$(compose ps --all --quiet worker)
-  compose stop api worker
-  for service_id in "api:$api_id" "worker:$worker_id"; do
-    service=${service_id%%:*}
-    id=${service_id#*:}
-    [ "$(docker inspect --format '{{.State.Running}}' "$id")" = false ]
-    exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$id")
-    if [ "$exit_code" != 0 ]; then
-      compose logs --no-color "$service" >&2 || true
-      echo "error: $service process did not shut down cleanly (exit $exit_code): $id" >&2
-      exit 1
-    fi
-  done
-  compose start api worker
-  compose up --detach --wait api worker
-  assert_running worker
 }
 
 check() (

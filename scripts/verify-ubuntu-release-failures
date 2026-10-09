@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 [[ $EUID -eq 0 ]] || { printf 'verify-ubuntu-release-failures: must run as root\n' >&2; exit 1; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 work=$(/usr/bin/mktemp -d /run/nmcp-release-failures.XXXXXX)
@@ -10,6 +10,54 @@ registration_pid=
 cancel_pid=
 pretransfer_pid=
 stale_pid=
+current_phase=initialization
+phase_output=
+phase() {
+  current_phase=$1
+  phase_output=${2:-}
+  printf 'release failure evidence phase: %s\n' "$current_phase"
+}
+diagnose_error() {
+  local status=$1 line=$2 failed_command=$3 output unit
+  trap - ERR
+  set +e
+  failed_command=${failed_command//migrator-secret/[REDACTED]}
+  failed_command=${failed_command//api-secret/[REDACTED]}
+  failed_command=${failed_command//worker-secret/[REDACTED]}
+  printf 'release failure evidence ERROR: phase=%s status=%s line=%s BASH_LINENO=%s command=%s\n' \
+    "$current_phase" "$status" "$line" "${BASH_LINENO[*]-}" "$failed_command" >&2
+  if [[ -n $phase_output && -e $phase_output ]]; then
+    printf '%s\n' "--- phase output: $phase_output ---" >&2
+    /usr/bin/cat -- "$phase_output" >&2 || true
+  fi
+  printf '%s\n' '--- exact unit states ---' >&2
+  for unit in nmcp-migrate.service nmcp-api.service nmcp-worker.service nmcp-files.service \
+      nmcp.target postgresql@nmcp-test.service; do
+    /usr/bin/systemctl show "$unit" --no-pager \
+      --property=LoadState,ActiveState,SubState,Result,ExecMainStatus >&2 || true
+  done
+  for output in "$stale_pid" "$predispatch_pid" "$installer_pid" "$registration_pid" \
+      "$cancel_pid" "$pretransfer_pid"; do
+    [[ -n $output ]] || continue
+    unit="nmcp-deploy-admin-$output-1.service"
+    /usr/bin/systemctl show "$unit" --no-pager \
+      --property=LoadState,ActiveState,SubState,Result,ExecMainStatus >&2 || true
+  done
+  for output in "$work"/*.out; do
+    [[ -e $output || $output == "$phase_output" ]] || continue
+    printf '%s\n' "--- retained output: $output ---" >&2
+    /usr/bin/cat -- "$output" >&2 || true
+  done
+  printf '%s\n' '--- pending systemd jobs ---' >&2
+  /usr/bin/systemctl list-jobs --no-pager >&2 || true
+  printf '%s\n' '--- migration readiness and handoff state ---' >&2
+  /usr/bin/ls -la /run/nmcp-migration-complete /run/nmcp-deploy >&2 || true
+  printf 'current release: ' >&2
+  /usr/bin/readlink -f /opt/nmcp/current >&2 || true
+  printf '%s\n' '--- active release evidence ---' >&2
+  /usr/bin/cat /var/lib/nmcp/deployment/active-release >&2 || true
+  return "$status"
+}
 cleanup() {
   /usr/bin/touch "$work/ownerdeath-proceed" 2>/dev/null || true
   /usr/bin/touch /run/nmcp-deploy/test-runner-record.go \
@@ -41,6 +89,7 @@ cleanup() {
   /usr/bin/rm -f /run/nmcp-migration-complete
 }
 trap cleanup EXIT
+trap 'diagnose_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 /usr/bin/chown nmcp:nmcp "$work"
 for path in /opt/nmcp /etc/nmcp /var/lib/nmcp/deployment /usr/local/libexec/nmcp; do
   [[ ! -e $path ]] || { printf 'test path already exists: %s\n' "$path" >&2; exit 1; }
@@ -174,8 +223,10 @@ EOF
   printf 'seeded migration readiness did not retain exited state\n' >&2; exit 1;
 }
 printf 'stale readiness evidence: retained prior success\n'
+phase stale-readiness "$work/stalefail.out"
 "$repo/scripts/install-ubuntu-release" activate stalefail >"$work/stalefail.out" 2>&1 &
 stale_pid=$!
+stale_unit="nmcp-deploy-admin-$stale_pid-1.service"
 for attempt in {1..1000}; do
   /usr/bin/grep -q '^NMCP_TEST_STALE_COMPATIBILITY_ENTERED$' "$work/stalefail.out" && break
   [[ $attempt -lt 1000 ]] || {
@@ -202,6 +253,33 @@ printf 'stale readiness evidence: API and Worker remained blocked\n'
 if wait "$stale_pid"; then
   printf 'hardening failure unexpectedly activated release\n' >&2; exit 1
 fi
+for attempt in {1..200}; do
+  stale_load=$(/usr/bin/systemctl show --property=LoadState --value "$stale_unit")
+  stale_state=$(/usr/bin/systemctl show --property=ActiveState --value "$stale_unit")
+  if [[ $stale_load == not-found || $stale_state == inactive || $stale_state == failed ]] \
+    && ! /usr/bin/systemctl list-jobs --no-legend | /usr/bin/grep -q "$stale_unit"; then
+    break
+  fi
+  [[ $attempt -lt 200 ]] || {
+    printf 'stale compatibility transient did not reach a terminal state: %s %s %s\n' \
+      "$stale_unit" "$stale_load" "$stale_state" >&2
+    exit 1
+  }
+  /usr/bin/sleep 0.02
+done
+for attempt in {1..100}; do
+  if ! compgen -G "/run/nmcp-deploy/migration-handoff.$stale_pid.*" >/dev/null \
+    && ! compgen -G "/run/nmcp-deploy/migration-runner.$stale_pid.*" >/dev/null \
+    && /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/deploy.lock /usr/bin/true \
+    && /usr/bin/flock --exclusive --nonblock /run/nmcp-deploy/migration-execution.lock /usr/bin/true; then
+    break
+  fi
+  [[ $attempt -lt 100 ]] || {
+    printf 'stale compatibility cleanup retained handoff state or deployment locks\n' >&2
+    exit 1
+  }
+  /usr/bin/sleep 0.02
+done
 stale_pid=
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]] || {
   printf 'failed candidate did not restore prior release link\n' >&2; exit 1;
@@ -216,6 +294,7 @@ stale_pid=
 printf 'stale readiness evidence: failed candidate rolled back inactive\n'
 /usr/bin/systemctl reset-failed nmcp-migrate.service nmcp-api.service nmcp-worker.service >/dev/null 2>&1 || true
 
+phase migration-failure
 if "$repo/scripts/install-ubuntu-release" activate migratefail; then
   printf 'migration failure unexpectedly activated release\n' >&2; exit 1
 fi
@@ -225,6 +304,7 @@ fi
 
 # The real transient migration must require/order after the concrete database,
 # and a database start failure must prevent the admin binary from running.
+phase postgresql-start-failure "$work/pgfail.out"
 /usr/bin/systemctl stop postgresql@nmcp-test.service
 /usr/bin/rm -f "$work/postgresql-started" "$work/postgresql-ready"
 cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
@@ -243,6 +323,7 @@ fi
 
 # A transient job queued behind a never-ready but finitely bounded PostgreSQL
 # start must hit its own queue deadline and release every deployment resource.
+phase transient-queue-timeout "$work/queuefail.out"
 cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
 [Service]
 Type=notify
@@ -286,6 +367,7 @@ fi
 # Pause the receiver after validating its lease offer but before declaring exec
 # readiness. The wrapper must expire the total deadline without issuing EXEC;
 # delayed exact-unit stop then proves rollback and locks remain fail-closed.
+phase receiver-cancellation "$work/cancelrace.out"
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
 Type=notify
@@ -353,6 +435,7 @@ fi
 # Kill the installer after the wrapper exists but while its launcher is paused
 # before systemd-run registration. Register the exact unit only after the first
 # not-found terminal check; the mandatory post-reap gate must still cancel it.
+phase pretransfer-owner-death "$work/ownerpretransfer.out"
 cat > /run/systemd/system/postgresql@nmcp-test.service <<EOF
 [Service]
 Type=notify
@@ -449,6 +532,7 @@ EOF
 /usr/bin/rm -f "$work/postgresql-started" "$work/postgresql-ready"
 /usr/bin/touch "$work/postgresql-slow"
 /usr/bin/rm -f /run/nmcp-deploy/test-runner-record.{ready,go}
+phase service-start-failure "$work/startfail.out"
 NMCP_TEST_PAUSE_AFTER_RUNNER_RECORD=1 \
   "$repo/scripts/install-ubuntu-release" activate startfail >"$work/startfail.out" 2>&1 &
 registration_pid=$!
@@ -485,6 +569,7 @@ ExecStart=/usr/bin/sleep infinity
 EOF
 /usr/bin/systemctl daemon-reload
 
+phase readiness-gate-failure "$work/candidate.out"
 if "$repo/scripts/install-ubuntu-release" activate candidate >"$work/candidate.out" 2>&1; then
   printf 'failed readiness gate unexpectedly activated release\n' >&2; exit 1
 fi
@@ -502,6 +587,7 @@ done
 /usr/bin/touch "$work/allow-candidate"
 /usr/bin/systemctl stop postgresql@nmcp-test.service
 /usr/bin/rm -f "$work/postgresql-started" "$work/postgresql-ready"
+phase rollback-activation-failure "$work/rollback.out"
 if "$repo/scripts/install-ubuntu-release" rollback old >"$work/rollback.out" 2>&1; then
   printf 'failed rollback gate unexpectedly succeeded\n' >&2; exit 1
 fi
@@ -526,6 +612,7 @@ done
 
 # Exercise production run_admin's synchronized pre-dispatch phase. Installer
 # death must release both locks without ever creating transient handoff state.
+phase predispatch-owner-death "$work/predispatch.out"
 /usr/bin/rm -f /run/nmcp-deploy/test-before-admin-dispatch.{ready,go}
 NMCP_TEST_PAUSE_BEFORE_ADMIN_DISPATCH=1 \
   "$repo/scripts/install-ubuntu-release" activate predispatch >"$work/predispatch.out" 2>&1 &
@@ -556,6 +643,7 @@ fi
 
 # The installer owns the primary lock on its own FD. Kill it only after
 # the transient child has received the same execution-lease open description.
+phase post-transfer-owner-death "$work/ownerdeath.out"
 cat > /opt/nmcp/releases/ownerdeath/bin/nmcp-admin <<EOF
 #!/bin/sh
 if test "\${1:-}" = migrate && test "\${2:-}" = up; then
@@ -624,6 +712,7 @@ for attempt in {1..100}; do
   [[ $attempt -lt 100 ]] || { printf 'owner-death transient leaked handoff state\n' >&2; exit 1; }
   /usr/bin/sleep 0.05
 done
+phase post-owner-death-direct-migration "$work/direct-after-ownerdeath.out"
 /usr/local/libexec/nmcp/run-ubuntu-migration >"$work/direct-after-ownerdeath.out" 2>&1
 [[ ! -e /run/nmcp-migration-complete ]]
 printf 'Activation cleanup, rollback restoration, and evidence tests passed\n'
