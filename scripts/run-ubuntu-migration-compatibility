@@ -22,6 +22,7 @@ role_mode=/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode
 migration_status=0
 signal_status=0
 finalized=false
+child_pid=
 finalize() {
   local exit_status=$1 harden_status=0 result
   [[ $finalized == false ]] || return
@@ -39,8 +40,35 @@ finalize() {
   fi
   exit "$result"
 }
-on_int() { signal_status=130; exit 130; }
-on_term() { signal_status=143; exit 143; }
+stop_child() {
+  local signal=$1 attempt grace_attempts=${NMCP_TEST_SIGNAL_GRACE_ATTEMPTS:-250}
+  [[ $grace_attempts =~ ^[1-9][0-9]{0,2}$ ]] || grace_attempts=250
+  [[ -n $child_pid ]] || return 0
+  if /usr/bin/kill -0 -- "-$child_pid" 2>/dev/null; then
+    /usr/bin/kill -s "$signal" -- "-$child_pid" 2>/dev/null || true
+    for ((attempt=1; attempt<=grace_attempts; attempt++)); do
+      /usr/bin/kill -0 -- "-$child_pid" 2>/dev/null || break
+      /usr/bin/sleep 0.1
+    done
+    if /usr/bin/kill -0 -- "-$child_pid" 2>/dev/null; then
+      /usr/bin/kill -KILL -- "-$child_pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$child_pid" 2>/dev/null || true
+  child_pid=
+}
+on_int() {
+  trap - INT TERM
+  signal_status=130
+  stop_child INT
+  exit 130
+}
+on_term() {
+  trap - INT TERM
+  signal_status=143
+  stop_child TERM
+  exit 143
+}
 
 # Arm cleanup before the first compatibility transition. Hardened mode is
 # idempotent, so even a failed preflight takes the same fail-closed exit path.
@@ -50,8 +78,11 @@ trap on_term TERM
 "$role_mode" compatibility
 
 set +e
-/usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
-  "$admin" "$@"
+/usr/bin/setsid /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+  "$admin" "$@" &
+child_pid=$!
+wait "$child_pid"
 migration_status=$?
+child_pid=
 set -e
 exit "$migration_status"
