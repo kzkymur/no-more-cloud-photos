@@ -73,7 +73,14 @@ func (s *Service) CleanupNextRendition(ctx context.Context, preferredID string, 
 	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
 	defer cancel()
 	id, err := s.cleanup.CleanupNextRendition(dbCtx, preferredID, excludedIDs, unlink)
-	return id, classifyError(err)
+	classified := classifyError(err)
+	if IsKind(classified, KindDatabaseUnavailable) {
+		// A timeout/connection failure before filesystem action is not a selected
+		// retry identity. Only outcome-uncertain and candidate-specific poison
+		// errors retain the ID used for exact convergence or deferral.
+		return "", classified
+	}
+	return id, classified
 }
 
 func (s *Service) Delete(ctx context.Context, mediaID string) (DeleteResult, error) {

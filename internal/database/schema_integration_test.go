@@ -1725,7 +1725,7 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		pool := migratedIntegrationPool(t, databaseURL)
 		ctx := context.Background()
 		reportID, findingID := newUUIDv4(t), newUUIDv4(t)
-		snapshotStarted := time.Now().UTC().Add(-4 * time.Second)
+		snapshotStarted := time.Now().UTC().Add(-10 * time.Second)
 		cutoff := snapshotStarted.Add(time.Second)
 		snapshotEnded := cutoff.Add(time.Second)
 		scanStarted := snapshotEnded.Add(time.Second)

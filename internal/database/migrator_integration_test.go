@@ -79,10 +79,7 @@ func TestMigratorIntegration(t *testing.T) {
 		if err := newMigrator(pool, full.migrations[:16]).Up(context.Background()); err != nil {
 			t.Fatalf("apply versions one through sixteen: %v", err)
 		}
-		var profileID string
-		if err := pool.QueryRow(context.Background(), `SELECT id::text FROM profiles WHERE status='active' ORDER BY key LIMIT 1`).Scan(&profileID); err != nil {
-			t.Fatal(err)
-		}
+		profileID := insertDraftProfile(t, pool, "legacy-duplicate-owner", 1)
 		jobIDs := make([]string, 0, 2)
 		for index := 0; index < 2; index++ {
 			mediaID := newUUIDv4(t)
@@ -128,10 +125,7 @@ func TestMigratorIntegration(t *testing.T) {
 		mediaID := newUUIDv4(t)
 		insertMedia(t, pool, mediaID)
 		originalID := insertOriginal(t, pool, mediaID, "6", newUUIDv4(t))
-		var profileID string
-		if err := pool.QueryRow(context.Background(), `SELECT id::text FROM profiles WHERE status='active' ORDER BY key LIMIT 1`).Scan(&profileID); err != nil {
-			t.Fatal(err)
-		}
+		profileID := insertDraftProfile(t, pool, "legacy-cutover-writer", 1)
 		targetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
 		var jobID string
 		if err := pool.QueryRow(context.Background(), `SELECT job_id::text FROM job_targets WHERE id=$1`, targetID).Scan(&jobID); err != nil {
@@ -182,10 +176,7 @@ func TestMigratorIntegration(t *testing.T) {
 		mediaID := newUUIDv4(t)
 		insertMedia(t, pool, mediaID)
 		originalID := insertOriginal(t, pool, mediaID, "d", newUUIDv4(t))
-		var profileID string
-		if err := pool.QueryRow(context.Background(), `SELECT id::text FROM profiles WHERE status='active' ORDER BY key LIMIT 1`).Scan(&profileID); err != nil {
-			t.Fatalf("read active v16 profile: %v", err)
-		}
+		profileID := insertDraftProfile(t, pool, "legacy-evidence-upgrade", 1)
 		targetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
 		var jobID, legacyLease string
 		if err := pool.QueryRow(context.Background(), `SELECT j.id::text,j.lease_token::text FROM jobs AS j JOIN job_targets AS t ON t.job_id=j.id WHERE t.id=$1`, targetID).Scan(&jobID, &legacyLease); err != nil {
