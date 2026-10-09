@@ -282,6 +282,30 @@ GRANT EXECUTE ON FUNCTION public.nmcp_finish_repair_run(nmcp_uuid_v4) TO nmcp_re
     --set ON_ERROR_STOP=1 --command \
     "GRANT EXECUTE ON FUNCTION public.nmcp_complete_check_source(nmcp_uuid_v4,text,text) TO nmcp_check_runtime"
 
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT EXECUTE ON FUNCTION public.nmcp_complete_check_source(nmcp_uuid_v4,text,text) TO nmcp_check_runtime WITH GRANT OPTION"
+  expect_runtime_role_verifier_denied "check API EXECUTE grant option drift"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION public.nmcp_complete_check_source(nmcp_uuid_v4,text,text) FROM nmcp_check_runtime"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT EXECUTE ON FUNCTION public.nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4) TO nmcp_runtime WITH GRANT OPTION"
+  expect_runtime_role_verifier_denied "upload API EXECUTE grant option drift"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION public.nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4) FROM nmcp_runtime"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT EXECUTE ON FUNCTION public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) TO nmcp_repair_runtime WITH GRANT OPTION"
+  expect_runtime_role_verifier_denied "repair API EXECUTE grant option drift"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) FROM nmcp_repair_runtime"
+
   run_runtime_role_verifier
 }
 

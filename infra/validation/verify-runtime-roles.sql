@@ -381,6 +381,7 @@ BEGIN
             WHERE p.oid=boundary_oid
               AND acl.grantee=boundary.acl_grantee::pg_catalog.regrole::oid
               AND acl.privilege_type='EXECUTE'
+              AND NOT acl.is_grantable
         ) THEN
             RAISE EXCEPTION 'missing intended EXECUTE ACL on %',boundary.signature;
         END IF;
