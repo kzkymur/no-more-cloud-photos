@@ -94,14 +94,24 @@ func TestQuarantineAndAttemptTempKeysAreClosed(t *testing.T) {
 		"originals/01/" + testOriginalID + "/.original.jpg." + testAttemptID + ".tmp",
 		"renditions/01/" + testOriginalID + "/" + testTargetID + "/." + testRenditionID + ".avif." + testAttemptID + ".tmp",
 	}
+	wantKinds := []AttemptTempKind{OriginalUploadAttemptTemp, OriginalFinalAttemptTemp, RenditionFinalAttemptTemp}
 	for index, construct := range constructors {
 		key, err := construct()
-		if err != nil || key.String() != want[index] || key.AttemptID().String() != testAttemptID {
+		if err != nil || key.String() != want[index] || key.AttemptID().String() != testAttemptID ||
+			key.Kind() != wantKinds[index] || key.OriginalID().String() != testOriginalID {
 			t.Fatalf("temp constructor %d = %q, %v", index, key.String(), err)
 		}
 		parsed, err := ParseAttemptTempKey(key.String())
-		if err != nil || parsed.String() != key.String() || parsed.AttemptID().String() != testAttemptID {
+		if err != nil || parsed.String() != key.String() || parsed.AttemptID().String() != testAttemptID || parsed.Kind() != wantKinds[index] {
 			t.Fatalf("ParseAttemptTempKey(%q) = %q, %v", key.String(), parsed.String(), err)
+		}
+		parsedTarget, hasTarget := parsed.JobTargetID()
+		parsedRendition, hasRendition := parsed.RenditionID()
+		if index == 2 && (!hasTarget || !hasRendition || parsedTarget.String() != testTargetID || parsedRendition.String() != testRenditionID) {
+			t.Fatalf("rendition temp identity = %s/%t %s/%t", parsedTarget.String(), hasTarget, parsedRendition.String(), hasRendition)
+		}
+		if index != 2 && (hasTarget || hasRendition) {
+			t.Fatalf("original temp exposed rendition identity: target=%t rendition=%t", hasTarget, hasRendition)
 		}
 	}
 	for _, value := range []string{

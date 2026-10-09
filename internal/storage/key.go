@@ -158,9 +158,21 @@ type QuarantineKey struct {
 }
 
 type AttemptTempKey struct {
-	value     string
-	attemptID AttemptID
+	value       string
+	attemptID   AttemptID
+	kind        AttemptTempKind
+	originalID  OriginalID
+	targetID    JobTargetID
+	renditionID RenditionID
 }
+
+type AttemptTempKind uint8
+
+const (
+	OriginalUploadAttemptTemp AttemptTempKind = iota + 1
+	OriginalFinalAttemptTemp
+	RenditionFinalAttemptTemp
+)
 
 const AttemptTempGrace = 48 * time.Hour
 
@@ -190,14 +202,18 @@ func ParseQuarantineKey(value string) (QuarantineKey, error) {
 	return key, nil
 }
 
-func (key QuarantineKey) String() string { return ".quarantine/" + key.id.String() }
+func (key QuarantineKey) String() string             { return ".quarantine/" + key.id.String() }
+func (key QuarantineKey) QuarantineID() QuarantineID { return key.id }
 
 func NewOriginalUploadTempKey(originalID OriginalID, attemptID AttemptID) (AttemptTempKey, error) {
 	if !originalID.uuidV4.valid() || !attemptID.uuidV4.valid() {
 		return AttemptTempKey{}, ErrInvalidKey
 	}
 	id := originalID.String()
-	return AttemptTempKey{value: fmt.Sprintf("originals/%s/%s/.original.%s.tmp", id[:2], id, attemptID.String()), attemptID: attemptID}, nil
+	return AttemptTempKey{
+		value:     fmt.Sprintf("originals/%s/%s/.original.%s.tmp", id[:2], id, attemptID.String()),
+		attemptID: attemptID, kind: OriginalUploadAttemptTemp, originalID: originalID,
+	}, nil
 }
 
 func NewOriginalTempKey(key OriginalKey, attemptID AttemptID) (AttemptTempKey, error) {
@@ -205,7 +221,10 @@ func NewOriginalTempKey(key OriginalKey, attemptID AttemptID) (AttemptTempKey, e
 		return AttemptTempKey{}, ErrInvalidKey
 	}
 	directories, finalName := splitCanonicalKey(key.String())
-	return AttemptTempKey{value: strings.Join(directories, "/") + "/." + finalName + "." + attemptID.String() + ".tmp", attemptID: attemptID}, nil
+	return AttemptTempKey{
+		value:     strings.Join(directories, "/") + "/." + finalName + "." + attemptID.String() + ".tmp",
+		attemptID: attemptID, kind: OriginalFinalAttemptTemp, originalID: key.originalID,
+	}, nil
 }
 
 func NewRenditionTempKey(key RenditionKey, attemptID AttemptID) (AttemptTempKey, error) {
@@ -213,7 +232,11 @@ func NewRenditionTempKey(key RenditionKey, attemptID AttemptID) (AttemptTempKey,
 		return AttemptTempKey{}, ErrInvalidKey
 	}
 	directories, finalName := splitCanonicalKey(key.String())
-	return AttemptTempKey{value: strings.Join(directories, "/") + "/." + finalName + "." + attemptID.String() + ".tmp", attemptID: attemptID}, nil
+	return AttemptTempKey{
+		value:     strings.Join(directories, "/") + "/." + finalName + "." + attemptID.String() + ".tmp",
+		attemptID: attemptID, kind: RenditionFinalAttemptTemp, originalID: key.originalID,
+		targetID: key.targetID, renditionID: key.renditionID,
+	}, nil
 }
 
 func ParseAttemptTempKey(value string) (AttemptTempKey, error) {
@@ -271,8 +294,16 @@ func ParseAttemptTempKey(value string) (AttemptTempKey, error) {
 	return canonical, nil
 }
 
-func (key AttemptTempKey) String() string       { return key.value }
-func (key AttemptTempKey) AttemptID() AttemptID { return key.attemptID }
+func (key AttemptTempKey) String() string         { return key.value }
+func (key AttemptTempKey) AttemptID() AttemptID   { return key.attemptID }
+func (key AttemptTempKey) Kind() AttemptTempKind  { return key.kind }
+func (key AttemptTempKey) OriginalID() OriginalID { return key.originalID }
+func (key AttemptTempKey) JobTargetID() (JobTargetID, bool) {
+	return key.targetID, key.kind == RenditionFinalAttemptTemp
+}
+func (key AttemptTempKey) RenditionID() (RenditionID, bool) {
+	return key.renditionID, key.kind == RenditionFinalAttemptTemp
+}
 
 // IsAgedAttemptTemp is candidate classification only. Reconciliation must
 // separately prove there is no live or recent owning attempt before repair may
@@ -305,16 +336,18 @@ func (key OriginalKey) String() string {
 	return fmt.Sprintf("originals/%s/%s/original.%s", id[0:2], id, originalExtensions[key.extension])
 }
 
-func (key OriginalKey) OriginalID() OriginalID { return key.originalID }
+func (key OriginalKey) OriginalID() OriginalID       { return key.originalID }
+func (key OriginalKey) Extension() OriginalExtension { return key.extension }
 
 func (key RenditionKey) String() string {
 	originalID := key.originalID.String()
 	return fmt.Sprintf("renditions/%s/%s/%s/%s.%s", originalID[0:2], originalID, key.targetID.String(), key.renditionID.String(), renditionExtensions[key.extension])
 }
 
-func (key RenditionKey) OriginalID() OriginalID   { return key.originalID }
-func (key RenditionKey) JobTargetID() JobTargetID { return key.targetID }
-func (key RenditionKey) RenditionID() RenditionID { return key.renditionID }
+func (key RenditionKey) OriginalID() OriginalID        { return key.originalID }
+func (key RenditionKey) JobTargetID() JobTargetID      { return key.targetID }
+func (key RenditionKey) RenditionID() RenditionID      { return key.renditionID }
+func (key RenditionKey) Extension() RenditionExtension { return key.extension }
 
 func ParseOriginalKey(value string) (OriginalKey, error) {
 	if invalidRawKey(value) {

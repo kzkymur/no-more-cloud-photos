@@ -16,6 +16,7 @@ var (
 	ErrDurability       = errors.New("storage durability operation failed")
 	ErrOutcomeUncertain = errors.New("storage outcome is uncertain")
 	ErrUnexpectedType   = errors.New("unexpected storage object type")
+	ErrUnstableScan     = errors.New("storage scan observed concurrent namespace mutation")
 	ErrClosed           = errors.New("storage is closed")
 )
 

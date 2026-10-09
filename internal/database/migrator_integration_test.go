@@ -38,8 +38,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 17 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version sixteen", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 18 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version eighteen", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,8 +62,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 17 || status.ExpectedVersion != 17 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version sixteen", status)
+		if status.CurrentVersion != 18 || status.ExpectedVersion != 18 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version eighteen", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
@@ -182,7 +182,7 @@ func TestMigratorIntegration(t *testing.T) {
 		if err := pool.QueryRow(context.Background(), `SELECT j.id::text,j.lease_token::text FROM jobs AS j JOIN job_targets AS t ON t.job_id=j.id WHERE t.id=$1`, targetID).Scan(&jobID, &legacyLease); err != nil {
 			t.Fatalf("read v16 running transform: %v", err)
 		}
-		if err := full.Up(context.Background()); err != nil {
+		if err := newMigrator(pool, full.migrations[:17]).Up(context.Background()); err != nil {
 			t.Fatalf("apply reconciliation evidence boundary: %v", err)
 		}
 		var version int64
@@ -640,7 +640,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 17 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 18 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
