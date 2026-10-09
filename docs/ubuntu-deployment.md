@@ -67,6 +67,19 @@ root, so this layout prevents accidental serving but does not claim OS-level
 quarantine isolation from either Core process. Issue #20 owns any future
 administrative unit, credential, and sandbox boundary; none is installed here.
 
+Upgrades from a revision that created the legacy dotless
+`/var/lib/nmcp/media/quarantine` fail before host installation, whether that
+path is empty or populated. Stop NMCP, inspect the path without following
+symlinks, and preserve any unexpected contents before changing it. If it is
+empty, remove it with `sudo rmdir /var/lib/nmcp/media/quarantine`. If populated,
+move the entire directory to reviewed operator-controlled storage outside
+`/var/lib/nmcp/media`, record its owner/mode/content inventory, and only then
+remove the now-empty legacy directory. Do not recursively delete or blindly
+merge contents. Re-run host installation to create canonical `.quarantine`,
+then adjudicate preserved entries under the reconciliation manifest procedure
+when that application workflow lands. Installation also rejects a symlink,
+unsafe owner/mode, or separate filesystem mounted at canonical `.quarantine`.
+
 ## Host prerequisites
 
 1. Install Ubuntu 24.04 runtime packages listed in
@@ -110,6 +123,11 @@ isolated from the common runtime graph. API and Worker receive only their
 reviewed existing memberships; no check/repair login or capability member is
 created. The migrator is a member of the three function-owner roles only so
 forward migrations can transfer narrowly scoped SECURITY DEFINER functions.
+The bootstrap treats every direct incoming or outgoing membership edge touching
+these stable roles or the three managed logins as a closed allowlist; this also
+blocks an external login from reaching the migrator or an owner transitively.
+Membership normalization and the final graph check run in one transaction, so
+an unsafe extra edge cannot leave a partially rewritten graph.
 Issue #20 will provision future operational check/repair credentials after the
 CLI contract lands; the root migration credential must not be reused. The
 bootstrap transfers database/schema ownership to `nmcp_migrator` and removes

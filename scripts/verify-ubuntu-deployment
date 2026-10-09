@@ -114,8 +114,8 @@ def main() -> int:
     require(
         "install -d -o 10001 -g 10001 -m 0700" in compose_text
         and "/var/lib/nmcp/media/.quarantine" in compose_text
-        and "/var/lib/nmcp/media/quarantine" not in compose_text,
-        "validation storage does not explicitly create only private .quarantine",
+        and "legacy dotless quarantine requires reviewed migration" in compose_text,
+        "validation storage does not reject legacy state and create private .quarantine",
     )
     environment_examples = "\n".join(text(path) for path in sorted((UBUNTU / "env").glob("*.example")))
     require("NMCP_QUARANTINE" not in environment_examples, "quarantine path became environment-configurable")
@@ -128,6 +128,12 @@ def main() -> int:
     )
     host_install = text(ROOT / "scripts" / "install-ubuntu-host")
     require(
+        "legacy /var/lib/nmcp/media/quarantine exists" in host_install
+        and "existing canonical quarantine ownership, mode, or device is unsafe" in host_install
+        and "stat -c '%d' /var/lib/nmcp/media/.quarantine" in host_install,
+        "host installation lacks quarantine upgrade/owner/mode/device preflight",
+    )
+    require(
         "handoff-ubuntu-migration-lock" in host_install,
         "migration execution-lease handoff helper is not installed",
     )
@@ -135,6 +141,28 @@ def main() -> int:
     require(
         "setpriv --reuid=nmcp --regid=nmcp" in text(ROOT / "scripts" / "run-ubuntu-migration"),
         "migration body does not drop permanently to nmcp",
+    )
+    role_bootstrap = text(UBUNTU / "postgresql-roles.sql")
+    shared_roles = text(ROOT / "infra" / "postgresql" / "runtime-roles.sql")
+    require(
+        "BEGIN;" in role_bootstrap and "COMMIT;" in role_bootstrap
+        and "nmcp_api_role nmcp_api" in role_bootstrap
+        and "nmcp_worker_role nmcp_worker" in role_bootstrap,
+        "Ubuntu role bootstrap is not one complete managed-graph transaction",
+    )
+    require(
+        "nmcp_allowed_membership" in shared_roles
+        and "actual.roleid IN" in shared_roles
+        and "actual.member IN" in shared_roles,
+        "shared role bootstrap does not close both sides of managed edges",
+    )
+    validation_script = text(ROOT / "scripts" / "validation-env")
+    require(
+        'container["HostConfig"].get("Mounts")' in validation_script
+        and 'container["HostConfig"].get("Tmpfs")' in validation_script
+        and 'mount.get("Type") == "volume"' in validation_script
+        and 'mount.get("Type") == "tmpfs"' in validation_script,
+        "validation does not inspect every configured File Server mount type",
     )
 
     files_unit = text(units / "nmcp-files.service")

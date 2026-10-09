@@ -16,8 +16,9 @@ services:
     volumes:
       - database:/var/lib/postgresql/data
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-nmcp-roles.sql:ro
-      - ../postgresql/runtime-roles.sql:/opt/nmcp-bootstrap/runtime-roles.sql:ro
-      - ./verify-runtime-roles.sql:/opt/nmcp-bootstrap/verify-runtime-roles.sql:ro
+      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+      - ../ubuntu/postgresql-roles.sql:/opt/nmcp-infra/ubuntu/postgresql-roles.sql:ro
+      - ./verify-runtime-roles.sql:/opt/nmcp-infra/validation/verify-runtime-roles.sql:ro
     networks: [backend]
     labels: *validation-labels
 
@@ -26,7 +27,7 @@ services:
       context: ../..
       dockerfile: infra/validation/core.Dockerfile
     user: "0:0"
-    command: ["sh", "-eu", "-c", "install -d -o 10001 -g 10001 -m 0700 /var/lib/nmcp/media /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/backups /var/lib/nmcp/media/tmp /var/lib/nmcp/media/.quarantine"]
+    command: ["sh", "-eu", "-c", "if [ -e /var/lib/nmcp/media/quarantine ] || [ -L /var/lib/nmcp/media/quarantine ]; then echo 'legacy dotless quarantine requires reviewed migration' >&2; exit 1; fi; install -d -o 10001 -g 10001 -m 0700 /var/lib/nmcp/media /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/backups /var/lib/nmcp/media/tmp /var/lib/nmcp/media/.quarantine"]
     volumes:
       - media:/var/lib/nmcp/media
     network_mode: none

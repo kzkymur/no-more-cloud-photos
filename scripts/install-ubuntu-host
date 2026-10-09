@@ -58,6 +58,20 @@ if [[ $files_load != not-found \
   printf 'install-ubuntu-host: nmcp-files.service must be exactly inactive/dead before reinstall\n' >&2
   exit 1
 fi
+if [[ -e /var/lib/nmcp/media/quarantine || -L /var/lib/nmcp/media/quarantine ]]; then
+  printf '%s\n' \
+    'install-ubuntu-host: legacy /var/lib/nmcp/media/quarantine exists; review and migrate it before installation' >&2
+  exit 1
+fi
+if [[ -e /var/lib/nmcp/media/.quarantine || -L /var/lib/nmcp/media/.quarantine ]]; then
+  [[ -d /var/lib/nmcp/media/.quarantine \
+    && ! -L /var/lib/nmcp/media/.quarantine \
+    && $(/usr/bin/stat -c '%U:%G:%a' /var/lib/nmcp/media/.quarantine) == nmcp:nmcp:700 \
+    && $(/usr/bin/stat -c '%d' /var/lib/nmcp/media) == $(/usr/bin/stat -c '%d' /var/lib/nmcp/media/.quarantine) ]] || {
+    printf 'install-ubuntu-host: existing canonical quarantine ownership, mode, or device is unsafe\n' >&2
+    exit 1
+  }
+fi
 for command in /usr/sbin/nginx /usr/sbin/ufw /usr/bin/systemd-analyze \
   /usr/bin/systemd-sysusers /usr/bin/systemd-tmpfiles /usr/bin/openssl /usr/bin/python3; do
   [[ -x $command ]] || { printf 'install-ubuntu-host: missing %s\n' "$command" >&2; exit 1; }
@@ -161,6 +175,13 @@ tls_link=/etc/nmcp/tls-current.new.$$
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/tmpfiles.d/nmcp.conf" /etc/tmpfiles.d/nmcp.conf
 /usr/bin/systemd-sysusers /etc/sysusers.d/nmcp.conf
 /usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/nmcp.conf
+[[ -d /var/lib/nmcp/media/.quarantine \
+  && ! -L /var/lib/nmcp/media/.quarantine \
+  && $(/usr/bin/stat -c '%U:%G:%a' /var/lib/nmcp/media/.quarantine) == nmcp:nmcp:700 \
+  && $(/usr/bin/stat -c '%d' /var/lib/nmcp/media) == $(/usr/bin/stat -c '%d' /var/lib/nmcp/media/.quarantine) ]] || {
+  printf 'install-ubuntu-host: canonical quarantine ownership, mode, or device is unsafe\n' >&2
+  exit 1
+}
 /usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
 
 for unit in nmcp.slice nmcp-migrate.service nmcp-api.service nmcp-worker.service \

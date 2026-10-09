@@ -4,6 +4,15 @@
 -- cluster-global NOLOGIN roles are stable migration targets and have no
 -- credentials. Application object privileges are granted transactionally by
 -- the embedded migrations, never by this bootstrap file.
+--
+-- Callers that already opened a transaction set nmcp_roles_in_transaction.
+-- Production callers also set nmcp_api_role and nmcp_worker_role so this one
+-- transaction can validate the complete managed graph.
+\if :{?nmcp_roles_in_transaction}
+\else
+BEGIN;
+\endif
+
 SELECT format(
     'CREATE ROLE %I NOLOGIN %s NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION',
     role_name,inheritance
@@ -51,74 +60,100 @@ BEGIN
 END;
 $$;
 
-SELECT :'nmcp_migrator_role'::pg_catalog.regrole;
--- Remove every stable-role nesting edge before restoring the one reviewed
--- Worker-to-common-runtime relationship. Capability roles deliberately have
--- no members until the operational admin logins are designed in issue #20.
-SELECT format('REVOKE %I FROM %I', granted.role_name,member.role_name)
+CREATE TEMPORARY TABLE nmcp_managed_role(roleid oid PRIMARY KEY) ON COMMIT DROP;
+CREATE TEMPORARY TABLE nmcp_allowed_membership(
+    roleid oid NOT NULL,
+    member oid NOT NULL,
+    admin_option boolean NOT NULL,
+    inherit_option boolean NOT NULL,
+    set_option boolean NOT NULL,
+    PRIMARY KEY(roleid,member)
+) ON COMMIT DROP;
+
+INSERT INTO nmcp_managed_role(roleid)
+SELECT role_oid
 FROM (VALUES
-    ('nmcp_runtime'),('nmcp_worker_runtime'),('nmcp_purge_function_owner'),
-    ('nmcp_check_runtime'),('nmcp_repair_runtime'),
-    ('nmcp_check_function_owner'),('nmcp_repair_function_owner')
-) AS granted(role_name)
-CROSS JOIN (VALUES
-    ('nmcp_runtime'),('nmcp_worker_runtime'),('nmcp_purge_function_owner'),
-    ('nmcp_check_runtime'),('nmcp_repair_runtime'),
-    ('nmcp_check_function_owner'),('nmcp_repair_function_owner')
-) AS member(role_name)
-WHERE granted.role_name<>member.role_name
-  AND NOT (
-      granted.role_name='nmcp_runtime'
-      AND member.role_name='nmcp_worker_runtime'
-  )
-\gexec
+    ('nmcp_runtime'::pg_catalog.regrole::oid),
+    ('nmcp_worker_runtime'::pg_catalog.regrole::oid),
+    ('nmcp_purge_function_owner'::pg_catalog.regrole::oid),
+    ('nmcp_check_runtime'::pg_catalog.regrole::oid),
+    ('nmcp_repair_runtime'::pg_catalog.regrole::oid),
+    ('nmcp_check_function_owner'::pg_catalog.regrole::oid),
+    ('nmcp_repair_function_owner'::pg_catalog.regrole::oid),
+    (:'nmcp_migrator_role'::pg_catalog.regrole::oid)
+) AS managed(role_oid);
+
+INSERT INTO nmcp_allowed_membership
+    (roleid,member,admin_option,inherit_option,set_option)
+VALUES
+    ('nmcp_runtime'::pg_catalog.regrole,
+     'nmcp_worker_runtime'::pg_catalog.regrole,false,true,false),
+    ('nmcp_purge_function_owner'::pg_catalog.regrole,
+     :'nmcp_migrator_role'::pg_catalog.regrole,false,false,true),
+    ('nmcp_check_function_owner'::pg_catalog.regrole,
+     :'nmcp_migrator_role'::pg_catalog.regrole,false,false,true),
+    ('nmcp_repair_function_owner'::pg_catalog.regrole,
+     :'nmcp_migrator_role'::pg_catalog.regrole,false,false,true);
 
 GRANT nmcp_runtime TO nmcp_worker_runtime
     WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
-REVOKE nmcp_check_runtime,nmcp_repair_runtime FROM :"nmcp_migrator_role";
 GRANT nmcp_purge_function_owner,nmcp_check_function_owner,nmcp_repair_function_owner
     TO :"nmcp_migrator_role" WITH ADMIN FALSE, INHERIT FALSE, SET TRUE;
 
-SELECT :'nmcp_migrator_role'::pg_catalog.regrole::oid AS nmcp_migrator_oid \gset
--- Divide-by-zero makes unexpected direct membership fail under ON_ERROR_STOP.
--- This closes indirect SET ROLE paths among stable roles, permits only the
--- reviewed Worker inheritance edge, and reserves owner membership to the
--- migrator. Check/repair LOGIN membership remains forbidden until issue #20
--- adds the reviewed operational credentials and updates this bootstrap.
-SELECT 1 / (NOT EXISTS (
-    SELECT 1
-    FROM pg_catalog.pg_auth_members AS membership
-    WHERE (
-        membership.member IN (
-            'nmcp_runtime'::pg_catalog.regrole,
-            'nmcp_worker_runtime'::pg_catalog.regrole,
-            'nmcp_purge_function_owner'::pg_catalog.regrole,
-            'nmcp_check_runtime'::pg_catalog.regrole,
-            'nmcp_repair_runtime'::pg_catalog.regrole,
-            'nmcp_check_function_owner'::pg_catalog.regrole,
-            'nmcp_repair_function_owner'::pg_catalog.regrole
-        ) AND NOT (
-            membership.member='nmcp_worker_runtime'::pg_catalog.regrole
-            AND membership.roleid='nmcp_runtime'::pg_catalog.regrole
-            AND NOT membership.admin_option
-            AND membership.inherit_option
-            AND NOT membership.set_option
+\if :{?nmcp_api_role}
+INSERT INTO nmcp_managed_role VALUES (:'nmcp_api_role'::pg_catalog.regrole::oid);
+INSERT INTO nmcp_allowed_membership VALUES (
+    'nmcp_runtime'::pg_catalog.regrole,
+    :'nmcp_api_role'::pg_catalog.regrole,false,true,false
+);
+GRANT nmcp_runtime TO :"nmcp_api_role"
+    WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
+\endif
+
+\if :{?nmcp_worker_role}
+INSERT INTO nmcp_managed_role VALUES (:'nmcp_worker_role'::pg_catalog.regrole::oid);
+INSERT INTO nmcp_allowed_membership VALUES (
+    'nmcp_worker_runtime'::pg_catalog.regrole,
+    :'nmcp_worker_role'::pg_catalog.regrole,false,true,false
+);
+GRANT nmcp_worker_runtime TO :"nmcp_worker_role"
+    WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
+\endif
+
+-- Every direct edge touching a managed login or stable role must match this
+-- exact allowlist. Closing both sides of every edge also closes all transitive
+-- paths from arbitrary cluster roles into the migrator, owners, capabilities,
+-- and application runtimes.
+SELECT 1 / ((
+    NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS actual
+        WHERE (
+            actual.roleid IN (SELECT roleid FROM nmcp_managed_role)
+            OR actual.member IN (SELECT roleid FROM nmcp_managed_role)
+        ) AND NOT EXISTS (
+            SELECT 1 FROM nmcp_allowed_membership AS allowed
+            WHERE allowed.roleid=actual.roleid
+              AND allowed.member=actual.member
+              AND allowed.admin_option=actual.admin_option
+              AND allowed.inherit_option=actual.inherit_option
+              AND allowed.set_option=actual.set_option
         )
-    ) OR (
-        membership.roleid IN (
-            'nmcp_purge_function_owner'::pg_catalog.regrole,
-            'nmcp_check_function_owner'::pg_catalog.regrole,
-            'nmcp_repair_function_owner'::pg_catalog.regrole
-        ) AND (
-            membership.member<>:nmcp_migrator_oid
-            OR membership.admin_option
-            OR membership.inherit_option
-            OR NOT membership.set_option
-        )
-    ) OR (
-        membership.roleid IN (
-            'nmcp_check_runtime'::pg_catalog.regrole,
-            'nmcp_repair_runtime'::pg_catalog.regrole
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM nmcp_allowed_membership AS allowed
+        WHERE NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_auth_members AS actual
+            WHERE actual.roleid=allowed.roleid
+              AND actual.member=allowed.member
+              AND actual.admin_option=allowed.admin_option
+              AND actual.inherit_option=allowed.inherit_option
+              AND actual.set_option=allowed.set_option
         )
     )
-))::integer AS nmcp_safe_stable_role_membership;
+))::integer AS nmcp_safe_managed_role_graph;
+
+\if :{?nmcp_roles_in_transaction}
+\else
+COMMIT;
+\endif
