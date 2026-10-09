@@ -59,6 +59,14 @@ with that environment, or source the generated file after preparation.
 
 Compose uses checkout-hashed project, volume, and ownership labels. Its verify
 command guarantees cleanup, while Docker's image/build cache is retained.
+PostgreSQL bind inputs are never exposed directly from the checkout: the
+entrypoint accepts only five repository-owned, regular, non-symlink SQL files
+whose content matches the exact `HEAD` blobs, then atomically stages private
+run copies with explicit container-readable mode. This keeps validation working
+after a fresh checkout under `umask 0077` without broadening checkout modes.
+The staging verifier rejects missing, replaced, unreadable, wrong-owner, or
+wrong-content copies, and marker-checked cleanup removes only its project/run
+directory.
 `cleanup` delegates to that ownership-checked reset and removes only
 `.validation/`; it never traverses arbitrary host paths.
 

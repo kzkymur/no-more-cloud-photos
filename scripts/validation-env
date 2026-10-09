@@ -10,6 +10,11 @@ project=${NMCP_VALIDATION_PROJECT:-nmcp-validation-$owner_short}
 api_port=${NMCP_API_PORT:-18080}
 files_port=${NMCP_FILES_PORT:-18443}
 export NMCP_VALIDATION_OWNER=$owner NMCP_API_PORT=$api_port NMCP_FILES_PORT=$files_port
+validation_dir="$root/.validation"
+input_parent="$validation_dir/compose-inputs"
+input_registry="$input_parent/$project.registry"
+input_root=
+current_uid=$(id -u)
 
 case "$project" in
   ""|[!a-z0-9]*|*[!a-z0-9_-]*)
@@ -18,7 +23,265 @@ case "$project" in
     ;;
 esac
 
+assert_private_directory() {
+  directory=$1
+  [ ! -L "$directory" ] && [ -d "$directory" ] || {
+    echo "error: unsafe Compose input directory: $directory" >&2
+    return 1
+  }
+  [ "$(stat -c %u "$directory")" = "$current_uid" ] || {
+    echo "error: wrong owner on Compose input directory: $directory" >&2
+    return 1
+  }
+  [ "$(stat -c %a "$directory")" = 700 ] || {
+    echo "error: unsafe mode on Compose input directory: $directory" >&2
+    return 1
+  }
+}
+
+assert_owned_directory() {
+  directory=$1
+  [ ! -L "$directory" ] && [ -d "$directory" ] || {
+    echo "error: unsafe validation directory: $directory" >&2
+    return 1
+  }
+  [ "$(stat -c %u "$directory")" = "$current_uid" ] || {
+    echo "error: wrong owner on validation directory: $directory" >&2
+    return 1
+  }
+}
+
+assert_tracked_source() {
+  source_path=$1
+  tracked_path=$2
+  [ "$source_path" = "$root/$tracked_path" ] || {
+    echo "error: Compose input escaped the repository allowlist: $source_path" >&2
+    return 1
+  }
+  [ ! -L "$source_path" ] && [ -f "$source_path" ] || {
+    echo "error: Compose input is missing, non-regular, or a symlink: $tracked_path" >&2
+    return 1
+  }
+  [ "$(stat -c %u "$source_path")" = "$current_uid" ] || {
+    echo "error: wrong owner on Compose input: $tracked_path" >&2
+    return 1
+  }
+  expected=$(git -C "$root" rev-parse "HEAD:$tracked_path")
+  actual=$(git -C "$root" hash-object -- "$source_path")
+  [ "$actual" = "$expected" ] || {
+    echo "error: Compose input differs from the exact HEAD blob: $tracked_path" >&2
+    return 1
+  }
+}
+
+stage_one_input() {
+  variable=$1
+  tracked_path=$2
+  output_name=$3
+  source_path="$root/$tracked_path"
+  assert_tracked_source "$source_path" "$tracked_path" || return 1
+  temporary=$(mktemp "$input_root/.${output_name}.XXXXXX")
+  cat "$source_path" >"$temporary"
+  chmod 0644 "$temporary"
+  cmp "$source_path" "$temporary" >/dev/null
+  python3 - "$temporary" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+  mv -f "$temporary" "$input_root/$output_name"
+  eval "export $variable=\$input_root/\$output_name"
+}
+
+write_input_marker() {
+  temporary=$(mktemp "$input_root/.owner.XXXXXX")
+  printf '%s\n%s\n' "$owner" "$project" >"$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$input_root/.owner"
+}
+
+stage_compose_inputs() {
+  if [ -n "$input_root" ]; then
+    verify_compose_inputs
+    return
+  fi
+  if [ -e "$validation_dir" ] || [ -L "$validation_dir" ]; then
+    assert_owned_directory "$validation_dir"
+  else
+    mkdir -m 0700 "$validation_dir"
+  fi
+  if [ -e "$input_parent" ] || [ -L "$input_parent" ]; then
+    assert_private_directory "$input_parent"
+  else
+    mkdir -m 0700 "$input_parent"
+  fi
+  input_root=$(mktemp -d "$input_parent/$project.XXXXXXXX")
+  chmod 0700 "$input_root"
+  write_input_marker
+  stage_one_input NMCP_POSTGRES_INIT_SQL infra/validation/postgres-init.sql postgres-init.sql
+  stage_one_input NMCP_RUNTIME_ROLES_SQL infra/postgresql/runtime-roles.sql runtime-roles.sql
+  stage_one_input NMCP_UBUNTU_ROLES_SQL infra/ubuntu/postgresql-roles.sql postgresql-roles.sql
+  stage_one_input NMCP_VERIFY_ROLE_GRAPH_SQL infra/postgresql/verify-runtime-role-graph.sql verify-runtime-role-graph.sql
+  stage_one_input NMCP_VERIFY_RUNTIME_ROLES_SQL infra/validation/verify-runtime-roles.sql verify-runtime-roles.sql
+  python3 - "$input_root" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+  verify_compose_inputs
+}
+
+verify_staged_input() {
+  variable=$1
+  tracked_path=$2
+  output_name=$3
+  case "$variable" in
+    NMCP_POSTGRES_INIT_SQL) staged_path=${NMCP_POSTGRES_INIT_SQL:-} ;;
+    NMCP_RUNTIME_ROLES_SQL) staged_path=${NMCP_RUNTIME_ROLES_SQL:-} ;;
+    NMCP_UBUNTU_ROLES_SQL) staged_path=${NMCP_UBUNTU_ROLES_SQL:-} ;;
+    NMCP_VERIFY_ROLE_GRAPH_SQL) staged_path=${NMCP_VERIFY_ROLE_GRAPH_SQL:-} ;;
+    NMCP_VERIFY_RUNTIME_ROLES_SQL) staged_path=${NMCP_VERIFY_RUNTIME_ROLES_SQL:-} ;;
+    *) echo "error: unexpected Compose input variable: $variable" >&2; return 1 ;;
+  esac
+  [ "$staged_path" = "$input_root/$output_name" ] || {
+    echo "error: staged Compose input path drift: $output_name" >&2
+    return 1
+  }
+  [ ! -L "$staged_path" ] && [ -f "$staged_path" ] || {
+    echo "error: staged Compose input is missing, non-regular, or a symlink: $output_name" >&2
+    return 1
+  }
+  [ "$(stat -c %u "$staged_path")" = "$current_uid" ] || {
+    echo "error: wrong owner on staged Compose input: $output_name" >&2
+    return 1
+  }
+  [ "$(stat -c %a "$staged_path")" = 644 ] || {
+    echo "error: staged Compose input is not container-readable mode 0644: $output_name" >&2
+    return 1
+  }
+  assert_tracked_source "$root/$tracked_path" "$tracked_path" || return 1
+  cmp "$root/$tracked_path" "$staged_path" >/dev/null || {
+    echo "error: staged Compose input content drift: $output_name" >&2
+    return 1
+  }
+}
+
+verify_compose_inputs() {
+  assert_private_directory "$input_root" || return 1
+  marker="$input_root/.owner"
+  [ ! -L "$marker" ] && [ -f "$marker" ] &&
+    [ "$(stat -c %u "$marker")" = "$current_uid" ] &&
+    [ "$(stat -c %a "$marker")" = 600 ] &&
+    [ "$(sed -n '1p' "$marker")" = "$owner" ] &&
+    [ "$(sed -n '2p' "$marker")" = "$project" ] || {
+      echo "error: invalid Compose input ownership marker" >&2
+      return 1
+    }
+  verify_staged_input NMCP_POSTGRES_INIT_SQL infra/validation/postgres-init.sql postgres-init.sql || return 1
+  verify_staged_input NMCP_RUNTIME_ROLES_SQL infra/postgresql/runtime-roles.sql runtime-roles.sql || return 1
+  verify_staged_input NMCP_UBUNTU_ROLES_SQL infra/ubuntu/postgresql-roles.sql postgresql-roles.sql || return 1
+  verify_staged_input NMCP_VERIFY_ROLE_GRAPH_SQL infra/postgresql/verify-runtime-role-graph.sql verify-runtime-role-graph.sql || return 1
+  verify_staged_input NMCP_VERIFY_RUNTIME_ROLES_SQL infra/validation/verify-runtime-roles.sql verify-runtime-roles.sql || return 1
+}
+
+remove_compose_inputs() {
+  [ -n "$input_root" ] || return 0
+  verify_compose_inputs
+  if [ -e "$input_registry" ] || [ -L "$input_registry" ]; then
+    [ ! -L "$input_registry" ] && [ -f "$input_registry" ] &&
+      [ "$(stat -c %u "$input_registry")" = "$current_uid" ] &&
+      [ "$(stat -c %a "$input_registry")" = 600 ] &&
+      [ "$(cat "$input_registry")" = "$input_root" ] || {
+        echo "error: refusing to remove an unowned Compose input registry" >&2
+        return 1
+      }
+    rm -- "$input_registry"
+  fi
+  rm -rf -- "$input_root"
+  input_root=
+}
+
+register_compose_inputs() {
+  verify_compose_inputs
+  temporary=$(mktemp "$input_parent/.${project}.registry.XXXXXX")
+  printf '%s\n' "$input_root" >"$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$input_registry"
+}
+
+load_registered_inputs() {
+  [ -e "$input_registry" ] || [ -L "$input_registry" ] || return 0
+  [ ! -L "$input_registry" ] && [ -f "$input_registry" ] &&
+    [ "$(stat -c %u "$input_registry")" = "$current_uid" ] &&
+    [ "$(stat -c %a "$input_registry")" = 600 ] || {
+      echo "error: unsafe Compose input registry" >&2
+      return 1
+    }
+  registered=$(cat "$input_registry")
+  case "$registered" in
+    "$input_parent/$project."*) ;;
+    *) echo "error: Compose input registry escaped its project root" >&2; return 1 ;;
+  esac
+  input_root=$registered
+  export NMCP_POSTGRES_INIT_SQL="$input_root/postgres-init.sql"
+  export NMCP_RUNTIME_ROLES_SQL="$input_root/runtime-roles.sql"
+  export NMCP_UBUNTU_ROLES_SQL="$input_root/postgresql-roles.sql"
+  export NMCP_VERIFY_ROLE_GRAPH_SQL="$input_root/verify-runtime-role-graph.sql"
+  export NMCP_VERIFY_RUNTIME_ROLES_SQL="$input_root/verify-runtime-roles.sql"
+  verify_compose_inputs
+}
+
+expect_compose_inputs_denied() {
+  label=$1
+  if verify_compose_inputs >/dev/null 2>&1; then
+    echo "error: Compose input verifier accepted $label" >&2
+    exit 1
+  fi
+}
+
+restage_postgres_init() {
+  stage_one_input NMCP_POSTGRES_INIT_SQL infra/validation/postgres-init.sql postgres-init.sql
+  verify_compose_inputs
+}
+
+check_compose_input_negatives() {
+  stage_compose_inputs
+  target="$input_root/postgres-init.sql"
+
+  rm -- "$target"
+  ln -s "$root/infra/validation/postgres-init.sql" "$target"
+  expect_compose_inputs_denied "symlink replacement"
+  rm -- "$target"
+  restage_postgres_init
+
+  printf '\n-- unexpected replacement\n' >>"$target"
+  expect_compose_inputs_denied "wrong content replacement"
+  restage_postgres_init
+
+  chmod 0600 "$target"
+  expect_compose_inputs_denied "container-unreadable mode"
+  restage_postgres_init
+
+  rm -- "$target"
+  expect_compose_inputs_denied "missing staged input"
+  restage_postgres_init
+
+  docker run --rm --entrypoint sh --volume "$input_root:/stage" \
+    postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24 \
+    -c 'chown 0:0 /stage/postgres-init.sql'
+  expect_compose_inputs_denied "wrong staged owner"
+  rm -- "$target"
+  restage_postgres_init
+}
+
 compose() {
+  stage_compose_inputs
   docker compose --project-name "$project" --file "$compose_file" "$@"
 }
 
@@ -52,6 +315,7 @@ assert_owned() {
 cleanup() {
   assert_owned
   compose down --volumes --remove-orphans
+  remove_compose_inputs
 }
 
 prepare_storage() {
@@ -839,11 +1103,13 @@ verify_isolation() {
 
 require_tools
 assert_owned
+load_registered_inputs
 case "${1:-}" in
   up)
     complete=false
     trap 'if [ "$complete" != true ]; then cleanup; fi' EXIT HUP INT TERM
     start_environment
+    register_compose_inputs
     complete=true
     trap - EXIT HUP INT TERM
     ;;
@@ -862,6 +1128,7 @@ case "${1:-}" in
     }
     trap cleanup_all EXIT HUP INT TERM
     cleanup
+    check_compose_input_negatives
     check_legacy_quarantine_guard
     start_environment
     check
