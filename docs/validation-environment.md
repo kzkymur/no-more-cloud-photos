@@ -90,7 +90,8 @@ three read-write tmpfs mounts at `/var/cache/nginx`, `/var/run`, and `/tmp`,
 with the exact configured size/mode/UID/GID option map. The inspection treats
 only equivalent Engine renderings as normalization: size suffixes are converted
 to bytes, and a leading-zero octal mode or Engine's decimal mode are compared as
-the same numeric value. Missing, extra, wrong-type, or wrong-RW live mounts fail.
+the same numeric value; Alpine's `/var/run` symlink appears as `/run` in live
+`mountinfo`. Missing, extra, wrong-type, or wrong-RW live mounts fail.
 It also
 records the live PostgreSQL, Nginx,
 ExifTool, FFprobe, and `prlimit`

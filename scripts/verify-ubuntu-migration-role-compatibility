@@ -72,6 +72,15 @@ assert_compatibility() {
 run_wrapper() {
   /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility "$@"
 }
+wait_for_path() {
+  local path=$1 attempt
+  for attempt in {1..100}; do
+    [[ ! -e $path ]] || return 0
+    /usr/bin/sleep 0.05
+  done
+  printf 'timed out after %s attempts waiting for %s\n' "$attempt" "$path" >&2
+  return 1
+}
 export NMCP_DATABASE_URL='postgres://nmcp_migrator:nmcp-migrator-wrapper-test@127.0.0.1:5432/nmcp?sslmode=disable'
 export NMCP_LOG_LEVEL=info NMCP_SHUTDOWN_TIMEOUT=10s
 
@@ -116,8 +125,7 @@ EOF
 /usr/bin/setsid /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
   "$work/term/nmcp-admin" migrate up --json &
 wrapper_pid=$!
-for attempt in {1..100}; do [[ -e $work/term/ready ]] && break; /usr/bin/sleep 0.05; done
-[[ -e $work/term/ready ]]
+wait_for_path "$work/term/ready"
 /usr/bin/kill -TERM -- "-$wrapper_pid"
 set +e
 wait "$wrapper_pid"
@@ -139,8 +147,7 @@ EOF
 /usr/bin/setsid /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
   "$work/kill/nmcp-admin" migrate up --json &
 wrapper_pid=$!
-for attempt in {1..100}; do [[ -e $work/kill/ready ]] && break; /usr/bin/sleep 0.05; done
-[[ -e $work/kill/ready ]]
+wait_for_path "$work/kill/ready"
 /usr/bin/kill -KILL -- "-$wrapper_pid"
 wait "$wrapper_pid" >/dev/null 2>&1 || true
 assert_compatibility
@@ -159,8 +166,7 @@ EOF
 /usr/bin/chmod 0700 "$work/harden/nmcp-admin"
 run_wrapper "$work/harden/nmcp-admin" migrate up --json &
 wrapper_pid=$!
-for attempt in {1..100}; do [[ -e $work/harden/ready ]] && break; /usr/bin/sleep 0.05; done
-[[ -e $work/harden/ready ]]
+wait_for_path "$work/harden/ready"
 /usr/bin/printf '\n-- integrity failure\n' >> /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
 /usr/bin/touch "$work/harden/go"
 set +e

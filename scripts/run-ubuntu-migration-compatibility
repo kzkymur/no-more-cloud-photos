@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2317 # trap-dispatched handlers are reached indirectly
 set -euo pipefail
 umask 0077
 

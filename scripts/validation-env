@@ -391,19 +391,42 @@ configured_tmpfs = container["HostConfig"].get("Tmpfs") or {}
 assert set(configured_tmpfs) == set(expected_tmpfs), configured_tmpfs
 for destination, options in configured_tmpfs.items():
     assert normalized_tmpfs(options) == expected_tmpfs[destination], (destination, options)
-expected_actual = {
+expected_actual_volumes = {
     ("/srv/nmcp/originals", "volume", False),
     ("/srv/nmcp/renditions", "volume", False),
-    ("/var/cache/nginx", "tmpfs", True),
-    ("/var/run", "tmpfs", True),
-    ("/tmp", "tmpfs", True),
 }
 actual = container.get("Mounts") or []
 for mount in actual:
     destination = mount.get("Destination")
     assert ".quarantine" not in destination and destination != "/var/lib/nmcp/media", mount
 actual_set = {(m.get("Destination"), m.get("Type"), m.get("RW")) for m in actual}
-assert len(actual) == len(expected_actual) and actual_set == expected_actual, actual
+assert len(actual) == len(expected_actual_volumes) and actual_set == expected_actual_volumes, actual
+'
+  docker exec "$files_id" cat /proc/self/mountinfo | python3 -c '
+import sys
+expected = {
+    "/srv/nmcp/originals": (None, False),
+    "/srv/nmcp/renditions": (None, False),
+    "/var/cache/nginx": ("tmpfs", True),
+    # Alpine resolves the configured /var/run symlink to /run in mountinfo.
+    "/run": ("tmpfs", True),
+    "/tmp": ("tmpfs", True),
+}
+actual = {}
+for line in sys.stdin:
+    fields = line.split()
+    separator = fields.index("-")
+    destination = fields[4]
+    if destination not in expected:
+        continue
+    assert destination not in actual, (destination, line)
+    actual[destination] = (fields[separator + 1], "rw" in fields[5].split(","))
+assert set(actual) == set(expected), actual
+for destination, (filesystem, writable) in actual.items():
+    expected_filesystem, expected_writable = expected[destination]
+    if expected_filesystem is not None:
+        assert filesystem == expected_filesystem, (destination, filesystem)
+    assert writable is expected_writable, (destination, writable)
 '
 
   api_id=$(compose ps --quiet api)
