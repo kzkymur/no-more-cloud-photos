@@ -72,13 +72,14 @@ write_fixture() {
     printf "wrong-original" >"$wrong_original/original.jpg"
     printf "wrong-rendition" >"$wrong_rendition/22222222-2222-4222-8222-222222222222.webp"
     printf "private-sentinel" >/var/lib/nmcp/media/backups/secret.dump
+    printf "quarantine-sentinel" >/var/lib/nmcp/media/.quarantine/private-sentinel
     rm -f "$symlink/original.jpg"
     ln -s /etc/passwd "$symlink/original.jpg"
     rm -f "$rendition_symlink/66666666-6666-4666-8666-666666666666.webp"
     ln -s /etc/passwd "$rendition_symlink/66666666-6666-4666-8666-666666666666.webp"
     chmod 0600 "$original/original.jpg" "$rendition/22222222-2222-4222-8222-222222222222.webp" \
       "$wrong_original/original.jpg" "$wrong_rendition/22222222-2222-4222-8222-222222222222.webp" \
-      /var/lib/nmcp/media/backups/secret.dump
+      /var/lib/nmcp/media/backups/secret.dump /var/lib/nmcp/media/.quarantine/private-sentinel
   '
 }
 
@@ -160,6 +161,19 @@ runtime_migration_command() {
     migrate nmcp-admin migrate "$action" --json
 }
 
+check_role_bootstrap_rerun() {
+  # Prove that rerunning the cluster bootstrap repairs unsafe options on the
+  # memberships it owns instead of preserving PostgreSQL's prior values.
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT nmcp_runtime TO nmcp_worker_runtime WITH ADMIN TRUE, INHERIT FALSE, SET TRUE; \
+GRANT nmcp_purge_function_owner,nmcp_check_function_owner,nmcp_repair_function_owner \
+TO nmcp_migrator WITH ADMIN TRUE, INHERIT TRUE, SET FALSE;"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --set nmcp_migrator_role=nmcp_migrator \
+    --file /opt/nmcp-bootstrap/runtime-roles.sql
+}
+
 check_database_role_boundary() {
   for identity in \
     nmcp_migrator:nmcp-migrator-validation-only \
@@ -170,6 +184,7 @@ check_database_role_boundary() {
     actual=$(database_query "$user" "$password" --tuples-only --no-align --command 'SELECT current_user')
     [ "$actual" = "$user" ] || { echo "error: expected database role $user, got $actual" >&2; exit 1; }
   done
+  check_role_bootstrap_rerun
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --file /opt/nmcp-bootstrap/verify-runtime-roles.sql
   expect_database_denied nmcp_worker nmcp-worker-validation-only \
@@ -194,6 +209,11 @@ check_database_role_boundary() {
       echo "error: runtime database role $user applied migrations" >&2
       exit 1
     fi
+    for capability in \
+      nmcp_check_runtime nmcp_repair_runtime \
+      nmcp_check_function_owner nmcp_repair_function_owner; do
+      expect_database_denied "$user" "$password" "SET ROLE $capability"
+    done
   done
 }
 
@@ -245,6 +265,10 @@ check() (
     [ -L /var/lib/nmcp/media/renditions/44/44444444-4444-4444-8444-444444444444/55555555-5555-4555-8555-555555555555/66666666-6666-4666-8666-666666666666.webp ]
     [ -f /var/lib/nmcp/media/originals/ff/00000000-0000-4000-8000-000000000000/original.jpg ]
     [ -f /var/lib/nmcp/media/renditions/ff/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp ]
+    [ ! -e /var/lib/nmcp/media/quarantine ]
+    [ "$(stat -c %u:%g:%a /var/lib/nmcp/media/.quarantine)" = 10001:10001:700 ]
+    [ "$(stat -c %d /var/lib/nmcp/media)" = "$(stat -c %d /var/lib/nmcp/media/.quarantine)" ]
+    [ "$(cat /var/lib/nmcp/media/.quarantine/private-sentinel)" = quarantine-sentinel ]
   '
 
   expect_status 200 "http://127.0.0.1:$api_port/healthz"
@@ -381,6 +405,7 @@ PY
 
   expect_status 405 --request POST "$original"
   expect_status 404 "$base/files/backups/secret.dump"
+  expect_status 404 "$base/files/.quarantine/private-sentinel"
   expect_status 404 "$base/files/originals/ff/00000000-0000-4000-8000-000000000000/original.jpg"
   expect_status 404 "$base/files/renditions/ff/00000000-0000-4000-8000-000000000000/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222.webp"
   symlink_status=$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' "$base/files/originals/33/33333333-3333-4333-8333-333333333333/original.jpg")

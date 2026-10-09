@@ -37,7 +37,7 @@ All IDs are UUIDv4. Migrations are forward-only, embedded in the administrative 
 | `maintenance_state` | Singleton mode (`normal` or `maintenance`), reason, owner, entered timestamp, nullable successful check report. Automatic deletion and normal writes are blocked in maintenance. |
 | `admin_audit` | Command, actor/host, sanitized arguments, outcome, affected IDs, timestamps. |
 | `admin_batches` | Operation, pinned profile/config, stable high-water/checkpoint, status (`running`, `succeeded`, `failed`, or `cancelled`), counts/error. Enables regeneration/retry resume without duplicates. |
-| `reconciliation_reports` | Immutable classified findings and repair disposition, including quarantine paths relative to configured quarantine root. |
+| `reconciliation_reports` | Immutable classified findings and repair disposition, including quarantine paths relative to canonical `${NMCP_STORAGE_ROOT}/.quarantine`. |
 
 Purge cancellation is persistent in `jobs.status='cancelled'` with `cancelled_at` and `cancel_reason`; it is not represented by deleting a queued job. Purge history therefore survives restore and later re-delete.
 
@@ -182,7 +182,7 @@ The retention scanner reads config each run, not a compiled timer interval. For 
 
 Transform publication locks Media and refuses deleted media; purge start uses the same lock, so transform versus purge cannot publish across the boundary. Missing files during purge are recorded but do not prevent converging database deletion when identity/path checks prove the expected object. Unexpected files are never deleted by wildcard traversal.
 
-`check` classifies same-filesystem temp, final orphan, DB-referenced missing file, checksum/size mismatch, invalid current relation, and expired candidates. It is always dry/read-only. `repair` consumes an immutable report under maintenance lock; ambiguous orphans go to a configured same-filesystem quarantine with a manifest. Restored files and newly found orphans are not immediately deleted. During restore/reconciliation, all automatic media/rendition/backup deletion and mutating API operations are stopped until explicit resume.
+`check` classifies same-filesystem temp, final orphan, DB-referenced missing file, checksum/size mismatch, invalid current relation, and expired candidates. It is always dry/read-only. `repair` consumes an immutable report under maintenance lock; ambiguous orphans go only to canonical `${NMCP_STORAGE_ROOT}/.quarantine` on the same filesystem with a manifest. The path is not configurable. Restored files and newly found orphans are not immediately deleted. During restore/reconciliation, all automatic media/rendition/backup deletion and mutating API operations are stopped until explicit resume.
 
 ## 9. Database backup and restore
 

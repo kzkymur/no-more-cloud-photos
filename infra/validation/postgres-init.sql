@@ -10,8 +10,10 @@ CREATE ROLE nmcp_worker LOGIN PASSWORD 'nmcp-worker-validation-only'
 \set nmcp_migrator_role nmcp_migrator
 \ir /opt/nmcp-bootstrap/runtime-roles.sql
 
-GRANT nmcp_runtime TO nmcp_api;
-GRANT nmcp_worker_runtime TO nmcp_worker;
+GRANT nmcp_runtime TO nmcp_api
+    WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
+GRANT nmcp_worker_runtime TO nmcp_worker
+    WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
 
 REVOKE ALL ON DATABASE nmcp FROM PUBLIC;
 GRANT CONNECT ON DATABASE nmcp TO nmcp_migrator,nmcp_api,nmcp_worker;
