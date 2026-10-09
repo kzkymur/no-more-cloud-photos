@@ -206,8 +206,12 @@ stale_pid=
 [[ $(/usr/bin/readlink -f /opt/nmcp/current) == /opt/nmcp/releases/old ]] || {
   printf 'failed candidate did not restore prior release link\n' >&2; exit 1;
 }
+[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) != active ]] || {
+  printf 'failed candidate retained successful migration readiness\n' >&2; exit 1;
+}
+/usr/bin/systemctl reset-failed nmcp-migrate.service >/dev/null 2>&1 || true
 [[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == inactive ]] || {
-  printf 'failed candidate left migration readiness active\n' >&2; exit 1;
+  printf 'failed migration readiness did not reset inactive\n' >&2; exit 1;
 }
 printf 'stale readiness evidence: failed candidate rolled back inactive\n'
 /usr/bin/systemctl reset-failed nmcp-migrate.service nmcp-api.service nmcp-worker.service >/dev/null 2>&1 || true
