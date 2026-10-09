@@ -429,8 +429,8 @@ for destination, (filesystem, writable) in actual.items():
     assert writable is expected_writable, (destination, writable)
 '
 
-  api_id=$(compose ps --quiet api)
-  worker_id=$(compose ps --quiet worker)
+  api_id=$(compose ps --all --quiet api)
+  worker_id=$(compose ps --all --quiet worker)
   compose stop api worker
   for id in "$api_id" "$worker_id"; do
     [ "$(docker inspect --format '{{.State.Running}}' "$id")" = false ]

@@ -150,6 +150,7 @@ cat > /run/systemd/system/postgresql@nmcp-test.service <<'EOF'
 Type=oneshot
 ExecStart=/usr/bin/true
 RemainAfterExit=yes
+TimeoutStartSec=30s
 EOF
 /usr/bin/systemctl daemon-reload
 
