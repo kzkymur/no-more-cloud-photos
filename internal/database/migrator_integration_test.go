@@ -70,6 +70,101 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("reconciliation upgrade rejects duplicate legacy transform ownership atomically", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:16]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one through sixteen: %v", err)
+		}
+		var profileID string
+		if err := pool.QueryRow(context.Background(), `SELECT id::text FROM profiles WHERE status='active' ORDER BY key LIMIT 1`).Scan(&profileID); err != nil {
+			t.Fatal(err)
+		}
+		jobIDs := make([]string, 0, 2)
+		for index := 0; index < 2; index++ {
+			mediaID := newUUIDv4(t)
+			insertMedia(t, pool, mediaID)
+			originalID := insertOriginal(t, pool, mediaID, fmt.Sprintf("%x", index+4), newUUIDv4(t))
+			targetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+			var jobID string
+			if err := pool.QueryRow(context.Background(), `SELECT job_id::text FROM job_targets WHERE id=$1`, targetID).Scan(&jobID); err != nil {
+				t.Fatal(err)
+			}
+			jobIDs = append(jobIDs, jobID)
+		}
+		duplicateLease := newUUIDv4(t)
+		for _, jobID := range jobIDs {
+			if _, err := pool.Exec(context.Background(), `UPDATE jobs SET lease_token=$2 WHERE id=$1`, jobID, duplicateLease); err != nil {
+				t.Fatalf("stage duplicate v16 transform owner: %v", err)
+			}
+		}
+		if err := full.Up(context.Background()); err == nil {
+			t.Fatal("migration accepted duplicate legacy transform ownership")
+		}
+		var version int64
+		var storageTablesAbsent bool
+		if err := pool.QueryRow(context.Background(), `SELECT
+			(SELECT max(version) FROM schema_migrations WHERE NOT dirty),
+			to_regclass('storage_attempts') IS NULL AND to_regclass('reconciliation_check_reports') IS NULL`).Scan(&version, &storageTablesAbsent); err != nil {
+			t.Fatal(err)
+		}
+		if version != 16 || !storageTablesAbsent {
+			t.Fatalf("failed upgrade rollback version=%d tables_absent=%t", version, storageTablesAbsent)
+		}
+	})
+
+	t.Run("reconciliation cutover waits for v16 transform writer and backfills its commit", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:16]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one through sixteen: %v", err)
+		}
+		mediaID := newUUIDv4(t)
+		insertMedia(t, pool, mediaID)
+		originalID := insertOriginal(t, pool, mediaID, "6", newUUIDv4(t))
+		var profileID string
+		if err := pool.QueryRow(context.Background(), `SELECT id::text FROM profiles WHERE status='active' ORDER BY key LIMIT 1`).Scan(&profileID); err != nil {
+			t.Fatal(err)
+		}
+		targetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		var jobID string
+		if err := pool.QueryRow(context.Background(), `SELECT job_id::text FROM job_targets WHERE id=$1`, targetID).Scan(&jobID); err != nil {
+			t.Fatal(err)
+		}
+		writer, err := pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Rollback(context.Background())
+		cutoverLease := newUUIDv4(t)
+		if _, err := writer.Exec(context.Background(), `UPDATE jobs SET lease_token=$2 WHERE id=$1`, jobID, cutoverLease); err != nil {
+			t.Fatalf("stage v16 lease writer: %v", err)
+		}
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(context.Background()) }()
+		select {
+		case err := <-migrationResult:
+			t.Fatalf("migration did not wait for v16 Jobs writer: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if err := writer.Commit(context.Background()); err != nil {
+			t.Fatalf("commit v16 Jobs writer: %v", err)
+		}
+		if err := awaitResult(t, migrationResult); err != nil {
+			t.Fatalf("migration after v16 Jobs writer: %v", err)
+		}
+		var coverage string
+		if err := pool.QueryRow(context.Background(), `SELECT coverage FROM storage_attempts WHERE id=$1 AND job_id=$2`, cutoverLease, jobID).Scan(&coverage); err != nil || coverage != "legacy_active" {
+			t.Fatalf("cutover committed lease coverage=%q error=%v", coverage, err)
+		}
+	})
+
 	t.Run("reconciliation evidence upgrade preserves legacy as non executable", func(t *testing.T) {
 		pool := integrationPool(t, databaseURL)
 		full, err := NewMigrator(pool)
@@ -83,6 +178,18 @@ func TestMigratorIntegration(t *testing.T) {
 		if _, err := pool.Exec(context.Background(), `INSERT INTO reconciliation_reports
 			(id,scope,findings,repair_disposition) VALUES ($1,'all','[]','{}')`, legacyID); err != nil {
 			t.Fatalf("insert v16 legacy report: %v", err)
+		}
+		mediaID := newUUIDv4(t)
+		insertMedia(t, pool, mediaID)
+		originalID := insertOriginal(t, pool, mediaID, "d", newUUIDv4(t))
+		var profileID string
+		if err := pool.QueryRow(context.Background(), `SELECT id::text FROM profiles WHERE status='active' ORDER BY key LIMIT 1`).Scan(&profileID); err != nil {
+			t.Fatalf("read active v16 profile: %v", err)
+		}
+		targetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		var jobID, legacyLease string
+		if err := pool.QueryRow(context.Background(), `SELECT j.id::text,j.lease_token::text FROM jobs AS j JOIN job_targets AS t ON t.job_id=j.id WHERE t.id=$1`, targetID).Scan(&jobID, &legacyLease); err != nil {
+			t.Fatalf("read v16 running transform: %v", err)
 		}
 		if err := full.Up(context.Background()); err != nil {
 			t.Fatalf("apply reconciliation evidence boundary: %v", err)
@@ -99,6 +206,20 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 		expectExecError(t, pool, `INSERT INTO reconciliation_reports
 			(id,scope,findings,repair_disposition) VALUES ($1,'all','[]','{}')`, newUUIDv4(t))
+		expectExecError(t, pool, `UPDATE reconciliation_reports SET scope='files' WHERE id=$1`, legacyID)
+		expectExecError(t, pool, `DELETE FROM reconciliation_reports WHERE id=$1`, legacyID)
+		expectExecError(t, pool, `TRUNCATE reconciliation_reports`)
+		expectExecError(t, pool, `SELECT nmcp_begin_repair_run($1,$2,$3,'legacy-probe')`, newUUIDv4(t), legacyID, newUUIDv4(t))
+		var coverage string
+		var history []string
+		if err := pool.QueryRow(context.Background(), `SELECT a.coverage,array_agg(e.event_type ORDER BY e.sequence)
+			FROM storage_attempts AS a JOIN storage_attempt_events AS e ON e.attempt_id=a.id
+			WHERE a.id=$1 AND a.job_id=$2 GROUP BY a.coverage`, legacyLease, jobID).Scan(&coverage, &history); err != nil {
+			t.Fatalf("read legacy-active transform backfill: %v", err)
+		}
+		if coverage != "legacy_active" || fmt.Sprint(history) != "[claimed]" {
+			t.Fatalf("legacy-active transform coverage/history=%q/%v", coverage, history)
+		}
 	})
 
 	t.Run("rendition cleanup boundary upgrade drains legacy state", func(t *testing.T) {

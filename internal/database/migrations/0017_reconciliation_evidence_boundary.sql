@@ -111,6 +111,12 @@ CREATE TABLE reconciliation_check_findings (
         kind IN ('aged_attempt_temp','final_orphan') AND observed_type='regular'
         AND relative_key IS NOT NULL AND observed_size_bytes IS NOT NULL
         AND observed_sha256 IS NOT NULL AND observed_mtime IS NOT NULL AND observed_ctime IS NOT NULL
+    )),
+    CHECK (actionability<>'repairable' OR kind<>'aged_attempt_temp' OR (
+        attempt_id IS NOT NULL AND subject_type IN ('original_attempt_temp','rendition_attempt_temp')
+    )),
+    CHECK (actionability<>'repairable' OR kind<>'final_orphan' OR (
+        expected_state='unreferenced' AND subject_type IN ('original','rendition') AND attempt_id IS NULL
     ))
 );
 CREATE INDEX reconciliation_check_findings_page_idx ON reconciliation_check_findings(report_id,ordinal);
@@ -125,6 +131,16 @@ CREATE TABLE reconciliation_check_report_seals (
 );
 CREATE INDEX reconciliation_check_reports_completed_idx
 ON reconciliation_check_report_seals(completed_at DESC,report_id DESC);
+
+CREATE TABLE reconciliation_check_source_results (
+    report_id nmcp_uuid_v4 NOT NULL REFERENCES reconciliation_check_reports(id) ON DELETE RESTRICT,
+    source text NOT NULL CHECK (source IN ('database_references','attempt_owners','storage_scan')),
+    result text NOT NULL CHECK (result IN ('complete','error')),
+    error_code text CHECK ((result='complete' AND error_code IS NULL)
+        OR (result='error' AND error_code ~ '^[a-z][a-z0-9_]{0,63}$')),
+    completed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY(report_id,source)
+);
 
 CREATE TABLE reconciliation_repair_runs (
     id nmcp_uuid_v4 PRIMARY KEY,
@@ -152,6 +168,7 @@ CREATE TABLE reconciliation_repair_manifest_items (
     prepared_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE(run_id,id),
     UNIQUE(run_id,finding_id),
+    UNIQUE(source_relative_key),
     FOREIGN KEY(run_id,source_report_id) REFERENCES reconciliation_repair_runs(id,source_report_id) ON DELETE RESTRICT,
     FOREIGN KEY(source_report_id,finding_id) REFERENCES reconciliation_check_findings(report_id,id) ON DELETE RESTRICT,
     CHECK (destination_relative_key='.quarantine/'||quarantine_id::text)
@@ -174,7 +191,7 @@ CREATE TABLE reconciliation_repair_events (
     sequence integer NOT NULL CHECK (sequence>0),
     event_type text NOT NULL CHECK (event_type IN (
         'prepared','applying','revalidated','rename','source_directory_fsync',
-        'destination_directory_fsync','completed'
+        'destination_directory_fsync','completed','failed'
     )),
     outcome_code text NOT NULL CHECK (outcome_code ~ '^[a-z][a-z0-9_]{0,63}$'),
     error_code text CHECK (error_code IS NULL OR error_code IN (
@@ -185,9 +202,12 @@ CREATE TABLE reconciliation_repair_events (
     )),
     observed_size_bytes bigint CHECK (observed_size_bytes IS NULL OR observed_size_bytes>=0),
     observed_sha256 text CHECK (observed_sha256 IS NULL OR nmcp_is_sha256(observed_sha256)),
+    transaction_id xid8 NOT NULL DEFAULT pg_catalog.pg_current_xact_id(),
     occurred_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE(attempt_id,sequence),
-    UNIQUE(attempt_id,id)
+    UNIQUE(attempt_id,id),
+    CHECK ((event_type='failed' AND error_code IS NOT NULL)
+        OR (event_type<>'failed' AND error_code IS NULL))
 );
 
 CREATE TABLE reconciliation_repair_results (
@@ -239,7 +259,7 @@ DO $$
 DECLARE table_name text;
 BEGIN
     FOREACH table_name IN ARRAY ARRAY[
-        'reconciliation_check_reports','reconciliation_check_findings','reconciliation_check_report_seals',
+        'reconciliation_check_reports','reconciliation_check_findings','reconciliation_check_report_seals','reconciliation_check_source_results',
         'reconciliation_repair_runs','reconciliation_repair_manifest_items','reconciliation_repair_attempts',
         'reconciliation_repair_events','reconciliation_repair_results','storage_attempts','storage_attempt_events'
     ] LOOP
@@ -264,25 +284,220 @@ CREATE TRIGGER reconciliation_check_findings_insert_guard
 BEFORE INSERT ON reconciliation_check_findings
 FOR EACH ROW EXECUTE FUNCTION nmcp_guard_check_finding_insert();
 
+CREATE FUNCTION nmcp_guard_repair_manifest_insert()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE finding reconciliation_check_findings%ROWTYPE; expected_source_type text;
+BEGIN
+    PERFORM 1 FROM reconciliation_repair_runs WHERE id=NEW.run_id AND source_report_id=NEW.source_report_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'repair run is absent or mismatched' USING ERRCODE='23514'; END IF;
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_results WHERE run_id=NEW.run_id) THEN
+        RAISE EXCEPTION 'completed repair run is frozen' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO finding FROM reconciliation_check_findings
+      WHERE report_id=NEW.source_report_id AND id=NEW.finding_id;
+    IF NOT FOUND OR finding.actionability<>'repairable'
+       OR NOT EXISTS (SELECT 1 FROM reconciliation_check_report_seals WHERE report_id=NEW.source_report_id) THEN
+        RAISE EXCEPTION 'repair manifest requires a repairable sealed finding' USING ERRCODE='23514';
+    END IF;
+    expected_source_type:=CASE finding.subject_type
+      WHEN 'original' THEN 'original_final'
+      WHEN 'rendition' THEN 'rendition_final'
+      WHEN 'original_attempt_temp' THEN 'original_attempt_temp'
+      WHEN 'rendition_attempt_temp' THEN 'rendition_attempt_temp'
+      ELSE NULL END;
+    IF NEW.source_type IS DISTINCT FROM expected_source_type
+       OR NEW.source_relative_key IS DISTINCT FROM finding.relative_key
+       OR NEW.expected_size_bytes IS DISTINCT FROM finding.observed_size_bytes
+       OR NEW.report_observed_sha256 IS DISTINCT FROM finding.observed_sha256
+       OR NEW.destination_relative_key IS DISTINCT FROM '.quarantine/'||NEW.quarantine_id::text
+       OR NEW.planned_action<>'quarantine' THEN
+        RAISE EXCEPTION 'repair manifest does not exactly copy finding authority' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER reconciliation_repair_manifest_items_insert_guard
+BEFORE INSERT ON reconciliation_repair_manifest_items
+FOR EACH ROW EXECUTE FUNCTION nmcp_guard_repair_manifest_insert();
+
+CREATE FUNCTION nmcp_guard_repair_attempt_insert()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE parent_run nmcp_uuid_v4; expected_number integer; previous_terminal boolean;
+BEGIN
+    SELECT run_id INTO STRICT parent_run FROM reconciliation_repair_manifest_items WHERE id=NEW.manifest_item_id;
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(parent_run::text,0));
+    PERFORM 1 FROM reconciliation_repair_runs WHERE id=parent_run FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_results WHERE run_id=parent_run) THEN
+        RAISE EXCEPTION 'completed repair run is frozen' USING ERRCODE='23514';
+    END IF;
+    SELECT COALESCE(max(attempt_number),0)+1 INTO expected_number
+      FROM reconciliation_repair_attempts WHERE manifest_item_id=NEW.manifest_item_id;
+    IF NEW.attempt_number<>expected_number THEN
+        RAISE EXCEPTION 'repair attempt number is not contiguous' USING ERRCODE='23514';
+    END IF;
+    IF expected_number>1 THEN
+        SELECT EXISTS (
+          SELECT 1 FROM reconciliation_repair_attempts AS a
+          JOIN LATERAL (SELECT event_type FROM reconciliation_repair_events
+             WHERE attempt_id=a.id ORDER BY sequence DESC LIMIT 1) AS latest ON true
+          WHERE a.manifest_item_id=NEW.manifest_item_id
+             AND a.attempt_number=expected_number-1 AND latest.event_type='failed'
+        ) INTO previous_terminal;
+        IF NOT previous_terminal THEN
+            RAISE EXCEPTION 'previous repair attempt is still active' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER reconciliation_repair_attempts_insert_guard
+BEFORE INSERT ON reconciliation_repair_attempts
+FOR EACH ROW EXECUTE FUNCTION nmcp_guard_repair_attempt_insert();
+
 CREATE FUNCTION nmcp_guard_repair_event_insert()
 RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE expected_sequence integer; previous_type text;
+DECLARE expected_sequence integer; previous_type text; parent_run nmcp_uuid_v4;
+  applying_transaction xid8; item reconciliation_repair_manifest_items%ROWTYPE;
 BEGIN
-    PERFORM 1 FROM reconciliation_repair_attempts WHERE id=NEW.attempt_id FOR UPDATE;
+    SELECT m.* INTO item FROM reconciliation_repair_attempts AS a
+      JOIN reconciliation_repair_manifest_items AS m ON m.id=a.manifest_item_id
+      WHERE a.id=NEW.attempt_id;
     IF NOT FOUND THEN RAISE EXCEPTION 'repair attempt is absent' USING ERRCODE='23503'; END IF;
+    parent_run:=item.run_id;
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(parent_run::text,0));
+    IF NEW.transaction_id IS DISTINCT FROM pg_catalog.pg_current_xact_id() THEN
+        RAISE EXCEPTION 'repair event transaction identity is not current' USING ERRCODE='23514';
+    END IF;
+    IF NEW.event_type IN ('applying','completed') THEN
+        PERFORM 1 FROM maintenance_state WHERE id=1 AND mode='maintenance' FOR SHARE;
+        IF NOT FOUND THEN RAISE EXCEPTION 'repair applying requires maintenance mode' USING ERRCODE='55000'; END IF;
+        IF EXISTS (SELECT 1 FROM reconciliation_check_findings WHERE id=item.finding_id AND media_id IS NOT NULL) THEN
+            PERFORM 1 FROM media WHERE id=(SELECT media_id FROM reconciliation_check_findings WHERE id=item.finding_id) FOR UPDATE;
+        END IF;
+        PERFORM 1 FROM jobs WHERE id IN (
+            SELECT f.job_id FROM reconciliation_check_findings AS f WHERE f.id=item.finding_id AND f.job_id IS NOT NULL
+            UNION
+            SELECT a.job_id FROM reconciliation_check_findings AS f
+              JOIN storage_attempts AS a ON a.id=f.attempt_id
+              WHERE f.id=item.finding_id AND a.job_id IS NOT NULL
+            UNION
+            SELECT j.id FROM reconciliation_check_findings AS f
+              JOIN jobs AS j ON j.media_id_snapshot=f.media_id
+              WHERE f.id=item.finding_id AND f.media_id IS NOT NULL
+        ) ORDER BY id FOR UPDATE;
+        PERFORM 1 FROM originals WHERE relative_path=item.source_relative_key FOR UPDATE;
+        IF FOUND THEN RAISE EXCEPTION 'repair source became referenced' USING ERRCODE='23514'; END IF;
+        PERFORM 1 FROM renditions WHERE relative_path=item.source_relative_key FOR UPDATE;
+        IF FOUND THEN RAISE EXCEPTION 'repair source became referenced' USING ERRCODE='23514'; END IF;
+        IF item.source_type IN ('original_attempt_temp','rendition_attempt_temp')
+           AND NOT EXISTS (
+             SELECT 1 FROM reconciliation_check_findings AS f
+             JOIN storage_attempts AS a ON a.id=f.attempt_id AND a.coverage='native'
+             JOIN LATERAL (SELECT event_type FROM storage_attempt_events
+               WHERE attempt_id=a.id ORDER BY sequence DESC LIMIT 1) AS latest ON true
+             WHERE f.id=item.finding_id AND latest.event_type IN ('aborted','released','expired')
+               AND ((a.kind='upload' AND f.subject_type='original_attempt_temp'
+                     AND a.temp_relative_key=item.source_relative_key)
+                 OR (a.kind='transform' AND f.subject_type='rendition_attempt_temp'
+                     AND f.job_id=a.job_id
+                     AND EXISTS (SELECT 1 FROM job_targets AS t WHERE t.id=f.job_target_id AND t.job_id=a.job_id)
+                     AND item.source_relative_key ~ ('^renditions/'||left(a.original_id::text,2)||'/'||a.original_id::text||'/'||f.job_target_id::text||'/\.[^/]+\.'||a.id::text||'\.tmp$')))
+           ) THEN
+            RAISE EXCEPTION 'repair attempt owner is no longer terminal and unambiguous' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    PERFORM 1 FROM reconciliation_repair_runs WHERE id=parent_run FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_results WHERE run_id=parent_run) THEN
+        RAISE EXCEPTION 'completed repair run is frozen' USING ERRCODE='23514';
+    END IF;
+    PERFORM 1 FROM reconciliation_repair_manifest_items WHERE id=item.id FOR UPDATE;
+    PERFORM 1 FROM reconciliation_repair_attempts WHERE id=NEW.attempt_id FOR UPDATE;
     SELECT COALESCE(max(sequence),0)+1 INTO expected_sequence
       FROM reconciliation_repair_events WHERE attempt_id=NEW.attempt_id;
     SELECT event_type INTO previous_type FROM reconciliation_repair_events
       WHERE attempt_id=NEW.attempt_id ORDER BY sequence DESC LIMIT 1;
+    SELECT transaction_id INTO applying_transaction FROM reconciliation_repair_events
+      WHERE attempt_id=NEW.attempt_id AND event_type='applying';
+    IF applying_transaction IS NOT NULL AND NEW.transaction_id IS DISTINCT FROM applying_transaction THEN
+        RAISE EXCEPTION 'applying through terminal repair events require one transaction' USING ERRCODE='23514';
+    END IF;
     IF NEW.sequence<>expected_sequence THEN RAISE EXCEPTION 'repair event sequence is not contiguous' USING ERRCODE='23514'; END IF;
-    IF NEW.sequence=1 AND NEW.event_type<>'prepared' THEN RAISE EXCEPTION 'repair attempt must begin prepared' USING ERRCODE='23514'; END IF;
-    IF previous_type='completed' THEN RAISE EXCEPTION 'completed repair attempt is terminal' USING ERRCODE='23514'; END IF;
+    IF (NEW.sequence=1 AND NEW.event_type<>'prepared')
+       OR (NEW.event_type='applying' AND previous_type<>'prepared')
+       OR (NEW.event_type='revalidated' AND previous_type<>'applying')
+       OR (NEW.event_type='rename' AND previous_type<>'revalidated')
+       OR (NEW.event_type='source_directory_fsync' AND previous_type<>'rename')
+       OR (NEW.event_type='destination_directory_fsync' AND previous_type<>'source_directory_fsync')
+       OR (NEW.event_type='completed' AND previous_type<>'destination_directory_fsync')
+       OR (NEW.event_type='failed' AND previous_type NOT IN ('prepared','applying','revalidated','rename','source_directory_fsync','destination_directory_fsync'))
+       OR (NEW.sequence>1 AND NEW.event_type='prepared') THEN
+        RAISE EXCEPTION 'invalid repair event transition: % to %',previous_type,NEW.event_type USING ERRCODE='23514';
+    END IF;
+    IF NEW.event_type<>'failed' AND NEW.outcome_code IS DISTINCT FROM CASE NEW.event_type
+         WHEN 'prepared' THEN 'prepared' WHEN 'applying' THEN 'applying'
+         WHEN 'revalidated' THEN 'matched' WHEN 'rename' THEN 'renamed'
+         WHEN 'source_directory_fsync' THEN 'durable'
+         WHEN 'destination_directory_fsync' THEN 'durable'
+         WHEN 'completed' THEN 'quarantined' END THEN
+        RAISE EXCEPTION 'repair event outcome does not match its transition' USING ERRCODE='23514';
+    END IF;
+    IF NEW.event_type='failed' AND NEW.outcome_code IS DISTINCT FROM
+         CASE WHEN NEW.error_code='outcome_uncertain' THEN 'unknown' ELSE 'failed' END THEN
+        RAISE EXCEPTION 'failed repair outcome contradicts its error' USING ERRCODE='23514';
+    END IF;
+    IF NEW.event_type='failed' AND previous_type IN ('rename','source_directory_fsync','destination_directory_fsync')
+       AND NEW.error_code<>'outcome_uncertain' THEN
+        RAISE EXCEPTION 'post-rename repair failure must preserve outcome uncertainty' USING ERRCODE='23514';
+    END IF;
+    IF NEW.event_type IN ('revalidated','completed')
+       AND (NEW.observed_size_bytes IS DISTINCT FROM item.expected_size_bytes
+         OR NEW.observed_sha256 IS DISTINCT FROM item.report_observed_sha256) THEN
+        RAISE EXCEPTION 'repair revalidation does not match manifest authority' USING ERRCODE='23514';
+    END IF;
+    IF previous_type IN ('completed','failed') THEN RAISE EXCEPTION 'repair attempt is terminal' USING ERRCODE='23514'; END IF;
     RETURN NEW;
 END;
 $$;
 CREATE TRIGGER reconciliation_repair_events_insert_guard
 BEFORE INSERT ON reconciliation_repair_events
 FOR EACH ROW EXECUTE FUNCTION nmcp_guard_repair_event_insert();
+
+CREATE FUNCTION nmcp_guard_repair_result_insert()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE actual_manifest bigint; actual_quarantined bigint; actual_failed bigint; actual_unknown bigint;
+BEGIN
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(NEW.run_id::text,0));
+    PERFORM 1 FROM reconciliation_repair_runs WHERE id=NEW.run_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'repair run is absent' USING ERRCODE='23503'; END IF;
+    SELECT count(*),
+      count(*) FILTER (WHERE latest.event_type='completed' AND latest.outcome_code='quarantined'),
+      count(*) FILTER (WHERE latest.event_type='failed' AND latest.error_code<>'outcome_uncertain'),
+      count(*) FILTER (WHERE latest.event_type='failed' AND latest.error_code='outcome_uncertain')
+    INTO actual_manifest,actual_quarantined,actual_failed,actual_unknown
+    FROM reconciliation_repair_manifest_items AS m
+    LEFT JOIN LATERAL (
+      SELECT e.event_type,e.outcome_code,e.error_code
+      FROM reconciliation_repair_attempts AS a
+      JOIN reconciliation_repair_events AS e ON e.attempt_id=a.id
+      WHERE a.manifest_item_id=m.id
+      ORDER BY a.attempt_number DESC,e.sequence DESC LIMIT 1
+    ) AS latest ON true
+    WHERE m.run_id=NEW.run_id;
+    IF actual_manifest=0 OR actual_quarantined+actual_failed+actual_unknown<>actual_manifest
+       OR NEW.manifest_count<>actual_manifest OR NEW.quarantined_count<>actual_quarantined
+       OR NEW.stale_count<>0 OR NEW.resolved_count<>0 OR NEW.failed_count<>actual_failed
+       OR NEW.unknown_count<>actual_unknown
+       OR NEW.result<>CASE WHEN actual_unknown>0 THEN 'unknown'
+            WHEN actual_failed=0 THEN 'succeeded'
+            WHEN actual_failed=actual_manifest THEN 'failed' ELSE 'partial' END THEN
+        RAISE EXCEPTION 'repair result is not derived from terminal manifest attempts' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER reconciliation_repair_results_insert_guard
+BEFORE INSERT ON reconciliation_repair_results
+FOR EACH ROW EXECUTE FUNCTION nmcp_guard_repair_result_insert();
 
 CREATE FUNCTION nmcp_guard_storage_attempt_event_insert()
 RETURNS trigger LANGUAGE plpgsql AS $$
@@ -389,6 +604,8 @@ BEGIN
           VALUES(NEW.lease_token,'transform',NEW.original_id,NEW.id,'native',NEW.updated_at);
         INSERT INTO storage_attempt_events(attempt_id,sequence,event_type,lease_expires_at,job_status,occurred_at)
           VALUES(NEW.lease_token,1,'claimed',NEW.lease_expires_at,NEW.status,NEW.updated_at);
+    ELSIF OLD.status='running' AND NEW.status='running' AND OLD.lease_token IS DISTINCT FROM NEW.lease_token THEN
+        RAISE EXCEPTION 'running transform lease token is immutable' USING ERRCODE='23514';
     ELSIF OLD.status='running' AND NEW.status='running' AND OLD.lease_token=NEW.lease_token
           AND OLD.lease_expires_at IS DISTINCT FROM NEW.lease_expires_at THEN
         SELECT COALESCE(max(sequence),0)+1 INTO next_sequence FROM storage_attempt_events WHERE attempt_id=NEW.lease_token;
@@ -432,30 +649,88 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION nmcp_complete_check_source(
+    source_report_id nmcp_uuid_v4,source_name text,source_error_code text
+) RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    PERFORM 1 FROM reconciliation_check_reports WHERE id=source_report_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'check report is absent' USING ERRCODE='23514'; END IF;
+    IF EXISTS (SELECT 1 FROM reconciliation_check_report_seals WHERE report_id=source_report_id) THEN
+        RAISE EXCEPTION 'sealed check report is immutable' USING ERRCODE='23514';
+    END IF;
+    INSERT INTO reconciliation_check_source_results(report_id,source,result,error_code)
+      VALUES(source_report_id,source_name,
+        CASE WHEN source_error_code IS NULL THEN 'complete' ELSE 'error' END,source_error_code);
+END;
+$$;
+
 CREATE FUNCTION nmcp_append_check_finding(
     finding_id nmcp_uuid_v4,finding_report_id nmcp_uuid_v4,finding_kind text,finding_reason text,
-    finding_actionability text,finding_subject_type text,finding_subject_id nmcp_uuid_v4,
+    finding_subject_type text,finding_subject_id nmcp_uuid_v4,
     finding_media_id nmcp_uuid_v4,finding_job_id nmcp_uuid_v4,finding_target_id nmcp_uuid_v4,
     finding_attempt_id nmcp_uuid_v4,finding_manifest_item_id nmcp_uuid_v4,finding_relative_key text,
     finding_expected_state text,finding_expected_size bigint,finding_expected_sha text,
     finding_observed_type text,finding_observed_size bigint,finding_observed_sha text,
     finding_observed_mtime timestamptz,finding_observed_ctime timestamptz,finding_observed_at timestamptz
 ) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER AS $$
-DECLARE next_ordinal bigint;
+DECLARE next_ordinal bigint; derived_actionability text:='non_actionable'; report_row reconciliation_check_reports%ROWTYPE;
 BEGIN
-    PERFORM 1 FROM reconciliation_check_reports WHERE id=finding_report_id FOR UPDATE;
+    SELECT * INTO report_row FROM reconciliation_check_reports WHERE id=finding_report_id FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'check report is absent' USING ERRCODE='23514'; END IF;
     IF EXISTS (SELECT 1 FROM reconciliation_check_report_seals WHERE report_id=finding_report_id) THEN
         RAISE EXCEPTION 'sealed check report is immutable' USING ERRCODE='23514';
     END IF;
     SELECT COALESCE(max(ordinal),0)+1 INTO next_ordinal
       FROM reconciliation_check_findings WHERE report_id=finding_report_id;
+    IF finding_observed_at<report_row.fs_scan_started_at THEN
+        RAISE EXCEPTION 'finding predates storage scan' USING ERRCODE='23514';
+    END IF;
+    IF finding_kind='final_orphan'
+       AND finding_expected_state='unreferenced'
+       AND finding_subject_type IN ('original','rendition')
+       AND EXISTS (SELECT 1 FROM reconciliation_check_source_results
+          WHERE report_id=finding_report_id AND source='database_references' AND result='complete')
+       AND NOT EXISTS (SELECT 1 FROM originals
+          WHERE relative_path=finding_relative_key OR id=finding_subject_id)
+       AND NOT EXISTS (SELECT 1 FROM renditions
+          WHERE relative_path=finding_relative_key OR id=finding_subject_id) THEN
+        derived_actionability:='repairable';
+    ELSIF finding_kind='aged_attempt_temp'
+       AND finding_attempt_id IS NOT NULL
+       AND finding_subject_type IN ('original_attempt_temp','rendition_attempt_temp')
+       AND finding_observed_mtime<=report_row.temp_cutoff_at
+       AND finding_observed_ctime<=report_row.temp_cutoff_at
+       AND EXISTS (SELECT 1 FROM reconciliation_check_source_results
+          WHERE report_id=finding_report_id AND source='attempt_owners' AND result='complete')
+       AND EXISTS (
+          SELECT 1 FROM storage_attempts AS a
+          JOIN LATERAL (
+              SELECT event_type,occurred_at FROM storage_attempt_events
+              WHERE attempt_id=a.id ORDER BY sequence DESC LIMIT 1
+          ) AS latest ON true
+          WHERE a.id=finding_attempt_id AND a.coverage='native'
+            AND latest.event_type IN ('aborted','released','expired')
+             AND latest.occurred_at<=report_row.temp_cutoff_at
+             AND ((a.kind='upload' AND finding_subject_type='original_attempt_temp'
+                   AND a.temp_relative_key=finding_relative_key)
+               OR (a.kind='transform' AND finding_subject_type='rendition_attempt_temp'
+                   AND finding_job_id=a.job_id
+                   AND EXISTS (SELECT 1 FROM job_targets AS t
+                     WHERE t.id=finding_target_id AND t.job_id=a.job_id)
+                   AND finding_relative_key ~ ('^renditions/'||left(a.original_id::text,2)||'/'||a.original_id::text||'/'||finding_target_id::text||'/\.[^/]+\.'||a.id::text||'\.tmp$')))
+       ) THEN
+        derived_actionability:='repairable';
+    ELSIF finding_kind IN ('referenced_missing','size_mismatch','sha256_mismatch','invalid_current','invalid_provenance',
+                           'expired_media_candidate','expired_rendition_candidate','terminal_delete_residue',
+                           'quarantine_missing','quarantine_mismatch') THEN
+        derived_actionability:='manual';
+    END IF;
     INSERT INTO reconciliation_check_findings(
         id,report_id,ordinal,kind,reason_code,actionability,subject_type,subject_id,media_id,job_id,
         job_target_id,attempt_id,manifest_item_id,relative_key,expected_state,expected_size_bytes,
         expected_sha256,observed_type,observed_size_bytes,observed_sha256,observed_mtime,observed_ctime,observed_at
     ) VALUES(
-        finding_id,finding_report_id,next_ordinal,finding_kind,finding_reason,finding_actionability,
+        finding_id,finding_report_id,next_ordinal,finding_kind,finding_reason,derived_actionability,
         finding_subject_type,finding_subject_id,finding_media_id,finding_job_id,finding_target_id,
         finding_attempt_id,finding_manifest_item_id,finding_relative_key,finding_expected_state,
         finding_expected_size,finding_expected_sha,finding_observed_type,finding_observed_size,
@@ -467,17 +742,143 @@ $$;
 
 CREATE FUNCTION nmcp_seal_check_report(sealed_report_id nmcp_uuid_v4,expected_findings bigint,scan_ended timestamptz)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
-DECLARE actual_count bigint; first_ordinal bigint; last_ordinal bigint;
+DECLARE actual_count bigint; first_ordinal bigint; last_ordinal bigint; scan_started timestamptz;
 BEGIN
-    PERFORM 1 FROM reconciliation_check_reports WHERE id=sealed_report_id FOR UPDATE;
+    SELECT fs_scan_started_at INTO scan_started FROM reconciliation_check_reports WHERE id=sealed_report_id FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'check report is absent' USING ERRCODE='23514'; END IF;
+    IF scan_ended<scan_started THEN RAISE EXCEPTION 'storage scan ended before it started' USING ERRCODE='23514'; END IF;
+    IF (SELECT count(*) FROM reconciliation_check_source_results
+        WHERE report_id=sealed_report_id AND result='complete')<>3
+       OR EXISTS (SELECT 1 FROM reconciliation_check_source_results
+          WHERE report_id=sealed_report_id AND result='error') THEN
+        RAISE EXCEPTION 'check sources are incomplete or failed' USING ERRCODE='23514';
+    END IF;
     SELECT count(*),min(ordinal),max(ordinal) INTO actual_count,first_ordinal,last_ordinal
       FROM reconciliation_check_findings WHERE report_id=sealed_report_id;
     IF actual_count<>expected_findings OR (actual_count>0 AND (first_ordinal<>1 OR last_ordinal<>actual_count)) THEN
         RAISE EXCEPTION 'check report findings are incomplete' USING ERRCODE='23514';
     END IF;
+    IF EXISTS (SELECT 1 FROM reconciliation_check_findings
+        WHERE report_id=sealed_report_id AND observed_at>scan_ended) THEN
+        RAISE EXCEPTION 'finding falls outside storage scan interval' USING ERRCODE='23514';
+    END IF;
     INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at)
       VALUES(sealed_report_id,actual_count,scan_ended);
+END;
+$$;
+
+CREATE FUNCTION nmcp_begin_repair_run(
+    repair_run_id nmcp_uuid_v4,repair_report_id nmcp_uuid_v4,
+    repair_authorization_id nmcp_uuid_v4,repair_actor text
+) RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+    PERFORM 1 FROM reconciliation_check_report_seals WHERE report_id=repair_report_id FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'repair requires a sealed check report' USING ERRCODE='23514'; END IF;
+    INSERT INTO reconciliation_repair_runs(id,source_report_id,authorization_id,authorized_actor)
+      VALUES(repair_run_id,repair_report_id,repair_authorization_id,repair_actor);
+END;
+$$;
+
+CREATE FUNCTION nmcp_prepare_repair_manifest_item(
+    repair_item_id nmcp_uuid_v4,repair_run_id nmcp_uuid_v4,
+    repair_finding_id nmcp_uuid_v4,repair_quarantine_id nmcp_uuid_v4
+) RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE run_row reconciliation_repair_runs%ROWTYPE; finding reconciliation_check_findings%ROWTYPE; source_type text;
+BEGIN
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(repair_run_id::text,0));
+    SELECT * INTO STRICT run_row FROM reconciliation_repair_runs WHERE id=repair_run_id FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_results WHERE run_id=repair_run_id) THEN
+        RAISE EXCEPTION 'completed repair run is frozen' USING ERRCODE='23514';
+    END IF;
+    SELECT * INTO STRICT finding FROM reconciliation_check_findings
+      WHERE report_id=run_row.source_report_id AND id=repair_finding_id;
+    IF finding.actionability<>'repairable' THEN
+        RAISE EXCEPTION 'finding is not repairable' USING ERRCODE='23514';
+    END IF;
+    source_type:=CASE finding.subject_type
+      WHEN 'original' THEN 'original_final'
+      WHEN 'rendition' THEN 'rendition_final'
+      WHEN 'original_attempt_temp' THEN 'original_attempt_temp'
+      WHEN 'rendition_attempt_temp' THEN 'rendition_attempt_temp' END;
+    INSERT INTO reconciliation_repair_manifest_items(
+      id,run_id,source_report_id,finding_id,quarantine_id,source_type,source_relative_key,
+      expected_size_bytes,report_observed_sha256,destination_relative_key,planned_action
+    ) VALUES(
+      repair_item_id,repair_run_id,run_row.source_report_id,repair_finding_id,repair_quarantine_id,
+      source_type,finding.relative_key,finding.observed_size_bytes,finding.observed_sha256,
+      '.quarantine/'||repair_quarantine_id::text,'quarantine'
+    );
+END;
+$$;
+
+CREATE FUNCTION nmcp_begin_repair_attempt(
+    repair_attempt_id nmcp_uuid_v4,repair_item_id nmcp_uuid_v4,prepared_event_id nmcp_uuid_v4
+)
+RETURNS integer LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE next_attempt integer; parent_run nmcp_uuid_v4;
+BEGIN
+    SELECT run_id INTO parent_run FROM reconciliation_repair_manifest_items WHERE id=repair_item_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'repair manifest item is absent' USING ERRCODE='23514'; END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(parent_run::text,0));
+    PERFORM 1 FROM maintenance_state WHERE id=1 AND mode='maintenance' FOR SHARE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'repair attempt requires maintenance mode' USING ERRCODE='55000'; END IF;
+    SELECT COALESCE(max(attempt_number),0)+1 INTO next_attempt
+      FROM reconciliation_repair_attempts WHERE manifest_item_id=repair_item_id;
+    INSERT INTO reconciliation_repair_attempts(id,manifest_item_id,attempt_number)
+      VALUES(repair_attempt_id,repair_item_id,next_attempt);
+    INSERT INTO reconciliation_repair_events(id,attempt_id,sequence,event_type,outcome_code)
+      VALUES(prepared_event_id,repair_attempt_id,1,'prepared','prepared');
+    RETURN next_attempt;
+END;
+$$;
+
+CREATE FUNCTION nmcp_append_repair_event(
+    repair_event_id nmcp_uuid_v4,repair_attempt_id nmcp_uuid_v4,repair_event_type text,
+    repair_outcome_code text,repair_error_code text,repair_observed_size bigint,repair_observed_sha text
+) RETURNS integer LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE next_sequence integer;
+BEGIN
+    PERFORM 1 FROM reconciliation_repair_attempts WHERE id=repair_attempt_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'repair attempt is absent' USING ERRCODE='23514'; END IF;
+    SELECT COALESCE(max(sequence),0)+1 INTO next_sequence
+      FROM reconciliation_repair_events WHERE attempt_id=repair_attempt_id;
+    INSERT INTO reconciliation_repair_events(
+      id,attempt_id,sequence,event_type,outcome_code,error_code,observed_size_bytes,observed_sha256
+    ) VALUES(repair_event_id,repair_attempt_id,next_sequence,repair_event_type,repair_outcome_code,
+      repair_error_code,repair_observed_size,repair_observed_sha);
+    RETURN next_sequence;
+END;
+$$;
+
+CREATE FUNCTION nmcp_finish_repair_run(repair_run_id nmcp_uuid_v4)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE manifest_count bigint; quarantined_count bigint; failed_count bigint; unknown_count bigint; derived_result text;
+BEGIN
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(repair_run_id::text,0));
+    PERFORM 1 FROM reconciliation_repair_runs WHERE id=repair_run_id FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'repair run is absent' USING ERRCODE='23514'; END IF;
+    SELECT count(*),
+      count(*) FILTER (WHERE latest.event_type='completed' AND latest.outcome_code='quarantined'),
+      count(*) FILTER (WHERE latest.event_type='failed' AND latest.error_code<>'outcome_uncertain'),
+      count(*) FILTER (WHERE latest.event_type='failed' AND latest.error_code='outcome_uncertain')
+    INTO manifest_count,quarantined_count,failed_count,unknown_count
+    FROM reconciliation_repair_manifest_items AS m
+    LEFT JOIN LATERAL (
+      SELECT e.event_type,e.outcome_code,e.error_code
+      FROM reconciliation_repair_attempts AS a
+      JOIN reconciliation_repair_events AS e ON e.attempt_id=a.id
+      WHERE a.manifest_item_id=m.id
+      ORDER BY a.attempt_number DESC,e.sequence DESC LIMIT 1
+    ) AS latest ON true
+    WHERE m.run_id=repair_run_id;
+    IF manifest_count=0 OR quarantined_count+failed_count+unknown_count<>manifest_count THEN
+        RAISE EXCEPTION 'repair manifest attempts are incomplete' USING ERRCODE='23514';
+    END IF;
+    derived_result:=CASE WHEN unknown_count>0 THEN 'unknown' WHEN failed_count=0 THEN 'succeeded'
+      WHEN failed_count=manifest_count THEN 'failed' ELSE 'partial' END;
+    INSERT INTO reconciliation_repair_results(
+      run_id,result,manifest_count,quarantined_count,stale_count,resolved_count,failed_count,unknown_count
+    ) VALUES(repair_run_id,derived_result,manifest_count,quarantined_count,0,0,failed_count,unknown_count);
 END;
 $$;
 
@@ -487,7 +888,8 @@ BEGIN
     EXECUTE format('GRANT USAGE,CREATE ON SCHEMA %I TO nmcp_check_function_owner,nmcp_repair_function_owner',target_schema);
     FOREACH function_signature IN ARRAY ARRAY[
         'nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)',
-        'nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)',
+        'nmcp_complete_check_source(nmcp_uuid_v4,text,text)',
+        'nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)',
         'nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)'
     ] LOOP
         EXECUTE format('ALTER FUNCTION %I.%s OWNER TO nmcp_check_function_owner',target_schema,function_signature);
@@ -499,14 +901,21 @@ BEGIN
         'nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)',
         'nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)',
         'nmcp_complete_upload_attempt(nmcp_uuid_v4,text)',
-        'nmcp_record_transform_storage_attempt()'
+        'nmcp_record_transform_storage_attempt()',
+        'nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)',
+        'nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
+        'nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
+        'nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)',
+        'nmcp_finish_repair_run(nmcp_uuid_v4)'
     ] LOOP
         EXECUTE format('ALTER FUNCTION %I.%s OWNER TO nmcp_repair_function_owner',target_schema,function_signature);
         EXECUTE format('ALTER FUNCTION %I.%s SET search_path=%I,pg_catalog,pg_temp',target_schema,function_signature,target_schema);
     END LOOP;
     FOREACH function_signature IN ARRAY ARRAY[
         'nmcp_reject_legacy_reconciliation_insert()','nmcp_guard_check_finding_insert()',
-        'nmcp_guard_repair_event_insert()','nmcp_guard_storage_attempt_event_insert()'
+        'nmcp_guard_repair_manifest_insert()','nmcp_guard_repair_attempt_insert()',
+        'nmcp_guard_repair_event_insert()','nmcp_guard_repair_result_insert()',
+        'nmcp_guard_storage_attempt_event_insert()'
     ] LOOP
         EXECUTE format('ALTER FUNCTION %I.%s SET search_path=%I,pg_catalog,pg_temp',target_schema,function_signature,target_schema);
     END LOOP;
@@ -518,13 +927,14 @@ $$;
 REVOKE ALL ON reconciliation_reports FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime,nmcp_repair_runtime;
 REVOKE ALL ON admin_audit,admin_batches FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime,nmcp_repair_runtime;
 REVOKE ALL ON maintenance_state FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime,nmcp_repair_runtime;
-REVOKE ALL ON reconciliation_check_reports,reconciliation_check_findings,reconciliation_check_report_seals,
+REVOKE ALL ON reconciliation_check_reports,reconciliation_check_findings,reconciliation_check_report_seals,reconciliation_check_source_results,
     reconciliation_repair_runs,reconciliation_repair_manifest_items,reconciliation_repair_attempts,
     reconciliation_repair_events,reconciliation_repair_results,storage_attempts,storage_attempt_events
 FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime,nmcp_repair_runtime;
 
 GRANT SELECT ON schema_migrations TO nmcp_check_function_owner;
-GRANT SELECT,INSERT ON reconciliation_check_reports,reconciliation_check_findings,reconciliation_check_report_seals TO nmcp_check_function_owner;
+GRANT SELECT,INSERT ON reconciliation_check_reports,reconciliation_check_findings,reconciliation_check_report_seals,
+    reconciliation_check_source_results TO nmcp_check_function_owner;
 GRANT UPDATE(id) ON reconciliation_check_reports TO nmcp_check_function_owner;
 GRANT SELECT ON system_config,media,originals,profiles,jobs,job_targets,renditions,purge_file_progress,
     rendition_cleanup_progress,media_purge_identity_guard,storage_attempts,storage_attempt_events
@@ -532,7 +942,7 @@ TO nmcp_check_function_owner;
 
 GRANT SELECT ON maintenance_state,media,originals,jobs,job_targets,renditions,media_purge_identity_guard,
     purge_file_progress,rendition_cleanup_progress,reconciliation_check_reports,reconciliation_check_findings,
-    reconciliation_check_report_seals,reconciliation_repair_runs,reconciliation_repair_manifest_items,
+    reconciliation_check_report_seals,reconciliation_check_source_results,reconciliation_repair_runs,reconciliation_repair_manifest_items,
     reconciliation_repair_attempts,reconciliation_repair_events,reconciliation_repair_results,
     storage_attempts,storage_attempt_events TO nmcp_repair_function_owner;
 GRANT INSERT ON reconciliation_repair_runs,reconciliation_repair_manifest_items,reconciliation_repair_attempts,
@@ -541,15 +951,18 @@ TO nmcp_repair_function_owner;
 GRANT UPDATE(id) ON maintenance_state,media,originals,jobs,job_targets,renditions,
     reconciliation_repair_runs,reconciliation_repair_manifest_items,reconciliation_repair_attempts,storage_attempts
 TO nmcp_repair_function_owner;
+GRANT UPDATE(report_id) ON reconciliation_check_report_seals TO nmcp_repair_function_owner;
 GRANT UPDATE(media_id) ON media_purge_identity_guard TO nmcp_repair_function_owner;
 GRANT USAGE,SELECT ON SEQUENCE storage_attempt_events_id_seq TO nmcp_repair_function_owner;
 
 REVOKE ALL ON FUNCTION nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz),
-    nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz),
+    nmcp_complete_check_source(nmcp_uuid_v4,text,text),
+    nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz),
     nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)
 FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_repair_runtime;
 GRANT EXECUTE ON FUNCTION nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz),
-    nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz),
+    nmcp_complete_check_source(nmcp_uuid_v4,text,text),
+    nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz),
     nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz) TO nmcp_check_runtime;
 
 REVOKE ALL ON FUNCTION nmcp_require_normal_maintenance(),
@@ -564,6 +977,20 @@ GRANT EXECUTE ON FUNCTION nmcp_require_normal_maintenance(),
     ,nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)
 TO nmcp_runtime;
 
+REVOKE ALL ON FUNCTION nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text),
+    nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4),
+    nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4),
+    nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text),
+    nmcp_finish_repair_run(nmcp_uuid_v4)
+FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime;
+GRANT EXECUTE ON FUNCTION nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text),
+    nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4),
+    nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4),
+    nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text),
+    nmcp_finish_repair_run(nmcp_uuid_v4)
+TO nmcp_repair_runtime;
+
 REVOKE ALL ON FUNCTION nmcp_reject_legacy_reconciliation_insert(),nmcp_guard_check_finding_insert(),
-    nmcp_guard_repair_event_insert(),nmcp_guard_storage_attempt_event_insert()
+    nmcp_guard_repair_manifest_insert(),nmcp_guard_repair_attempt_insert(),nmcp_guard_repair_event_insert(),
+    nmcp_guard_repair_result_insert(),nmcp_guard_storage_attempt_event_insert()
 FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime,nmcp_repair_runtime;

@@ -1729,22 +1729,31 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		cutoff := snapshotStarted.Add(time.Second)
 		snapshotEnded := cutoff.Add(time.Second)
 		scanStarted := snapshotEnded.Add(time.Second)
+		observedAt := scanStarted.Add(time.Second)
 		if _, err := pool.Exec(ctx, `SELECT nmcp_begin_check_report($1,'all',1::smallint,$2,$3,$4,$5)`,
 			reportID, snapshotStarted, cutoff, snapshotEnded, scanStarted); err != nil {
 			t.Fatalf("begin normalized check report: %v", err)
 		}
+		if _, err := pool.Exec(ctx, `SELECT nmcp_complete_check_source($1,'database_references',NULL)`, reportID); err != nil {
+			t.Fatalf("complete database reference source: %v", err)
+		}
 		var ordinal int64
 		if err := pool.QueryRow(ctx, `SELECT nmcp_append_check_finding(
-			$1,$2,'final_orphan','stable_unreferenced_final','repairable','original',$3,
+			$1,$2,'final_orphan','stable_unreferenced_final','original',$3,
 			NULL,NULL,NULL,NULL,NULL,$4,'unreferenced',1,$5,'regular',1,$5,$6,$6,$6)`,
 			findingID, reportID, newUUIDv4(t),
-			"originals/00/00000000-0000-4000-8000-000000000001/original.jpg", strings.Repeat("a", 64), cutoff).Scan(&ordinal); err != nil {
+			"originals/00/00000000-0000-4000-8000-000000000001/original.jpg", strings.Repeat("a", 64), observedAt).Scan(&ordinal); err != nil {
 			t.Fatalf("append normalized finding: %v", err)
 		}
 		if ordinal != 1 {
 			t.Fatalf("finding ordinal=%d, want 1", ordinal)
 		}
-		if _, err := pool.Exec(ctx, `SELECT nmcp_seal_check_report($1,1,$2)`, reportID, scanStarted.Add(time.Second)); err != nil {
+		for _, source := range []string{"attempt_owners", "storage_scan"} {
+			if _, err := pool.Exec(ctx, `SELECT nmcp_complete_check_source($1,$2,NULL)`, reportID, source); err != nil {
+				t.Fatalf("complete %s source: %v", source, err)
+			}
+		}
+		if _, err := pool.Exec(ctx, `SELECT nmcp_seal_check_report($1,1,$2)`, reportID, observedAt.Add(time.Second)); err != nil {
 			t.Fatalf("seal normalized check report: %v", err)
 		}
 		expectExecError(t, pool, `INSERT INTO reconciliation_check_findings
@@ -1780,6 +1789,233 @@ func runInitialSchemaIntegrationTests(t *testing.T, databaseURL string) {
 		}
 		expectExecError(t, pool, `UPDATE storage_attempts SET coverage='legacy_active' WHERE id=$1`, attemptID)
 		expectExecError(t, pool, `DELETE FROM storage_attempt_events WHERE attempt_id=$1`, attemptID)
+
+		execAsReconciliationRole := func(role, query string, arguments ...any) error {
+			t.Helper()
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(context.Background())
+			if _, err = tx.Exec(ctx, `SET LOCAL ROLE `+pgx.Identifier{role}.Sanitize()); err == nil {
+				_, err = tx.Exec(ctx, query, arguments...)
+			}
+			if err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT 1 FROM reconciliation_check_reports`); err == nil {
+			t.Fatal("check role read reconciliation evidence directly")
+		}
+		roleReportID := newUUIDv4(t)
+		if err := execAsReconciliationRole("nmcp_check_runtime",
+			`SELECT nmcp_begin_check_report($1,'all',1::smallint,$2,$3,$4,$5)`,
+			roleReportID, snapshotStarted, cutoff, snapshotEnded, scanStarted); err != nil {
+			t.Fatalf("check role execute-only API: %v", err)
+		}
+		for _, source := range []string{"database_references", "attempt_owners"} {
+			if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_complete_check_source($1,$2,NULL)`, roleReportID, source); err != nil {
+				t.Fatalf("check role completes %s: %v", source, err)
+			}
+		}
+		missingOwnerFindingID := newUUIDv4(t)
+		oldFileTime := cutoff.Add(-49 * time.Hour)
+		if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_append_check_finding(
+			$1,$2,'aged_attempt_temp','missing_owner','original_attempt_temp',$3,
+			NULL,NULL,NULL,$4,NULL,$5,'unreferenced',1,$6,'regular',1,$6,$7,$7,$8)`,
+			missingOwnerFindingID, roleReportID, newUUIDv4(t), newUUIDv4(t),
+			"originals/00/00000000-0000-4000-8000-000000000002/.original.00000000-0000-4000-8000-000000000003.tmp",
+			strings.Repeat("b", 64), oldFileTime, observedAt); err != nil {
+			t.Fatalf("check role appends missing-owner finding: %v", err)
+		}
+		referencedMediaID := newUUIDv4(t)
+		insertMedia(t, pool, referencedMediaID)
+		referencedOriginalID := insertOriginal(t, pool, referencedMediaID, "c", newUUIDv4(t))
+		var referencedPath string
+		if err := pool.QueryRow(ctx, `SELECT relative_path FROM originals WHERE id=$1`, referencedOriginalID).Scan(&referencedPath); err != nil {
+			t.Fatal(err)
+		}
+		referencedFindingID := newUUIDv4(t)
+		if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_append_check_finding(
+			$1,$2,'final_orphan','referenced_final','original',$3,$4,NULL,NULL,NULL,NULL,$5,
+			'unreferenced',1,$6,'regular',1,$6,$7,$7,$8)`, referencedFindingID, roleReportID,
+			referencedOriginalID, referencedMediaID, referencedPath, strings.Repeat("c", 64), oldFileTime, observedAt); err != nil {
+			t.Fatalf("check role appends referenced-final finding: %v", err)
+		}
+		if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_complete_check_source($1,'storage_scan',NULL)`, roleReportID); err != nil {
+			t.Fatalf("check role completes storage scan: %v", err)
+		}
+		sealRace := make(chan error, 2)
+		for index := 0; index < 2; index++ {
+			go func() {
+				sealRace <- execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_seal_check_report($1,2,$2)`, roleReportID, observedAt.Add(time.Second))
+			}()
+		}
+		assertOneConcurrentWinner(t, sealRace)
+		var missingOwnerActionability string
+		if err := pool.QueryRow(ctx, `SELECT actionability FROM reconciliation_check_findings WHERE id=$1`, missingOwnerFindingID).Scan(&missingOwnerActionability); err != nil || missingOwnerActionability != "non_actionable" {
+			t.Fatalf("missing owner actionability=%q error=%v", missingOwnerActionability, err)
+		}
+		var referencedActionability string
+		if err := pool.QueryRow(ctx, `SELECT actionability FROM reconciliation_check_findings WHERE id=$1`, referencedFindingID).Scan(&referencedActionability); err != nil || referencedActionability != "non_actionable" {
+			t.Fatalf("referenced final actionability=%q error=%v", referencedActionability, err)
+		}
+
+		failedSourceReportID := newUUIDv4(t)
+		if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_begin_check_report($1,'all',1::smallint,$2,$3,$4,$5)`, failedSourceReportID, snapshotStarted, cutoff, snapshotEnded, scanStarted); err != nil {
+			t.Fatal(err)
+		}
+		for _, source := range []struct {
+			name      string
+			errorCode any
+		}{{"database_references", "permission_denied"}, {"attempt_owners", nil}, {"storage_scan", nil}} {
+			if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_complete_check_source($1,$2,$3)`, failedSourceReportID, source.name, source.errorCode); err != nil {
+				t.Fatalf("record failed check source %s: %v", source.name, err)
+			}
+		}
+		if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_seal_check_report($1,0,$2)`, failedSourceReportID, observedAt); err == nil {
+			t.Fatal("check role sealed a report with a failed database source")
+		}
+		earlyEndReportID := newUUIDv4(t)
+		if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_begin_check_report($1,'all',1::smallint,$2,$3,$4,$5)`, earlyEndReportID, snapshotStarted, cutoff, snapshotEnded, scanStarted); err != nil {
+			t.Fatal(err)
+		}
+		for _, source := range []string{"database_references", "attempt_owners", "storage_scan"} {
+			if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_complete_check_source($1,$2,NULL)`, earlyEndReportID, source); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := execAsReconciliationRole("nmcp_check_runtime", `SELECT nmcp_seal_check_report($1,0,$2)`, earlyEndReportID, scanStarted.Add(-time.Second)); err == nil {
+			t.Fatal("check role sealed a report whose scan ended before it started")
+		}
+
+		transformMediaID := newUUIDv4(t)
+		insertMedia(t, pool, transformMediaID)
+		transformOriginalID := insertOriginal(t, pool, transformMediaID, "e", newUUIDv4(t))
+		var transformProfileID string
+		if err := pool.QueryRow(ctx, `SELECT id::text FROM profiles WHERE status='active' ORDER BY key LIMIT 1`).Scan(&transformProfileID); err != nil {
+			t.Fatalf("read active transform profile: %v", err)
+		}
+		transformTargetID := insertPendingTransform(t, pool, transformMediaID, transformOriginalID, transformProfileID)
+		var transformJobID, firstTransformLease string
+		if err := pool.QueryRow(ctx, `SELECT j.id::text,j.lease_token::text FROM jobs AS j JOIN job_targets AS t ON t.job_id=j.id WHERE t.id=$1`, transformTargetID).Scan(&transformJobID, &firstTransformLease); err != nil {
+			t.Fatalf("read claimed transform: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=lease_expires_at+interval '1 minute' WHERE id=$1 AND lease_token=$2`, transformJobID, firstTransformLease); err != nil {
+			t.Fatalf("heartbeat transform attempt: %v", err)
+		}
+		workerTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = workerTx.Exec(ctx, `SET LOCAL ROLE `+pgx.Identifier{"nmcp_worker_runtime"}.Sanitize()); err == nil {
+			_, err = workerTx.Exec(ctx, `UPDATE jobs SET lease_token=$2 WHERE id=$1 AND lease_token=$3`, transformJobID, newUUIDv4(t), firstTransformLease)
+		}
+		_ = workerTx.Rollback(ctx)
+		if err == nil {
+			t.Fatal("worker role replaced a running transform lease token without attempt history")
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='queued',lease_token=NULL,lease_expires_at=NULL,error_code='lease_expired',error_message='job lease expired',available_at=clock_timestamp() WHERE id=$1 AND lease_token=$2`, transformJobID, firstTransformLease); err != nil {
+			t.Fatalf("reclaim transform attempt: %v", err)
+		}
+		secondTransformLease := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=2,lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute',error_code=NULL,error_message=NULL WHERE id=$1`, transformJobID, secondTransformLease); err != nil {
+			t.Fatalf("retry transform with new lease: %v", err)
+		}
+		var firstHistory, secondHistory []string
+		if err := pool.QueryRow(ctx, `SELECT array_agg(event_type ORDER BY sequence) FROM storage_attempt_events WHERE attempt_id=$1`, firstTransformLease).Scan(&firstHistory); err != nil {
+			t.Fatalf("read first transform attempt history: %v", err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT array_agg(event_type ORDER BY sequence) FROM storage_attempt_events WHERE attempt_id=$1`, secondTransformLease).Scan(&secondHistory); err != nil {
+			t.Fatalf("read retry transform attempt history: %v", err)
+		}
+		if fmt.Sprint(firstHistory) != "[claimed heartbeat reclaimed]" || fmt.Sprint(secondHistory) != "[claimed]" {
+			t.Fatalf("transform attempt histories first=%v second=%v", firstHistory, secondHistory)
+		}
+
+		if err := execAsReconciliationRole("nmcp_repair_runtime", `SELECT 1 FROM reconciliation_repair_runs`); err == nil {
+			t.Fatal("repair role read reconciliation evidence directly")
+		}
+		repairRunID := newUUIDv4(t)
+		if err := execAsReconciliationRole("nmcp_repair_runtime", `SELECT nmcp_begin_repair_run($1,$2,$3,'integration-test')`, repairRunID, reportID, newUUIDv4(t)); err != nil {
+			t.Fatalf("repair role begins run: %v", err)
+		}
+		manifestRace := make(chan error, 2)
+		for index := 0; index < 2; index++ {
+			go func() {
+				manifestRace <- execAsReconciliationRole("nmcp_repair_runtime", `SELECT nmcp_prepare_repair_manifest_item($1,$2,$3,$4)`, newUUIDv4(t), repairRunID, findingID, newUUIDv4(t))
+			}()
+		}
+		assertOneConcurrentWinner(t, manifestRace)
+		var repairItemID string
+		if err := pool.QueryRow(ctx, `SELECT id::text FROM reconciliation_repair_manifest_items WHERE run_id=$1`, repairRunID).Scan(&repairItemID); err != nil {
+			t.Fatalf("read winning repair manifest: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='restore',owner='integration-test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+			t.Fatalf("enter repair maintenance: %v", err)
+		}
+		repairAttemptID := newUUIDv4(t)
+		if err := execAsReconciliationRole("nmcp_repair_runtime", `SELECT nmcp_begin_repair_attempt($1,$2,$3)`, repairAttemptID, repairItemID, newUUIDv4(t)); err != nil {
+			t.Fatalf("repair role begins contiguous attempt: %v", err)
+		}
+		eventRace := make(chan error, 2)
+		for index := 0; index < 2; index++ {
+			go func() {
+				tx, txErr := pool.Begin(ctx)
+				if txErr == nil {
+					_, txErr = tx.Exec(ctx, `SET LOCAL ROLE `+pgx.Identifier{"nmcp_repair_runtime"}.Sanitize())
+				}
+				if txErr == nil {
+					_, txErr = tx.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,'applying','applying',NULL,NULL,NULL)`, newUUIDv4(t), repairAttemptID)
+				}
+				if txErr == nil {
+					_, txErr = tx.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,'failed','failed','internal',NULL,NULL)`, newUUIDv4(t), repairAttemptID)
+				}
+				if txErr == nil {
+					txErr = tx.Commit(ctx)
+				} else if tx != nil {
+					_ = tx.Rollback(ctx)
+				}
+				eventRace <- txErr
+			}()
+		}
+		assertOneConcurrentWinner(t, eventRace)
+		repairAttemptID = newUUIDv4(t)
+		repairTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer repairTx.Rollback(context.Background())
+		if _, err = repairTx.Exec(ctx, `SET LOCAL ROLE `+pgx.Identifier{"nmcp_repair_runtime"}.Sanitize()); err == nil {
+			_, err = repairTx.Exec(ctx, `SELECT nmcp_begin_repair_attempt($1,$2,$3)`, repairAttemptID, repairItemID, newUUIDv4(t))
+		}
+		for _, event := range []struct{ eventType, outcome string }{
+			{"applying", "applying"}, {"revalidated", "matched"}, {"rename", "renamed"},
+			{"source_directory_fsync", "durable"}, {"destination_directory_fsync", "durable"}, {"completed", "quarantined"},
+		} {
+			if err == nil {
+				_, err = repairTx.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,$3,$4,NULL,$5,$6)`,
+					newUUIDv4(t), repairAttemptID, event.eventType, event.outcome, int64(1), strings.Repeat("a", 64))
+			}
+		}
+		if err != nil {
+			t.Fatalf("repair role execute-only journal: %v", err)
+		}
+		if err := repairTx.Commit(ctx); err != nil {
+			t.Fatalf("commit repair journal: %v", err)
+		}
+		resultRace := make(chan error, 2)
+		for index := 0; index < 2; index++ {
+			go func() {
+				resultRace <- execAsReconciliationRole("nmcp_repair_runtime", `SELECT nmcp_finish_repair_run($1)`, repairRunID)
+			}()
+		}
+		assertOneConcurrentWinner(t, resultRace)
+		var repairResult string
+		if err := pool.QueryRow(ctx, `SELECT result FROM reconciliation_repair_results WHERE run_id=$1`, repairRunID).Scan(&repairResult); err != nil || repairResult != "succeeded" {
+			t.Fatalf("derived repair result=%q error=%v", repairResult, err)
+		}
 	})
 
 	t.Run("required indexes are present and usable", func(t *testing.T) {
