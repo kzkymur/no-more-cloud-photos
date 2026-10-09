@@ -599,7 +599,7 @@ func TestCleanupFailureIntegrationServiceCancellationBoundary(t *testing.T) {
 			calls.Add(1)
 			return false, nil
 		})
-		if id != "" || !IsKind(err, KindDatabaseUnavailable) || calls.Load() != 0 {
+		if id != fixture.renditionID || !IsKind(err, KindDatabaseUnavailable) || calls.Load() != 0 {
 			t.Fatalf("CleanupNextRendition() = %q, %#v; callback calls=%d", id, err, calls.Load())
 		}
 		assertCleanupFailureState(t, pool, fixture.renditionID, true, "")
