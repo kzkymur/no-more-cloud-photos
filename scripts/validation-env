@@ -333,19 +333,50 @@ for mount in configured:
     assert mount.get("Type") == "volume", mount
     assert target in expected_volumes and mount.get("ReadOnly") is True, mount
     assert (mount.get("VolumeOptions") or {}).get("Subpath") == expected_volumes[target], mount
-expected_tmpfs = {"/var/cache/nginx", "/var/run", "/tmp"}
-assert set((container["HostConfig"].get("Tmpfs") or {}).keys()) == expected_tmpfs
-allowed_actual = set(expected_volumes) | expected_tmpfs
+def size_bytes(value):
+    suffixes = {"k": 1024, "m": 1024**2, "g": 1024**3}
+    value = value.lower()
+    if value[-1:] in suffixes:
+        return int(value[:-1]) * suffixes[value[-1]]
+    return int(value)
+def normalized_tmpfs(value):
+    parsed = {}
+    for item in value.split(","):
+        key, raw = item.split("=", 1)
+        assert key not in parsed, value
+        if key == "size":
+            parsed[key] = size_bytes(raw)
+        elif key == "mode":
+            # Compose accepts an octal spelling while Engine may report the
+            # equivalent numeric mode in decimal through HostConfig.
+            parsed[key] = int(raw, 8) if raw.startswith("0") else int(raw)
+        elif key in {"uid", "gid"}:
+            parsed[key] = int(raw)
+        else:
+            raise AssertionError(("unexpected tmpfs option", item))
+    return parsed
+expected_tmpfs = {
+    "/var/cache/nginx": {"size": 16 * 1024**2, "mode": 0o700},
+    "/var/run": {"size": 1024**2, "mode": 0o700},
+    "/tmp": {"size": 4 * 1024**2, "uid": 10001, "gid": 10001, "mode": 0o700},
+}
+configured_tmpfs = container["HostConfig"].get("Tmpfs") or {}
+assert set(configured_tmpfs) == set(expected_tmpfs), configured_tmpfs
+for destination, options in configured_tmpfs.items():
+    assert normalized_tmpfs(options) == expected_tmpfs[destination], (destination, options)
+expected_actual = {
+    ("/srv/nmcp/originals", "volume", False),
+    ("/srv/nmcp/renditions", "volume", False),
+    ("/var/cache/nginx", "tmpfs", True),
+    ("/var/run", "tmpfs", True),
+    ("/tmp", "tmpfs", True),
+}
 actual = container.get("Mounts") or []
 for mount in actual:
     destination = mount.get("Destination")
-    assert destination in allowed_actual, mount
-    if destination in expected_volumes:
-        assert mount.get("Type") == "volume" and mount.get("RW") is False, mount
-    else:
-        assert mount.get("Type") == "tmpfs" and mount.get("RW") is True, mount
     assert ".quarantine" not in destination and destination != "/var/lib/nmcp/media", mount
-assert {m.get("Destination") for m in actual if m.get("Type") == "volume"} == set(expected_volumes)
+actual_set = {(m.get("Destination"), m.get("Type"), m.get("RW")) for m in actual}
+assert len(actual) == len(expected_actual) and actual_set == expected_actual, actual
 '
 
   api_id=$(compose ps --quiet api)

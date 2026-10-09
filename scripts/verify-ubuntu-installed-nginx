@@ -9,21 +9,37 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd -- "$script_dir/.." && pwd -P)
 work=$(/usr/bin/mktemp -d /var/tmp/nmcp-installed-nginx.XXXXXX)
 for path in /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp /run/nmcp-deploy \
-  /usr/local/libexec/nmcp; do
+  /usr/local/libexec/nmcp /usr/share/doc/nmcp /etc/tmpfiles.d/nmcp.conf \
+  /etc/sysusers.d/nmcp.conf /etc/systemd/system/nmcp.slice \
+  /etc/systemd/system/nmcp-migrate.service /etc/systemd/system/nmcp-api.service \
+  /etc/systemd/system/nmcp-worker.service /etc/systemd/system/nmcp-files.service \
+  /etc/systemd/system/nmcp.target \
+  /etc/systemd/system/nmcp-tls-expiry.service /etc/systemd/system/nmcp-tls-expiry.timer \
+  /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf \
+  /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf; do
   [[ ! -e $path ]] || { printf 'refusing to replace existing test-host path: %s\n' "$path" >&2; exit 1; }
 done
 cleanup() {
+  /usr/bin/systemctl disable --now nmcp-tls-expiry.timer >/dev/null 2>&1 || true
   /usr/bin/systemctl stop nmcp-files.service nmcp-api.service >/dev/null 2>&1 || true
   /usr/bin/umount /var/lib/nmcp/media/.quarantine >/dev/null 2>&1 || true
   /usr/bin/rm -f /run/systemd/system/nmcp-files.service /run/systemd/system/nmcp-api.service \
     /run/systemd/system/postgresql@nmcp-test.service /run/systemd/system/nmcp.slice
   /usr/bin/rm -rf /run/systemd/system/nmcp-files.service.d
+  /usr/bin/rm -f /etc/systemd/system/nmcp.slice /etc/systemd/system/nmcp-migrate.service \
+    /etc/systemd/system/nmcp-api.service /etc/systemd/system/nmcp-worker.service \
+    /etc/systemd/system/nmcp-files.service /etc/systemd/system/nmcp.target \
+    /etc/systemd/system/nmcp-tls-expiry.service \
+    /etc/systemd/system/nmcp-tls-expiry.timer \
+    /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf \
+    /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf \
+    /etc/tmpfiles.d/nmcp.conf /etc/sysusers.d/nmcp.conf
   /usr/bin/rm -rf "/run/nmcp-test-restart.$$"
   /usr/bin/rm -f "/usr/local/share/ca-certificates/nmcp-test-$$.crt"
   /usr/sbin/update-ca-certificates >/dev/null 2>&1 || true
   /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || true
   /usr/bin/rm -rf -- /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp /run/nmcp-deploy \
-    /usr/local/libexec/nmcp "/root/nmcp-host-reinstall.$$" "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" \
+    /usr/local/libexec/nmcp /usr/share/doc/nmcp "/root/nmcp-host-reinstall.$$" "/root/nmcp-tls-renew.$$" "/root/nmcp-tls-renew-failure.$$" \
     "/root/nmcp-tls-renew-persistent.$$" "/root/nmcp-tls-renew-inactive.$$" "$work"
 }
 trap cleanup EXIT
@@ -222,9 +238,16 @@ fi
 /usr/bin/rm /var/lib/nmcp/media/quarantine/private-sentinel
 /usr/bin/rmdir /var/lib/nmcp/media/quarantine
 
-# A distinct filesystem mounted at the canonical path fails before installer
-# mutation; quarantine rename atomicity cannot be claimed across devices.
-/usr/bin/mount -t tmpfs -o size=1m,mode=0700 tmpfs /var/lib/nmcp/media/.quarantine
+# A distinct, otherwise-valid filesystem mounted at the canonical path fails
+# before installer mutation; quarantine rename atomicity cannot be claimed
+# across devices.
+nmcp_uid=$(/usr/bin/id -u nmcp)
+nmcp_gid=$(/usr/bin/id -g nmcp)
+media_device=$(/usr/bin/stat -c '%d' /var/lib/nmcp/media)
+/usr/bin/mount -t tmpfs -o "size=1m,mode=0700,uid=$nmcp_uid,gid=$nmcp_gid" \
+  tmpfs /var/lib/nmcp/media/.quarantine
+[[ $(/usr/bin/stat -c '%u:%g:%a' /var/lib/nmcp/media/.quarantine) == "$nmcp_uid:$nmcp_gid:700" ]]
+[[ $(/usr/bin/stat -c '%d' /var/lib/nmcp/media/.quarantine) != "$media_device" ]]
 if "$repo_root/scripts/install-ubuntu-host" --config-dir "$guard_input" \
   --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
   --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@nmcp-test.service \
@@ -236,6 +259,35 @@ fi
 [[ $(/usr/bin/readlink -f /etc/nmcp/tls-current) == "$guard_link" ]]
 [[ $(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf) == "$guard_config" ]]
 /usr/bin/umount /var/lib/nmcp/media/.quarantine
+
+# Exercise the production installer success path and verify that its resulting
+# canonical quarantine satisfies the complete type/ownership/mode/device contract.
+"$repo_root/scripts/install-ubuntu-host" --config-dir "$guard_input" \
+  --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
+  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@nmcp-test.service \
+  --tls-cert /etc/nmcp/tls-releases/test/cert.pem \
+  --tls-key /etc/nmcp/tls-releases/test/key.pem >/dev/null
+[[ -d /var/lib/nmcp/media/.quarantine && ! -L /var/lib/nmcp/media/.quarantine ]]
+[[ $(/usr/bin/stat -c '%u:%g:%a' /var/lib/nmcp/media/.quarantine) == "$nmcp_uid:$nmcp_gid:700" ]]
+[[ $(/usr/bin/stat -c '%d' /var/lib/nmcp/media/.quarantine) == "$media_device" ]]
+guard_link=$(/usr/bin/readlink -f /etc/nmcp/tls-current)
+guard_config=$(/usr/bin/sha256sum /etc/nmcp-nginx/nginx.conf)
+
+# Hold owner, group, and device valid while making only the mode unsafe, so the
+# unsafe-mode rejection branch cannot pass vacuously because of another check.
+/usr/bin/chmod 0750 /var/lib/nmcp/media/.quarantine
+[[ $(/usr/bin/stat -c '%u:%g:%a' /var/lib/nmcp/media/.quarantine) == "$nmcp_uid:$nmcp_gid:750" ]]
+[[ $(/usr/bin/stat -c '%d' /var/lib/nmcp/media/.quarantine) == "$media_device" ]]
+if "$repo_root/scripts/install-ubuntu-host" --config-dir "$guard_input" \
+  --api-listen 100.64.0.10:18443 --files-listen 100.64.0.10:19443 \
+  --tailnet-hostname host.example.ts.net --postgresql-unit postgresql@nmcp-test.service \
+  --tls-cert /etc/nmcp/tls-releases/test/cert.pem \
+  --tls-key /etc/nmcp/tls-releases/test/key.pem >/dev/null 2>"$guard_error"; then
+  printf 'unsafe canonical quarantine mode was accepted\n' >&2; exit 1
+fi
+/usr/bin/grep -q 'existing canonical quarantine ownership, mode, or device is unsafe' "$guard_error"
+[[ $(/usr/bin/stat -c '%u:%g:%a' /var/lib/nmcp/media/.quarantine) == "$nmcp_uid:$nmcp_gid:750" ]]
+/usr/bin/chmod 0700 /var/lib/nmcp/media/.quarantine
 
 cat > /run/systemd/system/nmcp-files.service <<'EOF'
 [Service]
