@@ -125,8 +125,17 @@ Type=oneshot
 RemainAfterExit=yes
 User=root
 EnvironmentFile=/etc/nmcp/admin.env
-ExecStart=/usr/bin/true
+ExecStart=/usr/local/libexec/nmcp/test-run-ubuntu-migration
 EOF
+cat > /usr/local/libexec/nmcp/test-run-ubuntu-migration <<EOF
+#!/bin/sh
+if test -e '$work/seed-stale-readiness'; then
+  /usr/bin/rm -f '$work/seed-stale-readiness'
+  exit 0
+fi
+exec /usr/local/libexec/nmcp/run-ubuntu-migration
+EOF
+/usr/bin/chmod 0755 /usr/local/libexec/nmcp/test-run-ubuntu-migration
 /usr/bin/install -o root -g root -m 0644 "$repo/infra/ubuntu/systemd/nmcp.slice" /run/systemd/system/nmcp.slice
 for unit in nmcp-api.service nmcp-worker.service; do
   /usr/bin/install -o root -g root -m 0644 "$repo/infra/ubuntu/systemd/$unit" "/run/systemd/system/$unit"
@@ -156,21 +165,8 @@ EOF
 # explicit API/Worker start during the pause must not make either service active
 # from stale readiness; cancel that queued dependency job before releasing the
 # deliberately failed activation.
+/usr/bin/touch "$work/seed-stale-readiness"
 /usr/bin/systemctl start nmcp-migrate.service
-[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == active ]]
-[[ $(/usr/bin/systemctl show nmcp-migrate.service --property=SubState --value) == exited ]]
-# Load the production migration command without clearing the retained active /
-# exited state. The activation under test must invalidate that stale success
-# before it can enter the exact candidate compatibility wrapper.
-cat > /run/systemd/system/nmcp-migrate.service <<EOF
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-User=root
-EnvironmentFile=/etc/nmcp/admin.env
-ExecStart=/usr/local/libexec/nmcp/run-ubuntu-migration
-EOF
-/usr/bin/systemctl daemon-reload
 [[ $(/usr/bin/systemctl show nmcp-migrate.service --property=ActiveState --value) == active ]]
 [[ $(/usr/bin/systemctl show nmcp-migrate.service --property=SubState --value) == exited ]]
 "$repo/scripts/install-ubuntu-release" activate stalefail >"$work/stalefail.out" 2>&1 &
