@@ -11,9 +11,15 @@ token1=$(printf '%s' "$work-one-$$-$RANDOM" | sha256sum | cut -d' ' -f1)
 token2=$(printf '%s' "$work-two-$$-$RANDOM" | sha256sum | cut -d' ' -f1)
 path1='' path2='' existing='' release1='' release2=''
 cleanup() {
-  [[ -n $path1 ]] && sudo "$helper" cleanup "$path1" "$token1" || true
-  [[ -n $path2 ]] && sudo "$helper" cleanup "$path2" "$token2" || true
-  [[ -n $existing ]] && sudo rm -rf --one-file-system -- "/opt/nmcp/releases/$existing"
+  if [[ -n $path1 ]]; then
+    sudo "$helper" cleanup "$path1" "$token1" || true
+  fi
+  if [[ -n $path2 ]]; then
+    sudo "$helper" cleanup "$path2" "$token2" || true
+  fi
+  if [[ -n $existing ]]; then
+    sudo rm -rf --one-file-system -- "/opt/nmcp/releases/$existing"
+  fi
   rm -rf -- "$work"
 }
 trap cleanup EXIT INT TERM
