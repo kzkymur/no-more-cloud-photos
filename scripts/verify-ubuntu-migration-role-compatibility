@@ -13,6 +13,7 @@ for path in /usr/local/libexec/nmcp /var/lib/nmcp /opt/nmcp-role-compatibility; 
 done
 
 cleanup() {
+  /usr/bin/rm -f /run/nmcp-test-before-role-graph-verify.{ready,go}
   /usr/bin/pkill -TERM -f '/opt/nmcp-role-compatibility/.*/nmcp-admin' >/dev/null 2>&1 || true
   /usr/sbin/runuser -u postgres -- /usr/bin/dropdb --if-exists nmcp >/dev/null 2>&1 || true
   /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=postgres \
@@ -95,6 +96,14 @@ assert_hardened
 run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
 assert_hardened
 
+# Caller-controlled libpq routing/session variables cannot redirect or alter
+# the root helper's reviewed local peer-authenticated connection.
+/usr/bin/env PGHOST=/nonexistent PGPORT=1 PGUSER=rogue PGDATABASE=rogue \
+  PGSERVICE=rogue PGSERVICEFILE=/nonexistent PGPASSFILE=/nonexistent \
+  PGPASSWORD=rogue PGOPTIONS='-c search_path=pg_temp' \
+  /usr/local/libexec/nmcp/set-ubuntu-migration-role-mode hardened
+assert_hardened
+
 # A stale compatibility state from an interrupted attempt is an accepted input,
 # but no other graph drift is; the next wrapper run hardens it again.
 /usr/local/libexec/nmcp/set-ubuntu-migration-role-mode compatibility
@@ -117,26 +126,35 @@ set -e
 [[ $status -eq 42 ]]
 assert_hardened
 
-# A normal termination signal is trapped and hardening still completes.
-/usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/term"
-cat > "$work/term/nmcp-admin" <<EOF
+# INT and TERM are delivered only to the wrapper. The migration child ignores
+# both, proving each dedicated handler terminates the child and hardens rather
+# than passing because the entire process group received the signal.
+test_signal() {
+  local name=$1 signal=$2 expected=$3 wrapper_pid status
+  /usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/$name"
+  cat > "$work/$name/nmcp-admin" <<EOF
 #!/bin/sh
-touch '$work/term/ready'
-sleep 300
+trap '' INT TERM
+touch '$work/$name/ready'
+exec sleep 300
 EOF
-/usr/bin/chown -R nmcp:nmcp "$work/term"
-/usr/bin/chmod 0700 "$work/term/nmcp-admin"
-/usr/bin/setsid /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
-  "$work/term/nmcp-admin" migrate up --json &
-wrapper_pid=$!
-wait_for_path "$work/term/ready"
-/usr/bin/kill -TERM -- "-$wrapper_pid"
-set +e
-wait "$wrapper_pid"
-status=$?
-set -e
-[[ $status -eq 143 ]]
-assert_hardened
+  /usr/bin/chown -R nmcp:nmcp "$work/$name"
+  /usr/bin/chmod 0700 "$work/$name/nmcp-admin"
+  NMCP_TEST_SIGNAL_GRACE_ATTEMPTS=5 \
+    /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
+    "$work/$name/nmcp-admin" migrate up --json &
+  wrapper_pid=$!
+  wait_for_path "$work/$name/ready"
+  /usr/bin/kill -s "$signal" "$wrapper_pid"
+  set +e
+  wait "$wrapper_pid"
+  status=$?
+  set -e
+  [[ $status -eq $expected ]]
+  assert_hardened
+}
+test_signal int INT 130
+test_signal term TERM 143
 
 # SIGKILL is the one untrappable interruption. It may leave compatibility TRUE,
 # but a restart accepts that exact state and must harden before success.
@@ -158,7 +176,9 @@ assert_compatibility
 run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
 assert_hardened
 
-# A post-migrate integrity failure returns nonzero and never reports readiness.
+# A real post-migrate verifier failure returns nonzero. Pause after checksum
+# validation and hardened bootstrap, mutate the live graph, then let the
+# independent verifier reject it. This is not a checksum-preflight failure.
 /usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/harden"
 cat > "$work/harden/nmcp-admin" <<EOF
 #!/bin/sh
@@ -168,21 +188,27 @@ exit 0
 EOF
 /usr/bin/chown -R nmcp:nmcp "$work/harden"
 /usr/bin/chmod 0700 "$work/harden/nmcp-admin"
-run_wrapper "$work/harden/nmcp-admin" migrate up --json &
+NMCP_TEST_PAUSE_BEFORE_GRAPH_VERIFY=1 \
+  /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
+  "$work/harden/nmcp-admin" migrate up --json &
 wrapper_pid=$!
 wait_for_path "$work/harden/ready"
-/usr/bin/printf '\n-- integrity failure\n' >> /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
 /usr/bin/touch "$work/harden/go"
+wait_for_path /run/nmcp-test-before-role-graph-verify.ready
+/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+  --set=ON_ERROR_STOP=1 --command "ALTER ROLE nmcp_check_runtime LOGIN"
+/usr/bin/touch /run/nmcp-test-before-role-graph-verify.go
 set +e
 wait "$wrapper_pid"
 status=$?
 set -e
 [[ $status -ne 0 ]]
-assert_compatibility
-/usr/bin/install -o root -g root -m 0644 \
-  "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \
-  /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
-write_checksums
+[[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+  --tuples-only --no-align --command \
+  "SELECT count(*) FROM pg_auth_members WHERE member='nmcp_migrator'::regrole AND roleid IN ('nmcp_purge_function_owner'::regrole,'nmcp_check_function_owner'::regrole,'nmcp_repair_function_owner'::regrole) AND NOT inherit_option") == 3 ]]
+/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+  --set=ON_ERROR_STOP=1 --command "ALTER ROLE nmcp_check_runtime NOLOGIN"
+/usr/bin/rm -f /run/nmcp-test-before-role-graph-verify.{ready,go}
 /usr/local/libexec/nmcp/set-ubuntu-migration-role-mode hardened
 assert_hardened
 

@@ -136,7 +136,9 @@ uses a two-phase role transition while API and Worker are stopped. Its root-only
 pinned bootstrap first verifies the complete safe graph and role attributes,
 then transactionally changes only the three function-owner-to-`nmcp_migrator`
 edges from `INHERIT FALSE` to `INHERIT TRUE`; their `ADMIN FALSE` and `SET TRUE`
-options and every other edge remain exact. An EXIT/INT/TERM handler always runs
+options and every other edge remain exact. The three inheritance bits are one
+state: only all-FALSE hardened or all-TRUE interrupted compatibility is valid;
+every mixed combination fails without normalization. An EXIT/INT/TERM handler always runs
 the default bootstrap and an independent graph verifier to restore `INHERIT
 FALSE`, whether migration succeeds or fails. Temporary inheritance benefits
 only the isolated migration login: the exact bilateral graph forbids API,
@@ -144,7 +146,10 @@ Worker, or a rogue role from reaching the migrator or function owners.
 
 The wrapper runs the checksum-verified SQL installed under
 `/usr/local/libexec/nmcp/postgresql` through local `postgres` peer
-authentication; it does not use or pass the admin DSN to an application
+authentication on the reviewed `/var/run/postgresql` socket, port 5432, and
+database/user identity. It starts libpq from an empty environment and pins those
+values on the command line, so caller `PGHOST`, service, password, and session
+variables cannot redirect or alter the privileged bootstrap. It does not use or pass the admin DSN to an application
 process. Release activation first invalidates any prior `nmcp-migrate.service`
 success. API and Worker require a fresh successful migration unit, so a failed
 hardening/verifier, normal signal, or interrupted compatibility phase prevents
