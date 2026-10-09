@@ -333,7 +333,10 @@ BEGIN
     PERFORM 1 FROM storage_attempts WHERE id=upload_attempt_id AND kind='upload' FOR UPDATE;
     IF NOT FOUND THEN RAISE EXCEPTION 'upload attempt is absent' USING ERRCODE='23514'; END IF;
     SELECT * INTO previous FROM storage_attempt_events WHERE attempt_id=upload_attempt_id ORDER BY sequence DESC LIMIT 1;
-    IF previous.event_type='published' THEN RETURN; END IF;
+    -- A heartbeat racing a committed publication is harmless. Return the
+    -- candidate expiry so callers that scan the declared timestamptz result do
+    -- not turn that terminal race into an application error.
+    IF previous.event_type='published' THEN RETURN expiry; END IF;
     IF previous.event_type NOT IN ('registered','heartbeat') OR previous.lease_expires_at<=clock_timestamp() THEN
         RAISE EXCEPTION 'upload attempt lease is not live' USING ERRCODE='55000';
     END IF;
