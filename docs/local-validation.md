@@ -106,3 +106,6 @@ state make a universal wall-clock promise misleading.
 Measured cold native-source-cache evidence for this split is CI run
 `37924475841`: the cache key was absent, the `native-race` job took 25m34s,
 its preparation/evidence step took 24m40s, and the complete gate took 25m42s.
+The unchanged-key warm run `37927394504` restored the verified 111 MB source
+cache; `native-race` took 20m36s, its preparation/evidence step took 17m46s,
+and the complete gate took 20m44s. Binaries were rebuilt in both runs.
