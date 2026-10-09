@@ -102,3 +102,7 @@ entrypoint. Main-branch pushes always run the privileged workflow. Compare the
 first run after a cache-key change (cold) with the next unchanged run (warm) and
 record both job durations in the pull request; local hardware and Docker cache
 state make a universal wall-clock promise misleading.
+
+Measured cold native-source-cache evidence for this split is CI run
+`37924475841`: the cache key was absent, the `native-race` job took 25m34s,
+its preparation/evidence step took 24m40s, and the complete gate took 25m42s.
