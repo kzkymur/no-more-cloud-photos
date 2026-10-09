@@ -20,6 +20,8 @@ for path in /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp /run/nmcp-deploy \
   [[ ! -e $path ]] || { printf 'refusing to replace existing test-host path: %s\n' "$path" >&2; exit 1; }
 done
 cleanup() {
+  /usr/sbin/ufw --force disable >/dev/null 2>&1 || true
+  /usr/sbin/ufw --force reset >/dev/null 2>&1 || true
   /usr/bin/systemctl disable --now nmcp-tls-expiry.timer >/dev/null 2>&1 || true
   /usr/bin/systemctl stop nmcp-files.service nmcp-api.service >/dev/null 2>&1 || true
   /usr/bin/umount /var/lib/nmcp/media/.quarantine >/dev/null 2>&1 || true
@@ -43,6 +45,15 @@ cleanup() {
     "/root/nmcp-tls-renew-persistent.$$" "/root/nmcp-tls-renew-inactive.$$" "$work"
 }
 trap cleanup EXIT
+
+# Exercise the successful installer path against the real host firewall. The
+# disposable runner starts with UFW inactive, while production installation is
+# intentionally fail-closed unless these exact Tailnet-only rules are active.
+/usr/sbin/ufw --force reset >/dev/null
+/usr/sbin/ufw default deny incoming >/dev/null
+/usr/sbin/ufw allow in on tailscale0 to "$test_ip" port "$api_port" proto tcp >/dev/null
+/usr/sbin/ufw allow in on tailscale0 to "$test_ip" port "$files_port" proto tcp >/dev/null
+/usr/sbin/ufw --force enable >/dev/null
 
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf" "$work/nmcp-sysusers.conf"
 /usr/bin/systemd-sysusers "$work/nmcp-sysusers.conf"

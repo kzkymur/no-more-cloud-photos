@@ -432,9 +432,16 @@ for destination, (filesystem, writable) in actual.items():
   api_id=$(compose ps --all --quiet api)
   worker_id=$(compose ps --all --quiet worker)
   compose stop api worker
-  for id in "$api_id" "$worker_id"; do
+  for service_id in "api:$api_id" "worker:$worker_id"; do
+    service=${service_id%%:*}
+    id=${service_id#*:}
     [ "$(docker inspect --format '{{.State.Running}}' "$id")" = false ]
-    [ "$(docker inspect --format '{{.State.ExitCode}}' "$id")" = 0 ] || { echo "error: process did not shut down cleanly: $id" >&2; exit 1; }
+    exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$id")
+    if [ "$exit_code" != 0 ]; then
+      compose logs --no-color "$service" >&2 || true
+      echo "error: $service process did not shut down cleanly (exit $exit_code): $id" >&2
+      exit 1
+    fi
   done
   compose start api worker
   compose up --detach --wait api worker
