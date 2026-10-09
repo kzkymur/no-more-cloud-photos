@@ -3,26 +3,38 @@ set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo"
-[[ $EUID -eq 0 ]] || { printf 'run-ubuntu-validation must run as root\n' >&2; exit 1; }
+[[ $EUID -ne 0 ]] || { printf 'run-ubuntu-validation must start as the unprivileged checkout owner\n' >&2; exit 1; }
+sudo -n true || { printf 'passwordless command-scoped sudo is required\n' >&2; exit 1; }
+[[ $(sudo id -u) == 0 && $(id -u) != 0 ]] || { printf 'privilege identity split is unavailable\n' >&2; exit 1; }
 
+mkdir -p .validation
+work=$(mktemp -d "$repo/.validation/ubuntu-run.XXXXXXXX")
+chmod 0700 "$work"
+token=$(printf '%s' "$work-$$-$RANDOM-$(date +%s%N)" | sha256sum | cut -d' ' -f1)
+resource_helper=$repo/scripts/ubuntu-validation-resources
+root_run=$(sudo "$resource_helper" create "$token")
+[[ $root_run =~ ^/var/tmp/nmcp-validation\.[A-Za-z0-9]{8}$ ]] || exit 1
+tailnet_added=0
 cleanup() {
-  if [[ -n ${release_id:-} ]]; then
-    rm -rf -- "/opt/nmcp/releases/$release_id" \
-      "/opt/nmcp/releases/$release_id-bad-mode" \
-      "/opt/nmcp/releases/$release_id-locked" \
-      "/opt/nmcp/releases/$release_id-orphan-migration" \
-      "/opt/nmcp/releases/$release_id-spoofed"
+  exit_status=$?
+  trap - EXIT INT TERM
+  if [[ $tailnet_added == 1 ]] && ! sudo ip address delete 100.64.0.10/32 dev lo >/dev/null 2>&1; then
+    printf 'owned Tailnet fixture address cleanup failed\n' >&2
+    exit_status=1
   fi
-  rm -rf -- /tmp/nmcp-release /tmp/nmcp-v16-source
-  rm -f -- /tmp/nmcp-admin-current /tmp/nmcp-admin-v16 \
-    /tmp/nmcp-deploy-lock-held /tmp/nmcp-orphan-migration-held
-  ip address delete 100.64.0.10/32 dev lo >/dev/null 2>&1 || true
+  if ! sudo "$resource_helper" cleanup "$root_run" "$token"; then
+    printf 'owned Ubuntu validation resource cleanup failed\n' >&2
+    exit_status=1
+  fi
+  rm -rf -- "$work"
+  exit "$exit_status"
 }
 trap cleanup EXIT INT TERM
 
 shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
   scripts/install-local-validation-deps scripts/local-validation-preflight \
   scripts/run-validation scripts/run-ubuntu-validation scripts/with-local-postgres \
+  scripts/ubuntu-validation-resources scripts/verify-ubuntu-validation-resources \
   scripts/check-ubuntu-tls-expiry scripts/renew-ubuntu-tls \
   scripts/run-ubuntu-migration scripts/run-ubuntu-migration-compatibility \
   scripts/set-ubuntu-migration-role-mode scripts/verify-ubuntu-migration-lock \
@@ -34,76 +46,98 @@ shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
   scripts/verify-ubuntu-systemd-environment scripts/verify-ubuntu-systemd-mounts \
   scripts/verify-ubuntu-trusted-inputs
 
+# Static and HTTP fixture checks retain the original unprivileged identity.
 scripts/verify-ubuntu-deployment
 scripts/verify-ubuntu-config-boundaries
 scripts/verify-ubuntu-firewall-fixtures
-scripts/verify-ubuntu-trusted-inputs
-scripts/verify-ubuntu-systemd-environment
-ip address add 100.64.0.10/32 dev lo
+scripts/verify-ubuntu-validation-resources
+sudo env PATH="$PATH" scripts/verify-ubuntu-trusted-inputs
+sudo env PATH="$PATH" scripts/verify-ubuntu-systemd-environment
+sudo ip address add 100.64.0.10/32 dev lo
+tailnet_added=1
 scripts/verify-ubuntu-nginx-http
-scripts/verify-ubuntu-installed-nginx
-scripts/verify-ubuntu-systemd-mounts
-scripts/verify-ubuntu-postgresql-dependency
-scripts/verify-ubuntu-service-gate
-scripts/verify-ubuntu-migration-lock
+sudo env PATH="$PATH" scripts/verify-ubuntu-installed-nginx
+sudo env PATH="$PATH" scripts/verify-ubuntu-systemd-mounts
+sudo env PATH="$PATH" scripts/verify-ubuntu-postgresql-dependency
+sudo env PATH="$PATH" scripts/verify-ubuntu-service-gate
+sudo env PATH="$PATH" scripts/verify-ubuntu-migration-lock
 
-go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
-mkdir /tmp/nmcp-v16-source
-git archive 97938b5031e48320330b8add8da1f77d8e801d68 | tar -x -C /tmp/nmcp-v16-source
-(cd /tmp/nmcp-v16-source && go build -o /tmp/nmcp-admin-v16 ./cmd/nmcp-admin)
-scripts/verify-ubuntu-migration-role-compatibility \
-  /tmp/nmcp-admin-current /tmp/nmcp-admin-v16
-scripts/verify-ubuntu-release-failures
+go build -o "$work/nmcp-admin-current" ./cmd/nmcp-admin
+mkdir "$work/v16-source"
+git archive 97938b5031e48320330b8add8da1f77d8e801d68 | tar -x -C "$work/v16-source"
+(cd "$work/v16-source" && go build -o "$work/nmcp-admin-v16" ./cmd/nmcp-admin)
+sudo env PATH="$PATH" scripts/verify-ubuntu-migration-role-compatibility \
+  "$work/nmcp-admin-current" "$work/nmcp-admin-v16"
+sudo env PATH="$PATH" scripts/verify-ubuntu-release-failures
 
-release_id=${RELEASE_ID:-local-$(date -u +%Y%m%d%H%M%S)-$$}
-mkdir -p /tmp/nmcp-release/bin
-for binary in core-api core-worker nmcp-admin; do
-  printf '#!/bin/sh\nexit 0\n' >"/tmp/nmcp-release/bin/$binary"
-  chmod 0755 "/tmp/nmcp-release/bin/$binary"
+release_id=validation-${token:0:16}
+release_bad=$release_id-bad-mode
+release_orphan=$release_id-orphan
+release_locked=$release_id-locked
+release_spoofed=$release_id-spoofed
+for release in "$release_id" "$release_bad" "$release_orphan" "$release_locked" "$release_spoofed"; do
+  sudo "$resource_helper" register-release "$root_run" "$token" "$release"
 done
-(cd /tmp/nmcp-release && sha256sum bin/* >MANIFEST.sha256)
-chmod 0700 /tmp/nmcp-release/bin/core-api
-if scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id-bad-mode"; then
-  printf '0700 runtime binary unexpectedly staged\n' >&2
-  exit 1
+
+mkdir -p "$work/release/bin"
+for binary in core-api core-worker nmcp-admin; do
+  printf '#!/bin/sh\nexit 0\n' >"$work/release/bin/$binary"
+  chmod 0755 "$work/release/bin/$binary"
+done
+(cd "$work/release" && sha256sum bin/* >MANIFEST.sha256)
+chmod 0700 "$work/release/bin/core-api"
+if sudo env PATH="$PATH" scripts/install-ubuntu-release stage "$work/release" "$release_bad"; then
+  printf '0700 runtime binary unexpectedly staged\n' >&2; exit 1
 fi
-chmod 0755 /tmp/nmcp-release/bin/core-api
-systemd-run --quiet --unit=nmcp-orphan-migration \
+chmod 0755 "$work/release/bin/core-api"
+
+suffix=${token:0:16}
+orphan_unit=nmcp-validation-orphan-$suffix
+deploy_unit=nmcp-validation-deploy-$suffix
+sudo "$resource_helper" register-unit "$root_run" "$token" "$orphan_unit"
+sudo systemd-run --quiet --unit="$orphan_unit" \
   /usr/bin/flock /run/nmcp-deploy/migration-execution.lock \
-  /bin/sh -c 'touch /tmp/nmcp-orphan-migration-held; sleep 3'
+  /bin/sh -c 'touch "$1"; sleep 3' sh "$root_run/orphan-held"
 for attempt in {1..30}; do
-  [[ -e /tmp/nmcp-orphan-migration-held ]] && break
+  sudo test -e "$root_run/orphan-held" && break
   [[ $attempt -lt 30 ]] || exit 1
   sleep 0.1
 done
-if scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id-orphan-migration"; then
-  printf 'new deployment overlapped an ownerless migration execution\n' >&2
-  exit 1
+if sudo env PATH="$PATH" scripts/install-ubuntu-release stage "$work/release" "$release_orphan"; then
+  printf 'new deployment overlapped an ownerless migration execution\n' >&2; exit 1
 fi
 for attempt in {1..50}; do
-  state=$(systemctl show --property=ActiveState --value nmcp-orphan-migration.service)
+  state=$(sudo systemctl show --property=ActiveState --value "$orphan_unit.service")
   [[ $state == inactive ]] && break
   [[ $state =~ ^(active|activating|deactivating)$ && $attempt -lt 50 ]] || exit 1
   sleep 0.1
 done
-[[ $(systemctl show --property=Result --value nmcp-orphan-migration.service) == success ]]
-flock /run/nmcp-deploy/deploy.lock -c 'touch /tmp/nmcp-deploy-lock-held; sleep 3' &
-lock_pid=$!
+[[ $(sudo systemctl show --property=Result --value "$orphan_unit.service") == success ]]
+
+sudo "$resource_helper" register-unit "$root_run" "$token" "$deploy_unit"
+sudo systemd-run --quiet --unit="$deploy_unit" \
+  /usr/bin/flock /run/nmcp-deploy/deploy.lock \
+  /bin/sh -c 'touch "$1"; sleep 3' sh "$root_run/deploy-held"
 for attempt in {1..30}; do
-  [[ -e /tmp/nmcp-deploy-lock-held ]] && break
+  sudo test -e "$root_run/deploy-held" && break
   [[ $attempt -lt 30 ]] || exit 1
   sleep 0.1
 done
-if scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id-locked"; then
-  printf 'concurrent deployment operation unexpectedly staged\n' >&2
-  exit 1
+if sudo env PATH="$PATH" scripts/install-ubuntu-release stage "$work/release" "$release_locked"; then
+  printf 'concurrent deployment operation unexpectedly staged\n' >&2; exit 1
 fi
-if env NMCP_DEPLOY_LOCKED=1 scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id-spoofed"; then
-  printf 'caller-controlled lock sentinel bypassed serialization\n' >&2
-  exit 1
+if sudo env PATH="$PATH" NMCP_DEPLOY_LOCKED=1 \
+  scripts/install-ubuntu-release stage "$work/release" "$release_spoofed"; then
+  printf 'caller-controlled lock sentinel bypassed serialization\n' >&2; exit 1
 fi
-wait "$lock_pid"
-scripts/install-ubuntu-release stage /tmp/nmcp-release "$release_id"
-[[ $(stat -c '%U:%G' "/opt/nmcp/releases/$release_id/bin/core-api") == root:root ]]
-[[ $(stat -c '%a' "/opt/nmcp/releases/$release_id/bin/core-api") == 755 ]]
+for attempt in {1..50}; do
+  state=$(sudo systemctl show --property=ActiveState --value "$deploy_unit.service")
+  [[ $state == inactive ]] && break
+  [[ $state =~ ^(active|activating|deactivating)$ && $attempt -lt 50 ]] || exit 1
+  sleep 0.1
+done
+
+sudo env PATH="$PATH" scripts/install-ubuntu-release stage "$work/release" "$release_id"
+sudo test "$(sudo stat -c '%U:%G' "/opt/nmcp/releases/$release_id/bin/core-api")" = root:root
+sudo test "$(sudo stat -c '%a' "/opt/nmcp/releases/$release_id/bin/core-api")" = 755
 sudo -u nmcp test -x "/opt/nmcp/releases/$release_id/bin/core-api"

@@ -33,13 +33,13 @@ the Compose lane and is not silently weakened or emulated.
 
 ```sh
 scripts/run-validation quick       # modules, format, vet, binaries, unit/local tests
-scripts/run-validation race        # complete Go race run
+scripts/run-validation race        # real PostgreSQL + native helpers under Go race
 scripts/run-validation postgres    # isolated local cluster, or TEST_DATABASE_URL
-scripts/run-validation native      # evidence after native helpers/fixtures are prepared
+scripts/run-validation native      # prepare pinned helpers/fixtures and run native evidence
 scripts/run-validation infra       # Compose clean/retained lifecycle and native images
-scripts/run-validation full        # quick + race + postgres + infra
-sudo env "PATH=$PATH" scripts/run-validation ubuntu  # privileged Ubuntu evidence
-sudo env "PATH=$PATH" scripts/run-validation all     # full plus privileged evidence
+scripts/run-validation full        # quick + postgres + native race/evidence + infra
+scripts/run-validation ubuntu      # unprivileged dispatcher; audited commands elevate
+scripts/run-validation all         # full plus command-scoped privileged evidence
 scripts/run-validation cleanup     # checkout-owned state only
 ```
 
@@ -51,15 +51,30 @@ the `nmcp_test` database, stops the server on every exit path, removes its short
 socket directory, and retains the cluster for faster reruns. Set
 `TEST_DATABASE_URL` to use an already managed disposable database instead.
 
+Native preparation downloads only into `.tools/` and `.native-work/`, verifies
+cached downloads before use, rebuilds the pinned helpers, checks their reported
+capabilities, and writes `.native-work/validation.env`. Run
+`scripts/prepare-native-validation COMMAND [ARG ...]` to execute another command
+with that environment, or source the generated file after preparation.
+
 Compose uses checkout-hashed project, volume, and ownership labels. Its verify
 command guarantees cleanup, while Docker's image/build cache is retained.
 `cleanup` delegates to that ownership-checked reset and removes only
 `.validation/`; it never traverses arbitrary host paths.
 
-The Ubuntu lane is intentionally separate. It requires root, systemd as PID 1,
+The Ubuntu lane is intentionally separate. Its dispatcher must run as the
+unprivileged checkout owner and requires passwordless command-scoped `sudo`,
+systemd as PID 1,
 PostgreSQL, Nginx, and the other packages installed by the installer. Run it in
 a disposable Ubuntu VM or an equivalent dedicated runner—not in a developer
 container that merely happens to expose `sudo`.
+The dispatcher retains the checkout owner for static and Nginx HTTP fixtures and
+elevates only named privileged verifiers. Each run allocates a root-owned mode
+`0700` random directory and token-bound release/unit registry. Cleanup validates
+that registry, stops and checks only registered run-unique transient units, and
+removes only initially absent releases registered by that run. A privileged
+two-run counterexample proves that cleaning one run preserves the other's
+release and a pre-existing release.
 
 ## CI topology and timing baseline
 
@@ -69,12 +84,14 @@ unit/integration tests 3m41s, and race tests 7m25s. Compose run `37911551976`
 took 17m48s (17m38s in `scripts/validation-env verify`). Privileged Ubuntu run
 `37911923533` took 2m39s.
 
-CI now runs four independent lanes: `quick`, `race`, `postgres`, and
-`native-codecs`. `full-gate` succeeds only when all four succeed and is the
+CI runs independent `quick`, `postgres`, and `native-race` lanes. The last lane
+enables real PostgreSQL and every native helper during `go test -race ./...`,
+then retains the explicit native evidence commands. `full-gate` succeeds only
+when all three succeed and is the
 single required merge check. Superseded branch runs are cancelled. Setup Go
 caches modules and build objects; the native lane caches checksum-verified
-source archives using OS, architecture, build-script, and workflow content in
-the key. Native binaries are deliberately rebuilt: their absolute rpaths and
+source archives using OS, architecture, build-script, and preparation-command
+content in the key. Native binaries are deliberately rebuilt: their absolute rpaths and
 runner package closure make cross-run binary reuse less trustworthy than source
 download reuse. This trades several build minutes for stronger provenance.
 

@@ -29,6 +29,39 @@ def text(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def workflow_event(workflow: str, event: str) -> tuple[set[str], list[str]]:
+    """Parse the small event mapping without mistaking comments/other blocks."""
+    lines = workflow.splitlines()
+    header = f"  {event}:"
+    try:
+        start = next(i for i, line in enumerate(lines) if line == header) + 1
+    except StopIteration as error:
+        raise RuntimeError(f"Ubuntu workflow is missing {event} trigger") from error
+    block = []
+    for line in lines[start:]:
+        if line and not line.startswith(" "):
+            break
+        if re.match(r"^  [A-Za-z_].*:$", line):
+            break
+        block.append(line)
+    keys = {
+        match.group(1)
+        for line in block
+        if (match := re.match(r"^    ([A-Za-z_][A-Za-z0-9_-]*):", line))
+    }
+    paths: list[str] = []
+    in_paths = False
+    for line in block:
+        if line == "    paths:":
+            in_paths = True
+            continue
+        if in_paths and re.match(r"^    [A-Za-z_]", line):
+            in_paths = False
+        if in_paths and (match := re.match(r'^      - "([^"]+)"$', line)):
+            paths.append(match.group(1))
+    return keys, paths
+
+
 def main() -> int:
     scripts = [
         ROOT / "scripts" / "install-ubuntu-host",
@@ -51,6 +84,12 @@ def main() -> int:
         ROOT / "scripts" / "verify-ubuntu-release-failures",
         ROOT / "scripts" / "verify-ubuntu-tls-certificate",
         ROOT / "scripts" / "verify-ubuntu-systemd-environment",
+        ROOT / "scripts" / "prepare-native-validation",
+        ROOT / "scripts" / "run-validation",
+        ROOT / "scripts" / "run-ubuntu-validation",
+        ROOT / "scripts" / "ubuntu-validation-resources",
+        ROOT / "scripts" / "verify-ubuntu-validation-resources",
+        ROOT / "scripts" / "with-local-postgres",
     ]
     for script in scripts:
         require(os.access(script, os.X_OK), f"{script.name} is not executable")
@@ -71,11 +110,28 @@ def main() -> int:
         ast.parse(text(script), filename=str(script))
 
     ubuntu_workflow = text(ROOT / ".github" / "workflows" / "ubuntu-deployment.yml")
-    for source in ('"cmd/nmcp-admin/**"', '"internal/database/**"', '"go.mod"', '"go.sum"'):
-        require(
-            ubuntu_workflow.count(f"- {source}") == 2,
-            f"Ubuntu workflow does not trigger for {source} on PR and main push",
-        )
+    expected_pr_paths = {
+        ".github/workflows/ubuntu-deployment.yml",
+        "docs/local-validation.md",
+        "docs/ubuntu-deployment.md",
+        "infra/ubuntu/**",
+        "infra/postgresql/**",
+        "cmd/nmcp-admin/**",
+        "internal/database/**",
+        "go.mod",
+        "go.sum",
+        "scripts/**",
+    }
+    pr_keys, pr_paths = workflow_event(ubuntu_workflow, "pull_request")
+    require(pr_keys == {"paths"}, "Ubuntu pull_request trigger keys changed")
+    require(
+        len(pr_paths) == len(set(pr_paths)) and set(pr_paths) == expected_pr_paths,
+        "Ubuntu pull_request path filter is not the exact conservative allowlist",
+    )
+    push_keys, push_paths = workflow_event(ubuntu_workflow, "push")
+    require(push_keys == {"branches"}, "Ubuntu main push must be branch-only and unfiltered")
+    require(not push_paths, "Ubuntu main push must not have a path filter")
+    require("    branches: [main]" in ubuntu_workflow, "Ubuntu push is not restricted to main")
 
     units = UBUNTU / "systemd"
     slice_text = text(units / "nmcp.slice")

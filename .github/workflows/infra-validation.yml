@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: infra-validation-${{ github.ref }}
-  cancel-in-progress: true
+  group: infra-validation-${{ github.event_name == 'push' && format('push-{0}', github.ref_name) || github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   compose:

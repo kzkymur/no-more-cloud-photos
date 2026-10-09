@@ -5,24 +5,58 @@ repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo"
 mode=${1:-quick}
 
+without_process_test_opt_ins=(
+  env
+  -u TEST_METADATA_TOOLS -u TEST_EXIFTOOL_PATH -u TEST_FFPROBE_PATH -u TEST_FFMPEG_PATH
+  -u TEST_STILL_HELPER -u TEST_ANIMATION_HELPER -u TEST_VIDEO_HELPER
+  -u NMCP_JOB_HELPER -u NMCP_JOB_HELPER_READY -u NMCP_JOB_HELPER_SCHEMA
+  -u VIDEOHELPER_RUNNER_CHILD -u VIDEOHELPER_RUNNER_DESCENDANT_PID
+  -u VIDEOHELPER_RUNNER_OVERFLOW -u VIDEOHELPER_RUNNER_RELEASE
+)
+without_test_opt_ins=("${without_process_test_opt_ins[@]}" -u TEST_DATABASE_URL -u NMCP_TEST_DATABASE_URL)
+
+prepare_native() {
+  if [[ ${NMCP_NATIVE_PREPARED:-} != 1 ]]; then
+    exec scripts/prepare-native-validation "$0" "$mode"
+  fi
+  : "${TEST_STILL_HELPER_PATH:?native helper environment has not been prepared}"
+  : "${TEST_ANIMATION_HELPER_PATH:?native helper environment has not been prepared}"
+  : "${TEST_VIDEO_HELPER_PATH:?native helper environment has not been prepared}"
+}
+
 quick() {
   scripts/local-validation-preflight quick
   go mod verify
   test -z "$(gofmt -l .)"
   go vet ./...
   go build ./cmd/core-api ./cmd/core-worker ./cmd/nmcp-admin
-  env -u TEST_DATABASE_URL go test -p 1 -count=1 ./...
+  "${without_test_opt_ins[@]}" go test -p 1 -count=1 ./...
+}
+
+race_tests() {
+  export NMCP_TEST_DATABASE_URL=$TEST_DATABASE_URL
+  psql "$TEST_DATABASE_URL" --set ON_ERROR_STOP=1 \
+    --set nmcp_migrator_role=nmcp --file infra/postgresql/runtime-roles.sql
+  TEST_METADATA_TOOLS=1 TEST_STILL_HELPER=1 TEST_ANIMATION_HELPER=1 TEST_VIDEO_HELPER=1 \
+    go test -p 1 -race -count=1 ./...
 }
 
 race() {
   scripts/local-validation-preflight race
-  env -u TEST_DATABASE_URL go test -p 1 -race -count=1 ./...
+  scripts/local-validation-preflight postgres
+  prepare_native
+  if [[ -n ${TEST_DATABASE_URL:-} ]]; then
+    race_tests
+  else
+    scripts/with-local-postgres "$0" race-existing
+  fi
 }
 
 postgres_tests() {
+  export NMCP_TEST_DATABASE_URL=$TEST_DATABASE_URL
   psql "$TEST_DATABASE_URL" --set ON_ERROR_STOP=1 \
     --set nmcp_migrator_role=nmcp --file infra/postgresql/runtime-roles.sql
-  go test -p 1 -count=1 ./...
+  "${without_process_test_opt_ins[@]}" go test -p 1 -count=1 ./...
 }
 
 postgres() {
@@ -36,9 +70,7 @@ postgres() {
 
 native() {
   scripts/local-validation-preflight native
-  : "${TEST_STILL_HELPER_PATH:?native helper environment has not been prepared}"
-  : "${TEST_ANIMATION_HELPER_PATH:?native helper environment has not been prepared}"
-  : "${TEST_VIDEO_HELPER_PATH:?native helper environment has not been prepared}"
+  prepare_native
   TEST_METADATA_TOOLS=1 \
     TEST_EXIFTOOL_PATH="${TEST_EXIFTOOL_PATH:-$repo/.tools/exiftool-13.36/exiftool}" \
     TEST_FFPROBE_PATH="${TEST_FFPROBE_PATH:-$repo/.tools/ffmpeg-6.0.1-amd64-static/ffprobe}" \
@@ -65,13 +97,15 @@ infra() {
 case "$mode" in
   quick) quick ;;
   race) race ;;
+  race-existing) race_tests ;;
   postgres) postgres ;;
   postgres-existing) postgres_tests ;;
   native) native ;;
+  native-race) prepare_native; race; native ;;
   infra) infra ;;
   ubuntu) scripts/local-validation-preflight ubuntu; scripts/run-ubuntu-validation ;;
-  full) quick; race; postgres; infra ;;
-  all) quick; race; postgres; infra; scripts/local-validation-preflight ubuntu; scripts/run-ubuntu-validation ;;
+  full) prepare_native; quick; postgres; race; native; infra ;;
+  all) prepare_native; quick; postgres; race; native; infra; scripts/local-validation-preflight ubuntu; scripts/run-ubuntu-validation ;;
   cleanup)
     scripts/validation-env reset 2>/dev/null || true
     rm -rf -- .validation

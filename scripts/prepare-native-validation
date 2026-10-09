@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+tools=$repo/.tools
+state=$repo/.native-work
+prefix=$state/prefix
+build=$state/helper-build
+fixtures=$state/fixtures
+downloads=$state/downloads
+env_file=$state/validation.env
+
+fail() { printf 'native preparation: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "missing '$1'; run scripts/install-local-validation-deps"; }
+
+[[ $(uname -s) == Linux ]] || fail "Linux is required"
+[[ $(uname -m) == x86_64 ]] || fail "amd64 is required for the pinned metadata probe archive"
+scripts/local-validation-preflight native
+for command in autoconf automake cmake ctest curl git go ldd make meson nasm ninja pkg-config \
+  prlimit python3 sha256sum tar timeout xz; do
+  need "$command"
+done
+
+mkdir -p "$tools" "$downloads" "$build" "$fixtures"
+rm -f -- "$env_file"
+
+download() {
+  local target=$1 url=$2 digest=$3
+  if [[ ! -f $target ]]; then
+    curl --fail --location --silent --show-error "$url" --output "$target"
+  fi
+  printf '%s  %s\n' "$digest" "$target" | sha256sum --check
+}
+
+download "$tools/exiftool-13.36.tar.gz" \
+  https://github.com/exiftool/exiftool/archive/refs/tags/13.36.tar.gz \
+  f70ecbcdccc18268d4d3c290faf8cf73b1cf128e3e7f8671e24d6604cae4dc73
+download "$tools/ffmpeg-6.0.1-amd64-static.tar.xz" \
+  https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz \
+  28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
+download "$downloads/sRGB2014.icc" \
+  https://registry.color.org/rgb-registry/profiles/sRGB2014.icc \
+  384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
+download "$downloads/static-gallery-4.webp" \
+  https://www.gstatic.com/webp/gallery/4.webp \
+  0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9
+download "$downloads/orientation-6.jpg" \
+  https://raw.githubusercontent.com/recurser/exif-orientation-examples/219294e144531b0c01247913cb58b6f5531b5081/Landscape_6.jpg \
+  9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124
+download "$downloads/canon-a410.dng" \
+  'https://raw.pixls.us/data/Canon/Canon%20PowerShot%20A410/CANON_A410_CHDK_CRW_0741.DNG' \
+  f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38
+
+rm -rf -- "$tools/exiftool-13.36" "$tools/ffmpeg-6.0.1-amd64-static"
+tar -xzf "$tools/exiftool-13.36.tar.gz" -C "$tools"
+tar -xJf "$tools/ffmpeg-6.0.1-amd64-static.tar.xz" -C "$tools"
+"$tools/exiftool-13.36/exiftool" -ver
+"$tools/ffmpeg-6.0.1-amd64-static/ffprobe" -version
+prlimit --version
+timeout 1m "$repo/internal/videoprocessor/helper/validate-inherited-toolchain_test.sh"
+
+rm -rf -- "$prefix" "$build" "$fixtures"
+mkdir -p "$prefix" "$build" "$fixtures"
+
+"$repo/internal/stillprocessor/helper/build-pinned-toolchain.sh" \
+  "$prefix" "$state/still"
+heic_fixture=$state/still/source/libheif-1.23.5/examples/example.heic
+printf '%s  %s\n' \
+  7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2 \
+  "$heic_fixture" | sha256sum --check
+export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig"
+export LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64"
+cmake -S "$repo/internal/stillprocessor/helper" -B "$build/still" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$prefix"
+cmake --build "$build/still" --parallel 2
+ctest --test-dir "$build/still" --output-on-failure
+"$build/still/bin/nmcp-heif-fixture-generator" \
+  "$fixtures/heif" "$downloads/sRGB2014.icc"
+capabilities=$("$build/still/bin/nmcp-still-helper" capabilities --protocol 1 --threads 1 \
+  --srgb-icc "$downloads/sRGB2014.icc")
+printf '%s\n' "$capabilities"
+CAPABILITIES=$capabilities python3 -c \
+  'import json,os; v=json.loads(os.environ["CAPABILITIES"])["result"]["library_versions"]; assert v["libvips"]=="8.18.7" and v["libheif"]=="1.23.5" and v["libraw"]=="0.22.2-Release" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14", v'
+
+"$repo/internal/animationprocessor/helper/build-pinned-codecs.sh" \
+  "$prefix" "$state/animation"
+cmake -S "$repo/internal/animationprocessor/helper" -B "$build/animation" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DNMCP_PINNED_PREFIX="$prefix"
+cmake --build "$build/animation" --parallel 2
+ctest --test-dir "$build/animation" --output-on-failure
+"$build/animation/bin/nmcp-animation-fixture-generator" "$fixtures/animation-variable.webp"
+"$build/animation/bin/nmcp-gif-fixture-generator" "$fixtures/animation-gif"
+capabilities=$("$build/animation/bin/nmcp-animation-helper" capabilities --protocol 1 --threads 1 \
+  --srgb-icc /proc/self/fd/3 3<"$downloads/sRGB2014.icc")
+printf '%s\n' "$capabilities"
+CAPABILITIES=$capabilities python3 -c \
+  'import json,os; r=json.loads(os.environ["CAPABILITIES"])["result"]; v=r["library_versions"]; assert v["libwebp"]==v["libwebp-demux"]==v["libwebp-mux"]=="1.6.0" and v["giflib"]=="5.2.2" and v["libheif"]=="1.23.5" and v["libaom"]=="v3.8.2" and v["lcms2"]=="2.14" and r["build_manifest"]=="giflib=5.2.2;libwebp=1.6.0;simd=on;threads=on;near-lossless=on", r'
+
+timeout 20m "$repo/internal/videoprocessor/helper/build-pinned-toolchain.sh" \
+  "$prefix" "$state/video"
+timeout 2m go build -o "$prefix/bin/nmcp-video-helper" ./cmd/nmcp-video-helper
+video_helper=$prefix/bin/nmcp-video-helper
+capabilities=$(timeout 1m "$video_helper" capabilities --protocol 1 --threads 1 \
+  --srgb-icc /proc/self/fd/3 3<"$downloads/sRGB2014.icc")
+printf '%s\n' "$capabilities"
+CAPABILITIES=$capabilities python3 -c \
+  'import json,os; r=json.loads(os.environ["CAPABILITIES"])["result"]; v=r["library_versions"]; assert v=={"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libaom":"v3.8.2"} and r["video_encoder"]=="libsvtav1" and r["audio_encoder"]=="aac-lc" and r["tone_map"]=="zscale+hable" and r["build_manifest"]=="ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1", r'
+ldd "$prefix/bin/ffmpeg" | tee "$state/video-ffmpeg-ldd.txt"
+python3 - "$state/video-ffmpeg-ldd.txt" "$prefix" <<'PY'
+import pathlib,sys
+text=pathlib.Path(sys.argv[1]).read_text()
+prefix=sys.argv[2]
+for library in ("libSvtAv1Enc", "libzimg", "libaom"):
+    line=next((line for line in text.splitlines() if library in line), None)
+    assert line and prefix in line, (library,line,text)
+PY
+
+generator=$tools/ffmpeg-6.0.1-amd64-static/ffmpeg
+ffprobe=$tools/ffmpeg-6.0.1-amd64-static/ffprobe
+timeout 1m "$generator" -version
+timeout 1m "$generator" -buildconf
+timeout 1m "$generator" -hide_banner -encoders 2>&1 | grep -E 'libx264|libx265'
+timeout 1m "$generator" -hide_banner -decoders 2>&1 | grep -E ' av1| aac'
+video_fixtures=$fixtures/video
+mkdir -p "$video_fixtures"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc=size=321x181:rate=25:duration=0.16' \
+  -f lavfi -i 'sine=frequency=440:sample_rate=44100:duration=0.16' -shortest \
+  -c:v libx264 -preset ultrafast -pix_fmt yuv444p -color_primaries bt709 \
+  -color_trc bt709 -colorspace bt709 -color_range tv -c:a aac -b:a 96k \
+  "$video_fixtures/avc-odd-audio.mp4"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc2=size=128x96:rate=25:duration=0.16' -an \
+  -c:v libx265 -preset ultrafast -x265-params pools=1:frame-threads=1 \
+  -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
+  "$video_fixtures/hevc-base.mp4"
+timeout 1m "$generator" -v error -y -i "$video_fixtures/hevc-base.mp4" -map 0 -c copy \
+  -metadata:s:v:0 rotate=90 "$video_fixtures/hevc-rotated.mov"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc2=size=320x180:rate=25:duration=0.16' -an \
+  -vf format=yuv420p10le -c:v libx265 -preset ultrafast \
+  -x265-params 'pools=1:frame-threads=1:keyint=1:min-keyint=1:repeat-headers=1:hdr10=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400' \
+  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv \
+  "$video_fixtures/hevc-pq.mp4"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc2=size=320x180:rate=25:duration=0.04' -frames:v 1 -an \
+  -vf format=yuv420p10le -c:v libx265 -preset ultrafast -f hevc \
+  -x265-params 'pools=1:frame-threads=1:keyint=1:min-keyint=1:bframes=0:hdr10=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400' \
+  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv \
+  "$video_fixtures/pq-first.hevc"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc2=size=320x180:rate=25:duration=0.12' -frames:v 3 -an \
+  -vf format=yuv420p10le -c:v libx265 -preset ultrafast -f hevc \
+  -x265-params 'pools=1:frame-threads=1:keyint=1:min-keyint=1:bframes=0' \
+  -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc -color_range tv \
+  "$video_fixtures/pq-later.hevc"
+cat "$video_fixtures/pq-first.hevc" "$video_fixtures/pq-later.hevc" > \
+  "$video_fixtures/pq-missing-combined.hevc"
+timeout 1m "$generator" -v error -y -r 25 -i "$video_fixtures/pq-missing-combined.hevc" \
+  -map 0:v:0 -c:v copy -tag:v hvc1 "$video_fixtures/hevc-pq-later-missing.mp4"
+rm -- "$video_fixtures/pq-first.hevc" "$video_fixtures/pq-later.hevc" \
+  "$video_fixtures/pq-missing-combined.hevc"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc2=size=320x180:rate=25:duration=0.16' -an \
+  -vf format=yuv420p10le -c:v libx265 -preset ultrafast \
+  -x265-params 'pools=1:frame-threads=1' -color_primaries bt2020 \
+  -color_trc arib-std-b67 -colorspace bt2020nc -color_range tv \
+  "$video_fixtures/hevc-hlg.mp4"
+timeout 1m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'color=red:size=96x64' -frames:v 1 "$video_fixtures/cover.jpg"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'color=blue:size=64x48:rate=25:duration=0.16' \
+  -f lavfi -i 'sine=frequency=440:sample_rate=44100:duration=0.16' \
+  -f lavfi -i 'sine=frequency=880:sample_rate=48000:duration=0.16' \
+  -map 0:v -map 1:a -map 2:a -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
+  -c:a aac -shortest -disposition:v:0 default -disposition:a:0 0 \
+  -disposition:a:1 default "$video_fixtures/multistream-base.mp4"
+timeout 1m "$generator" -v error -y -i "$video_fixtures/multistream-base.mp4" \
+  -i "$video_fixtures/cover.jpg" -map 0 -map 1:v -c copy -disposition:v:1 attached_pic \
+  "$video_fixtures/multistream.mp4"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc=size=96x54:rate=25:duration=0.16' \
+  -f lavfi -i 'testsrc2=size=120x80:rate=25:duration=0.16' \
+  -map 0:v -map 1:v -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv \
+  -disposition:v:0 0 -disposition:v:1 default "$video_fixtures/multistream-rotated-base.mp4"
+timeout 1m "$generator" -v error -y -i "$video_fixtures/multistream-rotated-base.mp4" \
+  -i "$video_fixtures/cover.jpg" -map 0:v:0 -map 0:v:1 -map 1:v -c copy \
+  -disposition:v:0 0 -disposition:v:1 default -disposition:v:2 attached_pic \
+  -metadata:s:v:1 rotate=90 "$video_fixtures/multistream-rotated.mp4"
+rm -- "$video_fixtures/multistream-base.mp4" "$video_fixtures/multistream-rotated-base.mp4" \
+  "$video_fixtures/cover.jpg"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc2=size=80x50:rate=25:duration=0.16' \
+  -f lavfi -i 'sine=frequency=660:sample_rate=192000:duration=0.16' -shortest \
+  -c:v libx264 -preset ultrafast -pix_fmt yuv420p -color_primaries bt709 \
+  -color_trc bt709 -colorspace bt709 -color_range tv -c:a pcm_s16le \
+  "$video_fixtures/audio-resample.mov"
+timeout 2m "$generator" -v error -y -threads 1 \
+  -f lavfi -i 'testsrc=size=160x90:rate=25:duration=0.2' -frames:v 4 \
+  -vf 'setpts=if(gte(N\,2)\,N+1\,N)/(25*TB),setsar=2/1' -fps_mode vfr -an -c:v libx264 \
+  -preset ultrafast -pix_fmt yuv420p -color_primaries bt709 -color_trc bt709 \
+  -colorspace bt709 -color_range tv "$video_fixtures/vfr-sar.mp4"
+for fixture in "$video_fixtures"/*.mp4 "$video_fixtures"/*.mov; do
+  sha256sum "$fixture"
+  timeout 1m "$ffprobe" -v error -show_streams -show_format "$fixture"
+  timeout 1m "$generator" -v error -xerror -i "$fixture" -f null -
+  timeout 1m "$generator" -v error -i "$fixture" -map 0:v -f framehash -
+done
+
+write_export() { printf 'export %s=%q\n' "$1" "$2" >> "$env_file"; }
+: > "$env_file"
+write_export NMCP_NATIVE_PREPARED 1
+write_export LD_LIBRARY_PATH "$LD_LIBRARY_PATH"
+write_export TEST_EXIFTOOL_PATH "$tools/exiftool-13.36/exiftool"
+write_export TEST_FFPROBE_PATH "$ffprobe"
+write_export TEST_FFMPEG_PATH "$generator"
+write_export TEST_STILL_HELPER_PATH "$build/still/bin/nmcp-still-helper"
+write_export TEST_STILL_RAW_REFERENCE_PATH "$build/still/bin/nmcp-raw-reference"
+write_export TEST_STILL_AVIF_REFERENCE_PATH "$build/still/bin/nmcp-avif-reference"
+write_export TEST_STILL_ICC_PATH "$downloads/sRGB2014.icc"
+write_export TEST_STILL_P3_ICC_PATH "$fixtures/heif/display-p3.icc"
+write_export TEST_STILL_HEIC_PATH "$heic_fixture"
+write_export TEST_STILL_WEBP_PATH "$downloads/static-gallery-4.webp"
+write_export TEST_STILL_ORIENTATION6_PATH "$downloads/orientation-6.jpg"
+write_export TEST_STILL_RAW_PATH "$downloads/canon-a410.dng"
+write_export TEST_STILL_PQ_PATH "$fixtures/heif/pq.avif"
+write_export TEST_STILL_HLG_PATH "$fixtures/heif/hlg.avif"
+write_export TEST_STILL_ICC_NCLX_PATH "$fixtures/heif/icc-nclx.avif"
+write_export TEST_STILL_INVALID_ICC_PATH "$fixtures/heif/invalid-icc.avif"
+write_export TEST_STILL_HEIF_COLLECTION_PATH "$fixtures/heif/collection-primary-second.avif"
+write_export TEST_ANIMATION_HELPER_PATH "$build/animation/bin/nmcp-animation-helper"
+write_export TEST_ANIMATION_WEBP_PATH "$fixtures/animation-variable.webp"
+write_export TEST_ANIMATION_WEBP_REFERENCE_PATH "$build/animation/bin/nmcp-webp-reference"
+write_export TEST_ANIMATION_GIF_BACKGROUND_PATH "$fixtures/animation-gif/dispose-background.gif"
+write_export TEST_ANIMATION_GIF_PREVIOUS_PATH "$fixtures/animation-gif/dispose-previous.gif"
+write_export TEST_ANIMATION_GIF_INCOMPRESSIBLE_SINGLE_PATH "$fixtures/animation-gif/incompressible-single.gif"
+write_export TEST_ANIMATION_GIF_INCOMPRESSIBLE_MANY_PATH "$fixtures/animation-gif/incompressible-many.gif"
+write_export TEST_VIDEO_HELPER_PATH "$video_helper"
+write_export TEST_VIDEO_PRLIMIT_PATH "$(command -v prlimit)"
+write_export TEST_VIDEO_ICC_PATH "$downloads/sRGB2014.icc"
+write_export TEST_VIDEO_AVC_PATH "$video_fixtures/avc-odd-audio.mp4"
+write_export TEST_VIDEO_HEVC_ROTATED_PATH "$video_fixtures/hevc-rotated.mov"
+write_export TEST_VIDEO_PQ_PATH "$video_fixtures/hevc-pq.mp4"
+write_export TEST_VIDEO_PQ_LATER_MISSING_PATH "$video_fixtures/hevc-pq-later-missing.mp4"
+write_export TEST_VIDEO_HLG_PATH "$video_fixtures/hevc-hlg.mp4"
+write_export TEST_VIDEO_MULTISTREAM_PATH "$video_fixtures/multistream.mp4"
+write_export TEST_VIDEO_MULTISTREAM_ROTATED_PATH "$video_fixtures/multistream-rotated.mp4"
+write_export TEST_VIDEO_VFR_PATH "$video_fixtures/vfr-sar.mp4"
+write_export TEST_VIDEO_RESAMPLE_PATH "$video_fixtures/audio-resample.mov"
+
+printf 'Native validation environment: %s\n' "$env_file"
+if [[ $# -gt 0 ]]; then
+  # shellcheck disable=SC1090
+  source "$env_file"
+  cd "$repo"
+  exec "$@"
+fi
