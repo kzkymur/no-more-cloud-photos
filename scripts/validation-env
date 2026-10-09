@@ -202,7 +202,8 @@ run_ubuntu_role_bootstrap() {
 
 expect_ubuntu_role_bootstrap_denied() {
   label=$1
-  if run_ubuntu_role_bootstrap >/dev/null 2>&1; then
+  mode=${2:-FALSE}
+  if run_ubuntu_role_bootstrap "$mode" >/dev/null 2>&1; then
     echo "error: Ubuntu PostgreSQL bootstrap accepted $label" >&2
     exit 1
   fi
@@ -247,7 +248,7 @@ TO nmcp_migrator WITH ADMIN TRUE, INHERIT TRUE, SET FALSE;"
       "GRANT nmcp_purge_function_owner TO nmcp_migrator WITH ADMIN FALSE, INHERIT $purge, SET TRUE; \
 GRANT nmcp_check_function_owner TO nmcp_migrator WITH ADMIN FALSE, INHERIT $check, SET TRUE; \
 GRANT nmcp_repair_function_owner TO nmcp_migrator WITH ADMIN FALSE, INHERIT $repair, SET TRUE"
-    expect_ubuntu_role_bootstrap_denied "mixed owner inheritance graph $pattern"
+    expect_ubuntu_role_bootstrap_denied "mixed owner inheritance graph $pattern" TRUE
     [ "$(bootstrap_catalog_value "SELECT string_agg(inherit_option::int::text, '' ORDER BY roleid::regrole::text) FROM pg_auth_members WHERE member='nmcp_migrator'::regrole AND roleid IN ('nmcp_check_function_owner'::regrole,'nmcp_purge_function_owner'::regrole,'nmcp_repair_function_owner'::regrole)")" = "$expected_bits" ] || {
       echo "error: mixed graph $pattern was changed after rejected compatibility preflight" >&2
       exit 1
@@ -257,17 +258,17 @@ GRANT nmcp_repair_function_owner TO nmcp_migrator WITH ADMIN FALSE, INHERIT $rep
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command "REVOKE nmcp_check_function_owner FROM nmcp_migrator"
-  expect_ubuntu_role_bootstrap_denied "missing owner membership"
+  expect_ubuntu_role_bootstrap_denied "missing owner membership" TRUE
   run_ubuntu_role_bootstrap
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "GRANT nmcp_check_function_owner TO nmcp_migrator WITH ADMIN TRUE, INHERIT FALSE, SET TRUE"
-  expect_ubuntu_role_bootstrap_denied "owner membership ADMIN option"
+  expect_ubuntu_role_bootstrap_denied "owner membership ADMIN option" TRUE
   run_ubuntu_role_bootstrap
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "GRANT nmcp_check_function_owner TO nmcp_migrator WITH ADMIN FALSE, INHERIT FALSE, SET FALSE"
-  expect_ubuntu_role_bootstrap_denied "owner membership SET option"
+  expect_ubuntu_role_bootstrap_denied "owner membership SET option" TRUE
   run_ubuntu_role_bootstrap
 
   # Compatibility preflight rejects and transactionally preserves even a
