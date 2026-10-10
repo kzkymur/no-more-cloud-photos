@@ -15,11 +15,18 @@ services:
       retries: 30
     volumes:
       - database:/var/lib/postgresql/data
-      - ${NMCP_POSTGRES_INIT_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/docker-entrypoint-initdb.d/10-nmcp-roles.sql:ro
-      - ${NMCP_RUNTIME_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
-      - ${NMCP_UBUNTU_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/ubuntu/postgresql-roles.sql:ro
-      - ${NMCP_VERIFY_ROLE_GRAPH_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
-      - ${NMCP_VERIFY_RUNTIME_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/validation/verify-runtime-roles.sql:ro
+      - type: volume
+        source: compose-inputs
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+        volume:
+          subpath: init
+      - type: volume
+        source: compose-inputs
+        target: /opt/nmcp-infra
+        read_only: true
+        volume:
+          subpath: infra
     networks: [backend]
     labels: *validation-labels
 
@@ -69,7 +76,12 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ${NMCP_RUNTIME_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+      - type: volume
+        source: compose-inputs
+        target: /opt/nmcp-infra
+        read_only: true
+        volume:
+          subpath: infra
     networks: [backend]
     labels: *validation-labels
 
@@ -90,8 +102,12 @@ services:
       migrate:
         condition: service_completed_successfully
     volumes:
-      - ${NMCP_RUNTIME_ROLES_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
-      - ${NMCP_VERIFY_ROLE_GRAPH_SQL:?scripts/validation-env must stage PostgreSQL inputs}:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
+      - type: volume
+        source: compose-inputs
+        target: /opt/nmcp-infra
+        read_only: true
+        volume:
+          subpath: infra
     networks: [backend]
     labels: *validation-labels
 
@@ -188,6 +204,9 @@ services:
     labels: *validation-labels
 
 volumes:
+  compose-inputs:
+    name: ${NMCP_COMPOSE_INPUT_VOLUME:?scripts/validation-env must set NMCP_COMPOSE_INPUT_VOLUME}
+    labels: *validation-labels
   database:
     labels: *validation-labels
   media:

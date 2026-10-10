@@ -59,16 +59,21 @@ with that environment, or source the generated file after preparation.
 
 Compose uses checkout-hashed project, volume, and ownership labels. Its verify
 command guarantees cleanup, while Docker's image/build cache is retained.
-PostgreSQL bind inputs are never exposed directly from the checkout: the
+PostgreSQL inputs are never exposed directly from the checkout: the
 entrypoint accepts only five repository-owned, regular, non-symlink SQL files
-whose content matches the exact `HEAD` blobs, then atomically stages private
-run copies with explicit container-readable mode. This keeps validation working
-after a fresh checkout under `umask 0077` without broadening checkout modes.
-The staging verifier rejects missing, replaced, unreadable, wrong-owner, or
-wrong-content copies, and marker-checked cleanup removes only its project/run
-directory.
-`cleanup` delegates to that ownership-checked reset and removes only
-`.validation/`; it never traverses arbitrary host paths.
+whose content matches the exact `HEAD` blobs. A per-project lock serializes
+staging, verification, Docker launch, and reset. The helper pins directories by
+file descriptor, rejects symlinked path components, verifies file identities
+before and after copying, and publishes only pinned snapshot bytes into an
+ownership-labeled, per-project/run Docker volume. Compose consumes that
+daemon-owned volume rather than a host path that can change between verification
+and bind resolution. This keeps validation working after a fresh checkout under
+`umask 0077` without broadening checkout modes. Cleanup first atomically detaches
+a registered stage beneath the pinned project directory, then removes only
+descriptor-relative entries; it fails closed if a directory identity has
+changed and never traverses arbitrary host paths. Unregistered partial runs are
+removed by the same supervisor before it releases the project lock. `cleanup`
+delegates to that reset and otherwise removes only `.validation/`.
 
 The Ubuntu lane is intentionally separate. Its dispatcher must run as the
 unprivileged checkout owner and requires passwordless command-scoped `sudo`,

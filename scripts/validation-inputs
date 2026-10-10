@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""Descriptor-confined lifecycle for local validation Compose inputs."""
+
+import array
+import fcntl
+import hashlib
+import io
+import json
+import os
+import secrets
+import socket
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+
+INPUTS = (
+    ("NMCP_POSTGRES_INIT_SQL", "infra/validation/postgres-init.sql", "postgres-init.sql"),
+    ("NMCP_RUNTIME_ROLES_SQL", "infra/postgresql/runtime-roles.sql", "runtime-roles.sql"),
+    ("NMCP_UBUNTU_ROLES_SQL", "infra/ubuntu/postgresql-roles.sql", "postgresql-roles.sql"),
+    ("NMCP_VERIFY_ROLE_GRAPH_SQL", "infra/postgresql/verify-runtime-role-graph.sql", "verify-runtime-role-graph.sql"),
+    ("NMCP_VERIFY_RUNTIME_ROLES_SQL", "infra/validation/verify-runtime-roles.sql", "verify-runtime-roles.sql"),
+)
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+
+class UnsafeInput(RuntimeError):
+    pass
+
+
+def check_project(project):
+    if not project or project[0] not in "abcdefghijklmnopqrstuvwxyz0123456789":
+        raise UnsafeInput(f"invalid validation project: {project!r}")
+    if any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in project):
+        raise UnsafeInput(f"invalid validation project: {project!r}")
+
+
+def check_basename(name, project):
+    prefix = project + "."
+    if (
+        not name
+        or name in (".", "..", "/")
+        or "/" in name
+        or not name.startswith(prefix)
+        or len(name) <= len(prefix)
+        or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for c in name)
+    ):
+        raise UnsafeInput("Compose input registry does not contain a safe project basename")
+    return name
+
+
+def owned_directory(fd, uid, private=False):
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:
+        raise UnsafeInput("validation directory is not an owned directory")
+    if private and stat.S_IMODE(info.st_mode) != 0o700:
+        raise UnsafeInput("Compose input directory mode is not 0700")
+
+
+def same_identity(first_fd, second_fd):
+    first, second = os.fstat(first_fd), os.fstat(second_fd)
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def open_directory(name, parent_fd, uid, private=False, create=False):
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    try:
+        fd = os.open(name, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        raise UnsafeInput(f"unsafe directory component: {name}") from exc
+    try:
+        owned_directory(fd, uid, private)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def read_regular(name, parent_fd, uid, mode, limit=None):
+    try:
+        fd = os.open(name, os.O_RDONLY | NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        raise UnsafeInput(f"missing or unsafe regular file: {name}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != mode:
+            raise UnsafeInput(f"wrong type, owner, or mode on file: {name}")
+        data = b""
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+            if limit is not None and len(data) > limit:
+                raise UnsafeInput(f"oversized file: {name}")
+        return fd, data
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def remove_tree(fd):
+    for name in os.listdir(fd):
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child = os.open(name, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=fd)
+            try:
+                remove_tree(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=fd)
+        else:
+            os.unlink(name, dir_fd=fd)
+
+
+class Store:
+    def __init__(self, root_path, root_fd, validation_fd, parent_fd, project, owner, uid=None):
+        self.root_path = root_path
+        self.root_fd = root_fd
+        self.validation_fd = validation_fd
+        self.parent_fd = parent_fd
+        self.project = project
+        self.owner = owner
+        self.uid = os.getuid() if uid is None else uid
+        self.basename = None
+        self.stage_fd = None
+        self.input_fds = {}
+        self.snapshot_names = {}
+        self.parent_path = os.path.join(root_path, ".validation", "compose-inputs")
+
+    @property
+    def registry(self):
+        return self.project + ".registry"
+
+    @property
+    def volume(self):
+        if self.basename is None:
+            raise UnsafeInput("no Compose input stage is loaded")
+        return self.project + "_compose-inputs_" + self.basename.removeprefix(self.project + ".")
+
+    def close_stage(self):
+        self.close_snapshot_fds()
+        if self.stage_fd is not None:
+            os.close(self.stage_fd)
+            self.stage_fd = None
+        self.basename = None
+
+    def close_snapshot_fds(self):
+        for fd in self.input_fds.values():
+            os.close(fd)
+        self.input_fds.clear()
+        self.snapshot_names.clear()
+
+    def verify_chain(self):
+        root_fd = validation_fd = parent_fd = None
+        try:
+            root_fd = os.open(self.root_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+            if not same_identity(self.root_fd, root_fd):
+                raise UnsafeInput("repository root identity changed")
+            validation_fd = open_directory(".validation", root_fd, self.uid)
+            if not same_identity(self.validation_fd, validation_fd):
+                raise UnsafeInput("validation directory identity changed")
+            parent_fd = open_directory("compose-inputs", validation_fd, self.uid, private=True)
+            if not same_identity(self.parent_fd, parent_fd):
+                raise UnsafeInput("Compose input parent identity changed")
+        except OSError as exc:
+            raise UnsafeInput("pinned Compose input parent is no longer repository-contained") from exc
+        finally:
+            for fd in (parent_fd, validation_fd, root_fd):
+                if fd is not None:
+                    os.close(fd)
+
+    def clear_snapshots(self):
+        for variable, fd in self.input_fds.items():
+            name = self.snapshot_names[variable]
+            try:
+                visible = os.stat(name, dir_fd=self.parent_fd, follow_symlinks=False)
+                pinned = os.fstat(fd)
+                if (visible.st_dev, visible.st_ino) == (pinned.st_dev, pinned.st_ino):
+                    os.unlink(name, dir_fd=self.parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(fd)
+        self.input_fds.clear()
+        self.snapshot_names.clear()
+
+    def source_data(self, tracked_path):
+        parts = tracked_path.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            raise UnsafeInput("invalid tracked input path")
+        current = os.dup(self.root_fd)
+        try:
+            for part in parts[:-1]:
+                next_fd = open_directory(part, current, self.uid)
+                os.close(current)
+                current = next_fd
+            fd = os.open(parts[-1], os.O_RDONLY | NOFOLLOW, dir_fd=current)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid:
+                    raise UnsafeInput(f"unsafe tracked Compose input: {tracked_path}")
+                data = b""
+                while True:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            finally:
+                os.close(fd)
+        finally:
+            os.close(current)
+        expected = subprocess.check_output(
+            ["git", f"--git-dir=/proc/{os.getpid()}/fd/{self.root_fd}/.git", "rev-parse", f"HEAD:{tracked_path}"],
+            text=True,
+        ).strip()
+        actual = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        if actual != expected:
+            raise UnsafeInput(f"Compose input differs from the exact HEAD blob: {tracked_path}")
+        return data
+
+    def write_file(self, directory_fd, name, data, mode):
+        temporary = ".tmp-" + secrets.token_hex(12)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, mode, dir_fd=directory_fd)
+        try:
+            try:
+                view = memoryview(data)
+                while view:
+                    written = os.write(fd, view)
+                    view = view[written:]
+                os.fchmod(fd, mode)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        except Exception:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def snapshot(self, output_name, data):
+        name = f".snapshot-{self.basename}-{output_name}"
+        try:
+            try:
+                os.stat(name, dir_fd=self.parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                self.write_file(self.parent_fd, name, data, 0o444)
+            fd, snapshot_data = read_regular(name, self.parent_fd, self.uid, 0o444)
+            if snapshot_data != data:
+                os.close(fd)
+                raise UnsafeInput("Compose input snapshot changed while opening")
+            return fd, name
+        except Exception:
+            raise
+
+    def stage(self):
+        self.verify_chain()
+        if self.stage_fd is not None:
+            self.verify()
+            return self.basename
+        basename = self.project + "." + secrets.token_hex(12)
+        os.mkdir(basename, 0o700, dir_fd=self.parent_fd)
+        stage_fd = None
+        try:
+            stage_fd = open_directory(basename, self.parent_fd, self.uid, private=True)
+            self.write_file(stage_fd, ".owner", f"{self.owner}\n{self.project}\n".encode(), 0o600)
+            for _, tracked_path, output_name in INPUTS:
+                self.write_file(stage_fd, output_name, self.source_data(tracked_path), 0o644)
+            os.fsync(stage_fd)
+            self.basename, self.stage_fd = basename, stage_fd
+            stage_fd = None
+            self.verify()
+            return basename
+        except Exception:
+            if stage_fd is not None:
+                try:
+                    remove_tree(stage_fd)
+                    os.rmdir(basename, dir_fd=self.parent_fd)
+                finally:
+                    os.close(stage_fd)
+            else:
+                try:
+                    os.rmdir(basename, dir_fd=self.parent_fd)
+                except OSError:
+                    pass
+            raise
+
+    def _open_stage(self, basename):
+        self.verify_chain()
+        fd = open_directory(basename, self.parent_fd, self.uid, private=True)
+        if self.stage_fd is not None:
+            old = os.fstat(self.stage_fd)
+            new = os.fstat(fd)
+            if (old.st_dev, old.st_ino) != (new.st_dev, new.st_ino):
+                os.close(fd)
+                raise UnsafeInput("Compose input stage identity changed")
+            os.close(fd)
+            return
+        self.basename, self.stage_fd = basename, fd
+
+    def _verify_contents(self, stage_fd):
+        owned_directory(stage_fd, self.uid, private=True)
+        expected_names = {".owner", *(output_name for _, _, output_name in INPUTS)}
+        if set(os.listdir(stage_fd)) != expected_names:
+            raise UnsafeInput("Compose input stage contains unexpected entries")
+        marker_fd, marker = read_regular(".owner", stage_fd, self.uid, 0o600, 1024)
+        os.close(marker_fd)
+        if marker != f"{self.owner}\n{self.project}\n".encode():
+            raise UnsafeInput("invalid Compose input ownership marker")
+        opened = {}
+        names = {}
+        try:
+            for variable, tracked_path, output_name in INPUTS:
+                fd, data = read_regular(output_name, stage_fd, self.uid, 0o644)
+                if data != self.source_data(tracked_path):
+                    os.close(fd)
+                    raise UnsafeInput(f"staged Compose input content drift: {output_name}")
+                os.close(fd)
+                opened[variable], names[variable] = self.snapshot(output_name, data)
+        except Exception:
+            for fd in opened.values():
+                os.close(fd)
+            raise
+        self.close_snapshot_fds()
+        self.input_fds = opened
+        self.snapshot_names = names
+
+    def verify(self):
+        self.verify_chain()
+        if self.stage_fd is None or self.basename is None:
+            raise UnsafeInput("no Compose input stage is loaded")
+        current = os.open(self.basename, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=self.parent_fd)
+        try:
+            pinned, visible = os.fstat(self.stage_fd), os.fstat(current)
+            if (pinned.st_dev, pinned.st_ino) != (visible.st_dev, visible.st_ino):
+                raise UnsafeInput("Compose input stage identity changed")
+        finally:
+            os.close(current)
+        self._verify_contents(self.stage_fd)
+
+    def register(self):
+        self.verify()
+        self.write_file(self.parent_fd, self.registry, (self.basename + "\n").encode(), 0o600)
+
+    def restage(self, output_name):
+        matches = [(path, name) for _, path, name in INPUTS if name == output_name]
+        if len(matches) != 1 or self.stage_fd is None:
+            raise UnsafeInput("invalid Compose input restage request")
+        tracked_path, name = matches[0]
+        self.write_file(self.stage_fd, name, self.source_data(tracked_path), 0o644)
+        os.fsync(self.stage_fd)
+        self.verify()
+
+    def publish(self):
+        self.verify()
+        volume = self.volume
+        inspect = subprocess.run(
+            ["docker", "volume", "inspect", volume],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if inspect.returncode == 0:
+            details = json.loads(inspect.stdout)[0]
+            labels = details.get("Labels") or {}
+            if (
+                labels.get("com.docker.compose.project") != self.project
+                or labels.get("com.docker.compose.volume") != "compose-inputs"
+                or labels.get("com.nmcp.validation.owner") != self.owner
+            ):
+                raise UnsafeInput("refusing to use an unowned Compose input volume")
+            return volume
+        else:
+            subprocess.run(
+                [
+                    "docker", "volume", "create",
+                    "--label", f"com.docker.compose.project={self.project}",
+                    "--label", "com.docker.compose.volume=compose-inputs",
+                    "--label", f"com.nmcp.validation.owner={self.owner}",
+                    volume,
+                ],
+                stdout=subprocess.DEVNULL,
+                check=True,
+            )
+
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as output:
+            for name in ("init", "infra", "infra/postgresql", "infra/ubuntu", "infra/validation"):
+                entry = tarfile.TarInfo(name)
+                entry.type = tarfile.DIRTYPE
+                entry.mode = 0o555
+                output.addfile(entry)
+            for variable, tracked_path, _ in INPUTS:
+                if tracked_path == "infra/validation/postgres-init.sql":
+                    name = "init/10-nmcp-roles.sql"
+                else:
+                    name = tracked_path
+                fd = self.input_fds[variable]
+                size = os.fstat(fd).st_size
+                data = os.pread(fd, size, 0)
+                if len(data) != size:
+                    raise UnsafeInput("short read from verified Compose input snapshot")
+                entry = tarfile.TarInfo(name)
+                entry.mode = 0o444
+                entry.size = size
+                output.addfile(entry, io.BytesIO(data))
+        try:
+            subprocess.run(
+                [
+                    "docker", "run", "--rm", "--interactive", "--network", "none",
+                    "--volume", f"{volume}:/inputs",
+                    "--entrypoint", "sh",
+                    "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+                    "-eu", "-c", "tar -x -C /inputs",
+                ],
+                input=archive.getvalue(),
+                stdout=subprocess.DEVNULL,
+                check=True,
+            )
+        except Exception:
+            subprocess.run(
+                ["docker", "volume", "rm", volume],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            raise
+        return volume
+
+    def unpublish(self):
+        volume = self.volume
+        inspect = subprocess.run(
+            ["docker", "volume", "inspect", volume],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if inspect.returncode != 0:
+            return
+        details = json.loads(inspect.stdout)[0]
+        labels = details.get("Labels") or {}
+        if (
+            labels.get("com.docker.compose.project") != self.project
+            or labels.get("com.docker.compose.volume") != "compose-inputs"
+            or labels.get("com.nmcp.validation.owner") != self.owner
+        ):
+            raise UnsafeInput("refusing to remove an unowned Compose input volume")
+        subprocess.run(["docker", "volume", "rm", volume], stdout=subprocess.DEVNULL, check=True)
+
+    def _read_registry(self):
+        self.verify_chain()
+        try:
+            fd, data = read_regular(self.registry, self.parent_fd, self.uid, 0o600, 512)
+        except UnsafeInput as exc:
+            try:
+                os.stat(self.registry, dir_fd=self.parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None, None
+            raise exc
+        try:
+            name = data.decode("ascii").removesuffix("\n")
+        except UnicodeDecodeError as exc:
+            os.close(fd)
+            raise UnsafeInput("non-ASCII Compose input registry") from exc
+        if "\n" in name or "\r" in name:
+            os.close(fd)
+            raise UnsafeInput("invalid Compose input registry")
+        try:
+            return check_basename(name, self.project), fd
+        except Exception:
+            os.close(fd)
+            raise
+
+    def read_registry(self):
+        name, fd = self._read_registry()
+        if fd is not None:
+            os.close(fd)
+        return name
+
+    def load(self):
+        basename = self.read_registry()
+        if basename is None:
+            return None
+        self._open_stage(basename)
+        self.verify()
+        return basename
+
+    def remove(self, race_hook=None):
+        if self.stage_fd is None:
+            return
+        self.verify()
+        registered, registry_fd = self._read_registry()
+        if registered is not None and registered != self.basename:
+            os.close(registry_fd)
+            raise UnsafeInput("Compose input registry identity changed")
+        detached = ".delete-" + secrets.token_hex(12)
+        try:
+            if race_hook:
+                race_hook()
+            os.rename(self.basename, detached, src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd)
+        except Exception:
+            if registry_fd is not None:
+                os.close(registry_fd)
+            raise
+        candidate = None
+        exact_detach = False
+        try:
+            candidate = os.open(detached, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=self.parent_fd)
+            if not same_identity(self.stage_fd, candidate):
+                raise UnsafeInput("Compose input stage changed before cleanup detach")
+            exact_detach = True
+            if registered is not None:
+                visible = os.open(self.registry, os.O_RDONLY | NOFOLLOW, dir_fd=self.parent_fd)
+                try:
+                    if not same_identity(registry_fd, visible):
+                        raise UnsafeInput("Compose input registry changed before cleanup")
+                finally:
+                    os.close(visible)
+                os.unlink(self.registry, dir_fd=self.parent_fd)
+            self.clear_snapshots()
+            self.close_stage()
+            remove_tree(candidate)
+            os.close(candidate)
+            candidate = None
+            os.rmdir(detached, dir_fd=self.parent_fd)
+        finally:
+            if candidate is not None:
+                os.close(candidate)
+            if registry_fd is not None:
+                os.close(registry_fd)
+            if not exact_detach:
+                try:
+                    os.stat(self.basename, dir_fd=self.parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    try:
+                        os.rename(detached, self.basename, src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd)
+                    except FileNotFoundError:
+                        pass
+
+    def run(self, argv, race_hook=None, stdio=None):
+        self.verify()
+        if race_hook:
+            race_hook()
+        self.verify_chain()
+        env = os.environ.copy()
+        env["NMCP_COMPOSE_INPUT_VOLUME"] = self.volume
+        for variable in self.snapshot_names:
+            fd = self.input_fds[variable]
+            env[variable] = f"/proc/{os.getpid()}/fd/{fd}"
+        kwargs = {}
+        if stdio is not None:
+            kwargs = {"stdin": stdio[0], "stdout": stdio[1], "stderr": stdio[2]}
+        return subprocess.call(argv, env=env, **kwargs)
+
+
+def respond(sock, payload):
+    sock.send(json.dumps(payload, separators=(",", ":")).encode())
+
+
+def serve(sock, child, store):
+    sock.settimeout(0.1)
+    while child.poll() is None:
+        try:
+            raw, ancillary, _, _ = sock.recvmsg(
+                1024 * 1024, socket.CMSG_SPACE(3 * array.array("i").itemsize)
+            )
+        except socket.timeout:
+            continue
+        if not raw:
+            break
+        passed_fds = []
+        try:
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    values = array.array("i")
+                    values.frombytes(data[: len(data) - (len(data) % values.itemsize)])
+                    passed_fds.extend(values)
+            request = json.loads(raw)
+            command = request["command"]
+            if command == "stage":
+                result = store.stage()
+            elif command == "load":
+                result = store.load()
+            elif command == "verify":
+                store.verify()
+                result = True
+            elif command == "register":
+                store.register()
+                result = True
+            elif command == "restage":
+                store.restage(request["name"])
+                result = True
+            elif command == "publish":
+                result = store.publish()
+            elif command == "unpublish":
+                store.unpublish()
+                result = True
+            elif command == "remove":
+                store.remove()
+                result = True
+            elif command == "run":
+                if len(passed_fds) != 3:
+                    raise UnsafeInput("validation command did not provide stdin/stdout/stderr")
+                result = store.run(request["argv"], stdio=passed_fds)
+            else:
+                raise UnsafeInput(f"unknown validation input command: {command}")
+            respond(sock, {"ok": True, "result": result})
+        except Exception as exc:
+            respond(sock, {"ok": False, "error": str(exc)})
+        finally:
+            for passed_fd in passed_fds:
+                os.close(passed_fd)
+    return child.wait()
+
+
+def invoke(root, project, script, arguments):
+    check_project(project)
+    uid = os.getuid()
+    root_path = os.path.realpath(root)
+    if os.path.abspath(root) != root_path:
+        raise UnsafeInput("validation repository root must be canonical and non-symlinked")
+    root_fd = os.open(root_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+    validation_fd = parent_fd = lock_fd = None
+    try:
+        owned_directory(root_fd, uid)
+        validation_fd = open_directory(".validation", root_fd, uid, create=True)
+        parent_fd = open_directory("compose-inputs", validation_fd, uid, private=True, create=True)
+        lock_fd = os.open(project + ".lock", os.O_RDWR | os.O_CREAT | NOFOLLOW, 0o600, dir_fd=parent_fd)
+        lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != uid or stat.S_IMODE(lock_info.st_mode) != 0o600:
+            raise UnsafeInput("unsafe validation project lock")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        owner = hashlib.sha256(os.fsencode(root_path)).hexdigest()
+        server_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        os.set_inheritable(child_sock.fileno(), True)
+        env = os.environ.copy()
+        env["NMCP_VALIDATION_INPUTS_MANAGED"] = "1"
+        env["NMCP_VALIDATION_INPUTS_PROJECT"] = project
+        env["NMCP_VALIDATION_INPUTS_FD"] = str(child_sock.fileno())
+        child = subprocess.Popen([script, *arguments], env=env, pass_fds=(child_sock.fileno(),))
+        child_sock.close()
+        store = Store(root_path, root_fd, validation_fd, parent_fd, project, owner, uid)
+        try:
+            return serve(server_sock, child, store)
+        finally:
+            if store.stage_fd is not None and store.read_registry() != store.basename:
+                store.unpublish()
+                store.remove()
+            store.close_stage()
+            server_sock.close()
+    finally:
+        for fd in (lock_fd, parent_fd, validation_fd, root_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+def client(command, argv):
+    fd = int(os.environ["NMCP_VALIDATION_INPUTS_FD"])
+    sock = socket.socket(fileno=os.dup(fd))
+    request = {"command": command}
+    if command == "run":
+        request["argv"] = argv
+    elif command == "restage":
+        if len(argv) != 1:
+            raise UnsafeInput("restage requires one output basename")
+        request["name"] = argv[0]
+    payload = json.dumps(request, separators=(",", ":")).encode()
+    if command == "run":
+        descriptors = array.array("i", (0, 1, 2))
+        sock.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)])
+    else:
+        sock.send(payload)
+    response = json.loads(sock.recv(1024 * 1024))
+    if not response["ok"]:
+        raise UnsafeInput(response["error"])
+    result = response["result"]
+    if command in ("stage", "load", "publish") and result is not None:
+        print(result)
+    return result if command == "run" else 0
+
+
+def expect_denied(label, operation):
+    try:
+        operation()
+    except (UnsafeInput, OSError):
+        return
+    raise AssertionError(f"accepted {label}")
+
+
+def self_test():
+    project = "stage-test"
+    owner = "a" * 64
+    uid = os.getuid()
+    with tempfile.TemporaryDirectory() as temporary:
+        root = os.path.join(temporary, "repo")
+        outside = os.path.join(temporary, "outside")
+        os.mkdir(root, 0o700)
+        os.mkdir(outside, 0o700)
+        sentinel = os.path.join(outside, "sentinel")
+        with open(sentinel, "w", encoding="ascii") as stream:
+            stream.write("unchanged")
+        root_fd = os.open(root, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+        os.mkdir(".validation", 0o700, dir_fd=root_fd)
+        validation_fd = open_directory(".validation", root_fd, uid)
+        os.mkdir("compose-inputs", 0o700, dir_fd=validation_fd)
+        parent_fd = open_directory("compose-inputs", validation_fd, uid, private=True)
+
+        moved_validation = os.path.join(temporary, "moved-validation")
+        os.rename(os.path.join(root, ".validation"), moved_validation)
+        os.symlink(outside, os.path.join(root, ".validation"))
+        assert os.fstat(validation_fd).st_ino == os.stat(moved_validation).st_ino
+        expect_denied("parent symlink", lambda: open_directory(".validation", root_fd, uid))
+        os.unlink(os.path.join(root, ".validation"))
+        os.rename(moved_validation, os.path.join(root, ".validation"))
+        moved_inputs = os.path.join(temporary, "moved-inputs")
+        inputs_path = os.path.join(root, ".validation", "compose-inputs")
+        os.rename(inputs_path, moved_inputs)
+        os.symlink(outside, inputs_path)
+        expect_denied("intermediate symlink", lambda: open_directory("compose-inputs", validation_fd, uid))
+        os.unlink(inputs_path)
+        os.rename(moved_inputs, inputs_path)
+
+        for bad in (b"", b".\n", b"..\n", b"/\n", b"../outside\n"):
+            fd = os.open(project + ".registry", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600, dir_fd=parent_fd)
+            os.write(fd, bad)
+            os.close(fd)
+            store = Store(root, root_fd, validation_fd, parent_fd, project, owner, uid)
+            expect_denied(repr(bad), store.load)
+        os.unlink(project + ".registry", dir_fd=parent_fd)
+
+        def fake_store():
+            store = Store(root, root_fd, validation_fd, parent_fd, project, owner, uid)
+            store.source_data = lambda path: (path + "\n").encode()
+            return store
+
+        store = fake_store()
+        basename = store.stage()
+        store.register()
+        leaf = os.path.join(root, ".validation", "compose-inputs", basename, "postgres-init.sql")
+        os.unlink(leaf)
+        os.symlink(sentinel, leaf)
+        expect_denied("leaf symlink", store.verify)
+        store.close_stage()
+
+        store = fake_store()
+        basename = store.stage()
+        store.register()
+        stage_path = os.path.join(root, ".validation", "compose-inputs", basename)
+        moved = os.path.join(outside, basename)
+        os.rename(stage_path, moved)
+        os.symlink(moved, stage_path)
+        store.close_stage()
+        expect_denied("moved-outside reload", store.load)
+        os.unlink(stage_path)
+        os.rename(moved, stage_path)
+        store.load()
+
+        moved_parent = os.path.join(temporary, "moved-compose-inputs")
+        os.rename(inputs_path, moved_parent)
+        os.symlink(outside, inputs_path)
+        store.close_stage()
+        expect_denied("moved-outside registry reload", store.load)
+        os.unlink(inputs_path)
+        os.rename(moved_parent, inputs_path)
+        store.load()
+
+        moved_snapshots = []
+        def swap_snapshots():
+            for name in store.snapshot_names.values():
+                path = os.path.join(inputs_path, name)
+                moved_snapshot = os.path.join(outside, "moved-" + name)
+                os.rename(path, moved_snapshot)
+                with open(path, "wb") as stream:
+                    stream.write(b"outside")
+                os.chmod(path, 0o444)
+                moved_snapshots.append((path, moved_snapshot))
+        expected = (INPUTS[0][1] + "\n").encode()
+        def swap_stage():
+            os.rename(stage_path, os.path.join(outside, "original"))
+            os.symlink(outside, stage_path)
+        command = [
+            sys.executable,
+            "-c",
+            "import os,sys; assert open(os.environ['NMCP_POSTGRES_INIT_SQL'], 'rb').read() == sys.argv[1].encode()",
+            expected.decode(),
+        ]
+        assert store.run(command, race_hook=swap_snapshots) == 0
+        for path, moved_snapshot in moved_snapshots:
+            os.unlink(path)
+            os.rename(moved_snapshot, path)
+
+        expect_denied("verify-to-cleanup swap", lambda: store.remove(race_hook=swap_stage))
+        assert open(sentinel, encoding="ascii").read() == "unchanged"
+        if os.path.islink(stage_path):
+            os.unlink(stage_path)
+        detached = [name for name in os.listdir(os.path.join(root, ".validation", "compose-inputs")) if name.startswith(".delete-")]
+        for name in detached:
+            path = os.path.join(root, ".validation", "compose-inputs", name)
+            if os.path.islink(path):
+                os.unlink(path)
+
+        partial = fake_store()
+        calls = 0
+        def failing_source(path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise UnsafeInput("injected partial-stage failure")
+            return b"safe\n"
+        partial.source_data = failing_source
+        before = set(os.listdir(os.path.join(root, ".validation", "compose-inputs")))
+        expect_denied("partial staging", partial.stage)
+        after = set(os.listdir(os.path.join(root, ".validation", "compose-inputs")))
+        assert before == after
+
+        lock_name = project + ".lock-test"
+        lock_a = os.open(lock_name, os.O_RDWR | os.O_CREAT | NOFOLLOW, 0o600, dir_fd=parent_fd)
+        lock_b = os.open(lock_name, os.O_RDWR | NOFOLLOW, dir_fd=parent_fd)
+        fcntl.flock(lock_a, fcntl.LOCK_EX)
+        pid = os.fork()
+        if pid == 0:
+            start = time.monotonic()
+            fcntl.flock(lock_b, fcntl.LOCK_EX)
+            os._exit(0 if time.monotonic() - start >= 0.15 else 1)
+        time.sleep(0.2)
+        fcntl.flock(lock_a, fcntl.LOCK_UN)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        os.close(lock_a)
+        os.close(lock_b)
+        assert open(sentinel, encoding="ascii").read() == "unchanged"
+        os.close(parent_fd)
+        os.close(validation_fd)
+        os.close(root_fd)
+
+        sleeper = os.path.join(root, "sleep-validation")
+        with open(sleeper, "w", encoding="ascii") as stream:
+            stream.write("#!/bin/sh\nsleep \"$1\"\n")
+        os.chmod(sleeper, 0o700)
+        helper = os.path.realpath(__file__)
+        def timed_invocations(projects):
+            started = time.monotonic()
+            children = [
+                subprocess.Popen([sys.executable, helper, "invoke", root, name, sleeper, "0.3"])
+                for name in projects
+            ]
+            assert all(child.wait() == 0 for child in children)
+            return time.monotonic() - started
+        serialized = timed_invocations(("concurrent", "concurrent"))
+        parallel = timed_invocations(("peer-a", "peer-b"))
+        assert serialized >= 0.55, serialized
+        assert parallel < serialized - 0.15, (serialized, parallel)
+    print("validation input security tests passed")
+    return 0
+
+
+def main():
+    try:
+        if len(sys.argv) >= 2 and sys.argv[1] == "invoke":
+            if len(sys.argv) < 5:
+                raise UnsafeInput("invoke requires ROOT PROJECT SCRIPT [ARGS...]")
+            return invoke(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:])
+        if len(sys.argv) >= 3 and sys.argv[1] == "client":
+            return client(sys.argv[2], sys.argv[3:])
+        if sys.argv[1:] == ["self-test"]:
+            return self_test()
+        raise UnsafeInput("usage: validation-inputs {invoke|client|self-test} ...")
+    except (UnsafeInput, OSError, subprocess.CalledProcessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
