@@ -17,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import zlib
 
 
 INPUTS = (
@@ -138,15 +139,218 @@ def read_limited(fd, limit, label):
 
 
 def git_output(gitdir_fd, commondir_fd, *arguments, text=False):
+    gitdir = f"/proc/{os.getpid()}/fd/{gitdir_fd}"
     common = f"/proc/{os.getpid()}/fd/{commondir_fd}"
     return subprocess.check_output(
-        ["git", "--no-replace-objects", f"--git-dir={common}", *arguments],
+        ["git", "--no-replace-objects", f"--git-dir={gitdir}", *arguments],
         text=text,
         env=git_environment({
             "GIT_COMMON_DIR": common,
             "GIT_OBJECT_DIRECTORY": common + "/objects",
+            "GIT_NO_LAZY_FETCH": "1",
         }),
     )
+
+
+def read_verified_git_object(gitdir_fd, commondir_fd, expected_oid, expected_type, limit):
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", expected_oid):
+        raise UnsafeInput("invalid expected Git object name")
+    gitdir = f"/proc/{os.getpid()}/fd/{gitdir_fd}"
+    common = f"/proc/{os.getpid()}/fd/{commondir_fd}"
+    process = subprocess.Popen(
+        ["git", "--no-replace-objects", f"--git-dir={gitdir}", "cat-file", "--batch"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=git_environment({
+            "GIT_COMMON_DIR": common,
+            "GIT_OBJECT_DIRECTORY": common + "/objects",
+            "GIT_NO_LAZY_FETCH": "1",
+        }),
+    )
+    try:
+        process.stdin.write(expected_oid.encode("ascii") + b"\n")
+        process.stdin.close()
+        header = process.stdout.readline(1025)
+        if not header.endswith(b"\n") or len(header) > 1024:
+            raise UnsafeInput("invalid Git object response header")
+        fields = header[:-1].split(b" ")
+        if len(fields) != 3:
+            raise UnsafeInput("Git object is missing or malformed")
+        returned_oid, object_type, raw_size = fields
+        try:
+            size = int(raw_size)
+        except ValueError as exc:
+            raise UnsafeInput("Git object has an invalid size") from exc
+        if (
+            returned_oid.decode("ascii", "strict") != expected_oid
+            or object_type.decode("ascii", "strict") != expected_type
+            or size < 0 or size > limit
+        ):
+            raise UnsafeInput("Git object identity, type, or size mismatch")
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = process.stdout.read(min(remaining, 65536))
+            if not chunk:
+                raise UnsafeInput("short Git object response")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if process.stdout.read(1) != b"\n" or process.stdout.read(1) != b"":
+            raise UnsafeInput("invalid Git object response terminator")
+        if process.wait() != 0:
+            raise UnsafeInput("Git object reader failed")
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
+    algorithm = hashlib.sha1 if len(expected_oid) == 40 else hashlib.sha256
+    frame = expected_type.encode("ascii") + b" " + str(len(data)).encode("ascii") + b"\0" + data
+    if not secrets.compare_digest(algorithm(frame).hexdigest(), expected_oid):
+        raise UnsafeInput(f"mutable Git {expected_type} bytes do not match their object name")
+    return data
+
+
+def commit_tree_oid(data, oid_length):
+    first = data.split(b"\n", 1)[0]
+    prefix = b"tree "
+    if not first.startswith(prefix):
+        raise UnsafeInput("verified Git commit has no leading tree")
+    oid = first[len(prefix):]
+    if len(oid) != oid_length or not re.fullmatch(b"[0-9a-f]+", oid):
+        raise UnsafeInput("verified Git commit has an invalid tree object name")
+    return oid.decode("ascii")
+
+
+def parse_tree(data, oid_length):
+    entries = {}
+    offset = 0
+    raw_oid_length = oid_length // 2
+    while offset < len(data):
+        space = data.find(b" ", offset)
+        nul = data.find(b"\0", space + 1 if space >= 0 else offset)
+        if space <= offset or nul <= space + 1 or nul + 1 + raw_oid_length > len(data):
+            raise UnsafeInput("verified Git tree is malformed")
+        mode = data[offset:space]
+        name = data[space + 1:nul]
+        if b"/" in name or name in (b"", b".", b"..") or name in entries:
+            raise UnsafeInput("verified Git tree has an unsafe or duplicate name")
+        raw_oid = data[nul + 1:nul + 1 + raw_oid_length]
+        entries[name] = (mode, raw_oid.hex())
+        offset = nul + 1 + raw_oid_length
+    return entries
+
+
+def tree_entry_oid(entries, name, expected_mode, tracked_path):
+    try:
+        mode, oid = entries[name]
+    except KeyError as exc:
+        raise UnsafeInput(f"tracked input is absent from verified Git tree: {tracked_path}") from exc
+    if mode != expected_mode:
+        kind = "tree" if expected_mode == b"40000" else "regular non-executable Git blob"
+        raise UnsafeInput(f"tracked input is not a {kind}: {tracked_path}")
+    return oid
+
+
+def verified_commit_inputs(gitdir_fd, commondir_fd, commit_oid):
+    oid_length = len(commit_oid)
+    cache = {}
+
+    def verified(oid, object_type, limit):
+        key = (oid, object_type)
+        if key not in cache:
+            cache[key] = read_verified_git_object(
+                gitdir_fd, commondir_fd, oid, object_type, limit,
+            )
+        return cache[key]
+
+    commit = verified(commit_oid, "commit", 1024 * 1024)
+    root_tree = commit_tree_oid(commit, oid_length)
+    snapshots = {}
+    for _, tracked_path, _ in INPUTS:
+        tree_oid = root_tree
+        parts = [os.fsencode(part) for part in tracked_path.split("/")]
+        for index, part in enumerate(parts):
+            tree = parse_tree(verified(tree_oid, "tree", 64 * 1024 * 1024), oid_length)
+            if index < len(parts) - 1:
+                tree_oid = tree_entry_oid(tree, part, b"40000", tracked_path)
+            else:
+                oid = tree_entry_oid(tree, part, b"100644", tracked_path)
+                snapshots[tracked_path] = verified(oid, "blob", 64 * 1024 * 1024)
+    return snapshots
+
+
+def read_ref_value(base_fd, reference):
+    current = os.dup(base_fd)
+    try:
+        parts = reference.split("/")
+        for part in parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=current)
+            os.close(current)
+            current = next_fd
+        fd = os.open(parts[-1], os.O_RDONLY | NOFOLLOW, dir_fd=current)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise UnsafeInput("Git reference is not a regular file")
+            return read_limited(fd, 4096, "Git reference").decode("ascii").strip()
+        finally:
+            os.close(fd)
+    finally:
+        os.close(current)
+
+
+def read_packed_ref(commondir_fd, reference):
+    try:
+        fd = os.open("packed-refs", os.O_RDONLY | NOFOLLOW, dir_fd=commondir_fd)
+    except FileNotFoundError as exc:
+        raise UnsafeInput("repository HEAD reference is missing") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise UnsafeInput("repository packed-refs is not a regular file")
+        data = read_limited(fd, 16 * 1024 * 1024, "repository packed-refs")
+    finally:
+        os.close(fd)
+    matches = []
+    encoded = reference.encode("ascii")
+    for line in data.splitlines():
+        if not line or line.startswith((b"#", b"^")):
+            continue
+        fields = line.split(b" ", 1)
+        if len(fields) != 2:
+            raise UnsafeInput("repository packed-refs is malformed")
+        if fields[1] == encoded:
+            matches.append(fields[0].decode("ascii", "strict"))
+    if len(matches) != 1:
+        raise UnsafeInput("repository HEAD reference is missing or duplicated")
+    return matches[0]
+
+
+def resolve_pinned_ref(gitdir_fd, commondir_fd, reference):
+    for _ in range(8):
+        if (
+            not re.fullmatch(r"refs/[A-Za-z0-9._/-]+", reference)
+            or ".." in reference or "//" in reference or "/." in reference
+            or reference.endswith(("/", ".", ".lock"))
+        ):
+            raise UnsafeInput("repository HEAD contains an unsafe symbolic reference")
+        private = reference.startswith(("refs/worktree/", "refs/bisect/", "refs/rewritten/"))
+        try:
+            value = read_ref_value(gitdir_fd if private else commondir_fd, reference)
+        except FileNotFoundError:
+            if private:
+                raise UnsafeInput("repository worktree-private HEAD reference is missing")
+            value = read_packed_ref(commondir_fd, reference)
+        if value.startswith("ref: "):
+            reference = value[5:]
+            continue
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value):
+            raise UnsafeInput("repository HEAD reference has an invalid object name")
+        return value.lower()
+    raise UnsafeInput("repository HEAD reference recursion is too deep")
 
 
 def resolve_pinned_head(gitdir_fd, commondir_fd):
@@ -161,23 +365,11 @@ def resolve_pinned_head(gitdir_fd, commondir_fd):
         raise UnsafeInput("repository HEAD is not ASCII") from exc
     if value.startswith("ref: "):
         reference = value[5:]
-        if (
-            not re.fullmatch(r"refs/[A-Za-z0-9._/-]+", reference)
-            or ".." in reference or "//" in reference or "/." in reference
-            or reference.endswith(("/", ".", ".lock"))
-        ):
-            raise UnsafeInput("repository HEAD contains an unsafe symbolic reference")
-        revision = reference + "^{commit}"
+        return resolve_pinned_ref(gitdir_fd, commondir_fd, reference)
     else:
         if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value):
             raise UnsafeInput("repository HEAD contains an invalid object name")
-        revision = value + "^{commit}"
-    try:
-        return git_output(
-            gitdir_fd, commondir_fd, "rev-parse", "--verify", revision, text=True,
-        ).strip()
-    except subprocess.CalledProcessError as exc:
-        raise UnsafeInput("repository HEAD does not resolve to a commit") from exc
+        return value.lower()
 
 
 def reject_object_alternates(commondir_fd):
@@ -198,6 +390,40 @@ def reject_object_alternates(commondir_fd):
         for fd in (info_fd, objects_fd):
             if fd is not None:
                 os.close(fd)
+
+
+def reject_unsupported_ref_storage(commondir_fd):
+    try:
+        info = os.stat("reftable", dir_fd=commondir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        raise UnsafeInput("repository reftable ref storage is not supported")
+    try:
+        config_fd = os.open("config", os.O_RDONLY | NOFOLLOW, dir_fd=commondir_fd)
+    except FileNotFoundError:
+        return
+    try:
+        info = os.fstat(config_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise UnsafeInput("repository config is not a regular file")
+        config = read_limited(config_fd, 1024 * 1024, "repository config").decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UnsafeInput("repository config is not UTF-8") from exc
+    finally:
+        os.close(config_fd)
+    section = None
+    for raw_line in config.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section == "extensions":
+            key, separator, value = line.partition("=")
+            if separator and key.strip().lower() == "refstorage" and value.strip().lower() != "files":
+                raise UnsafeInput("repository ref storage must use loose/packed files")
 
 
 def canonical_directory(path, label):
@@ -262,19 +488,42 @@ def resolve_checkout_git(root_path, root_fd, git_entry_fd):
                 common_name = os.path.join(gitdir_path, common_name)
             os.close(common_fd)
             common_path, common_fd = canonical_directory(os.path.normpath(common_name), "commondir")
+        if common_data is not None and entry_data is None:
+            raise UnsafeInput("directory-style repository gitdir must not redirect commondir")
         if entry_data is not None and common_data is not None:
+            worktrees_fd = member_fd = backlink_entry_fd = None
             try:
+                if os.path.dirname(gitdir_path) != os.path.join(common_path, "worktrees"):
+                    raise UnsafeInput("linked-worktree gitdir is not owned by its commondir")
+                worktrees_fd = os.open(
+                    "worktrees", os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=common_fd,
+                )
+                member_fd = os.open(
+                    os.path.basename(gitdir_path), os.O_RDONLY | DIRECTORY | NOFOLLOW,
+                    dir_fd=worktrees_fd,
+                )
+                if not same_identity(member_fd, gitdir_fd):
+                    raise UnsafeInput("linked-worktree commondir does not own its admin gitdir")
                 backlink_fd = os.open("gitdir", os.O_RDONLY | NOFOLLOW, dir_fd=gitdir_fd)
+                try:
+                    backlink_data, backlink_name = read_git_path_file(backlink_fd, "gitdir backlink")
+                finally:
+                    os.close(backlink_fd)
+                if not os.path.isabs(backlink_name):
+                    backlink_name = os.path.join(gitdir_path, backlink_name)
+                backlink_name = os.path.abspath(os.path.normpath(backlink_name))
+                if backlink_name != os.path.join(root_path, ".git"):
+                    raise UnsafeInput("linked-worktree gitdir backlink does not name this checkout")
+                backlink_entry_fd = os.open(backlink_name, os.O_RDONLY | NOFOLLOW)
+                if not same_identity(backlink_entry_fd, git_entry_fd):
+                    raise UnsafeInput("linked-worktree backlink does not identify this checkout gitfile")
             except OSError as exc:
-                raise UnsafeInput("linked-worktree gitdir has no safe backlink") from exc
-            try:
-                backlink_data, backlink_name = read_git_path_file(backlink_fd, "gitdir backlink")
+                raise UnsafeInput("linked-worktree admin relationship is unsafe") from exc
             finally:
-                os.close(backlink_fd)
-            if not os.path.isabs(backlink_name):
-                backlink_name = os.path.join(gitdir_path, backlink_name)
-            if os.path.abspath(os.path.normpath(backlink_name)) != os.path.join(root_path, ".git"):
-                raise UnsafeInput("linked-worktree gitdir backlink does not name this checkout")
+                for fd in (backlink_entry_fd, member_fd, worktrees_fd):
+                    if fd is not None:
+                        os.close(fd)
+        reject_unsupported_ref_storage(common_fd)
         reject_object_alternates(common_fd)
         return (
             gitdir_path, gitdir_fd, entry_data, common_path, common_fd,
@@ -363,6 +612,7 @@ class Store:
         commondir_fd=None,
         commondir_data=None,
         git_backlink_data=None,
+        source_snapshots=None,
     ):
         self.root_path = root_path
         self.root_fd = root_fd
@@ -380,6 +630,7 @@ class Store:
         self.commondir_fd = commondir_fd if commondir_fd is not None else gitdir_fd
         self.commondir_data = commondir_data
         self.git_backlink_data = git_backlink_data
+        self.source_snapshots = source_snapshots
         self.basename = None
         self.stage_fd = None
         self.input_fds = {}
@@ -431,6 +682,7 @@ class Store:
             common_fd = os.open(self.commondir_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
             if not same_identity(self.commondir_fd, common_fd):
                 raise UnsafeInput("repository commondir identity changed")
+            reject_unsupported_ref_storage(common_fd)
             reject_object_alternates(common_fd)
             os.close(common_fd)
             if self.commondir_data is not None:
@@ -481,6 +733,11 @@ class Store:
 
     def source_data(self, tracked_path):
         self.verify_git_identity()
+        if self.gitdir_fd is not None and self.source_snapshots is None:
+            self.source_snapshots = verified_commit_inputs(
+                self.gitdir_fd, self.commondir_fd, self.commit_oid,
+            )
+        expected = self.source_snapshots[tracked_path] if self.gitdir_fd is not None else None
         parts = tracked_path.split("/")
         if any(part in ("", ".", "..") for part in parts):
             raise UnsafeInput("invalid tracked input path")
@@ -501,14 +758,14 @@ class Store:
                     if not chunk:
                         break
                     data += chunk
+                    if expected is not None and len(data) > len(expected):
+                        raise UnsafeInput(f"tracked Compose input exceeds its verified Git blob: {tracked_path}")
             finally:
                 os.close(fd)
         finally:
             os.close(current)
-        expected = git_output(
-            self.gitdir_fd, self.commondir_fd,
-            "cat-file", "blob", f"{self.commit_oid}:{tracked_path}"
-        ) if self.gitdir_fd is not None else data
+        if expected is None:
+            expected = data
         self.verify_git_identity()
         if data != expected:
             raise UnsafeInput(f"Compose input differs from the exact HEAD blob: {tracked_path}")
@@ -1928,7 +2185,7 @@ def invoke(root, project, script, arguments):
     root_fd = os.open(root_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
     validation_fd = parent_fd = git_entry_fd = gitdir_fd = commondir_fd = None
     gitdir_path = git_entry_data = commondir_path = commondir_data = git_backlink_data = None
-    commit_oid = None
+    commit_oid = source_snapshots = None
     lock_sock = None
     try:
         owned_directory(root_fd, uid)
@@ -1939,6 +2196,9 @@ def invoke(root, project, script, arguments):
                 commondir_path, commondir_fd, commondir_data, git_backlink_data,
             ) = resolve_checkout_git(root_path, root_fd, git_entry_fd)
             commit_oid = resolve_pinned_head(gitdir_fd, commondir_fd)
+            source_snapshots = verified_commit_inputs(gitdir_fd, commondir_fd, commit_oid)
+            if resolve_pinned_head(gitdir_fd, commondir_fd) != commit_oid:
+                raise UnsafeInput("repository HEAD changed while snapshotting verified inputs")
         validation_fd = open_directory(".validation", root_fd, uid, create=True)
         parent_fd = open_directory("compose-inputs", validation_fd, uid, private=True, create=True)
         root_info = os.fstat(root_fd)
@@ -1982,6 +2242,7 @@ def invoke(root, project, script, arguments):
             commondir_fd,
             commondir_data,
             git_backlink_data,
+            source_snapshots,
         )
         try:
             return serve(server_sock, child, store, allowed_commands)
@@ -2223,6 +2484,68 @@ def self_test():
                 pass
             os.rename(moved_git_entry, os.path.join(root, ".git"))
         assert lifecycle.read_registry() is None
+
+        wrapper_root = os.path.join(temporary, "wrapper-root")
+        wrapper_scripts = os.path.join(wrapper_root, "scripts")
+        os.makedirs(wrapper_scripts, mode=0o700)
+        wrapper = os.path.join(wrapper_scripts, "validation-env")
+        wrapper_helper = os.path.join(wrapper_scripts, "validation-inputs")
+        for source, destination in (
+            (os.path.join(os.path.dirname(helper), "validation-env"), wrapper),
+            (helper, wrapper_helper),
+        ):
+            with open(source, "rb") as input_stream, open(destination, "wb") as output_stream:
+                output_stream.write(input_stream.read())
+            os.chmod(destination, 0o700)
+        wrapper_bin = os.path.join(temporary, "wrapper-bin")
+        os.mkdir(wrapper_bin, 0o700)
+        wrapper_log = os.path.join(temporary, "wrapper-docker.log")
+        wrapper_sha_log = os.path.join(temporary, "wrapper-sha.log")
+        with open(os.path.join(wrapper_bin, "docker"), "w", encoding="ascii") as stream:
+            stream.write(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$*\" >>{wrapper_log!r}\n"
+                "if [ \"${1:-}\" = compose ]; then exit 97; fi\n"
+                "exit 0\n"
+            )
+        os.chmod(os.path.join(wrapper_bin, "docker"), 0o700)
+        with open(os.path.join(wrapper_bin, "sha256sum"), "w", encoding="ascii") as stream:
+            stream.write(f"#!/bin/sh\nprintf called >>{wrapper_sha_log!r}\nexit 96\n")
+        os.chmod(os.path.join(wrapper_bin, "sha256sum"), 0o700)
+        os.symlink(os.path.realpath(sys.executable), os.path.join(wrapper_bin, "python3"))
+        os.symlink("/usr/bin/dirname", os.path.join(wrapper_bin, "dirname"))
+        wrapper_env = {
+            key: value for key, value in os.environ.items()
+            if key not in (
+                "NMCP_VALIDATION_INPUTS_MANAGED", "NMCP_VALIDATION_INPUTS_PROJECT",
+                "NMCP_VALIDATION_INPUTS_FD",
+            )
+        }
+        wrapper_env.update({
+            "PATH": wrapper_bin,
+            "NMCP_VALIDATION_PROJECT": "wrapper-lifecycle-test",
+        })
+        expected_lifecycle_calls = {
+            "logs": ("container ls",),
+            "down": ("container ls", "network ls"),
+            "reset": (
+                "container ls", "network ls", "volume ls", "volume prune",
+                "volume ls", "image ls", "volume ls",
+            ),
+        }
+        for command_name, expected_calls in expected_lifecycle_calls.items():
+            with open(wrapper_log, "w", encoding="ascii"):
+                pass
+            assert subprocess.run(
+                [wrapper, command_name], env=wrapper_env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode == 0
+            with open(wrapper_log, encoding="ascii") as stream:
+                wrapper_calls = stream.read().splitlines()
+            assert wrapper_calls and not any(call.startswith("compose ") for call in wrapper_calls)
+            assert tuple(" ".join(call.split()[:2]) for call in wrapper_calls) == expected_calls
+        assert not os.path.exists(wrapper_sha_log)
+
         validation_env = os.path.join(os.path.dirname(os.path.realpath(__file__)), "validation-env")
         with open(validation_env, encoding="ascii") as stream:
             dispatch = stream.read()
@@ -2639,10 +2962,125 @@ def self_test():
         delayed_stage_child = os.path.join(temporary, "delayed-stage-child")
         with open(delayed_stage_child, "w", encoding="ascii") as stream:
             stream.write(
-                "#!/bin/sh\nset -eu\nsleep 0.3\n"
+                "#!/bin/sh\nset -eu\n"
+                "if [ -n \"${NMCP_DELAY_READY:-}\" ]; then : >\"$NMCP_DELAY_READY\"; fi\n"
+                "sleep 0.3\n"
                 f"python3 {helper!r} client stage >/dev/null\n"
             )
         os.chmod(delayed_stage_child, 0o700)
+
+        root_head = os.path.join(root, ".git", "HEAD")
+        with open(root_head, "rb") as stream:
+            root_head_data = stream.read()
+        with open(root_head, "wb") as stream:
+            stream.write(pinned_commit.upper().encode("ascii") + b"\n")
+        try:
+            assert subprocess.run(
+                [sys.executable, helper, "invoke", root, "uppercase-detached-head", stage_child],
+                env=git_environment(), stdout=subprocess.DEVNULL,
+            ).returncode == 0
+        finally:
+            with open(root_head, "wb") as stream:
+                stream.write(root_head_data)
+
+        subprocess.run(
+            ["git", "-C", root, "tag", "-a", "validation-annotated-tag", pinned_commit,
+             "-m", "validation tag"],
+            env=commit_env, check=True,
+        )
+        with open(root_head, "wb") as stream:
+            stream.write(b"ref: refs/tags/validation-annotated-tag\n")
+        try:
+            assert subprocess.run(
+                [sys.executable, helper, "invoke", root, "annotated-tag-head", stage_child],
+                env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0
+        finally:
+            with open(root_head, "wb") as stream:
+                stream.write(root_head_data)
+            subprocess.run(
+                ["git", "-C", root, "tag", "-d", "validation-annotated-tag"],
+                env=git_environment(), stdout=subprocess.DEVNULL, check=True,
+            )
+
+        packed_ref_gitdir = os.path.join(temporary, "packed-ref-gitdir")
+        os.makedirs(os.path.join(packed_ref_gitdir, "refs", "heads"), mode=0o700)
+        with open(os.path.join(packed_ref_gitdir, "HEAD"), "w", encoding="ascii") as stream:
+            stream.write("ref: refs/heads/validation-symbolic\n")
+        with open(
+            os.path.join(packed_ref_gitdir, "refs", "heads", "validation-symbolic"),
+            "w", encoding="ascii",
+        ) as stream:
+            stream.write("ref: refs/heads/validation-packed\n")
+        with open(os.path.join(packed_ref_gitdir, "packed-refs"), "w", encoding="ascii") as stream:
+            stream.write(f"# pack-refs with: peeled fully-peeled sorted\n{pinned_commit} refs/heads/validation-packed\n")
+        packed_ref_fd = os.open(packed_ref_gitdir, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+        try:
+            assert resolve_pinned_head(packed_ref_fd, packed_ref_fd) == pinned_commit
+            with open(
+                os.path.join(packed_ref_gitdir, "refs", "heads", "validation-packed"),
+                "w", encoding="ascii",
+            ) as stream:
+                stream.write(older_commit + "\n")
+            assert resolve_pinned_head(packed_ref_fd, packed_ref_fd) == older_commit
+        finally:
+            os.close(packed_ref_fd)
+
+        malformed_tree_cases = (
+            b"100644 truncated\0short",
+            b"100644 duplicate\0" + bytes.fromhex(pinned_commit) + b"100644 duplicate\0" + bytes.fromhex(pinned_commit),
+            b"100644 ../unsafe\0" + bytes.fromhex(pinned_commit),
+            b"100644 missing-object-name",
+        )
+        for malformed_tree in malformed_tree_cases:
+            expect_denied(
+                "malformed verified Git tree",
+                lambda data=malformed_tree: parse_tree(data, len(pinned_commit)),
+            )
+        invalid_mode_entries = {b"infra": (b"100644", pinned_commit)}
+        expect_denied(
+            "non-tree intermediate tracked entry",
+            lambda: tree_entry_oid(invalid_mode_entries, b"infra", b"40000", INPUTS[0][1]),
+        )
+        invalid_mode_entries = {b"postgres-init.sql": (b"100755", pinned_commit)}
+        expect_denied(
+            "executable final tracked entry",
+            lambda: tree_entry_oid(
+                invalid_mode_entries, b"postgres-init.sql", b"100644", INPUTS[0][1],
+            ),
+        )
+
+        oversized_path = os.path.join(root, INPUTS[0][1])
+        with open(oversized_path, "rb") as stream:
+            oversized_original = stream.read()
+        oversized = subprocess.Popen(
+            [sys.executable, helper, "invoke", root, "oversized-source", delayed_stage_child],
+            env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.1)
+        with open(oversized_path, "ab") as stream:
+            stream.write(b"oversized after verified snapshot\n")
+        assert oversized.wait() != 0
+        with open(oversized_path, "wb") as stream:
+            stream.write(oversized_original)
+        os.chmod(oversized_path, 0o600)
+
+        reftable_root = os.path.join(temporary, "reftable-repo")
+        subprocess.run(
+            ["git", "init", "--quiet", "--ref-format=reftable", reftable_root],
+            env=git_environment(), check=True,
+        )
+        reftable_root_fd = os.open(reftable_root, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+        reftable_entry_fd = os.open(".git", os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=reftable_root_fd)
+        try:
+            expect_denied(
+                "unsupported reftable repository",
+                lambda: resolve_checkout_git(reftable_root, reftable_root_fd, reftable_entry_fd),
+            )
+        finally:
+            os.close(reftable_entry_fd)
+            os.close(reftable_root_fd)
+
         foreign_gitdir = os.path.join(temporary, "foreign.git")
         subprocess.run(
             ["git", "clone", "--quiet", "--bare", root, foreign_gitdir],
@@ -2652,6 +3090,16 @@ def self_test():
             ["git", f"--git-dir={foreign_gitdir}", "update-ref", "HEAD", pinned_commit + "^"],
             env=git_environment(), check=True,
         )
+        directory_commondir = os.path.join(root, ".git", "commondir")
+        with open(directory_commondir, "w", encoding="utf-8") as stream:
+            stream.write(foreign_gitdir + "\n")
+        try:
+            assert subprocess.run(
+                [sys.executable, helper, "invoke", root, "directory-foreign-commondir", stage_child],
+                env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0
+        finally:
+            os.unlink(directory_commondir)
         foreign_env = git_environment({
             "GIT_DIR": foreign_gitdir,
             "GIT_WORK_TREE": outside,
@@ -2678,6 +3126,105 @@ def self_test():
                 env=git_environment(), check=True,
             )
 
+        def substitute_loose_object(oid, object_type, data):
+            path = os.path.join(root, ".git", "objects", oid[:2], oid[2:])
+            with open(path, "rb") as stream:
+                original = stream.read()
+            replacement = path + ".replacement"
+            frame = object_type.encode("ascii") + b" " + str(len(data)).encode("ascii") + b"\0" + data
+            with open(replacement, "wb") as stream:
+                stream.write(zlib.compress(frame))
+            os.replace(replacement, path)
+            return path, original
+
+        def restore_loose_object(path, original):
+            replacement = path + ".restore"
+            with open(replacement, "wb") as stream:
+                stream.write(original)
+            os.replace(replacement, path)
+
+        commit_data = subprocess.check_output(
+            ["git", "-C", root, "cat-file", "commit", pinned_commit], env=git_environment(),
+        )
+        commit_path, original_commit_object = substitute_loose_object(
+            pinned_commit, "commit", commit_data + b"\nsubstituted commit bytes\n",
+        )
+        try:
+            assert subprocess.check_output(
+                ["git", "-C", root, "cat-file", "commit", pinned_commit], env=git_environment(),
+            ).endswith(b"substituted commit bytes\n")
+            assert subprocess.run(
+                [sys.executable, helper, "invoke", root, "loose-commit-substitution", stage_child],
+                env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0
+        finally:
+            restore_loose_object(commit_path, original_commit_object)
+
+        root_tree_oid = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", f"{pinned_commit}^{{tree}}"],
+            env=git_environment(), text=True,
+        ).strip()
+        root_tree_data = subprocess.check_output(
+            ["git", "-C", root, "cat-file", "tree", root_tree_oid], env=git_environment(),
+        )
+        assert b"README\0" in root_tree_data
+        tree_path, original_tree_object = substitute_loose_object(
+            root_tree_oid, "tree", root_tree_data.replace(b"README\0", b"READMX\0", 1),
+        )
+        try:
+            assert subprocess.run(
+                [sys.executable, helper, "invoke", root, "loose-tree-substitution", stage_child],
+                env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0
+        finally:
+            restore_loose_object(tree_path, original_tree_object)
+
+        attacked_path = INPUTS[0][1]
+        blob_oid = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", f"{pinned_commit}:{attacked_path}"],
+            env=git_environment(), text=True,
+        ).strip()
+        with open(os.path.join(root, attacked_path), "rb") as stream:
+            original_worktree_data = stream.read()
+        attacker_data = b"attacker-controlled SQL bytes\n"
+        blob_path, original_blob_object = substitute_loose_object(blob_oid, "blob", attacker_data)
+        with open(os.path.join(root, attacked_path), "wb") as stream:
+            stream.write(attacker_data)
+        try:
+            assert subprocess.check_output(
+                ["git", "-C", root, "cat-file", "blob", blob_oid], env=git_environment(),
+            ) == attacker_data
+            assert subprocess.run(
+                [sys.executable, helper, "invoke", root, "loose-blob-substitution", stage_child],
+                env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0
+        finally:
+            restore_loose_object(blob_path, original_blob_object)
+            with open(os.path.join(root, attacked_path), "wb") as stream:
+                stream.write(original_worktree_data)
+            os.chmod(os.path.join(root, attacked_path), 0o600)
+
+        snapshot_ready = os.path.join(temporary, "verified-snapshot-ready")
+        snapshot_env = git_environment({"NMCP_DELAY_READY": snapshot_ready})
+        snapshot_reuse = subprocess.Popen(
+            [sys.executable, helper, "invoke", root, "verified-snapshot-reuse", delayed_stage_child],
+            env=snapshot_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5
+        while not os.path.exists(snapshot_ready) and time.monotonic() < deadline:
+            if snapshot_reuse.poll() is not None:
+                break
+            time.sleep(0.01)
+        assert os.path.exists(snapshot_ready)
+        blob_path, original_blob_object = substitute_loose_object(blob_oid, "blob", attacker_data)
+        try:
+            assert snapshot_reuse.wait() == 0
+        finally:
+            if snapshot_reuse.poll() is None:
+                snapshot_reuse.kill()
+                snapshot_reuse.wait()
+            restore_loose_object(blob_path, original_blob_object)
+
         moved_gitdir = os.path.join(temporary, "moved-root-gitdir")
         root_swap = subprocess.Popen(
             [sys.executable, helper, "invoke", root, "directory-git-swap", delayed_stage_child],
@@ -2702,6 +3249,20 @@ def self_test():
         linked_gitfile = os.path.join(linked, ".git")
         with open(linked_gitfile, "rb") as stream:
             linked_gitfile_data = stream.read()
+        linked_admin_path = linked_gitfile_data.decode("utf-8").strip().removeprefix("gitdir: ")
+        linked_common_file = os.path.join(linked_admin_path, "commondir")
+        with open(linked_common_file, "rb") as stream:
+            linked_common_data = stream.read()
+        try:
+            with open(linked_common_file, "wb") as stream:
+                stream.write((foreign_gitdir + "\n").encode("utf-8"))
+            assert subprocess.run(
+                [sys.executable, helper, "invoke", linked, "foreign-linked-commondir", stage_child],
+                env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode != 0
+        finally:
+            with open(linked_common_file, "wb") as stream:
+                stream.write(linked_common_data)
         gitfile_swap = subprocess.Popen(
             [sys.executable, helper, "invoke", linked, "gitfile-swap", delayed_stage_child],
             env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -2729,10 +3290,19 @@ def self_test():
         with open(linked_gitfile, "wb") as stream:
             stream.write(linked_gitfile_data)
 
+        private_ref = "refs/worktree/validation-head"
         subprocess.run(
-            ["git", "-C", root, "update-ref", "refs/heads/pinned-common-test", pinned_commit],
+            ["git", "-C", linked, "update-ref", private_ref, pinned_commit],
             env=git_environment(), check=True,
         )
+        subprocess.run(
+            ["git", "-C", linked, "symbolic-ref", "HEAD", private_ref],
+            env=git_environment(), check=True,
+        )
+        assert subprocess.check_output(
+            ["git", "-C", linked, "rev-parse", "HEAD^{commit}"],
+            env=git_environment(), text=True,
+        ).strip() == pinned_commit
         linked_root_fd = os.open(linked, os.O_RDONLY | DIRECTORY | NOFOLLOW)
         linked_entry_fd = os.open(".git", os.O_RDONLY | NOFOLLOW, dir_fd=linked_root_fd)
         (
@@ -2742,25 +3312,27 @@ def self_test():
         with open(common_file, "rb") as stream:
             common_file_data = stream.read()
         try:
-            assert git_output(
-                linked_gitdir_fd, linked_common_fd,
-                "show-ref", "--verify", "refs/heads/pinned-common-test", text=True,
-            ).split()[0] == pinned_commit
+            assert resolve_pinned_head(linked_gitdir_fd, linked_common_fd) == pinned_commit
             with open(common_file, "wb") as stream:
                 stream.write((foreign_gitdir + "\n").encode("utf-8"))
             assert git_output(
                 linked_gitdir_fd, linked_common_fd,
-                "rev-parse", "--verify", "refs/heads/pinned-common-test^{commit}", text=True,
+                "rev-parse", "--verify", private_ref, text=True,
             ).strip() == pinned_commit
+            assert resolve_pinned_head(linked_gitdir_fd, linked_common_fd) == pinned_commit
         finally:
             with open(common_file, "wb") as stream:
                 stream.write(common_file_data)
             for fd in (linked_common_fd, linked_gitdir_fd, linked_entry_fd, linked_root_fd):
                 os.close(fd)
-            subprocess.run(
-                ["git", "-C", root, "update-ref", "-d", "refs/heads/pinned-common-test"],
-                env=git_environment(), check=True,
-            )
+        subprocess.run(
+            ["git", "-C", linked, "checkout", "--quiet", "--detach", pinned_commit],
+            env=git_environment(), check=True,
+        )
+        subprocess.run(
+            ["git", "-C", linked, "update-ref", "-d", private_ref],
+            env=git_environment(), check=True,
+        )
         subprocess.run(
             ["git", "-C", root, "worktree", "remove", "--force", linked_foreign],
             env=git_environment(), check=True,
