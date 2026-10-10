@@ -512,20 +512,41 @@ BEGIN
         RAISE EXCEPTION 'unintended grantee has direct checker source column ACL';
     END IF;
 
+    IF EXISTS (
+        WITH expected(table_name,grantee,privilege_type,is_grantable) AS (VALUES
+            ('change_events','nmcp_purge_function_owner','SELECT',false),
+            ('change_events','nmcp_runtime','SELECT',false),
+            ('change_events','nmcp_runtime','INSERT',false),
+            ('change_events','nmcp_runtime','UPDATE',false),
+            ('change_events','nmcp_runtime','DELETE',false),
+            ('reconciliation_repair_manifest_items','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','nmcp_repair_function_owner','INSERT',false),
+            ('reconciliation_repair_attempts','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_repair_attempts','nmcp_repair_function_owner','INSERT',false),
+            ('reconciliation_repair_events','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_repair_events','nmcp_repair_function_owner','INSERT',false)
+        ), actual AS (
+            SELECT c.relname::text,pg_catalog.pg_get_userbyid(acl.grantee)::text,
+                   acl.privilege_type,acl.is_grantable
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl
+            WHERE n.nspname='public' AND c.relname IN (
+                'change_events','reconciliation_repair_manifest_items',
+                'reconciliation_repair_attempts','reconciliation_repair_events'
+            ) AND acl.grantee<>c.relowner
+        )
+        (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        UNION ALL
+        (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) THEN
+        RAISE EXCEPTION 'checker source table ACL catalog differs from exact allowlist';
+    END IF;
+
     FOREACH source_table IN ARRAY ARRAY[
         'change_events','reconciliation_repair_manifest_items',
         'reconciliation_repair_attempts','reconciliation_repair_events'
     ] LOOP
-        IF EXISTS (
-            SELECT 1
-            FROM pg_catalog.pg_class AS c
-            JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
-            CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl
-            WHERE n.nspname='public' AND c.relname=source_table
-              AND acl.grantee='nmcp_check_function_owner'::pg_catalog.regrole::oid
-        ) THEN
-            RAISE EXCEPTION 'checker owner has table ACL on %',source_table;
-        END IF;
         FOREACH source_privilege IN ARRAY ARRAY[
             'SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'
         ] LOOP

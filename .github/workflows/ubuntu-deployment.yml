@@ -110,7 +110,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            ffmpeg libimage-exiftool-perl nginx-core postgresql shellcheck
+            ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck
 
       - name: Check shell scripts
         run: |
@@ -127,7 +127,7 @@ jobs:
             scripts/verify-ubuntu-trusted-inputs
 
       - name: Verify deployment assets
-        run: scripts/verify-ubuntu-deployment
+        run: /usr/bin/python3 scripts/verify-ubuntu-deployment
 
       - name: Verify configuration and firewall counterexamples
         run: |

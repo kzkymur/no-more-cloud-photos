@@ -2,6 +2,7 @@
 """Fail-closed static and parser checks for Ubuntu production assets."""
 
 import ast
+import copy
 import os
 import pathlib
 import re
@@ -9,6 +10,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -27,6 +33,183 @@ def run(command, **kwargs):
 
 def text(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def workflow_step(steps: list[dict], name: str) -> tuple[int, dict]:
+    matches = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if isinstance(step, dict) and step.get("name") == name
+    ]
+    require(len(matches) == 1, f"Ubuntu workflow needs exactly one active {name} step")
+    return matches[0]
+
+
+def require_unconditional(mapping: dict, label: str) -> None:
+    require("if" not in mapping, f"{label} must be unconditional")
+    require(
+        "continue-on-error" not in mapping
+        or mapping["continue-on-error"] in (False, "false"),
+        f"{label} must fail closed",
+    )
+
+
+def shell_commands(run_text: str) -> list[str]:
+    logical = re.sub(r"\\\s*\n\s*", " ", run_text)
+    return [
+        " ".join(line.strip().split())
+        for line in logical.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def validate_ubuntu_workflow(source: str) -> None:
+    require(yaml is not None, "PyYAML is required to validate the Ubuntu workflow")
+    workflow = yaml.safe_load(source)
+    require(isinstance(workflow, dict), "Ubuntu workflow root must be a mapping")
+    jobs = workflow.get("jobs")
+    require(isinstance(jobs, dict), "Ubuntu workflow jobs must be a mapping")
+    require(set(jobs) == {"verify"}, "Ubuntu workflow evidence must run in the verify job")
+    job = jobs["verify"]
+    require(isinstance(job, dict), "Ubuntu verify job must be a mapping")
+    require_unconditional(job, "Ubuntu verify job")
+    require(job.get("runs-on") == "ubuntu-24.04", "Ubuntu verify job runner changed")
+    require("container" not in job, "Ubuntu verify job must execute on the host runner")
+    steps = job.get("steps")
+    require(isinstance(steps, list), "Ubuntu verify job steps must be a list")
+
+    checkout_matches = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if isinstance(step, dict) and str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    require(len(checkout_matches) == 1, "Ubuntu workflow needs exactly one active checkout step")
+    checkout_index, checkout = checkout_matches[0]
+    require_unconditional(checkout, "Ubuntu checkout step")
+    require(checkout.get("uses") == "actions/checkout@v6", "Ubuntu checkout action changed")
+    require(
+        isinstance(checkout.get("with"), dict)
+        and checkout["with"].get("fetch-depth") in (0, "0"),
+        "Ubuntu checkout must fetch exact historical commits",
+    )
+
+    setup_index, setup = workflow_step(steps, "Install Go")
+    require_unconditional(setup, "Ubuntu Go setup step")
+    require(
+        setup.get("uses")
+        == "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+        "Ubuntu historical migration build does not pin the reviewed Go action",
+    )
+    setup_with = setup.get("with")
+    require(isinstance(setup_with, dict), "Ubuntu Go setup inputs must be a mapping")
+    require(
+        str(setup_with.get("go-version")) == "1.27.1"
+        and setup_with.get("cache") in (True, "true"),
+        "Ubuntu historical migration build does not pin the reviewed Go toolchain",
+    )
+
+    dependency_index, dependency = workflow_step(
+        steps, "Install parser and HTTP test dependencies"
+    )
+    require_unconditional(dependency, "Ubuntu parser dependency step")
+    dependency_commands = shell_commands(str(dependency.get("run", "")))
+    require(
+        any("apt-get install" in command and "python3-yaml" in command for command in dependency_commands),
+        "Ubuntu workflow does not install its structural YAML parser",
+    )
+
+    static_index, static = workflow_step(steps, "Verify deployment assets")
+    require_unconditional(static, "Ubuntu deployment asset verification step")
+    require(
+        static.get("run") == "/usr/bin/python3 scripts/verify-ubuntu-deployment",
+        "Ubuntu workflow bypasses the structural deployment verifier",
+    )
+
+    migration_index, migration = workflow_step(
+        steps, "Verify migration role compatibility and hardening"
+    )
+    require_unconditional(migration, "Ubuntu migration compatibility step")
+    require("shell" not in migration and "working-directory" not in migration,
+            "Ubuntu migration compatibility step changes execution context")
+    expected_commands = [
+        "go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin",
+        "mkdir /tmp/nmcp-v17-source",
+        "git archive ea644c9ad47a35af67b8598758eb717bd2a86e57 | tar -x -C /tmp/nmcp-v17-source",
+        "(cd /tmp/nmcp-v17-source && go build -o /tmp/nmcp-admin-v17 ./cmd/nmcp-admin)",
+        "sudo scripts/verify-ubuntu-migration-role-compatibility /tmp/nmcp-admin-current /tmp/nmcp-admin-v17",
+    ]
+    require(
+        shell_commands(str(migration.get("run", ""))) == expected_commands,
+        "Ubuntu workflow lost the executable v17-to-v18 migration binary contract",
+    )
+    require(
+        checkout_index < setup_index < dependency_index < static_index < migration_index,
+        "Ubuntu workflow evidence steps are not in dependency order",
+    )
+
+
+def expect_workflow_rejected(source: str, label: str, expected_error: str) -> None:
+    try:
+        validate_ubuntu_workflow(source)
+    except RuntimeError as error:
+        require(
+            expected_error in str(error),
+            f"{label} failed for the wrong reason: {error}",
+        )
+        return
+    raise RuntimeError(f"Ubuntu workflow validator accepted {label}")
+
+
+def verify_ubuntu_workflow_mutations(source: str) -> None:
+    workflow = yaml.safe_load(source)
+
+    disabled = copy.deepcopy(workflow)
+    disabled_steps = disabled["jobs"]["verify"]["steps"]
+    _, disabled_setup = workflow_step(disabled_steps, "Install Go")
+    disabled_setup["if"] = False
+    expect_workflow_rejected(
+        yaml.safe_dump(disabled, sort_keys=False),
+        "disabled Go setup evidence",
+        "Ubuntu Go setup step must be unconditional",
+    )
+
+    unused = copy.deepcopy(workflow)
+    unused_steps = unused["jobs"]["verify"]["steps"]
+    _, active_migration = workflow_step(
+        unused_steps, "Verify migration role compatibility and hardening"
+    )
+    unused["x-unused-reviewed-steps"] = [copy.deepcopy(active_migration)]
+    active_migration["run"] = "/bin/true"
+    expect_workflow_rejected(
+        yaml.safe_dump(unused, sort_keys=False),
+        "unused migration evidence block",
+        "Ubuntu workflow lost the executable v17-to-v18 migration binary contract",
+    )
+
+    non_gating = copy.deepcopy(workflow)
+    non_gating_steps = non_gating["jobs"]["verify"]["steps"]
+    _, non_gating_migration = workflow_step(
+        non_gating_steps, "Verify migration role compatibility and hardening"
+    )
+    non_gating_migration["continue-on-error"] = "${{ true }}"
+    expect_workflow_rejected(
+        yaml.safe_dump(non_gating, sort_keys=False),
+        "non-gating migration evidence",
+        "Ubuntu migration compatibility step must fail closed",
+    )
+
+    reordered = copy.deepcopy(workflow)
+    reordered_steps = reordered["jobs"]["verify"]["steps"]
+    setup_index, setup = workflow_step(reordered_steps, "Install Go")
+    migration_index, _ = workflow_step(
+        reordered_steps, "Verify migration role compatibility and hardening"
+    )
+    reordered_steps.insert(migration_index + 1, reordered_steps.pop(setup_index))
+    expect_workflow_rejected(
+        yaml.safe_dump(reordered, sort_keys=False),
+        "out-of-order migration dependencies",
+        "Ubuntu workflow evidence steps are not in dependency order",
+    )
 
 
 def main() -> int:
@@ -76,26 +259,8 @@ def main() -> int:
             ubuntu_workflow.count(f"- {source}") == 2,
             f"Ubuntu workflow does not trigger for {source} on PR and main push",
         )
-    go_setup = """      - name: Install Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: 1.27.1
-          cache: true"""
-    require(
-        ubuntu_workflow.count(go_setup) == 1,
-        "Ubuntu historical migration build does not pin the reviewed Go toolchain",
-    )
-    historical_upgrade = """          go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
-          mkdir /tmp/nmcp-v17-source
-          git archive ea644c9ad47a35af67b8598758eb717bd2a86e57 | tar -x -C /tmp/nmcp-v17-source
-          (cd /tmp/nmcp-v17-source && go build -o /tmp/nmcp-admin-v17 ./cmd/nmcp-admin)
-          sudo scripts/verify-ubuntu-migration-role-compatibility \\
-            /tmp/nmcp-admin-current /tmp/nmcp-admin-v17"""
-    require(
-        ubuntu_workflow.count("fetch-depth: 0") == 1
-        and ubuntu_workflow.count(historical_upgrade) == 1,
-        "Ubuntu workflow lost the exact v17-to-v18 migration binary contract",
-    )
+    validate_ubuntu_workflow(ubuntu_workflow)
+    verify_ubuntu_workflow_mutations(ubuntu_workflow)
 
     units = UBUNTU / "systemd"
     slice_text = text(units / "nmcp.slice")
