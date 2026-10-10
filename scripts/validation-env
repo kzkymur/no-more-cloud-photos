@@ -4,8 +4,16 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 script="$root/scripts/validation-env"
 compose_file="$root/infra/validation/compose.yaml"
-owner=$(printf '%s' "$root" | sha256sum | cut -c1-64)
-owner_short=$(printf '%s' "$owner" | cut -c1-12)
+command -v python3 >/dev/null 2>&1 || { echo "error: python3 is required" >&2; exit 1; }
+owner=$(python3 -c 'import hashlib,os,sys; print(hashlib.sha256(os.fsencode(sys.argv[1])).hexdigest())' "$root")
+case "$owner" in
+  ""|*[!0-9a-f]*)
+    echo "error: Python returned an invalid validation owner digest" >&2
+    exit 1
+    ;;
+esac
+[ "${#owner}" -eq 64 ] || { echo "error: Python returned an invalid validation owner digest" >&2; exit 1; }
+owner_short=$(printf '%.12s' "$owner")
 project=${NMCP_VALIDATION_PROJECT:-nmcp-validation-$owner_short}
 api_port=${NMCP_API_PORT:-18080}
 files_port=${NMCP_FILES_PORT:-18443}
@@ -240,13 +248,15 @@ compose() {
 
 require_tools() {
   case "${1:-}" in
-    down|reset|logs) tools="docker python3" ;;
-    *) tools="docker curl git python3 sha256sum" ;;
+    down|reset|logs) tools="docker python3"; compose_required=false ;;
+    *) tools="docker curl git python3"; compose_required=true ;;
   esac
   for tool in $tools; do
     command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool is required" >&2; exit 1; }
   done
-  docker compose version >/dev/null 2>&1 || { echo "error: docker compose v2 is required" >&2; exit 1; }
+  if [ "$compose_required" = true ]; then
+    docker compose version >/dev/null 2>&1 || { echo "error: docker compose v2 is required" >&2; exit 1; }
+  fi
 }
 
 assert_owned() {
