@@ -59,21 +59,29 @@ with that environment, or source the generated file after preparation.
 
 Compose uses checkout-hashed project, volume, and ownership labels. Its verify
 command guarantees cleanup, while Docker's image/build cache is retained.
-PostgreSQL inputs are never exposed directly from the checkout: the
-entrypoint accepts only five repository-owned, regular, non-symlink SQL files
-whose content matches the exact `HEAD` blobs. A per-project lock serializes
-staging, verification, Docker launch, and reset. The helper pins directories by
-file descriptor, rejects symlinked path components, verifies file identities
-before and after copying, and publishes only pinned snapshot bytes into an
-ownership-labeled, per-project/run Docker volume. Compose consumes that
-daemon-owned volume rather than a host path that can change between verification
-and bind resolution. This keeps validation working after a fresh checkout under
-`umask 0077` without broadening checkout modes. Cleanup first atomically detaches
-a registered stage beneath the pinned project directory, then removes only
-descriptor-relative entries; it fails closed if a directory identity has
-changed and never traverses arbitrary host paths. Unregistered partial runs are
-removed by the same supervisor before it releases the project lock. `cleanup`
-delegates to that reset and otherwise removes only `.validation/`.
+PostgreSQL inputs are never exposed directly from the checkout: the entrypoint
+accepts only five repository-owned, regular, non-symlink SQL files whose content
+matches blobs from one descriptor-pinned Git commit. A kernel-owned per-project
+lock serializes staging, verification, Docker launch, and reset even if an
+attacker replaces legacy lock pathnames. The helper pins directories by file
+descriptor, rejects symlinked path components, and copies verified bytes into
+sealed anonymous descriptors. It publishes only those immutable bytes into an
+ownership- and manifest-labeled, per-project/run Docker volume. Every reuse
+validates the exact inventory, types, modes, ownership, sizes, digests, and a
+digest-bound completion record; partial, raced, or tampered owned volumes are
+rebuilt before Compose can consume them. This keeps validation working after a
+fresh checkout under `umask 0077` without broadening checkout modes.
+
+Cleanup first atomically detaches registered stages beneath the pinned project
+directory, then removes only descriptor-relative entries; it fails closed if an
+identity changed and never traverses arbitrary host paths. Lifecycle commands
+use the durable registered launch identity, so `logs`, `down`, and `reset` keep
+working after a branch switch or local input edit without republishing current
+checkout bytes. Cleanup discovers owned partial stages and labeled volumes,
+attempts all independent actions, and returns their aggregate failures.
+Unregistered partial runs are removed before the supervisor releases the
+project lock. `cleanup` delegates to that reset and removes `.validation/` only
+after reset succeeds.
 
 The Ubuntu lane is intentionally separate. Its dispatcher must run as the
 unprivileged checkout owner and requires passwordless command-scoped `sudo`,

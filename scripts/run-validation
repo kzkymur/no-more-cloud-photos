@@ -107,7 +107,7 @@ case "$mode" in
   full) prepare_native; quick; postgres; race; native; infra ;;
   all) prepare_native; quick; postgres; race; native; infra; scripts/local-validation-preflight ubuntu; scripts/run-ubuntu-validation ;;
   cleanup)
-    scripts/validation-env reset 2>/dev/null || true
+    scripts/validation-env reset
     rm -rf -- .validation
     ;;
   *) printf 'usage: %s {quick|race|postgres|native|infra|ubuntu|full|all|cleanup}\n' "$0" >&2; exit 2 ;;
