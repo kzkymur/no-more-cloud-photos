@@ -370,6 +370,28 @@ $$;
 DO $$
 BEGIN
     IF EXISTS (
+        WITH expected(table_name,owner_name,relation_kind) AS (VALUES
+            ('change_events','nmcp_migrator','r'::"char"),
+            ('reconciliation_repair_manifest_items','nmcp_migrator','r'::"char"),
+            ('reconciliation_repair_attempts','nmcp_migrator','r'::"char"),
+            ('reconciliation_repair_events','nmcp_migrator','r'::"char")
+        ), actual AS (
+            SELECT c.relname::text,pg_catalog.pg_get_userbyid(c.relowner)::text,c.relkind
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+            WHERE n.nspname='public' AND c.relname IN (
+                'change_events','reconciliation_repair_manifest_items',
+                'reconciliation_repair_attempts','reconciliation_repair_events'
+            )
+        )
+        (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        UNION ALL
+        (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) THEN
+        RAISE EXCEPTION 'checker source relation owner or kind differs from exact allowlist';
+    END IF;
+
+    IF EXISTS (
         WITH managed(roleid) AS (VALUES
             ('nmcp_runtime'::pg_catalog.regrole::oid),
             ('nmcp_worker_runtime'::pg_catalog.regrole::oid),
@@ -447,7 +469,7 @@ DECLARE
     source_privilege text;
 BEGIN
     IF EXISTS (
-        WITH expected(table_name,column_name,grantee,privilege_type,is_grantable) AS (VALUES
+        WITH expected_base(table_name,column_name,grantee,privilege_type,is_grantable) AS (VALUES
             ('change_events','position','nmcp_check_function_owner','SELECT',false),
             ('change_events','event_type','nmcp_check_function_owner','SELECT',false),
             ('change_events','reason','nmcp_check_function_owner','SELECT',false),
@@ -472,11 +494,18 @@ BEGIN
             ('reconciliation_repair_events','error_code','nmcp_check_function_owner','SELECT',false),
             ('reconciliation_repair_events','observed_size_bytes','nmcp_check_function_owner','SELECT',false),
             ('reconciliation_repair_events','observed_sha256','nmcp_check_function_owner','SELECT',false),
-            ('reconciliation_repair_events','occurred_at','nmcp_check_function_owner','SELECT',false)
+            ('reconciliation_repair_events','occurred_at','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','id','nmcp_repair_function_owner','UPDATE',false),
+            ('reconciliation_repair_attempts','id','nmcp_repair_function_owner','UPDATE',false)
+        ), expected AS (
+            SELECT table_name,column_name,'nmcp_migrator'::text AS grantor,
+                   grantee,privilege_type,is_grantable
+            FROM expected_base
         ), actual AS (
             SELECT c.relname::text,a.attname::text,
-                   CASE WHEN acl.grantee=0 THEN 'PUBLIC'
-                        ELSE pg_catalog.pg_get_userbyid(acl.grantee)::text END,
+                    pg_catalog.pg_get_userbyid(acl.grantor)::text,
+                    CASE WHEN acl.grantee=0 THEN 'PUBLIC'
+                         ELSE pg_catalog.pg_get_userbyid(acl.grantee)::text END,
                    acl.privilege_type,acl.is_grantable
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
@@ -486,30 +515,12 @@ BEGIN
                 'change_events','reconciliation_repair_manifest_items',
                 'reconciliation_repair_attempts','reconciliation_repair_events'
             ) AND a.attnum>0 AND NOT a.attisdropped
-              AND acl.grantee='nmcp_check_function_owner'::pg_catalog.regrole::oid
         )
         (SELECT * FROM expected EXCEPT SELECT * FROM actual)
         UNION ALL
         (SELECT * FROM actual EXCEPT SELECT * FROM expected)
     ) THEN
         RAISE EXCEPTION 'checker source column ACL catalog differs from exact allowlist';
-    END IF;
-
-    IF EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_class AS c
-        JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
-        JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.oid
-        CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS acl
-        WHERE n.nspname='public' AND c.relname IN (
-            'change_events','reconciliation_repair_manifest_items',
-            'reconciliation_repair_attempts','reconciliation_repair_events'
-        ) AND a.attnum>0 AND NOT a.attisdropped
-          AND (acl.grantee=0 OR pg_catalog.pg_get_userbyid(acl.grantee) NOT IN (
-              'nmcp_check_function_owner','nmcp_repair_function_owner'
-          ))
-    ) THEN
-        RAISE EXCEPTION 'unintended grantee has direct checker source column ACL';
     END IF;
 
     IF EXISTS (

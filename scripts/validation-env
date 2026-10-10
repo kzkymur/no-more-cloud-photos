@@ -371,6 +371,22 @@ check_runtime_role_verifier_negatives() {
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
+    "ALTER TABLE public.change_events OWNER TO nmcp_check_function_owner"
+  expect_runtime_role_verifier_denied \
+    "checker source relation owner drift" \
+    "checker source relation owner or kind differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER TABLE public.change_events OWNER TO nmcp_migrator"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE SELECT(position,event_type,reason,media_id,payload,occurred_at) ON public.change_events FROM nmcp_migrator"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT SELECT(position,event_type,reason,media_id,payload,occurred_at) ON public.change_events TO nmcp_check_function_owner"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
     "GRANT SELECT(id) ON public.change_events TO nmcp_check_function_owner"
   expect_runtime_role_verifier_denied "checker source extra column ACL drift"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
@@ -392,6 +408,26 @@ check_runtime_role_verifier_negatives() {
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE UPDATE(position) ON public.change_events FROM nmcp_check_function_owner"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT UPDATE(attempt_number) ON public.reconciliation_repair_attempts TO nmcp_repair_function_owner"
+  expect_runtime_role_verifier_denied \
+    "checker source repair owner extra column ACL drift" \
+    "checker source column ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE UPDATE(attempt_number) ON public.reconciliation_repair_attempts FROM nmcp_repair_function_owner"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT UPDATE(id) ON public.reconciliation_repair_attempts TO nmcp_repair_function_owner WITH GRANT OPTION"
+  expect_runtime_role_verifier_denied \
+    "checker source repair owner column grant-option drift" \
+    "checker source column ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE GRANT OPTION FOR UPDATE(id) ON public.reconciliation_repair_attempts FROM nmcp_repair_function_owner"
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \

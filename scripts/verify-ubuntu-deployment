@@ -54,6 +54,13 @@ def require_unconditional(mapping: dict, label: str) -> None:
     )
 
 
+def require_default_run_context(mapping: dict, label: str) -> None:
+    require(
+        "shell" not in mapping and "working-directory" not in mapping,
+        f"{label} must use the reviewed shell and working directory",
+    )
+
+
 def shell_commands(run_text: str) -> list[str]:
     logical = re.sub(r"\\\s*\n\s*", " ", run_text)
     return [
@@ -67,12 +74,32 @@ def validate_ubuntu_workflow(source: str) -> None:
     require(yaml is not None, "PyYAML is required to validate the Ubuntu workflow")
     workflow = yaml.safe_load(source)
     require(isinstance(workflow, dict), "Ubuntu workflow root must be a mapping")
+    require("defaults" not in workflow, "Ubuntu workflow must not override run defaults")
+    triggers = workflow.get("on", workflow.get(True))
+    require(isinstance(triggers, dict), "Ubuntu workflow triggers must be a mapping")
+    required_paths = {
+        "cmd/nmcp-admin/**",
+        "internal/database/**",
+        "go.mod",
+        "go.sum",
+        "infra/validation/verify-runtime-roles.sql",
+    }
+    for event_name in ("pull_request", "push"):
+        event = triggers.get(event_name)
+        require(isinstance(event, dict), f"Ubuntu workflow {event_name} trigger must be a mapping")
+        event_paths = event.get("paths")
+        require(isinstance(event_paths, list), f"Ubuntu workflow {event_name} paths must be a list")
+        require(
+            required_paths.issubset(set(event_paths)),
+            f"Ubuntu workflow {event_name} omits checker migration evidence paths",
+        )
     jobs = workflow.get("jobs")
     require(isinstance(jobs, dict), "Ubuntu workflow jobs must be a mapping")
     require(set(jobs) == {"verify"}, "Ubuntu workflow evidence must run in the verify job")
     job = jobs["verify"]
     require(isinstance(job, dict), "Ubuntu verify job must be a mapping")
     require_unconditional(job, "Ubuntu verify job")
+    require("defaults" not in job, "Ubuntu verify job must not override run defaults")
     require(job.get("runs-on") == "ubuntu-24.04", "Ubuntu verify job runner changed")
     require("container" not in job, "Ubuntu verify job must execute on the host runner")
     steps = job.get("steps")
@@ -87,9 +114,11 @@ def validate_ubuntu_workflow(source: str) -> None:
     checkout_index, checkout = checkout_matches[0]
     require_unconditional(checkout, "Ubuntu checkout step")
     require(checkout.get("uses") == "actions/checkout@v6", "Ubuntu checkout action changed")
+    checkout_with = checkout.get("with")
     require(
-        isinstance(checkout.get("with"), dict)
-        and checkout["with"].get("fetch-depth") in (0, "0"),
+        isinstance(checkout_with, dict)
+        and set(checkout_with) == {"fetch-depth"}
+        and checkout_with["fetch-depth"] in (0, "0"),
         "Ubuntu checkout must fetch exact historical commits",
     )
 
@@ -112,6 +141,7 @@ def validate_ubuntu_workflow(source: str) -> None:
         steps, "Install parser and HTTP test dependencies"
     )
     require_unconditional(dependency, "Ubuntu parser dependency step")
+    require_default_run_context(dependency, "Ubuntu parser dependency step")
     dependency_commands = shell_commands(str(dependency.get("run", "")))
     require(
         any("apt-get install" in command and "python3-yaml" in command for command in dependency_commands),
@@ -120,6 +150,7 @@ def validate_ubuntu_workflow(source: str) -> None:
 
     static_index, static = workflow_step(steps, "Verify deployment assets")
     require_unconditional(static, "Ubuntu deployment asset verification step")
+    require_default_run_context(static, "Ubuntu deployment asset verification step")
     require(
         static.get("run") == "/usr/bin/python3 scripts/verify-ubuntu-deployment",
         "Ubuntu workflow bypasses the structural deployment verifier",
@@ -129,8 +160,7 @@ def validate_ubuntu_workflow(source: str) -> None:
         steps, "Verify migration role compatibility and hardening"
     )
     require_unconditional(migration, "Ubuntu migration compatibility step")
-    require("shell" not in migration and "working-directory" not in migration,
-            "Ubuntu migration compatibility step changes execution context")
+    require_default_run_context(migration, "Ubuntu migration compatibility step")
     expected_commands = [
         "go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin",
         "mkdir /tmp/nmcp-v17-source",
@@ -146,6 +176,10 @@ def validate_ubuntu_workflow(source: str) -> None:
         checkout_index < setup_index < dependency_index < static_index < migration_index,
         "Ubuntu workflow evidence steps are not in dependency order",
     )
+    for index, step in enumerate(steps):
+        if isinstance(step, dict) and "run" in step:
+            label = step.get("name", f"step {index}")
+            require_default_run_context(step, f"Ubuntu run step {label}")
 
 
 def expect_workflow_rejected(source: str, label: str, expected_error: str) -> None:
@@ -162,6 +196,82 @@ def expect_workflow_rejected(source: str, label: str, expected_error: str) -> No
 
 def verify_ubuntu_workflow_mutations(source: str) -> None:
     workflow = yaml.safe_load(source)
+
+    workflow_defaults = copy.deepcopy(workflow)
+    workflow_defaults["defaults"] = {"run": {"shell": "/bin/true {0}"}}
+    expect_workflow_rejected(
+        yaml.safe_dump(workflow_defaults, sort_keys=False),
+        "workflow-level neutralizing shell default",
+        "Ubuntu workflow must not override run defaults",
+    )
+
+    job_defaults = copy.deepcopy(workflow)
+    job_defaults["jobs"]["verify"]["defaults"] = {"run": {"shell": "/bin/true {0}"}}
+    expect_workflow_rejected(
+        yaml.safe_dump(job_defaults, sort_keys=False),
+        "job-level neutralizing shell default",
+        "Ubuntu verify job must not override run defaults",
+    )
+
+    historical_checkout = copy.deepcopy(workflow)
+    checkout = next(
+        step
+        for step in historical_checkout["jobs"]["verify"]["steps"]
+        if isinstance(step, dict) and str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    checkout["with"]["ref"] = "ea644c9ad47a35af67b8598758eb717bd2a86e57"
+    expect_workflow_rejected(
+        yaml.safe_dump(historical_checkout, sort_keys=False),
+        "historical checkout ref override",
+        "Ubuntu checkout must fetch exact historical commits",
+    )
+
+    step_shell = copy.deepcopy(workflow)
+    _, shell_migration = workflow_step(
+        step_shell["jobs"]["verify"]["steps"],
+        "Verify migration role compatibility and hardening",
+    )
+    shell_migration["shell"] = "/bin/true {0}"
+    expect_workflow_rejected(
+        yaml.safe_dump(step_shell, sort_keys=False),
+        "step-level neutralizing shell",
+        "Ubuntu migration compatibility step must use the reviewed shell and working directory",
+    )
+
+    step_directory = copy.deepcopy(workflow)
+    _, directory_migration = workflow_step(
+        step_directory["jobs"]["verify"]["steps"],
+        "Verify migration role compatibility and hardening",
+    )
+    directory_migration["working-directory"] = "/tmp"
+    expect_workflow_rejected(
+        yaml.safe_dump(step_directory, sort_keys=False),
+        "step-level working-directory override",
+        "Ubuntu migration compatibility step must use the reviewed shell and working directory",
+    )
+
+    unrelated_step_shell = copy.deepcopy(workflow)
+    _, privileged_inputs = workflow_step(
+        unrelated_step_shell["jobs"]["verify"]["steps"],
+        "Verify privileged input capture counterexamples",
+    )
+    privileged_inputs["shell"] = "/bin/true {0}"
+    expect_workflow_rejected(
+        yaml.safe_dump(unrelated_step_shell, sort_keys=False),
+        "neutralizing shell on another security evidence step",
+        "Ubuntu run step Verify privileged input capture counterexamples must use the reviewed shell and working directory",
+    )
+
+    missing_path = copy.deepcopy(workflow)
+    missing_triggers = missing_path.get("on", missing_path.get(True))
+    missing_triggers["pull_request"]["paths"].remove(
+        "infra/validation/verify-runtime-roles.sql"
+    )
+    expect_workflow_rejected(
+        yaml.safe_dump(missing_path, sort_keys=False),
+        "missing checker verifier workflow path",
+        "Ubuntu workflow pull_request omits checker migration evidence paths",
+    )
 
     disabled = copy.deepcopy(workflow)
     disabled_steps = disabled["jobs"]["verify"]["steps"]
@@ -254,11 +364,6 @@ def main() -> int:
         ast.parse(text(script), filename=str(script))
 
     ubuntu_workflow = text(ROOT / ".github" / "workflows" / "ubuntu-deployment.yml")
-    for source in ('"cmd/nmcp-admin/**"', '"internal/database/**"', '"go.mod"', '"go.sum"'):
-        require(
-            ubuntu_workflow.count(f"- {source}") == 2,
-            f"Ubuntu workflow does not trigger for {source} on PR and main push",
-        )
     validate_ubuntu_workflow(ubuntu_workflow)
     verify_ubuntu_workflow_mutations(ubuntu_workflow)
 
