@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import socket
 import stat
@@ -121,12 +122,62 @@ def git_environment(extra=None):
     return env
 
 
-def git_output(gitdir_fd, *arguments, text=False):
+def read_limited(fd, limit, label):
+    chunks = []
+    remaining = limit + 1
+    while remaining:
+        chunk = os.read(fd, min(remaining, 4096))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        raise UnsafeInput(f"{label} is too large")
+    return data
+
+
+def git_output(gitdir_fd, commondir_fd, *arguments, text=False):
+    common = f"/proc/{os.getpid()}/fd/{commondir_fd}"
     return subprocess.check_output(
-        ["git", "--no-replace-objects", f"--git-dir=/proc/{os.getpid()}/fd/{gitdir_fd}", *arguments],
+        ["git", "--no-replace-objects", f"--git-dir={common}", *arguments],
         text=text,
-        env=git_environment(),
+        env=git_environment({
+            "GIT_COMMON_DIR": common,
+            "GIT_OBJECT_DIRECTORY": common + "/objects",
+        }),
     )
+
+
+def resolve_pinned_head(gitdir_fd, commondir_fd):
+    head_fd = os.open("HEAD", os.O_RDONLY | NOFOLLOW, dir_fd=gitdir_fd)
+    try:
+        data = read_limited(head_fd, 4096, "repository HEAD")
+    finally:
+        os.close(head_fd)
+    try:
+        value = data.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise UnsafeInput("repository HEAD is not ASCII") from exc
+    if value.startswith("ref: "):
+        reference = value[5:]
+        if (
+            not re.fullmatch(r"refs/[A-Za-z0-9._/-]+", reference)
+            or ".." in reference or "//" in reference or "/." in reference
+            or reference.endswith(("/", ".", ".lock"))
+        ):
+            raise UnsafeInput("repository HEAD contains an unsafe symbolic reference")
+        revision = reference + "^{commit}"
+    else:
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value):
+            raise UnsafeInput("repository HEAD contains an invalid object name")
+        revision = value + "^{commit}"
+    try:
+        return git_output(
+            gitdir_fd, commondir_fd, "rev-parse", "--verify", revision, text=True,
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        raise UnsafeInput("repository HEAD does not resolve to a commit") from exc
 
 
 def reject_object_alternates(commondir_fd):
@@ -199,6 +250,7 @@ def resolve_checkout_git(root_path, root_fd, git_entry_fd):
     common_fd = os.dup(gitdir_fd)
     common_file_fd = None
     common_data = None
+    backlink_data = None
     try:
         try:
             common_file_fd = os.open("commondir", os.O_RDONLY | NOFOLLOW, dir_fd=gitdir_fd)
@@ -210,8 +262,24 @@ def resolve_checkout_git(root_path, root_fd, git_entry_fd):
                 common_name = os.path.join(gitdir_path, common_name)
             os.close(common_fd)
             common_path, common_fd = canonical_directory(os.path.normpath(common_name), "commondir")
+        if entry_data is not None and common_data is not None:
+            try:
+                backlink_fd = os.open("gitdir", os.O_RDONLY | NOFOLLOW, dir_fd=gitdir_fd)
+            except OSError as exc:
+                raise UnsafeInput("linked-worktree gitdir has no safe backlink") from exc
+            try:
+                backlink_data, backlink_name = read_git_path_file(backlink_fd, "gitdir backlink")
+            finally:
+                os.close(backlink_fd)
+            if not os.path.isabs(backlink_name):
+                backlink_name = os.path.join(gitdir_path, backlink_name)
+            if os.path.abspath(os.path.normpath(backlink_name)) != os.path.join(root_path, ".git"):
+                raise UnsafeInput("linked-worktree gitdir backlink does not name this checkout")
         reject_object_alternates(common_fd)
-        return gitdir_path, gitdir_fd, entry_data, common_path, common_fd, common_data
+        return (
+            gitdir_path, gitdir_fd, entry_data, common_path, common_fd,
+            common_data, backlink_data,
+        )
     except Exception:
         os.close(common_fd)
         os.close(gitdir_fd)
@@ -294,6 +362,7 @@ class Store:
         commondir_path=None,
         commondir_fd=None,
         commondir_data=None,
+        git_backlink_data=None,
     ):
         self.root_path = root_path
         self.root_fd = root_fd
@@ -310,6 +379,7 @@ class Store:
         self.commondir_path = commondir_path or gitdir_path
         self.commondir_fd = commondir_fd if commondir_fd is not None else gitdir_fd
         self.commondir_data = commondir_data
+        self.git_backlink_data = git_backlink_data
         self.basename = None
         self.stage_fd = None
         self.input_fds = {}
@@ -371,7 +441,15 @@ class Store:
                     os.close(common_file)
                 if current_common != self.commondir_data:
                     raise UnsafeInput("repository commondir link changed during validation")
-            current = git_output(self.gitdir_fd, "rev-parse", "--verify", "HEAD^{commit}", text=True).strip()
+            if self.git_backlink_data is not None:
+                backlink_file = os.open("gitdir", os.O_RDONLY | NOFOLLOW, dir_fd=self.gitdir_fd)
+                try:
+                    current_backlink, _ = read_git_path_file(backlink_file, "gitdir backlink")
+                finally:
+                    os.close(backlink_file)
+                if current_backlink != self.git_backlink_data:
+                    raise UnsafeInput("repository gitdir backlink changed during validation")
+            current = resolve_pinned_head(self.gitdir_fd, self.commondir_fd)
             if current != self.commit_oid:
                 raise UnsafeInput("repository HEAD changed during validation")
         finally:
@@ -428,7 +506,8 @@ class Store:
         finally:
             os.close(current)
         expected = git_output(
-            self.gitdir_fd, "cat-file", "blob", f"{self.commit_oid}:{tracked_path}"
+            self.gitdir_fd, self.commondir_fd,
+            "cat-file", "blob", f"{self.commit_oid}:{tracked_path}"
         ) if self.gitdir_fd is not None else data
         self.verify_git_identity()
         if data != expected:
@@ -1032,8 +1111,19 @@ class Store:
                 if len(data) != expected["size"] or hashlib.sha256(data).hexdigest() != expected["sha256"]:
                     raise UnsafeInput(f"Compose input volume content drift: {name}")
 
-    def remove_volume(self, volume):
-        subprocess.run(["docker", "volume", "rm", volume], stdout=subprocess.DEVNULL, check=True)
+    def remove_volume(self, volume, labels):
+        command = ["docker", "volume", "prune", "--all", "--force"]
+        for name, value in sorted(labels.items()):
+            command.extend(("--filter", f"label={name}={value}"))
+        subprocess.run(command, stdout=subprocess.DEVNULL, check=True)
+        try:
+            remaining = self.inspect_volume(volume)
+        except MissingVolume:
+            return
+        current = remaining.get("Labels") or {}
+        if all(current.get(name) == value for name, value in labels.items()):
+            raise UnsafeInput("owned Compose input volume remains after filtered prune")
+        raise UnsafeInput("foreign replacement preserved after filtered volume prune")
 
     def publish(self, create_hook=None):
         self.verify()
@@ -1051,7 +1141,7 @@ class Store:
             labels = details.get("Labels") or {}
             if any(labels.get(name) != value for name, value in expected_labels.items()):
                 raise
-            self.remove_volume(volume)
+            self.remove_volume(volume, expected_labels)
 
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode="w") as output:
@@ -1107,12 +1197,10 @@ class Store:
                 last_error = exc
                 if not labels_match:
                     raise
-                subprocess.run(
-                    ["docker", "volume", "rm", volume],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
+                try:
+                    self.remove_volume(volume, expected_labels)
+                except Exception:
+                    pass
         raise last_error
 
     def volume_security_test(self):
@@ -1189,8 +1277,8 @@ class Store:
         _, digest, _ = self.volume_manifest()
         labels = self.expected_volume_labels(digest)
         try:
-            self.remove_volume(volume)
-        except subprocess.CalledProcessError:
+            self.remove_volume(volume, labels)
+        except MissingVolume:
             pass
         create = ["docker", "volume", "create"]
         for label, value in labels.items():
@@ -1237,7 +1325,12 @@ class Store:
             or labels.get("com.nmcp.validation.run") != self.basename
         ):
             raise UnsafeInput("refusing to remove an unowned Compose input volume")
-        subprocess.run(["docker", "volume", "rm", volume], stdout=subprocess.DEVNULL, check=True)
+        self.remove_volume(volume, {
+            "com.docker.compose.project": self.project,
+            "com.docker.compose.volume": "compose-inputs",
+            "com.nmcp.validation.owner": self.owner,
+            "com.nmcp.validation.run": self.basename,
+        })
 
     def _read_registry_record(self):
         self.verify_chain()
@@ -1390,15 +1483,29 @@ class Store:
             except UnsafeInput:
                 pass
         for name in candidates:
-            stage_fd = detached_fd = None
+            path_fd = stage_fd = detached_fd = None
             detached = name
             try:
-                stage_fd = open_directory(name, self.parent_fd, self.uid, private=True)
-                stage_info = os.fstat(stage_fd)
+                path_fd = os.open(
+                    name, os.O_PATH | DIRECTORY | NOFOLLOW, dir_fd=self.parent_fd,
+                )
+                stage_info = os.fstat(path_fd)
+                if not stat.S_ISDIR(stage_info.st_mode) or stage_info.st_uid != self.uid:
+                    raise UnsafeInput("cleanup stage has unsafe type or owner")
                 registered_owned = registered_record is not None and (
                     name == registered_record["basename"]
                     or name.startswith(".delete-" + registered_record["basename"] + "-")
                 ) and registered_record["stage"] == [stage_info.st_dev, stage_info.st_ino]
+                if stat.S_IMODE(stage_info.st_mode) != 0o700:
+                    if not registered_owned:
+                        raise UnsafeInput("unregistered cleanup stage has unsafe mode")
+                    os.chmod(f"/proc/{os.getpid()}/fd/{path_fd}", 0o700)
+                stage_fd = os.open(
+                    f"/proc/{os.getpid()}/fd/{path_fd}", os.O_RDONLY | DIRECTORY,
+                )
+                if not same_identity(path_fd, stage_fd):
+                    raise UnsafeInput("cleanup stage identity changed during mode recovery")
+                owned_directory(stage_fd, self.uid, private=True)
                 try:
                     os.stat(".owner", dir_fd=stage_fd, follow_symlinks=False)
                 except FileNotFoundError:
@@ -1460,7 +1567,7 @@ class Store:
             except Exception as exc:
                 errors.append(f"stage {name}: {exc}")
             finally:
-                for fd in (detached_fd, stage_fd):
+                for fd in (detached_fd, stage_fd, path_fd):
                     if fd is not None:
                         os.close(fd)
 
@@ -1486,7 +1593,7 @@ class Store:
                         raise UnsafeInput("Compose input volume has an invalid run identity")
                     if failure_hook:
                         failure_hook("volume", volume)
-                    self.remove_volume(volume)
+                    self.remove_volume(volume, labels)
                 except MissingVolume:
                     continue
                 except Exception as exc:
@@ -1539,15 +1646,37 @@ class Store:
         details = subprocess.run(
             ["docker", resource, "inspect", identity],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
             check=False,
         )
         if details.returncode != 0:
-            return None
-        record = json.loads(details.stdout)[0]
+            raise UnsafeInput(f"Docker {resource} inspect failed: {identity}")
+        try:
+            records = json.loads(details.stdout)
+            if not isinstance(records, list) or len(records) != 1:
+                raise ValueError("wrong record count")
+            record = records[0]
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise UnsafeInput(f"Docker {resource} inspect returned invalid data: {identity}") from exc
         if resource in ("container", "image"):
             return (record.get("Config") or {}).get("Labels") or {}
         return record.get("Labels") or {}
+
+    def _prune_project_volumes(self):
+        result = subprocess.run(
+            [
+                "docker", "volume", "prune", "--all", "--force",
+                "--filter", f"label=com.docker.compose.project={self.project}",
+                "--filter", f"label=com.nmcp.validation.owner={self.owner}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise UnsafeInput("Docker owned volume prune failed")
 
     def docker_lifecycle(self, action, stdio=None):
         if action not in ("down", "reset", "logs"):
@@ -1556,11 +1685,17 @@ class Store:
         kwargs = {}
         if stdio is not None:
             kwargs = {"stdin": stdio[0], "stdout": stdio[1], "stderr": stdio[2]}
-        containers = self._docker_ids("container")
+        try:
+            containers = self._docker_ids("container")
+        except Exception as exc:
+            errors.append(f"container discovery: {exc}")
+            containers = []
         owned_containers = []
         for container in containers:
-            labels = self._docker_labels("container", container)
-            if labels is None:
+            try:
+                labels = self._docker_labels("container", container)
+            except Exception as exc:
+                errors.append(f"container inspect {container}: {exc}")
                 continue
             if labels.get("com.nmcp.validation.owner") != self.owner:
                 errors.append(f"foreign container {container}")
@@ -1577,19 +1712,26 @@ class Store:
                     ["docker", "container", "stop", "--time", "20", container],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
                 )
-                if stopped.returncode not in (0, 1):
+                if stopped.returncode != 0:
                     errors.append(f"container stop {container}")
             for container in owned_containers:
                 removed = subprocess.run(
                     ["docker", "container", "rm", "--force", container],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
                 )
-                if removed.returncode != 0 and self._docker_labels("container", container) is not None:
+                if removed.returncode != 0:
                     errors.append(f"container remove {container}")
 
-            for network in self._docker_ids("network"):
-                labels = self._docker_labels("network", network)
-                if labels is None:
+            try:
+                networks = self._docker_ids("network")
+            except Exception as exc:
+                errors.append(f"network discovery: {exc}")
+                networks = []
+            for network in networks:
+                try:
+                    labels = self._docker_labels("network", network)
+                except Exception as exc:
+                    errors.append(f"network inspect {network}: {exc}")
                     continue
                 if labels.get("com.nmcp.validation.owner") != self.owner:
                     errors.append(f"foreign network {network}")
@@ -1598,27 +1740,50 @@ class Store:
                     ["docker", "network", "rm", network], stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, check=False,
                 )
-                if removed.returncode != 0 and self._docker_labels("network", network) is not None:
+                if removed.returncode != 0:
                     errors.append(f"network remove {network}")
 
         if action == "reset":
-            for volume in self._docker_ids("volume"):
-                labels = self._docker_labels("volume", volume)
-                if labels is None:
+            try:
+                volumes = self._docker_ids("volume")
+            except Exception as exc:
+                errors.append(f"volume discovery: {exc}")
+                volumes = []
+            for volume in volumes:
+                try:
+                    labels = self._docker_labels("volume", volume)
+                except Exception as exc:
+                    errors.append(f"volume inspect {volume}: {exc}")
                     continue
                 if labels.get("com.nmcp.validation.owner") != self.owner:
                     errors.append(f"foreign volume {volume}")
-                    continue
-                removed = subprocess.run(
-                    ["docker", "volume", "rm", volume], stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, check=False,
-                )
-                if removed.returncode != 0 and self._docker_labels("volume", volume) is not None:
-                    errors.append(f"volume remove {volume}")
+            try:
+                self._prune_project_volumes()
+            except Exception as exc:
+                errors.append(f"volume prune: {exc}")
+            try:
+                remaining_volumes = self._docker_ids("volume")
+            except Exception as exc:
+                errors.append(f"volume rediscovery: {exc}")
+                remaining_volumes = []
+            for volume in remaining_volumes:
+                try:
+                    labels = self._docker_labels("volume", volume)
+                    kind = "owned volume retained" if labels.get("com.nmcp.validation.owner") == self.owner else "foreign volume"
+                    errors.append(f"{kind} {volume}")
+                except Exception as exc:
+                    errors.append(f"volume reinspection {volume}: {exc}")
 
-            for image in self._docker_ids("image", "com.nmcp.validation.project"):
-                labels = self._docker_labels("image", image)
-                if labels is None:
+            try:
+                images = self._docker_ids("image", "com.nmcp.validation.project")
+            except Exception as exc:
+                errors.append(f"image discovery: {exc}")
+                images = []
+            for image in images:
+                try:
+                    labels = self._docker_labels("image", image)
+                except Exception as exc:
+                    errors.append(f"image inspect {image}: {exc}")
                     continue
                 if (
                     labels.get("com.nmcp.validation.kind") != "compose-input-image"
@@ -1630,7 +1795,7 @@ class Store:
                     ["docker", "image", "rm", image], stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, check=False,
                 )
-                if removed.returncode != 0 and self._docker_labels("image", image) is not None:
+                if removed.returncode != 0:
                     errors.append(f"input image remove {image}")
         if errors:
             raise UnsafeInput("Docker lifecycle failures: " + "; ".join(errors))
@@ -1669,7 +1834,7 @@ def respond(sock, payload):
     sock.send(json.dumps(payload, separators=(",", ":")).encode())
 
 
-def serve(sock, child, store):
+def serve(sock, child, store, allowed_commands=None):
     sock.settimeout(0.1)
     while child.poll() is None:
         try:
@@ -1689,6 +1854,8 @@ def serve(sock, child, store):
                     passed_fds.extend(values)
             request = json.loads(raw)
             command = request["command"]
+            if allowed_commands is not None and command not in allowed_commands:
+                raise UnsafeInput("command is unavailable in lifecycle-only mode")
             if command == "stage":
                 result = store.stage()
             elif command == "load":
@@ -1752,19 +1919,26 @@ def invoke(root, project, script, arguments):
     root_path = os.path.realpath(root)
     if os.path.abspath(root) != root_path:
         raise UnsafeInput("validation repository root must be canonical and non-symlinked")
+    lifecycle_commands = {
+        "down": frozenset(("docker-down",)),
+        "logs": frozenset(("docker-logs",)),
+        "reset": frozenset(("docker-reset", "cleanup")),
+    }
+    allowed_commands = lifecycle_commands.get(arguments[0]) if len(arguments) == 1 else None
     root_fd = os.open(root_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
     validation_fd = parent_fd = git_entry_fd = gitdir_fd = commondir_fd = None
+    gitdir_path = git_entry_data = commondir_path = commondir_data = git_backlink_data = None
+    commit_oid = None
     lock_sock = None
     try:
         owned_directory(root_fd, uid)
-        git_entry_fd = os.open(".git", os.O_RDONLY | NOFOLLOW, dir_fd=root_fd)
-        (
-            gitdir_path, gitdir_fd, git_entry_data,
-            commondir_path, commondir_fd, commondir_data,
-        ) = resolve_checkout_git(root_path, root_fd, git_entry_fd)
-        commit_oid = git_output(
-            gitdir_fd, "rev-parse", "--verify", "HEAD^{commit}", text=True
-        ).strip()
+        if allowed_commands is None:
+            git_entry_fd = os.open(".git", os.O_RDONLY | NOFOLLOW, dir_fd=root_fd)
+            (
+                gitdir_path, gitdir_fd, git_entry_data,
+                commondir_path, commondir_fd, commondir_data, git_backlink_data,
+            ) = resolve_checkout_git(root_path, root_fd, git_entry_fd)
+            commit_oid = resolve_pinned_head(gitdir_fd, commondir_fd)
         validation_fd = open_directory(".validation", root_fd, uid, create=True)
         parent_fd = open_directory("compose-inputs", validation_fd, uid, private=True, create=True)
         root_info = os.fstat(root_fd)
@@ -1807,9 +1981,10 @@ def invoke(root, project, script, arguments):
             commondir_path,
             commondir_fd,
             commondir_data,
+            git_backlink_data,
         )
         try:
-            return serve(server_sock, child, store)
+            return serve(server_sock, child, store, allowed_commands)
         finally:
             if store.stage_fd is not None and store.read_registry() != store.basename:
                 cleanup_errors = []
@@ -1997,34 +2172,57 @@ def self_test():
         )
         lifecycle.stage()
         lifecycle.register()
-        expected_volume = lifecycle.volume
+        lifecycle_basename = lifecycle.basename
         lifecycle.close_stage()
         subprocess.run(["git", "-C", root, "checkout", "--quiet", "HEAD^"], check=True)
         with open(os.path.join(root, INPUTS[0][1]), "a", encoding="ascii") as stream:
             stream.write("lifecycle local edit\n")
-        lifecycle_log = os.path.join(temporary, "lifecycle.log")
-        recorder = os.path.join(temporary, "record-lifecycle")
-        with open(recorder, "w", encoding="ascii") as stream:
-            stream.write(
-                "#!/bin/sh\n"
-                "printf '%s %s\\n' \"$1\" \"$NMCP_COMPOSE_INPUT_VOLUME\" >>\"$2\"\n"
-            )
-        os.chmod(recorder, 0o700)
         lifecycle_child = os.path.join(temporary, "lifecycle-child")
         helper = os.path.realpath(__file__)
         with open(lifecycle_child, "w", encoding="ascii") as stream:
             stream.write(
                 "#!/bin/sh\nset -eu\n"
-                f"python3 {helper!r} client load-lifecycle >/dev/null\n"
-                f"python3 {helper!r} client run-lifecycle {recorder!r} \"$1\" {lifecycle_log!r}\n"
+                "case \"$1\" in\n"
+                f"  logs) python3 {helper!r} client docker-logs ;;\n"
+                f"  down) python3 {helper!r} client docker-down ;;\n"
+                f"  reset) python3 {helper!r} client docker-reset; python3 {helper!r} client cleanup ;;\n"
+                "esac\n"
             )
         os.chmod(lifecycle_child, 0o700)
-        for command_name in ("logs", "down", "reset"):
-            assert invoke(root, "command-lifecycle", lifecycle_child, [command_name]) == 0
-        with open(lifecycle_log, encoding="ascii") as stream:
-            assert stream.read().splitlines() == [
-                f"{name} {expected_volume}" for name in ("logs", "down", "reset")
-            ]
+        fake_bin = os.path.join(temporary, "fake-bin")
+        os.mkdir(fake_bin, 0o700)
+        fake_docker = os.path.join(fake_bin, "docker")
+        with open(fake_docker, "w", encoding="ascii") as stream:
+            stream.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake_docker, 0o700)
+        lifecycle_stage_path = os.path.join(root, ".validation", "compose-inputs", lifecycle_basename)
+        os.chmod(lifecycle_stage_path, 0)
+        moved_git_entry = os.path.join(temporary, "lifecycle-moved-git")
+        os.rename(os.path.join(root, ".git"), moved_git_entry)
+        original_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = fake_bin + os.pathsep + original_path
+        try:
+            assert invoke(root, "command-lifecycle", lifecycle_child, ["logs"]) == 0
+            with open(os.path.join(root, ".git"), "wb") as stream:
+                stream.write(b"corrupt gitfile\n")
+            assert invoke(root, "command-lifecycle", lifecycle_child, ["down"]) == 0
+            os.unlink(os.path.join(root, ".git"))
+            moved_head = os.path.join(moved_git_entry, "HEAD")
+            with open(moved_head, "rb") as stream:
+                moved_head_data = stream.read()
+            with open(moved_head, "wb") as stream:
+                stream.write(b"invalid HEAD\n")
+            assert invoke(root, "command-lifecycle", lifecycle_child, ["reset"]) == 0
+            with open(moved_head, "wb") as stream:
+                stream.write(moved_head_data)
+        finally:
+            os.environ["PATH"] = original_path
+            try:
+                os.unlink(os.path.join(root, ".git"))
+            except FileNotFoundError:
+                pass
+            os.rename(moved_git_entry, os.path.join(root, ".git"))
+        assert lifecycle.read_registry() is None
         validation_env = os.path.join(os.path.dirname(os.path.realpath(__file__)), "validation-env")
         with open(validation_env, encoding="ascii") as stream:
             dispatch = stream.read()
@@ -2033,12 +2231,6 @@ def self_test():
         assert "validation_inputs docker-down" in dispatch
         assert "validation_inputs docker-reset" in dispatch
         assert "validation_inputs docker-logs" in dispatch
-        lifecycle_cleanup = Store(
-            root, root_fd, validation_fd, parent_fd, "command-lifecycle", invoke_owner, uid,
-            git_entry_fd, gitdir_path, gitdir_fd, pinned_commit,
-        )
-        assert lifecycle_cleanup.load(lifecycle=True)
-        lifecycle_cleanup.cleanup_project()
         for _, tracked_path, _ in INPUTS:
             data = subprocess.check_output(
                 ["git", "-C", root, "cat-file", "blob", f"{older_commit}:{tracked_path}"]
@@ -2333,7 +2525,7 @@ def self_test():
             "com.nmcp.validation.owner": owner,
             "com.nmcp.validation.run": project + "." + "1" * 24,
         }}
-        def remove_fake_volume(volume):
+        def remove_fake_volume(volume, labels):
             attempted.append(("removed", volume))
             remaining_volumes.remove(volume)
         aggregate.remove_volume = remove_fake_volume
@@ -2363,6 +2555,30 @@ def self_test():
             subprocess.run = original_run
             aggregate.inspect_volume = original_inspect
             aggregate.remove_volume = original_remove_volume
+
+        race_labels = {
+            "com.docker.compose.project": project,
+            "com.nmcp.validation.owner": owner,
+            "com.nmcp.validation.run": project + "." + "2" * 24,
+        }
+        prune_commands = []
+        original_run = subprocess.run
+        original_inspect = aggregate.inspect_volume
+        subprocess.run = lambda command, **kwargs: (
+            prune_commands.append(command) or subprocess.CompletedProcess(command, 0, "")
+        )
+        aggregate.inspect_volume = lambda volume: {"Labels": {"com.nmcp.validation.owner": "foreign"}}
+        try:
+            expect_denied(
+                "volume replacement between inspect and deletion",
+                lambda: aggregate.remove_volume(project + "_compose-inputs_race", race_labels),
+            )
+            assert len(prune_commands) == 1
+            assert prune_commands[0][1:4] == ["volume", "prune", "--all"]
+            assert "rm" not in prune_commands[0]
+        finally:
+            subprocess.run = original_run
+            aggregate.inspect_volume = original_inspect
 
         malformed = fake_store()
         malformed_basename = malformed.stage()
@@ -2496,6 +2712,59 @@ def self_test():
         assert gitfile_swap.wait() != 0
         with open(linked_gitfile, "wb") as stream:
             stream.write(linked_gitfile_data)
+
+        linked_foreign = os.path.join(temporary, "linked-worktree-foreign")
+        subprocess.run(
+            ["git", "-C", root, "worktree", "add", "--quiet", "--detach", linked_foreign, pinned_commit],
+            env=git_environment(), check=True,
+        )
+        with open(os.path.join(linked_foreign, ".git"), "rb") as stream:
+            foreign_pairing = stream.read()
+        with open(linked_gitfile, "wb") as stream:
+            stream.write(foreign_pairing)
+        assert subprocess.run(
+            [sys.executable, helper, "invoke", linked, "foreign-linked-pairing", stage_child],
+            env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode != 0
+        with open(linked_gitfile, "wb") as stream:
+            stream.write(linked_gitfile_data)
+
+        subprocess.run(
+            ["git", "-C", root, "update-ref", "refs/heads/pinned-common-test", pinned_commit],
+            env=git_environment(), check=True,
+        )
+        linked_root_fd = os.open(linked, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+        linked_entry_fd = os.open(".git", os.O_RDONLY | NOFOLLOW, dir_fd=linked_root_fd)
+        (
+            linked_gitdir_path, linked_gitdir_fd, _, _, linked_common_fd, _, _,
+        ) = resolve_checkout_git(linked, linked_root_fd, linked_entry_fd)
+        common_file = os.path.join(linked_gitdir_path, "commondir")
+        with open(common_file, "rb") as stream:
+            common_file_data = stream.read()
+        try:
+            assert git_output(
+                linked_gitdir_fd, linked_common_fd,
+                "show-ref", "--verify", "refs/heads/pinned-common-test", text=True,
+            ).split()[0] == pinned_commit
+            with open(common_file, "wb") as stream:
+                stream.write((foreign_gitdir + "\n").encode("utf-8"))
+            assert git_output(
+                linked_gitdir_fd, linked_common_fd,
+                "rev-parse", "--verify", "refs/heads/pinned-common-test^{commit}", text=True,
+            ).strip() == pinned_commit
+        finally:
+            with open(common_file, "wb") as stream:
+                stream.write(common_file_data)
+            for fd in (linked_common_fd, linked_gitdir_fd, linked_entry_fd, linked_root_fd):
+                os.close(fd)
+            subprocess.run(
+                ["git", "-C", root, "update-ref", "-d", "refs/heads/pinned-common-test"],
+                env=git_environment(), check=True,
+            )
+        subprocess.run(
+            ["git", "-C", root, "worktree", "remove", "--force", linked_foreign],
+            env=git_environment(), check=True,
+        )
         subprocess.run(
             ["git", "-C", root, "worktree", "remove", "--force", linked],
             env=git_environment(), check=True,

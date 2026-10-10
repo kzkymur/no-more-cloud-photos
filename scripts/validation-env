@@ -239,7 +239,11 @@ compose() {
 }
 
 require_tools() {
-  for tool in docker curl git python3 sha256sum; do
+  case "${1:-}" in
+    down|reset|logs) tools="docker python3" ;;
+    *) tools="docker curl git python3 sha256sum" ;;
+  esac
+  for tool in $tools; do
     command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool is required" >&2; exit 1; }
   done
   docker compose version >/dev/null 2>&1 || { echo "error: docker compose v2 is required" >&2; exit 1; }
@@ -1699,12 +1703,14 @@ verify_isolation() {
   ! docker volume ls --quiet --filter "label=com.docker.compose.project=$peer_project" | grep .
   check
 
-  docker volume create --label "com.docker.compose.project=$guard_project" --label com.nmcp.validation.owner=foreign "$guard_volume" >/dev/null
+  docker volume create --label "com.docker.compose.project=$guard_project" --label com.nmcp.validation.owner=foreign \
+    --label "com.nmcp.validation.guard=$guard_volume" "$guard_volume" >/dev/null
   if NMCP_VALIDATION_PROJECT=$guard_project "$script" reset; then
     echo "error: ownership guard accepted a foreign resource" >&2
     exit 1
   fi
-  docker volume rm "$guard_volume" >/dev/null
+  docker volume prune --all --force --filter "label=com.docker.compose.project=$guard_project" \
+    --filter label=com.nmcp.validation.owner=foreign --filter "label=com.nmcp.validation.guard=$guard_volume" >/dev/null
 }
 
 if [ "${1:-}" = staging-test ]; then
@@ -1730,7 +1736,7 @@ if [ "${1:-}" = recover-publish-test ]; then
   exit
 fi
 
-require_tools
+require_tools "${1:-}"
 case "${1:-}" in
   down|reset|logs) ;;
   *)
@@ -1761,7 +1767,8 @@ case "${1:-}" in
       cleanup_status=0
       NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=${NMCP_ISOLATION_API_PORT:-28080} NMCP_FILES_PORT=${NMCP_ISOLATION_FILES_PORT:-28443} "$script" reset || cleanup_status=1
       if docker volume inspect "$guard_volume" >/dev/null 2>&1; then
-        docker volume rm "$guard_volume" >/dev/null || cleanup_status=1
+        docker volume prune --all --force --filter "label=com.docker.compose.project=$guard_project" \
+          --filter label=com.nmcp.validation.owner=foreign --filter "label=com.nmcp.validation.guard=$guard_volume" >/dev/null || cleanup_status=1
       fi
       cleanup || cleanup_status=1
       return "$cleanup_status"
