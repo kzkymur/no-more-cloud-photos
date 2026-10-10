@@ -168,6 +168,62 @@ docker run --rm --network none --entrypoint sh \
     echo "error: Compose input source modes or ownership changed during staging" >&2
     return 1
   }
+
+  kill_project="${project}-killed-publisher"
+  kill_dir=$(mktemp -d "$validation_dir/killed-publisher.XXXXXX")
+  chmod 0700 "$kill_dir"
+  ready="$kill_dir/ready"
+  publisher_pid=
+  cleanup_killed_publisher() {
+    if [ -n "$publisher_pid" ] && kill -0 "$publisher_pid" 2>/dev/null; then
+      kill -KILL "$publisher_pid" 2>/dev/null || true
+      wait "$publisher_pid" 2>/dev/null || true
+    fi
+    NMCP_VALIDATION_PROJECT=$kill_project "$script" reset >/dev/null 2>&1 || true
+    rm -rf -- "$kill_dir"
+  }
+  trap cleanup_killed_publisher EXIT HUP INT TERM
+  NMCP_VALIDATION_PROJECT=$kill_project NMCP_VALIDATION_KILL_TEST=1 \
+    NMCP_VALIDATION_KILL_READY=$ready "$script" kill-publish-test \
+    >"$kill_dir/publisher.log" 2>&1 &
+  publisher_pid=$!
+  attempts=0
+  while [ ! -s "$ready" ]; do
+    kill -0 "$publisher_pid" 2>/dev/null || {
+      echo "error: killed-publisher fixture exited before publishing a partial volume" >&2
+      return 1
+    }
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 300 ] || {
+      echo "error: timed out waiting for partial Compose input volume" >&2
+      return 1
+    }
+    sleep 0.1
+  done
+  partial_volume=$(cat "$ready")
+  docker run --rm --network none --volume "$partial_volume:/inputs:ro" --entrypoint sh \
+    postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24 \
+    -eu -c 'test "$(cat /inputs/infra/partial)" = killed-partial; test ! -e /inputs/.nmcp-complete'
+  kill -KILL "$publisher_pid"
+  if wait "$publisher_pid" 2>/dev/null; then
+    echo "error: killed validation input supervisor exited successfully" >&2
+    return 1
+  fi
+  publisher_pid=
+  killed_child=$(cat "$ready.child")
+  attempts=0
+  while kill -0 "$killed_child" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || {
+      echo "error: killed publisher child did not terminate" >&2
+      return 1
+    }
+    sleep 0.1
+  done
+  NMCP_VALIDATION_PROJECT=$kill_project "$script" recover-publish-test
+  NMCP_VALIDATION_PROJECT=$kill_project "$script" reset >/dev/null 2>&1
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$kill_dir"
 )
 
 compose() {
@@ -1007,9 +1063,20 @@ if [ "${1:-}" = staging-test ]; then
 fi
 
 if [ "${1:-}" = kill-publish-test ] && [ "${NMCP_VALIDATION_KILL_TEST:-}" = 1 ]; then
+  printf '%s\n' "$$" >"$NMCP_VALIDATION_KILL_READY.child"
   stage_compose_inputs
   register_compose_inputs
   validation_inputs seed-partial-and-wait
+  exit
+fi
+
+if [ "${1:-}" = recover-publish-test ]; then
+  load_registered_inputs load
+  [ -n "$input_root" ] || {
+    echo "error: killed publisher did not retain its registered stage" >&2
+    exit 1
+  }
+  validation_inputs publish >/dev/null
   exit
 fi
 

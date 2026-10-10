@@ -201,6 +201,10 @@ class Store:
         return self.project + ".registry"
 
     @property
+    def intent(self):
+        return self.project + ".intent"
+
+    @property
     def volume(self):
         if self.basename is None:
             raise UnsafeInput("no Compose input stage is loaded")
@@ -320,16 +324,159 @@ class Store:
     def snapshot(self, output_name, data):
         return sealed_bytes(f"nmcp-{output_name}", data)
 
-    def stage(self, race_hook=None):
+    def _intent_record(self, basename, stage_fd=None):
+        root = os.fstat(self.root_fd)
+        stage = os.fstat(stage_fd) if stage_fd is not None else None
+        record = {
+            "schema": 2,
+            "phase": "bound" if stage is not None else "planned",
+            "owner": self.owner,
+            "project": self.project,
+            "basename": basename,
+            "commit": self.commit_oid,
+            "repository": [root.st_dev, root.st_ino],
+            "stage": [stage.st_dev, stage.st_ino] if stage is not None else None,
+        }
+        record["auth"] = hashlib.sha256(canonical_json(record)).hexdigest()
+        return record
+
+    def _read_intent(self):
+        try:
+            fd, raw = read_regular(self.intent, self.parent_fd, self.uid, 0o600, 4096)
+        except UnsafeInput as exc:
+            try:
+                os.stat(self.intent, dir_fd=self.parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None, None
+            raise exc
+        try:
+            record = json.loads(raw)
+            authenticated = dict(record) if isinstance(record, dict) else {}
+            authentication = authenticated.pop("auth", None)
+            root = os.fstat(self.root_fd)
+            if (
+                not isinstance(record, dict)
+                or set(record) != {
+                    "schema", "phase", "owner", "project", "basename", "commit",
+                    "repository", "stage", "auth"
+                }
+                or record["schema"] != 2
+                or record["phase"] not in ("planned", "bound")
+                or record["owner"] != self.owner
+                or record["project"] != self.project
+                or check_basename(record["basename"], self.project) != record["basename"]
+                or not isinstance(record["commit"], str)
+                or len(record["commit"]) not in (40, 64)
+                or record["repository"] != [root.st_dev, root.st_ino]
+                or (
+                    record["stage"] is not None
+                    and (
+                        not isinstance(record["stage"], list)
+                        or len(record["stage"]) != 2
+                        or not all(isinstance(value, int) for value in record["stage"])
+                    )
+                )
+                or (record["phase"] == "planned") != (record["stage"] is None)
+                or authentication != hashlib.sha256(canonical_json(authenticated)).hexdigest()
+            ):
+                raise UnsafeInput("invalid Compose input stage intent")
+            return record, fd
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, KeyError) as exc:
+            os.close(fd)
+            raise UnsafeInput("invalid Compose input stage intent") from exc
+        except Exception:
+            os.close(fd)
+            raise
+
+    def _unlink_exact(self, name, pinned_fd):
+        visible = os.open(name, os.O_RDONLY | NOFOLLOW, dir_fd=self.parent_fd)
+        try:
+            if not same_identity(pinned_fd, visible):
+                raise UnsafeInput(f"{name} identity changed before cleanup")
+        finally:
+            os.close(visible)
+        os.unlink(name, dir_fd=self.parent_fd)
+        os.fsync(self.parent_fd)
+
+    def recover_intent(self):
+        record, intent_fd = self._read_intent()
+        if record is None:
+            return
+        stage_fd = None
+        try:
+            basename = record["basename"]
+            matches = [
+                name for name in os.listdir(self.parent_fd)
+                if name == basename or name.startswith(".delete-" + basename + "-")
+            ]
+            if not matches:
+                self._unlink_exact(self.intent, intent_fd)
+                return
+            if len(matches) != 1:
+                raise UnsafeInput("stage intent has ambiguous recovery artifacts")
+            visible_name = matches[0]
+            stage_fd = open_directory(visible_name, self.parent_fd, self.uid, private=True)
+            entries = set(os.listdir(stage_fd))
+            if record["phase"] == "planned":
+                if entries:
+                    raise UnsafeInput("planned stage intent names a nonempty directory")
+            else:
+                info = os.fstat(stage_fd)
+                if record["stage"] != [info.st_dev, info.st_ino]:
+                    raise UnsafeInput("bound stage intent identity does not match")
+            try:
+                os.stat(".owner", dir_fd=stage_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                raw = None
+            else:
+                self._read_marker(stage_fd, basename, record)
+                raw = True
+            if entries and raw is None:
+                raise UnsafeInput("nonempty intended stage has no ownership marker")
+            detached = visible_name
+            if visible_name == basename:
+                detached = ".delete-" + basename + "-" + secrets.token_hex(12)
+                os.rename(basename, detached, src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd)
+            detached_fd = os.open(detached, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=self.parent_fd)
+            try:
+                if not same_identity(stage_fd, detached_fd):
+                    raise UnsafeInput("intended stage changed during recovery detach")
+                remove_tree(detached_fd)
+            finally:
+                os.close(detached_fd)
+            os.rmdir(detached, dir_fd=self.parent_fd)
+            self._unlink_exact(self.intent, intent_fd)
+        finally:
+            if stage_fd is not None:
+                os.close(stage_fd)
+            os.close(intent_fd)
+
+    def stage(self, race_hook=None, fault_hook=None):
         self.verify_chain()
         if self.stage_fd is not None:
             self.verify()
             return self.basename
+        self.recover_intent()
         basename = self.project + "." + secrets.token_hex(12)
+        self.write_file(
+            self.parent_fd, self.intent,
+            canonical_json(self._intent_record(basename)) + b"\n", 0o600,
+        )
+        os.fsync(self.parent_fd)
         os.mkdir(basename, 0o700, dir_fd=self.parent_fd)
+        os.fsync(self.parent_fd)
+        if fault_hook:
+            fault_hook("after-mkdir")
         stage_fd = None
         try:
             stage_fd = open_directory(basename, self.parent_fd, self.uid, private=True)
+            self.write_file(
+                self.parent_fd, self.intent,
+                canonical_json(self._intent_record(basename, stage_fd)) + b"\n", 0o600,
+            )
+            os.fsync(self.parent_fd)
+            if fault_hook:
+                fault_hook("after-bind")
             marker = {
                 "schema": 1,
                 "owner": self.owner,
@@ -339,27 +486,62 @@ class Store:
             }
             marker["auth"] = hashlib.sha256(canonical_json(marker)).hexdigest()
             self.write_file(stage_fd, ".owner", canonical_json(marker) + b"\n", 0o600)
+            os.fsync(stage_fd)
+            if fault_hook:
+                fault_hook("after-owner")
             for index, (_, tracked_path, output_name) in enumerate(INPUTS):
                 data = self.source_data(tracked_path)
                 if race_hook:
                     race_hook(index)
                 self.write_file(stage_fd, output_name, data, 0o644)
+                if fault_hook:
+                    fault_hook(f"after-input-{index}")
             os.fsync(stage_fd)
+            if fault_hook:
+                fault_hook("after-final-fsync")
             self.basename, self.stage_fd = basename, stage_fd
-            stage_fd = None
             self.verify()
+            intent, intent_fd = self._read_intent()
+            try:
+                if intent["basename"] != basename or intent["phase"] != "bound":
+                    raise UnsafeInput("Compose input stage intent changed")
+                info = os.fstat(self.stage_fd)
+                if intent["stage"] != [info.st_dev, info.st_ino]:
+                    raise UnsafeInput("Compose input stage intent identity changed")
+                self._read_marker(self.stage_fd, basename, intent)
+                self._unlink_exact(self.intent, intent_fd)
+            finally:
+                os.close(intent_fd)
+            stage_fd = None
             return basename
         except Exception:
+            removed = False
             if stage_fd is not None:
                 try:
+                    self.close_snapshot_fds()
                     remove_tree(stage_fd)
                     os.rmdir(basename, dir_fd=self.parent_fd)
+                    removed = True
                 finally:
                     os.close(stage_fd)
+                    if self.stage_fd == stage_fd:
+                        self.stage_fd = None
+                        self.basename = None
             else:
                 try:
                     os.rmdir(basename, dir_fd=self.parent_fd)
+                    removed = True
                 except OSError:
+                    pass
+            if removed:
+                try:
+                    intent, intent_fd = self._read_intent()
+                    if intent is not None and intent["basename"] == basename:
+                        try:
+                            self._unlink_exact(self.intent, intent_fd)
+                        finally:
+                            os.close(intent_fd)
+                except UnsafeInput:
                     pass
             raise
 
@@ -376,7 +558,7 @@ class Store:
             return
         self.basename, self.stage_fd = basename, fd
 
-    def _read_marker(self, stage_fd):
+    def _read_marker(self, stage_fd, basename=None, intent=None):
         marker_fd, raw = read_regular(".owner", stage_fd, self.uid, 0o600, 4096)
         os.close(marker_fd)
         try:
@@ -388,14 +570,18 @@ class Store:
         expected = {"schema", "owner", "project", "basename", "commit", "auth"}
         authenticated = dict(marker)
         authentication = authenticated.pop("auth", None)
+        expected_basename = self.basename if basename is None else basename
+        if expected_basename is None and isinstance(marker.get("basename"), str):
+            expected_basename = check_basename(marker["basename"], self.project)
         if (
             set(marker) != expected
             or marker["schema"] != 1
             or marker["owner"] != self.owner
             or marker["project"] != self.project
-            or marker["basename"] != self.basename
+            or marker["basename"] != expected_basename
             or not isinstance(marker["commit"], str)
             or len(marker["commit"]) not in (40, 64)
+            or (intent is not None and marker["commit"] != intent["commit"])
             or authentication != hashlib.sha256(canonical_json(authenticated)).hexdigest()
         ):
             raise UnsafeInput("invalid Compose input ownership marker")
@@ -653,18 +839,31 @@ class Store:
     def volume_security_test(self):
         volume = self.publish()
         image = "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24"
-        subprocess.run(
-            [
-                "docker", "run", "--rm", "--network", "none", "--volume", f"{volume}:/inputs",
-                "--entrypoint", "sh", image, "-eu", "-c",
-                "chmod 0644 /inputs/infra/postgresql/runtime-roles.sql; printf evil > /inputs/infra/postgresql/runtime-roles.sql; "
-                "rm /inputs/.nmcp-complete; touch /inputs/unexpected",
-            ],
-            stdout=subprocess.DEVNULL,
-            check=True,
+        corruptions = (
+            ("content bytes", "printf evil > /inputs/infra/postgresql/runtime-roles.sql"),
+            ("file mode", "chmod 0644 /inputs/infra/postgresql/runtime-roles.sql"),
+            ("missing completion", "rm /inputs/.nmcp-complete"),
+            ("missing expected entry", "rm /inputs/infra/postgresql/runtime-roles.sql"),
+            ("unexpected entry", "touch /inputs/unexpected"),
         )
-        self.publish()
-        self.validate_volume(volume)
+        for label, mutation in corruptions:
+            subprocess.run(
+                [
+                    "docker", "run", "--rm", "--network", "none", "--volume", f"{volume}:/inputs",
+                    "--entrypoint", "sh", image, "-eu", "-c", mutation,
+                ],
+                stdout=subprocess.DEVNULL,
+                check=True,
+            )
+            try:
+                self.validate_volume(volume)
+            except UnsafeInput:
+                pass
+            else:
+                raise UnsafeInput(f"Compose input volume accepted isolated corruption: {label}")
+            if self.publish() != volume:
+                raise UnsafeInput("Compose input volume identity changed during repair")
+            self.validate_volume(volume)
         self.unpublish()
 
         def create_partial(name, labels):
@@ -712,6 +911,14 @@ class Store:
             stdout=subprocess.DEVNULL,
             check=True,
         )
+        ready = os.environ.get("NMCP_VALIDATION_KILL_READY")
+        if ready:
+            ready_fd = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600)
+            try:
+                os.write(ready_fd, (volume + "\n").encode("ascii"))
+                os.fsync(ready_fd)
+            finally:
+                os.close(ready_fd)
         while True:
             time.sleep(60)
 
@@ -838,10 +1045,15 @@ class Store:
                     except FileNotFoundError:
                         pass
 
-    def cleanup_project(self):
+    def cleanup_project(self, failure_hook=None):
         self.close_stage()
         errors = []
         candidates = []
+        intent = intent_fd = None
+        try:
+            intent, intent_fd = self._read_intent()
+        except Exception as exc:
+            errors.append(f"intent: {exc}")
         for name in os.listdir(self.parent_fd):
             if name.startswith(".delete-" + self.project + "."):
                 candidates.append(name)
@@ -856,24 +1068,43 @@ class Store:
             detached = name
             try:
                 stage_fd = open_directory(name, self.parent_fd, self.uid, private=True)
-                marker_fd, raw = read_regular(".owner", stage_fd, self.uid, 0o600, 4096)
-                os.close(marker_fd)
-                marker = json.loads(raw)
-                if not isinstance(marker, dict):
-                    raise UnsafeInput("invalid cleanup ownership marker")
-                basename = marker.get("basename") if isinstance(marker, dict) else None
-                authenticated = dict(marker)
-                authentication = authenticated.pop("auth", None)
-                if (
-                    marker.get("schema") != 1
-                    or marker.get("owner") != self.owner
-                    or marker.get("project") != self.project
-                    or not isinstance(basename, str)
-                    or not basename.startswith(self.project + ".")
-                    or (name != basename and not name.startswith(".delete-" + basename + "-"))
-                    or authentication != hashlib.sha256(canonical_json(authenticated)).hexdigest()
-                ):
-                    raise UnsafeInput("invalid cleanup ownership marker")
+                try:
+                    os.stat(".owner", dir_fd=stage_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    marker = None
+                else:
+                    marker = self._read_marker(stage_fd)
+                if marker is None:
+                    if intent is None or (
+                        name != intent["basename"]
+                        and not name.startswith(".delete-" + intent["basename"] + "-")
+                    ):
+                        raise UnsafeInput("stage has no matching cleanup intent")
+                    basename = intent["basename"]
+                    entries = set(os.listdir(stage_fd))
+                    info = os.fstat(stage_fd)
+                    if intent["phase"] == "planned":
+                        if entries:
+                            raise UnsafeInput("planned cleanup intent names a nonempty directory")
+                    elif intent["stage"] != [info.st_dev, info.st_ino]:
+                        raise UnsafeInput("bound cleanup intent identity does not match")
+                    elif entries:
+                        raise UnsafeInput("nonempty intended stage has no ownership marker")
+                else:
+                    basename = marker["basename"]
+                    if name != basename and not name.startswith(".delete-" + basename + "-"):
+                        raise UnsafeInput("invalid cleanup ownership marker")
+                    if intent is not None and (
+                        basename == intent["basename"]
+                        or name.startswith(".delete-" + intent["basename"] + "-")
+                    ):
+                        info = os.fstat(stage_fd)
+                        if intent["phase"] != "bound" or intent["stage"] != [info.st_dev, info.st_ino]:
+                            raise UnsafeInput("cleanup marker does not match bound stage identity")
+                        if marker["commit"] != intent["commit"]:
+                            raise UnsafeInput("cleanup marker commit does not match stage intent")
+                if failure_hook:
+                    failure_hook("stage", name)
                 if name == basename:
                     detached = ".delete-" + basename + "-" + secrets.token_hex(12)
                     os.rename(name, detached, src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd)
@@ -914,29 +1145,45 @@ class Store:
                     run = labels.get("com.nmcp.validation.run", "")
                     if not run.startswith(self.project + "."):
                         raise UnsafeInput("Compose input volume has an invalid run identity")
+                    if failure_hook:
+                        failure_hook("volume", volume)
                     self.remove_volume(volume)
+                except MissingVolume:
+                    continue
                 except Exception as exc:
                     errors.append(f"volume {volume}: {exc}")
 
-        if not errors:
+        registry_fd = None
+        try:
+            registered, registry_fd = self._read_registry()
+            if registry_fd is not None:
+                remaining = any(
+                    name == registered or name.startswith(".delete-" + registered + "-")
+                    for name in os.listdir(self.parent_fd)
+                )
+                if not remaining and not errors:
+                    if failure_hook:
+                        failure_hook("registry", self.registry)
+                    self._unlink_exact(self.registry, registry_fd)
+        except Exception as exc:
+            errors.append(f"registry: {exc}")
+        finally:
+            if registry_fd is not None:
+                os.close(registry_fd)
+
+        if intent_fd is not None:
             try:
-                registered, registry_fd = self._read_registry()
-                if registry_fd is not None:
-                    remaining = any(
-                        name == registered or name.startswith(".delete-" + registered + "-")
-                        for name in os.listdir(self.parent_fd)
-                    )
-                    if not remaining:
-                        visible = os.open(self.registry, os.O_RDONLY | NOFOLLOW, dir_fd=self.parent_fd)
-                        try:
-                            if not same_identity(registry_fd, visible):
-                                raise UnsafeInput("registry identity changed during cleanup")
-                        finally:
-                            os.close(visible)
-                        os.unlink(self.registry, dir_fd=self.parent_fd)
-                    os.close(registry_fd)
+                remaining = any(
+                    name == intent["basename"]
+                    or name.startswith(".delete-" + intent["basename"] + "-")
+                    for name in os.listdir(self.parent_fd)
+                )
+                if not remaining:
+                    self._unlink_exact(self.intent, intent_fd)
             except Exception as exc:
-                errors.append(f"registry: {exc}")
+                errors.append(f"intent cleanup: {exc}")
+            finally:
+                os.close(intent_fd)
         if errors:
             raise UnsafeInput("cleanup failures: " + "; ".join(errors))
 
@@ -1133,7 +1380,10 @@ def client(command, argv):
         sock.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)])
     else:
         sock.send(payload)
-    response = json.loads(sock.recv(1024 * 1024))
+    raw_response = sock.recv(1024 * 1024)
+    if not raw_response:
+        raise UnsafeInput("validation input supervisor terminated without a response")
+    response = json.loads(raw_response)
     if not response["ok"]:
         raise UnsafeInput(response["error"])
     result = response["result"]
@@ -1179,6 +1429,12 @@ def self_test():
             with open(os.path.join(root, tracked_path), "w", encoding="ascii") as stream:
                 stream.write("version two: " + tracked_path + "\n")
         subprocess.run(["git", "-C", root, "commit", "--quiet", "-am", "second"], env=commit_env, check=True)
+        source_modes = {}
+        for _, tracked_path, _ in INPUTS:
+            path = os.path.join(root, tracked_path)
+            os.chmod(path, 0o600)
+            source_modes[tracked_path] = stat.S_IMODE(os.stat(path).st_mode)
+        assert source_modes == {tracked_path: 0o600 for _, tracked_path, _ in INPUTS}
         sentinel = os.path.join(outside, "sentinel")
         with open(sentinel, "w", encoding="ascii") as stream:
             stream.write("unchanged")
@@ -1257,6 +1513,75 @@ def self_test():
         assert edited_reload.load(lifecycle=True)
         edited_reload.cleanup_project()
         subprocess.run(["git", "-C", root, "checkout", "--quiet", pinned_commit], check=True)
+        for _, tracked_path, _ in INPUTS:
+            data = subprocess.check_output(
+                ["git", "-C", root, "cat-file", "blob", f"{pinned_commit}:{tracked_path}"]
+            )
+            with open(os.path.join(root, tracked_path), "wb") as stream:
+                stream.write(data)
+            os.chmod(os.path.join(root, tracked_path), 0o600)
+
+        invoke_owner = hashlib.sha256(os.fsencode(os.path.realpath(root))).hexdigest()
+        lifecycle = Store(
+            root, root_fd, validation_fd, parent_fd, "command-lifecycle", invoke_owner, uid,
+            git_entry_fd, gitdir_path, gitdir_fd, pinned_commit,
+        )
+        lifecycle.stage()
+        lifecycle.register()
+        expected_volume = lifecycle.volume
+        lifecycle.close_stage()
+        subprocess.run(["git", "-C", root, "checkout", "--quiet", "HEAD^"], check=True)
+        with open(os.path.join(root, INPUTS[0][1]), "a", encoding="ascii") as stream:
+            stream.write("lifecycle local edit\n")
+        lifecycle_log = os.path.join(temporary, "lifecycle.log")
+        recorder = os.path.join(temporary, "record-lifecycle")
+        with open(recorder, "w", encoding="ascii") as stream:
+            stream.write(
+                "#!/bin/sh\n"
+                "printf '%s %s\\n' \"$1\" \"$NMCP_COMPOSE_INPUT_VOLUME\" >>\"$2\"\n"
+            )
+        os.chmod(recorder, 0o700)
+        lifecycle_child = os.path.join(temporary, "lifecycle-child")
+        helper = os.path.realpath(__file__)
+        with open(lifecycle_child, "w", encoding="ascii") as stream:
+            stream.write(
+                "#!/bin/sh\nset -eu\n"
+                f"python3 {helper!r} client load-lifecycle >/dev/null\n"
+                f"python3 {helper!r} client run-lifecycle {recorder!r} \"$1\" {lifecycle_log!r}\n"
+            )
+        os.chmod(lifecycle_child, 0o700)
+        for command_name in ("logs", "down", "reset"):
+            assert invoke(root, "command-lifecycle", lifecycle_child, [command_name]) == 0
+        with open(lifecycle_log, encoding="ascii") as stream:
+            assert stream.read().splitlines() == [
+                f"{name} {expected_volume}" for name in ("logs", "down", "reset")
+            ]
+        validation_env = os.path.join(os.path.dirname(os.path.realpath(__file__)), "validation-env")
+        with open(validation_env, encoding="ascii") as stream:
+            dispatch = stream.read()
+        lifecycle_dispatch = "down|reset|logs) load_registered_inputs load-lifecycle ;;"
+        assert dispatch.count(lifecycle_dispatch) == 1
+        assert "down|reset|logs) load_registered_inputs load ;;" not in dispatch
+        lifecycle_cleanup = Store(
+            root, root_fd, validation_fd, parent_fd, "command-lifecycle", invoke_owner, uid,
+            git_entry_fd, gitdir_path, gitdir_fd, pinned_commit,
+        )
+        assert lifecycle_cleanup.load(lifecycle=True)
+        lifecycle_cleanup.cleanup_project()
+        for _, tracked_path, _ in INPUTS:
+            data = subprocess.check_output(
+                ["git", "-C", root, "cat-file", "blob", f"{older_commit}:{tracked_path}"]
+            )
+            with open(os.path.join(root, tracked_path), "wb") as stream:
+                stream.write(data)
+        subprocess.run(["git", "-C", root, "checkout", "--quiet", pinned_commit], check=True)
+        for _, tracked_path, _ in INPUTS:
+            data = subprocess.check_output(
+                ["git", "-C", root, "cat-file", "blob", f"{pinned_commit}:{tracked_path}"]
+            )
+            with open(os.path.join(root, tracked_path), "wb") as stream:
+                stream.write(data)
+            os.chmod(os.path.join(root, tracked_path), 0o600)
         os.close(gitdir_fd)
         os.close(git_entry_fd)
 
@@ -1287,6 +1612,143 @@ def self_test():
             store = Store(root, root_fd, validation_fd, parent_fd, project, owner, uid)
             store.source_data = lambda path: (path + "\n").encode()
             return store
+
+        death_points = (
+            "after-mkdir", "after-bind", "after-owner",
+            *(f"after-input-{index}" for index in range(len(INPUTS))),
+            "after-final-fsync",
+        )
+        for death_point in death_points:
+            killed = fake_store()
+            killed_pid = os.fork()
+            if killed_pid == 0:
+                killed.stage(
+                    fault_hook=lambda point, expected=death_point: (
+                        os.kill(os.getpid(), 9) if point == expected else None
+                    )
+                )
+                os._exit(1)
+            _, killed_status = os.waitpid(killed_pid, 0)
+            assert os.WIFSIGNALED(killed_status) and os.WTERMSIG(killed_status) == 9
+            retry = fake_store()
+            intent, intent_fd = retry._read_intent()
+            assert intent is not None
+            assert intent["phase"] == ("planned" if death_point == "after-mkdir" else "bound")
+            os.close(intent_fd)
+            original_run = subprocess.run
+            subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "")
+            try:
+                retry.cleanup_project()
+            finally:
+                subprocess.run = original_run
+            assert not os.path.exists(
+                os.path.join(root, ".validation", "compose-inputs", intent["basename"])
+            )
+            assert not os.path.exists(
+                os.path.join(root, ".validation", "compose-inputs", retry.intent)
+            )
+
+        substituted = fake_store()
+        substituted_basename = project + "." + "e" * 24
+        substituted.write_file(
+            parent_fd, substituted.intent,
+            canonical_json(substituted._intent_record(substituted_basename)) + b"\n", 0o600,
+        )
+        os.symlink(outside, substituted_basename, dir_fd=parent_fd)
+        original_run = subprocess.run
+        subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "")
+        try:
+            expect_denied("substituted intended stage", substituted.cleanup_project)
+        finally:
+            subprocess.run = original_run
+        assert os.path.islink(os.path.join(root, ".validation", "compose-inputs", substituted_basename))
+        assert open(sentinel, encoding="ascii").read() == "unchanged"
+        os.unlink(substituted_basename, dir_fd=parent_fd)
+        os.unlink(substituted.intent, dir_fd=parent_fd)
+
+        forged = fake_store()
+        forged_basename = project + "." + "c" * 24
+        os.mkdir(forged_basename, 0o700, dir_fd=parent_fd)
+        forged_fd = open_directory(forged_basename, parent_fd, uid, private=True)
+        forged.write_file(forged_fd, "foreign", b"preserve\n", 0o600)
+        os.close(forged_fd)
+        forged.write_file(
+            parent_fd, forged.intent,
+            canonical_json(forged._intent_record(forged_basename)) + b"\n", 0o600,
+        )
+        original_run = subprocess.run
+        subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "")
+        try:
+            expect_denied("forged planned intent for nonempty directory", forged.cleanup_project)
+        finally:
+            subprocess.run = original_run
+        forged_fd = open_directory(forged_basename, parent_fd, uid, private=True)
+        foreign_fd, foreign_data = read_regular("foreign", forged_fd, uid, 0o600)
+        os.close(foreign_fd)
+        assert foreign_data == b"preserve\n"
+        os.unlink("foreign", dir_fd=forged_fd)
+        os.close(forged_fd)
+        os.rmdir(forged_basename, dir_fd=parent_fd)
+        os.unlink(forged.intent, dir_fd=parent_fd)
+
+        malformed_intent = fake_store()
+        malformed_basename = project + "." + "d" * 24
+        malformed_intent.write_file(parent_fd, malformed_intent.intent, b"{bad\n", 0o600)
+        os.mkdir(malformed_basename, 0o700, dir_fd=parent_fd)
+        original_run = subprocess.run
+        subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "")
+        try:
+            expect_denied("malformed stage intent", malformed_intent.cleanup_project)
+        finally:
+            subprocess.run = original_run
+        assert malformed_basename in os.listdir(parent_fd)
+        os.rmdir(malformed_basename, dir_fd=parent_fd)
+        os.unlink(malformed_intent.intent, dir_fd=parent_fd)
+
+        marker_store = fake_store()
+        marker_pid = os.fork()
+        if marker_pid == 0:
+            marker_store.stage(
+                fault_hook=lambda point: os.kill(os.getpid(), 9) if point == "after-owner" else None
+            )
+            os._exit(1)
+        _, marker_status = os.waitpid(marker_pid, 0)
+        assert os.WIFSIGNALED(marker_status)
+        marker_intent, marker_intent_fd = marker_store._read_intent()
+        os.close(marker_intent_fd)
+        marker_stage_fd = open_directory(marker_intent["basename"], parent_fd, uid, private=True)
+        marker_fd, valid_marker_raw = read_regular(".owner", marker_stage_fd, uid, 0o600)
+        os.close(marker_fd)
+        valid_marker = json.loads(valid_marker_raw)
+        def marker_bytes(change):
+            changed = dict(valid_marker)
+            changed.pop("auth")
+            change(changed)
+            changed["auth"] = hashlib.sha256(canonical_json(changed)).hexdigest()
+            return canonical_json(changed) + b"\n"
+        malformed_markers = (
+            ("extra marker key", marker_bytes(lambda value: value.__setitem__("extra", True))),
+            ("missing marker schema", marker_bytes(lambda value: value.pop("schema"))),
+            ("wrong marker schema", marker_bytes(lambda value: value.__setitem__("schema", 2))),
+            ("marker commit mismatch", marker_bytes(
+                lambda value: value.__setitem__("commit", "f" * len(marker_intent["commit"]))
+            )),
+        )
+        original_run = subprocess.run
+        subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "")
+        try:
+            for label, malformed_marker in malformed_markers:
+                marker_store.write_file(marker_stage_fd, ".owner", malformed_marker, 0o600)
+                expect_denied(label, marker_store.cleanup_project)
+                assert marker_intent["basename"] in os.listdir(parent_fd)
+            marker_store.write_file(marker_stage_fd, ".owner", valid_marker_raw, 0o600)
+            os.close(marker_stage_fd)
+            marker_stage_fd = None
+            marker_store.cleanup_project()
+        finally:
+            subprocess.run = original_run
+            if marker_stage_fd is not None:
+                os.close(marker_stage_fd)
 
         store = fake_store()
         basename = store.stage()
@@ -1379,6 +1841,82 @@ def self_test():
         assert stranded.read_registry() is None
         assert stranded_name not in os.listdir(parent_fd)
 
+        aggregate = fake_store()
+        first_stage = aggregate.stage()
+        aggregate.register()
+        aggregate.close_stage()
+        second = fake_store()
+        second_basename = second.stage()
+        second.close_stage()
+        volume_names = [project + "_compose-inputs_first", project + "_compose-inputs_second"]
+        remaining_volumes = set(volume_names)
+        attempted = []
+        original_run = subprocess.run
+        original_inspect = aggregate.inspect_volume
+        original_remove_volume = aggregate.remove_volume
+        subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "\n".join(sorted(remaining_volumes)) + ("\n" if remaining_volumes else "")
+        )
+        aggregate.inspect_volume = lambda volume: {"Labels": {
+            "com.docker.compose.volume": "compose-inputs",
+            "com.nmcp.validation.owner": owner,
+            "com.nmcp.validation.run": project + "." + "1" * 24,
+        }}
+        def remove_fake_volume(volume):
+            attempted.append(("removed", volume))
+            remaining_volumes.remove(volume)
+        aggregate.remove_volume = remove_fake_volume
+        failures = {("stage", first_stage), ("volume", volume_names[0])}
+        def fail_cleanup(kind, name):
+            attempted.append((kind, name))
+            if (kind, name) in failures:
+                raise OSError("injected cleanup failure")
+        try:
+            try:
+                aggregate.cleanup_project(failure_hook=fail_cleanup)
+            except UnsafeInput as exc:
+                message = str(exc)
+                assert first_stage in message and volume_names[0] in message
+            else:
+                raise AssertionError("cleanup accepted injected independent failures")
+            assert ("stage", second_basename) in attempted
+            assert ("volume", volume_names[1]) in attempted
+            assert ("removed", volume_names[1]) in attempted
+            assert remaining_volumes == {volume_names[0]}
+            assert aggregate.read_registry() == first_stage
+            aggregate.cleanup_project()
+            assert ("removed", volume_names[0]) in attempted
+            assert not remaining_volumes
+            assert aggregate.read_registry() is None
+        finally:
+            subprocess.run = original_run
+            aggregate.inspect_volume = original_inspect
+            aggregate.remove_volume = original_remove_volume
+
+        malformed = fake_store()
+        malformed_basename = malformed.stage()
+        malformed.register()
+        malformed.close_stage()
+        registry_fd = os.open(malformed.registry, os.O_WRONLY | os.O_TRUNC | NOFOLLOW, dir_fd=parent_fd)
+        os.write(registry_fd, b"../outside\n")
+        os.close(registry_fd)
+        foreign_name = project + "." + "f" * 24
+        os.mkdir(foreign_name, 0o700, dir_fd=parent_fd)
+        unrelated = os.path.join(outside, "foreign-sentinel")
+        with open(unrelated, "w", encoding="ascii") as stream:
+            stream.write("foreign")
+        original_run = subprocess.run
+        subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "")
+        try:
+            expect_denied("malformed registry cleanup", malformed.cleanup_project)
+        finally:
+            subprocess.run = original_run
+        assert malformed_basename not in os.listdir(parent_fd)
+        assert foreign_name in os.listdir(parent_fd)
+        assert open(unrelated, encoding="ascii").read() == "foreign"
+        os.rmdir(foreign_name, dir_fd=parent_fd)
+        os.unlink(malformed.registry, dir_fd=parent_fd)
+
         lock_name = project + ".lock-test"
         lock_a = os.open(lock_name, os.O_RDWR | os.O_CREAT | NOFOLLOW, 0o600, dir_fd=parent_fd)
         lock_b = os.open(lock_name, os.O_RDWR | NOFOLLOW, dir_fd=parent_fd)
@@ -1395,6 +1933,10 @@ def self_test():
         os.close(lock_a)
         os.close(lock_b)
         assert open(sentinel, encoding="ascii").read() == "unchanged"
+        assert {
+            tracked_path: stat.S_IMODE(os.stat(os.path.join(root, tracked_path)).st_mode)
+            for _, tracked_path, _ in INPUTS
+        } == source_modes
         os.close(parent_fd)
         os.close(validation_fd)
         os.close(root_fd)
