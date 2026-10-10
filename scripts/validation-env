@@ -55,9 +55,7 @@ verify_compose_inputs() {
 }
 
 remove_compose_inputs() {
-  [ -n "$input_root" ] || return 0
-  validation_inputs unpublish
-  validation_inputs remove
+  validation_inputs cleanup
   input_root=
 }
 
@@ -66,7 +64,8 @@ register_compose_inputs() {
 }
 
 load_registered_inputs() {
-  registered=$(validation_inputs load)
+  load_command=${1:-load}
+  registered=$(validation_inputs "$load_command")
   [ -n "$registered" ] || return 0
   input_root="$input_parent/$registered"
   export_compose_inputs
@@ -115,6 +114,12 @@ check_compose_input_negatives() {
 }
 
 check_staging_security() (
+  source_modes_before=$(stat -c '%a:%u:%g:%n' \
+    "$root/infra/validation/postgres-init.sql" \
+    "$root/infra/postgresql/runtime-roles.sql" \
+    "$root/infra/ubuntu/postgresql-roles.sql" \
+    "$root/infra/postgresql/verify-runtime-role-graph.sql" \
+    "$root/infra/validation/verify-runtime-roles.sql")
   python3 "$input_helper" self-test
   registered=$(validation_inputs load)
   if [ -n "$registered" ]; then
@@ -122,7 +127,7 @@ check_staging_security() (
     export_compose_inputs
   else
     stage_compose_inputs
-    trap 'remove_compose_inputs || true' EXIT HUP INT TERM
+    trap remove_compose_inputs EXIT HUP INT TERM
     register_compose_inputs
   fi
   verify_compose_inputs
@@ -142,6 +147,7 @@ for name in names:
 '
   volume=$(validation_inputs publish)
   [ "$(validation_inputs publish)" = "$volume" ]
+  [ "$(validation_inputs volume-test)" = "$volume" ]
   validation_inputs run sh -eu -c '
 docker run --rm --network none --entrypoint sh \
   --volume "$1:/inputs:ro" \
@@ -152,12 +158,26 @@ docker run --rm --network none --entrypoint sh \
     remove_compose_inputs
     trap - EXIT HUP INT TERM
   fi
+  source_modes_after=$(stat -c '%a:%u:%g:%n' \
+    "$root/infra/validation/postgres-init.sql" \
+    "$root/infra/postgresql/runtime-roles.sql" \
+    "$root/infra/ubuntu/postgresql-roles.sql" \
+    "$root/infra/postgresql/verify-runtime-role-graph.sql" \
+    "$root/infra/validation/verify-runtime-roles.sql")
+  [ "$source_modes_after" = "$source_modes_before" ] || {
+    echo "error: Compose input source modes or ownership changed during staging" >&2
+    return 1
+  }
 )
 
 compose() {
   stage_compose_inputs
   validation_inputs publish >/dev/null
   validation_inputs run docker compose --project-name "$project" --file "$compose_file" "$@"
+}
+
+compose_lifecycle() {
+  validation_inputs run-lifecycle docker compose --project-name "$project" --file "$compose_file" "$@"
 }
 
 require_tools() {
@@ -181,16 +201,21 @@ assert_owned() {
       esac
       if [ "$actual" != "$owner" ]; then
         echo "error: refusing to operate on $type $resource for project $project: owner mismatch" >&2
-        exit 1
+        return 1
       fi
     done
   done
 }
 
 cleanup() {
-  assert_owned
-  compose down --volumes --remove-orphans
-  remove_compose_inputs
+  cleanup_status=0
+  if assert_owned; then
+    compose_lifecycle down --volumes --remove-orphans || cleanup_status=1
+  else
+    cleanup_status=1
+  fi
+  remove_compose_inputs || cleanup_status=1
+  return "$cleanup_status"
 }
 
 prepare_storage() {
@@ -981,9 +1006,21 @@ if [ "${1:-}" = staging-test ]; then
   exit
 fi
 
+if [ "${1:-}" = kill-publish-test ] && [ "${NMCP_VALIDATION_KILL_TEST:-}" = 1 ]; then
+  stage_compose_inputs
+  register_compose_inputs
+  validation_inputs seed-partial-and-wait
+  exit
+fi
+
 require_tools
-assert_owned
-load_registered_inputs
+case "${1:-}" in
+  down|reset|logs) load_registered_inputs load-lifecycle ;;
+  *)
+    assert_owned
+    load_registered_inputs load
+    ;;
+esac
 case "${1:-}" in
   up)
     complete=false
@@ -1002,9 +1039,13 @@ case "${1:-}" in
     guard_volume="${guard_project}_foreign"
     retention_token="retained-$owner-$$"
     cleanup_all() {
-      NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=${NMCP_ISOLATION_API_PORT:-28080} NMCP_FILES_PORT=${NMCP_ISOLATION_FILES_PORT:-28443} "$script" reset || true
-      docker volume rm "$guard_volume" >/dev/null 2>&1 || true
-      cleanup || true
+      cleanup_status=0
+      NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=${NMCP_ISOLATION_API_PORT:-28080} NMCP_FILES_PORT=${NMCP_ISOLATION_FILES_PORT:-28443} "$script" reset || cleanup_status=1
+      if docker volume inspect "$guard_volume" >/dev/null 2>&1; then
+        docker volume rm "$guard_volume" >/dev/null || cleanup_status=1
+      fi
+      cleanup || cleanup_status=1
+      return "$cleanup_status"
     }
     trap cleanup_all EXIT HUP INT TERM
     cleanup
@@ -1019,15 +1060,19 @@ case "${1:-}" in
     assert_retention_markers
     check
     verify_isolation
+    cleanup_all
+    trap - EXIT HUP INT TERM
     ;;
   down)
-    compose down --remove-orphans
+    assert_owned
+    compose_lifecycle down --remove-orphans
     ;;
   reset)
     cleanup
     ;;
   logs)
-    compose logs --no-color
+    assert_owned
+    compose_lifecycle logs --no-color
     ;;
   *)
     echo "usage: scripts/validation-env {up|check|verify|down|reset|logs|staging-test}" >&2
