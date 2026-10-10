@@ -148,13 +148,19 @@ for name in names:
   volume=$(validation_inputs publish)
   [ "$(validation_inputs publish)" = "$volume" ]
   [ "$(validation_inputs volume-test)" = "$volume" ]
+  input_image=$(validation_inputs image-test)
+  case "$input_image" in sha256:*) ;; *) echo "error: immutable input image is not content-addressed" >&2; return 1 ;; esac
   validation_inputs run sh -eu -c '
+test "$NMCP_POSTGRES_INPUT_IMAGE" = "$2"
 docker run --rm --network none --entrypoint sh \
   --volume "$1:/inputs:ro" \
   postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24 \
-  -eu -c "test -s /inputs/init/10-nmcp-roles.sql"
-' sh "$volume"
+  -eu -c "test ! -e /inputs/.nmcp-complete"
+docker run --rm --network none --read-only --entrypoint sh "$2" \
+  -eu -c "test -s /docker-entrypoint-initdb.d/10-nmcp-roles.sql; test -s /opt/nmcp-infra/postgresql/runtime-roles.sql; test -s /opt/nmcp-input-manifest/.nmcp-complete"
+  ' sh "$volume" "$input_image"
   if [ -z "$registered" ]; then
+    validation_inputs docker-reset
     remove_compose_inputs
     trap - EXIT HUP INT TERM
   fi
@@ -232,10 +238,6 @@ compose() {
   validation_inputs run docker compose --project-name "$project" --file "$compose_file" "$@"
 }
 
-compose_lifecycle() {
-  validation_inputs run-lifecycle docker compose --project-name "$project" --file "$compose_file" "$@"
-}
-
 require_tools() {
   for tool in docker curl git python3 sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool is required" >&2; exit 1; }
@@ -265,11 +267,7 @@ assert_owned() {
 
 cleanup() {
   cleanup_status=0
-  if assert_owned; then
-    compose_lifecycle down --volumes --remove-orphans || cleanup_status=1
-  else
-    cleanup_status=1
-  fi
+  validation_inputs docker-reset || cleanup_status=1
   remove_compose_inputs || cleanup_status=1
   return "$cleanup_status"
 }
@@ -720,6 +718,24 @@ check_processes_and_isolation() {
 
   files_id=$(compose ps --quiet files)
   postgres_id=$(compose ps --quiet postgres)
+  postgres_image=$(docker inspect --format '{{.Image}}' "$postgres_id")
+  case "$postgres_image" in sha256:*) ;; *) echo "error: PostgreSQL consumer did not use an immutable image ID" >&2; exit 1 ;; esac
+  [ "$(docker image inspect --format '{{ index .Config.Labels "com.nmcp.validation.kind" }}' "$postgres_image")" = compose-input-image ]
+  [ "$(docker image inspect --format '{{ index .Config.Labels "com.nmcp.validation.owner" }}' "$postgres_image")" = "$owner" ]
+  [ "$(docker image inspect --format '{{ index .Config.Labels "com.nmcp.validation.project" }}' "$postgres_image")" = "$project" ]
+  for sql_service in postgres role-compatibility role-harden; do
+    sql_id=$(compose ps --all --quiet "$sql_service")
+    [ "$(docker inspect --format '{{.Image}}' "$sql_id")" = "$postgres_image" ] || {
+      echo "error: $sql_service did not consume the same immutable SQL image" >&2
+      exit 1
+    }
+    docker inspect "$sql_id" | python3 -c '
+import json,sys
+container=json.load(sys.stdin)[0]
+for mount in (container["HostConfig"].get("Mounts") or []):
+    assert mount.get("Target") not in ("/docker-entrypoint-initdb.d","/opt/nmcp-infra"), mount
+'
+  done
   files_networks=$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$files_id")
   postgres_networks=$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$postgres_id")
   [ "$(printf '%s\n' "$files_networks" | grep -c .)" = 1 ]
@@ -1046,7 +1062,43 @@ verify_isolation() {
   peer_files_port=${NMCP_ISOLATION_FILES_PORT:-28443}
   NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" up
   NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" check
-  NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" reset
+  broken_compose="$validation_dir/compose.yaml.lifecycle-test.$$"
+  (
+    restore_compose() {
+      rm -f -- "$compose_file"
+      mv -- "$broken_compose" "$compose_file"
+    }
+    mv -- "$compose_file" "$broken_compose"
+    trap restore_compose EXIT HUP INT TERM
+    printf 'invalid: [\n' >"$compose_file"
+    NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" logs >/dev/null
+    NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" down
+    restore_compose
+    trap - EXIT HUP INT TERM
+  )
+  NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" up
+  peer_run=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="ascii"))["basename"])' \
+    "$input_parent/$peer_project.registry")
+  rm -- "$input_parent/$peer_run/postgres-init.sql"
+  printf 'damaged lifecycle stage\n' >"$input_parent/$peer_run/runtime-roles.sql"
+  printf '{damaged owner marker\n' >"$input_parent/$peer_run/.owner"
+  (
+    restore_compose() {
+      rm -f -- "$compose_file"
+      mv -- "$broken_compose" "$compose_file"
+    }
+    mv -- "$compose_file" "$broken_compose"
+    trap restore_compose EXIT HUP INT TERM
+    printf 'invalid: [\n' >"$compose_file"
+    NMCP_VALIDATION_PROJECT=$peer_project NMCP_API_PORT=$peer_api_port NMCP_FILES_PORT=$peer_files_port "$script" reset
+    restore_compose
+    trap - EXIT HUP INT TERM
+  )
+  [ ! -e "$input_parent/$peer_project.registry" ]
+  [ ! -e "$input_parent/$peer_run" ]
+  ! docker container ls --all --quiet --filter "label=com.docker.compose.project=$peer_project" | grep .
+  ! docker network ls --quiet --filter "label=com.docker.compose.project=$peer_project" | grep .
+  ! docker volume ls --quiet --filter "label=com.docker.compose.project=$peer_project" | grep .
   check
 
   docker volume create --label "com.docker.compose.project=$guard_project" --label com.nmcp.validation.owner=foreign "$guard_volume" >/dev/null
@@ -1082,7 +1134,7 @@ fi
 
 require_tools
 case "${1:-}" in
-  down|reset|logs) load_registered_inputs load-lifecycle ;;
+  down|reset|logs) ;;
   *)
     assert_owned
     load_registered_inputs load
@@ -1131,15 +1183,13 @@ case "${1:-}" in
     trap - EXIT HUP INT TERM
     ;;
   down)
-    assert_owned
-    compose_lifecycle down --remove-orphans
+    validation_inputs docker-down
     ;;
   reset)
     cleanup
     ;;
   logs)
-    assert_owned
-    compose_lifecycle logs --no-color
+    validation_inputs docker-logs
     ;;
   *)
     echo "usage: scripts/validation-env {up|check|verify|down|reset|logs|staging-test}" >&2

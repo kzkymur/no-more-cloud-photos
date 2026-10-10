@@ -65,20 +65,30 @@ matches blobs from one descriptor-pinned Git commit. A kernel-owned per-project
 lock serializes staging, verification, Docker launch, and reset even if an
 attacker replaces legacy lock pathnames. The helper pins directories by file
 descriptor, rejects symlinked path components, and copies verified bytes into
-sealed anonymous descriptors. It publishes only those immutable bytes into an
-ownership- and manifest-labeled, per-project/run Docker volume. Every reuse
-validates the exact inventory, types, modes, ownership, sizes, digests, and a
-digest-bound completion record; partial, raced, or tampered owned volumes are
-rebuilt before Compose can consume them. This keeps validation working after a
-fresh checkout under `umask 0077` without broadening checkout modes.
+sealed anonymous descriptors. Repository discovery variables and object-store
+overrides are removed; the checkout's pinned `.git` entry is resolved directly
+to pinned gitdir and commondir identities (including linked-worktree gitfiles).
+The helper builds a private content-addressed PostgreSQL image directly from the
+sealed bytes and validates its exact inventory, modes, ownership, digests, and
+completion record. PostgreSQL and both role helpers consume that immutable image
+ID with no SQL bind or named-volume mount. The separately exercised publisher
+volume retains exact manifest, partial-create, kill-recovery, and tamper evidence,
+but is never a consumer input. This keeps validation working after a fresh
+checkout under `umask 0077` without broadening checkout modes or leaving a
+publish-to-consumer mutation window.
 
 Cleanup first atomically detaches registered stages beneath the pinned project
 directory, then removes only descriptor-relative entries; it fails closed if an
 identity changed and never traverses arbitrary host paths. Lifecycle commands
 use the durable registered launch identity, so `logs`, `down`, and `reset` keep
-working after a branch switch or local input edit without republishing current
-checkout bytes. Cleanup discovers owned partial stages and labeled volumes,
-attempts all independent actions, and returns their aggregate failures.
+working after a branch switch, local input edit, missing/invalid Compose file,
+or damaged registered input leaves without republishing current checkout bytes.
+`down`, `reset`, and `logs` discover resources from exact project/owner labels
+instead of parsing the current Compose file. The authenticated registry pins the
+stage device/inode, allowing reset to detach a damaged owned stage while refusing
+an identity replacement. Cleanup discovers owned partial stages, labeled volumes,
+and immutable input images, attempts all independent actions, and returns their
+aggregate failures.
 Unregistered partial runs are removed before the supervisor releases the
 project lock. `cleanup` delegates to that reset and removes `.validation/` only
 after reset succeeds.
