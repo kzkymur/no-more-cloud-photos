@@ -3,7 +3,8 @@ x-validation-labels: &validation-labels
 
 services:
   postgres:
-    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    image: ${NMCP_POSTGRES_INPUT_IMAGE:?scripts/validation-inputs must publish the immutable PostgreSQL input image}
+    pull_policy: never
     environment:
       POSTGRES_DB: nmcp
       POSTGRES_USER: nmcp_bootstrap
@@ -15,18 +16,6 @@ services:
       retries: 30
     volumes:
       - database:/var/lib/postgresql/data
-      - type: volume
-        source: compose-inputs
-        target: /docker-entrypoint-initdb.d
-        read_only: true
-        volume:
-          subpath: init
-      - type: volume
-        source: compose-inputs
-        target: /opt/nmcp-infra
-        read_only: true
-        volume:
-          subpath: infra
     networks: [backend]
     labels: *validation-labels
 
@@ -59,7 +48,8 @@ services:
     labels: *validation-labels
 
   role-compatibility:
-    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    image: ${NMCP_POSTGRES_INPUT_IMAGE:?scripts/validation-inputs must publish the immutable PostgreSQL input image}
+    pull_policy: never
     entrypoint: ["psql"]
     command:
       - --host=postgres
@@ -75,18 +65,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    volumes:
-      - type: volume
-        source: compose-inputs
-        target: /opt/nmcp-infra
-        read_only: true
-        volume:
-          subpath: infra
     networks: [backend]
     labels: *validation-labels
 
   role-harden:
-    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    image: ${NMCP_POSTGRES_INPUT_IMAGE:?scripts/validation-inputs must publish the immutable PostgreSQL input image}
+    pull_policy: never
     entrypoint: ["sh", "-eu", "-c"]
     command:
       - >-
@@ -101,13 +85,6 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    volumes:
-      - type: volume
-        source: compose-inputs
-        target: /opt/nmcp-infra
-        read_only: true
-        volume:
-          subpath: infra
     networks: [backend]
     labels: *validation-labels
 
@@ -204,9 +181,6 @@ services:
     labels: *validation-labels
 
 volumes:
-  compose-inputs:
-    name: ${NMCP_COMPOSE_INPUT_VOLUME:?scripts/validation-env must set NMCP_COMPOSE_INPUT_VOLUME}
-    labels: *validation-labels
   database:
     labels: *validation-labels
   media:

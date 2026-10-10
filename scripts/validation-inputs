@@ -34,6 +34,7 @@ REQUIRED_SEALS = (
     | getattr(fcntl, "F_SEAL_GROW", 0)
     | getattr(fcntl, "F_SEAL_WRITE", 0)
 )
+POSTGRES_IMAGE = "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24"
 
 
 class UnsafeInput(RuntimeError):
@@ -110,6 +111,116 @@ def sealed_bytes(name, data):
         raise
 
 
+def git_environment(extra=None):
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
+def git_output(gitdir_fd, *arguments, text=False):
+    return subprocess.check_output(
+        ["git", "--no-replace-objects", f"--git-dir=/proc/{os.getpid()}/fd/{gitdir_fd}", *arguments],
+        text=text,
+        env=git_environment(),
+    )
+
+
+def reject_object_alternates(commondir_fd):
+    objects_fd = info_fd = None
+    try:
+        try:
+            objects_fd = os.open("objects", os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=commondir_fd)
+            info_fd = os.open("info", os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=objects_fd)
+        except FileNotFoundError:
+            return
+        for name in ("alternates", "http-alternates"):
+            try:
+                os.stat(name, dir_fd=info_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise UnsafeInput("repository object alternates are not accepted")
+    finally:
+        for fd in (info_fd, objects_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+def canonical_directory(path, label):
+    canonical = os.path.realpath(path)
+    if os.path.abspath(path) != canonical:
+        raise UnsafeInput(f"repository {label} must be canonical and non-symlinked")
+    fd = os.open(canonical, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+    if os.path.realpath(f"/proc/{os.getpid()}/fd/{fd}") != canonical:
+        os.close(fd)
+        raise UnsafeInput(f"repository {label} identity is not canonical")
+    return canonical, fd
+
+
+def read_git_path_file(fd, label):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+        raise UnsafeInput(f"repository {label} is not a bounded regular file")
+    data = os.pread(fd, info.st_size, 0)
+    if len(data) != info.st_size:
+        raise UnsafeInput(f"short read from repository {label}")
+    try:
+        line = data.decode("utf-8").removesuffix("\n")
+    except UnicodeDecodeError as exc:
+        raise UnsafeInput(f"repository {label} is not UTF-8") from exc
+    if not line or "\n" in line or "\r" in line:
+        raise UnsafeInput(f"repository {label} has invalid syntax")
+    return data, line
+
+
+def resolve_checkout_git(root_path, root_fd, git_entry_fd):
+    entry = os.fstat(git_entry_fd)
+    entry_data = None
+    if stat.S_ISDIR(entry.st_mode):
+        gitdir_path = os.path.join(root_path, ".git")
+        gitdir_fd = os.dup(git_entry_fd)
+    elif stat.S_ISREG(entry.st_mode):
+        entry_data, line = read_git_path_file(git_entry_fd, "gitfile")
+        if not line.startswith("gitdir: "):
+            raise UnsafeInput("repository gitfile does not name a gitdir")
+        target = line.removeprefix("gitdir: ")
+        if not target:
+            raise UnsafeInput("repository gitfile has an empty gitdir")
+        if not os.path.isabs(target):
+            target = os.path.join(root_path, target)
+        gitdir_path, gitdir_fd = canonical_directory(os.path.normpath(target), "gitdir")
+    else:
+        raise UnsafeInput("repository .git entry has an unsafe type")
+
+    common_path = gitdir_path
+    common_fd = os.dup(gitdir_fd)
+    common_file_fd = None
+    common_data = None
+    try:
+        try:
+            common_file_fd = os.open("commondir", os.O_RDONLY | NOFOLLOW, dir_fd=gitdir_fd)
+        except FileNotFoundError:
+            pass
+        else:
+            common_data, common_name = read_git_path_file(common_file_fd, "commondir")
+            if not os.path.isabs(common_name):
+                common_name = os.path.join(gitdir_path, common_name)
+            os.close(common_fd)
+            common_path, common_fd = canonical_directory(os.path.normpath(common_name), "commondir")
+        reject_object_alternates(common_fd)
+        return gitdir_path, gitdir_fd, entry_data, common_path, common_fd, common_data
+    except Exception:
+        os.close(common_fd)
+        os.close(gitdir_fd)
+        raise
+    finally:
+        if common_file_fd is not None:
+            os.close(common_file_fd)
+
+
 def open_directory(name, parent_fd, uid, private=False, create=False):
     if create:
         try:
@@ -179,6 +290,10 @@ class Store:
         gitdir_path=None,
         gitdir_fd=None,
         commit_oid=None,
+        git_entry_data=None,
+        commondir_path=None,
+        commondir_fd=None,
+        commondir_data=None,
     ):
         self.root_path = root_path
         self.root_fd = root_fd
@@ -191,9 +306,14 @@ class Store:
         self.gitdir_path = gitdir_path
         self.gitdir_fd = gitdir_fd
         self.commit_oid = commit_oid or ("0" * 40)
+        self.git_entry_data = git_entry_data
+        self.commondir_path = commondir_path or gitdir_path
+        self.commondir_fd = commondir_fd if commondir_fd is not None else gitdir_fd
+        self.commondir_data = commondir_data
         self.basename = None
         self.stage_fd = None
         self.input_fds = {}
+        self.input_image = None
         self.parent_path = os.path.join(root_path, ".validation", "compose-inputs")
 
     @property
@@ -212,6 +332,7 @@ class Store:
 
     def close_stage(self):
         self.close_snapshot_fds()
+        self.input_image = None
         if self.stage_fd is not None:
             os.close(self.stage_fd)
             self.stage_fd = None
@@ -230,13 +351,27 @@ class Store:
             entry_fd = os.open(".git", os.O_RDONLY | NOFOLLOW, dir_fd=self.root_fd)
             if not same_identity(self.git_entry_fd, entry_fd):
                 raise UnsafeInput("repository git entry identity changed")
+            if self.git_entry_data is not None:
+                current_entry, _ = read_git_path_file(entry_fd, "gitfile")
+                if current_entry != self.git_entry_data:
+                    raise UnsafeInput("repository gitfile changed during validation")
             gitdir_fd = os.open(self.gitdir_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
             if not same_identity(self.gitdir_fd, gitdir_fd):
                 raise UnsafeInput("repository gitdir identity changed")
-            current = subprocess.check_output(
-                ["git", f"--git-dir=/proc/{os.getpid()}/fd/{self.gitdir_fd}", "rev-parse", "--verify", "HEAD^{commit}"],
-                text=True,
-            ).strip()
+            common_fd = os.open(self.commondir_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+            if not same_identity(self.commondir_fd, common_fd):
+                raise UnsafeInput("repository commondir identity changed")
+            reject_object_alternates(common_fd)
+            os.close(common_fd)
+            if self.commondir_data is not None:
+                common_file = os.open("commondir", os.O_RDONLY | NOFOLLOW, dir_fd=self.gitdir_fd)
+                try:
+                    current_common, _ = read_git_path_file(common_file, "commondir")
+                finally:
+                    os.close(common_file)
+                if current_common != self.commondir_data:
+                    raise UnsafeInput("repository commondir link changed during validation")
+            current = git_output(self.gitdir_fd, "rev-parse", "--verify", "HEAD^{commit}", text=True).strip()
             if current != self.commit_oid:
                 raise UnsafeInput("repository HEAD changed during validation")
         finally:
@@ -292,8 +427,8 @@ class Store:
                 os.close(fd)
         finally:
             os.close(current)
-        expected = subprocess.check_output(
-            ["git", f"--git-dir=/proc/{os.getpid()}/fd/{self.gitdir_fd}", "cat-file", "blob", f"{self.commit_oid}:{tracked_path}"],
+        expected = git_output(
+            self.gitdir_fd, "cat-file", "blob", f"{self.commit_oid}:{tracked_path}"
         ) if self.gitdir_fd is not None else data
         self.verify_git_identity()
         if data != expected:
@@ -640,7 +775,19 @@ class Store:
 
     def register(self):
         self.verify()
-        self.write_file(self.parent_fd, self.registry, (self.basename + "\n").encode(), 0o600)
+        root = os.fstat(self.root_fd)
+        stage = os.fstat(self.stage_fd)
+        record = {
+            "schema": 1,
+            "owner": self.owner,
+            "project": self.project,
+            "basename": self.basename,
+            "commit": self._read_marker(self.stage_fd)["commit"],
+            "repository": [root.st_dev, root.st_ino],
+            "stage": [stage.st_dev, stage.st_ino],
+        }
+        record["auth"] = hashlib.sha256(canonical_json(record)).hexdigest()
+        self.write_file(self.parent_fd, self.registry, canonical_json(record) + b"\n", 0o600)
 
     def restage(self, output_name):
         matches = [(path, name) for _, path, name in INPUTS if name == output_name]
@@ -685,6 +832,136 @@ class Store:
             "com.nmcp.validation.run": self.basename,
             "com.nmcp.validation.manifest": digest,
         }
+
+    def expected_image_labels(self, digest):
+        return {
+            "com.nmcp.validation.kind": "compose-input-image",
+            "com.nmcp.validation.owner": self.owner,
+            "com.nmcp.validation.project": self.project,
+            "com.nmcp.validation.run": self.basename,
+            "com.nmcp.validation.manifest": digest,
+        }
+
+    def image_paths(self):
+        paths = {}
+        for variable, tracked_path, _ in INPUTS:
+            target = (
+                "docker-entrypoint-initdb.d/10-nmcp-roles.sql"
+                if tracked_path == "infra/validation/postgres-init.sql"
+                else "opt/nmcp-infra/" + tracked_path.removeprefix("infra/")
+            )
+            paths[target] = read_fd(self.input_fds[variable])
+        return paths
+
+    def inspect_image(self, image):
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if inspect.returncode != 0:
+            raise UnsafeInput(f"immutable Compose input image is absent: {image}")
+        return json.loads(inspect.stdout)[0]
+
+    def validate_image(self, image):
+        _, digest, completion = self.volume_manifest()
+        details = self.inspect_image(image)
+        labels = (details.get("Config") or {}).get("Labels") or {}
+        expected_labels = self.expected_image_labels(digest)
+        if any(labels.get(name) != value for name, value in expected_labels.items()):
+            raise UnsafeInput("immutable Compose input image labels do not match verified bytes")
+        base = self.inspect_image(POSTGRES_IMAGE)
+        base_layers = (base.get("RootFS") or {}).get("Layers") or []
+        image_layers = (details.get("RootFS") or {}).get("Layers") or []
+        if image_layers[: len(base_layers)] != base_layers or len(image_layers) <= len(base_layers):
+            raise UnsafeInput("immutable Compose input image is not derived from the pinned PostgreSQL image")
+        base_config, image_config = base.get("Config") or {}, details.get("Config") or {}
+        for key in (
+            "Entrypoint", "Cmd", "User", "WorkingDir", "Env", "StopSignal",
+            "Healthcheck", "Shell", "Volumes", "ExposedPorts",
+        ):
+            if image_config.get(key) != base_config.get(key):
+                raise UnsafeInput(f"immutable Compose input image changed base configuration: {key}")
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm", "--network", "none", "--read-only",
+                "--entrypoint", "tar", image, "-c", "-C", "/",
+                "docker-entrypoint-initdb.d",
+                "opt/nmcp-infra", "opt/nmcp-input-manifest",
+            ],
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+        expected_files = self.image_paths()
+        expected_files["opt/nmcp-input-manifest/.nmcp-complete"] = completion
+        expected_directories = {
+            "docker-entrypoint-initdb.d",
+            "opt/nmcp-infra", "opt/nmcp-infra/postgresql", "opt/nmcp-infra/ubuntu",
+            "opt/nmcp-infra/validation", "opt/nmcp-input-manifest",
+        }
+        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:*") as contents:
+            files = {}
+            directories = set()
+            for member in contents.getmembers():
+                name = member.name.removeprefix("./").rstrip("/")
+                if member.isfile():
+                    stream = contents.extractfile(member)
+                    files[name] = stream.read() if stream is not None else b""
+                    if member.mode != 0o444 or member.uid != 0 or member.gid != 0:
+                        raise UnsafeInput(f"unsafe immutable input image metadata: {name}")
+                elif member.isdir():
+                    directories.add(name)
+                else:
+                    raise UnsafeInput(f"unsafe immutable input image entry: {name}")
+            if files != expected_files or directories != expected_directories:
+                raise UnsafeInput("immutable Compose input image inventory or bytes differ")
+
+    def publish_image(self):
+        self.verify()
+        if self.input_image is not None:
+            self.validate_image(self.input_image)
+            return self.input_image
+        _, digest, completion = self.volume_manifest()
+        labels = self.expected_image_labels(digest)
+        context = io.BytesIO()
+        image_paths = self.image_paths()
+        dockerfile = [f"FROM {POSTGRES_IMAGE}"]
+        with tarfile.open(fileobj=context, mode="w") as archive:
+            for name, data in image_paths.items():
+                context_name = "payload/" + name
+                entry = tarfile.TarInfo(context_name)
+                entry.mode = 0o444
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+                dockerfile.append(f"COPY --chown=0:0 {context_name} /{name}")
+            completion_name = "payload/opt/nmcp-input-manifest/.nmcp-complete"
+            entry = tarfile.TarInfo(completion_name)
+            entry.mode = 0o444
+            entry.size = len(completion)
+            archive.addfile(entry, io.BytesIO(completion))
+            dockerfile.append(
+                f"COPY --chown=0:0 {completion_name} /opt/nmcp-input-manifest/.nmcp-complete"
+            )
+            installed = ["/" + name for name in image_paths]
+            installed.append("/opt/nmcp-input-manifest/.nmcp-complete")
+            dockerfile.append("RUN chmod 0444 " + " ".join(installed))
+            dockerfile_data = ("\n".join(dockerfile) + "\n").encode("ascii")
+            entry = tarfile.TarInfo("Dockerfile")
+            entry.mode = 0o444
+            entry.size = len(dockerfile_data)
+            archive.addfile(entry, io.BytesIO(dockerfile_data))
+        build = ["docker", "build", "--quiet", "--pull=false", "--network", "none"]
+        for name, value in labels.items():
+            build.extend(("--label", f"{name}={value}"))
+        build.append("-")
+        result = subprocess.run(build, input=context.getvalue(), stdout=subprocess.PIPE, check=True)
+        image = result.stdout.decode("ascii").strip().splitlines()[-1]
+        if not image.startswith("sha256:"):
+            raise UnsafeInput("Docker did not return an immutable image ID")
+        self.validate_image(image)
+        self.input_image = image
+        return image
 
     def inspect_volume(self, volume):
         inspect = subprocess.run(
@@ -765,6 +1042,7 @@ class Store:
         expected_labels = self.expected_volume_labels(digest)
         try:
             self.validate_volume(volume)
+            self.publish_image()
             return volume
         except MissingVolume:
             pass
@@ -823,6 +1101,7 @@ class Store:
                     check=True,
                 )
                 self.validate_volume(volume)
+                self.publish_image()
                 return volume
             except Exception as exc:
                 last_error = exc
@@ -885,6 +1164,23 @@ class Store:
         self.validate_volume(volume)
         return volume
 
+    def image_security_test(self):
+        volume = self.publish()
+        image = self.input_image
+        if not image:
+            raise UnsafeInput("immutable Compose input image was not published")
+        subprocess.run(
+            [
+                "docker", "run", "--rm", "--network", "none",
+                "--volume", f"{volume}:/inputs", "--entrypoint", "sh", POSTGRES_IMAGE,
+                "-eu", "-c", "printf consumer-race > /inputs/infra/postgresql/runtime-roles.sql; rm -f /inputs/.nmcp-complete",
+            ],
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
+        self.validate_image(image)
+        return image
+
     def seed_partial_volume_and_wait(self):
         if os.environ.get("NMCP_VALIDATION_KILL_TEST") != "1":
             raise UnsafeInput("partial-volume kill test is not enabled")
@@ -943,10 +1239,10 @@ class Store:
             raise UnsafeInput("refusing to remove an unowned Compose input volume")
         subprocess.run(["docker", "volume", "rm", volume], stdout=subprocess.DEVNULL, check=True)
 
-    def _read_registry(self):
+    def _read_registry_record(self):
         self.verify_chain()
         try:
-            fd, data = read_regular(self.registry, self.parent_fd, self.uid, 0o600, 512)
+            fd, data = read_regular(self.registry, self.parent_fd, self.uid, 0o600, 4096)
         except UnsafeInput as exc:
             try:
                 os.stat(self.registry, dir_fd=self.parent_fd, follow_symlinks=False)
@@ -954,18 +1250,40 @@ class Store:
                 return None, None
             raise exc
         try:
-            name = data.decode("ascii").removesuffix("\n")
-        except UnicodeDecodeError as exc:
+            record = json.loads(data)
+            authenticated = dict(record) if isinstance(record, dict) else {}
+            authentication = authenticated.pop("auth", None)
+            root = os.fstat(self.root_fd)
+            if (
+                not isinstance(record, dict)
+                or set(record) != {
+                    "schema", "owner", "project", "basename", "commit",
+                    "repository", "stage", "auth"
+                }
+                or record["schema"] != 1
+                or record["owner"] != self.owner
+                or record["project"] != self.project
+                or check_basename(record["basename"], self.project) != record["basename"]
+                or not isinstance(record["commit"], str)
+                or len(record["commit"]) not in (40, 64)
+                or record["repository"] != [root.st_dev, root.st_ino]
+                or not isinstance(record["stage"], list)
+                or len(record["stage"]) != 2
+                or not all(isinstance(value, int) for value in record["stage"])
+                or authentication != hashlib.sha256(canonical_json(authenticated)).hexdigest()
+            ):
+                raise UnsafeInput("invalid Compose input registry")
+            return record, fd
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, KeyError) as exc:
             os.close(fd)
-            raise UnsafeInput("non-ASCII Compose input registry") from exc
-        if "\n" in name or "\r" in name:
-            os.close(fd)
-            raise UnsafeInput("invalid Compose input registry")
-        try:
-            return check_basename(name, self.project), fd
+            raise UnsafeInput("invalid Compose input registry") from exc
         except Exception:
             os.close(fd)
             raise
+
+    def _read_registry(self):
+        record, fd = self._read_registry_record()
+        return (record["basename"] if record is not None else None), fd
 
     def read_registry(self):
         name, fd = self._read_registry()
@@ -1050,10 +1368,18 @@ class Store:
         errors = []
         candidates = []
         intent = intent_fd = None
+        registered_record = registered_record_fd = None
         try:
             intent, intent_fd = self._read_intent()
         except Exception as exc:
             errors.append(f"intent: {exc}")
+        try:
+            registered_record, registered_record_fd = self._read_registry_record()
+        except Exception as exc:
+            errors.append(f"registry: {exc}")
+        finally:
+            if registered_record_fd is not None:
+                os.close(registered_record_fd)
         for name in os.listdir(self.parent_fd):
             if name.startswith(".delete-" + self.project + "."):
                 candidates.append(name)
@@ -1068,28 +1394,41 @@ class Store:
             detached = name
             try:
                 stage_fd = open_directory(name, self.parent_fd, self.uid, private=True)
+                stage_info = os.fstat(stage_fd)
+                registered_owned = registered_record is not None and (
+                    name == registered_record["basename"]
+                    or name.startswith(".delete-" + registered_record["basename"] + "-")
+                ) and registered_record["stage"] == [stage_info.st_dev, stage_info.st_ino]
                 try:
                     os.stat(".owner", dir_fd=stage_fd, follow_symlinks=False)
                 except FileNotFoundError:
                     marker = None
                 else:
-                    marker = self._read_marker(stage_fd)
+                    try:
+                        marker = self._read_marker(stage_fd)
+                    except UnsafeInput:
+                        if not registered_owned:
+                            raise
+                        marker = None
                 if marker is None:
-                    if intent is None or (
-                        name != intent["basename"]
-                        and not name.startswith(".delete-" + intent["basename"] + "-")
+                    if registered_owned:
+                        basename = registered_record["basename"]
+                    elif intent is None or (
+                            name != intent["basename"]
+                            and not name.startswith(".delete-" + intent["basename"] + "-")
                     ):
                         raise UnsafeInput("stage has no matching cleanup intent")
-                    basename = intent["basename"]
-                    entries = set(os.listdir(stage_fd))
-                    info = os.fstat(stage_fd)
-                    if intent["phase"] == "planned":
-                        if entries:
-                            raise UnsafeInput("planned cleanup intent names a nonempty directory")
-                    elif intent["stage"] != [info.st_dev, info.st_ino]:
-                        raise UnsafeInput("bound cleanup intent identity does not match")
-                    elif entries:
-                        raise UnsafeInput("nonempty intended stage has no ownership marker")
+                    else:
+                        basename = intent["basename"]
+                        entries = set(os.listdir(stage_fd))
+                        info = os.fstat(stage_fd)
+                        if intent["phase"] == "planned":
+                            if entries:
+                                raise UnsafeInput("planned cleanup intent names a nonempty directory")
+                        elif intent["stage"] != [info.st_dev, info.st_ino]:
+                            raise UnsafeInput("bound cleanup intent identity does not match")
+                        elif entries:
+                            raise UnsafeInput("nonempty intended stage has no ownership marker")
                 else:
                     basename = marker["basename"]
                     if name != basename and not name.startswith(".delete-" + basename + "-"):
@@ -1187,6 +1526,115 @@ class Store:
         if errors:
             raise UnsafeInput("cleanup failures: " + "; ".join(errors))
 
+    def _docker_ids(self, resource, label_name="com.docker.compose.project"):
+        command = ["docker", resource, "ls", "--quiet", "--filter", f"label={label_name}={self.project}"]
+        if resource == "container":
+            command.insert(3, "--all")
+        result = subprocess.run(command, stdout=subprocess.PIPE, text=True, check=False)
+        if result.returncode != 0:
+            raise UnsafeInput(f"Docker {resource} discovery failed")
+        return list(dict.fromkeys(result.stdout.split()))
+
+    def _docker_labels(self, resource, identity):
+        details = subprocess.run(
+            ["docker", resource, "inspect", identity],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if details.returncode != 0:
+            return None
+        record = json.loads(details.stdout)[0]
+        if resource in ("container", "image"):
+            return (record.get("Config") or {}).get("Labels") or {}
+        return record.get("Labels") or {}
+
+    def docker_lifecycle(self, action, stdio=None):
+        if action not in ("down", "reset", "logs"):
+            raise UnsafeInput("invalid Docker lifecycle action")
+        errors = []
+        kwargs = {}
+        if stdio is not None:
+            kwargs = {"stdin": stdio[0], "stdout": stdio[1], "stderr": stdio[2]}
+        containers = self._docker_ids("container")
+        owned_containers = []
+        for container in containers:
+            labels = self._docker_labels("container", container)
+            if labels is None:
+                continue
+            if labels.get("com.nmcp.validation.owner") != self.owner:
+                errors.append(f"foreign container {container}")
+                continue
+            owned_containers.append(container)
+        if action == "logs":
+            for container in sorted(owned_containers):
+                result = subprocess.run(["docker", "logs", container], check=False, **kwargs)
+                if result.returncode != 0:
+                    errors.append(f"container logs {container}")
+        else:
+            for container in owned_containers:
+                stopped = subprocess.run(
+                    ["docker", "container", "stop", "--time", "20", container],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                )
+                if stopped.returncode not in (0, 1):
+                    errors.append(f"container stop {container}")
+            for container in owned_containers:
+                removed = subprocess.run(
+                    ["docker", "container", "rm", "--force", container],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                )
+                if removed.returncode != 0 and self._docker_labels("container", container) is not None:
+                    errors.append(f"container remove {container}")
+
+            for network in self._docker_ids("network"):
+                labels = self._docker_labels("network", network)
+                if labels is None:
+                    continue
+                if labels.get("com.nmcp.validation.owner") != self.owner:
+                    errors.append(f"foreign network {network}")
+                    continue
+                removed = subprocess.run(
+                    ["docker", "network", "rm", network], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                )
+                if removed.returncode != 0 and self._docker_labels("network", network) is not None:
+                    errors.append(f"network remove {network}")
+
+        if action == "reset":
+            for volume in self._docker_ids("volume"):
+                labels = self._docker_labels("volume", volume)
+                if labels is None:
+                    continue
+                if labels.get("com.nmcp.validation.owner") != self.owner:
+                    errors.append(f"foreign volume {volume}")
+                    continue
+                removed = subprocess.run(
+                    ["docker", "volume", "rm", volume], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                )
+                if removed.returncode != 0 and self._docker_labels("volume", volume) is not None:
+                    errors.append(f"volume remove {volume}")
+
+            for image in self._docker_ids("image", "com.nmcp.validation.project"):
+                labels = self._docker_labels("image", image)
+                if labels is None:
+                    continue
+                if (
+                    labels.get("com.nmcp.validation.kind") != "compose-input-image"
+                    or labels.get("com.nmcp.validation.owner") != self.owner
+                ):
+                    errors.append(f"foreign input image {image}")
+                    continue
+                removed = subprocess.run(
+                    ["docker", "image", "rm", image], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, check=False,
+                )
+                if removed.returncode != 0 and self._docker_labels("image", image) is not None:
+                    errors.append(f"input image remove {image}")
+        if errors:
+            raise UnsafeInput("Docker lifecycle failures: " + "; ".join(errors))
+
     def run(self, argv, race_hook=None, stdio=None):
         self.verify()
         if race_hook:
@@ -1194,6 +1642,9 @@ class Store:
         self.verify_chain()
         env = os.environ.copy()
         env["NMCP_COMPOSE_INPUT_VOLUME"] = self.volume
+        if self.input_image is not None:
+            self.validate_image(self.input_image)
+            env["NMCP_POSTGRES_INPUT_IMAGE"] = self.input_image
         for variable in self.input_fds:
             fd = self.input_fds[variable]
             env[variable] = f"/proc/{os.getpid()}/fd/{fd}"
@@ -1257,6 +1708,8 @@ def serve(sock, child, store):
                 result = store.publish()
             elif command == "volume-test":
                 result = store.volume_security_test()
+            elif command == "image-test":
+                result = store.image_security_test()
             elif command == "seed-partial-and-wait":
                 store.seed_partial_volume_and_wait()
                 result = True
@@ -1268,6 +1721,11 @@ def serve(sock, child, store):
                 result = True
             elif command == "cleanup":
                 store.cleanup_project()
+                result = True
+            elif command in ("docker-down", "docker-reset", "docker-logs"):
+                if len(passed_fds) != 3:
+                    raise UnsafeInput("Docker lifecycle command did not provide stdin/stdout/stderr")
+                store.docker_lifecycle(command.removeprefix("docker-"), stdio=passed_fds)
                 result = True
             elif command == "run":
                 if len(passed_fds) != 3:
@@ -1295,20 +1753,17 @@ def invoke(root, project, script, arguments):
     if os.path.abspath(root) != root_path:
         raise UnsafeInput("validation repository root must be canonical and non-symlinked")
     root_fd = os.open(root_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
-    validation_fd = parent_fd = git_entry_fd = gitdir_fd = None
+    validation_fd = parent_fd = git_entry_fd = gitdir_fd = commondir_fd = None
     lock_sock = None
     try:
         owned_directory(root_fd, uid)
         git_entry_fd = os.open(".git", os.O_RDONLY | NOFOLLOW, dir_fd=root_fd)
-        gitdir_path = subprocess.check_output(
-            ["git", "-C", root_path, "rev-parse", "--absolute-git-dir"], text=True
-        ).strip()
-        if os.path.realpath(gitdir_path) != gitdir_path:
-            raise UnsafeInput("repository gitdir must be canonical and non-symlinked")
-        gitdir_fd = os.open(gitdir_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
-        commit_oid = subprocess.check_output(
-            ["git", f"--git-dir=/proc/{os.getpid()}/fd/{gitdir_fd}", "rev-parse", "--verify", "HEAD^{commit}"],
-            text=True,
+        (
+            gitdir_path, gitdir_fd, git_entry_data,
+            commondir_path, commondir_fd, commondir_data,
+        ) = resolve_checkout_git(root_path, root_fd, git_entry_fd)
+        commit_oid = git_output(
+            gitdir_fd, "rev-parse", "--verify", "HEAD^{commit}", text=True
         ).strip()
         validation_fd = open_directory(".validation", root_fd, uid, create=True)
         parent_fd = open_directory("compose-inputs", validation_fd, uid, private=True, create=True)
@@ -1348,18 +1803,32 @@ def invoke(root, project, script, arguments):
             gitdir_path,
             gitdir_fd,
             commit_oid,
+            git_entry_data,
+            commondir_path,
+            commondir_fd,
+            commondir_data,
         )
         try:
             return serve(server_sock, child, store)
         finally:
             if store.stage_fd is not None and store.read_registry() != store.basename:
-                store.cleanup_project()
+                cleanup_errors = []
+                try:
+                    store.docker_lifecycle("reset")
+                except Exception as exc:
+                    cleanup_errors.append(str(exc))
+                try:
+                    store.cleanup_project()
+                except Exception as exc:
+                    cleanup_errors.append(str(exc))
+                if cleanup_errors:
+                    raise UnsafeInput("unregistered validation cleanup failed: " + "; ".join(cleanup_errors))
             store.close_stage()
             server_sock.close()
     finally:
         if lock_sock is not None:
             lock_sock.close()
-        for fd in (gitdir_fd, git_entry_fd, parent_fd, validation_fd, root_fd):
+        for fd in (commondir_fd, gitdir_fd, git_entry_fd, parent_fd, validation_fd, root_fd):
             if fd is not None:
                 os.close(fd)
 
@@ -1368,14 +1837,14 @@ def client(command, argv):
     fd = int(os.environ["NMCP_VALIDATION_INPUTS_FD"])
     sock = socket.socket(fileno=os.dup(fd))
     request = {"command": command}
-    if command in ("run", "run-lifecycle"):
+    if command in ("run", "run-lifecycle", "docker-down", "docker-reset", "docker-logs"):
         request["argv"] = argv
     elif command == "restage":
         if len(argv) != 1:
             raise UnsafeInput("restage requires one output basename")
         request["name"] = argv[0]
     payload = json.dumps(request, separators=(",", ":")).encode()
-    if command in ("run", "run-lifecycle"):
+    if command in ("run", "run-lifecycle", "docker-down", "docker-reset", "docker-logs"):
         descriptors = array.array("i", (0, 1, 2))
         sock.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)])
     else:
@@ -1387,7 +1856,7 @@ def client(command, argv):
     if not response["ok"]:
         raise UnsafeInput(response["error"])
     result = response["result"]
-    if command in ("stage", "load", "load-lifecycle", "publish", "volume-test") and result is not None:
+    if command in ("stage", "load", "load-lifecycle", "publish", "volume-test", "image-test") and result is not None:
         print(result)
     return result if command == "run" else 0
 
@@ -1559,9 +2028,11 @@ def self_test():
         validation_env = os.path.join(os.path.dirname(os.path.realpath(__file__)), "validation-env")
         with open(validation_env, encoding="ascii") as stream:
             dispatch = stream.read()
-        lifecycle_dispatch = "down|reset|logs) load_registered_inputs load-lifecycle ;;"
-        assert dispatch.count(lifecycle_dispatch) == 1
-        assert "down|reset|logs) load_registered_inputs load ;;" not in dispatch
+        assert dispatch.count("down|reset|logs) ;;") == 1
+        assert "compose_lifecycle" not in dispatch
+        assert "validation_inputs docker-down" in dispatch
+        assert "validation_inputs docker-reset" in dispatch
+        assert "validation_inputs docker-logs" in dispatch
         lifecycle_cleanup = Store(
             root, root_fd, validation_fd, parent_fd, "command-lifecycle", invoke_owner, uid,
             git_entry_fd, gitdir_path, gitdir_fd, pinned_commit,
@@ -1941,11 +2412,99 @@ def self_test():
         os.close(validation_fd)
         os.close(root_fd)
 
+        helper = os.path.realpath(__file__)
+        stage_child = os.path.join(temporary, "stage-child")
+        with open(stage_child, "w", encoding="ascii") as stream:
+            stream.write(
+                "#!/bin/sh\nset -eu\n"
+                f"python3 {helper!r} client stage >/dev/null\n"
+            )
+        os.chmod(stage_child, 0o700)
+        delayed_stage_child = os.path.join(temporary, "delayed-stage-child")
+        with open(delayed_stage_child, "w", encoding="ascii") as stream:
+            stream.write(
+                "#!/bin/sh\nset -eu\nsleep 0.3\n"
+                f"python3 {helper!r} client stage >/dev/null\n"
+            )
+        os.chmod(delayed_stage_child, 0o700)
+        foreign_gitdir = os.path.join(temporary, "foreign.git")
+        subprocess.run(
+            ["git", "clone", "--quiet", "--bare", root, foreign_gitdir],
+            env=git_environment(), check=True,
+        )
+        subprocess.run(
+            ["git", f"--git-dir={foreign_gitdir}", "update-ref", "HEAD", pinned_commit + "^"],
+            env=git_environment(), check=True,
+        )
+        foreign_env = git_environment({
+            "GIT_DIR": foreign_gitdir,
+            "GIT_WORK_TREE": outside,
+            "GIT_COMMON_DIR": foreign_gitdir,
+            "GIT_OBJECT_DIRECTORY": os.path.join(foreign_gitdir, "objects"),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": os.path.join(foreign_gitdir, "objects"),
+        })
+        assert subprocess.run(
+            [sys.executable, helper, "invoke", root, "foreign-git-env", stage_child],
+            env=foreign_env,
+        ).returncode == 0
+        subprocess.run(
+            ["git", "-C", root, "replace", pinned_commit, older_commit],
+            env=git_environment(), check=True,
+        )
+        try:
+            assert subprocess.run(
+                [sys.executable, helper, "invoke", root, "replace-ref-test", stage_child],
+                env=git_environment(),
+            ).returncode == 0
+        finally:
+            subprocess.run(
+                ["git", "-C", root, "replace", "-d", pinned_commit],
+                env=git_environment(), check=True,
+            )
+
+        moved_gitdir = os.path.join(temporary, "moved-root-gitdir")
+        root_swap = subprocess.Popen(
+            [sys.executable, helper, "invoke", root, "directory-git-swap", delayed_stage_child],
+            env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.1)
+        os.rename(os.path.join(root, ".git"), moved_gitdir)
+        os.symlink(foreign_gitdir, os.path.join(root, ".git"))
+        assert root_swap.wait() != 0
+        os.unlink(os.path.join(root, ".git"))
+        os.rename(moved_gitdir, os.path.join(root, ".git"))
+
+        linked = os.path.join(temporary, "linked-worktree")
+        subprocess.run(
+            ["git", "-C", root, "worktree", "add", "--quiet", "--detach", linked, pinned_commit],
+            env=git_environment(), check=True,
+        )
+        assert subprocess.run(
+            [sys.executable, helper, "invoke", linked, "foreign-linked-env", stage_child],
+            env=foreign_env,
+        ).returncode == 0
+        linked_gitfile = os.path.join(linked, ".git")
+        with open(linked_gitfile, "rb") as stream:
+            linked_gitfile_data = stream.read()
+        gitfile_swap = subprocess.Popen(
+            [sys.executable, helper, "invoke", linked, "gitfile-swap", delayed_stage_child],
+            env=git_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.1)
+        with open(linked_gitfile, "wb") as stream:
+            stream.write(f"gitdir: {foreign_gitdir}\n".encode("utf-8"))
+        assert gitfile_swap.wait() != 0
+        with open(linked_gitfile, "wb") as stream:
+            stream.write(linked_gitfile_data)
+        subprocess.run(
+            ["git", "-C", root, "worktree", "remove", "--force", linked],
+            env=git_environment(), check=True,
+        )
+
         sleeper = os.path.join(root, "sleep-validation")
         with open(sleeper, "w", encoding="ascii") as stream:
             stream.write("#!/bin/sh\nsleep \"$1\"\n")
         os.chmod(sleeper, 0o700)
-        helper = os.path.realpath(__file__)
         def timed_invocations(projects):
             started = time.monotonic()
             children = [
