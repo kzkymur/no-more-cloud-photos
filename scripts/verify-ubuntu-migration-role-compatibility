@@ -2,9 +2,9 @@
 set -euo pipefail
 
 [[ $EUID -eq 0 ]] || { printf 'must run as root\n' >&2; exit 1; }
-[[ $# -eq 2 ]] || { printf 'usage: %s CURRENT_ADMIN V16_ADMIN\n' "$0" >&2; exit 2; }
+[[ $# -eq 2 ]] || { printf 'usage: %s CURRENT_ADMIN V17_ADMIN\n' "$0" >&2; exit 2; }
 current_admin=$(/usr/bin/readlink -f -- "$1")
-v16_admin=$(/usr/bin/readlink -f -- "$2")
+v17_admin=$(/usr/bin/readlink -f -- "$2")
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 work=$(/usr/bin/mktemp -d /var/tmp/nmcp-role-compatibility.XXXXXX)
 /usr/bin/chmod 0755 "$work"
@@ -29,7 +29,7 @@ if ! /usr/bin/id nmcp >/dev/null 2>&1; then
   /usr/bin/systemd-sysusers "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf"
 fi
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp/postgresql \
-  /opt/nmcp-role-compatibility/current/bin /opt/nmcp-role-compatibility/v16/bin
+  /opt/nmcp-role-compatibility/current/bin /opt/nmcp-role-compatibility/v17/bin
 /usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
 /usr/bin/install -o root -g root -m 0755 \
   "$repo_root/scripts/set-ubuntu-migration-role-mode" \
@@ -43,8 +43,8 @@ fi
   /usr/local/libexec/nmcp/postgresql/postgresql-roles.sql
 /usr/bin/install -o root -g root -m 0755 "$current_admin" \
   /opt/nmcp-role-compatibility/current/bin/nmcp-admin
-/usr/bin/install -o root -g root -m 0755 "$v16_admin" \
-  /opt/nmcp-role-compatibility/v16/bin/nmcp-admin
+/usr/bin/install -o root -g root -m 0755 "$v17_admin" \
+  /opt/nmcp-role-compatibility/v17/bin/nmcp-admin
 
 write_checksums() {
   local temporary
@@ -69,10 +69,21 @@ assert_hardened() {
   /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
     --file=/usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql >/dev/null
 }
+assert_runtime_boundary() {
+  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+    --set=ON_ERROR_STOP=1 --file="$repo_root/infra/validation/verify-runtime-roles.sql" >/dev/null
+}
 assert_compatibility() {
   [[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
     --tuples-only --no-align --set=ON_ERROR_STOP=1 --command \
     "SELECT count(*) FROM pg_catalog.pg_auth_members WHERE member='nmcp_migrator'::regrole AND roleid IN ('nmcp_purge_function_owner'::regrole,'nmcp_check_function_owner'::regrole,'nmcp_repair_function_owner'::regrole) AND NOT admin_option AND inherit_option AND set_option") == 3 ]]
+}
+assert_migration() {
+  local version=$1 name=$2 checksum=$3
+  [[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
+    --tuples-only --no-align --set=ON_ERROR_STOP=1 --command \
+    "SELECT count(*) FILTER (WHERE version=$version AND name='$name' AND checksum='$checksum' AND NOT dirty)||':'||count(*) FILTER (WHERE dirty OR version>$version)||':'||max(version) FROM schema_migrations") == \
+    "1:0:$version" ]]
 }
 run_wrapper() {
   /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility "$@"
@@ -92,9 +103,12 @@ export NMCP_LOG_LEVEL=info NMCP_SHUTDOWN_TIMEOUT=10s
 # Fresh v0 migration and a normal rerun both finish in the hardened graph.
 reset_database
 run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
+assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24
 assert_hardened
+assert_runtime_boundary
 run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
 assert_hardened
+assert_runtime_boundary
 
 # Caller-controlled libpq routing/session variables cannot redirect or alter
 # the root helper's reviewed local peer-authenticated connection.
@@ -232,15 +246,14 @@ set -e
 /usr/local/libexec/nmcp/set-ubuntu-migration-role-mode hardened
 assert_hardened
 
-# Upgrade evidence uses the exact pre-0017 admin binary for v0→16, followed by
-# the candidate binary for v16→17 under the same production wrapper.
+# Upgrade evidence uses the exact historical 0017 admin binary for v0→17,
+# followed by the candidate binary for v17→18 under the production wrapper.
 reset_database
-run_wrapper /opt/nmcp-role-compatibility/v16/bin/nmcp-admin migrate up --json
-[[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
-  --tuples-only --no-align --command 'SELECT max(version) FROM schema_migrations WHERE NOT dirty') == 16 ]]
+run_wrapper /opt/nmcp-role-compatibility/v17/bin/nmcp-admin migrate up --json
+assert_migration 17 reconciliation_evidence_boundary a2fb79856995607fd3364d2dd1ff1755d643f5f6fd2d01f7beee819b865fe6fb
 run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
-[[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
-  --tuples-only --no-align --command 'SELECT max(version) FROM schema_migrations WHERE NOT dirty') == 17 ]]
+assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24
 assert_hardened
+assert_runtime_boundary
 
 printf 'Ubuntu migration role compatibility verification passed\n'

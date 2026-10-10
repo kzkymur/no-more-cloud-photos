@@ -80,72 +80,6 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'unsafe runtime login role attributes';
     END IF;
-    IF EXISTS (
-        WITH managed(roleid) AS (VALUES
-            ('nmcp_runtime'::pg_catalog.regrole::oid),
-            ('nmcp_worker_runtime'::pg_catalog.regrole::oid),
-            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid),
-            ('nmcp_check_runtime'::pg_catalog.regrole::oid),
-            ('nmcp_repair_runtime'::pg_catalog.regrole::oid),
-            ('nmcp_check_function_owner'::pg_catalog.regrole::oid),
-            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid),
-            ('nmcp_migrator'::pg_catalog.regrole::oid),
-            ('nmcp_api'::pg_catalog.regrole::oid),
-            ('nmcp_worker'::pg_catalog.regrole::oid)
-        ), allowed(roleid,member,admin_option,inherit_option,set_option) AS (VALUES
-            ('nmcp_runtime'::pg_catalog.regrole::oid,
-             'nmcp_worker_runtime'::pg_catalog.regrole::oid,false,true,false),
-            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid,
-             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
-            ('nmcp_check_function_owner'::pg_catalog.regrole::oid,
-             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
-            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid,
-             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
-            ('nmcp_runtime'::pg_catalog.regrole::oid,
-             'nmcp_api'::pg_catalog.regrole::oid,false,true,false),
-            ('nmcp_worker_runtime'::pg_catalog.regrole::oid,
-             'nmcp_worker'::pg_catalog.regrole::oid,false,true,false)
-        )
-        SELECT 1
-        FROM pg_catalog.pg_auth_members AS actual
-        WHERE (actual.roleid IN (SELECT roleid FROM managed)
-               OR actual.member IN (SELECT roleid FROM managed))
-          AND NOT EXISTS (
-              SELECT 1 FROM allowed
-              WHERE allowed.roleid=actual.roleid
-                AND allowed.member=actual.member
-                AND allowed.admin_option=actual.admin_option
-                AND allowed.inherit_option=actual.inherit_option
-                AND allowed.set_option=actual.set_option
-          )
-    ) OR EXISTS (
-        WITH allowed(roleid,member,admin_option,inherit_option,set_option) AS (VALUES
-            ('nmcp_runtime'::pg_catalog.regrole::oid,
-             'nmcp_worker_runtime'::pg_catalog.regrole::oid,false,true,false),
-            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid,
-             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
-            ('nmcp_check_function_owner'::pg_catalog.regrole::oid,
-             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
-            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid,
-             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
-            ('nmcp_runtime'::pg_catalog.regrole::oid,
-             'nmcp_api'::pg_catalog.regrole::oid,false,true,false),
-            ('nmcp_worker_runtime'::pg_catalog.regrole::oid,
-             'nmcp_worker'::pg_catalog.regrole::oid,false,true,false)
-        )
-        SELECT 1 FROM allowed
-        WHERE NOT EXISTS (
-            SELECT 1 FROM pg_catalog.pg_auth_members AS actual
-            WHERE actual.roleid=allowed.roleid
-              AND actual.member=allowed.member
-              AND actual.admin_option=allowed.admin_option
-              AND actual.inherit_option=allowed.inherit_option
-              AND actual.set_option=allowed.set_option
-        )
-    ) THEN
-        RAISE EXCEPTION 'managed PostgreSQL role graph differs from exact allowlist';
-    END IF;
-
     SELECT pg_catalog.pg_get_userbyid(c.relowner)
     INTO table_owner
     FROM pg_catalog.pg_class AS c
@@ -331,7 +265,15 @@ BEGIN
              'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
             ('nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)',
              'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
+            ('nmcp_append_check_finding_once(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)',
+             'nmcp_check_function_owner',NULL,ARRAY[]::text[]),
             ('nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)',
+             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
+            ('nmcp_read_check_database_references(timestamptz)',
+             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
+            ('nmcp_read_check_attempt_owners()',
+             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
+            ('nmcp_read_check_report_outcome(nmcp_uuid_v4)',
              'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
             ('nmcp_require_normal_maintenance()',
              'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
@@ -419,6 +361,180 @@ BEGIN
         ) THEN
             RAISE EXCEPTION 'missing intended effective EXECUTE on %',boundary.signature;
         END IF;
+    END LOOP;
+END;
+$$;
+
+-- Check the managed role graph after function boundaries so an inherited
+-- privilege counterexample is rejected by the effective-ACL assertion itself.
+DO $$
+BEGIN
+    IF EXISTS (
+        WITH managed(roleid) AS (VALUES
+            ('nmcp_runtime'::pg_catalog.regrole::oid),
+            ('nmcp_worker_runtime'::pg_catalog.regrole::oid),
+            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid),
+            ('nmcp_check_runtime'::pg_catalog.regrole::oid),
+            ('nmcp_repair_runtime'::pg_catalog.regrole::oid),
+            ('nmcp_check_function_owner'::pg_catalog.regrole::oid),
+            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid),
+            ('nmcp_migrator'::pg_catalog.regrole::oid),
+            ('nmcp_api'::pg_catalog.regrole::oid),
+            ('nmcp_worker'::pg_catalog.regrole::oid)
+        ), allowed(roleid,member,admin_option,inherit_option,set_option) AS (VALUES
+            ('nmcp_runtime'::pg_catalog.regrole::oid,
+             'nmcp_worker_runtime'::pg_catalog.regrole::oid,false,true,false),
+            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_check_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_runtime'::pg_catalog.regrole::oid,
+             'nmcp_api'::pg_catalog.regrole::oid,false,true,false),
+            ('nmcp_worker_runtime'::pg_catalog.regrole::oid,
+             'nmcp_worker'::pg_catalog.regrole::oid,false,true,false)
+        )
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS actual
+        WHERE (actual.roleid IN (SELECT roleid FROM managed)
+               OR actual.member IN (SELECT roleid FROM managed))
+          AND NOT EXISTS (
+              SELECT 1 FROM allowed
+              WHERE allowed.roleid=actual.roleid
+                AND allowed.member=actual.member
+                AND allowed.admin_option=actual.admin_option
+                AND allowed.inherit_option=actual.inherit_option
+                AND allowed.set_option=actual.set_option
+          )
+    ) OR EXISTS (
+        WITH allowed(roleid,member,admin_option,inherit_option,set_option) AS (VALUES
+            ('nmcp_runtime'::pg_catalog.regrole::oid,
+             'nmcp_worker_runtime'::pg_catalog.regrole::oid,false,true,false),
+            ('nmcp_purge_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_check_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_repair_function_owner'::pg_catalog.regrole::oid,
+             'nmcp_migrator'::pg_catalog.regrole::oid,false,false,true),
+            ('nmcp_runtime'::pg_catalog.regrole::oid,
+             'nmcp_api'::pg_catalog.regrole::oid,false,true,false),
+            ('nmcp_worker_runtime'::pg_catalog.regrole::oid,
+             'nmcp_worker'::pg_catalog.regrole::oid,false,true,false)
+        )
+        SELECT 1 FROM allowed
+        WHERE NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_auth_members AS actual
+            WHERE actual.roleid=allowed.roleid
+              AND actual.member=allowed.member
+              AND actual.admin_option=allowed.admin_option
+              AND actual.inherit_option=allowed.inherit_option
+              AND actual.set_option=allowed.set_option
+        )
+    ) THEN
+        RAISE EXCEPTION 'managed PostgreSQL role graph differs from exact allowlist';
+    END IF;
+END;
+$$;
+
+-- Migration 0018 deliberately gives the checker owner only the columns read by
+-- its SECURITY DEFINER sources. Compare the underlying ACL catalogs so table
+-- grants, write privileges, and grant options cannot hide
+-- behind an effective-privilege spot check.
+DO $$
+DECLARE
+    source_table text;
+    source_privilege text;
+BEGIN
+    IF EXISTS (
+        WITH expected(table_name,column_name,grantee,privilege_type,is_grantable) AS (VALUES
+            ('change_events','position','nmcp_check_function_owner','SELECT',false),
+            ('change_events','event_type','nmcp_check_function_owner','SELECT',false),
+            ('change_events','reason','nmcp_check_function_owner','SELECT',false),
+            ('change_events','media_id','nmcp_check_function_owner','SELECT',false),
+            ('change_events','payload','nmcp_check_function_owner','SELECT',false),
+            ('change_events','occurred_at','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','id','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','quarantine_id','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','media_id','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','job_id','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','job_target_id','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','destination_relative_key','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','expected_size_bytes','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','report_observed_sha256','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_attempts','id','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_attempts','manifest_item_id','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_attempts','attempt_number','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_events','attempt_id','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_events','sequence','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_events','event_type','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_events','outcome_code','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_events','error_code','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_events','observed_size_bytes','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_events','observed_sha256','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_events','occurred_at','nmcp_check_function_owner','SELECT',false)
+        ), actual AS (
+            SELECT c.relname::text,a.attname::text,
+                   CASE WHEN acl.grantee=0 THEN 'PUBLIC'
+                        ELSE pg_catalog.pg_get_userbyid(acl.grantee)::text END,
+                   acl.privilege_type,acl.is_grantable
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+            JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.oid
+            CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS acl
+            WHERE n.nspname='public' AND c.relname IN (
+                'change_events','reconciliation_repair_manifest_items',
+                'reconciliation_repair_attempts','reconciliation_repair_events'
+            ) AND a.attnum>0 AND NOT a.attisdropped
+              AND acl.grantee='nmcp_check_function_owner'::pg_catalog.regrole::oid
+        )
+        (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        UNION ALL
+        (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) THEN
+        RAISE EXCEPTION 'checker source column ACL catalog differs from exact allowlist';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS c
+        JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+        JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.oid
+        CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS acl
+        WHERE n.nspname='public' AND c.relname IN (
+            'change_events','reconciliation_repair_manifest_items',
+            'reconciliation_repair_attempts','reconciliation_repair_events'
+        ) AND a.attnum>0 AND NOT a.attisdropped
+          AND (acl.grantee=0 OR pg_catalog.pg_get_userbyid(acl.grantee) NOT IN (
+              'nmcp_check_function_owner','nmcp_repair_function_owner'
+          ))
+    ) THEN
+        RAISE EXCEPTION 'unintended grantee has direct checker source column ACL';
+    END IF;
+
+    FOREACH source_table IN ARRAY ARRAY[
+        'change_events','reconciliation_repair_manifest_items',
+        'reconciliation_repair_attempts','reconciliation_repair_events'
+    ] LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl
+            WHERE n.nspname='public' AND c.relname=source_table
+              AND acl.grantee='nmcp_check_function_owner'::pg_catalog.regrole::oid
+        ) THEN
+            RAISE EXCEPTION 'checker owner has table ACL on %',source_table;
+        END IF;
+        FOREACH source_privilege IN ARRAY ARRAY[
+            'SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER'
+        ] LOOP
+            IF pg_catalog.has_table_privilege(
+                'nmcp_check_function_owner','public.'||source_table,source_privilege
+            ) THEN
+                RAISE EXCEPTION 'checker owner has effective table % on %',source_privilege,source_table;
+            END IF;
+        END LOOP;
     END LOOP;
 END;
 $$;

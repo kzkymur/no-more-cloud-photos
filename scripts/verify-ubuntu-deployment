@@ -76,6 +76,26 @@ def main() -> int:
             ubuntu_workflow.count(f"- {source}") == 2,
             f"Ubuntu workflow does not trigger for {source} on PR and main push",
         )
+    go_setup = """      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true"""
+    require(
+        ubuntu_workflow.count(go_setup) == 1,
+        "Ubuntu historical migration build does not pin the reviewed Go toolchain",
+    )
+    historical_upgrade = """          go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
+          mkdir /tmp/nmcp-v17-source
+          git archive ea644c9ad47a35af67b8598758eb717bd2a86e57 | tar -x -C /tmp/nmcp-v17-source
+          (cd /tmp/nmcp-v17-source && go build -o /tmp/nmcp-admin-v17 ./cmd/nmcp-admin)
+          sudo scripts/verify-ubuntu-migration-role-compatibility \\
+            /tmp/nmcp-admin-current /tmp/nmcp-admin-v17"""
+    require(
+        ubuntu_workflow.count("fetch-depth: 0") == 1
+        and ubuntu_workflow.count(historical_upgrade) == 1,
+        "Ubuntu workflow lost the exact v17-to-v18 migration binary contract",
+    )
 
     units = UBUNTU / "systemd"
     slice_text = text(units / "nmcp.slice")

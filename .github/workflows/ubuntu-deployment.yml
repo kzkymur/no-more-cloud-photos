@@ -100,6 +100,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+
       - name: Install parser and HTTP test dependencies
         run: |
           sudo apt-get update
@@ -157,11 +163,11 @@ jobs:
       - name: Verify migration role compatibility and hardening
         run: |
           go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
-          mkdir /tmp/nmcp-v16-source
-          git archive 97938b5031e48320330b8add8da1f77d8e801d68 | tar -x -C /tmp/nmcp-v16-source
-          (cd /tmp/nmcp-v16-source && go build -o /tmp/nmcp-admin-v16 ./cmd/nmcp-admin)
+          mkdir /tmp/nmcp-v17-source
+          git archive ea644c9ad47a35af67b8598758eb717bd2a86e57 | tar -x -C /tmp/nmcp-v17-source
+          (cd /tmp/nmcp-v17-source && go build -o /tmp/nmcp-admin-v17 ./cmd/nmcp-admin)
           sudo scripts/verify-ubuntu-migration-role-compatibility \
-            /tmp/nmcp-admin-current /tmp/nmcp-admin-v16
+            /tmp/nmcp-admin-current /tmp/nmcp-admin-v17
 
       - name: Verify release activation and rollback failure transactions
         run: sudo scripts/verify-ubuntu-release-failures

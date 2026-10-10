@@ -213,6 +213,47 @@ func TestMigratorIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("reconciliation checker sources upgrade from exact version seventeen", func(t *testing.T) {
+		ctx := context.Background()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(full.migrations) != 18 {
+			t.Fatalf("migration count = %d, want 18", len(full.migrations))
+		}
+		migrationUnderTest := full.migrations[17]
+		if migrationUnderTest.version != 18 || migrationUnderTest.name != "reconciliation_checker_sources" ||
+			migrationUnderTest.checksum != "34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24" {
+			t.Fatalf("migration 18 identity = version %d name %q checksum %q", migrationUnderTest.version, migrationUnderTest.name, migrationUnderTest.checksum)
+		}
+		if err := newMigrator(pool, full.migrations[:17]).Up(ctx); err != nil {
+			t.Fatalf("apply exact versions one through seventeen: %v", err)
+		}
+		if err := full.Up(ctx); err != nil {
+			t.Fatalf("upgrade exact version seventeen to eighteen: %v", err)
+		}
+		var version int64
+		var name, checksum string
+		var signatures int
+		if err := pool.QueryRow(ctx, `SELECT version,name,checksum,
+			(SELECT count(*) FROM unnest(ARRAY[
+				to_regprocedure('nmcp_read_check_database_references(timestamptz)'),
+				to_regprocedure('nmcp_read_check_attempt_owners()'),
+				to_regprocedure('nmcp_read_check_report_outcome(nmcp_uuid_v4)')
+			]) AS signatures(signature) WHERE signature IS NOT NULL)
+			FROM schema_migrations WHERE version=18 AND NOT dirty`).Scan(&version, &name, &checksum, &signatures); err != nil {
+			t.Fatal(err)
+		}
+		if version != 18 || name != migrationUnderTest.name || checksum != migrationUnderTest.checksum || signatures != 3 {
+			t.Fatalf("migration 18 evidence = %d/%q/%q signatures=%d", version, name, checksum, signatures)
+		}
+		if err := full.Up(ctx); err != nil {
+			t.Fatalf("rerun after version eighteen: %v", err)
+		}
+	})
+
 	t.Run("rendition cleanup boundary upgrade drains legacy state", func(t *testing.T) {
 		prepareVersionFifteen := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
 			t.Helper()
