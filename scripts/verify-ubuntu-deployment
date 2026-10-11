@@ -525,6 +525,9 @@ def main() -> int:
     require("User=root" in migrate_unit, "migration serializer must own the root-only lock")
     migration_runner = text(ROOT / "scripts" / "run-ubuntu-migration")
     migration_compatibility = text(ROOT / "scripts" / "run-ubuntu-migration-compatibility")
+    migration_role_verifier = text(
+        ROOT / "scripts" / "verify-ubuntu-migration-role-compatibility"
+    )
     role_mode = text(ROOT / "scripts" / "set-ubuntu-migration-role-mode")
     release_installer = text(ROOT / "scripts" / "install-ubuntu-release")
     require(
@@ -532,6 +535,15 @@ def main() -> int:
         and "setpriv --reuid=nmcp --regid=nmcp" in migration_compatibility
         and 'trap \'finalize "$?"\' EXIT' in migration_compatibility,
         "migration compatibility wrapper does not drop to nmcp and harden on exit",
+    )
+    require(
+        '"$repo_root/infra/validation/verify-runtime-roles.sql"'
+        in migration_role_verifier
+        and "--file=/usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql"
+        in migration_role_verifier
+        and '--file="$repo_root/infra/validation/verify-runtime-roles.sql"'
+        not in migration_role_verifier,
+        "Ubuntu migration evidence does not install and use the root-owned runtime verifier",
     )
     require(
         "postgresql-role-bootstrap.sha256" in role_mode
