@@ -4,6 +4,7 @@
 import fcntl
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -14,6 +15,7 @@ UNIT = "nmcp-migration-role-verifier.service"
 READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
+SUCCESS = "Ubuntu migration role compatibility verification passed"
 
 
 def fail(message):
@@ -49,10 +51,28 @@ def reset_signal_paths(name):
             pass
 
 
+def reset_paths(*paths):
+    for path in paths:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
 def release(name):
-    descriptor = os.open(f"/run/nmcp-ci/{name}.release",
+    path = f"/run/nmcp-ci/{name}.release"
+    descriptor = os.open(path,
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    os.close(descriptor)
+    try:
+        os.write(descriptor, b"release\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory = os.open("/run/nmcp-ci", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def wait_unit_absent(timeout=30):
@@ -61,6 +81,38 @@ def wait_unit_absent(timeout=30):
         if time.monotonic() >= deadline:
             fail("fixed unit did not unload during containment test")
         time.sleep(0.1)
+
+
+def assert_client_lock_reusable():
+    descriptor = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("client lock was not reusable after client exit")
+    finally:
+        os.close(descriptor)
+
+
+def assert_client_failure(result, mode):
+    if result.returncode == 0 or SUCCESS in result.stdout:
+        fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
+    state = show("LoadState", "ControlGroup")
+    if state.get("LoadState") != "not-found":
+        fail(f"client fault left the fixed unit loaded: {mode}: {state}")
+    if cgroup_pids(state.get("ControlGroup", "")):
+        fail(f"client fault left control-group processes: {mode}: {state}")
+    if cgroup_pids("/system.slice/" + UNIT):
+        fail(f"client fault left processes in the fixed unit cgroup: {mode}")
+    assert_client_lock_reusable()
+
+
+def fast_recovery(client, repo, commit, go_binary, context):
+    recovered = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+                     "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if recovered.returncode or recovered.stdout.count(SUCCESS) != 1:
+        fail(f"fast clean recovery failed after {context}: {recovered.stdout} {recovered.stderr}")
+    wait_unit_absent()
+    assert_client_lock_reusable()
 
 
 def pid_exists(pid):
@@ -140,6 +192,65 @@ def main():
     if os.geteuid() != 0 or len(sys.argv) != 5:
         fail("usage: containment CLIENT REPOSITORY CURRENT_COMMIT ABSOLUTE_GO")
     client, repo, commit, go_binary = sys.argv[1:]
+    client_faults = (
+        "client-fault-after-launch", "client-fault-missing-invocation",
+        "client-fault-after-invocation", "client-fault-after-properties",
+        "client-fault-at-terminal", "client-fault-after-journal",
+    )
+    for mode in client_faults:
+        if mode == "client-fault-missing-invocation":
+            reset_signal_paths(mode)
+            process = subprocess.Popen(
+                ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+                cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            wait_path(f"/run/nmcp-ci/{mode}.ready", timeout=30)
+            matching = show("LoadState", "InvocationID", "Description", "Environment", "ExecStart")
+            if (matching.get("LoadState") != "loaded" or not matching.get("InvocationID")
+                    or "NMCP_VERIFIER_NONCE=" not in matching.get("Environment", "")
+                    or "NMCP_VERIFIER_NONCE=" not in matching.get("ExecStart", "")):
+                fail("matching-nonce adoption fixture lacks the real launched service identity")
+            release(mode)
+            fault_stdout, fault_stderr = process.communicate(timeout=30)
+            faulted = subprocess.CompletedProcess(process.args, process.returncode,
+                                                  fault_stdout, fault_stderr)
+        else:
+            faulted = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert_client_failure(faulted, mode)
+        if mode == "client-fault-missing-invocation" and "missing exact invocation identity" not in faulted.stderr:
+            fail("matching-nonce adoption test did not exercise missing initial InvocationID")
+        fast_recovery(client, repo, commit, go_binary, mode)
+
+    for boundary in ("kill", "stop", "wait", "reset", "unload"):
+        mode = "client-cleanup-fault-" + boundary
+        faulted = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert_client_failure(faulted, mode)
+        if f"injected cleanup {boundary} failure after real action" not in faulted.stderr:
+            fail(f"cleanup fault hook did not report after its real action: {boundary}")
+        fast_recovery(client, repo, commit, go_binary, mode)
+
+    for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),
+                                ("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):
+        for boundary in ("kill", "stop", "wait", "reset", "unload"):
+            mode = f"client-signal-{signal_name}-{boundary}"
+            marker = f"/run/nmcp-ci/{mode}.ready"
+            reset_paths(marker)
+            cancelled = subprocess.Popen(
+                ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+                cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            wait_path(marker, timeout=30)
+            os.kill(cancelled.pid, signum)
+            cancelled_stdout, cancelled_stderr = cancelled.communicate(timeout=30)
+            result = subprocess.CompletedProcess(cancelled.args, cancelled.returncode,
+                                                 cancelled_stdout, cancelled_stderr)
+            assert_client_failure(result, mode)
+            if "cancelled by signal" not in cancelled_stderr:
+                fail(f"client did not report latched cancellation after teardown: {mode}")
+            fast_recovery(client, repo, commit, go_binary, mode)
+
     prior = None
     for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):
         faulted = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
@@ -222,12 +333,21 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         os.close(lock)
+    # This harness killed the nonce-owning client and then its supervisor. A
+    # different launch nonce must not authorize a later client to name-clean it.
+    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wait_unit_absent()
 
     # Client A must retain client.lock after its service reaches terminal state.
     # Client B cannot reap/reuse the name until A attests and fully unloads it.
     for name in ("client-terminal-race-a", "client-terminal-race-a-unloaded",
-                 "client-terminal-race-b"):
+                  "client-terminal-race-b"):
         reset_signal_paths(name)
+    attempting_b = "/run/nmcp-ci/client-terminal-race-b.attempting"
+    acquired_b = "/run/nmcp-ci/client-terminal-race-b.acquired"
+    started_b = "/run/nmcp-ci/client-terminal-race-b.started"
+    reset_paths(attempting_b, acquired_b, started_b)
     recovered = subprocess.Popen(
         ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, "client-terminal-race-a"),
         cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -241,8 +361,9 @@ def main():
         ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, "client-terminal-race-b"),
         cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    time.sleep(0.5)
-    if waiting.poll() is not None or os.path.exists("/run/nmcp-ci/client-terminal-race-b.ready"):
+    wait_path(attempting_b, timeout=30)
+    if (waiting.poll() is not None or os.path.exists(acquired_b) or os.path.exists(started_b)
+            or os.path.exists("/run/nmcp-ci/client-terminal-race-b.ready")):
         fail("client B did not block behind terminal-state client A")
     if show("InvocationID")["InvocationID"] != invocation_a:
         fail("client B replaced client A before A unloaded")
@@ -250,12 +371,15 @@ def main():
     wait_path("/run/nmcp-ci/client-terminal-race-a-unloaded.ready", timeout=60)
     if show("LoadState").get("LoadState") != "not-found":
         fail("client A reported teardown before the fixed name unloaded")
-    if waiting.poll() is not None or os.path.exists("/run/nmcp-ci/client-terminal-race-b.ready"):
+    if (waiting.poll() is not None or os.path.exists(acquired_b) or os.path.exists(started_b)
+            or os.path.exists("/run/nmcp-ci/client-terminal-race-b.ready")):
         fail("client B acquired client.lock before A confirmed unload")
     release("client-terminal-race-a-unloaded")
     recovered_stdout, recovered_stderr = recovered.communicate(timeout=60)
     if recovered.returncode:
         fail(f"clean recovery client A failed: {recovered_stdout} {recovered_stderr}")
+    wait_path(acquired_b, timeout=60)
+    wait_path(started_b, timeout=60)
     wait_path("/run/nmcp-ci/client-terminal-race-b.ready", timeout=60)
     terminal_b = show("InvocationID", "ActiveState")
     if terminal_b["InvocationID"] == invocation_a:
@@ -279,8 +403,9 @@ def main():
         cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     wait_path("/run/nmcp-ci/client-reuse-pause.ready", timeout=60)
-    replaced_a = show("InvocationID", "ActiveState", "ControlGroup")
+    replaced_a = show("InvocationID", "ActiveState", "ControlGroup", "Environment")
     replaced_invocation = replaced_a["InvocationID"]
+    replaced_environment = replaced_a["Environment"]
     run(("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", UNIT),
         check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     deadline = time.monotonic() + 20
@@ -293,17 +418,24 @@ def main():
     run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     wait_unit_absent()
+    sentinel_nonce = secrets.token_hex(32)
+    if replaced_environment == f"NMCP_VERIFIER_NONCE={sentinel_nonce}":
+        fail("reused-name counterexample accidentally reused client A's nonce")
     sentinel = run(("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",
+                    f"--description=NMCP migration role verifier {sentinel_nonce}",
+                    f"--property=Environment=NMCP_VERIFIER_NONCE={sentinel_nonce}",
                     "--property=KillMode=control-group", "/usr/bin/sleep", "300"),
                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     del sentinel
-    sentinel_state = show("InvocationID", "ActiveState", "MainPID")
+    sentinel_state = show("InvocationID", "ActiveState", "MainPID", "Environment")
     sentinel_invocation = sentinel_state["InvocationID"]
     if sentinel_invocation == replaced_invocation or sentinel_state["ActiveState"] != "active":
         fail("reused-name sentinel did not own a distinct live invocation")
+    if sentinel_state.get("Environment") != f"NMCP_VERIFIER_NONCE={sentinel_nonce}":
+        fail("reused-name sentinel did not expose its mismatched nonce")
     release("client-reuse-pause")
     replaced.communicate(timeout=60)
-    if replaced.returncode == 0 or "ownership lost" not in replaced.stderr:
+    if replaced.returncode == 0 or "launch identity lost" not in replaced.stderr:
         fail("client did not fail safely after fixed-name ownership loss")
     after_replaced = show("InvocationID", "ActiveState", "MainPID")
     if after_replaced["InvocationID"] != sentinel_invocation or after_replaced["ActiveState"] != "active":
@@ -331,6 +463,18 @@ def main():
                     stdout=None, stderr=None)
     if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):
         fail("retained-dependency recovery did not harden and clean")
+    for path in tuple(
+            f"/run/nmcp-ci/{name}{suffix}"
+            for name in (
+                *client_faults,
+                "client-terminal-race-a", "client-terminal-race-a-unloaded",
+                "client-terminal-race-b", "client-reuse-pause",
+            )
+            for suffix in (".ready", ".release", ".attempting", ".acquired", ".started")):
+        reset_paths(path)
+    for signal_name in ("int", "term", "hup", "quit"):
+        for boundary in ("kill", "stop", "wait", "reset", "unload"):
+            reset_paths(f"/run/nmcp-ci/client-signal-{signal_name}-{boundary}.ready")
     return 0
 
 

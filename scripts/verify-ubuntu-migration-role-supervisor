@@ -419,13 +419,17 @@ def open_verified(root_fd, manifest, name):
 
 def main():
     global FAULT_MODE
-    if os.geteuid() != 0 or len(sys.argv) not in (4, 5):
-        die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO [FAULT_POINT]")
+    if os.geteuid() != 0 or len(sys.argv) not in (5, 6):
+        die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO NONCE [FAULT_POINT]")
     os.chdir("/")
     os.umask(0o077)
     signal.signal(signal.SIGINT, interrupted)
     signal.signal(signal.SIGTERM, interrupted)
-    FAULT_MODE = sys.argv[4] if len(sys.argv) == 5 else ""
+    nonce = sys.argv[4]
+    if (len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce)
+            or os.environ.get("NMCP_VERIFIER_NONCE") != nonce):
+        die("supervisor launch nonce does not match its environment")
+    FAULT_MODE = sys.argv[5] if len(sys.argv) == 6 else ""
     repo, current_commit, go_binary = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
     if current_commit != git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip():
         die("checkout HEAD is not the requested candidate commit")
@@ -464,7 +468,15 @@ def main():
     trace = []
     snapshot_fd = None
     retained_process = None
+    fast_success = FAULT_MODE == "fast-success"
     try:
+        if FAULT_MODE == "fast-fail":
+            die("injected fast supervisor failure before builds")
+        if FAULT_MODE == "fast-hold":
+            while True:
+                signal.pause()
+        if fast_success:
+            return 0
         if FAULT_MODE.startswith("path:"):
             for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
                                ("/opt/nmcp-role-compatibility", 0o755)):
@@ -701,12 +713,13 @@ def main():
                 os.close(snapshot_fd)
             except OSError as error:
                 cleanup_errors.append(error)
-        for label, arguments in (
+        cleanup_commands = () if FAULT_MODE in ("fast-success", "fast-fail", "fast-hold") else (
             ("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp")),
             ("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
                             "--dbname=postgres", "--set=ON_ERROR_STOP=1", "--command",
                             "DROP ROLE IF EXISTS nmcp_graph_probe,nmcp_graph_bridge,nmcp_api,nmcp_worker,nmcp_migrator,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner")),
-        ):
+        )
+        for label, arguments in cleanup_commands:
             try:
                 result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True)
@@ -736,6 +749,8 @@ def main():
         os.close(lock_fd)
         if cleanup_errors:
             raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))
+        if fast_success:
+            print("Ubuntu migration role compatibility verification passed", flush=True)
     if retained_process is not None:
         die("retained cleanup dependency unexpectedly permitted cleanup")
     print("Ubuntu migration role compatibility verification passed", flush=True)
