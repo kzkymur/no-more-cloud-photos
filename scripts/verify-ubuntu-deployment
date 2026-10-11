@@ -714,6 +714,23 @@ def validate_client(source: str) -> None:
         fail(f"systemctl show omitted required properties: {', '.join(missing)}")
     return values
 ''', "client property parser must completely parse explicit absence and full loaded identity")
+    terminal_helpers = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "successful_terminal_state"
+    ]
+    require(len(terminal_helpers) == 1 and terminal_helpers[0] in tree.body,
+            "client must define exactly one top-level successful_terminal_state helper")
+    require_exact_function(tree, "successful_terminal_state", '''def successful_terminal_state(state):
+    # systemd releases expose CLD_EXITED as either its numeric string ("1")
+    # or its documented symbolic spelling. Keep the raw property in evidence.
+    code = state.get("ExecMainCode")
+    status = state.get("ExecMainStatus")
+    exited = type(code) is str and code in ("1", "exited")
+    zero_status = ((type(status) is int and status == 0)
+                   or (type(status) is str and status == "0"))
+    return (state.get("Result") == "success" and exited and zero_status
+            and state.get("ActiveState") == "active" and state.get("SubState") == "exited")
+''', "client terminal success must use the exact raw typed systemd state contract")
     require_exact_function(tree, "unit_properties", '''def unit_properties(*names, context="show"):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
     deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
@@ -820,7 +837,7 @@ def validate_client(source: str) -> None:
         'if valid_invocation(candidate_invocation) and launch_matches(observed, nonce, exec_argv):',
         'fail(f"missing exact invocation identity: {observed}")',
         'current = owned_state(invocation, nonce, exec_argv,',
-        'current.get("Result") == "success" and current.get("ExecMainCode") == "exited"',
+        'successful = successful_terminal_state(current)',
         'f"_SYSTEMD_INVOCATION_ID={invocation}"',
         'journal.count("Ubuntu migration role compatibility verification passed") != 1',
         'teardown_owned(invocation, nonce, exec_argv)',
@@ -962,6 +979,24 @@ COMMAND_DEADLINE = work_deadline
             "client lock-held work deadline must reserve cleanup before prelaunch")
     require(source.count("secrets.token_hex(32)") == 1,
             "client must generate exactly one cryptographic 64-hex nonce")
+
+    successful_assignments = [
+        node for node in ast.walk(main_node)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "successful"
+    ]
+    expected_successful_assignment = ast.parse(
+        "successful = successful_terminal_state(current)"
+    ).body[0]
+    terminal_helper_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "successful_terminal_state"
+    ]
+    require(len(successful_assignments) == 1
+            and ast.dump(successful_assignments[0]) == ast.dump(expected_successful_assignment)
+            and len(terminal_helper_calls) == 1
+            and terminal_helper_calls[0] is successful_assignments[0].value,
+            "client must use the terminal success helper exactly once at the live result decision")
 
     launch_assignments = [
         node for node in ast.walk(main_node)
@@ -1660,9 +1695,9 @@ def validate_containment(source: str, phase: str) -> None:
     require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
             "containment must not infer absence from an empty or failed property query")
     require_exact_function(tree, "assert_property_parser_contract", '''def assert_property_parser_contract(client):
-    client_parser = runpy.run_path(client, run_name="nmcp_client_parser_fixture")[
-        "parse_unit_properties"
-    ]
+    client_namespace = runpy.run_path(client, run_name="nmcp_client_parser_fixture")
+    client_parser = client_namespace["parse_unit_properties"]
+    successful_terminal_state = client_namespace["successful_terminal_state"]
     requested = ("LoadState", "ExecStart")
     minimal_absence = subprocess.CompletedProcess(
         ("systemctl", "show"), 0, "LoadState=not-found\\n", ""
@@ -1696,6 +1731,27 @@ def validate_containment(source: str, phase: str) -> None:
             fail(f"{parser_name} parser lost transitional loaded state")
         if parser(next(transition), requested).get("LoadState") != "not-found":
             fail(f"{parser_name} parser did not complete on minimal transitional absence")
+    successful_state = {
+        "Result": "success", "ExecMainStatus": "0",
+        "ActiveState": "active", "SubState": "exited",
+    }
+    for code in ("1", "exited"):
+        if not successful_terminal_state({**successful_state, "ExecMainCode": code}):
+            fail(f"terminal success rejected strict CLD_EXITED spelling: {code!r}")
+    if not successful_terminal_state({**successful_state, "ExecMainCode": "1", "ExecMainStatus": 0}):
+        fail("terminal success rejected exact integer zero status")
+    for code in ("", "0", "2", "3", "killed", "dumped", 1, True, None):
+        if successful_terminal_state({**successful_state, "ExecMainCode": code}):
+            fail(f"terminal success accepted non-CLD_EXITED code: {code!r}")
+    rejected_terminal_states = (
+        {**successful_state, "ExecMainCode": "1", "ExecMainStatus": "1"},
+        {**successful_state, "ExecMainCode": "1", "ExecMainStatus": False},
+        {**successful_state, "ExecMainCode": "1", "Result": "exit-code"},
+        {**successful_state, "ExecMainCode": "1", "ActiveState": "failed"},
+        {**successful_state, "ExecMainCode": "1", "SubState": "dead"},
+    )
+    if any(successful_terminal_state(state) for state in rejected_terminal_states):
+        fail("terminal success accepted non-success result, status, or terminal state")
 ''', "containment parser fixture must causally exercise both live parsers")
     runpy_imports = [
         node for node in tree.body if isinstance(node, ast.Import)
@@ -3065,7 +3121,47 @@ def verify_supervisor_mutations(
         ("invocation identity syntax weakened", replace_once(client, 'return len(value) == 32 and all(character in "0123456789abcdef" for character in value)', 'return bool(value)')),
         ("terminal ownership not revalidated", replace_once(client,
             'current = owned_state(invocation, nonce, exec_argv,', 'current = unit_properties(')),
-        ("result unchecked", replace_once(client, 'current.get("Result") == "success"', 'True')),
+        ("terminal code truthiness", replace_once(client,
+            '    exited = type(code) is str and code in ("1", "exited")',
+            '    exited = bool(code)')),
+        ("terminal code integer coercion", replace_once(client,
+            '    exited = type(code) is str and code in ("1", "exited")',
+            '    exited = int(code) == 1')),
+        ("terminal code stripping", replace_once(client,
+            '    exited = type(code) is str and code in ("1", "exited")',
+            '    exited = type(code) is str and code.strip() in ("1", "exited")')),
+        ("terminal code lowercasing", replace_once(client,
+            '    exited = type(code) is str and code in ("1", "exited")',
+            '    exited = type(code) is str and code.lower() in ("1", "exited")')),
+        ("terminal code broad membership", replace_once(client,
+            '    exited = type(code) is str and code in ("1", "exited")',
+            '    exited = code in (1, True, "1", "exited")')),
+        ("terminal status truthiness", replace_once(client,
+            '    zero_status = ((type(status) is int and status == 0)\n'
+            '                   or (type(status) is str and status == "0"))',
+            '    zero_status = not status')),
+        ("terminal status integer coercion", replace_once(client,
+            '    zero_status = ((type(status) is int and status == 0)\n'
+            '                   or (type(status) is str and status == "0"))',
+            '    zero_status = int(status) == 0')),
+        ("terminal result conjunct omitted", replace_once(client,
+            '    return (state.get("Result") == "success" and exited and zero_status',
+            '    return (exited and zero_status')),
+        ("terminal status conjunct omitted", replace_once(client,
+            '    return (state.get("Result") == "success" and exited and zero_status',
+            '    return (state.get("Result") == "success" and exited')),
+        ("terminal active-state conjunct omitted", replace_once(client,
+            '            and state.get("ActiveState") == "active" and state.get("SubState") == "exited")',
+            '            and state.get("SubState") == "exited")')),
+        ("terminal sub-state conjunct omitted", replace_once(client,
+            '            and state.get("ActiveState") == "active" and state.get("SubState") == "exited")',
+            '            and state.get("ActiveState") == "active")')),
+        ("terminal helper bypassed by inline decision", replace_once(client,
+            '            successful = successful_terminal_state(current)',
+            '            successful = current.get("Result") == "success"')),
+        ("duplicate divergent terminal helper", replace_once(client,
+            '\n\ndef unit_properties(*names, context="show"):',
+            '\n\ndef successful_terminal_state(state):\n    return True\n\n\ndef unit_properties(*names, context="show"):' )),
         ("journal not invocation scoped", client.replace('f"_SYSTEMD_INVOCATION_ID={invocation}"', '"--since=today"')),
         ("successful cgroup unchecked", replace_once(client, '            if cgroup_pids(current.get("ControlGroup", "")):', '            if False:')),
         ("owned kill omitted", replace_once(client,
@@ -3194,8 +3290,20 @@ def verify_supervisor_mutations(
             '    assert_property_parser_contract(client)',
             '    if False:\n        assert_property_parser_contract(client)')),
         ("parser fixture ignores client-only divergence", replace_once(containment,
-            '    client_parser = runpy.run_path(client, run_name="nmcp_client_parser_fixture")[\n        "parse_unit_properties"\n    ]',
+            '    client_parser = client_namespace["parse_unit_properties"]',
             '    client_parser = parse_unit_properties')),
+        ("terminal fixture ignores live client helper", replace_once(containment,
+            '    successful_terminal_state = client_namespace["successful_terminal_state"]',
+            '    successful_terminal_state = lambda state: True')),
+        ("terminal fixture positive matrix is dead", replace_once(containment,
+            '        if not successful_terminal_state({**successful_state, "ExecMainCode": code}):',
+            '        if False and not successful_terminal_state({**successful_state, "ExecMainCode": code}):')),
+        ("terminal fixture negative code matrix is dead", replace_once(containment,
+            '        if successful_terminal_state({**successful_state, "ExecMainCode": code}):',
+            '        if False and successful_terminal_state({**successful_state, "ExecMainCode": code}):')),
+        ("terminal fixture rejected-state matrix is dead", replace_once(containment,
+            '    if any(successful_terminal_state(state) for state in rejected_terminal_states):',
+            '    if False and any(successful_terminal_state(state) for state in rejected_terminal_states):')),
         ("containment show retries omitted", replace_once(containment,
             '    for attempt in range(4):', '    for attempt in range(1):')),
         ("containment subprocess wait unbounded", replace_once(containment,

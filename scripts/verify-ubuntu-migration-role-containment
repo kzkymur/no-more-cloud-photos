@@ -77,9 +77,9 @@ def show(*properties):
 
 
 def assert_property_parser_contract(client):
-    client_parser = runpy.run_path(client, run_name="nmcp_client_parser_fixture")[
-        "parse_unit_properties"
-    ]
+    client_namespace = runpy.run_path(client, run_name="nmcp_client_parser_fixture")
+    client_parser = client_namespace["parse_unit_properties"]
+    successful_terminal_state = client_namespace["successful_terminal_state"]
     requested = ("LoadState", "ExecStart")
     minimal_absence = subprocess.CompletedProcess(
         ("systemctl", "show"), 0, "LoadState=not-found\n", ""
@@ -113,6 +113,27 @@ def assert_property_parser_contract(client):
             fail(f"{parser_name} parser lost transitional loaded state")
         if parser(next(transition), requested).get("LoadState") != "not-found":
             fail(f"{parser_name} parser did not complete on minimal transitional absence")
+    successful_state = {
+        "Result": "success", "ExecMainStatus": "0",
+        "ActiveState": "active", "SubState": "exited",
+    }
+    for code in ("1", "exited"):
+        if not successful_terminal_state({**successful_state, "ExecMainCode": code}):
+            fail(f"terminal success rejected strict CLD_EXITED spelling: {code!r}")
+    if not successful_terminal_state({**successful_state, "ExecMainCode": "1", "ExecMainStatus": 0}):
+        fail("terminal success rejected exact integer zero status")
+    for code in ("", "0", "2", "3", "killed", "dumped", 1, True, None):
+        if successful_terminal_state({**successful_state, "ExecMainCode": code}):
+            fail(f"terminal success accepted non-CLD_EXITED code: {code!r}")
+    rejected_terminal_states = (
+        {**successful_state, "ExecMainCode": "1", "ExecMainStatus": "1"},
+        {**successful_state, "ExecMainCode": "1", "ExecMainStatus": False},
+        {**successful_state, "ExecMainCode": "1", "Result": "exit-code"},
+        {**successful_state, "ExecMainCode": "1", "ActiveState": "failed"},
+        {**successful_state, "ExecMainCode": "1", "SubState": "dead"},
+    )
+    if any(successful_terminal_state(state) for state in rejected_terminal_states):
+        fail("terminal success accepted non-success result, status, or terminal state")
 
 
 def wait_path(path, timeout=900):

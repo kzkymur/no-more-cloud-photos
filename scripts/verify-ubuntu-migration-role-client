@@ -185,6 +185,18 @@ def parse_unit_properties(result, requested):
     return values
 
 
+def successful_terminal_state(state):
+    # systemd releases expose CLD_EXITED as either its numeric string ("1")
+    # or its documented symbolic spelling. Keep the raw property in evidence.
+    code = state.get("ExecMainCode")
+    status = state.get("ExecMainStatus")
+    exited = type(code) is str and code in ("1", "exited")
+    zero_status = ((type(status) is int and status == 0)
+                   or (type(status) is str and status == "0"))
+    return (state.get("Result") == "success" and exited and zero_status
+            and state.get("ActiveState") == "active" and state.get("SubState") == "exited")
+
+
 def unit_properties(*names, context="show"):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
     deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
@@ -616,8 +628,7 @@ def main():
             sys.stdout.write(journal)
             if requested_mode == "client-fault-after-journal":
                 fail("injected client failure after journal capture")
-            successful = (current.get("Result") == "success" and current.get("ExecMainCode") == "exited"
-                          and current.get("ExecMainStatus") == "0")
+            successful = successful_terminal_state(current)
             if not successful:
                 fail(f"verification invocation failed: {current}")
             deadline = bounded_deadline(5)
