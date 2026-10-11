@@ -1938,15 +1938,158 @@ def validate_containment(source: str, phase: str) -> None:
     reviewed_persistent_functions = {
         node for node in tree.body if isinstance(node, ast.FunctionDef)
     }
+    expected_containment_functions = {
+        "fail", "persistent_failure_classification", "persistent_result_violation",
+        "bounded_sanitized_repr", "sanitized_state", "persistent_failure_diagnostics",
+        "assert_persistent_failure_contract", "run", "parse_unit_properties", "show",
+        "assert_property_parser_contract", "wait_path", "reset_signal_paths", "reset_paths",
+        "counter", "wait_counter", "release", "wait_unit_absent",
+        "assert_client_lock_reusable", "assert_client_lock_held", "assert_client_failure",
+        "fast_recovery", "fault_paths", "assert_interception", "cleanup_fixture_invocation",
+        "exec_start_argv", "persistent_supervisor_mode", "persistent_launch_signature",
+        "assert_launch_signature_counterexamples", "signed_launch_state",
+        "cleanup_signed_launch", "pid_exists", "cgroup_pids", "process_has_inode",
+        "intent_entry", "run_root_entry", "observable_identity", "assert_replaced_or_absent",
+        "main",
+    }
+    actual_containment_functions = {node.name for node in reviewed_persistent_functions}
+    expected_function_signatures = (
+        ("fail", "message"), ("persistent_failure_classification", "stdout, stderr"),
+        ("persistent_result_violation", "returncode, classification, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup, post_cleanup_cgroup"),
+        ("bounded_sanitized_repr", "value"), ("sanitized_state", "state"),
+        ("persistent_failure_diagnostics", "mode, boundary, faulted, classification, intercepted, attempted, observed, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup_cgroup"),
+        ("assert_persistent_failure_contract", ""), ("run", "argv, **kwargs"),
+        ("parse_unit_properties", "result, requested"), ("show", "*properties"),
+        ("assert_property_parser_contract", "client"), ("wait_path", "path, timeout=900"),
+        ("reset_signal_paths", "name"), ("reset_paths", "*paths"), ("counter", "path"),
+        ("wait_counter", "path, expected, timeout=30"), ("release", "name"),
+        ("wait_unit_absent", "timeout=30"), ("assert_client_lock_reusable", ""),
+        ("assert_client_lock_held", ""), ("assert_client_failure", "result, mode"),
+        ("fast_recovery", "client, repo, commit, go_binary, context"),
+        ("fault_paths", "mode, boundary"),
+        ("assert_interception", "mode, boundary, *, persistent=False"),
+        ("cleanup_fixture_invocation", "invocation"), ("exec_start_argv", "value"),
+        ("persistent_supervisor_mode", "mode"),
+        ("persistent_launch_signature", "state, repo, commit, go_binary, mode"),
+        ("assert_launch_signature_counterexamples", "state, repo, commit, go_binary, mode"),
+        ("signed_launch_state", "signature"), ("cleanup_signed_launch", "signature"),
+        ("pid_exists", "pid"), ("cgroup_pids", "control_group"),
+        ("process_has_inode", "pid, expected"), ("intent_entry", "path"),
+        ("run_root_entry", ""), ("observable_identity", "path, recorded"),
+        ("assert_replaced_or_absent", "path, identity"), ("main", ""),
+    )
+    actual_function_signatures = tuple(
+        (node.name, ast.unparse(node.args)) for node in tree.body if isinstance(node, ast.FunctionDef)
+    )
+    actual_function_defaults = {
+        node.name: [ast.dump(value) for value in (*node.args.defaults, *node.args.kw_defaults)
+                    if value is not None]
+        for node in reviewed_persistent_functions
+        if any(value is not None for value in (*node.args.defaults, *node.args.kw_defaults))
+    }
+    expected_function_defaults = {
+        "wait_path": [ast.dump(ast.Constant(value=900))],
+        "wait_counter": [ast.dump(ast.Constant(value=30))],
+        "wait_unit_absent": [ast.dump(ast.Constant(value=30))],
+        "assert_interception": [ast.dump(ast.Constant(value=False))],
+    }
     protected_persistent_bindings.update(node.name for node in reviewed_persistent_functions)
-    require(len(reviewed_persistent_functions)
-            == len({node.name for node in reviewed_persistent_functions})
+    require(actual_containment_functions == expected_containment_functions
+            and actual_function_signatures == expected_function_signatures
+            and len(reviewed_persistent_functions) == len(actual_containment_functions)
+            and actual_function_defaults == expected_function_defaults
+            and not any(node.returns or any(argument.annotation for argument in (
+                            *node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs))
+                        or (node.args.vararg is not None and node.args.vararg.annotation is not None)
+                        or (node.args.kwarg is not None and node.args.kwarg.annotation is not None)
+                        for node in reviewed_persistent_functions)
             and not any(node.decorator_list for node in reviewed_persistent_functions)
             and {node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
                 == reviewed_persistent_functions
             and not any(isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef))
                         for node in ast.walk(tree)),
             "containment top-level callable names must be unique protected bindings")
+    module_docstrings = [
+        node for node in tree.body if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+    ]
+    module_assignments = [node for node in tree.body if isinstance(node, ast.Assign)]
+    expected_module_assignments = {
+        "UNIT", "READY", "PID_FILES", "ENV", "SUCCESS", "PERSISTENT_PROPERTY_ERROR",
+        "PERSISTENT_ACTION_ERROR", "DIAGNOSTIC_TEXT_LIMIT", "PROGRAM", "NONCE_VARIABLE",
+        "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "LAUNCH_PROPERTIES",
+    }
+    actual_module_assignment_names = [
+        node.targets[0].id for node in module_assignments
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+    ]
+    expected_assignment_nodes = ast.parse('''UNIT = "nmcp-migration-role-verifier.service"
+READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
+PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
+ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
+SUCCESS = "Ubuntu migration role compatibility verification passed"
+PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"
+PERSISTENT_ACTION_ERROR = " command remains unavailable:"
+DIAGNOSTIC_TEXT_LIMIT = 512
+PROGRAM = "/run/nmcp-ci/supervisor.py"
+NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
+DESCRIPTION_PREFIX = "NMCP migration role verifier "
+SERVICE_PROPERTIES = {
+    "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
+    "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
+    "RemainAfterExit": "yes", "User": "root", "Group": "root", "UMask": "0077",
+    "WorkingDirectory": "/", "StandardOutput": "journal", "StandardError": "journal",
+}
+LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
+                     *SERVICE_PROPERTIES)
+''').body
+    expected_module_sequence = (
+        ["doc"] + ["import:" + name for name in (
+            "fcntl", "json", "os", "runpy", "secrets", "shlex", "signal", "subprocess",
+            "sys", "time")]
+        + ["assign:" + name for name in actual_module_assignment_names]
+        + ["function:" + name for name, _signature in expected_function_signatures]
+        + ["guard"]
+    )
+    actual_module_sequence = []
+    for node in tree.body:
+        if node is module_docstrings[0]:
+            actual_module_sequence.append("doc")
+        elif isinstance(node, ast.Import):
+            actual_module_sequence.append("import:" + node.names[0].name)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            actual_module_sequence.append("assign:" + node.targets[0].id)
+        elif isinstance(node, ast.FunctionDef):
+            actual_module_sequence.append("function:" + node.name)
+        elif isinstance(node, ast.If):
+            actual_module_sequence.append("guard")
+    require(len(module_docstrings) == 1 and tree.body[0] is module_docstrings[0]
+            and len(actual_module_assignment_names) == len(module_assignments)
+            and len(actual_module_assignment_names) == len(expected_module_assignments)
+            and set(actual_module_assignment_names) == expected_module_assignments
+            and [ast.dump(node) for node in module_assignments]
+                == [ast.dump(node) for node in expected_assignment_nodes]
+            and actual_module_sequence == expected_module_sequence
+            and all(not any(isinstance(child, (ast.Call, ast.Lambda, ast.NamedExpr,
+                                                ast.Await, ast.Yield, ast.YieldFrom))
+                                for child in ast.walk(node.value))
+                    for node in module_assignments),
+            "containment module constants must remain inert")
+    expected_main_guard = ast.parse('''if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"containment-test: {error}", file=sys.stderr)
+        raise SystemExit(1)
+''').body[0]
+    module_guards = [node for node in tree.body if isinstance(node, ast.If)]
+    require(len(module_guards) == 1
+            and ast.dump(module_guards[0]) == ast.dump(expected_main_guard)
+            and all(node is module_docstrings[0]
+                    or isinstance(node, (ast.Import, ast.Assign, ast.FunctionDef, ast.If))
+                    for node in tree.body),
+            "containment module scope gained executable statements")
     reviewed_persistent_assignments = []
     expected_persistent_constants = {
         "SUCCESS": "Ubuntu migration role compatibility verification passed",
@@ -1961,6 +2104,48 @@ def validate_containment(source: str, phase: str) -> None:
                    and node.value.value == value]
         require(len(matches) == 1, f"containment {name} constant changed")
         reviewed_persistent_assignments.append(matches[0].targets[0])
+    protected_persistent_bindings.update(expected_module_assignments)
+    reviewed_persistent_assignments.extend(
+        node.targets[0] for node in module_assignments
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+        and node.targets[0] not in reviewed_persistent_assignments
+    )
+    expected_constant_loads = {
+        "UNIT": 16, "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 5,
+        "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
+        "DIAGNOSTIC_TEXT_LIMIT": 3, "PROGRAM": 2, "NONCE_VARIABLE": 2,
+        "DESCRIPTION_PREFIX": 1, "SERVICE_PROPERTIES": 2, "LAUNCH_PROPERTIES": 4,
+    }
+    actual_constant_loads = {name: 0 for name in expected_module_assignments}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                and node.id in actual_constant_loads):
+            actual_constant_loads[node.id] += 1
+    require(actual_constant_loads == expected_constant_loads,
+            "containment module constant loads exceed the reviewed inventory")
+    constant_parents = {
+        id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+    }
+    expected_mutable_constant_contexts = {
+        "ENV": {
+            ast.dump(ast.parse('call(env=ENV)', mode="eval").body.keywords[0]): 11,
+        },
+        "SERVICE_PROPERTIES": {
+            ast.dump(ast.parse('(*SERVICE_PROPERTIES,)', mode="eval").body.elts[0]): 1,
+            ast.dump(ast.parse('SERVICE_PROPERTIES.items()', mode="eval").body.func): 1,
+        },
+    }
+    actual_mutable_constant_contexts = {
+        name: {} for name in expected_mutable_constant_contexts
+    }
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                and node.id in actual_mutable_constant_contexts):
+            parent_dump = ast.dump(constant_parents[id(node)])
+            contexts = actual_mutable_constant_contexts[node.id]
+            contexts[parent_dump] = contexts.get(parent_dump, 0) + 1
+    require(actual_mutable_constant_contexts == expected_mutable_constant_contexts,
+            "containment mutable constant use sites exceed the reviewed inventory")
     reviewed_imports = {
         "fcntl", "json", "os", "runpy", "secrets", "shlex", "signal",
         "subprocess", "sys", "time",
@@ -1968,13 +2153,62 @@ def validate_containment(source: str, phase: str) -> None:
     actual_imports = [
         alias.name for node in tree.body if isinstance(node, ast.Import) for alias in node.names
     ]
+    reviewed_import_aliases = {
+        alias for node in tree.body if isinstance(node, ast.Import) for alias in node.names
+    }
+    all_import_nodes = [node for node in ast.walk(tree) if isinstance(node, ast.Import)]
     require(len(actual_imports) == len(reviewed_imports)
             and set(actual_imports) == reviewed_imports
+            and not any(alias.asname for alias in reviewed_import_aliases)
+            and len(all_import_nodes) == len(reviewed_imports)
+            and all(node in tree.body for node in all_import_nodes)
             and not any(isinstance(node, ast.ImportFrom) for node in ast.walk(tree)),
             "containment imports exceed the reviewed modules")
-    persistent_binding_violations = []
+    protected_persistent_bindings.update(reviewed_imports)
+    expected_module_loads = {
+        "fcntl": 17, "json": 2, "os": 65, "runpy": 1, "secrets": 2,
+        "shlex": 1, "signal": 6, "subprocess": 84, "sys": 3, "time": 35,
+    }
+    actual_module_loads = {name: 0 for name in reviewed_imports}
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Name) and node.id in protected_persistent_bindings
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                and node.id in actual_module_loads):
+            actual_module_loads[node.id] += 1
+    expected_module_attributes = {
+        ("fcntl", "LOCK_EX"): 5, ("fcntl", "LOCK_NB"): 5, ("fcntl", "LOCK_UN"): 1,
+        ("fcntl", "flock"): 6, ("json", "load"): 2, ("os", "O_CREAT"): 1,
+        ("os", "O_DIRECTORY"): 1, ("os", "O_EXCL"): 1, ("os", "O_NOFOLLOW"): 7,
+        ("os", "O_RDONLY"): 1, ("os", "O_RDWR"): 5, ("os", "O_WRONLY"): 1,
+        ("os", "close"): 7, ("os", "fsync"): 2, ("os", "geteuid"): 1,
+        ("os", "kill"): 4, ("os", "listdir"): 1, ("os", "lstat"): 2,
+        ("os", "open"): 7, ("os", "path"): 18, ("os", "stat"): 2,
+        ("os", "unlink"): 2, ("os", "walk"): 1, ("os", "write"): 1,
+        ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2, ("shlex", "split"): 1,
+        ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 2,
+        ("signal", "SIGQUIT"): 1, ("signal", "SIGTERM"): 1,
+        ("subprocess", "CompletedProcess"): 12, ("subprocess", "PIPE"): 60,
+        ("subprocess", "Popen"): 10, ("subprocess", "SubprocessError"): 1,
+        ("subprocess", "run"): 1, ("sys", "argv"): 2, ("sys", "stderr"): 1,
+        ("time", "monotonic"): 24, ("time", "sleep"): 11,
+    }
+    actual_module_attributes = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id in reviewed_imports):
+            key = (node.value.id, node.attr)
+            actual_module_attributes[key] = actual_module_attributes.get(key, 0) + 1
+    require(actual_module_loads == expected_module_loads
+            and actual_module_attributes == expected_module_attributes,
+            "containment imported module loads/calls exceed the reviewed inventory")
+    persistent_binding_violations = []
+    reviewed_kwargs_setdefault = ast.dump(ast.parse(
+        'kwargs.setdefault("timeout", 18 * 60)', mode="eval").body)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name)
+                and node.id in {"__builtins__", "exec", "eval", "compile", "__import__",
+                                "getattr", "setattr", "delattr", "globals", "locals", "vars"}):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Name) and node.id in protected_persistent_bindings
                 and isinstance(node.ctx, (ast.Store, ast.Del))
                 and node not in reviewed_persistent_assignments):
             persistent_binding_violations.append(node)
@@ -1983,6 +2217,18 @@ def validate_containment(source: str, phase: str) -> None:
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Attribute) and node.attr in protected_persistent_bindings
               and isinstance(node.ctx, (ast.Store, ast.Del))):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Attribute)
+              and isinstance(node.ctx, (ast.Store, ast.Del))):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del))
+              and any(isinstance(child, ast.Name)
+                      and child.id in expected_module_assignments for child in ast.walk(node.value))):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in {"update", "setdefault", "pop", "popitem", "clear",
+                                     "__setitem__", "__delitem__"}
+              and ast.dump(node) != reviewed_kwargs_setdefault):
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
               and node.value.id in protected_persistent_bindings
@@ -1998,7 +2244,8 @@ def validate_containment(source: str, phase: str) -> None:
             persistent_binding_violations.append(node)
         elif isinstance(node, ast.alias):
             bound = node.asname or node.name.split(".", 1)[0]
-            if bound in protected_persistent_bindings or node.name == "*":
+            if ((bound in protected_persistent_bindings and node not in reviewed_import_aliases)
+                    or node.name == "*"):
                 persistent_binding_violations.append(node)
         elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in protected_persistent_bindings:
             persistent_binding_violations.append(node)
@@ -2012,13 +2259,18 @@ def validate_containment(source: str, phase: str) -> None:
               and node.func.id in {"globals", "locals", "vars", "setattr", "delattr",
                                    "getattr", "exec", "eval", "compile", "__import__"}):
             persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in {"globals", "locals", "vars", "setattr", "delattr",
+                                     "getattr", "exec", "eval", "compile", "__import__",
+                                     "FunctionType", "MethodType", "CodeType", "loads"}):
+            persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Attribute)
               and (node.attr.startswith("__") or node.attr in {
                                 "__code__", "__defaults__", "__kwdefaults__", "__dict__",
                                 "__globals__", "__closure__", "__setattr__", "__delattr__",
                                 "setattr", "delattr", "getattr", "modules", "builtins",
                                 "_getframe", "f_globals", "f_locals", "gi_frame", "cr_frame",
-                                "tb_frame"})):
+                                "tb_frame", "exec", "eval", "compile", "__import__"})):
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.ImportFrom)
               and (node.module or "").split(".", 1)[0] in {"__main__", "builtins", "importlib"}):
@@ -3728,6 +3980,90 @@ def verify_supervisor_mutations(
             '"property_unknown": True, "action_unavailable": True}\n'
             'frame_globals["assert_persistent_" + "failure_contract"] = lambda: None\n\n\n'
             'def run(argv, **kwargs):')),
+        ("persistent coupled builtins exec replacement", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\n__builtins__.exec(\'globals()["persistent_failure_" + "classification"] = '
+            'lambda stdout, stderr: {"success_in_stdout": False, "property_unknown": True, '
+            '"action_unavailable": True}; globals()["assert_persistent_" + '
+            '"failure_contract"] = lambda: None\')\n\n\ndef run(argv, **kwargs):')),
+        ("persistent imported fcntl function replaced", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nfcntl.flock = lambda *args: None\n\n\ndef run(argv, **kwargs):')),
+        ("persistent imported os function replaced", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nos.close = lambda descriptor: None\n\n\ndef run(argv, **kwargs):')),
+        ("persistent getattr builtins exec replacement", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nimport builtins\ngetattr(builtins, "exec")(\'globals()["persistent_failure_" '
+            '+ "classification"] = lambda stdout, stderr: {"success_in_stdout": False, '
+            '"property_unknown": True, "action_unavailable": True}\')\n\n\ndef run(argv, **kwargs):')),
+        ("persistent imported module alias write", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nfilesystem = os\nfilesystem.close = lambda descriptor: None\n\n\n'
+            'def run(argv, **kwargs):')),
+        ("persistent exec callable alias", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nexecute = exec\nexecute("fcntl.flock = lambda *args: None")\n\n\n'
+            'def run(argv, **kwargs):')),
+        ("persistent getattr callable alias namespace write", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nread_attribute = getattr\nmodule_state = read_attribute(os, "__dict__")\n'
+            'module_state["close"] = lambda descriptor: None\n\n\ndef run(argv, **kwargs):')),
+        ("persistent extra runpy execution", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nrunpy.run_path("/tmp/unreviewed.py")\n\n\ndef run(argv, **kwargs):')),
+        ("persistent nested builtins import execution", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nif True:\n    import builtins as b\n    expose = b.vars\n'
+            '    execute = expose(b)["exec"]\n'
+            '    execute("fcntl.flock = lambda *args: None")\n\n\ndef run(argv, **kwargs):')),
+        ("persistent top-level generic runner execution", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nrun(("/usr/bin/python3", "-c", '
+            '\'open("/tmp/unreviewed", "w").write("executed")\'))\n\n\n'
+            'def run(argv, **kwargs):')),
+        ("persistent executable function default", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef unreviewed(value=open("/tmp/unreviewed", "w")):\n'
+            '    return value\n\n\ndef run(argv, **kwargs):')),
+        ("persistent extra module constant", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nUNREVIEWED = "value"\n\n\ndef run(argv, **kwargs):')),
+        ("persistent module mapping mutation", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nENV["PATH"] = "/tmp"\n\n\ndef run(argv, **kwargs):')),
+        ("persistent wait counter signature reordered", replace_once(containment,
+            'def wait_counter(path, expected, timeout=30):',
+            'def wait_counter(path, timeout, expected=30):')),
+        ("persistent ready constant changed", replace_once(containment,
+            'READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"',
+            'READY = "/tmp/unreviewed.ready"')),
+        ("persistent environment constant cleared", replace_once(containment,
+            'ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}',
+            'ENV = {}')),
+        ("persistent nested environment mapping mutation", replace_once(containment,
+            'def main():\n',
+            'def main():\n    ENV["LD_PRELOAD"] = "/tmp/unreviewed.so"\n')),
+        ("persistent nested service properties mutation", replace_once(containment,
+            'def main():\n',
+            'def main():\n    SERVICE_PROPERTIES["KillMode"] = "process"\n')),
+        ("persistent aliased environment setdefault mutation", replace_once(containment,
+            'return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)',
+            'return subprocess.run(argv, cwd="/", '
+            'env=(((environment := ENV).setdefault("LD_PRELOAD", "/tmp/unreviewed.so"), '
+            'environment)[1]), text=True, **kwargs)')),
+        ("persistent unbound environment update mutation", replace_once(containment,
+            'return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)',
+            'return subprocess.run(argv, cwd="/", '
+            'env=((environment := ENV), dict.update(environment, '
+            '{"LD_PRELOAD": "/tmp/unreviewed.so"}), environment)[2], '
+            'text=True, **kwargs)')),
+        ("persistent environment alias subscript mutation", replace_once(
+            replace_once(containment,
+                'def main():\n',
+                'def main():\n    environment = ENV\n    environment["PATH"] = "/tmp"\n'),
+            'cwd="/", env=ENV, text=True, **kwargs)',
+            'cwd="/", env=environment, text=True, **kwargs)')),
         ("persistent constant builtins setattr", replace_once(containment,
             '\n\ndef run(argv, **kwargs):',
             '\n\nimport builtins\nbuiltins.setattr('
@@ -4018,7 +4354,25 @@ def verify_supervisor_mutations(
         ("cleanup failure evidence weakened", replace_once(containment, '"drop database exited" not in retained.stdout or "drop roles exited" not in retained.stdout', '"drop database exited" not in retained.stdout')),
         ("retained recovery accepted", replace_once(containment, 'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):', 'if False:')),
     ]
+    runtime_valid_containment_mutations = {
+        "persistent coupled builtins exec replacement",
+        "persistent imported fcntl function replaced",
+        "persistent imported os function replaced",
+        "persistent getattr builtins exec replacement",
+        "persistent imported module alias write",
+        "persistent exec callable alias",
+        "persistent getattr callable alias namespace write",
+        "persistent extra runpy execution",
+        "persistent nested builtins import execution",
+        "persistent top-level generic runner execution",
+        "persistent executable function default",
+        "persistent extra module constant",
+        "persistent module mapping mutation",
+    }
     for label, mutation in containment_mutations:
+        if label in runtime_valid_containment_mutations:
+            ast.parse(mutation, filename=f"<containment mutation: {label}>")
+            compile(mutation, f"<containment mutation: {label}>", "exec")
         expect_rejected(lambda value: validate_containment(value, phase), mutation, label,
                         "containment")
     stage_mutations = [
