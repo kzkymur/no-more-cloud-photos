@@ -8,8 +8,11 @@ on:
       - "infra/ubuntu/**"
       - "infra/postgresql/**"
       - "infra/validation/verify-runtime-roles.sql"
+      - "infra/validation/repair-mount-verifier/**"
       - "cmd/nmcp-admin/**"
       - "internal/database/**"
+      - "internal/reconciliation/**"
+      - "internal/storage/**"
       - "go.mod"
       - "go.sum"
       - "scripts/assert-ubuntu-files-endpoint"
@@ -34,6 +37,7 @@ on:
       - "scripts/verify-ubuntu-installed-nginx"
       - "scripts/verify-ubuntu-migration-lock"
       - "scripts/verify-ubuntu-migration-role-compatibility"
+      - "scripts/verify-ubuntu-repair-mount-boundaries"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
       - "scripts/verify-ubuntu-service-gate"
@@ -50,8 +54,11 @@ on:
       - "infra/ubuntu/**"
       - "infra/postgresql/**"
       - "infra/validation/verify-runtime-roles.sql"
+      - "infra/validation/repair-mount-verifier/**"
       - "cmd/nmcp-admin/**"
       - "internal/database/**"
+      - "internal/reconciliation/**"
+      - "internal/storage/**"
       - "go.mod"
       - "go.sum"
       - "scripts/assert-ubuntu-files-endpoint"
@@ -76,6 +83,7 @@ on:
       - "scripts/verify-ubuntu-installed-nginx"
       - "scripts/verify-ubuntu-migration-lock"
       - "scripts/verify-ubuntu-migration-role-compatibility"
+      - "scripts/verify-ubuntu-repair-mount-boundaries"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
       - "scripts/verify-ubuntu-service-gate"
@@ -112,7 +120,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck
+            ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck util-linux
 
       - name: Check shell scripts
         run: |
@@ -120,7 +128,7 @@ jobs:
             scripts/check-ubuntu-tls-expiry scripts/renew-ubuntu-tls \
             scripts/run-ubuntu-migration scripts/run-ubuntu-migration-compatibility \
             scripts/set-ubuntu-migration-role-mode scripts/verify-ubuntu-migration-lock \
-            scripts/verify-ubuntu-migration-role-compatibility \
+            scripts/verify-ubuntu-migration-role-compatibility scripts/verify-ubuntu-repair-mount-boundaries \
             scripts/verify-ubuntu-config-boundaries scripts/verify-ubuntu-firewall-fixtures \
             scripts/verify-ubuntu-installed-nginx scripts/verify-ubuntu-nginx-http \
             scripts/verify-ubuntu-postgresql-dependency scripts/verify-ubuntu-release-failures \
@@ -130,6 +138,13 @@ jobs:
 
       - name: Verify deployment assets
         run: /usr/bin/python3 scripts/verify-ubuntu-deployment
+
+      - name: Verify privileged repair mount boundaries
+        run: |
+          go test -c -o /tmp/nmcp-storage-repair.test ./internal/storage
+          go build -o /tmp/nmcp-repair-late-bind ./infra/validation/repair-mount-verifier
+          sudo scripts/verify-ubuntu-repair-mount-boundaries \
+            /tmp/nmcp-storage-repair.test /tmp/nmcp-repair-late-bind
 
       - name: Verify configuration and firewall counterexamples
         run: |
@@ -165,11 +180,11 @@ jobs:
       - name: Verify migration role compatibility and hardening
         run: |
           go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
-          mkdir /tmp/nmcp-v17-source
-          git archive ea644c9ad47a35af67b8598758eb717bd2a86e57 | tar -x -C /tmp/nmcp-v17-source
-          (cd /tmp/nmcp-v17-source && go build -o /tmp/nmcp-admin-v17 ./cmd/nmcp-admin)
+          mkdir /tmp/nmcp-v18-source
+          git archive 172583179d860619ae2c79505971e10ae7f394fc | tar -x -C /tmp/nmcp-v18-source
+          (cd /tmp/nmcp-v18-source && go build -o /tmp/nmcp-admin-v18 ./cmd/nmcp-admin)
           sudo scripts/verify-ubuntu-migration-role-compatibility \
-            /tmp/nmcp-admin-current /tmp/nmcp-admin-v17
+            /tmp/nmcp-admin-current /tmp/nmcp-admin-v18
 
       - name: Verify release activation and rollback failure transactions
         run: sudo scripts/verify-ubuntu-release-failures

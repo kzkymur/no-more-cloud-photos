@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'must run as root\n' >&2; exit 1; }
+[[ $# -eq 2 ]] || { printf 'usage: %s STORAGE_TEST LATE_BIND_VERIFIER\n' "$0" >&2; exit 2; }
+storage_test=$(/usr/bin/readlink -f -- "$1")
+late_bind_verifier=$(/usr/bin/readlink -f -- "$2")
+[[ -x $storage_test && -x $late_bind_verifier ]] || { printf 'verifiers must be executable\n' >&2; exit 1; }
+work=$(/usr/bin/mktemp -d /var/tmp/nmcp-repair-mounts.XXXXXX)
+trap '/usr/bin/rm -rf -- "$work"' EXIT
+
+host_namespace=$(/usr/bin/readlink /proc/self/ns/mnt)
+# The single-quoted program is intentionally expanded only by the inner shell.
+# shellcheck disable=SC2016
+/usr/bin/unshare --mount --propagation private -- /bin/bash -euo pipefail -c '
+  storage_test=$1
+  late_bind_verifier=$2
+  work=$3
+  host_namespace=$4
+  private_namespace=$(/usr/bin/readlink /proc/self/ns/mnt)
+  [[ $private_namespace != "$host_namespace" ]]
+  "$storage_test" -test.v -test.count=1 -test.run="^TestRepairRejectsRealBindMountBoundaries$" \
+    | /usr/bin/tee "$work/storage.log"
+  ! /usr/bin/grep -F -- "--- SKIP:" "$work/storage.log"
+  for case_name in source_ancestor source_file quarantine_directory; do
+    /usr/bin/grep -F -- "--- PASS: TestRepairRejectsRealBindMountBoundaries/$case_name" "$work/storage.log"
+  done
+  "$late_bind_verifier" | /usr/bin/tee "$work/late.log"
+  /usr/bin/grep -F -- "PASS: late same-filesystem file bind failed closed before rename" "$work/late.log"
+' bash "$storage_test" "$late_bind_verifier" "$work" "$host_namespace"
+
+printf 'Ubuntu privileged repair mount verification passed\n'

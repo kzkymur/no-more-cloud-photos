@@ -245,8 +245,47 @@ END;
 $$;
 
 -- Treat every reconciliation/upload/repair SECURITY DEFINER entry point as one
--- catalog allowlist.  Checking only representative functions lets ownership,
--- invoker mode, search_path, or EXECUTE drift hide elsewhere in the boundary.
+-- closed catalog allowlist. Checking only representative or known functions
+-- lets an unexpected owner-controlled definer escape review.
+CREATE TEMPORARY TABLE expected_reconciliation_definers (
+    signature text PRIMARY KEY,
+    owner_name text NOT NULL,
+    acl_grantee text,
+    effective_grantees text[] NOT NULL
+);
+INSERT INTO expected_reconciliation_definers VALUES
+    ('nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']),
+    ('nmcp_complete_check_source(nmcp_uuid_v4,text,text)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']),
+    ('nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']),
+    ('nmcp_append_check_finding_once(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner',NULL,ARRAY[]::text[]),
+    ('nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']),
+    ('nmcp_read_check_database_references(timestamptz)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']),
+    ('nmcp_read_check_database_references_v18(timestamptz)','nmcp_check_function_owner',NULL,ARRAY[]::text[]),
+    ('nmcp_read_check_attempt_owners()','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']),
+    ('nmcp_read_check_report_outcome(nmcp_uuid_v4)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']),
+    ('nmcp_require_normal_maintenance()','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_complete_upload_attempt(nmcp_uuid_v4,text)','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_record_transform_storage_attempt()','nmcp_repair_function_owner',NULL,ARRAY[]::text[]),
+    ('nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','nmcp_repair_function_owner',NULL,ARRAY[]::text[]),
+    ('nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',NULL,ARRAY[]::text[]),
+    ('nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_read_repair_plan_digest(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_read_repair_run_outcome(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_read_repair_run_by_authorization(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_finish_repair_run(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']),
+    ('nmcp_require_terminal_repair_attempt()','nmcp_repair_function_owner',NULL,ARRAY[]::text[]);
 DO $$
 DECLARE
     boundary record;
@@ -257,49 +296,7 @@ DECLARE
     unintended_role text;
     target_search_path text[] := ARRAY['search_path=public, pg_catalog, pg_temp'];
 BEGIN
-    FOR boundary IN
-        SELECT * FROM (VALUES
-            ('nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)',
-             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
-            ('nmcp_complete_check_source(nmcp_uuid_v4,text,text)',
-             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
-            ('nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)',
-             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
-            ('nmcp_append_check_finding_once(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)',
-             'nmcp_check_function_owner',NULL,ARRAY[]::text[]),
-            ('nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)',
-             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
-            ('nmcp_read_check_database_references(timestamptz)',
-             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
-            ('nmcp_read_check_attempt_owners()',
-             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
-            ('nmcp_read_check_report_outcome(nmcp_uuid_v4)',
-             'nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime']::text[]),
-            ('nmcp_require_normal_maintenance()',
-             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
-            ('nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)',
-             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
-            ('nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)',
-             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
-            ('nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)',
-             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
-            ('nmcp_complete_upload_attempt(nmcp_uuid_v4,text)',
-             'nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']::text[]),
-            ('nmcp_record_transform_storage_attempt()',
-             'nmcp_repair_function_owner',NULL,ARRAY[]::text[]),
-            ('nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)',
-             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
-            ('nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
-             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
-            ('nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
-             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
-            ('nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)',
-             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
-            ('nmcp_finish_repair_run(nmcp_uuid_v4)',
-             'nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime']::text[]),
-            ('nmcp_require_terminal_repair_attempt()',
-             'nmcp_repair_function_owner',NULL,ARRAY[]::text[])
-        ) AS expected(signature,owner_name,acl_grantee,effective_grantees)
+    FOR boundary IN SELECT * FROM expected_reconciliation_definers
     LOOP
         boundary_oid := pg_catalog.to_regprocedure('public.'||boundary.signature);
         IF boundary_oid IS NULL THEN
@@ -362,6 +359,70 @@ BEGIN
             RAISE EXCEPTION 'missing intended effective EXECUTE on %',boundary.signature;
         END IF;
     END LOOP;
+    IF EXISTS (
+        WITH actual AS (
+            SELECT p.oid,
+                   pg_catalog.pg_get_userbyid(p.proowner)::text AS owner_name
+            FROM pg_catalog.pg_proc AS p
+            JOIN pg_catalog.pg_namespace AS n ON n.oid=p.pronamespace
+            WHERE n.nspname='public' AND p.prosecdef
+              AND p.proowner IN ('nmcp_check_function_owner'::pg_catalog.regrole,
+                                 'nmcp_repair_function_owner'::pg_catalog.regrole)
+        ), expected AS (
+            SELECT pg_catalog.to_regprocedure('public.'||signature)::oid AS oid,owner_name
+            FROM expected_reconciliation_definers
+        )
+        (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        UNION ALL
+        (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) THEN
+        RAISE EXCEPTION 'reconciliation SECURITY DEFINER set differs from exact allowlist';
+    END IF;
+END;
+$$;
+DROP TABLE expected_reconciliation_definers;
+
+-- Fixed-shape readers and replay wrappers are an application/database ABI.
+-- Compare the catalog-rendered result exactly so reordered or widened rows do
+-- not pass merely because the callable signature and ACL remained unchanged.
+DO $$
+DECLARE
+    expected record;
+    function_oid oid;
+BEGIN
+    FOR expected IN SELECT * FROM (VALUES
+        ('nmcp_read_check_database_references(timestamptz)',
+         'TABLE(row_kind text, subject_id uuid, media_id uuid, original_id uuid, job_id uuid, job_target_id uuid, relative_key text, expected_state text, size_bytes bigint, sha256 text, is_current boolean, provenance_valid boolean, current_valid boolean, due_at timestamp with time zone)'),
+        ('nmcp_read_check_database_references_v18(timestamptz)',
+         'TABLE(row_kind text, subject_id uuid, media_id uuid, original_id uuid, job_id uuid, job_target_id uuid, relative_key text, expected_state text, size_bytes bigint, sha256 text, is_current boolean, provenance_valid boolean, current_valid boolean, due_at timestamp with time zone)'),
+        ('nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)',
+         'TABLE(ordinal bigint, finding_id uuid, source_type text, subject_id uuid, media_id uuid, job_id uuid, job_target_id uuid, storage_attempt_id uuid, source_relative_key text, expected_size_bytes bigint, report_observed_sha256 text, observed_mtime timestamp with time zone, observed_ctime timestamp with time zone)'),
+        ('nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)',
+         'TABLE(run_id uuid, source_report_id uuid, authorization_id uuid, authorized_actor text, created boolean)'),
+        ('nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
+         'TABLE(item_id uuid, report_ordinal bigint, destination_relative_key text, created boolean)'),
+        ('nmcp_read_repair_plan_digest(nmcp_uuid_v4)','text'),
+        ('nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)',
+         'TABLE(plan_id uuid, item_count bigint, plan_digest text, created boolean)'),
+        ('nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
+         'TABLE(decision text, reason_code text, source_type text, subject_id uuid, media_id uuid, job_id uuid, job_target_id uuid, storage_attempt_id uuid, source_relative_key text, expected_size_bytes bigint, expected_sha256 text, destination_relative_key text, owner_attempt_id uuid, owner_kind text, owner_coverage text, owner_event_type text, owner_lease_expires_at timestamp with time zone, owner_event_occurred_at timestamp with time zone)'),
+        ('nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)',
+         'TABLE(decision text, reason_code text, source_type text, subject_id uuid, media_id uuid, job_id uuid, job_target_id uuid, storage_attempt_id uuid, source_relative_key text, expected_size_bytes bigint, expected_sha256 text, destination_relative_key text, owner_attempt_id uuid, owner_kind text, owner_coverage text, owner_event_type text, owner_lease_expires_at timestamp with time zone, owner_event_occurred_at timestamp with time zone)'),
+        ('nmcp_read_repair_run_outcome(nmcp_uuid_v4)',
+         'TABLE(run_id uuid, source_report_id uuid, authorization_id uuid, authorized_actor text, started_at timestamp with time zone, plan_id uuid, plan_version smallint, plan_item_count bigint, plan_digest text, result text, quarantined_count bigint, stale_count bigint, resolved_count bigint, failed_count bigint, unknown_count bigint, completed_at timestamp with time zone)'),
+        ('nmcp_read_repair_run_by_authorization(nmcp_uuid_v4)',
+         'TABLE(run_id uuid, source_report_id uuid, authorization_id uuid, authorized_actor text, started_at timestamp with time zone, plan_id uuid, plan_version smallint, plan_item_count bigint, plan_digest text, result text, quarantined_count bigint, stale_count bigint, resolved_count bigint, failed_count bigint, unknown_count bigint, completed_at timestamp with time zone)'),
+        ('nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)',
+         'TABLE(ordinal bigint, item_id uuid, finding_id uuid, quarantine_id uuid, source_type text, subject_id uuid, media_id uuid, job_id uuid, job_target_id uuid, storage_attempt_id uuid, source_relative_key text, expected_size_bytes bigint, expected_sha256 text, observed_mtime timestamp with time zone, observed_ctime timestamp with time zone, owner_snapshot text, destination_relative_key text, effective_outcome text, active_attempt_id uuid, latest_attempt_number integer)'),
+        ('nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)',
+         'TABLE(attempt_number integer, attempt_id uuid, started_at timestamp with time zone, sequence integer, event_id uuid, event_type text, outcome_code text, error_code text, observed_size_bytes bigint, observed_sha256 text, transaction_id xid8, occurred_at timestamp with time zone, physical_effect_possible boolean)')
+    ) AS shapes(signature,result_shape)
+    LOOP
+        function_oid := pg_catalog.to_regprocedure('public.'||expected.signature);
+        IF function_oid IS NULL OR pg_catalog.pg_get_function_result(function_oid)<>expected.result_shape THEN
+            RAISE EXCEPTION 'reconciliation fixed result shape differs on %',expected.signature;
+        END IF;
+    END LOOP;
 END;
 $$;
 
@@ -372,6 +433,7 @@ BEGIN
     IF EXISTS (
         WITH expected(table_name,owner_name,relation_kind) AS (VALUES
             ('change_events','nmcp_migrator','r'::"char"),
+            ('reconciliation_repair_plan_seals','nmcp_migrator','r'::"char"),
             ('reconciliation_repair_manifest_items','nmcp_migrator','r'::"char"),
             ('reconciliation_repair_attempts','nmcp_migrator','r'::"char"),
             ('reconciliation_repair_events','nmcp_migrator','r'::"char")
@@ -380,7 +442,7 @@ BEGIN
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
             WHERE n.nspname='public' AND c.relname IN (
-                'change_events','reconciliation_repair_manifest_items',
+                'change_events','reconciliation_repair_plan_seals','reconciliation_repair_manifest_items',
                 'reconciliation_repair_attempts','reconciliation_repair_events'
             )
         )
@@ -484,6 +546,8 @@ BEGIN
             ('reconciliation_repair_manifest_items','destination_relative_key','nmcp_check_function_owner','SELECT',false),
             ('reconciliation_repair_manifest_items','expected_size_bytes','nmcp_check_function_owner','SELECT',false),
             ('reconciliation_repair_manifest_items','report_observed_sha256','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','prepared_at','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_repair_manifest_items','report_ordinal','nmcp_repair_function_owner','SELECT',false),
             ('reconciliation_repair_attempts','id','nmcp_check_function_owner','SELECT',false),
             ('reconciliation_repair_attempts','manifest_item_id','nmcp_check_function_owner','SELECT',false),
             ('reconciliation_repair_attempts','attempt_number','nmcp_check_function_owner','SELECT',false),
@@ -512,7 +576,7 @@ BEGIN
             JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.oid
             CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS acl
             WHERE n.nspname='public' AND c.relname IN (
-                'change_events','reconciliation_repair_manifest_items',
+                'change_events','reconciliation_repair_plan_seals','reconciliation_repair_manifest_items',
                 'reconciliation_repair_attempts','reconciliation_repair_events'
             ) AND a.attnum>0 AND NOT a.attisdropped
         )
@@ -535,7 +599,9 @@ BEGIN
             ('reconciliation_repair_attempts','nmcp_repair_function_owner','SELECT',false),
             ('reconciliation_repair_attempts','nmcp_repair_function_owner','INSERT',false),
             ('reconciliation_repair_events','nmcp_repair_function_owner','SELECT',false),
-            ('reconciliation_repair_events','nmcp_repair_function_owner','INSERT',false)
+            ('reconciliation_repair_events','nmcp_repair_function_owner','INSERT',false),
+            ('reconciliation_repair_plan_seals','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_repair_plan_seals','nmcp_repair_function_owner','INSERT',false)
         ), actual AS (
             SELECT c.relname::text,pg_catalog.pg_get_userbyid(acl.grantee)::text,
                    acl.privilege_type,acl.is_grantable
@@ -543,7 +609,7 @@ BEGIN
             JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
             CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl
             WHERE n.nspname='public' AND c.relname IN (
-                'change_events','reconciliation_repair_manifest_items',
+                'change_events','reconciliation_repair_plan_seals','reconciliation_repair_manifest_items',
                 'reconciliation_repair_attempts','reconciliation_repair_events'
             ) AND acl.grantee<>c.relowner
         )
@@ -555,7 +621,7 @@ BEGIN
     END IF;
 
     FOREACH source_table IN ARRAY ARRAY[
-        'change_events','reconciliation_repair_manifest_items',
+        'change_events','reconciliation_repair_plan_seals','reconciliation_repair_manifest_items',
         'reconciliation_repair_attempts','reconciliation_repair_events'
     ] LOOP
         FOREACH source_privilege IN ARRAY ARRAY[
@@ -579,6 +645,7 @@ BEGIN
     FOREACH evidence_table IN ARRAY ARRAY[
         'reconciliation_reports','reconciliation_check_reports','reconciliation_check_findings','reconciliation_check_source_results',
         'reconciliation_check_report_seals','reconciliation_repair_runs',
+        'reconciliation_repair_plan_seals',
         'reconciliation_repair_manifest_items','reconciliation_repair_attempts',
         'reconciliation_repair_events','reconciliation_repair_results','storage_attempts','storage_attempt_events'
     ] LOOP
@@ -639,12 +706,23 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'unsafe reconciliation function owner or search_path';
     END IF;
-    IF NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','EXECUTE')
-       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','EXECUTE')
+    IF NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','EXECUTE')
        OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','EXECUTE')
        OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_read_repair_run_outcome(nmcp_uuid_v4)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)','EXECUTE')
+       OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)','EXECUTE')
        OR NOT pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_finish_repair_run(nmcp_uuid_v4)','EXECUTE')
-       OR pg_catalog.has_function_privilege('nmcp_check_runtime','public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','EXECUTE') THEN
+       OR pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','EXECUTE')
+       OR pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','EXECUTE')
+       OR pg_catalog.has_function_privilege('nmcp_check_runtime','public.nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','EXECUTE')
+       OR pg_catalog.has_function_privilege('nmcp_check_runtime','public.nmcp_read_repair_run_outcome(nmcp_uuid_v4)','EXECUTE')
+       OR pg_catalog.has_function_privilege('nmcp_repair_runtime','public.nmcp_read_check_database_references(timestamptz)','EXECUTE') THEN
         RAISE EXCEPTION 'unsafe repair publication EXECUTE ACL';
     END IF;
     IF NOT pg_catalog.has_table_privilege('nmcp_check_function_owner','public.reconciliation_check_source_results','SELECT,INSERT')
