@@ -35,11 +35,11 @@ fi
 /usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
 /usr/bin/install -o root -g root -m 0755 \
   "$repo_root/scripts/set-ubuntu-migration-role-mode" \
-  "$repo_root/scripts/run-ubuntu-migration-compatibility" /usr/local/libexec/nmcp/
+  "$repo_root/scripts/run-ubuntu-migration-compatibility" \
+  "$repo_root/scripts/verify-installed-runtime-roles" /usr/local/libexec/nmcp/
 /usr/bin/install -o root -g root -m 0644 \
   "$repo_root/infra/postgresql/runtime-roles.sql" \
   "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \
-  "$repo_root/infra/validation/verify-runtime-roles.sql" \
   /usr/local/libexec/nmcp/postgresql/
 /usr/bin/install -o root -g root -m 0644 \
   "$repo_root/infra/ubuntu/postgresql-roles.sql" \
@@ -48,12 +48,6 @@ fi
   /opt/nmcp-role-compatibility/current/bin/nmcp-admin
 /usr/bin/install -o root -g root -m 0755 "$v18_admin" \
   /opt/nmcp-role-compatibility/v18/bin/nmcp-admin
-[[ $(/usr/bin/stat --format='%F:%u:%g:%a' -- \
-  /usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql) == 'regular file:0:0:644' ]] || {
-  printf 'unsafe installed runtime verifier ownership, type, or mode\n' >&2
-  exit 1
-}
-
 write_checksums() {
   local temporary
   temporary=$(/usr/bin/mktemp /var/lib/nmcp/deployment/postgresql-role-bootstrap.XXXXXX)
@@ -78,9 +72,7 @@ assert_hardened() {
     --file=/usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql >/dev/null
 }
 assert_runtime_boundary() {
-  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
-    --set=ON_ERROR_STOP=1 \
-    --file=/usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql >/dev/null
+  /usr/local/libexec/nmcp/verify-installed-runtime-roles "$repo_root" >/dev/null
 }
 assert_compatibility() {
   [[ $(/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
