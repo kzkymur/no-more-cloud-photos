@@ -35,8 +35,7 @@ fi
 /usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
 /usr/bin/install -o root -g root -m 0755 \
   "$repo_root/scripts/set-ubuntu-migration-role-mode" \
-  "$repo_root/scripts/run-ubuntu-migration-compatibility" \
-  "$repo_root/scripts/verify-installed-runtime-roles" /usr/local/libexec/nmcp/
+  "$repo_root/scripts/run-ubuntu-migration-compatibility" /usr/local/libexec/nmcp/
 /usr/bin/install -o root -g root -m 0644 \
   "$repo_root/infra/postgresql/runtime-roles.sql" \
   "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \
@@ -72,6 +71,11 @@ assert_hardened() {
     --file=/usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql >/dev/null
 }
 assert_runtime_boundary() {
+  /usr/bin/install -o root -g root -m 0755 -- \
+    "$repo_root/scripts/verify-installed-runtime-roles" \
+    /usr/local/libexec/nmcp/verify-installed-runtime-roles
+  [[ $(/usr/bin/stat --format='%F:%u:%g:%a' -- \
+    /usr/local/libexec/nmcp/verify-installed-runtime-roles) == 'regular file:0:0:755' ]]
   /usr/local/libexec/nmcp/verify-installed-runtime-roles "$repo_root" >/dev/null
 }
 assert_compatibility() {
@@ -118,6 +122,7 @@ assert_runtime_boundary
   PGPASSWORD=rogue PGOPTIONS='-c search_path=pg_temp' \
   /usr/local/libexec/nmcp/set-ubuntu-migration-role-mode hardened
 assert_hardened
+assert_runtime_boundary
 
 # A stale compatibility state from an interrupted attempt is an accepted input,
 # but no other graph drift is; the next wrapper run hardens it again.
@@ -125,6 +130,7 @@ assert_hardened
 assert_compatibility
 run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
 assert_hardened
+assert_runtime_boundary
 
 # Migration failure preserves its status after mandatory hardening.
 /usr/bin/install -d -o nmcp -g nmcp -m 0700 "$work/fail"
@@ -140,6 +146,7 @@ status=$?
 set -e
 [[ $status -eq 42 ]]
 assert_hardened
+assert_runtime_boundary
 
 # INT and TERM are delivered only to the wrapper. The migration child ignores
 # both, proving each dedicated handler terminates the child and hardens rather
@@ -189,7 +196,9 @@ EOF
   assert_hardened
 }
 test_signal int INT 130
+assert_runtime_boundary
 test_signal term TERM 143
+assert_runtime_boundary
 
 # SIGKILL is the one untrappable interruption. It may leave compatibility TRUE,
 # but a restart accepts that exact state and must harden before success.
@@ -210,6 +219,7 @@ wait "$wrapper_pid" >/dev/null 2>&1 || true
 assert_compatibility
 run_wrapper /opt/nmcp-role-compatibility/current/bin/nmcp-admin migrate up --json
 assert_hardened
+assert_runtime_boundary
 
 # A real post-migrate verifier failure returns nonzero. Pause after checksum
 # validation and hardened bootstrap, mutate the live graph, then let the
@@ -246,6 +256,7 @@ set -e
 /usr/bin/rm -f /run/nmcp-test-before-role-graph-verify.{ready,go}
 /usr/local/libexec/nmcp/set-ubuntu-migration-role-mode hardened
 assert_hardened
+assert_runtime_boundary
 
 # Upgrade evidence uses the exact approved historical 0018 admin binary for
 # v0→18, followed by the candidate binary for the isolated v18→19 boundary.
@@ -289,6 +300,7 @@ assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd271
      WHERE conrelid='reconciliation_repair_manifest_items'::regclass
        AND conname='reconciliation_repair_manifest_items_source_relative_key_key')::text") == "false:true" ]]
 assert_hardened
+assert_runtime_boundary
 
 # Completed v18 history is equally ineligible for v19 execution authority.
 # Its exact result remains readable after transactional rejection.
@@ -333,6 +345,7 @@ assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd271
      WHERE conrelid='reconciliation_repair_manifest_items'::regclass
        AND conname='reconciliation_repair_manifest_items_source_relative_key_key')::text") == "false:true" ]]
 assert_hardened
+assert_runtime_boundary
 
 # An already-running v18 repair writer is drained before v19 preflight/DDL.
 # Prove both the granted RowExclusiveLock and the migration's waiting

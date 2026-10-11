@@ -3,6 +3,8 @@
 
 import ast
 import copy
+import hashlib
+import json
 import os
 import pathlib
 import re
@@ -34,6 +36,14 @@ def run(command, **kwargs):
 
 def text(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def normalized_tree(value):
+    if isinstance(value, dict):
+        return {str(key): normalized_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalized_tree(item) for item in value]
+    return value
 
 
 def workflow_step(steps: list[dict], name: str) -> tuple[int, dict]:
@@ -112,6 +122,11 @@ def validate_migration_role_verifier(helper_source: str, compatibility_source: s
     )
     invocation = (
         "assert_runtime_boundary() {\n"
+        "  /usr/bin/install -o root -g root -m 0755 -- \\\n"
+        '    "$repo_root/scripts/verify-installed-runtime-roles" \\\n'
+        "    /usr/local/libexec/nmcp/verify-installed-runtime-roles\n"
+        "  [[ $(/usr/bin/stat --format='%F:%u:%g:%a' -- \\\n"
+        "    /usr/local/libexec/nmcp/verify-installed-runtime-roles) == 'regular file:0:0:755' ]]\n"
         '  /usr/local/libexec/nmcp/verify-installed-runtime-roles "$repo_root" >/dev/null\n'
         "}\n"
     )
@@ -129,8 +144,7 @@ def validate_migration_role_verifier(helper_source: str, compatibility_source: s
         "/usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment\n"
         "/usr/bin/install -o root -g root -m 0755 \\\n"
         '  "$repo_root/scripts/set-ubuntu-migration-role-mode" \\\n'
-        '  "$repo_root/scripts/run-ubuntu-migration-compatibility" \\\n'
-        '  "$repo_root/scripts/verify-installed-runtime-roles" /usr/local/libexec/nmcp/\n'
+        '  "$repo_root/scripts/run-ubuntu-migration-compatibility" /usr/local/libexec/nmcp/\n'
         "/usr/bin/install -o root -g root -m 0644 \\\n"
         '  "$repo_root/infra/postgresql/runtime-roles.sql" \\\n'
         '  "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \\\n'
@@ -141,15 +155,19 @@ def validate_migration_role_verifier(helper_source: str, compatibility_source: s
         and compatibility_source.count(invocation_context) == 1
         and compatibility_source.count(install_context) == 1
         and compatibility_source.count("assert_runtime_boundary()") == 1
+        and len(re.findall(r"(?m)^assert_runtime_boundary$", compatibility_source)) == 13
+        and compatibility_source.count('"$repo_root/scripts/verify-installed-runtime-roles"') == 1
         and compatibility_source.count(
-            '"$repo_root/scripts/verify-installed-runtime-roles"'
-        ) == 1
-        and compatibility_source.count(
-            '/usr/local/libexec/nmcp/verify-installed-runtime-roles "$repo_root"'
-        ) == 1
+            "/usr/local/libexec/nmcp/verify-installed-runtime-roles"
+        ) == 3
         and "verify-runtime-roles.sql" not in compatibility_source
         and "if false" not in compatibility_source,
-        "migration compatibility evidence does not uniquely install and invoke the reviewed helper",
+        "migration compatibility evidence does not preserve every exact runtime boundary",
+    )
+    require(
+        hashlib.sha256(compatibility_source.encode("utf-8")).hexdigest()
+        == "4141a061b5097e23c8891f65c67c8d599ebfb257d178a4543b91515b95397aa8",
+        "migration compatibility script differs from the complete reviewed program",
     )
 
 
@@ -198,7 +216,7 @@ def verify_migration_role_verifier_mutations(
     try:
         validate_migration_role_verifier(helper_source, dead_invocation)
     except RuntimeError as error:
-        require("uniquely install and invoke" in str(error), str(error))
+        require("every exact runtime boundary" in str(error), str(error))
     else:
         raise RuntimeError("runtime verifier validator accepted dead helper invocation")
 
@@ -222,9 +240,48 @@ def verify_migration_role_verifier_mutations(
     try:
         validate_migration_role_verifier(helper_source, dead_install)
     except RuntimeError as error:
-        require("uniquely install and invoke" in str(error), str(error))
+        require("every exact runtime boundary" in str(error), str(error))
     else:
         raise RuntimeError("runtime verifier validator accepted dead reviewed install decoy")
+
+    compatibility_mutations = {
+        "zero runtime boundary calls": re.sub(
+            r"(?m)^assert_runtime_boundary\n", "", compatibility_source
+        ),
+        "extra runtime boundary call": compatibility_source + "assert_runtime_boundary\n",
+        "reordered runtime boundary call": compatibility_source.replace(
+            "assert_hardened\nassert_runtime_boundary\n",
+            "assert_runtime_boundary\nassert_hardened\n",
+            1,
+        ),
+        "active helper cp replacement": compatibility_source.replace(
+            "assert_hardened\nassert_runtime_boundary\n",
+            "assert_hardened\n/usr/bin/cp /bin/true /usr/local/libexec/nmcp/verify-installed-runtime-roles\nassert_runtime_boundary\n",
+            1,
+        ),
+        "active helper symlink replacement": compatibility_source.replace(
+            "assert_hardened\nassert_runtime_boundary\n",
+            "assert_hardened\n/usr/bin/ln -sf /bin/true /usr/local/libexec/nmcp/verify-installed-runtime-roles\nassert_runtime_boundary\n",
+            1,
+        ),
+        "intervening helper overwrite inside boundary": compatibility_source.replace(
+            "  /usr/local/libexec/nmcp/verify-installed-runtime-roles \"$repo_root\" >/dev/null",
+            "  /usr/bin/install -m 0755 /bin/true /usr/local/libexec/nmcp/verify-installed-runtime-roles\n"
+            "  /usr/local/libexec/nmcp/verify-installed-runtime-roles \"$repo_root\" >/dev/null",
+            1,
+        ),
+    }
+    for label, mutation in compatibility_mutations.items():
+        try:
+            validate_migration_role_verifier(helper_source, mutation)
+        except RuntimeError as error:
+            require(
+                "every exact runtime boundary" in str(error)
+                or "complete reviewed program" in str(error),
+                str(error),
+            )
+        else:
+            raise RuntimeError(f"runtime verifier validator accepted {label}")
 
 
 def validate_ubuntu_workflow(source: str) -> None:
@@ -459,14 +516,36 @@ def validate_ubuntu_workflow(source: str) -> None:
     )
     require(
         (checkout_index, setup_index, dependency_index, shellcheck_index) == (0, 1, 2, 3)
-        and shellcheck_index
-        < static_index < mount_index < migration_index,
+        and static_index == 4
+        and static_index < mount_index < migration_index,
         "Ubuntu workflow evidence steps are not in dependency order",
     )
     for index, step in enumerate(steps):
         if isinstance(step, dict) and "run" in step:
             label = step.get("name", f"step {index}")
             require_default_run_context(step, f"Ubuntu run step {label}")
+    action_uses = [str(step["uses"]) for step in steps if isinstance(step, dict) and "uses" in step]
+    require(
+        action_uses
+        == [
+            "actions/checkout@v6",
+            "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+        ]
+        and not any(action.startswith("./") for action in action_uses),
+        "Ubuntu workflow action sources differ from the exact reviewed list",
+    )
+    workflow_digest = hashlib.sha256(
+        json.dumps(
+            normalized_tree(workflow),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    require(
+        workflow_digest == "53a9a04a3080d2814b193d19e914e59d92f811011d1c4c0759c720c5ab00ee2e",
+        "Ubuntu workflow complete reviewed AST changed",
+    )
 
 
 def expect_workflow_rejected(source: str, label: str, expected_error: str) -> None:
@@ -619,6 +698,30 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
         yaml.safe_dump(shellcheck_env, sort_keys=False),
         "ShellCheck PATH override",
         "Ubuntu ShellCheck step mapping changed",
+    )
+
+    local_action_before_static = copy.deepcopy(workflow)
+    local_action_steps = local_action_before_static["jobs"]["verify"]["steps"]
+    _, static_step = workflow_step(local_action_steps, "Verify deployment assets")
+    static_index = local_action_steps.index(static_step)
+    local_action_steps.insert(static_index, {"uses": "./.github/actions/shadow-verifier"})
+    expect_workflow_rejected(
+        yaml.safe_dump(local_action_before_static, sort_keys=False),
+        "unreviewed local composite action before static verification",
+        "Ubuntu workflow evidence steps are not in dependency order",
+    )
+
+    writable_step_before_static = copy.deepcopy(workflow)
+    writable_steps = writable_step_before_static["jobs"]["verify"]["steps"]
+    static_index, _ = workflow_step(writable_steps, "Verify deployment assets")
+    writable_steps.insert(
+        static_index,
+        {"name": "Overwrite verifier", "run": "printf bypass > scripts/verify-ubuntu-deployment"},
+    )
+    expect_workflow_rejected(
+        yaml.safe_dump(writable_step_before_static, sort_keys=False),
+        "unlisted writable step before static verification",
+        "Ubuntu workflow evidence steps are not in dependency order",
     )
 
     unused_shellcheck = copy.deepcopy(workflow)

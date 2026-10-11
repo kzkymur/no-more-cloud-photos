@@ -520,6 +520,42 @@ BEGIN
 END;
 $$;
 
+-- The public schema is the publication boundary for every protected relation
+-- and privileged function. Close its owner and ACL catalog exactly so no role
+-- can create shadow objects or publish new entry points outside the inventory.
+DO $$
+BEGIN
+    IF (SELECT pg_catalog.pg_get_userbyid(n.nspowner) FROM pg_catalog.pg_namespace AS n WHERE n.nspname='public')
+       <> 'nmcp_migrator'
+       OR EXISTS (
+        WITH expected(grantee,grantor,privilege_type,is_grantable) AS (VALUES
+            ('nmcp_migrator','nmcp_migrator','CREATE',false),
+            ('nmcp_migrator','nmcp_migrator','USAGE',false),
+            ('nmcp_runtime','nmcp_migrator','USAGE',false),
+            ('nmcp_worker_runtime','nmcp_migrator','USAGE',false),
+            ('nmcp_purge_function_owner','nmcp_migrator','USAGE',false),
+            ('nmcp_check_runtime','nmcp_migrator','USAGE',false),
+            ('nmcp_repair_runtime','nmcp_migrator','USAGE',false),
+            ('nmcp_check_function_owner','nmcp_migrator','USAGE',false),
+            ('nmcp_repair_function_owner','nmcp_migrator','USAGE',false)
+        ), actual AS (
+            SELECT CASE WHEN acl.grantee=0 THEN 'PUBLIC'
+                        ELSE pg_catalog.pg_get_userbyid(acl.grantee)::text END,
+                   pg_catalog.pg_get_userbyid(acl.grantor)::text,
+                   acl.privilege_type,acl.is_grantable
+            FROM pg_catalog.pg_namespace AS n
+            CROSS JOIN LATERAL pg_catalog.aclexplode(n.nspacl) AS acl
+            WHERE n.nspname='public'
+        )
+        (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        UNION ALL
+        (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) THEN
+        RAISE EXCEPTION 'public schema owner or ACL differs from exact allowlist';
+    END IF;
+END;
+$$;
+
 -- Close the column ACL catalog over every maintenance, reconciliation evidence,
 -- and checker-source relation. This includes the deliberately narrow owner
 -- grants used by SECURITY DEFINER functions; every other grantee, privilege,
