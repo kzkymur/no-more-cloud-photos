@@ -364,8 +364,7 @@ BEGIN
             SELECT p.oid,
                    pg_catalog.pg_get_userbyid(p.proowner)::text AS owner_name
             FROM pg_catalog.pg_proc AS p
-            JOIN pg_catalog.pg_namespace AS n ON n.oid=p.pronamespace
-            WHERE n.nspname='public' AND p.prosecdef
+            WHERE p.prosecdef
               AND p.proowner IN ('nmcp_check_function_owner'::pg_catalog.regrole,
                                  'nmcp_repair_function_owner'::pg_catalog.regrole)
         ), expected AS (
@@ -521,10 +520,10 @@ BEGIN
 END;
 $$;
 
--- Migration 0018 deliberately gives the checker owner only the columns read by
--- its SECURITY DEFINER sources. Compare the underlying ACL catalogs so table
--- grants, write privileges, and grant options cannot hide
--- behind an effective-privilege spot check.
+-- Close the column ACL catalog over every maintenance, reconciliation evidence,
+-- and checker-source relation. This includes the deliberately narrow owner
+-- grants used by SECURITY DEFINER functions; every other grantee, privilege,
+-- and grant option is forbidden, including grants inherited by runtime roles.
 DO $$
 DECLARE
     source_table text;
@@ -559,8 +558,14 @@ BEGIN
             ('reconciliation_repair_events','observed_size_bytes','nmcp_check_function_owner','SELECT',false),
             ('reconciliation_repair_events','observed_sha256','nmcp_check_function_owner','SELECT',false),
             ('reconciliation_repair_events','occurred_at','nmcp_check_function_owner','SELECT',false),
+            ('maintenance_state','id','nmcp_purge_function_owner','UPDATE',false),
+            ('maintenance_state','id','nmcp_repair_function_owner','UPDATE',false),
+            ('reconciliation_check_reports','id','nmcp_check_function_owner','UPDATE',false),
+            ('reconciliation_check_report_seals','report_id','nmcp_repair_function_owner','UPDATE',false),
+            ('reconciliation_repair_runs','id','nmcp_repair_function_owner','UPDATE',false),
             ('reconciliation_repair_manifest_items','id','nmcp_repair_function_owner','UPDATE',false),
-            ('reconciliation_repair_attempts','id','nmcp_repair_function_owner','UPDATE',false)
+            ('reconciliation_repair_attempts','id','nmcp_repair_function_owner','UPDATE',false),
+            ('storage_attempts','id','nmcp_repair_function_owner','UPDATE',false)
         ), expected AS (
             SELECT table_name,column_name,'nmcp_migrator'::text AS grantor,
                    grantee,privilege_type,is_grantable
@@ -576,15 +581,20 @@ BEGIN
             JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.oid
             CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS acl
             WHERE n.nspname='public' AND c.relname IN (
-                'change_events','reconciliation_repair_plan_seals','reconciliation_repair_manifest_items',
-                'reconciliation_repair_attempts','reconciliation_repair_events'
+                'maintenance_state','change_events','reconciliation_reports',
+                'reconciliation_check_reports','reconciliation_check_findings',
+                'reconciliation_check_source_results','reconciliation_check_report_seals',
+                'reconciliation_repair_runs','reconciliation_repair_plan_seals',
+                'reconciliation_repair_manifest_items','reconciliation_repair_attempts',
+                'reconciliation_repair_events','reconciliation_repair_results',
+                'storage_attempts','storage_attempt_events'
             ) AND a.attnum>0 AND NOT a.attisdropped
         )
         (SELECT * FROM expected EXCEPT SELECT * FROM actual)
         UNION ALL
         (SELECT * FROM actual EXCEPT SELECT * FROM expected)
     ) THEN
-        RAISE EXCEPTION 'checker source column ACL catalog differs from exact allowlist';
+        RAISE EXCEPTION 'protected relation column ACL catalog differs from exact allowlist';
     END IF;
 
     IF EXISTS (

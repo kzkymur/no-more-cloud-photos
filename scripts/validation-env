@@ -464,7 +464,7 @@ check_runtime_role_verifier_negatives() {
     "GRANT UPDATE(attempt_number) ON public.reconciliation_repair_attempts TO nmcp_repair_function_owner"
   expect_runtime_role_verifier_denied \
     "checker source repair owner extra column ACL drift" \
-    "checker source column ACL catalog differs from exact allowlist"
+    "protected relation column ACL catalog differs from exact allowlist"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE UPDATE(attempt_number) ON public.reconciliation_repair_attempts FROM nmcp_repair_function_owner"
@@ -474,7 +474,7 @@ check_runtime_role_verifier_negatives() {
     "GRANT UPDATE(id) ON public.reconciliation_repair_attempts TO nmcp_repair_function_owner WITH GRANT OPTION"
   expect_runtime_role_verifier_denied \
     "checker source repair owner column grant-option drift" \
-    "checker source column ACL catalog differs from exact allowlist"
+    "protected relation column ACL catalog differs from exact allowlist"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE GRANT OPTION FOR UPDATE(id) ON public.reconciliation_repair_attempts FROM nmcp_repair_function_owner"
@@ -508,6 +508,48 @@ check_runtime_role_verifier_negatives() {
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "DROP ROLE nmcp_checker_acl_probe"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT SELECT(mode) ON public.maintenance_state TO nmcp_runtime"
+  expect_runtime_role_verifier_denied \
+    "maintenance column SELECT inherited by runtime members" \
+    "protected relation column ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE SELECT(mode) ON public.maintenance_state FROM nmcp_runtime"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT UPDATE(reason) ON public.maintenance_state TO nmcp_api WITH GRANT OPTION"
+  expect_runtime_role_verifier_denied \
+    "maintenance member column UPDATE grant-option drift" \
+    "protected relation column ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE UPDATE(reason) ON public.maintenance_state FROM nmcp_api"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_evidence_acl_probe NOLOGIN; \
+GRANT SELECT(findings) ON public.reconciliation_reports TO nmcp_evidence_acl_probe"
+  expect_runtime_role_verifier_denied \
+    "legacy evidence arbitrary column SELECT grantee drift" \
+    "protected relation column ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE SELECT(findings) ON public.reconciliation_reports FROM nmcp_evidence_acl_probe; \
+DROP ROLE nmcp_evidence_acl_probe"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT UPDATE(repair_disposition) ON public.reconciliation_reports TO nmcp_worker WITH GRANT OPTION"
+  expect_runtime_role_verifier_denied \
+    "legacy evidence member column UPDATE grant-option drift" \
+    "protected relation column ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE UPDATE(repair_disposition) ON public.reconciliation_reports FROM nmcp_worker"
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
@@ -603,6 +645,20 @@ ALTER FUNCTION public.nmcp_unexpected_repair_definer() OWNER TO nmcp_repair_func
     --set ON_ERROR_STOP=1 --command \
     "ALTER FUNCTION public.nmcp_unexpected_repair_definer() OWNER TO nmcp_bootstrap; \
 DROP FUNCTION public.nmcp_unexpected_repair_definer()"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE SCHEMA nmcp_verifier_probe; \
+CREATE FUNCTION nmcp_verifier_probe.nmcp_unexpected_check_definer() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS 'SELECT'; \
+REVOKE ALL ON FUNCTION nmcp_verifier_probe.nmcp_unexpected_check_definer() FROM PUBLIC; \
+ALTER FUNCTION nmcp_verifier_probe.nmcp_unexpected_check_definer() OWNER TO nmcp_check_function_owner"
+  expect_runtime_role_verifier_denied \
+    "unexpected non-public reconciliation SECURITY DEFINER" \
+    "reconciliation SECURITY DEFINER set differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER FUNCTION nmcp_verifier_probe.nmcp_unexpected_check_definer() OWNER TO nmcp_bootstrap; \
+DROP SCHEMA nmcp_verifier_probe CASCADE"
 
   run_runtime_role_verifier
 }
