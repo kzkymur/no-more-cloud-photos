@@ -172,7 +172,11 @@ func (store *Store) beginRepair(ctx context.Context, source string, destination 
 	operation.sourceChain = chain
 
 	var sourceValidationErr error
-	sourceFD, sourceErr := repairOpenat2(parentFD, sourceName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_NOATIME|unix.O_CLOEXEC)
+	sourceFD := -1
+	sourceErr := operation.store.inject(ctx, BoundaryRepairSourceOpen, Before, operation.sourceKey, 0)
+	if sourceErr == nil {
+		sourceFD, sourceErr = repairOpenat2(parentFD, sourceName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_NOATIME|unix.O_CLOEXEC)
+	}
 	if sourceErr == nil {
 		operation.progress.SourcePresent = true
 		defer unix.Close(sourceFD)
@@ -186,7 +190,7 @@ func (store *Store) beginRepair(ctx context.Context, source string, destination 
 		}
 	} else if !errors.Is(sourceErr, unix.ENOENT) {
 		operation.progress.SourcePresent = true
-		sourceValidationErr = repairFailure(repairCauseForError(sourceErr, RepairCauseWrongType), RepairStagePrepare, operation.progress, sourceErr)
+		sourceValidationErr = repairFailure(repairInitialSourceOpenCause(sourceErr), RepairStagePrepare, operation.progress, sourceErr)
 	}
 
 	quarantineFD, quarantineExists, quarantineErr := operation.openCanonicalQuarantine(ctx, !dryRun && sourceErr == nil && sourceValidationErr == nil)
@@ -266,9 +270,12 @@ func (operation *RepairQuarantine) Revalidate(ctx context.Context) (RepairProgre
 			return operation.progress, repairFailure(RepairCauseSourceRestored, RepairStageRevalidate, operation.progress, err)
 		}
 	} else if operation.progress.Disposition == RepairSourceReady {
+		if err := operation.store.inject(ctx, BoundaryRepairSourceOpen, Before, operation.sourceKey, 0); err != nil {
+			return operation.progress, repairFailure(repairSourceObservationCause(err), RepairStageRevalidate, operation.progress, err)
+		}
 		fd, err := repairOpenat2(operation.sourceParentFD, operation.sourceName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC)
 		if err != nil {
-			return operation.progress, repairFailure(RepairCauseSourceChanged, RepairStageRevalidate, operation.progress, err)
+			return operation.progress, repairFailure(repairSourceObservationCause(err), RepairStageRevalidate, operation.progress, err)
 		}
 		identity, digest, err := operation.validateFile(ctx, operation.sourceParentFD, operation.sourceName, fd, operation.expectation, BoundaryRepairSourceHash, RepairStageRevalidate, RepairCauseSourceChanged, true)
 		_ = unix.Close(fd)
@@ -308,9 +315,12 @@ func (operation *RepairQuarantine) Rename(ctx context.Context) (RepairProgress, 
 	}
 	// Hash and namespace validation is deliberately repeated immediately before
 	// the only mutation syscall.
+	if err := operation.store.inject(ctx, BoundaryRepairSourceOpen, Before, operation.sourceKey, 0); err != nil {
+		return operation.progress, repairFailure(repairSourceObservationCause(err), RepairStageRename, operation.progress, err)
+	}
 	fd, err := repairOpenat2(operation.sourceParentFD, operation.sourceName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC)
 	if err != nil {
-		return operation.progress, repairFailure(RepairCauseSourceChanged, RepairStageRename, operation.progress, err)
+		return operation.progress, repairFailure(repairSourceObservationCause(err), RepairStageRename, operation.progress, err)
 	}
 	identity, _, validateErr := operation.validateFile(ctx, operation.sourceParentFD, operation.sourceName, fd, operation.expectation, BoundaryRepairSourceHash, RepairStageRename, RepairCauseSourceChanged, true)
 	_ = unix.Close(fd)
@@ -640,13 +650,23 @@ func (operation *RepairQuarantine) validateFile(ctx context.Context, parentFD in
 	if err := operation.store.inject(ctx, boundary, After, operation.sourceKey, 0); err != nil {
 		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseInternal), stage, operation.progress, err)
 	}
+	if boundary == BoundaryRepairSourceHash {
+		if injectedErr := operation.store.inject(ctx, BoundaryRepairSourceDescriptorStat, Before, operation.sourceKey, 0); injectedErr != nil {
+			return identity, digest, repairFailure(repairCauseForError(injectedErr, RepairCauseInternal), stage, operation.progress, injectedErr)
+		}
+	}
 	after, err := repairIdentityAt(fd, "", unix.AT_EMPTY_PATH)
 	if err != nil {
-		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseSourceChanged), stage, operation.progress, err)
+		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseInternal), stage, operation.progress, err)
+	}
+	if boundary == BoundaryRepairSourceHash {
+		if injectedErr := operation.store.inject(ctx, BoundaryRepairSourceLeafStat, Before, operation.sourceKey, 0); injectedErr != nil {
+			return identity, digest, repairFailure(repairSourceLeafCause(injectedErr), stage, operation.progress, injectedErr)
+		}
 	}
 	leaf, err := repairIdentityAt(parentFD, name, unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
-		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseSourceChanged), stage, operation.progress, err)
+		return identity, digest, repairFailure(repairSourceLeafCause(err), stage, operation.progress, err)
 	}
 	if identity != after || identity != leaf {
 		return identity, digest, repairFailure(RepairCauseSourceChanged, stage, operation.progress, ErrValidation)
@@ -824,4 +844,25 @@ func repairCauseForError(err error, fallback RepairCause) RepairCause {
 	default:
 		return fallback
 	}
+}
+
+func repairSourceObservationCause(err error) RepairCause {
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
+		return RepairCauseSourceChanged
+	}
+	return repairCauseForError(err, RepairCauseInternal)
+}
+
+func repairSourceLeafCause(err error) RepairCause {
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) {
+		return RepairCauseSourceChanged
+	}
+	return repairCauseForError(err, RepairCauseInternal)
+}
+
+func repairInitialSourceOpenCause(err error) RepairCause {
+	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENXIO) {
+		return RepairCauseWrongType
+	}
+	return repairCauseForError(err, RepairCauseInternal)
 }

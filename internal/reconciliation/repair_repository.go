@@ -11,7 +11,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type RepairPostgresRepository struct{ pool *pgxpool.Pool }
+type RepairPostgresRepository struct {
+	pool      *pgxpool.Pool
+	finishRun func(context.Context, string) error
+}
 
 type repairHistoryQuerier interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
@@ -21,7 +24,12 @@ func NewRepairPostgresRepository(pool *pgxpool.Pool) (*RepairPostgresRepository,
 	if pool == nil {
 		return nil, errors.New("repair database is required")
 	}
-	return &RepairPostgresRepository{pool: pool}, nil
+	repository := &RepairPostgresRepository{pool: pool}
+	repository.finishRun = func(ctx context.Context, runID string) error {
+		_, err := pool.Exec(ctx, `SELECT nmcp_finish_repair_run($1)`, runID)
+		return err
+	}
+	return repository, nil
 }
 
 func (repository *RepairPostgresRepository) ReadFindings(ctx context.Context, reportID string) ([]RepairFinding, error) {
@@ -346,7 +354,7 @@ func (repository *RepairPostgresRepository) ConfirmHistory(ctx context.Context, 
 }
 
 func (repository *RepairPostgresRepository) Finish(ctx context.Context, runID string) (RepairExecutionResult, error) {
-	_, finishErr := repository.pool.Exec(ctx, `SELECT nmcp_finish_repair_run($1)`, runID)
+	finishErr := repository.finishRun(ctx, runID)
 	var run RepairRun
 	var err error
 	if finishErr == nil {
@@ -361,7 +369,7 @@ func (repository *RepairPostgresRepository) Finish(ctx context.Context, runID st
 			run = confirmed
 		} else {
 			replayCtx, replayCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_, replayErr := repository.pool.Exec(replayCtx, `SELECT nmcp_finish_repair_run($1)`, runID)
+			replayErr := repository.finishRun(replayCtx, runID)
 			replayCancel()
 			finalCtx, finalCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			finalRun, finalErr := repository.confirmRunOutcome(finalCtx, runID)

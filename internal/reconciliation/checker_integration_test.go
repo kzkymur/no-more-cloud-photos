@@ -903,11 +903,28 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cancelledFinish, cancelFinish := context.WithCancel(ctx)
-	cancelFinish()
-	finished, err := repairRepository.Finish(cancelledFinish, runID)
+	originalFinish := repairRepository.finishRun
+	finishCalls := 0
+	repairRepository.finishRun = func(finishCtx context.Context, requestedRunID string) error {
+		finishCalls++
+		if finishCalls == 1 {
+			return errors.New("finish query not reached")
+		}
+		if err := originalFinish(finishCtx, requestedRunID); err != nil {
+			return err
+		}
+		return errors.New("finish commit response lost")
+	}
+	finished, err := repairRepository.Finish(ctx, runID)
 	if err != nil || finished.Result != "succeeded" || finished.Quarantined != 1 {
-		t.Fatalf("finish exact replay after pre-execution cancellation = %+v, %v", finished, err)
+		t.Fatalf("finish replay with committed response loss = %+v, %v", finished, err)
+	}
+	if finishCalls != 2 {
+		t.Fatalf("finish operation calls = %d, want initial failure plus exact replay", finishCalls)
+	}
+	var resultRows int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM reconciliation_repair_results WHERE run_id=$1 AND result='succeeded' AND manifest_count=1 AND quarantined_count=1`, runID).Scan(&resultRows); err != nil || resultRows != 1 {
+		t.Fatalf("finish response-loss durable result rows = %d, %v", resultRows, err)
 	}
 	if err := os.WriteFile(destination, []byte("mismatch"), 0o600); err != nil {
 		t.Fatal(err)

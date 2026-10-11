@@ -36,6 +36,12 @@ func TestRepairIntegrationCheckerDryRunApplyChecker(t *testing.T) {
 	root := t.TempDir()
 	var denyRename atomic.Int32
 	store, err := storage.Open(root, storage.Options{Faults: storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+		if denyRename.Load() == 5 && event.Boundary == storage.BoundaryRepairSourceOpen && event.Phase == storage.Before {
+			return unix.EIO
+		}
+		if denyRename.Load() == 6 && event.Boundary == storage.BoundaryRepairSourceDescriptorStat && event.Phase == storage.Before {
+			return unix.EMFILE
+		}
 		if event.Boundary == storage.BoundaryRepairRename && event.Phase == storage.Before {
 			switch denyRename.Load() {
 			case 1:
@@ -174,7 +180,7 @@ func TestRepairIntegrationCheckerDryRunApplyChecker(t *testing.T) {
 		"ffffffff-ffff-4fff-8fff-ffffffffffff", attemptID); err == nil {
 		t.Fatal("applying event committed without a same-transaction convergence boundary")
 	}
-	for code := int32(1); code <= 4; code++ {
+	for code := int32(1); code <= 6; code++ {
 		denyRename.Store(code)
 		if _, err := repairer.Execute(ctx, plan.Run.RunID); !errors.Is(err, ErrRepairRetryable) {
 			t.Fatalf("storage failure %d Execute() error = %v, want retryable", code, err)
@@ -216,7 +222,7 @@ func TestRepairIntegrationCheckerDryRunApplyChecker(t *testing.T) {
 		}
 	}
 	pagedHistory, err := repairRepository.ReadHistory(ctx, plan.Items[0].ItemID)
-	if err != nil || len(pagedHistory) != 1015 {
+	if err != nil || len(pagedHistory) != 1021 {
 		t.Fatalf("paged history length = %d, %v", len(pagedHistory), err)
 	}
 	if pagedHistory[len(pagedHistory)-1].EventType != "failed" {

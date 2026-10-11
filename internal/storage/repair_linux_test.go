@@ -411,6 +411,147 @@ func TestRepairPostRevalidationCancellationRemainsCancelled(t *testing.T) {
 	assertRepairCause(t, err, RepairCauseCancelled)
 }
 
+func TestRepairLaterSourceOperationalFailuresRemainRetryable(t *testing.T) {
+	t.Run("inspect open read only", func(t *testing.T) {
+		root := t.TempDir()
+		inject := false
+		store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+			if inject && event.Boundary == BoundaryRepairSourceOpen && event.Phase == Before {
+				return unix.EROFS
+			}
+			return nil
+		})})
+		key, destination := testOriginalKey(t), testQuarantineKey(t)
+		payload := []byte("inspect-open")
+		publishTestObject(t, store, key, payload)
+		expectation := repairTestExpectation(t, root, key.String(), payload)
+		inject = true
+		_, _, err := store.BeginRepairOriginal(context.Background(), key, destination, expectation)
+		assertRepairCause(t, err, RepairCauseReadOnly)
+	})
+
+	t.Run("inspect descriptor stat io", func(t *testing.T) {
+		root := t.TempDir()
+		store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+			if event.Boundary == BoundaryRepairSourceDescriptorStat && event.Phase == Before {
+				return unix.EIO
+			}
+			return nil
+		})})
+		key, destination := testOriginalKey(t), testQuarantineKey(t)
+		payload := []byte("inspect-descriptor-stat")
+		publishTestObject(t, store, key, payload)
+		_, _, err := store.BeginRepairOriginal(context.Background(), key, destination, repairTestExpectation(t, root, key.String(), payload))
+		assertRepairCause(t, err, RepairCauseInternal)
+	})
+
+	t.Run("revalidate open permission", func(t *testing.T) {
+		root := t.TempDir()
+		failOpen := false
+		store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+			if failOpen && event.Boundary == BoundaryRepairSourceOpen && event.Phase == Before {
+				return unix.EACCES
+			}
+			return nil
+		})})
+		key, destination := testOriginalKey(t), testQuarantineKey(t)
+		payload := []byte("revalidate-open")
+		publishTestObject(t, store, key, payload)
+		operation, _, err := store.BeginRepairOriginal(context.Background(), key, destination, repairTestExpectation(t, root, key.String(), payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer operation.Close()
+		failOpen = true
+		_, err = operation.Revalidate(context.Background())
+		assertRepairCause(t, err, RepairCausePermission)
+	})
+
+	t.Run("final open descriptor exhaustion", func(t *testing.T) {
+		root := t.TempDir()
+		failOpen := false
+		store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+			if failOpen && event.Boundary == BoundaryRepairSourceOpen && event.Phase == Before {
+				return unix.EMFILE
+			}
+			return nil
+		})})
+		key, destination := testOriginalKey(t), testQuarantineKey(t)
+		payload := []byte("final-open")
+		publishTestObject(t, store, key, payload)
+		operation, _, err := store.BeginRepairOriginal(context.Background(), key, destination, repairTestExpectation(t, root, key.String(), payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer operation.Close()
+		if _, err = operation.Revalidate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		failOpen = true
+		_, err = operation.Rename(context.Background())
+		assertRepairCause(t, err, RepairCauseInternal)
+	})
+
+	t.Run("final descriptor stat io", func(t *testing.T) {
+		root := t.TempDir()
+		failStat := false
+		store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+			if failStat && event.Boundary == BoundaryRepairSourceDescriptorStat && event.Phase == Before {
+				return unix.EIO
+			}
+			return nil
+		})})
+		key, destination := testOriginalKey(t), testQuarantineKey(t)
+		payload := []byte("final-descriptor-stat")
+		publishTestObject(t, store, key, payload)
+		operation, _, err := store.BeginRepairOriginal(context.Background(), key, destination, repairTestExpectation(t, root, key.String(), payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer operation.Close()
+		if _, err = operation.Revalidate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		failStat = true
+		_, err = operation.Rename(context.Background())
+		assertRepairCause(t, err, RepairCauseInternal)
+	})
+
+	for _, test := range []struct {
+		name     string
+		boundary Boundary
+		fault    error
+		want     RepairCause
+	}{
+		{name: "descriptor stat io", boundary: BoundaryRepairSourceDescriptorStat, fault: unix.EIO, want: RepairCauseInternal},
+		{name: "leaf stat permission", boundary: BoundaryRepairSourceLeafStat, fault: unix.EACCES, want: RepairCausePermission},
+		{name: "leaf stat stale is retryable", boundary: BoundaryRepairSourceLeafStat, fault: unix.ESTALE, want: RepairCauseInternal},
+		{name: "leaf stat absence is changed", boundary: BoundaryRepairSourceLeafStat, fault: unix.ENOENT, want: RepairCauseSourceChanged},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			failStat := false
+			store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+				if failStat && event.Boundary == test.boundary && event.Phase == Before {
+					return test.fault
+				}
+				return nil
+			})})
+			key, destination := testOriginalKey(t), testQuarantineKey(t)
+			payload := []byte("post-hash-stat")
+			publishTestObject(t, store, key, payload)
+			operation, _, err := store.BeginRepairOriginal(context.Background(), key, destination, repairTestExpectation(t, root, key.String(), payload))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer operation.Close()
+			failStat = true
+			_, err = operation.Revalidate(context.Background())
+			assertRepairCause(t, err, test.want)
+		})
+	}
+}
+
 func TestRepairRejectsCanonicalNamespaceReplacementAndPreRenameCancellation(t *testing.T) {
 	t.Run("dry run preserves source access time", func(t *testing.T) {
 		root := t.TempDir()
