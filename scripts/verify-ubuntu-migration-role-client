@@ -166,6 +166,25 @@ def command_path(name):
     record_counter(name + ".attempted")
 
 
+def parse_unit_properties(result, requested):
+    if result.returncode:
+        fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+    if not result.stdout:
+        fail("systemctl show returned empty output")
+    values = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in values:
+            fail(f"systemctl show returned malformed output: {line!r}")
+        values[key] = value
+    if values.get("LoadState") == "not-found":
+        return values
+    missing = [name for name in requested if name not in values]
+    if missing:
+        fail(f"systemctl show omitted required properties: {', '.join(missing)}")
+    return values
+
+
 def unit_properties(*names, context="show"):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
     deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
@@ -179,19 +198,7 @@ def unit_properties(*names, context="show"):
             result = command(("/usr/bin/systemctl", "show", UNIT,
                               *(f"--property={name}" for name in requested)), check=False,
                              timeout=remaining)
-            if result.returncode:
-                fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
-            if not result.stdout:
-                fail("systemctl show returned empty output")
-            values = {}
-            for line in result.stdout.splitlines():
-                key, separator, value = line.partition("=")
-                if not separator or not key or key in values:
-                    fail(f"systemctl show returned malformed output: {line!r}")
-                values[key] = value
-            missing = [name for name in requested if name not in values]
-            if missing:
-                fail(f"systemctl show omitted required properties: {', '.join(missing)}")
+            values = parse_unit_properties(result, requested)
             if errors:
                 RECOVERED_ERRORS.extend(errors)
             return values

@@ -696,6 +696,24 @@ def validate_client(source: str) -> None:
             raise RuntimeError("absolute client cleanup deadline exhausted") from error
         raise
 ''', "client subprocesses must remain bounded by the absolute budget")
+    require_exact_function(tree, "parse_unit_properties", '''def parse_unit_properties(result, requested):
+    if result.returncode:
+        fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+    if not result.stdout:
+        fail("systemctl show returned empty output")
+    values = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in values:
+            fail(f"systemctl show returned malformed output: {line!r}")
+        values[key] = value
+    if values.get("LoadState") == "not-found":
+        return values
+    missing = [name for name in requested if name not in values]
+    if missing:
+        fail(f"systemctl show omitted required properties: {', '.join(missing)}")
+    return values
+''', "client property parser must completely parse explicit absence and full loaded identity")
     require_exact_function(tree, "unit_properties", '''def unit_properties(*names, context="show"):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
     deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
@@ -709,19 +727,7 @@ def validate_client(source: str) -> None:
             result = command(("/usr/bin/systemctl", "show", UNIT,
                               *(f"--property={name}" for name in requested)), check=False,
                              timeout=remaining)
-            if result.returncode:
-                fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
-            if not result.stdout:
-                fail("systemctl show returned empty output")
-            values = {}
-            for line in result.stdout.splitlines():
-                key, separator, value = line.partition("=")
-                if not separator or not key or key in values:
-                    fail(f"systemctl show returned malformed output: {line!r}")
-                values[key] = value
-            missing = [name for name in requested if name not in values]
-            if missing:
-                fail(f"systemctl show omitted required properties: {', '.join(missing)}")
+            values = parse_unit_properties(result, requested)
             if errors:
                 RECOVERED_ERRORS.extend(errors)
             return values
@@ -1617,6 +1623,24 @@ def validate_containment(source: str, phase: str) -> None:
     kwargs.setdefault("timeout", 18 * 60)
     return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)
 ''', "containment subprocesses must have a bounded default wait")
+    require_exact_function(tree, "parse_unit_properties", '''def parse_unit_properties(result, requested):
+    if result.returncode:
+        fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+    if not result.stdout:
+        fail("containment systemctl show returned empty output")
+    values = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in values:
+            fail(f"containment systemctl show returned malformed output: {line!r}")
+        values[key] = value
+    if values.get("LoadState") == "not-found":
+        return values
+    missing = [name for name in requested if name not in values]
+    if missing:
+        fail(f"containment systemctl show omitted required properties: {', '.join(missing)}")
+    return values
+''', "containment property parser must completely parse explicit absence and full loaded identity")
     require_exact_function(tree, "show", '''def show(*properties):
     requested = tuple(dict.fromkeys(("LoadState", *properties)))
     errors = []
@@ -1625,19 +1649,7 @@ def validate_containment(source: str, phase: str) -> None:
             result = run(("/usr/bin/systemctl", "show", UNIT,
                           *(f"--property={item}" for item in requested)), check=False,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
-            if result.returncode:
-                fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")
-            if not result.stdout:
-                fail("containment systemctl show returned empty output")
-            values = {}
-            for line in result.stdout.splitlines():
-                key, separator, value = line.partition("=")
-                if not separator or not key or key in values:
-                    fail(f"containment systemctl show returned malformed output: {line!r}")
-                values[key] = value
-            missing = [name for name in requested if name not in values]
-            if missing:
-                fail(f"containment systemctl show omitted required properties: {', '.join(missing)}")
+            values = parse_unit_properties(result, requested)
             return values
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             errors.append(error)
@@ -1647,6 +1659,49 @@ def validate_containment(source: str, phase: str) -> None:
 ''', "containment property reads must fail closed with bounded retry")
     require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
             "containment must not infer absence from an empty or failed property query")
+    require_exact_function(tree, "assert_property_parser_contract", '''def assert_property_parser_contract(client):
+    client_parser = runpy.run_path(client, run_name="nmcp_client_parser_fixture")[
+        "parse_unit_properties"
+    ]
+    requested = ("LoadState", "ExecStart")
+    minimal_absence = subprocess.CompletedProcess(
+        ("systemctl", "show"), 0, "LoadState=not-found\\n", ""
+    )
+    loaded_full = subprocess.CompletedProcess(
+        ("systemctl", "show"), 0,
+        "LoadState=loaded\\nExecStart={ path=/usr/bin/true ; argv[]=/usr/bin/true ; }\\n", ""
+    )
+    rejected = (
+        subprocess.CompletedProcess(("systemctl", "show"), 1, "", "not found"),
+        subprocess.CompletedProcess(("systemctl", "show"), 0, "", ""),
+        subprocess.CompletedProcess(("systemctl", "show"), 0, "LoadState=not-found\\nbroken\\n", ""),
+        subprocess.CompletedProcess(("systemctl", "show"), 0, "LoadState=loaded\\n", ""),
+    )
+    for parser_name, parser in (("client", client_parser), ("containment", parse_unit_properties)):
+        absent = parser(minimal_absence, requested)
+        if absent != {"LoadState": "not-found"}:
+            fail(f"{parser_name} parser did not accept exact minimal explicit absence")
+        loaded = parser(loaded_full, requested)
+        if loaded.get("LoadState") != "loaded" or "ExecStart" not in loaded:
+            fail(f"{parser_name} parser lost complete loaded identity")
+        for result in rejected:
+            try:
+                parser(result, requested)
+            except RuntimeError:
+                pass
+            else:
+                fail(f"{parser_name} parser accepted unknown or incomplete unit state")
+        transition = iter((loaded_full, minimal_absence))
+        if parser(next(transition), requested).get("LoadState") != "loaded":
+            fail(f"{parser_name} parser lost transitional loaded state")
+        if parser(next(transition), requested).get("LoadState") != "not-found":
+            fail(f"{parser_name} parser did not complete on minimal transitional absence")
+''', "containment parser fixture must causally exercise both live parsers")
+    runpy_imports = [
+        node for node in tree.body if isinstance(node, ast.Import)
+        and [(alias.name, alias.asname) for alias in node.names] == [("runpy", None)]
+    ]
+    require(len(runpy_imports) == 1, "containment parser fixture must import runpy exactly once")
     require_exact_function(tree, "assert_client_lock_reusable", '''def assert_client_lock_reusable():
     descriptor = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
     try:
@@ -1890,6 +1945,23 @@ def validate_containment(source: str, phase: str) -> None:
             and source.count('("after-intent", "after-mkdir", "after-open", "after-register")') == 2,
             "containment causal death/overlap/lock/recovery/fault contract changed")
     main_node = named_function(tree, "main")
+    argument_assignments = [
+        node for node in main_node.body
+        if ast.dump(node) == ast.dump(ast.parse(
+            "client, repo, commit, go_binary = sys.argv[1:]"
+        ).body[0])
+    ]
+    parser_contract_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "assert_property_parser_contract"
+    ]
+    expected_parser_contract_call = ast.parse(
+        "assert_property_parser_contract(client)"
+    ).body[0]
+    require(len(argument_assignments) == 1 and len(parser_contract_calls) == 1
+            and ast.dump(main_node.body[main_node.body.index(argument_assignments[0]) + 1])
+            == ast.dump(expected_parser_contract_call),
+            "containment parser fixture must run exactly once immediately after argument parsing")
     budget_loops = [
         node for node in ast.walk(main_node) if isinstance(node, ast.For)
         and isinstance(node.target, ast.Name) and node.target.id == "budget_boundary"
@@ -2697,17 +2769,23 @@ def verify_supervisor_mutations(
         ("no retained result", replace_once(client, '"--property=RemainAfterExit=yes"', '"--property=RemainAfterExit=no"')),
         ("supervisor not exact commit", replace_once(client, '"show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"', '"show", "HEAD:scripts/verify-ubuntu-migration-role-supervisor"')),
         ("property nonzero treated as absent", replace_once(client,
-            '            if result.returncode:\n                fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
-            '            if result.returncode:\n                return {"LoadState": "not-found"}')),
+            '    if result.returncode:\n        fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
+            '    if result.returncode:\n        return {"LoadState": "not-found"}')),
         ("empty property result accepted", replace_once(client,
-            '            if not result.stdout:\n                fail("systemctl show returned empty output")',
-            '            if not result.stdout:\n                return {"LoadState": "not-found"}')),
+            '    if not result.stdout:\n        fail("systemctl show returned empty output")',
+            '    if not result.stdout:\n        return {"LoadState": "not-found"}')),
         ("duplicate property accepted", replace_once(client,
-            '                if not separator or not key or key in values:',
-            '                if not separator or not key:')),
-        ("missing property accepted", replace_once(client,
-            '            if missing:\n                fail(f"systemctl show omitted required properties: {\', \'.join(missing)}")',
-            '            if False:\n                pass')),
+            '        if not separator or not key or key in values:',
+            '        if not separator or not key:')),
+        ("loaded missing property accepted", replace_once(client,
+            '    if missing:\n        fail(f"systemctl show omitted required properties: {\', \'.join(missing)}")',
+            '    if False:\n        pass')),
+        ("missing checked before explicit absence", replace_once(client,
+            '    if values.get("LoadState") == "not-found":\n        return values\n    missing = [name for name in requested if name not in values]\n    if missing:\n        fail(f"systemctl show omitted required properties: {\', \'.join(missing)}")',
+            '    missing = [name for name in requested if name not in values]\n    if missing:\n        fail(f"systemctl show omitted required properties: {\', \'.join(missing)}")\n    if values.get("LoadState") == "not-found":\n        return values')),
+        ("unit properties bypass parser", replace_once(client,
+            '            values = parse_unit_properties(result, requested)',
+            '            values = {"LoadState": "not-found"}')),
         ("property retries unbounded", replace_once(client, 'PROPERTY_RETRIES = 4', 'PROPERTY_RETRIES = 400')),
         ("property retry budget unbounded", replace_once(client, 'PROPERTY_RETRY_BUDGET = 3.0', 'PROPERTY_RETRY_BUDGET = 300.0')),
         ("client total budget changed", replace_once(client,
@@ -3087,17 +3165,37 @@ def verify_supervisor_mutations(
         expect_rejected(validate_client, mutation, label, "client")
     containment_mutations = [
         ("containment nonzero show treated as absent", replace_once(containment,
-            '            if result.returncode:\n                fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
-            '            if result.returncode:\n                return {"LoadState": "not-found"}')),
+            '    if result.returncode:\n        fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
+            '    if result.returncode:\n        return {"LoadState": "not-found"}')),
         ("containment empty show accepted", replace_once(containment,
-            '            if not result.stdout:\n                fail("containment systemctl show returned empty output")',
-            '            if not result.stdout:\n                return {"LoadState": "not-found"}')),
+            '    if not result.stdout:\n        fail("containment systemctl show returned empty output")',
+            '    if not result.stdout:\n        return {"LoadState": "not-found"}')),
         ("containment malformed show accepted", replace_once(containment,
-            '                if not separator or not key or key in values:',
-            '                if not separator:')),
-        ("containment missing show property accepted", replace_once(containment,
-            '            if missing:\n                fail(f"containment systemctl show omitted required properties: {\', \'.join(missing)}")',
-            '            if False:\n                pass')),
+            '        if not separator or not key or key in values:',
+            '        if not separator:')),
+        ("containment loaded missing property accepted", replace_once(containment,
+            '    if missing:\n        fail(f"containment systemctl show omitted required properties: {\', \'.join(missing)}")',
+            '    if False:\n        pass')),
+        ("containment missing checked before explicit absence", replace_once(containment,
+            '    if values.get("LoadState") == "not-found":\n        return values\n    missing = [name for name in requested if name not in values]\n    if missing:\n        fail(f"containment systemctl show omitted required properties: {\', \'.join(missing)}")',
+            '    missing = [name for name in requested if name not in values]\n    if missing:\n        fail(f"containment systemctl show omitted required properties: {\', \'.join(missing)}")\n    if values.get("LoadState") == "not-found":\n        return values')),
+        ("containment show bypasses parser", replace_once(containment,
+            '            values = parse_unit_properties(result, requested)',
+            '            values = {"LoadState": "not-found"}')),
+        ("parser fixture omits nonzero synthesis", replace_once(containment,
+            '        subprocess.CompletedProcess(("systemctl", "show"), 1, "", "not found"),\n', '')),
+        ("parser fixture omits empty synthesis", replace_once(containment,
+            '        subprocess.CompletedProcess(("systemctl", "show"), 0, "", ""),\n', '')),
+        ("parser fixture omits malformed synthesis", replace_once(containment,
+            '        subprocess.CompletedProcess(("systemctl", "show"), 0, "LoadState=not-found\\nbroken\\n", ""),\n', '')),
+        ("parser fixture omits loaded-missing synthesis", replace_once(containment,
+            '        subprocess.CompletedProcess(("systemctl", "show"), 0, "LoadState=loaded\\n", ""),\n', '')),
+        ("parser fixture call is dead", replace_once(containment,
+            '    assert_property_parser_contract(client)',
+            '    if False:\n        assert_property_parser_contract(client)')),
+        ("parser fixture ignores client-only divergence", replace_once(containment,
+            '    client_parser = runpy.run_path(client, run_name="nmcp_client_parser_fixture")[\n        "parse_unit_properties"\n    ]',
+            '    client_parser = parse_unit_properties')),
         ("containment show retries omitted", replace_once(containment,
             '    for attempt in range(4):', '    for attempt in range(1):')),
         ("containment subprocess wait unbounded", replace_once(containment,

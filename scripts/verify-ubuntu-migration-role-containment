@@ -4,6 +4,7 @@
 import fcntl
 import json
 import os
+import runpy
 import secrets
 import shlex
 import signal
@@ -39,6 +40,25 @@ def run(argv, **kwargs):
     return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)
 
 
+def parse_unit_properties(result, requested):
+    if result.returncode:
+        fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+    if not result.stdout:
+        fail("containment systemctl show returned empty output")
+    values = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in values:
+            fail(f"containment systemctl show returned malformed output: {line!r}")
+        values[key] = value
+    if values.get("LoadState") == "not-found":
+        return values
+    missing = [name for name in requested if name not in values]
+    if missing:
+        fail(f"containment systemctl show omitted required properties: {', '.join(missing)}")
+    return values
+
+
 def show(*properties):
     requested = tuple(dict.fromkeys(("LoadState", *properties)))
     errors = []
@@ -47,25 +67,52 @@ def show(*properties):
             result = run(("/usr/bin/systemctl", "show", UNIT,
                           *(f"--property={item}" for item in requested)), check=False,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
-            if result.returncode:
-                fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")
-            if not result.stdout:
-                fail("containment systemctl show returned empty output")
-            values = {}
-            for line in result.stdout.splitlines():
-                key, separator, value = line.partition("=")
-                if not separator or not key or key in values:
-                    fail(f"containment systemctl show returned malformed output: {line!r}")
-                values[key] = value
-            missing = [name for name in requested if name not in values]
-            if missing:
-                fail(f"containment systemctl show omitted required properties: {', '.join(missing)}")
+            values = parse_unit_properties(result, requested)
             return values
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             errors.append(error)
             if attempt < 3:
                 time.sleep(0.05 * (2 ** attempt))
     fail("containment unit properties remain unknown: " + "; ".join(map(str, errors)))
+
+
+def assert_property_parser_contract(client):
+    client_parser = runpy.run_path(client, run_name="nmcp_client_parser_fixture")[
+        "parse_unit_properties"
+    ]
+    requested = ("LoadState", "ExecStart")
+    minimal_absence = subprocess.CompletedProcess(
+        ("systemctl", "show"), 0, "LoadState=not-found\n", ""
+    )
+    loaded_full = subprocess.CompletedProcess(
+        ("systemctl", "show"), 0,
+        "LoadState=loaded\nExecStart={ path=/usr/bin/true ; argv[]=/usr/bin/true ; }\n", ""
+    )
+    rejected = (
+        subprocess.CompletedProcess(("systemctl", "show"), 1, "", "not found"),
+        subprocess.CompletedProcess(("systemctl", "show"), 0, "", ""),
+        subprocess.CompletedProcess(("systemctl", "show"), 0, "LoadState=not-found\nbroken\n", ""),
+        subprocess.CompletedProcess(("systemctl", "show"), 0, "LoadState=loaded\n", ""),
+    )
+    for parser_name, parser in (("client", client_parser), ("containment", parse_unit_properties)):
+        absent = parser(minimal_absence, requested)
+        if absent != {"LoadState": "not-found"}:
+            fail(f"{parser_name} parser did not accept exact minimal explicit absence")
+        loaded = parser(loaded_full, requested)
+        if loaded.get("LoadState") != "loaded" or "ExecStart" not in loaded:
+            fail(f"{parser_name} parser lost complete loaded identity")
+        for result in rejected:
+            try:
+                parser(result, requested)
+            except RuntimeError:
+                pass
+            else:
+                fail(f"{parser_name} parser accepted unknown or incomplete unit state")
+        transition = iter((loaded_full, minimal_absence))
+        if parser(next(transition), requested).get("LoadState") != "loaded":
+            fail(f"{parser_name} parser lost transitional loaded state")
+        if parser(next(transition), requested).get("LoadState") != "not-found":
+            fail(f"{parser_name} parser did not complete on minimal transitional absence")
 
 
 def wait_path(path, timeout=900):
@@ -406,6 +453,7 @@ def main():
     if os.geteuid() != 0 or len(sys.argv) != 5:
         fail("usage: containment CLIENT REPOSITORY CURRENT_COMMIT ABSOLUTE_GO")
     client, repo, commit, go_binary = sys.argv[1:]
+    assert_property_parser_contract(client)
 
     # A stale loaded fixed name is never launch-ready merely because it is
     # failed and cgroup-empty. The new client must fail without touching it.
