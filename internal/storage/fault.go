@@ -31,6 +31,17 @@ const (
 	BoundaryQuarantineRename                   Boundary = "quarantine_rename"
 	BoundaryQuarantineSourceDirectorySync      Boundary = "quarantine_source_directory_sync"
 	BoundaryQuarantineDestinationDirectorySync Boundary = "quarantine_destination_directory_sync"
+	BoundaryRepairSourceHash                   Boundary = "repair_source_hash"
+	BoundaryRepairRevalidate                   Boundary = "repair_revalidate"
+	BoundaryRepairCanonicalRoot                Boundary = "repair_canonical_root"
+	BoundaryRepairCanonicalAncestor            Boundary = "repair_canonical_ancestor"
+	BoundaryRepairCanonicalQuarantine          Boundary = "repair_canonical_quarantine"
+	BoundaryRepairRename                       Boundary = "repair_rename"
+	BoundaryRepairRenameCommit                 Boundary = "repair_rename_commit"
+	BoundaryRepairSourceDirectorySync          Boundary = "repair_source_directory_sync"
+	BoundaryRepairDestinationDirectorySync     Boundary = "repair_destination_directory_sync"
+	BoundaryRepairDestinationHash              Boundary = "repair_destination_hash"
+	BoundaryRepairCanonicalVerify              Boundary = "repair_canonical_verify"
 )
 
 type Phase string

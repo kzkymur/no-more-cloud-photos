@@ -47,3 +47,50 @@ func (err *QuarantineError) Error() string {
 }
 
 func (err *QuarantineError) Unwrap() error { return err.cause }
+
+type RepairCause string
+
+const (
+	RepairCausePermission         RepairCause = "permission"
+	RepairCauseReadOnly           RepairCause = "read_only"
+	RepairCauseCrossDevice        RepairCause = "cross_device"
+	RepairCauseNoSpace            RepairCause = "no_space"
+	RepairCauseQuota              RepairCause = "quota"
+	RepairCauseCollision          RepairCause = "collision"
+	RepairCauseWrongType          RepairCause = "wrong_type"
+	RepairCauseSourceMissing      RepairCause = "source_missing"
+	RepairCauseSourceChanged      RepairCause = "source_changed"
+	RepairCauseSourceRestored     RepairCause = "source_restored"
+	RepairCauseManifestMismatch   RepairCause = "manifest_mismatch"
+	RepairCauseQuarantineMismatch RepairCause = "quarantine_mismatch"
+	RepairCauseNamespaceChanged   RepairCause = "namespace_changed"
+	RepairCauseDurability         RepairCause = "durability"
+	RepairCauseOutcomeUncertain   RepairCause = "outcome_uncertain"
+	RepairCauseCancelled          RepairCause = "cancelled"
+	RepairCauseInternal           RepairCause = "internal"
+)
+
+type RepairStage string
+
+const (
+	RepairStagePrepare         RepairStage = "prepare"
+	RepairStageHash            RepairStage = "hash"
+	RepairStageRevalidate      RepairStage = "revalidate"
+	RepairStageRename          RepairStage = "rename"
+	RepairStageSourceSync      RepairStage = "source_directory_fsync"
+	RepairStageDestinationSync RepairStage = "destination_directory_fsync"
+	RepairStageCanonicalVerify RepairStage = "canonical_destination_verify"
+)
+
+type RepairError struct {
+	Cause    RepairCause
+	Stage    RepairStage
+	Progress RepairProgress
+	Err      error
+}
+
+func (err *RepairError) Error() string {
+	return fmt.Sprintf("storage repair %s failed: %s", err.Stage, err.Cause)
+}
+
+func (err *RepairError) Unwrap() error { return err.Err }

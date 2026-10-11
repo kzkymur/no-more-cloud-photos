@@ -452,10 +452,15 @@ func classify(snapshot Snapshot, observations []storage.Observation, observedAt 
 		findings = append(findings, finding)
 	}
 	for path, reference := range quarantine {
-		if seen[path] || pointerValue(reference.ExpectedState) != "quarantined" {
+		state := pointerValue(reference.ExpectedState)
+		if seen[path] || state != "quarantined" && state != "possible_quarantine" {
 			continue
 		}
-		finding := findingFromReference(reference, "quarantine_missing", "journaled_quarantine_absent", observedAt)
+		reason := "journaled_quarantine_absent"
+		if state == "possible_quarantine" {
+			reason = "possible_quarantine_absent"
+		}
+		finding := findingFromReference(reference, "quarantine_missing", reason, observedAt)
 		finding.ObservedType = "missing"
 		findings = append(findings, finding)
 	}

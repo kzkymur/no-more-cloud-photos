@@ -51,11 +51,13 @@ type Options struct {
 }
 
 type Store struct {
-	rootFD int
-	faults FaultInjector
-	ops    systemOperations
-	mu     sync.RWMutex
-	closed bool
+	rootFD       int
+	rootPath     string
+	rootIdentity repairNamespaceIdentity
+	faults       FaultInjector
+	ops          systemOperations
+	mu           sync.RWMutex
+	closed       bool
 }
 
 func Open(root string, options Options) (*Store, error) {
@@ -66,7 +68,12 @@ func Open(root string, options Options) (*Store, error) {
 	if err != nil {
 		return nil, classifyError("open root", err)
 	}
-	return &Store{rootFD: fd, faults: options.Faults, ops: linuxOperations}, nil
+	identity, err := repairIdentityAt(fd, "", unix.AT_EMPTY_PATH)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, classifyError("stat root", err)
+	}
+	return &Store{rootFD: fd, rootPath: root, rootIdentity: identity, faults: options.Faults, ops: linuxOperations}, nil
 }
 
 func openRootWithoutSymlinks(root string) (int, error) {
