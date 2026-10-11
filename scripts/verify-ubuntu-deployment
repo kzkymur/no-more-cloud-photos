@@ -122,6 +122,51 @@ def require_exact_function(tree: ast.Module, name: str, expected: str, message: 
     require(ast.dump(observed) == ast.dump(expected_node), message)
 
 
+def require_exact_assignment(tree: ast.Module, name: str, expected: str, message: str) -> None:
+    matches = [
+        node for node in tree.body if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == name
+    ]
+    expected_node = ast.parse(expected).body[0]
+    require(len(matches) == 1 and ast.dump(matches[0]) == ast.dump(expected_node), message)
+
+
+def constant_string(node: ast.AST):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = constant_string(node.left)
+        right = constant_string(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        if (isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+                and isinstance(node.right, ast.Constant) and type(node.right.value) is int):
+            return node.left.value * node.right.value
+        if (isinstance(node.right, ast.Constant) and isinstance(node.right.value, str)
+                and isinstance(node.left, ast.Constant) and type(node.left.value) is int):
+            return node.right.value * node.left.value
+    if isinstance(node, ast.JoinedStr):
+        values = [constant_string(value) for value in node.values]
+        return "".join(values) if all(value is not None for value in values) else None
+    if (isinstance(node, ast.FormattedValue) and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, (str, int)) and node.format_spec is None):
+        if node.conversion in (-1, ord("s")):
+            return str(node.value.value)
+        if node.conversion == ord("r"):
+            return repr(node.value.value)
+        if node.conversion == ord("a"):
+            return ascii(node.value.value)
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join" and not node.keywords and len(node.args) == 1
+            and isinstance(node.args[0], (ast.Tuple, ast.List))):
+        separator = constant_string(node.func.value)
+        values = [constant_string(item) for item in node.args[0].elts]
+        return separator.join(values) if separator is not None and all(
+            value is not None for value in values
+        ) else None
+    return None
+
+
 def validate_runtime_helper(source: str) -> None:
     require(source.startswith("#!/usr/bin/env bash\nset -euo pipefail\numask 0077\n"),
             "runtime helper preamble changed")
@@ -522,6 +567,15 @@ def validate_client(source: str) -> None:
     require(literal_assignment(tree, "PROPERTY_RETRIES") == 4
             and literal_assignment(tree, "PROPERTY_RETRY_BUDGET") == 3.0,
             "client property retry bounds changed")
+    require_exact_assignment(tree, "TOTAL_BUDGET", "TOTAL_BUDGET = 17 * 60",
+                             "client fixed total budget changed")
+    require_exact_assignment(tree, "CLEANUP_RESERVE", "CLEANUP_RESERVE = 3 * 60",
+                             "client exclusive cleanup reserve changed")
+    require(literal_assignment(tree, "WORK_BUDGET_FAULT_SECONDS") == 1.0
+            and literal_assignment(tree, "WORK_BUDGET_MODES") == {
+                "client-work-budget-launch", "client-work-budget-service",
+                "client-work-budget-journal",
+            }, "client accelerated work-budget modes changed")
     cancellation_assignments = [
         node for node in tree.body if isinstance(node, ast.Assign)
         and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
@@ -648,6 +702,15 @@ def validate_client(source: str) -> None:
     finally:
         os.close(directory)
 ''', "client attempting/acquired markers must be durably fsynced")
+    require_exact_function(tree, "exhaust_work_budget", '''def exhaust_work_budget(boundary):
+    global COMMAND_DEADLINE
+    COMMAND_DEADLINE = min(COMMAND_DEADLINE,
+                           time.monotonic() + WORK_BUDGET_FAULT_SECONDS)
+    durable_marker(f"client-work-budget-{boundary}.ready")
+    while time.monotonic() < COMMAND_DEADLINE:
+        time.sleep(min(0.05, max(0, COMMAND_DEADLINE - time.monotonic())))
+    fail(f"absolute client work budget exhausted at {boundary}")
+''', "client accelerated work-budget exhaustion marker/deadline changed")
     require_exact_function(tree, "valid_invocation", '''def valid_invocation(value):
     return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 ''', "client exact InvocationID validator changed")
@@ -688,7 +751,10 @@ def validate_client(source: str) -> None:
         'signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)',
         'launch_attempted = False',
         'launch_attempted = True',
-        'COMMAND_DEADLINE = time.monotonic() + 17 * 60',
+        'total_deadline = time.monotonic() + TOTAL_BUDGET',
+        'work_deadline = total_deadline - CLEANUP_RESERVE',
+        'COMMAND_DEADLINE = work_deadline',
+        'COMMAND_DEADLINE = total_deadline',
         'discovered = launch_state(context="recovery")',
         'except BaseException as error:\n            primary_error = error',
         'f"launched unit has no safe nonce-bound identity: {discovered}"',
@@ -726,6 +792,8 @@ elif (requested_mode.startswith("client-cleanup-fault-")
         supervisor_mode = "fast-success"
     else:
         supervisor_mode = "fast-fail"
+elif requested_mode in WORK_BUDGET_MODES:
+    supervisor_mode = "fast-success" if requested_mode.endswith("-journal") else "fast-hold"
 elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
     supervisor_mode = "run-root:after-intent"
 ''').body
@@ -751,7 +819,9 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
     ordered_lock_fragments = (
         'durable_marker("client-terminal-race-b.attempting")',
         "fcntl.flock(client_lock, fcntl.LOCK_EX)",
-        "COMMAND_DEADLINE = time.monotonic() + 17 * 60",
+        "total_deadline = time.monotonic() + TOTAL_BUDGET",
+        "work_deadline = total_deadline - CLEANUP_RESERVE",
+        "COMMAND_DEADLINE = work_deadline",
         'durable_marker("client-terminal-race-b.acquired")',
         "nonce = secrets.token_hex(32)",
         "publish_supervisor(repo, commit)",
@@ -792,6 +862,21 @@ if occupants:
             and [ast.dump(node) for node in lock_try.body[prelaunch_starts[0]:prelaunch_starts[0] + 4]]
             == [ast.dump(node) for node in expected_prelaunch],
             "client prelaunch must reject every state except explicit not-found in live lock-held flow")
+    total_deadline_starts = [
+        index for index, node in enumerate(lock_try.body)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "total_deadline"
+    ]
+    expected_deadlines = ast.parse('''total_deadline = time.monotonic() + TOTAL_BUDGET
+work_deadline = total_deadline - CLEANUP_RESERVE
+COMMAND_DEADLINE = work_deadline
+''').body
+    require(len(total_deadline_starts) == 1
+            and [ast.dump(node) for node in lock_try.body[
+                total_deadline_starts[0]:total_deadline_starts[0] + 3
+            ]] == [ast.dump(node) for node in expected_deadlines]
+            and total_deadline_starts[0] < prelaunch_starts[0],
+            "client lock-held work deadline must reserve cleanup before prelaunch")
     require(source.count("secrets.token_hex(32)") == 1,
             "client must generate exactly one cryptographic 64-hex nonce")
 
@@ -808,6 +893,14 @@ if occupants:
     ]
     require(len(launch_tries) == 1, "client needs one encompassing post-launch try/finally")
     launch_try = launch_tries[0]
+    launch_index = lock_try.body.index(launch_try)
+    prelaunch_deadline_region = lock_try.body[
+        total_deadline_starts[0] + len(expected_deadlines):launch_index
+    ]
+    require(not any(
+        isinstance(node, ast.Name) and node.id == "COMMAND_DEADLINE"
+        for statement in prelaunch_deadline_region for node in ast.walk(statement)
+    ), "client prelaunch region must not read, alias, reset, or remove the work deadline")
     signal_tries = [
         node for node in launch_try.body
         if isinstance(node, ast.Try) and launch_assignments[0] in ast.walk(node)
@@ -821,6 +914,8 @@ if occupants:
 try:
     launch_attempted = True
     launched = command(service_argv, check=False)
+    if requested_mode == "client-work-budget-launch":
+        exhaust_work_budget("launch")
     capture_error = None
     try:
         observed = launch_state(context="immediate")
@@ -857,6 +952,7 @@ except BaseException as error:
     expected_finally = ast.parse('''try:
     pass
 finally:
+    COMMAND_DEADLINE = total_deadline
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
     try:
         if launch_attempted and invocation is None:
@@ -881,6 +977,9 @@ finally:
                 cleanup_errors.append(error)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    if requested_mode in WORK_BUDGET_MODES:
+        client_pause(requested_mode + "-unloaded")
+    COMMAND_DEADLINE = work_deadline
     if CANCELLED:
         cancellation = RuntimeError(f"verification client cancelled by signal {CANCELLED[0]}")
         if primary_error is None:
@@ -895,6 +994,219 @@ finally:
             and [ast.dump(node) for node in launch_try.finalbody]
             == [ast.dump(node) for node in expected_finally],
             "client post-launch failures must aggregate owned teardown errors")
+    require(ast.dump(launch_try.finalbody[0]) == ast.dump(
+                ast.parse("COMMAND_DEADLINE = total_deadline").body[0])
+            and ast.dump(launch_try.finalbody[3]) == ast.dump(
+                ast.parse('''if requested_mode in WORK_BUDGET_MODES:
+    client_pause(requested_mode + "-unloaded")
+''').body[0])
+            and ast.dump(launch_try.finalbody[4]) == ast.dump(
+                ast.parse("COMMAND_DEADLINE = work_deadline").body[0]),
+            "client cleanup reserve must encompass only signal-blocked owned teardown")
+    deadline_assignments = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+        and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "COMMAND_DEADLINE"
+    ]
+    top_deadline_assignments = [node for node in tree.body if node in deadline_assignments]
+    exhaust_node = named_function(tree, "exhaust_work_budget")
+    exhaust_deadline_assignments = [
+        node for node in ast.walk(exhaust_node) if node in deadline_assignments
+    ]
+    require(len(top_deadline_assignments) == 1 and len(exhaust_deadline_assignments) == 1,
+            "client COMMAND_DEADLINE initialization/helper assignment changed")
+    expected_deadline_assignments = (
+        *top_deadline_assignments,
+        *exhaust_deadline_assignments,
+        lock_try.body[total_deadline_starts[0] + 2],
+        launch_try.finalbody[0],
+        launch_try.finalbody[4],
+    )
+    deadline_stores_or_deletes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Name)
+        and node.id == "COMMAND_DEADLINE" and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    expected_deadline_targets = [node.targets[0] for node in expected_deadline_assignments]
+    exact_deadline_function_names = [
+        node for function_name in ("bounded_deadline", "command", "exhaust_work_budget")
+        for node in ast.walk(named_function(tree, function_name))
+        if isinstance(node, ast.Name) and node.id == "COMMAND_DEADLINE"
+    ]
+    expected_deadline_names = [
+        top_deadline_assignments[0].targets[0],
+        *exact_deadline_function_names,
+        lock_try.body[total_deadline_starts[0] + 2].targets[0],
+        launch_try.finalbody[0].targets[0],
+        launch_try.finalbody[4].targets[0],
+    ]
+    all_deadline_names = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == "COMMAND_DEADLINE"
+    ]
+    indirect_deadline_mutations = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "COMMAND_DEADLINE"
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+        or isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del))
+        and constant_string(node.slice) == "COMMAND_DEADLINE"
+    ]
+    deadline_globals = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Global) and "COMMAND_DEADLINE" in node.names
+    ]
+    expected_globals = {
+        ast.dump(ast.parse("global COMMAND_DEADLINE").body[0]),
+        ast.dump(ast.parse("global COMMAND_DEADLINE, REQUESTED_MODE").body[0]),
+    }
+    forbidden_reflection = {
+        "eval", "exec", "compile", "getattr", "setattr", "delattr",
+        "globals", "locals", "vars", "__import__",
+    }
+    reflection_nodes = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and node.id in forbidden_reflection | {"importlib", "builtins", "__builtins__"}
+        or isinstance(node, ast.Attribute)
+        and node.attr in forbidden_reflection | {"__dict__", "importlib", "builtins"}
+        or isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+        and node.value.id == "sys" and node.attr == "modules"
+        or isinstance(node, ast.Import)
+        and any(alias.name.split(".", 1)[0] in {"importlib", "builtins"} for alias in node.names)
+        or isinstance(node, ast.ImportFrom)
+        and (node.module or "").split(".", 1)[0] in {"importlib", "builtins"}
+    ]
+    computed_deadline_strings = [
+        node for node in ast.walk(tree)
+        if constant_string(node) is not None
+        and "COMMAND_DEADLINE" in constant_string(node)
+    ]
+    require(len(top_deadline_assignments) == 1
+            and ast.dump(top_deadline_assignments[0])
+            == ast.dump(ast.parse("COMMAND_DEADLINE = None").body[0])
+            and len(exhaust_deadline_assignments) == 1
+            and len(deadline_assignments) == len(expected_deadline_assignments) == 5
+            and all(any(node is expected for expected in expected_deadline_targets)
+                    for node in deadline_stores_or_deletes)
+            and len(deadline_stores_or_deletes) == len(expected_deadline_targets)
+            and len(all_deadline_names) == len(expected_deadline_names)
+            and all(any(node is expected for expected in expected_deadline_names)
+                    for node in all_deadline_names)
+            and not indirect_deadline_mutations
+            and {ast.dump(node) for node in deadline_globals} == expected_globals
+            and len(deadline_globals) == 2
+            and not reflection_nodes
+            and not computed_deadline_strings,
+            "client COMMAND_DEADLINE mutation surface exceeds the reviewed assignments")
+    budget_constants = {
+        "PROPERTY_RETRY_BUDGET", "TOTAL_BUDGET", "CLEANUP_RESERVE",
+        "WORK_BUDGET_FAULT_SECONDS", "WORK_BUDGET_MODES",
+    }
+    budget_state = budget_constants | {"total_deadline", "work_deadline", "COMMAND_DEADLINE"}
+    module_budget_assignments = {}
+    for name in budget_constants:
+        matches = [
+            node for node in tree.body if isinstance(node, ast.Assign)
+            and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        ]
+        require(len(matches) == 1, f"client must define budget constant {name} exactly once")
+        module_budget_assignments[name] = matches[0]
+    total_assignment = lock_try.body[total_deadline_starts[0]]
+    work_assignment = lock_try.body[total_deadline_starts[0] + 1]
+    exact_budget_regions = (
+        total_assignment, work_assignment,
+        named_function(tree, "unit_properties"), exhaust_node,
+        *main_node.body[routing_starts[0]:routing_starts[0] + 2],
+        launch_try.finalbody[3],
+    )
+    expected_constant_names = [
+        assignment.targets[0] for assignment in module_budget_assignments.values()
+    ] + [
+        node for region in exact_budget_regions for node in ast.walk(region)
+        if isinstance(node, ast.Name) and node.id in budget_constants
+    ]
+    observed_constant_names = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in budget_constants
+    ]
+    exact_local_budget_regions = (
+        total_assignment, work_assignment,
+        lock_try.body[total_deadline_starts[0] + 2],
+        launch_try.finalbody[0], launch_try.finalbody[4],
+    )
+    expected_local_budget_names = [
+        node for region in exact_local_budget_regions for node in ast.walk(region)
+        if isinstance(node, ast.Name) and node.id in {"total_deadline", "work_deadline"}
+    ]
+    observed_local_budget_names = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in {"total_deadline", "work_deadline"}
+    ]
+    expected_budget_targets = [
+        *[assignment.targets[0] for assignment in module_budget_assignments.values()],
+        total_assignment.targets[0], work_assignment.targets[0],
+        *expected_deadline_targets,
+    ]
+    observed_budget_stores_or_deletes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Name)
+        and node.id in budget_state and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    budget_scope_declarations = [
+        node for node in ast.walk(tree) if isinstance(node, (ast.Global, ast.Nonlocal))
+        and budget_state.intersection(node.names)
+    ]
+    budget_string_binders = []
+    for node in ast.walk(tree):
+        names = []
+        if isinstance(node, ast.arg):
+            names.append(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.append(node.name)
+        elif isinstance(node, ast.alias):
+            names.append(node.asname or node.name.split(".", 1)[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            names.append(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.append(node.rest)
+        if budget_state.intersection(names):
+            budget_string_binders.append(node)
+    require(len(observed_constant_names) == len(expected_constant_names)
+            and all(any(node is expected for expected in expected_constant_names)
+                    for node in observed_constant_names)
+            and len(observed_local_budget_names) == len(expected_local_budget_names)
+            and all(any(node is expected for expected in expected_local_budget_names)
+                    for node in observed_local_budget_names)
+            and len(observed_budget_stores_or_deletes) == len(expected_budget_targets)
+            and all(any(node is expected for expected in expected_budget_targets)
+                    for node in observed_budget_stores_or_deletes)
+            and len(budget_scope_declarations) == len(deadline_globals)
+            and all(any(node is expected for expected in deadline_globals)
+                    for node in budget_scope_declarations)
+            and not budget_string_binders,
+            "client budget state has an unreviewed assignment, alias, deletion, or rebind")
+    exhaust_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "exhaust_work_budget"
+    ]
+    expected_exhaust_guards = {
+        ast.dump(ast.parse(f'requested_mode == "client-work-budget-{boundary}"',
+                           mode="eval").body): boundary
+        for boundary in ("launch", "service", "journal")
+    }
+    observed_exhaust_guards = {}
+    for call in exhaust_calls:
+        parent = parents.get(call)
+        require(isinstance(parent, ast.Expr) and isinstance(parents.get(parent), ast.If),
+                "client work-budget exhaustion calls must be directly guarded")
+        guard = parents[parent]
+        require(len(guard.body) == 1 and guard.body[0] is parent and not guard.orelse
+                and len(call.args) == 1 and isinstance(call.args[0], ast.Constant),
+                "client work-budget exhaustion guard changed")
+        observed_exhaust_guards[ast.dump(guard.test)] = call.args[0].value
+    require(len(exhaust_calls) == 3 and observed_exhaust_guards == expected_exhaust_guards,
+            "client may accelerate work exhaustion only at launch, service, and journal")
     expected_outcome = ast.parse('''if cleanup_errors:
     detail = "; ".join(map(str, cleanup_errors))
     if primary_error is not None:
@@ -906,7 +1218,6 @@ if requested_mode == "client-terminal-race-a":
     client_pause("client-terminal-race-a-unloaded")
 return result
 ''').body
-    launch_index = lock_try.body.index(launch_try)
     require([ast.dump(node) for node in lock_try.body[launch_index + 1:]]
             == [ast.dump(node) for node in expected_outcome],
             "client must immediately resolve primary/cleanup errors after the inner finally")
@@ -1006,6 +1317,9 @@ return result
         'if requested_mode == "client-fault-after-properties":\n                fail("injected client failure after property attestation")',
         'if requested_mode == "client-fault-at-terminal":\n                fail("injected client failure at terminal state")',
         'if requested_mode == "client-fault-after-journal":\n                fail("injected client failure after journal capture")',
+        'if requested_mode == "client-work-budget-launch":\n                    exhaust_work_budget("launch")',
+        'if requested_mode == "client-work-budget-service":\n                exhaust_work_budget("service")',
+        'if requested_mode == "client-work-budget-journal":\n                exhaust_work_budget("journal")',
     )
     require(all(source.count(fragment) == 1 for fragment in fault_fragments),
             "client launch/invocation/property/terminal/journal fault boundaries changed")
@@ -1019,6 +1333,27 @@ def validate_containment(source: str, phase: str) -> None:
             "containment nested process evidence changed")
     require(literal_assignment(tree, "SUCCESS") == "Ubuntu migration role compatibility verification passed",
             "containment canonical success marker changed")
+    require(literal_assignment(tree, "PROGRAM") == "/run/nmcp-ci/supervisor.py"
+            and literal_assignment(tree, "NONCE_VARIABLE") == "NMCP_VERIFIER_NONCE"
+            and literal_assignment(tree, "DESCRIPTION_PREFIX") == "NMCP migration role verifier ",
+            "containment persistent launch labels changed")
+    require(literal_assignment(tree, "SERVICE_PROPERTIES") == {
+        "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
+        "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
+        "RemainAfterExit": "yes", "User": "root", "Group": "root", "UMask": "0077",
+        "WorkingDirectory": "/", "StandardOutput": "journal", "StandardError": "journal",
+    }, "containment persistent fixed service property table changed")
+    launch_property_assignments = [
+        node for node in tree.body if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "LAUNCH_PROPERTIES"
+    ]
+    expected_launch_properties = ast.parse(
+        'LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart", '
+        '*SERVICE_PROPERTIES)'
+    ).body[0]
+    require(len(launch_property_assignments) == 1
+            and ast.dump(launch_property_assignments[0]) == ast.dump(expected_launch_properties),
+            "containment retained full launch signature fields changed")
     require_exact_function(tree, "run", '''def run(argv, **kwargs):
     kwargs.setdefault("timeout", 18 * 60)
     return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)
@@ -1062,6 +1397,17 @@ def validate_containment(source: str, phase: str) -> None:
     finally:
         os.close(descriptor)
 ''', "containment client-lock acquisition/release assertion changed")
+    require_exact_function(tree, "assert_client_lock_held", '''def assert_client_lock_held():
+    descriptor = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        fail("client released its lock before proving owned unload")
+    finally:
+        os.close(descriptor)
+''', "containment work-budget teardown must prove the client lock remains held")
     require_exact_function(tree, "assert_client_failure", '''def assert_client_failure(result, mode):
     if result.returncode == 0 or SUCCESS in result.stdout:
         fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
@@ -1093,7 +1439,7 @@ def validate_containment(source: str, phase: str) -> None:
     if not persistent and attempts < 1:
         fail(f"transient interception did not retry the real command path: {mode}")
 ''', "containment interception counters changed")
-    require_exact_function(tree, "cleanup_exact_invocation", '''def cleanup_exact_invocation(invocation):
+    require_exact_function(tree, "cleanup_fixture_invocation", '''def cleanup_fixture_invocation(invocation):
     state = show("InvocationID", "ActiveState", "ControlGroup")
     if state["LoadState"] == "not-found":
         return
@@ -1116,7 +1462,110 @@ def validate_containment(source: str, phase: str) -> None:
     run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     wait_unit_absent()
-''', "containment persistent-fault recovery must bind the exact InvocationID")
+''', "containment stale fixture cleanup must bind the exact InvocationID")
+    require_exact_function(tree, "exec_start_argv", '''def exec_start_argv(value):
+    marker = "argv[]="
+    start = value.find(marker)
+    end = value.find(" ;", start)
+    if start < 0 or end < 0:
+        return None
+    try:
+        return tuple(shlex.split(value[start + len(marker):end]))
+    except ValueError:
+        return None
+''', "containment persistent ExecStart parser changed")
+    require_exact_function(tree, "persistent_supervisor_mode", '''def persistent_supervisor_mode(mode):
+    boundary = mode.rsplit("-", 1)[1]
+    if boundary in ("kill", "wait"):
+        return "fast-hold"
+    if boundary == "stop":
+        return "fast-success"
+    return "fast-fail"
+''', "containment persistent supervisor mode mapping changed")
+    require_exact_function(tree, "persistent_launch_signature", '''def persistent_launch_signature(state, repo, commit, go_binary, mode):
+    environment = state.get("Environment", "")
+    prefix = NONCE_VARIABLE + "="
+    nonce = environment[len(prefix):] if environment.startswith(prefix) else ""
+    if (len(nonce) != 64
+            or any(character not in "0123456789abcdef" for character in nonce)
+            or environment != prefix + nonce):
+        fail(f"persistent-fault fixture has invalid exact nonce environment: {mode}: {state}")
+    supervisor_argv = ("/usr/bin/python3", "-I", "-S", PROGRAM,
+                       os.path.abspath(os.path.join("/", repo)), commit, go_binary, nonce,
+                       persistent_supervisor_mode(mode))
+    expected_argv = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+                     "LC_ALL=C", "LANG=C", "HOME=/root", prefix + nonce,
+                     *supervisor_argv)
+    invocation = state.get("InvocationID", "")
+    valid_invocation = (len(invocation) == 32
+                        and all(character in "0123456789abcdef" for character in invocation))
+    if (state.get("LoadState") != "loaded" or not valid_invocation
+            or state.get("Description") != DESCRIPTION_PREFIX + nonce
+            or exec_start_argv(state.get("ExecStart", "")) != expected_argv
+            or any(state.get(name) != expected for name, expected in SERVICE_PROPERTIES.items())):
+        fail(f"persistent-fault fixture lacks exact launch signature: {mode}: {state}")
+    return {name: state[name] for name in LAUNCH_PROPERTIES}
+''', "containment persistent full launch signature parser changed")
+    require_exact_function(tree, "assert_launch_signature_counterexamples", '''def assert_launch_signature_counterexamples(state, repo, commit, go_binary, mode):
+    mutations = {
+        "description": ("Description", "wrong verifier description"),
+        "environment": ("Environment", f"{NONCE_VARIABLE}={'0' * 64}"),
+        "exec-start": ("ExecStart", state["ExecStart"].replace(PROGRAM, "/bin/false", 1)),
+        "fixed-property": ("KillMode", "process"),
+    }
+    for label, (property_name, replacement) in mutations.items():
+        changed = dict(state)
+        changed[property_name] = replacement
+        try:
+            persistent_launch_signature(changed, repo, commit, go_binary, mode)
+        except RuntimeError:
+            continue
+        fail(f"persistent launch signature accepted mismatched {label}")
+''', "containment live launch-signature counterexamples changed")
+    require_exact_function(tree, "signed_launch_state", '''def signed_launch_state(signature):
+    state = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+    if state.get("LoadState") == "not-found":
+        return state
+    if (state.get("LoadState") != "loaded"
+            or any(state.get(name) != expected for name, expected in signature.items())):
+        fail(f"persistent-fault launch signature changed; refusing name action: {state}")
+    return state
+''', "containment persistent loaded polls must revalidate the retained full signature")
+    require_exact_function(tree, "cleanup_signed_launch", '''def cleanup_signed_launch(signature):
+    state = signed_launch_state(signature)
+    if state["LoadState"] == "not-found":
+        return
+    state = signed_launch_state(signature)
+    if state["LoadState"] == "not-found":
+        return
+    stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if stopped.returncode:
+        fail(f"persistent-fault stop failed: {stopped.stderr.strip()}")
+    deadline = time.monotonic() + 20
+    while True:
+        state = signed_launch_state(signature)
+        if state["LoadState"] == "not-found":
+            return
+        if state.get("ActiveState") in ("failed", "inactive"):
+            break
+        if time.monotonic() >= deadline:
+            fail(f"persistent-fault signed launch did not terminate: {state}")
+        time.sleep(0.1)
+    state = signed_launch_state(signature)
+    if state["LoadState"] == "not-found":
+        return
+    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 30
+    while True:
+        state = signed_launch_state(signature)
+        if state["LoadState"] == "not-found":
+            return
+        if time.monotonic() >= deadline:
+            fail("persistent-fault signed launch did not unload")
+        time.sleep(0.1)
+''', "containment persistent cleanup must revalidate before actions and every loaded poll")
     contract = (
         'client_faults = (\n        "client-fault-after-launch", "client-fault-missing-invocation",\n        "client-fault-after-invocation", "client-fault-after-properties",\n        "client-fault-at-terminal", "client-fault-after-journal",\n        "client-property-fault-immediate", "client-property-fault-recovery",\n        "client-property-fault-owned",\n    )',
         '"client-property-fault-immediate": "immediate"',
@@ -1133,7 +1582,10 @@ def validate_containment(source: str, phase: str) -> None:
         'for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):',
         'f"intercepted {boundary} command before attempt" not in faulted.stderr',
         'mode = "client-cleanup-persistent-" + boundary',
-        'cleanup_exact_invocation(invocation)',
+        'signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)',
+        'assert_launch_signature_counterexamples(observed, repo, commit, go_binary, mode)',
+        'after_exit = signed_launch_state(signature)',
+        'cleanup_signed_launch(signature)',
         '"remains unknown", "remains unavailable"',
         'for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),',
         '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
@@ -1179,6 +1631,43 @@ def validate_containment(source: str, phase: str) -> None:
             and source.count('("after-intent", "after-mkdir", "after-open", "after-register")') == 2,
             "containment causal death/overlap/lock/recovery/fault contract changed")
     main_node = named_function(tree, "main")
+    budget_loops = [
+        node for node in ast.walk(main_node) if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name) and node.target.id == "budget_boundary"
+    ]
+    expected_budget_loop = ast.parse('''for budget_boundary in ("launch", "service", "journal"):
+    budget_mode = f"client-work-budget-{budget_boundary}"
+    budget_ready = f"/run/nmcp-ci/{budget_mode}.ready"
+    unloaded_ready = f"/run/nmcp-ci/{budget_mode}-unloaded.ready"
+    reset_paths(budget_ready, unloaded_ready,
+                f"/run/nmcp-ci/{budget_mode}-unloaded.release")
+    budgeted = subprocess.Popen(
+        ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, budget_mode),
+        cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    wait_path(budget_ready, timeout=30)
+    budget_started = time.monotonic()
+    wait_path(unloaded_ready, timeout=30)
+    budget_elapsed = time.monotonic() - budget_started
+    if show("LoadState", "ControlGroup").get("LoadState") != "not-found":
+        fail(f"work-budget teardown did not explicitly unload: {budget_boundary}")
+    if cgroup_pids("/system.slice/" + UNIT):
+        fail(f"work-budget teardown left cgroup processes: {budget_boundary}")
+    assert_client_lock_held()
+    release(budget_mode + "-unloaded")
+    budget_stdout, budget_stderr = budgeted.communicate(timeout=30)
+    budget_result = subprocess.CompletedProcess(budgeted.args, budgeted.returncode,
+                                                budget_stdout, budget_stderr)
+    assert_client_failure(budget_result, budget_mode)
+    if f"absolute client work budget exhausted at {budget_boundary}" not in budget_stderr:
+        fail(f"work-budget fault did not exhaust at {budget_boundary}")
+    if budget_elapsed < 0.7 or budget_elapsed > 20:
+        fail(f"work-budget reserve timing was not bounded: {budget_boundary}: {budget_elapsed:.3f}s")
+    fast_recovery(client, repo, commit, go_binary, budget_mode)
+''').body[0]
+    require(len(budget_loops) == 1
+            and ast.dump(budget_loops[0]) == ast.dump(expected_budget_loop),
+            "containment work-budget launch/service/journal causal ordering changed")
     stale_starts = [
         index for index, node in enumerate(main_node.body)
         if isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -1211,7 +1700,7 @@ if (unchanged.get("InvocationID") != stale_invocation or unchanged.get("ActiveSt
         or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):
     fail("rejected prelaunch client touched the stale fixed unit")
 assert_client_lock_reusable()
-cleanup_exact_invocation(stale_invocation)
+cleanup_fixture_invocation(stale_invocation)
 wait_unit_absent()
 ''').body
     require(len(stale_starts) == 1
@@ -1245,12 +1734,11 @@ wait_unit_absent()
     expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 3
     wait_counter(intercepted, expected_interceptions)
     wait_path(handoff_ready, timeout=30)
-    observed = show("InvocationID", "Description", "Environment", "ExecStart")
-    invocation = observed.get("InvocationID", "")
+    observed = show(*LAUNCH_PROPERTIES)
+    signature = None
     if observed["LoadState"] != "not-found":
-        if (len(invocation) != 32 or "NMCP_VERIFIER_NONCE=" not in observed.get("Environment", "")
-                or "NMCP_VERIFIER_NONCE=" not in observed.get("ExecStart", "")):
-            fail(f"persistent-fault fixture lacks exact launch identity: {mode}: {observed}")
+        signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)
+        assert_launch_signature_counterexamples(observed, repo, commit, go_binary, mode)
     release(mode + ".handoff")
     fault_stdout, fault_stderr = process.communicate(timeout=60)
     faulted = subprocess.CompletedProcess(process.args, process.returncode,
@@ -1258,12 +1746,14 @@ wait_unit_absent()
     if faulted.returncode == 0 or SUCCESS in faulted.stdout:
         fail(f"persistent command failure claimed success: {mode}")
     assert_client_lock_reusable()
-    after_exit = show("InvocationID", "ActiveState", "ControlGroup")
+    if signature is None:
+        after_exit = show("LoadState")
+        if after_exit["LoadState"] != "not-found":
+            fail(f"persistent fault loaded without an attested launch signature: {mode}")
+    else:
+        after_exit = signed_launch_state(signature)
     if after_exit["LoadState"] != "not-found":
-        if not invocation or after_exit.get("InvocationID") != invocation:
-            fail(f"persistent fault changed invocation before recovery: {mode}: {after_exit}")
-        cleanup_exact_invocation(invocation)
-    wait_unit_absent()
+        cleanup_signed_launch(signature)
     if cgroup_pids("/system.slice/" + UNIT):
         fail(f"persistent fault recovery left cgroup processes: {mode}")
     assert_interception(mode, boundary, persistent=True)
@@ -1296,8 +1786,8 @@ wait_unit_absent()
         node.func.id for node in ast.walk(main_node)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     ]
-    require(call_names.count("assert_client_failure") == 3
-            and call_names.count("fast_recovery") == 4,
+    require(call_names.count("assert_client_failure") == 4
+            and call_names.count("fast_recovery") == 5,
             "containment causal fault families must each assert failure and fast recovery")
     race_fragments = (
         'go_binary, "client-terminal-race-a"),',
@@ -1911,8 +2401,61 @@ def verify_supervisor_mutations(
             '            if False:\n                pass')),
         ("property retries unbounded", replace_once(client, 'PROPERTY_RETRIES = 4', 'PROPERTY_RETRIES = 400')),
         ("property retry budget unbounded", replace_once(client, 'PROPERTY_RETRY_BUDGET = 3.0', 'PROPERTY_RETRY_BUDGET = 300.0')),
-        ("absolute client budget omitted", replace_once(client,
-            '        COMMAND_DEADLINE = time.monotonic() + 17 * 60\n', '')),
+        ("client total budget changed", replace_once(client,
+            'TOTAL_BUDGET = 17 * 60', 'TOTAL_BUDGET = 18 * 60')),
+        ("cleanup reserve omitted", replace_once(client,
+            'CLEANUP_RESERVE = 3 * 60', 'CLEANUP_RESERVE = 0')),
+        ("work and teardown share deadline", replace_once(client,
+            '        work_deadline = total_deadline - CLEANUP_RESERVE',
+            '        work_deadline = total_deadline')),
+        ("normal work consumes cleanup reserve", client.replace(
+            '        COMMAND_DEADLINE = work_deadline',
+            '        COMMAND_DEADLINE = total_deadline', 1)),
+        ("normal modes clear work deadline", replace_once(client,
+            '        COMMAND_DEADLINE = work_deadline\n        if requested_mode == "client-terminal-race-b":',
+            '        COMMAND_DEADLINE = work_deadline\n'
+            '        if requested_mode not in WORK_BUDGET_MODES:\n'
+            '            COMMAND_DEADLINE = None\n'
+            '        if requested_mode == "client-terminal-race-b":')),
+        ("normal modes collapse total deadline to work deadline", replace_once(client,
+            '        COMMAND_DEADLINE = work_deadline\n        if requested_mode == "client-terminal-race-b":',
+            '        COMMAND_DEADLINE = work_deadline\n'
+            '        if requested_mode not in WORK_BUDGET_MODES:\n'
+            '            total_deadline = work_deadline\n'
+            '        if requested_mode == "client-terminal-race-b":')),
+        ("normal modes delete work deadline", replace_once(client,
+            '        COMMAND_DEADLINE = work_deadline\n        if requested_mode == "client-terminal-race-b":',
+            '        COMMAND_DEADLINE = work_deadline\n'
+            '        if requested_mode not in WORK_BUDGET_MODES:\n'
+            '            del COMMAND_DEADLINE\n'
+            '        if requested_mode == "client-terminal-race-b":')),
+        ("normal modes indirectly reset aliased deadline", replace_once(client,
+            '        COMMAND_DEADLINE = work_deadline\n        if requested_mode == "client-terminal-race-b":',
+            '        COMMAND_DEADLINE = work_deadline\n'
+            '        deadline_namespace = globals()\n'
+            '        if requested_mode not in WORK_BUDGET_MODES:\n'
+            '            deadline_namespace["COMMAND_DEADLINE"] = None\n'
+            '        if requested_mode == "client-terminal-race-b":')),
+        ("computed sys.modules deadline reset", replace_once(client,
+            '        COMMAND_DEADLINE = work_deadline\n        if requested_mode == "client-terminal-race-b":',
+            '        COMMAND_DEADLINE = work_deadline\n'
+            '        sys.modules[__name__].__dict__["COMMAND_" + "DEADLINE"] = None\n'
+            '        if requested_mode == "client-terminal-race-b":')),
+        ("reflective computed deadline exec", replace_once(client,
+            '        COMMAND_DEADLINE = work_deadline\n        if requested_mode == "client-terminal-race-b":',
+            '        COMMAND_DEADLINE = work_deadline\n'
+            '        getattr(__import__("builtins"), "exec")('
+            '"COMMAND_" + "DEADLINE = None", sys.modules[__name__].__dict__)\n'
+            '        if requested_mode == "client-terminal-race-b":')),
+        ("deadline established before lock", replace_once(client,
+            '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        total_deadline = time.monotonic() + TOTAL_BUDGET',
+            '        total_deadline = time.monotonic() + TOTAL_BUDGET\n        fcntl.flock(client_lock, fcntl.LOCK_EX)')),
+        ("teardown reserve activated after signal mask", replace_once(client,
+            '        finally:\n            # The final minute of the lock-held budget is exclusively for\n            # teardown. No launch, result, or journal path can consume it.\n            COMMAND_DEADLINE = total_deadline\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
+            '        finally:\n            # The final minute of the lock-held budget is exclusively for\n            # teardown. No launch, result, or journal path can consume it.\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n            COMMAND_DEADLINE = total_deadline')),
+        ("work deadline not restored after teardown", replace_once(client,
+            '            COMMAND_DEADLINE = work_deadline\n            if CANCELLED:',
+            '            COMMAND_DEADLINE = total_deadline\n            if CANCELLED:')),
         ("subprocess ignores absolute budget", replace_once(client,
             '        timeout = min(timeout, remaining)', '        timeout = timeout')),
         ("prelaunch loaded unit accepted", replace_once(client,
@@ -2011,8 +2554,8 @@ def verify_supervisor_mutations(
         ("raising statement between finally and resolution", replace_once(client, '        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))', '        unit_properties("LoadState")\n        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))')),
         ("signal cancellation bypasses cleanup", replace_once(client, '    CANCELLED.append(signum)', '    os._exit(128 + signum)')),
         ("teardown signal block omitted", replace_once(client,
-            '        finally:\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
-            '        finally:\n            previous_mask = set()')),
+            '            COMMAND_DEADLINE = total_deadline\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
+            '            COMMAND_DEADLINE = total_deadline\n            previous_mask = set()')),
         ("cleanup interception moved after action", replace_once(client,
             '    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])\n    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)',
             '    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)\n    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])')),
@@ -2022,8 +2565,18 @@ def verify_supervisor_mutations(
             '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.attempting")\n        fcntl.flock(client_lock, fcntl.LOCK_EX)',
             '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.attempting")')),
         ("B acquired marker before flock", replace_once(client,
-            '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        COMMAND_DEADLINE = time.monotonic() + 17 * 60\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")',
-            '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")\n        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        COMMAND_DEADLINE = time.monotonic() + 17 * 60')),
+            '        COMMAND_DEADLINE = work_deadline\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")',
+            '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")\n        COMMAND_DEADLINE = work_deadline')),
+        ("launch work exhaustion hook omitted", replace_once(client,
+            '                if requested_mode == "client-work-budget-launch":\n                    exhaust_work_budget("launch")\n', '')),
+        ("service work exhaustion hook omitted", replace_once(client,
+            '            if requested_mode == "client-work-budget-service":\n                exhaust_work_budget("service")\n', '')),
+        ("journal work exhaustion hook omitted", replace_once(client,
+            '            if requested_mode == "client-work-budget-journal":\n                exhaust_work_budget("journal")\n', '')),
+        ("work exhaustion marker omitted", replace_once(client,
+            '    durable_marker(f"client-work-budget-{boundary}.ready")', '    pass')),
+        ("work teardown pause omitted", replace_once(client,
+            '            if requested_mode in WORK_BUDGET_MODES:\n                client_pause(requested_mode + "-unloaded")\n', '')),
         ("launch fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-launch":\n                fail("injected client failure after launch")\n', '')),
         ("invocation fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-invocation":\n                fail("injected client failure after invocation capture")\n', '')),
         ("property fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-properties":\n                fail("injected client failure after property attestation")\n', '')),
@@ -2057,7 +2610,7 @@ def verify_supervisor_mutations(
             '    if (unchanged.get("InvocationID") != stale_invocation or unchanged.get("ActiveState") != "failed"\n            or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):',
             '    if False:')),
         ("stale loaded cleanup omitted", replace_once(containment,
-            '    cleanup_exact_invocation(stale_invocation)\n    wait_unit_absent()',
+            '    cleanup_fixture_invocation(stale_invocation)\n    wait_unit_absent()',
             '    wait_unit_absent()')),
         ("one client fault omitted", replace_once(containment,
             '        "client-fault-at-terminal", "client-fault-after-journal",\n',
@@ -2075,8 +2628,8 @@ def verify_supervisor_mutations(
         ("fault lock reuse unchecked", replace_once(containment,
             '    assert_client_lock_reusable()\n\n\ndef fast_recovery', '    pass\n\n\ndef fast_recovery')),
         ("client lock reuse acquisition omitted", replace_once(containment,
-            '        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)',
-            '        pass')),
+            '        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)\n    except BlockingIOError:\n        fail("client lock was not reusable after client exit")',
+            '        pass\n    except BlockingIOError:\n        fail("client lock was not reusable after client exit")')),
         ("fault fast recovery omitted", replace_once(containment,
             '            if f"intercepted {boundary} command before attempt" not in faulted.stderr:\n                fail(f"property retry did not retain its initial real error: {mode}")\n        fast_recovery(client, repo, commit, go_binary, mode)',
             '            if f"intercepted {boundary} command before attempt" not in faulted.stderr:\n                fail(f"property retry did not retain its initial real error: {mode}")\n        pass')),
@@ -2089,15 +2642,73 @@ def verify_supervisor_mutations(
             '    if persistent and attempts:', '    if False:')),
         ("transient real retry not required", replace_once(containment,
             '    if not persistent and attempts < 1:', '    if False:')),
-        ("persistent exact invocation check omitted", replace_once(containment,
-            '    if state.get("InvocationID") != invocation:\n        fail(f"persistent-fault cleanup refused a different invocation: {state}")',
-            '    if False:\n        pass')),
+        ("persistent exact nonce environment weakened to substring", replace_once(containment,
+            '            or environment != prefix + nonce):',
+            '            or prefix + nonce not in environment):')),
+        ("persistent exact nonce environment comparison omitted", replace_once(containment,
+            '            or environment != prefix + nonce):',
+            '            or False):')),
+        ("persistent nonce length weakened", replace_once(containment,
+            '    if (len(nonce) != 64', '    if (len(nonce) < 32')),
+        ("persistent nonce alphabet comparison omitted", replace_once(containment,
+            '            or any(character not in "0123456789abcdef" for character in nonce)\n', '')),
+        ("persistent description comparison omitted", replace_once(containment,
+            '            or state.get("Description") != DESCRIPTION_PREFIX + nonce\n', '')),
+        ("persistent description weakened to substring", replace_once(containment,
+            '            or state.get("Description") != DESCRIPTION_PREFIX + nonce',
+            '            or DESCRIPTION_PREFIX + nonce not in state.get("Description", "")')),
+        ("persistent ExecStart comparison omitted", replace_once(containment,
+            '            or exec_start_argv(state.get("ExecStart", "")) != expected_argv\n', '')),
+        ("persistent ExecStart weakened to substring", replace_once(containment,
+            '            or exec_start_argv(state.get("ExecStart", "")) != expected_argv',
+            '            or PROGRAM not in state.get("ExecStart", "")')),
+        ("persistent fixed property comparison omitted", replace_once(containment,
+            '            or any(state.get(name) != expected for name, expected in SERVICE_PROPERTIES.items())):',
+            '            or False):')),
+        ("persistent property comparison weakened to substring", replace_once(containment,
+            'state.get(name) != expected for name, expected in SERVICE_PROPERTIES.items()',
+            'expected not in state.get(name, "") for name, expected in SERVICE_PROPERTIES.items()')),
+        ("persistent InvocationID comparison omitted", replace_once(containment,
+            '    valid_invocation = (len(invocation) == 32\n                        and all(character in "0123456789abcdef" for character in invocation))',
+            '    valid_invocation = True')),
+        ("persistent InvocationID length weakened", replace_once(containment,
+            '    valid_invocation = (len(invocation) == 32',
+            '    valid_invocation = (len(invocation) >= 16')),
+        ("persistent InvocationID alphabet comparison omitted", replace_once(containment,
+            '                        and all(character in "0123456789abcdef" for character in invocation))',
+            '                        and True)')),
+        ("persistent loaded comparison omitted", replace_once(containment,
+            '    if (state.get("LoadState") != "loaded" or not valid_invocation',
+            '    if (False or not valid_invocation')),
+        ("persistent description counterexample omitted", replace_once(containment,
+            '        "description": ("Description", "wrong verifier description"),\n', '')),
+        ("persistent environment counterexample omitted", replace_once(containment,
+            '        "environment": ("Environment", f"{NONCE_VARIABLE}={\'0\' * 64}"),\n', '')),
+        ("persistent argv counterexample omitted", replace_once(containment,
+            '        "exec-start": ("ExecStart", state["ExecStart"].replace(PROGRAM, "/bin/false", 1)),\n', '')),
+        ("persistent property counterexample omitted", replace_once(containment,
+            '        "fixed-property": ("KillMode", "process"),\n', '')),
+        ("retained signature revalidation omitted", replace_once(containment,
+            '            or any(state.get(name) != expected for name, expected in signature.items())):',
+            '            or False):')),
         ("persistent cleanup unbounded", replace_once(containment,
-            '    run(("/usr/bin/systemctl", "stop", UNIT),\n        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    deadline = time.monotonic() + 20',
-            '    run(("/usr/bin/systemctl", "stop", UNIT),\n        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    deadline = float("inf")')),
+            '    if stopped.returncode:\n        fail(f"persistent-fault stop failed: {stopped.stderr.strip()}")\n    deadline = time.monotonic() + 20',
+            '    if stopped.returncode:\n        fail(f"persistent-fault stop failed: {stopped.stderr.strip()}")\n    deadline = float("inf")')),
         ("persistent owned cleanup dead", replace_once(containment,
-            '            cleanup_exact_invocation(invocation)',
-            '            if False:\n                cleanup_exact_invocation(invocation)')),
+            '            cleanup_signed_launch(signature)',
+            '            if False:\n                cleanup_signed_launch(signature)')),
+        ("persistent stop prevalidation omitted", replace_once(containment,
+            '    state = signed_launch_state(signature)\n    if state["LoadState"] == "not-found":\n        return\n    stopped = run',
+            '    stopped = run')),
+        ("persistent loaded poll revalidation omitted", replace_once(containment,
+            '        state = signed_launch_state(signature)\n        if state["LoadState"] == "not-found":\n            return\n        if state.get("ActiveState") in ("failed", "inactive"):',
+            '        state = show("ActiveState")\n        if state.get("ActiveState") in ("failed", "inactive"):')),
+        ("persistent reset prevalidation omitted", replace_once(containment,
+            '    state = signed_launch_state(signature)\n    if state["LoadState"] == "not-found":\n        return\n    run(("/usr/bin/systemctl", "reset-failed", UNIT)',
+            '    run(("/usr/bin/systemctl", "reset-failed", UNIT)')),
+        ("persistent unload poll revalidation omitted", containment.replace(
+            '        state = signed_launch_state(signature)',
+            '        state = show("LoadState")', 2)),
         ("persistent handoff waits reordered", replace_once(containment,
             '        wait_counter(intercepted, expected_interceptions)\n        wait_path(handoff_ready, timeout=30)',
             '        wait_path(handoff_ready, timeout=30)\n        wait_counter(intercepted, expected_interceptions)')),
@@ -2105,11 +2716,35 @@ def verify_supervisor_mutations(
             '        wait_path(handoff_ready, timeout=30)',
             '        if False:\n            wait_path(handoff_ready, timeout=30)')),
         ("persistent handoff released before attestation", replace_once(containment,
-            '        observed = show("InvocationID", "Description", "Environment", "ExecStart")',
-            '        release(mode + ".handoff")\n        observed = show("InvocationID", "Description", "Environment", "ExecStart")')),
+            '        observed = show(*LAUNCH_PROPERTIES)',
+            '        release(mode + ".handoff")\n        observed = show(*LAUNCH_PROPERTIES)')),
         ("persistent handoff paths not reset", replace_once(containment,
             '        reset_paths(intercepted, attempted, handoff_ready, handoff_release)',
             '        reset_paths(intercepted, attempted)')),
+        ("work budget boundary omitted", replace_once(containment,
+            '    for budget_boundary in ("launch", "service", "journal"):',
+            '    for budget_boundary in ("launch", "service",):')),
+        ("work budget uses fake client", replace_once(containment,
+            '            ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, budget_mode),',
+            '            ("/usr/bin/false",),')),
+        ("work budget unit absence unchecked", replace_once(containment,
+            '        if show("LoadState", "ControlGroup").get("LoadState") != "not-found":',
+            '        if False:')),
+        ("work budget cgroup unchecked", replace_once(containment,
+            '        if cgroup_pids("/system.slice/" + UNIT):\n            fail(f"work-budget teardown left cgroup processes: {budget_boundary}")',
+            '        if False:\n            pass')),
+        ("work budget client lock unchecked", replace_once(containment,
+            '        assert_client_lock_held()\n        release(budget_mode + "-unloaded")',
+            '        release(budget_mode + "-unloaded")')),
+        ("work budget released before state proof", replace_once(containment,
+            '        if show("LoadState", "ControlGroup").get("LoadState") != "not-found":',
+            '        release(budget_mode + "-unloaded")\n        if show("LoadState", "ControlGroup").get("LoadState") != "not-found":')),
+        ("work budget failure accepted", replace_once(containment,
+            '        assert_client_failure(budget_result, budget_mode)', '        pass')),
+        ("work budget bound removed", replace_once(containment,
+            '        if budget_elapsed < 0.7 or budget_elapsed > 20:', '        if False:')),
+        ("work budget fast recovery omitted", replace_once(containment,
+            '        fast_recovery(client, repo, commit, go_binary, budget_mode)', '        pass')),
         ("signal matrix signal omitted", replace_once(containment,
             '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
             '("hup", signal.SIGHUP)):' )),

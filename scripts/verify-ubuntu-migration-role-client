@@ -45,6 +45,15 @@ INTERCEPTIONS = {}
 BOUNDARIES = set()
 PROPERTY_RETRIES = 4
 PROPERTY_RETRY_BUDGET = 3.0
+TOTAL_BUDGET = 17 * 60
+# Worst-case owned teardown includes bounded property retries, the 15-second
+# systemd stop bound, cgroup draining, reset, unload polling, and margin.
+CLEANUP_RESERVE = 3 * 60
+WORK_BUDGET_FAULT_SECONDS = 1.0
+WORK_BUDGET_MODES = {
+    "client-work-budget-launch", "client-work-budget-service",
+    "client-work-budget-journal",
+}
 
 
 def fail(message):
@@ -243,6 +252,16 @@ def durable_marker(name):
         os.close(directory)
 
 
+def exhaust_work_budget(boundary):
+    global COMMAND_DEADLINE
+    COMMAND_DEADLINE = min(COMMAND_DEADLINE,
+                           time.monotonic() + WORK_BUDGET_FAULT_SECONDS)
+    durable_marker(f"client-work-budget-{boundary}.ready")
+    while time.monotonic() < COMMAND_DEADLINE:
+        time.sleep(min(0.05, max(0, COMMAND_DEADLINE - time.monotonic())))
+    fail(f"absolute client work budget exhausted at {boundary}")
+
+
 def cleanup_boundary(name):
     prefix = "client-signal-"
     if (name not in BOUNDARIES and REQUESTED_MODE.startswith(prefix)
@@ -416,6 +435,8 @@ def main():
             supervisor_mode = "fast-success"
         else:
             supervisor_mode = "fast-fail"
+    elif requested_mode in WORK_BUDGET_MODES:
+        supervisor_mode = "fast-success" if requested_mode.endswith("-journal") else "fast-hold"
     elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
         supervisor_mode = "run-root:after-intent"
     os.makedirs(RUN, mode=0o700, exist_ok=True)
@@ -428,7 +449,9 @@ def main():
         if requested_mode == "client-terminal-race-b":
             durable_marker("client-terminal-race-b.attempting")
         fcntl.flock(client_lock, fcntl.LOCK_EX)
-        COMMAND_DEADLINE = time.monotonic() + 17 * 60
+        total_deadline = time.monotonic() + TOTAL_BUDGET
+        work_deadline = total_deadline - CLEANUP_RESERVE
+        COMMAND_DEADLINE = work_deadline
         if requested_mode == "client-terminal-race-b":
             durable_marker("client-terminal-race-b.acquired")
         if CANCELLED:
@@ -472,6 +495,8 @@ def main():
             try:
                 launch_attempted = True
                 launched = command(service_argv, check=False)
+                if requested_mode == "client-work-budget-launch":
+                    exhaust_work_budget("launch")
                 capture_error = None
                 try:
                     observed = launch_state(context="immediate")
@@ -503,6 +528,8 @@ def main():
                 fail(f"unsafe service properties: {observed}")
             if requested_mode == "client-fault-after-properties":
                 fail("injected client failure after property attestation")
+            if requested_mode == "client-work-budget-service":
+                exhaust_work_budget("service")
             cleanup_test = (requested_mode.startswith("client-cleanup-fault-")
                             or requested_mode.startswith("client-cleanup-persistent-")
                             or requested_mode.startswith("client-signal-"))
@@ -530,6 +557,8 @@ def main():
                 fail("injected client failure at terminal cleanup boundary test")
             if requested_mode == "client-fault-at-terminal":
                 fail("injected client failure at terminal state")
+            if requested_mode == "client-work-budget-journal":
+                exhaust_work_budget("journal")
             command(("/usr/bin/journalctl", "--sync"), check=False)
             journal = command(("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
                                f"_SYSTEMD_INVOCATION_ID={invocation}")).stdout
@@ -554,6 +583,9 @@ def main():
         except BaseException as error:
             primary_error = error
         finally:
+            # The final minute of the lock-held budget is exclusively for
+            # teardown. No launch, result, or journal path can consume it.
+            COMMAND_DEADLINE = total_deadline
             previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
             try:
                 if launch_attempted and invocation is None:
@@ -578,6 +610,9 @@ def main():
                         cleanup_errors.append(error)
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if requested_mode in WORK_BUDGET_MODES:
+                client_pause(requested_mode + "-unloaded")
+            COMMAND_DEADLINE = work_deadline
             if CANCELLED:
                 cancellation = RuntimeError(f"verification client cancelled by signal {CANCELLED[0]}")
                 if primary_error is None:

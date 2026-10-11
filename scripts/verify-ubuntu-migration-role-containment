@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import secrets
+import shlex
 import signal
 import subprocess
 import sys
@@ -16,6 +17,17 @@ READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
 SUCCESS = "Ubuntu migration role compatibility verification passed"
+PROGRAM = "/run/nmcp-ci/supervisor.py"
+NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
+DESCRIPTION_PREFIX = "NMCP migration role verifier "
+SERVICE_PROPERTIES = {
+    "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
+    "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
+    "RemainAfterExit": "yes", "User": "root", "Group": "root", "UMask": "0077",
+    "WorkingDirectory": "/", "StandardOutput": "journal", "StandardError": "journal",
+}
+LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
+                     *SERVICE_PROPERTIES)
 
 
 def fail(message):
@@ -130,6 +142,18 @@ def assert_client_lock_reusable():
         os.close(descriptor)
 
 
+def assert_client_lock_held():
+    descriptor = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        fail("client released its lock before proving owned unload")
+    finally:
+        os.close(descriptor)
+
+
 def assert_client_failure(result, mode):
     if result.returncode == 0 or SUCCESS in result.stdout:
         fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
@@ -169,7 +193,7 @@ def assert_interception(mode, boundary, *, persistent=False):
         fail(f"transient interception did not retry the real command path: {mode}")
 
 
-def cleanup_exact_invocation(invocation):
+def cleanup_fixture_invocation(invocation):
     state = show("InvocationID", "ActiveState", "ControlGroup")
     if state["LoadState"] == "not-found":
         return
@@ -192,6 +216,115 @@ def cleanup_exact_invocation(invocation):
     run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     wait_unit_absent()
+
+
+def exec_start_argv(value):
+    marker = "argv[]="
+    start = value.find(marker)
+    end = value.find(" ;", start)
+    if start < 0 or end < 0:
+        return None
+    try:
+        return tuple(shlex.split(value[start + len(marker):end]))
+    except ValueError:
+        return None
+
+
+def persistent_supervisor_mode(mode):
+    boundary = mode.rsplit("-", 1)[1]
+    if boundary in ("kill", "wait"):
+        return "fast-hold"
+    if boundary == "stop":
+        return "fast-success"
+    return "fast-fail"
+
+
+def persistent_launch_signature(state, repo, commit, go_binary, mode):
+    environment = state.get("Environment", "")
+    prefix = NONCE_VARIABLE + "="
+    nonce = environment[len(prefix):] if environment.startswith(prefix) else ""
+    if (len(nonce) != 64
+            or any(character not in "0123456789abcdef" for character in nonce)
+            or environment != prefix + nonce):
+        fail(f"persistent-fault fixture has invalid exact nonce environment: {mode}: {state}")
+    supervisor_argv = ("/usr/bin/python3", "-I", "-S", PROGRAM,
+                       os.path.abspath(os.path.join("/", repo)), commit, go_binary, nonce,
+                       persistent_supervisor_mode(mode))
+    expected_argv = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+                     "LC_ALL=C", "LANG=C", "HOME=/root", prefix + nonce,
+                     *supervisor_argv)
+    invocation = state.get("InvocationID", "")
+    valid_invocation = (len(invocation) == 32
+                        and all(character in "0123456789abcdef" for character in invocation))
+    if (state.get("LoadState") != "loaded" or not valid_invocation
+            or state.get("Description") != DESCRIPTION_PREFIX + nonce
+            or exec_start_argv(state.get("ExecStart", "")) != expected_argv
+            or any(state.get(name) != expected for name, expected in SERVICE_PROPERTIES.items())):
+        fail(f"persistent-fault fixture lacks exact launch signature: {mode}: {state}")
+    return {name: state[name] for name in LAUNCH_PROPERTIES}
+
+
+def assert_launch_signature_counterexamples(state, repo, commit, go_binary, mode):
+    mutations = {
+        "description": ("Description", "wrong verifier description"),
+        "environment": ("Environment", f"{NONCE_VARIABLE}={'0' * 64}"),
+        "exec-start": ("ExecStart", state["ExecStart"].replace(PROGRAM, "/bin/false", 1)),
+        "fixed-property": ("KillMode", "process"),
+    }
+    for label, (property_name, replacement) in mutations.items():
+        changed = dict(state)
+        changed[property_name] = replacement
+        try:
+            persistent_launch_signature(changed, repo, commit, go_binary, mode)
+        except RuntimeError:
+            continue
+        fail(f"persistent launch signature accepted mismatched {label}")
+
+
+def signed_launch_state(signature):
+    state = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+    if state.get("LoadState") == "not-found":
+        return state
+    if (state.get("LoadState") != "loaded"
+            or any(state.get(name) != expected for name, expected in signature.items())):
+        fail(f"persistent-fault launch signature changed; refusing name action: {state}")
+    return state
+
+
+def cleanup_signed_launch(signature):
+    state = signed_launch_state(signature)
+    if state["LoadState"] == "not-found":
+        return
+    state = signed_launch_state(signature)
+    if state["LoadState"] == "not-found":
+        return
+    stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if stopped.returncode:
+        fail(f"persistent-fault stop failed: {stopped.stderr.strip()}")
+    deadline = time.monotonic() + 20
+    while True:
+        state = signed_launch_state(signature)
+        if state["LoadState"] == "not-found":
+            return
+        if state.get("ActiveState") in ("failed", "inactive"):
+            break
+        if time.monotonic() >= deadline:
+            fail(f"persistent-fault signed launch did not terminate: {state}")
+        time.sleep(0.1)
+    state = signed_launch_state(signature)
+    if state["LoadState"] == "not-found":
+        return
+    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 30
+    while True:
+        state = signed_launch_state(signature)
+        if state["LoadState"] == "not-found":
+            return
+        if time.monotonic() >= deadline:
+            fail("persistent-fault signed launch did not unload")
+        time.sleep(0.1)
 
 
 def pid_exists(pid):
@@ -303,7 +436,7 @@ def main():
             or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):
         fail("rejected prelaunch client touched the stale fixed unit")
     assert_client_lock_reusable()
-    cleanup_exact_invocation(stale_invocation)
+    cleanup_fixture_invocation(stale_invocation)
     wait_unit_absent()
 
     client_faults = (
@@ -350,6 +483,36 @@ def main():
                 fail(f"property retry did not retain its initial real error: {mode}")
         fast_recovery(client, repo, commit, go_binary, mode)
 
+    for budget_boundary in ("launch", "service", "journal"):
+        budget_mode = f"client-work-budget-{budget_boundary}"
+        budget_ready = f"/run/nmcp-ci/{budget_mode}.ready"
+        unloaded_ready = f"/run/nmcp-ci/{budget_mode}-unloaded.ready"
+        reset_paths(budget_ready, unloaded_ready,
+                    f"/run/nmcp-ci/{budget_mode}-unloaded.release")
+        budgeted = subprocess.Popen(
+            ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, budget_mode),
+            cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        wait_path(budget_ready, timeout=30)
+        budget_started = time.monotonic()
+        wait_path(unloaded_ready, timeout=30)
+        budget_elapsed = time.monotonic() - budget_started
+        if show("LoadState", "ControlGroup").get("LoadState") != "not-found":
+            fail(f"work-budget teardown did not explicitly unload: {budget_boundary}")
+        if cgroup_pids("/system.slice/" + UNIT):
+            fail(f"work-budget teardown left cgroup processes: {budget_boundary}")
+        assert_client_lock_held()
+        release(budget_mode + "-unloaded")
+        budget_stdout, budget_stderr = budgeted.communicate(timeout=30)
+        budget_result = subprocess.CompletedProcess(budgeted.args, budgeted.returncode,
+                                                    budget_stdout, budget_stderr)
+        assert_client_failure(budget_result, budget_mode)
+        if f"absolute client work budget exhausted at {budget_boundary}" not in budget_stderr:
+            fail(f"work-budget fault did not exhaust at {budget_boundary}")
+        if budget_elapsed < 0.7 or budget_elapsed > 20:
+            fail(f"work-budget reserve timing was not bounded: {budget_boundary}: {budget_elapsed:.3f}s")
+        fast_recovery(client, repo, commit, go_binary, budget_mode)
+
     for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):
         mode = "client-cleanup-fault-" + boundary
         intercepted, attempted = fault_paths(mode, boundary)
@@ -390,12 +553,11 @@ def main():
         expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 3
         wait_counter(intercepted, expected_interceptions)
         wait_path(handoff_ready, timeout=30)
-        observed = show("InvocationID", "Description", "Environment", "ExecStart")
-        invocation = observed.get("InvocationID", "")
+        observed = show(*LAUNCH_PROPERTIES)
+        signature = None
         if observed["LoadState"] != "not-found":
-            if (len(invocation) != 32 or "NMCP_VERIFIER_NONCE=" not in observed.get("Environment", "")
-                    or "NMCP_VERIFIER_NONCE=" not in observed.get("ExecStart", "")):
-                fail(f"persistent-fault fixture lacks exact launch identity: {mode}: {observed}")
+            signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)
+            assert_launch_signature_counterexamples(observed, repo, commit, go_binary, mode)
         release(mode + ".handoff")
         fault_stdout, fault_stderr = process.communicate(timeout=60)
         faulted = subprocess.CompletedProcess(process.args, process.returncode,
@@ -403,12 +565,14 @@ def main():
         if faulted.returncode == 0 or SUCCESS in faulted.stdout:
             fail(f"persistent command failure claimed success: {mode}")
         assert_client_lock_reusable()
-        after_exit = show("InvocationID", "ActiveState", "ControlGroup")
+        if signature is None:
+            after_exit = show("LoadState")
+            if after_exit["LoadState"] != "not-found":
+                fail(f"persistent fault loaded without an attested launch signature: {mode}")
+        else:
+            after_exit = signed_launch_state(signature)
         if after_exit["LoadState"] != "not-found":
-            if not invocation or after_exit.get("InvocationID") != invocation:
-                fail(f"persistent fault changed invocation before recovery: {mode}: {after_exit}")
-            cleanup_exact_invocation(invocation)
-        wait_unit_absent()
+            cleanup_signed_launch(signature)
         if cgroup_pids("/system.slice/" + UNIT):
             fail(f"persistent fault recovery left cgroup processes: {mode}")
         assert_interception(mode, boundary, persistent=True)
@@ -654,6 +818,7 @@ def main():
             f"/run/nmcp-ci/{name}{suffix}"
             for name in (
                 *client_faults,
+                budget_mode,
                 "client-terminal-race-a", "client-terminal-race-a-unloaded",
                 "client-terminal-race-b", "client-reuse-pause",
             )
