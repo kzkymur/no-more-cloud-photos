@@ -1824,6 +1824,177 @@ def validate_containment(source: str, phase: str) -> None:
         and [(alias.name, alias.asname) for alias in node.names] == [("runpy", None)]
     ]
     require(len(runpy_imports) == 1, "containment parser fixture must import runpy exactly once")
+    require_exact_function(tree, "persistent_failure_classification", '''def persistent_failure_classification(stdout, stderr):
+    return {
+        "success_in_stdout": SUCCESS in stdout,
+        "property_unknown": PERSISTENT_PROPERTY_ERROR in stderr,
+        "action_unavailable": PERSISTENT_ACTION_ERROR in stderr,
+    }
+''', "containment persistent failure classification changed")
+    require_exact_function(tree, "bounded_sanitized_repr", '''def bounded_sanitized_repr(value):
+    text = str(value)
+    index = 0
+    parts = []
+    hexadecimal = "0123456789abcdefABCDEF"
+    while index < len(text):
+        candidate = text[index:index + 64]
+        left_hex = index > 0 and text[index - 1] in hexadecimal
+        right_hex = index + 64 < len(text) and text[index + 64] in hexadecimal
+        candidate_hex = True
+        for character in candidate:
+            if character not in hexadecimal:
+                candidate_hex = False
+                break
+        if len(candidate) == 64 and candidate_hex and not left_hex and not right_hex:
+            parts.append("<redacted-hex64>")
+            index += 64
+        else:
+            parts.append(text[index])
+            index += 1
+    text = "".join(parts)
+    if len(text) > DIAGNOSTIC_TEXT_LIMIT:
+        text = text[:DIAGNOSTIC_TEXT_LIMIT] + "...<truncated>"
+    return repr(text)
+''', "containment persistent diagnostics redaction or bound changed")
+    require_exact_function(tree, "sanitized_state", '''def sanitized_state(state):
+    if state is None:
+        return "explicit-absence"
+    redacted = {
+        name: ("<redacted>" if name in ("Description", "Environment", "ExecStart") else value)
+        for name, value in sorted(state.items())
+    }
+    return bounded_sanitized_repr(redacted)
+''', "containment persistent state diagnostics sanitization changed")
+    require_exact_function(tree, "persistent_failure_diagnostics", '''def persistent_failure_diagnostics(mode, boundary, faulted, classification, intercepted,
+                                   attempted, observed, after_exit, signed_cleanup_ran,
+                                   post_cleanup):
+    return (
+        f"mode={mode!r}; boundary={boundary!r}; returncode={faulted.returncode!r}; "
+        f"success_in_stdout={classification['success_in_stdout']!r}; "
+        f"property_unknown={classification['property_unknown']!r}; "
+        f"action_unavailable={classification['action_unavailable']!r}; "
+        f"stdout={bounded_sanitized_repr(faulted.stdout)}; "
+        f"stderr={bounded_sanitized_repr(faulted.stderr)}; "
+        f"intercepted={intercepted!r}; attempted={attempted!r}; "
+        f"observed_signature={sanitized_state(observed)}; "
+        f"after_exit={sanitized_state(after_exit)}; "
+        f"signed_external_cleanup_ran={signed_cleanup_ran!r}; "
+        f"post_cleanup={sanitized_state(post_cleanup)}"
+    )
+''', "containment persistent assertion diagnostics changed")
+    require_exact_function(tree, "assert_persistent_failure_contract", '''def assert_persistent_failure_contract():
+    cases = (
+        ("", "verification-client: unit properties remain unknown: intercepted", (False, True, False)),
+        ("", "verification-client: owned stop command remains unavailable: intercepted", (False, False, True)),
+        (SUCCESS + "\\n", "verification-client: unrelated error", (True, False, False)),
+        ("", "verification-client: unrelated error", (False, False, False)),
+    )
+    for stdout, stderr, expected in cases:
+        classification = persistent_failure_classification(stdout, stderr)
+        observed = tuple(classification[name] for name in (
+            "success_in_stdout", "property_unknown", "action_unavailable"))
+        if observed != expected:
+            fail(f"persistent failure classification changed: {observed!r} != {expected!r}")
+    secret = "a" * 64
+    rendered = bounded_sanitized_repr(secret + ":" + "x" * DIAGNOSTIC_TEXT_LIMIT)
+    if secret in rendered or "<redacted-hex64>" not in rendered or "<truncated>" not in rendered:
+        fail("persistent failure diagnostics lost redaction or bounded output")
+''', "containment persistent diagnostic pure fixtures changed")
+    protected_persistent_bindings = {
+        "SUCCESS", "PERSISTENT_PROPERTY_ERROR", "PERSISTENT_ACTION_ERROR", "DIAGNOSTIC_TEXT_LIMIT",
+        "persistent_failure_classification", "bounded_sanitized_repr", "sanitized_state",
+        "persistent_failure_diagnostics", "assert_persistent_failure_contract",
+        "len", "str", "repr", "sorted",
+    }
+    protected_persistent_string_bindings = set(protected_persistent_bindings)
+    reviewed_persistent_functions = {
+        node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    protected_persistent_bindings.update(node.name for node in reviewed_persistent_functions)
+    require(len(reviewed_persistent_functions)
+            == len({node.name for node in reviewed_persistent_functions})
+            and not any(node.decorator_list for node in reviewed_persistent_functions)
+            and {node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+                == reviewed_persistent_functions
+            and not any(isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef))
+                        for node in ast.walk(tree)),
+            "containment top-level callable names must be unique protected bindings")
+    reviewed_persistent_assignments = []
+    expected_persistent_constants = {
+        "SUCCESS": "Ubuntu migration role compatibility verification passed",
+        "PERSISTENT_PROPERTY_ERROR": "unit properties remain unknown:",
+        "PERSISTENT_ACTION_ERROR": " command remains unavailable:",
+        "DIAGNOSTIC_TEXT_LIMIT": 512,
+    }
+    for name, value in expected_persistent_constants.items():
+        matches = [node for node in tree.body if isinstance(node, ast.Assign)
+                   and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                   and node.targets[0].id == name and isinstance(node.value, ast.Constant)
+                   and node.value.value == value]
+        require(len(matches) == 1, f"containment {name} constant changed")
+        reviewed_persistent_assignments.append(matches[0].targets[0])
+    reviewed_imports = {
+        "fcntl", "json", "os", "runpy", "secrets", "shlex", "signal",
+        "subprocess", "sys", "time",
+    }
+    actual_imports = [
+        alias.name for node in tree.body if isinstance(node, ast.Import) for alias in node.names
+    ]
+    require(len(actual_imports) == len(reviewed_imports)
+            and set(actual_imports) == reviewed_imports
+            and not any(isinstance(node, ast.ImportFrom) for node in ast.walk(tree)),
+            "containment imports exceed the reviewed modules")
+    persistent_binding_violations = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name) and node.id in protected_persistent_bindings
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and node not in reviewed_persistent_assignments):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, (ast.Global, ast.Nonlocal))
+              and protected_persistent_bindings.intersection(node.names)):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Attribute) and node.attr in protected_persistent_bindings
+              and isinstance(node.ctx, (ast.Store, ast.Del))):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+              and node.value.id in protected_persistent_bindings
+              and isinstance(node.ctx, (ast.Store, ast.Del))):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+              and node.name in protected_persistent_bindings
+              and node not in reviewed_persistent_functions):
+            persistent_binding_violations.append(node)
+        elif isinstance(node, ast.arg) and node.arg in protected_persistent_bindings:
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.ExceptHandler) and node.name in protected_persistent_bindings):
+            persistent_binding_violations.append(node)
+        elif isinstance(node, ast.alias):
+            bound = node.asname or node.name.split(".", 1)[0]
+            if bound in protected_persistent_bindings or node.name == "*":
+                persistent_binding_violations.append(node)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in protected_persistent_bindings:
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.MatchMapping)
+              and node.rest in protected_persistent_bindings):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Constant)
+              and node.value in protected_persistent_string_bindings):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+              and node.func.id in {"globals", "locals", "vars", "setattr", "delattr",
+                                   "getattr", "exec", "eval", "compile", "__import__"}):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Attribute)
+              and (node.attr.startswith("__") or node.attr in {
+                                "__code__", "__defaults__", "__kwdefaults__", "__dict__",
+                                "__globals__", "__closure__", "__setattr__", "__delattr__",
+                                "setattr", "delattr", "getattr", "modules", "builtins"})):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.ImportFrom)
+              and (node.module or "").split(".", 1)[0] in {"__main__", "builtins", "importlib"}):
+            persistent_binding_violations.append(node)
+    require(not persistent_binding_violations,
+            "containment persistent classification/diagnostic binding has a mutation path")
     require_exact_function(tree, "assert_client_lock_reusable", '''def assert_client_lock_reusable():
     descriptor = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
     try:
@@ -2022,7 +2193,12 @@ def validate_containment(source: str, phase: str) -> None:
         'assert_launch_signature_counterexamples(observed, repo, commit, go_binary, mode)',
         'after_exit = signed_launch_state(signature)',
         'cleanup_signed_launch(signature)',
-        '"remains unknown", "remains unavailable"',
+        'PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"',
+        'PERSISTENT_ACTION_ERROR = " command remains unavailable:"',
+        'DIAGNOSTIC_TEXT_LIMIT = 512',
+        'assert_persistent_failure_contract()',
+        'classification = persistent_failure_classification(faulted.stdout, faulted.stderr)',
+        'persistent_failure_diagnostics(',
         'for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),',
         '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
         'mode = f"client-signal-{signal_name}-{boundary}"',
@@ -2255,14 +2431,22 @@ wait_unit_absent()
             fail(f"persistent fault loaded without an attested launch signature: {mode}")
     else:
         after_exit = signed_launch_state(signature)
+    signed_cleanup_ran = False
     if after_exit["LoadState"] != "not-found":
+        signed_cleanup_ran = True
         cleanup_signed_launch(signature)
+    post_cleanup = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
     if cgroup_pids("/system.slice/" + UNIT):
         fail(f"persistent fault recovery left cgroup processes: {mode}")
     assert_interception(mode, boundary, persistent=True)
-    if SUCCESS in faulted.stdout or not any(message in faulted.stderr for message in (
-            "remains unknown", "remains unavailable")):
-        fail(f"persistent command failure claimed success or lost unknown state: {mode}")
+    classification = persistent_failure_classification(faulted.stdout, faulted.stderr)
+    if (classification["success_in_stdout"]
+            or not (classification["property_unknown"]
+                    or classification["action_unavailable"])):
+        diagnostics = persistent_failure_diagnostics(
+            mode, boundary, faulted, classification, counter(intercepted), counter(attempted),
+            signature, after_exit, signed_cleanup_ran, post_cleanup)
+        fail("persistent command failure claimed success or lost unknown state: " + diagnostics)
     fast_recovery(client, repo, commit, go_binary, mode)
 ''').body[0]
     require(len(persistent_loops) == 1
@@ -3417,6 +3601,66 @@ def verify_supervisor_mutations(
     for label, mutation in client_mutations:
         expect_rejected(validate_client, mutation, label, "client")
     containment_mutations = [
+        ("persistent property classifier uses wrong singular verb", replace_once(containment,
+            'PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"',
+            'PERSISTENT_PROPERTY_ERROR = "unit properties remains unknown:"')),
+        ("persistent action classifier removed", replace_once(containment,
+            '        "action_unavailable": PERSISTENT_ACTION_ERROR in stderr,',
+            '        "action_unavailable": False,')),
+        ("persistent success marker classifier removed", replace_once(containment,
+            '        "success_in_stdout": SUCCESS in stdout,',
+            '        "success_in_stdout": False,')),
+        ("persistent unrelated error broadly accepted", replace_once(containment,
+            '        "property_unknown": PERSISTENT_PROPERTY_ERROR in stderr,',
+            '        "property_unknown": bool(stderr),')),
+        ("persistent diagnostics become unbounded", replace_once(containment,
+            'DIAGNOSTIC_TEXT_LIMIT = 512', 'DIAGNOSTIC_TEXT_LIMIT = 999999')),
+        ("persistent diagnostics nonce redaction removed", replace_once(containment,
+            '            parts.append("<redacted-hex64>")',
+            '            parts.append(candidate)')),
+        ("persistent action classifier rebound after fixture definition", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nPERSISTENT_ACTION_ERROR = ""\n\n\ndef run(argv, **kwargs):')),
+        ("persistent diagnostic bound rebound", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nDIAGNOSTIC_TEXT_LIMIT = 999999\n\n\ndef run(argv, **kwargs):')),
+        ("persistent sanitizer builtin shadowed", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nstr = lambda value: value\n\n\ndef run(argv, **kwargs):')),
+        ("persistent failure sink rebound", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nfail = lambda message: None\n\n\ndef run(argv, **kwargs):')),
+        ("persistent failure sink decorated replacement", replace_once(containment,
+            'def fail(message):\n    raise RuntimeError(message)',
+            '@lambda function: (lambda message: None)\n'
+            'def fail(message):\n    raise RuntimeError(message)')),
+        ("persistent failure sink nested module replacement", replace_once(containment,
+            'def fail(message):\n    raise RuntimeError(message)',
+            'if True:\n    @lambda function: (lambda message: None)\n'
+            '    def fail(message):\n        raise RuntimeError(message)')),
+        ("persistent classifier code replaced", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\npersistent_failure_classification.__code__ = '
+            '(lambda stdout, stderr: {"success_in_stdout": False, '
+            '"property_unknown": True, "action_unavailable": True}).__code__\n\n\n'
+            'def run(argv, **kwargs):')),
+        ("persistent constant reflected computed setattr", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\ntype(sys.modules[__name__]).__setattr__('
+            'sys.modules[__name__], "PERSISTENT_" + "ACTION_ERROR", "")\n\n\n'
+            'def run(argv, **kwargs):')),
+        ("persistent classifier reflected globals mutation", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\npersistent_failure_classification.__getattribute__("__globals__")['
+            '"PERSISTENT_" + "ACTION_ERROR"] = ""\n\n\ndef run(argv, **kwargs):')),
+        ("persistent constant builtins setattr", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nimport builtins\nbuiltins.setattr('
+            'sys.modules[__name__], "PERSISTENT_" + "ACTION_ERROR", "")\n\n\n'
+            'def run(argv, **kwargs):')),
+        ("persistent wildcard import binder", replace_once(containment,
+            '\n\ndef run(argv, **kwargs):',
+            '\n\nfrom os import *\n\n\ndef run(argv, **kwargs):')),
         ("containment nonzero show treated as absent", replace_once(containment,
             '    if result.returncode:\n        fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
             '    if result.returncode:\n        return {"LoadState": "not-found"}')),

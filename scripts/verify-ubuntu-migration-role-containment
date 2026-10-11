@@ -18,6 +18,9 @@ READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
 SUCCESS = "Ubuntu migration role compatibility verification passed"
+PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"
+PERSISTENT_ACTION_ERROR = " command remains unavailable:"
+DIAGNOSTIC_TEXT_LIMIT = 512
 PROGRAM = "/run/nmcp-ci/supervisor.py"
 NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
 DESCRIPTION_PREFIX = "NMCP migration role verifier "
@@ -33,6 +36,87 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
 
 def fail(message):
     raise RuntimeError(message)
+
+
+def persistent_failure_classification(stdout, stderr):
+    return {
+        "success_in_stdout": SUCCESS in stdout,
+        "property_unknown": PERSISTENT_PROPERTY_ERROR in stderr,
+        "action_unavailable": PERSISTENT_ACTION_ERROR in stderr,
+    }
+
+
+def bounded_sanitized_repr(value):
+    text = str(value)
+    index = 0
+    parts = []
+    hexadecimal = "0123456789abcdefABCDEF"
+    while index < len(text):
+        candidate = text[index:index + 64]
+        left_hex = index > 0 and text[index - 1] in hexadecimal
+        right_hex = index + 64 < len(text) and text[index + 64] in hexadecimal
+        candidate_hex = True
+        for character in candidate:
+            if character not in hexadecimal:
+                candidate_hex = False
+                break
+        if len(candidate) == 64 and candidate_hex and not left_hex and not right_hex:
+            parts.append("<redacted-hex64>")
+            index += 64
+        else:
+            parts.append(text[index])
+            index += 1
+    text = "".join(parts)
+    if len(text) > DIAGNOSTIC_TEXT_LIMIT:
+        text = text[:DIAGNOSTIC_TEXT_LIMIT] + "...<truncated>"
+    return repr(text)
+
+
+def sanitized_state(state):
+    if state is None:
+        return "explicit-absence"
+    redacted = {
+        name: ("<redacted>" if name in ("Description", "Environment", "ExecStart") else value)
+        for name, value in sorted(state.items())
+    }
+    return bounded_sanitized_repr(redacted)
+
+
+def persistent_failure_diagnostics(mode, boundary, faulted, classification, intercepted,
+                                   attempted, observed, after_exit, signed_cleanup_ran,
+                                   post_cleanup):
+    return (
+        f"mode={mode!r}; boundary={boundary!r}; returncode={faulted.returncode!r}; "
+        f"success_in_stdout={classification['success_in_stdout']!r}; "
+        f"property_unknown={classification['property_unknown']!r}; "
+        f"action_unavailable={classification['action_unavailable']!r}; "
+        f"stdout={bounded_sanitized_repr(faulted.stdout)}; "
+        f"stderr={bounded_sanitized_repr(faulted.stderr)}; "
+        f"intercepted={intercepted!r}; attempted={attempted!r}; "
+        f"observed_signature={sanitized_state(observed)}; "
+        f"after_exit={sanitized_state(after_exit)}; "
+        f"signed_external_cleanup_ran={signed_cleanup_ran!r}; "
+        f"post_cleanup={sanitized_state(post_cleanup)}"
+    )
+
+
+def assert_persistent_failure_contract():
+    cases = (
+        ("", "verification-client: unit properties remain unknown: intercepted", (False, True, False)),
+        ("", "verification-client: owned stop command remains unavailable: intercepted", (False, False, True)),
+        (SUCCESS + "\n", "verification-client: unrelated error", (True, False, False)),
+        ("", "verification-client: unrelated error", (False, False, False)),
+    )
+    for stdout, stderr, expected in cases:
+        classification = persistent_failure_classification(stdout, stderr)
+        observed = tuple(classification[name] for name in (
+            "success_in_stdout", "property_unknown", "action_unavailable"))
+        if observed != expected:
+            fail(f"persistent failure classification changed: {observed!r} != {expected!r}")
+    secret = "a" * 64
+    rendered = bounded_sanitized_repr(secret + ":" + "x" * DIAGNOSTIC_TEXT_LIMIT)
+    if secret in rendered or "<redacted-hex64>" not in rendered or "<truncated>" not in rendered:
+        fail("persistent failure diagnostics lost redaction or bounded output")
 
 
 def run(argv, **kwargs):
@@ -486,6 +570,7 @@ def main():
         fail("usage: containment CLIENT REPOSITORY CURRENT_COMMIT ABSOLUTE_GO")
     client, repo, commit, go_binary = sys.argv[1:]
     assert_property_parser_contract(client)
+    assert_persistent_failure_contract()
 
     # A stale loaded fixed name is never launch-ready merely because it is
     # failed and cgroup-empty. The new client must fail without touching it.
@@ -691,14 +776,22 @@ def main():
                 fail(f"persistent fault loaded without an attested launch signature: {mode}")
         else:
             after_exit = signed_launch_state(signature)
+        signed_cleanup_ran = False
         if after_exit["LoadState"] != "not-found":
+            signed_cleanup_ran = True
             cleanup_signed_launch(signature)
+        post_cleanup = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
         if cgroup_pids("/system.slice/" + UNIT):
             fail(f"persistent fault recovery left cgroup processes: {mode}")
         assert_interception(mode, boundary, persistent=True)
-        if SUCCESS in faulted.stdout or not any(message in faulted.stderr for message in (
-                "remains unknown", "remains unavailable")):
-            fail(f"persistent command failure claimed success or lost unknown state: {mode}")
+        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)
+        if (classification["success_in_stdout"]
+                or not (classification["property_unknown"]
+                        or classification["action_unavailable"])):
+            diagnostics = persistent_failure_diagnostics(
+                mode, boundary, faulted, classification, counter(intercepted), counter(attempted),
+                signature, after_exit, signed_cleanup_ran, post_cleanup)
+            fail("persistent command failure claimed success or lost unknown state: " + diagnostics)
         fast_recovery(client, repo, commit, go_binary, mode)
 
     for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),
