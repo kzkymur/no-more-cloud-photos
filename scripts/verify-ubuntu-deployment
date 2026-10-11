@@ -2,6 +2,7 @@
 """Fail-closed static and parser checks for Ubuntu production assets."""
 
 import ast
+import hashlib
 import os
 import pathlib
 import re
@@ -2191,20 +2192,187 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         ("subprocess", "run"): 1, ("sys", "argv"): 2, ("sys", "stderr"): 1,
         ("time", "monotonic"): 24, ("time", "sleep"): 11,
     }
+    expected_recursive_module_attributes = {
+        "fcntl.LOCK_EX": 5, "fcntl.LOCK_NB": 5, "fcntl.LOCK_UN": 1,
+        "fcntl.flock": 6, "json.load": 2, "os.O_CREAT": 1,
+        "os.O_DIRECTORY": 1, "os.O_EXCL": 1, "os.O_NOFOLLOW": 7,
+        "os.O_RDONLY": 1, "os.O_RDWR": 5, "os.O_WRONLY": 1,
+        "os.close": 7, "os.fsync": 2, "os.geteuid": 1, "os.kill": 4,
+        "os.listdir": 1, "os.lstat": 2, "os.open": 7, "os.path": 18,
+        "os.path.abspath": 1, "os.path.dirname": 1, "os.path.exists": 10,
+        "os.path.isdir": 1, "os.path.islink": 1, "os.path.join": 4,
+        "os.stat": 2, "os.unlink": 2, "os.walk": 1, "os.write": 1,
+        "runpy.run_path": 1, "secrets.token_hex": 2, "shlex.split": 1,
+        "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 2,
+        "signal.SIGQUIT": 1, "signal.SIGTERM": 1,
+        "subprocess.CompletedProcess": 12, "subprocess.PIPE": 60,
+        "subprocess.Popen": 10, "subprocess.SubprocessError": 1,
+        "subprocess.run": 1, "sys.argv": 2, "sys.stderr": 1,
+        "time.monotonic": 24, "time.sleep": 11,
+    }
+
+    def rooted_attribute_chain(node):
+        attributes = []
+        while isinstance(node, ast.Attribute):
+            attributes.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        return ".".join((node.id, *reversed(attributes)))
+
     actual_module_attributes = {}
+    actual_recursive_module_attributes = {}
     for node in ast.walk(tree):
         if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
                 and node.value.id in reviewed_imports):
             key = (node.value.id, node.attr)
             actual_module_attributes[key] = actual_module_attributes.get(key, 0) + 1
+        if isinstance(node, ast.Attribute):
+            chain = rooted_attribute_chain(node)
+            if chain is not None and chain.split(".", 1)[0] in reviewed_imports:
+                actual_recursive_module_attributes[chain] = (
+                    actual_recursive_module_attributes.get(chain, 0) + 1)
     require(actual_module_loads == expected_module_loads
-            and actual_module_attributes == expected_module_attributes,
+            and actual_module_attributes == expected_module_attributes
+            and actual_recursive_module_attributes == expected_recursive_module_attributes
+            and all(isinstance(constant_parents[id(node)], ast.Attribute)
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+                    and node.id in reviewed_imports),
             "containment imported module loads/calls exceed the reviewed inventory")
+    call_target_counts = {}
+    call_contexts = []
+    security_call_contexts = []
+    node_regions = {}
+
+    def record_regions(node, region="<module>"):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            region = node.name
+        node_regions[id(node)] = region
+        for child in ast.iter_child_nodes(node):
+            record_regions(child, region)
+
+    record_regions(tree)
+    child_relations = {}
+    for parent in ast.walk(tree):
+        for field, value in ast.iter_fields(parent):
+            children = value if isinstance(value, list) else (value,)
+            for child in children:
+                if isinstance(child, ast.AST):
+                    child_relations[id(child)] = (parent, field)
+    reviewed_name_callees = {
+        "RuntimeError", "SystemExit", "all", "any", "assert_client_failure",
+        "assert_client_lock_held", "assert_client_lock_reusable", "assert_interception",
+        "assert_launch_signature_counterexamples", "assert_persistent_failure_contract",
+        "assert_property_parser_contract", "assert_replaced_or_absent", "bool",
+        "bounded_sanitized_repr", "cgroup_pids", "cleanup_fixture_invocation",
+        "cleanup_signed_launch", "counter", "dict", "exec_start_argv", "fail",
+        "fast_recovery", "fault_paths", "int", "intent_entry", "iter", "len", "main",
+        "map", "next", "observable_identity", "open", "parse_unit_properties", "parser",
+        "persistent_failure_classification", "persistent_failure_diagnostics",
+        "persistent_launch_signature", "persistent_result_violation",
+        "persistent_supervisor_mode", "pid_exists", "print", "process_has_inode",
+        "range", "release", "repr", "reset_paths", "reset_signal_paths", "run",
+        "run_root_entry", "sanitized_state", "set", "show", "signed_launch_state",
+        "sorted", "str", "successful_terminal_state", "tuple", "wait_counter",
+        "wait_path", "wait_unit_absent",
+    }
+    reviewed_attribute_callee_roots = {
+        "SERVICE_PROPERTIES", "after_exit", "budgeted", "cancelled", "descendants",
+        "dict", "environment", "errors", "expected_slow_counts", "fcntl", "first",
+        "found", "json", "kwargs", "line", "loaded", "matching", "mode", "mutations",
+        "orphaned", "os", "parts", "post_cleanup", "process", "property_boundaries",
+        "recovered", "replaced", "result", "runpy", "secrets", "sentinel_state",
+        "shlex", "signature", "slow", "slow_paths", "slow_state", "source", "state",
+        "stopped", "subprocess", "time", "unchanged", "value", "values", "waiting",
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            target = "name:" + node.func.id
+            require(node.func.id in reviewed_name_callees,
+                    "containment gained an unreviewed named call target")
+        else:
+            chain = rooted_attribute_chain(node.func)
+            if chain is None:
+                target = "dynamic:" + ast.dump(node.func)
+            else:
+                target = "attr:" + chain
+                require(chain.split(".", 1)[0] in reviewed_attribute_callee_roots,
+                        "containment gained an unreviewed attribute call root")
+        call_target_counts[target] = call_target_counts.get(target, 0) + 1
+        parent, field = child_relations[id(node)]
+        context = (node_regions[id(node)], target, type(parent).__name__, field,
+                   ast.dump(node))
+        call_contexts.append(context)
+        if (target == "name:run"
+                or target.startswith(("attr:subprocess.", "attr:os.", "attr:fcntl.",
+                                      "attr:runpy."))):
+            security_call_contexts.append(context)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            chain = rooted_attribute_chain(node)
+            if chain is not None and chain.split(".", 1)[0] in reviewed_imports:
+                parent, field = child_relations[id(node)]
+                call_contexts.append((node_regions[id(node)], "module-attribute:" + chain,
+                                      type(parent).__name__, field, ast.dump(node)))
+    # These normalized AST fingerprints only guard the exact reviewed inventory/context;
+    # they are not source authentication and never replace the semantic inventories above.
+    require(hashlib.sha256(repr(sorted(call_target_counts.items())).encode()).hexdigest()
+                == "55b76e21b30b36548017a0e3e6b12ab5c4a0d795f5fa47924bcb2a53321a7b86"
+            and hashlib.sha256(repr(sorted(call_contexts)).encode()).hexdigest()
+                == "57e22d63131e8733c0b4c08a0c3e47fef9604a19b3f20501fb6c602384c6735e"
+            and hashlib.sha256(repr(sorted(security_call_contexts)).encode()).hexdigest()
+                == "7125573755f57fb77b90bfbdcdc4ea9f7c3d92a8694b58afba2643ebd289b6d3",
+            "containment call targets, arguments, or use-site contexts changed")
+    protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
+    expected_call_root_stores = {
+        "SERVICE_PROPERTIES": 1, "after_exit": 2, "budgeted": 1, "cancelled": 1,
+        "descendants": 1, "environment": 1, "errors": 1, "expected_slow_counts": 1,
+        "first": 1, "found": 1, "line": 1, "loaded": 1, "matching": 1, "mode": 6,
+        "mutations": 1, "orphaned": 1, "parser": 1, "parts": 1, "post_cleanup": 2,
+        "process": 3, "property_boundaries": 1, "recovered": 3, "replaced": 1,
+        "result": 3, "sentinel_state": 1, "signature": 2, "slow": 1,
+        "slow_paths": 1, "slow_state": 1, "source": 6, "state": 11, "stopped": 2,
+        "successful_terminal_state": 1, "unchanged": 1, "value": 10, "values": 2,
+        "waiting": 1,
+    }
+    actual_call_root_stores = {}
+    call_root_store_contexts = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                and node.id in protected_call_roots):
+            actual_call_root_stores[node.id] = actual_call_root_stores.get(node.id, 0) + 1
+            parent, field = child_relations[id(node)]
+            call_root_store_contexts.append((node_regions[id(node)], node.id,
+                                             type(parent).__name__, field, ast.dump(parent)))
+    require(actual_call_root_stores == expected_call_root_stores
+            and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
+                == "49347ef0ecea9f39915ae1760a572b64917842b332b200ecc951720976051d86"
+            and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
+                        and node.id in protected_call_roots for node in ast.walk(tree))
+            and not any(isinstance(node, (ast.Global, ast.Nonlocal))
+                        and protected_call_roots.intersection(node.names)
+                        for node in ast.walk(tree))
+            and not any(isinstance(node, (ast.MatchAs, ast.MatchStar))
+                        and node.name in protected_call_roots for node in ast.walk(tree))
+            and not any(isinstance(node, ast.MatchMapping)
+                        and node.rest in protected_call_roots for node in ast.walk(tree))
+            and not any(isinstance(node, ast.ExceptHandler)
+                        and node.name in protected_call_roots for node in ast.walk(tree))
+            and not any(isinstance(node, ast.alias)
+                        and (node.asname or node.name.split(".", 1)[0])
+                            in protected_call_roots
+                        and node not in reviewed_import_aliases for node in ast.walk(tree)),
+            "containment callable roots were rebound or shadowed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
         'kwargs.setdefault("timeout", 18 * 60)', mode="eval").body)
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Name)
+        if isinstance(node, ast.NamedExpr):
+            persistent_binding_violations.append(node)
+        elif (isinstance(node, ast.Name)
                 and node.id in {"__builtins__", "exec", "eval", "compile", "__import__",
                                 "getattr", "setattr", "delattr", "globals", "locals", "vars"}):
             persistent_binding_violations.append(node)
@@ -4064,6 +4232,40 @@ def verify_supervisor_mutations(
                 'def main():\n    environment = ENV\n    environment["PATH"] = "/tmp"\n'),
             'cwd="/", env=ENV, text=True, **kwargs)',
             'cwd="/", env=environment, text=True, **kwargs)')),
+        ("persistent recursive os callee cleanup suppression", replace_once(containment,
+            'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
+            'if recovered.returncode or not (os.path.os.system("/bin/true") == 0):')),
+        ("persistent walrus os callee cleanup suppression", replace_once(containment,
+            'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
+            'if recovered.returncode or not '
+            '((path_module := os.path).os.system("/bin/true") == 0):')),
+        ("persistent recursive fcntl callee", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = fcntl.flock.__call__\n')),
+        ("persistent recursive json callee", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = json.load.__call__\n')),
+        ("persistent recursive runpy callee", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = runpy.run_path.__call__\n')),
+        ("persistent recursive secrets callee", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = secrets.token_hex.__call__\n')),
+        ("persistent recursive shlex callee", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = shlex.split.__call__\n')),
+        ("persistent recursive signal attribute", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = signal.SIGKILL.real\n')),
+        ("persistent recursive subprocess callee", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = subprocess.Popen.__call__\n')),
+        ("persistent recursive sys callee", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = sys.argv.copy\n')),
+        ("persistent recursive time callee", replace_once(containment,
+            'def main():\n', 'def main():\n    recursive_probe = time.monotonic.__call__\n')),
+        ("persistent builtin callee shadow", replace_once(containment,
+            'def main():\n', 'def main():\n    all = bool\n')),
+        ("persistent builtin callee lambda shadow", replace_once(containment,
+            'def main():\n', 'def main():\n    all = lambda values: True\n')),
+        ("persistent builtin callee pattern shadow", replace_once(containment,
+            'def main():\n', 'def main():\n    match bool:\n        case all:\n            pass\n')),
+        ("persistent builtin callee exception shadow", replace_once(containment,
+            'def main():\n', 'def main():\n    try:\n        raise RuntimeError("shadow")\n'
+            '    except RuntimeError as all:\n        pass\n')),
         ("persistent constant builtins setattr", replace_once(containment,
             '\n\ndef run(argv, **kwargs):',
             '\n\nimport builtins\nbuiltins.setattr('
@@ -4368,6 +4570,21 @@ def verify_supervisor_mutations(
         "persistent executable function default",
         "persistent extra module constant",
         "persistent module mapping mutation",
+        "persistent recursive os callee cleanup suppression",
+        "persistent walrus os callee cleanup suppression",
+        "persistent recursive fcntl callee",
+        "persistent recursive json callee",
+        "persistent recursive runpy callee",
+        "persistent recursive secrets callee",
+        "persistent recursive shlex callee",
+        "persistent recursive signal attribute",
+        "persistent recursive subprocess callee",
+        "persistent recursive sys callee",
+        "persistent recursive time callee",
+        "persistent builtin callee shadow",
+        "persistent builtin callee lambda shadow",
+        "persistent builtin callee pattern shadow",
+        "persistent builtin callee exception shadow",
     }
     for label, mutation in containment_mutations:
         if label in runtime_valid_containment_mutations:
