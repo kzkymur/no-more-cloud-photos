@@ -720,6 +720,9 @@ def validate_client(source: str) -> None:
     ]
     require(len(terminal_helpers) == 1 and terminal_helpers[0] in tree.body,
             "client must define exactly one top-level successful_terminal_state helper")
+    parse_helper = named_function(tree, "parse_unit_properties")
+    require(tree.body.index(terminal_helpers[0]) == tree.body.index(parse_helper) + 1,
+            "client terminal-state helper moved from its reviewed definition location")
     require_exact_function(tree, "successful_terminal_state", '''def successful_terminal_state(state):
     # systemd releases expose CLD_EXITED as either its numeric string ("1")
     # or its documented symbolic spelling. Keep the raw property in evidence.
@@ -997,6 +1000,12 @@ COMMAND_DEADLINE = work_deadline
             and len(terminal_helper_calls) == 1
             and terminal_helper_calls[0] is successful_assignments[0].value,
             "client must use the terminal success helper exactly once at the live result decision")
+    terminal_helper_loads = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Name)
+        and node.id == "successful_terminal_state" and isinstance(node.ctx, ast.Load)
+    ]
+    require(terminal_helper_loads == [terminal_helper_calls[0].func],
+            "client live terminal helper name must resolve only to its original definition")
 
     launch_assignments = [
         node for node in ast.walk(main_node)
@@ -1197,6 +1206,7 @@ finally:
         or isinstance(node, ast.Attribute)
         and node.attr in forbidden_reflection | {
             "__dict__", "__globals__", "f_globals", "f_locals", "gi_frame", "cr_frame", "tb_frame",
+            "__code__", "__closure__", "__defaults__", "__kwdefaults__",
             "modules", "importlib", "builtins",
         }
         or isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
@@ -1206,6 +1216,45 @@ finally:
                 for alias in node.names)
         or isinstance(node, ast.ImportFrom)
         and (node.module or "").split(".", 1)[0] in {"__main__", "importlib", "builtins"}
+        or isinstance(node, ast.ImportFrom)
+        and any(alias.name == "*" for alias in node.names)
+    ]
+    top_level_functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    protected_callable_names = {node.name for node in top_level_functions}
+    require(len(protected_callable_names) == len(top_level_functions),
+            "client top-level helper definitions must have unique protected names")
+    callable_stores_or_deletes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Name)
+        and node.id in protected_callable_names and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    callable_scope_declarations = [
+        node for node in ast.walk(tree) if isinstance(node, (ast.Global, ast.Nonlocal))
+        and protected_callable_names.intersection(node.names)
+    ]
+    callable_attribute_stores_or_deletes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        and node.attr in protected_callable_names and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    callable_binders = []
+    for node in ast.walk(tree):
+        names = []
+        if isinstance(node, ast.arg):
+            names.append(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.append(node.name)
+        elif isinstance(node, ast.alias):
+            names.append(node.asname or node.name.split(".", 1)[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node not in top_level_functions:
+                names.append(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            names.append(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.append(node.rest)
+        if protected_callable_names.intersection(names):
+            callable_binders.append(node)
+    callable_string_indirection = [
+        node for node in ast.walk(tree) if constant_string(node) in protected_callable_names
     ]
     computed_deadline_strings = [
         node for node in ast.walk(tree)
@@ -1229,6 +1278,12 @@ finally:
             and not reflection_nodes
             and not computed_deadline_strings,
             "client COMMAND_DEADLINE mutation surface exceeds the reviewed assignments")
+    require(not callable_stores_or_deletes
+            and not callable_scope_declarations
+            and not callable_attribute_stores_or_deletes
+            and not callable_binders
+            and not callable_string_indirection,
+            "client protected helper binding has an unreviewed rebind or mutation path")
     budget_constants = {
         "PROPERTY_RETRIES", "PROPERTY_RETRY_BUDGET", "TOTAL_BUDGET", "CLEANUP_RESERVE",
         "CLEANUP_BUDGET", "ACTION_ATTEMPTS", "ACTION_TIMEOUTS",
@@ -1740,7 +1795,8 @@ def validate_containment(source: str, phase: str) -> None:
             fail(f"terminal success rejected strict CLD_EXITED spelling: {code!r}")
     if not successful_terminal_state({**successful_state, "ExecMainCode": "1", "ExecMainStatus": 0}):
         fail("terminal success rejected exact integer zero status")
-    for code in ("", "0", "2", "3", "killed", "dumped", 1, True, None):
+    for code in ("", " 1", "1 ", "01", "Exited", "EXITED", " exited", "exited ",
+                 "0", "2", "3", "killed", "dumped", 1, True, None):
         if successful_terminal_state({**successful_state, "ExecMainCode": code}):
             fail(f"terminal success accepted non-CLD_EXITED code: {code!r}")
     rejected_terminal_states = (
@@ -1749,6 +1805,16 @@ def validate_containment(source: str, phase: str) -> None:
         {**successful_state, "ExecMainCode": "1", "Result": "exit-code"},
         {**successful_state, "ExecMainCode": "1", "ActiveState": "failed"},
         {**successful_state, "ExecMainCode": "1", "SubState": "dead"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "Result"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "ExecMainCode"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "ExecMainStatus"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "ActiveState"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "SubState"},
     )
     if any(successful_terminal_state(state) for state in rejected_terminal_states):
         fail("terminal success accepted non-success result, status, or terminal state")
@@ -3257,6 +3323,97 @@ def verify_supervisor_mutations(
         ("journal fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-journal":\n                fail("injected client failure after journal capture")\n', '')),
         ("post-unload lock-held pause omitted", replace_once(client, '        if requested_mode == "client-terminal-race-a":\n            client_pause("client-terminal-race-a-unloaded")\n', '')),
     ]
+    callable_binding_mutations = [
+        ("reviewer reproduced terminal helper widening", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nstrict_terminal_state = successful_terminal_state; '
+            'successful_terminal_state = lambda state: strict_terminal_state(state) or '
+            'state.get("ExecMainCode") == " 1"\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper direct assignment", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nsuccessful_terminal_state = parse_unit_properties\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper lambda rebind", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nsuccessful_terminal_state = lambda state: True\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("non-terminal public helper lambda rebind", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nparse_unit_properties = lambda result, requested: {}\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper deletion", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\ndel successful_terminal_state\n\n\ndef cgroup_pids(control_group):' )),
+        ("terminal helper global rebind", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\ndef injected_global_rebind():\n'
+            '    global successful_terminal_state\n'
+            '    successful_terminal_state = lambda state: True\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper nonlocal rebind", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\ndef injected_nonlocal_rebind(successful_terminal_state):\n'
+            '    def inner():\n'
+            '        nonlocal successful_terminal_state\n'
+            '        successful_terminal_state = lambda state: True\n'
+            '    return inner\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper import alias binder", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nimport os as successful_terminal_state\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper wildcard import binder", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nfrom os import *\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper loop binder", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nfor successful_terminal_state in ():\n    pass\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper with binder", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nwith open("/dev/null") as successful_terminal_state:\n    pass\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper exception binder", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\ntry:\n    pass\nexcept RuntimeError as successful_terminal_state:\n    pass\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper parameter binder", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\ndef injected_parameter(successful_terminal_state):\n    pass\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper comprehension binder", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\ninjected = [None for successful_terminal_state in ()]\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper module attribute mutation", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nsys.modules[__name__].successful_terminal_state = lambda state: True\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper function code mutation", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nsuccessful_terminal_state.__code__ = (lambda state: True).__code__\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper computed globals mutation", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nglobals()["successful_" + "terminal_state"] = lambda state: True\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper computed setattr mutation", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nsetattr(sys.modules[__name__], "".join(("successful_", "terminal_state")), '
+            'lambda state: True)\n\n\n'
+            'def cgroup_pids(control_group):' )),
+        ("terminal helper reflected vars mutation", replace_once(client,
+            '\n\ndef cgroup_pids(control_group):',
+            '\n\nvars(__import__("__main__"))[f"successful_{\'terminal_state\'}"] = '
+            'lambda state: True\n\n\n'
+            'def cgroup_pids(control_group):' )),
+    ]
+    for label, mutation in callable_binding_mutations:
+        ast.parse(mutation, filename=f"<client mutation: {label}>")
+        compile(mutation, f"<client mutation: {label}>", "exec")
+        expect_rejected(validate_client, mutation, label, "client")
     for label, mutation in client_mutations:
         expect_rejected(validate_client, mutation, label, "client")
     containment_mutations = [

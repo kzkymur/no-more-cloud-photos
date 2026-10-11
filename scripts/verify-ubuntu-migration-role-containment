@@ -122,7 +122,8 @@ def assert_property_parser_contract(client):
             fail(f"terminal success rejected strict CLD_EXITED spelling: {code!r}")
     if not successful_terminal_state({**successful_state, "ExecMainCode": "1", "ExecMainStatus": 0}):
         fail("terminal success rejected exact integer zero status")
-    for code in ("", "0", "2", "3", "killed", "dumped", 1, True, None):
+    for code in ("", " 1", "1 ", "01", "Exited", "EXITED", " exited", "exited ",
+                 "0", "2", "3", "killed", "dumped", 1, True, None):
         if successful_terminal_state({**successful_state, "ExecMainCode": code}):
             fail(f"terminal success accepted non-CLD_EXITED code: {code!r}")
     rejected_terminal_states = (
@@ -131,6 +132,16 @@ def assert_property_parser_contract(client):
         {**successful_state, "ExecMainCode": "1", "Result": "exit-code"},
         {**successful_state, "ExecMainCode": "1", "ActiveState": "failed"},
         {**successful_state, "ExecMainCode": "1", "SubState": "dead"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "Result"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "ExecMainCode"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "ExecMainStatus"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "ActiveState"},
+        {key: value for key, value in {**successful_state, "ExecMainCode": "1"}.items()
+         if key != "SubState"},
     )
     if any(successful_terminal_state(state) for state in rejected_terminal_states):
         fail("terminal success accepted non-success result, status, or terminal state")
