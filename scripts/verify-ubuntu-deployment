@@ -516,7 +516,12 @@ def validate_client(source: str) -> None:
         "client-fault-after-launch", "client-fault-after-invocation",
         "client-fault-after-properties", "client-fault-at-terminal",
         "client-fault-after-journal", "client-fault-missing-invocation",
+        "client-property-fault-immediate", "client-property-fault-recovery",
+        "client-property-fault-owned",
     }, "client exact fault boundary table changed")
+    require(literal_assignment(tree, "PROPERTY_RETRIES") == 4
+            and literal_assignment(tree, "PROPERTY_RETRY_BUDGET") == 3.0,
+            "client property retry bounds changed")
     cancellation_assignments = [
         node for node in tree.body if isinstance(node, ast.Assign)
         and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
@@ -553,14 +558,64 @@ def validate_client(source: str) -> None:
         return False
     return all(state.get(name) == expected for name, expected in SERVICE_PROPERTIES.items())
 ''', "client full nonce/argv/property launch identity changed")
-    require_exact_function(tree, "launch_state", '''def launch_state():
+    require_exact_function(tree, "bounded_deadline", '''def bounded_deadline(seconds):
+    deadline = time.monotonic() + seconds
+    return min(deadline, COMMAND_DEADLINE) if COMMAND_DEADLINE is not None else deadline
+''', "client deadlines must remain subordinate to its absolute budget")
+    require_exact_function(tree, "command", '''def command(argv, *, check=True, stdout=subprocess.PIPE, timeout=30):
+    if COMMAND_DEADLINE is not None:
+        remaining = COMMAND_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            fail("absolute client command budget exhausted")
+        timeout = min(timeout, remaining)
+    return subprocess.run(argv, cwd="/", env=ENVIRONMENT,
+                          check=check, stdout=stdout, stderr=subprocess.PIPE, text=True,
+                          timeout=timeout)
+''', "client subprocesses must remain bounded by the absolute budget")
+    require_exact_function(tree, "unit_properties", '''def unit_properties(*names, context="show"):
+    requested = tuple(dict.fromkeys(("LoadState", *names)))
+    deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
+    errors = []
+    for attempt in range(PROPERTY_RETRIES):
+        try:
+            command_path(context)
+            result = command(("/usr/bin/systemctl", "show", UNIT,
+                              *(f"--property={name}" for name in requested)), check=False,
+                             timeout=max(0.05, deadline - time.monotonic()))
+            if result.returncode:
+                fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+            if not result.stdout:
+                fail("systemctl show returned empty output")
+            values = {}
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if not separator or not key or key in values:
+                    fail(f"systemctl show returned malformed output: {line!r}")
+                values[key] = value
+            missing = [name for name in requested if name not in values]
+            if missing:
+                fail(f"systemctl show omitted required properties: {', '.join(missing)}")
+            if errors:
+                RECOVERED_ERRORS.extend(errors)
+            return values
+        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+            errors.append(error)
+            if attempt + 1 >= PROPERTY_RETRIES or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.05 * (2 ** attempt), max(0, deadline - time.monotonic())))
+    fail("unit properties remain unknown: " + "; ".join(map(str, errors)))
+''', "client property reads must fail closed with bounded retry and retained errors")
+    require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
+            "client must not infer absence from an empty or failed property query")
+    require_exact_function(tree, "launch_state", '''def launch_state(*, context="show"):
     return unit_properties("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
-                           "Description", "Environment", "ExecStart", *SERVICE_PROPERTIES)
+                           "Description", "Environment", "ExecStart", *SERVICE_PROPERTIES,
+                           context=context)
 ''', "client launch identity observation changed")
-    require_exact_function(tree, "owned_state", '''def owned_state(invocation, nonce, service_command, *properties):
+    require_exact_function(tree, "owned_state", '''def owned_state(invocation, nonce, service_command, *properties, context="owned-state"):
     state = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState",
                             "ControlGroup", "Description", "Environment", "ExecStart",
-                            *SERVICE_PROPERTIES, *properties)
+                            *SERVICE_PROPERTIES, *properties, context=context)
     if state.get("LoadState") == "not-found":
         return state
     if not launch_matches(state, nonce, service_command):
@@ -573,6 +628,7 @@ def validate_client(source: str) -> None:
     state = owned_state(invocation, nonce, service_command)
     if state.get("LoadState") == "not-found":
         return False
+    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])
     result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)
     if result.returncode:
         fail(f"owned unit command failed ({' '.join(arguments)}): {result.stderr.strip()}")
@@ -632,7 +688,8 @@ def validate_client(source: str) -> None:
         'signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)',
         'launch_attempted = False',
         'launch_attempted = True',
-        'discovered = launch_state()',
+        'COMMAND_DEADLINE = time.monotonic() + 17 * 60',
+        'discovered = launch_state(context="recovery")',
         'except BaseException as error:\n            primary_error = error',
         'f"launched unit has no safe nonce-bound identity: {discovered}"',
         'cleanup_errors.append(error)',
@@ -660,6 +717,7 @@ if requested_mode in CLIENT_FAULTS:
 elif requested_mode == "client-terminal-race-a":
     supervisor_mode = ""
 elif (requested_mode.startswith("client-cleanup-fault-")
+      or requested_mode.startswith("client-cleanup-persistent-")
       or requested_mode.startswith("client-signal-")):
     boundary = requested_mode.rsplit("-", 1)[1]
     if boundary in ("kill", "wait"):
@@ -693,6 +751,7 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
     ordered_lock_fragments = (
         'durable_marker("client-terminal-race-b.attempting")',
         "fcntl.flock(client_lock, fcntl.LOCK_EX)",
+        "COMMAND_DEADLINE = time.monotonic() + 17 * 60",
         'durable_marker("client-terminal-race-b.acquired")',
         "nonce = secrets.token_hex(32)",
         "publish_supervisor(repo, commit)",
@@ -716,6 +775,23 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
             and lock_source.index('durable_marker("client-terminal-race-b.started")')
             > lock_source.index("launched = command(service_argv, check=False)"),
             "client B started marker must follow its distinct service launch")
+    prelaunch_starts = [
+        index for index, node in enumerate(lock_try.body)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "before"
+    ]
+    expected_prelaunch = ast.parse('''before = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+                         context="prelaunch")
+if before.get("LoadState") != "not-found":
+    fail(f"fixed verification unit is not explicitly absent: {before}")
+occupants = cgroup_pids(before.get("ControlGroup", ""))
+if occupants:
+    fail(f"verification unit control group is not empty: {occupants}")
+''').body
+    require(len(prelaunch_starts) == 1
+            and [ast.dump(node) for node in lock_try.body[prelaunch_starts[0]:prelaunch_starts[0] + 4]]
+            == [ast.dump(node) for node in expected_prelaunch],
+            "client prelaunch must reject every state except explicit not-found in live lock-held flow")
     require(source.count("secrets.token_hex(32)") == 1,
             "client must generate exactly one cryptographic 64-hex nonce")
 
@@ -745,12 +821,15 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
 try:
     launch_attempted = True
     launched = command(service_argv, check=False)
+    capture_error = None
     try:
-        observed = launch_state()
-    except BaseException:
+        observed = launch_state(context="immediate")
+    except BaseException as error:
+        capture_error = error
         observed = {}
     candidate_invocation = observed.get("InvocationID", "")
-    if requested_mode == "client-fault-missing-invocation":
+    if requested_mode in ("client-fault-missing-invocation",
+                          "client-property-fault-recovery"):
         candidate_invocation = ""
     if valid_invocation(candidate_invocation) and launch_matches(observed, nonce, exec_argv):
         invocation = candidate_invocation
@@ -762,10 +841,12 @@ finally:
             "client launch attempt, systemd-run, and immediate InvocationID capture must stay signal-masked")
     expected_launch_failures = ast.parse('''if launched.returncode:
     fail(f"fixed unit launch failed: {launched.stderr.strip()}")
+if capture_error is not None:
+    raise capture_error
 if invocation is None:
     fail(f"missing exact invocation identity: {observed}")
 ''').body
-    require([ast.dump(node) for node in launch_try.body[2:3] + launch_try.body[4:5]]
+    require([ast.dump(node) for node in launch_try.body[2:4] + launch_try.body[5:6]]
             == [ast.dump(node) for node in expected_launch_failures],
             "client nonzero launch and missing InvocationID must fail into owned recovery")
     expected_handler = ast.parse('''try:
@@ -780,7 +861,7 @@ finally:
     try:
         if launch_attempted and invocation is None:
             try:
-                discovered = launch_state()
+                discovered = launch_state(context="recovery")
                 candidate_invocation = discovered.get("InvocationID", "")
                 if discovered.get("LoadState") == "not-found":
                     pass
@@ -806,6 +887,8 @@ finally:
             primary_error = cancellation
         elif str(cancellation) not in str(primary_error):
             cleanup_errors.append(cancellation)
+    if RECOVERED_ERRORS:
+        cleanup_errors.extend(RECOVERED_ERRORS)
 ''').body[0].finalbody
     require(len(launch_try.handlers) == 1
             and ast.dump(launch_try.handlers[0]) == ast.dump(expected_handler)
@@ -864,32 +947,59 @@ return result
     require(literal_systemctl == ["owned_command"],
             "client name-based systemctl action bypasses exact InvocationID revalidation")
 
+    retry_source = ast.get_source_segment(source, named_function(tree, "retry_owned_command")) or ""
+    retry_contract = (
+        "for attempt in range(3):", "cleanup_boundary(name)",
+        "acted = owned_command(invocation, nonce, service_command, action, *arguments)",
+        "RECOVERED_ERRORS.extend(errors)", "if attempt < 2:",
+        "time.sleep(0.05 * (2 ** attempt))", "owned {name} command remains unavailable",
+    )
+    require(all(retry_source.count(fragment) == 1 for fragment in retry_contract),
+            "client cleanup actions must retry the same owned command and retain initial failures")
     teardown = ast.get_source_segment(source, named_function(tree, "teardown_owned")) or ""
     teardown_contract = (
         'errors = []',
-        'owned_state(invocation, nonce, service_command, "Result", "ExecMainCode", "ExecMainStatus")',
-        'owned_command(invocation, nonce, service_command,\n                              "kill", "--kill-whom=all", "--signal=KILL")',
-        'cleanup_boundary("kill")', 'injected_cleanup_failure("kill", errors)',
-        'cleanup_boundary("wait")', 'injected_cleanup_failure("wait", errors)',
-        'owned_command(invocation, nonce, service_command, "stop")',
-        'cleanup_boundary("stop")', 'injected_cleanup_failure("stop", errors)',
-        'owned_command(invocation, nonce, service_command, "reset-failed")',
-        'cleanup_boundary("reset")', 'injected_cleanup_failure("reset", errors)',
-        'wait_unloaded(invocation, nonce, service_command, errors)',
+        'context="show"', 'cleanup_boundary("wait")', 'context="wait"',
+        'retry_owned_command(invocation, nonce, service_command,\n                                    "kill", "kill", "--kill-whom=all", "--signal=KILL")',
+        'retry_owned_command(invocation, nonce, service_command, "stop", "stop")',
+        'retry_owned_command(invocation, nonce, service_command, "reset", "reset-failed")',
+        'wait_unloaded(invocation, nonce, service_command)',
         'if errors:\n        raise RuntimeError("; ".join(map(str, errors)))',
     )
     require(all(teardown.count(fragment) == 1 for fragment in teardown_contract),
-            "client teardown must aggregate and continue after real kill/stop/wait/reset/unload actions")
+            "client teardown must retry pre-action failures and aggregate kill/stop/wait/reset/unload errors")
     require(teardown.count("owned_state(invocation, nonce, service_command") == 3,
             "client teardown must revalidate full ownership before each poll/name operation")
     wait_source = ast.get_source_segment(source, named_function(tree, "wait_unloaded")) or ""
-    require(wait_source.count("owned_state(invocation, nonce, service_command)") == 1
+    require(wait_source.count('owned_state(invocation, nonce, service_command, context="unload")') == 1
             and 'cleanup_boundary("unload")' in wait_source
-            and 'injected_cleanup_failure("unload", errors)' in wait_source,
+            and "deadline = bounded_deadline(timeout)" in wait_source,
             "client unload polling/fault boundary ownership contract changed")
 
+    command_path_source = ast.get_source_segment(source, named_function(tree, "command_path")) or ""
+    command_path_contract = (
+        'REQUESTED_MODE == "client-cleanup-fault-" + name',
+        'REQUESTED_MODE == "client-cleanup-persistent-" + name',
+        '"client-property-fault-immediate": "immediate"',
+        '"client-property-fault-recovery": "recovery"',
+        '"client-property-fault-owned": "owned-state"',
+        'record_counter(name + ".intercepted")', 'record_counter(name + ".attempted")',
+        'if REQUESTED_MODE == "client-cleanup-fault-stop":',
+        'durable_marker(REQUESTED_MODE + ".blocked")',
+        'required = 4 if name in ("show", "wait", "unload") else 3',
+        'if persistent and interception == required:',
+        'durable_marker(REQUESTED_MODE + ".handoff.ready")',
+        'release = f"{RUN}/{REQUESTED_MODE}.handoff.release"',
+        'fail("timed out awaiting persistent-fault teardown handoff")',
+        'fail(f"intercepted {name} command before attempt")',
+    )
+    require(all(command_path_source.count(fragment) == 1 for fragment in command_path_contract)
+            and command_path_source.index('fail(f"intercepted {name} command before attempt")')
+            < command_path_source.index('record_counter(name + ".attempted")'),
+            "client fault hooks must intercept before real actions and count retries exactly")
+
     fault_fragments = (
-        'if requested_mode == "client-fault-missing-invocation":\n                    candidate_invocation = ""',
+        'if requested_mode in ("client-fault-missing-invocation",\n                                      "client-property-fault-recovery"):\n                    candidate_invocation = ""',
         'if requested_mode == "client-fault-missing-invocation":\n                client_pause("client-fault-missing-invocation")',
         'if requested_mode == "client-fault-after-launch":\n                fail("injected client failure after launch")',
         'owned_state(invocation, nonce, exec_argv)\n            if requested_mode == "client-fault-after-invocation":',
@@ -909,6 +1019,49 @@ def validate_containment(source: str, phase: str) -> None:
             "containment nested process evidence changed")
     require(literal_assignment(tree, "SUCCESS") == "Ubuntu migration role compatibility verification passed",
             "containment canonical success marker changed")
+    require_exact_function(tree, "run", '''def run(argv, **kwargs):
+    kwargs.setdefault("timeout", 18 * 60)
+    return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)
+''', "containment subprocesses must have a bounded default wait")
+    require_exact_function(tree, "show", '''def show(*properties):
+    requested = tuple(dict.fromkeys(("LoadState", *properties)))
+    errors = []
+    for attempt in range(4):
+        try:
+            result = run(("/usr/bin/systemctl", "show", UNIT,
+                          *(f"--property={item}" for item in requested)), check=False,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
+            if result.returncode:
+                fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+            if not result.stdout:
+                fail("containment systemctl show returned empty output")
+            values = {}
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if not separator or not key or key in values:
+                    fail(f"containment systemctl show returned malformed output: {line!r}")
+                values[key] = value
+            missing = [name for name in requested if name not in values]
+            if missing:
+                fail(f"containment systemctl show omitted required properties: {', '.join(missing)}")
+            return values
+        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+            errors.append(error)
+            if attempt < 3:
+                time.sleep(0.05 * (2 ** attempt))
+    fail("containment unit properties remain unknown: " + "; ".join(map(str, errors)))
+''', "containment property reads must fail closed with bounded retry")
+    require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
+            "containment must not infer absence from an empty or failed property query")
+    require_exact_function(tree, "assert_client_lock_reusable", '''def assert_client_lock_reusable():
+    descriptor = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("client lock was not reusable after client exit")
+    finally:
+        os.close(descriptor)
+''', "containment client-lock acquisition/release assertion changed")
     require_exact_function(tree, "assert_client_failure", '''def assert_client_failure(result, mode):
     if result.returncode == 0 or SUCCESS in result.stdout:
         fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
@@ -929,8 +1082,46 @@ def validate_containment(source: str, phase: str) -> None:
     wait_unit_absent()
     assert_client_lock_reusable()
 ''', "containment causal fast recovery assertion changed")
+    require_exact_function(tree, "assert_interception", '''def assert_interception(mode, boundary, *, persistent=False):
+    intercepted, attempted = fault_paths(mode, boundary)
+    minimum = 4 if persistent and boundary in ("show", "wait", "unload") else 3 if persistent else 1
+    if counter(intercepted) < minimum:
+        fail(f"command path was not intercepted as required: {mode}")
+    attempts = counter(attempted)
+    if persistent and attempts:
+        fail(f"persistent interception reached the real command path: {mode}: {attempts}")
+    if not persistent and attempts < 1:
+        fail(f"transient interception did not retry the real command path: {mode}")
+''', "containment interception counters changed")
+    require_exact_function(tree, "cleanup_exact_invocation", '''def cleanup_exact_invocation(invocation):
+    state = show("InvocationID", "ActiveState", "ControlGroup")
+    if state["LoadState"] == "not-found":
+        return
+    if state.get("InvocationID") != invocation:
+        fail(f"persistent-fault cleanup refused a different invocation: {state}")
+    run(("/usr/bin/systemctl", "stop", UNIT),
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 20
+    while True:
+        state = show("InvocationID", "ActiveState")
+        if state["LoadState"] == "not-found":
+            return
+        if state.get("InvocationID") != invocation:
+            fail(f"persistent-fault cleanup observed name reuse: {state}")
+        if state.get("ActiveState") in ("failed", "inactive"):
+            break
+        if time.monotonic() >= deadline:
+            fail(f"persistent-fault invocation did not terminate: {state}")
+        time.sleep(0.1)
+    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wait_unit_absent()
+''', "containment persistent-fault recovery must bind the exact InvocationID")
     contract = (
-        'client_faults = (\n        "client-fault-after-launch", "client-fault-missing-invocation",\n        "client-fault-after-invocation", "client-fault-after-properties",\n        "client-fault-at-terminal", "client-fault-after-journal",\n    )',
+        'client_faults = (\n        "client-fault-after-launch", "client-fault-missing-invocation",\n        "client-fault-after-invocation", "client-fault-after-properties",\n        "client-fault-at-terminal", "client-fault-after-journal",\n        "client-property-fault-immediate", "client-property-fault-recovery",\n        "client-property-fault-owned",\n    )',
+        '"client-property-fault-immediate": "immediate"',
+        '"client-property-fault-recovery": "recovery"',
+        '"client-property-fault-owned": "owned-state"',
         'for mode in client_faults:',
         'matching = show("LoadState", "InvocationID", "Description", "Environment", "ExecStart")',
         '"NMCP_VERIFIER_NONCE=" not in matching.get("Environment", "")',
@@ -939,8 +1130,11 @@ def validate_containment(source: str, phase: str) -> None:
         '"matching-nonce adoption test did not exercise missing initial InvocationID"',
         'assert_client_failure(faulted, mode)',
         'fast_recovery(client, repo, commit, go_binary, mode)',
-        'for boundary in ("kill", "stop", "wait", "reset", "unload"):',
-        'f"injected cleanup {boundary} failure after real action" not in faulted.stderr',
+        'for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):',
+        'f"intercepted {boundary} command before attempt" not in faulted.stderr',
+        'mode = "client-cleanup-persistent-" + boundary',
+        'cleanup_exact_invocation(invocation)',
+        '"remains unknown", "remains unavailable"',
         'for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),',
         '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
         'mode = f"client-signal-{signal_name}-{boundary}"',
@@ -955,7 +1149,7 @@ def validate_containment(source: str, phase: str) -> None:
         '"containment-supervisor-kill"', 'wait_path(READY)',
         'if not set(descendants) <= set(all_service_pids):',
         'os.kill(first.pid, signal.SIGKILL)',
-        'show("InvocationID", "ActiveState") != {"InvocationID": invocation, "ActiveState": "active"}',
+        'orphaned.get("InvocationID") != invocation or orphaned.get("ActiveState") != "active"',
         'os.kill(main_pid, signal.SIGKILL)',
         'with open("/run/nmcp-ci/lock-keeper.pid", encoding="ascii") as source:',
         'keeper_pid not in all_service_pids or not process_has_inode(',
@@ -985,26 +1179,125 @@ def validate_containment(source: str, phase: str) -> None:
             and source.count('("after-intent", "after-mkdir", "after-open", "after-register")') == 2,
             "containment causal death/overlap/lock/recovery/fault contract changed")
     main_node = named_function(tree, "main")
+    stale_starts = [
+        index for index, node in enumerate(main_node.body)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "stale_nonce"
+    ]
+    expected_stale = ast.parse('''stale_nonce = secrets.token_hex(32)
+run(("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",
+     f"--description=NMCP migration role verifier {stale_nonce}",
+     f"--property=Environment=NMCP_VERIFIER_NONCE={stale_nonce}",
+     "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
+     "--property=TimeoutStopSec=15s", "--property=RuntimeMaxSec=15min",
+     "--property=Delegate=no", "--property=RemainAfterExit=yes",
+     "--property=User=root", "--property=Group=root", "--property=UMask=0077",
+     "--property=WorkingDirectory=/", "--property=StandardOutput=journal",
+     "--property=StandardError=journal", "/usr/bin/false"), check=True,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+deadline = time.monotonic() + 20
+while show("ActiveState").get("ActiveState") != "failed":
+    if time.monotonic() >= deadline:
+        fail("stale fixed-unit fixture did not reach failed state")
+    time.sleep(0.1)
+stale = show("InvocationID", "ActiveState", "ControlGroup", "Environment")
+stale_invocation = stale["InvocationID"]
+rejected = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+                "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:
+    fail("client accepted a stale loaded fixed unit")
+unchanged = show("InvocationID", "ActiveState", "Environment")
+if (unchanged.get("InvocationID") != stale_invocation or unchanged.get("ActiveState") != "failed"
+        or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):
+    fail("rejected prelaunch client touched the stale fixed unit")
+assert_client_lock_reusable()
+cleanup_exact_invocation(stale_invocation)
+wait_unit_absent()
+''').body
+    require(len(stale_starts) == 1
+            and [ast.dump(node) for node in main_node.body[stale_starts[0]:stale_starts[0] + len(expected_stale)]]
+            == [ast.dump(node) for node in expected_stale],
+            "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
+
+    persistent_loops = []
+    for node in ast.walk(main_node):
+        if not isinstance(node, ast.For):
+            continue
+        assignments = [
+            child for child in node.body
+            if isinstance(child, ast.Assign) and len(child.targets) == 1
+            and isinstance(child.targets[0], ast.Name) and child.targets[0].id == "mode"
+        ]
+        if any(ast.dump(item.value) == ast.dump(
+                ast.parse('"client-cleanup-persistent-" + boundary', mode="eval").body)
+                for item in assignments):
+            persistent_loops.append(node)
+    expected_persistent = ast.parse('''for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):
+    mode = "client-cleanup-persistent-" + boundary
+    intercepted, attempted = fault_paths(mode, boundary)
+    handoff_ready = f"/run/nmcp-ci/{mode}.handoff.ready"
+    handoff_release = f"/run/nmcp-ci/{mode}.handoff.release"
+    reset_paths(intercepted, attempted, handoff_ready, handoff_release)
+    process = subprocess.Popen(
+        ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+        cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 3
+    wait_counter(intercepted, expected_interceptions)
+    wait_path(handoff_ready, timeout=30)
+    observed = show("InvocationID", "Description", "Environment", "ExecStart")
+    invocation = observed.get("InvocationID", "")
+    if observed["LoadState"] != "not-found":
+        if (len(invocation) != 32 or "NMCP_VERIFIER_NONCE=" not in observed.get("Environment", "")
+                or "NMCP_VERIFIER_NONCE=" not in observed.get("ExecStart", "")):
+            fail(f"persistent-fault fixture lacks exact launch identity: {mode}: {observed}")
+    release(mode + ".handoff")
+    fault_stdout, fault_stderr = process.communicate(timeout=60)
+    faulted = subprocess.CompletedProcess(process.args, process.returncode,
+                                          fault_stdout, fault_stderr)
+    if faulted.returncode == 0 or SUCCESS in faulted.stdout:
+        fail(f"persistent command failure claimed success: {mode}")
+    assert_client_lock_reusable()
+    after_exit = show("InvocationID", "ActiveState", "ControlGroup")
+    if after_exit["LoadState"] != "not-found":
+        if not invocation or after_exit.get("InvocationID") != invocation:
+            fail(f"persistent fault changed invocation before recovery: {mode}: {after_exit}")
+        cleanup_exact_invocation(invocation)
+    wait_unit_absent()
+    if cgroup_pids("/system.slice/" + UNIT):
+        fail(f"persistent fault recovery left cgroup processes: {mode}")
+    assert_interception(mode, boundary, persistent=True)
+    if SUCCESS in faulted.stdout or not any(message in faulted.stderr for message in (
+            "remains unknown", "remains unavailable")):
+        fail(f"persistent command failure claimed success or lost unknown state: {mode}")
+    fast_recovery(client, repo, commit, go_binary, mode)
+''').body[0]
+    require(len(persistent_loops) == 1
+            and ast.dump(persistent_loops[0]) == ast.dump(expected_persistent),
+            "containment persistent fault handoff/exit/lock/owned cleanup sequence changed")
     loop_pairs = []
     for node in ast.walk(main_node):
         if isinstance(node, ast.For):
             loop_pairs.append(ast.dump(node.iter))
     expected_faults = ast.dump(ast.parse("client_faults", mode="eval").body)
     expected_boundaries = ast.dump(ast.parse(
+        '("show", "kill", "stop", "wait", "reset", "unload")', mode="eval").body)
+    expected_signal_boundaries = ast.dump(ast.parse(
         '("kill", "stop", "wait", "reset", "unload")', mode="eval").body)
     expected_signals = ast.dump(ast.parse(
         '(("int", signal.SIGINT), ("term", signal.SIGTERM), ("hup", signal.SIGHUP), ("quit", signal.SIGQUIT))',
         mode="eval").body)
     require(loop_pairs.count(expected_faults) == 1
             and loop_pairs.count(expected_boundaries) == 3
+            and loop_pairs.count(expected_signal_boundaries) == 2
             and loop_pairs.count(expected_signals) == 1,
-            "containment causal matrix must execute six client faults, five cleanup hooks, and 4x5 signals")
+            "containment causal matrix must execute nine client faults and transient/persistent cleanup hooks")
     call_names = [
         node.func.id for node in ast.walk(main_node)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     ]
     require(call_names.count("assert_client_failure") == 3
-            and call_names.count("fast_recovery") == 3,
+            and call_names.count("fast_recovery") == 4,
             "containment causal fault families must each assert failure and fast recovery")
     race_fragments = (
         'go_binary, "client-terminal-race-a"),',
@@ -1604,6 +1897,27 @@ def verify_supervisor_mutations(
         ("inherited service environment", replace_once(client, '"/usr/bin/env", "-i",', '"/usr/bin/env",')),
         ("no retained result", replace_once(client, '"--property=RemainAfterExit=yes"', '"--property=RemainAfterExit=no"')),
         ("supervisor not exact commit", replace_once(client, '"show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"', '"show", "HEAD:scripts/verify-ubuntu-migration-role-supervisor"')),
+        ("property nonzero treated as absent", replace_once(client,
+            '            if result.returncode:\n                fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
+            '            if result.returncode:\n                return {"LoadState": "not-found"}')),
+        ("empty property result accepted", replace_once(client,
+            '            if not result.stdout:\n                fail("systemctl show returned empty output")',
+            '            if not result.stdout:\n                return {"LoadState": "not-found"}')),
+        ("duplicate property accepted", replace_once(client,
+            '                if not separator or not key or key in values:',
+            '                if not separator or not key:')),
+        ("missing property accepted", replace_once(client,
+            '            if missing:\n                fail(f"systemctl show omitted required properties: {\', \'.join(missing)}")',
+            '            if False:\n                pass')),
+        ("property retries unbounded", replace_once(client, 'PROPERTY_RETRIES = 4', 'PROPERTY_RETRIES = 400')),
+        ("property retry budget unbounded", replace_once(client, 'PROPERTY_RETRY_BUDGET = 3.0', 'PROPERTY_RETRY_BUDGET = 300.0')),
+        ("absolute client budget omitted", replace_once(client,
+            '        COMMAND_DEADLINE = time.monotonic() + 17 * 60\n', '')),
+        ("subprocess ignores absolute budget", replace_once(client,
+            '        timeout = min(timeout, remaining)', '        timeout = timeout')),
+        ("prelaunch loaded unit accepted", replace_once(client,
+            '        if before.get("LoadState") != "not-found":\n            fail(f"fixed verification unit is not explicitly absent: {before}")',
+            '        if False:\n            fail(f"fixed verification unit is not explicitly absent: {before}")')),
         ("terminal recovery uses fast supervisor", replace_once(client,
             '        supervisor_mode = ""\n    elif (requested_mode.startswith("client-cleanup-fault-")',
             '        supervisor_mode = "fast-success"\n    elif (requested_mode.startswith("client-cleanup-fault-")')),
@@ -1640,12 +1954,12 @@ def verify_supervisor_mutations(
         ("journal not invocation scoped", client.replace('f"_SYSTEMD_INVOCATION_ID={invocation}"', '"--since=today"')),
         ("successful cgroup unchecked", replace_once(client, '            if cgroup_pids(current.get("ControlGroup", "")):', '            if False:')),
         ("owned kill omitted", replace_once(client,
-            '                owned_command(invocation, nonce, service_command,\n                              "kill", "--kill-whom=all", "--signal=KILL")',
+            '                retry_owned_command(invocation, nonce, service_command,\n                                    "kill", "kill", "--kill-whom=all", "--signal=KILL")',
             '                pass')),
-        ("unit not stopped", replace_once(client, '            owned_command(invocation, nonce, service_command, "stop")', '            pass')),
-        ("unit not reset", replace_once(client, '            owned_command(invocation, nonce, service_command, "reset-failed")', '            pass')),
+        ("unit not stopped", replace_once(client, '            retry_owned_command(invocation, nonce, service_command, "stop", "stop")', '            pass')),
+        ("unit not reset", replace_once(client, '            retry_owned_command(invocation, nonce, service_command, "reset", "reset-failed")', '            pass')),
         ("unit unload not awaited", replace_once(client,
-            '            wait_unloaded(invocation, nonce, service_command, errors)', '            pass')),
+            '            wait_unloaded(invocation, nonce, service_command)', '            pass')),
         ("ownership mismatch accepted", replace_once(client, '    if state.get("InvocationID") != invocation:', '    if state.get("InvocationID") == invocation:')),
         ("launch ownership accepted", replace_once(client,
             '    if not launch_matches(state, nonce, service_command):', '    if False:')),
@@ -1653,8 +1967,8 @@ def verify_supervisor_mutations(
             '    state = owned_state(invocation, nonce, service_command)\n    if state.get("LoadState") == "not-found":',
             '    state = unit_properties("LoadState")\n    if state.get("LoadState") == "not-found":')),
         ("unload ownership revalidation omitted", client.replace(
-            '        state = owned_state(invocation, nonce, service_command)\n        if state.get("LoadState") == "not-found":\n            cleanup_boundary("unload")',
-            '        state = unit_properties("LoadState")\n        if state.get("LoadState") == "not-found":\n            cleanup_boundary("unload")', 1)),
+            '        state = owned_state(invocation, nonce, service_command, context="unload")',
+            '        state = unit_properties("LoadState")', 1)),
         ("client lock released before launch", replace_once(client, '        publish_supervisor(repo, commit)\n', '        publish_supervisor(repo, commit)\n        os.close(client_lock)\n')),
         ("launch outside cleanup try", replace_once(
             replace_once(client, '                launched = command(service_argv, check=False)', '                launched = launched'),
@@ -1663,13 +1977,13 @@ def verify_supervisor_mutations(
         ("signal mask not restored", client.replace('signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)', 'signal.pthread_sigmask(signal.SIG_UNBLOCK, previous_mask)')),
         ("QUIT cancellation omitted", replace_once(client, 'signal.SIGHUP, signal.SIGQUIT}', 'signal.SIGHUP}')),
         ("immediate launch identity capture omitted", replace_once(client,
-            '                    observed = launch_state()', '                    observed = {}')),
+            '                    observed = launch_state(context="immediate")', '                    observed = {}')),
         ("launch attempt marked too late", replace_once(client, '                launch_attempted = True\n                launched = command(service_argv, check=False)', '                launched = command(service_argv, check=False)\n                launch_attempted = True')),
         ("launch recovery disabled", replace_once(client, '        launch_attempted = False', '        launch_attempted = None')),
         ("nonzero launch accepted", replace_once(client, '            if launched.returncode:', '            if False:')),
         ("missing launch InvocationID accepted", replace_once(client, '            if invocation is None:\n                fail(f"missing exact invocation identity: {observed}")', '            if False:\n                fail(f"missing exact invocation identity: {observed}")')),
         ("missing ID recovery discovery omitted", replace_once(client,
-            '                        discovered = launch_state()', '                        discovered = {"LoadState": "not-found"}')),
+            '                        discovered = launch_state(context="recovery")', '                        discovered = {"LoadState": "not-found"}')),
         ("recovered InvocationID nonce unchecked", replace_once(client,
             '                              and launch_matches(discovered, nonce, exec_argv)):',
             '                              and True):')),
@@ -1680,22 +1994,36 @@ def verify_supervisor_mutations(
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException as error:\n                        cleanup_errors.append(error)',
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException:\n                        pass')),
         ("teardown aggregation bypassed", replace_once(client, '        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))', '        if False:\n            detail = "; ".join(map(str, cleanup_errors))')),
+        ("recovered property errors discarded", replace_once(client,
+            '            if RECOVERED_ERRORS:\n                cleanup_errors.extend(RECOVERED_ERRORS)',
+            '            if RECOVERED_ERRORS:\n                pass')),
+        ("immediate property hook omitted", replace_once(client,
+            '        "client-property-fault-immediate": "immediate",', '')),
+        ("recovery property hook omitted", replace_once(client,
+            '        "client-property-fault-recovery": "recovery",', '')),
+        ("owned property hook omitted", replace_once(client,
+            '        "client-property-fault-owned": "owned-state",', '')),
+        ("cleanup retry replaced by one shot", replace_once(client,
+            '    for attempt in range(3):', '    for attempt in range(1):')),
+        ("cleanup retry changes ownership target", replace_once(client,
+            '            acted = owned_command(invocation, nonce, service_command, action, *arguments)',
+            '            acted = owned_command("", nonce, service_command, action, *arguments)')),
         ("raising statement between finally and resolution", replace_once(client, '        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))', '        unit_properties("LoadState")\n        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))')),
         ("signal cancellation bypasses cleanup", replace_once(client, '    CANCELLED.append(signum)', '    os._exit(128 + signum)')),
         ("teardown signal block omitted", replace_once(client,
             '        finally:\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
             '        finally:\n            previous_mask = set()')),
-        ("cleanup kill fault before action", replace_once(client,
-            '            try:\n                owned_command(invocation, nonce, service_command,\n                              "kill", "--kill-whom=all", "--signal=KILL")',
-            '            injected_cleanup_failure("kill", errors)\n            try:\n                owned_command(invocation, nonce, service_command,\n                              "kill", "--kill-whom=all", "--signal=KILL")')),
+        ("cleanup interception moved after action", replace_once(client,
+            '    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])\n    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)',
+            '    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)\n    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])')),
         ("cleanup aggregation omitted", replace_once(client,
             '    if errors:\n        raise RuntimeError("; ".join(map(str, errors)))', '    pass')),
         ("B attempting marker after flock", replace_once(client,
             '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.attempting")\n        fcntl.flock(client_lock, fcntl.LOCK_EX)',
             '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.attempting")')),
         ("B acquired marker before flock", replace_once(client,
-            '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")',
-            '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")\n        fcntl.flock(client_lock, fcntl.LOCK_EX)')),
+            '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        COMMAND_DEADLINE = time.monotonic() + 17 * 60\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")',
+            '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")\n        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        COMMAND_DEADLINE = time.monotonic() + 17 * 60')),
         ("launch fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-launch":\n                fail("injected client failure after launch")\n', '')),
         ("invocation fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-invocation":\n                fail("injected client failure after invocation capture")\n', '')),
         ("property fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-properties":\n                fail("injected client failure after property attestation")\n', '')),
@@ -1706,6 +2034,31 @@ def verify_supervisor_mutations(
     for label, mutation in client_mutations:
         expect_rejected(validate_client, mutation, label, "client")
     containment_mutations = [
+        ("containment nonzero show treated as absent", replace_once(containment,
+            '            if result.returncode:\n                fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
+            '            if result.returncode:\n                return {"LoadState": "not-found"}')),
+        ("containment empty show accepted", replace_once(containment,
+            '            if not result.stdout:\n                fail("containment systemctl show returned empty output")',
+            '            if not result.stdout:\n                return {"LoadState": "not-found"}')),
+        ("containment malformed show accepted", replace_once(containment,
+            '                if not separator or not key or key in values:',
+            '                if not separator:')),
+        ("containment missing show property accepted", replace_once(containment,
+            '            if missing:\n                fail(f"containment systemctl show omitted required properties: {\', \'.join(missing)}")',
+            '            if False:\n                pass')),
+        ("containment show retries omitted", replace_once(containment,
+            '    for attempt in range(4):', '    for attempt in range(1):')),
+        ("containment subprocess wait unbounded", replace_once(containment,
+            '    kwargs.setdefault("timeout", 18 * 60)', '    pass')),
+        ("stale loaded client success accepted", replace_once(containment,
+            '    if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:',
+            '    if False:')),
+        ("stale loaded identity change accepted", replace_once(containment,
+            '    if (unchanged.get("InvocationID") != stale_invocation or unchanged.get("ActiveState") != "failed"\n            or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):',
+            '    if False:')),
+        ("stale loaded cleanup omitted", replace_once(containment,
+            '    cleanup_exact_invocation(stale_invocation)\n    wait_unit_absent()',
+            '    wait_unit_absent()')),
         ("one client fault omitted", replace_once(containment,
             '        "client-fault-at-terminal", "client-fault-after-journal",\n',
             '        "client-fault-at-terminal",\n')),
@@ -1717,15 +2070,46 @@ def verify_supervisor_mutations(
         ("fault unit residue accepted", replace_once(containment,
             '    if state.get("LoadState") != "not-found":', '    if False:')),
         ("fault cgroup residue accepted", replace_once(containment,
-            '    if cgroup_pids("/system.slice/" + UNIT):', '    if False:')),
+            '    if cgroup_pids("/system.slice/" + UNIT):\n        fail(f"client fault left processes in the fixed unit cgroup: {mode}")',
+            '    if False:\n        pass')),
         ("fault lock reuse unchecked", replace_once(containment,
             '    assert_client_lock_reusable()\n\n\ndef fast_recovery', '    pass\n\n\ndef fast_recovery')),
+        ("client lock reuse acquisition omitted", replace_once(containment,
+            '        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)',
+            '        pass')),
         ("fault fast recovery omitted", replace_once(containment,
-            '        fast_recovery(client, repo, commit, go_binary, mode)\n\n    for boundary',
-            '        pass\n\n    for boundary')),
+            '            if f"intercepted {boundary} command before attempt" not in faulted.stderr:\n                fail(f"property retry did not retain its initial real error: {mode}")\n        fast_recovery(client, repo, commit, go_binary, mode)',
+            '            if f"intercepted {boundary} command before attempt" not in faulted.stderr:\n                fail(f"property retry did not retain its initial real error: {mode}")\n        pass')),
         ("cleanup fault boundary omitted", containment.replace(
-            '("kill", "stop", "wait", "reset", "unload")',
-            '("kill", "stop", "wait", "reset")', 1)),
+            '("show", "kill", "stop", "wait", "reset", "unload")',
+            '("show", "kill", "stop", "wait", "reset")', 1)),
+        ("cleanup interception counter weakened", replace_once(containment,
+            '    if counter(intercepted) < minimum:', '    if False:')),
+        ("persistent real action accepted", replace_once(containment,
+            '    if persistent and attempts:', '    if False:')),
+        ("transient real retry not required", replace_once(containment,
+            '    if not persistent and attempts < 1:', '    if False:')),
+        ("persistent exact invocation check omitted", replace_once(containment,
+            '    if state.get("InvocationID") != invocation:\n        fail(f"persistent-fault cleanup refused a different invocation: {state}")',
+            '    if False:\n        pass')),
+        ("persistent cleanup unbounded", replace_once(containment,
+            '    run(("/usr/bin/systemctl", "stop", UNIT),\n        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    deadline = time.monotonic() + 20',
+            '    run(("/usr/bin/systemctl", "stop", UNIT),\n        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    deadline = float("inf")')),
+        ("persistent owned cleanup dead", replace_once(containment,
+            '            cleanup_exact_invocation(invocation)',
+            '            if False:\n                cleanup_exact_invocation(invocation)')),
+        ("persistent handoff waits reordered", replace_once(containment,
+            '        wait_counter(intercepted, expected_interceptions)\n        wait_path(handoff_ready, timeout=30)',
+            '        wait_path(handoff_ready, timeout=30)\n        wait_counter(intercepted, expected_interceptions)')),
+        ("persistent handoff wait dead", replace_once(containment,
+            '        wait_path(handoff_ready, timeout=30)',
+            '        if False:\n            wait_path(handoff_ready, timeout=30)')),
+        ("persistent handoff released before attestation", replace_once(containment,
+            '        observed = show("InvocationID", "Description", "Environment", "ExecStart")',
+            '        release(mode + ".handoff")\n        observed = show("InvocationID", "Description", "Environment", "ExecStart")')),
+        ("persistent handoff paths not reset", replace_once(containment,
+            '        reset_paths(intercepted, attempted, handoff_ready, handoff_release)',
+            '        reset_paths(intercepted, attempted)')),
         ("signal matrix signal omitted", replace_once(containment,
             '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
             '("hup", signal.SIGHUP)):' )),
@@ -1754,7 +2138,9 @@ def verify_supervisor_mutations(
         ("reuse sentinel nonce unchecked", replace_once(containment,
             '    if sentinel_state.get("Environment") != f"NMCP_VERIFIER_NONCE={sentinel_nonce}":',
             '    if False:')),
-        ("reuse sentinel fake", replace_once(containment, '("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",', '("/bin/true",')),
+        ("reuse sentinel fake", replace_once(containment,
+            '("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",\n                    f"--description=NMCP migration role verifier {sentinel_nonce}"',
+            '("/bin/true",\n                    f"--description=NMCP migration role verifier {sentinel_nonce}"')),
         ("boundary fault omitted", replace_once(containment,
           'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
           'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-register"):' )),
@@ -1764,7 +2150,7 @@ def verify_supervisor_mutations(
     ]
     for label, mutation in containment_mutations:
         expect_rejected(lambda value: validate_containment(value, phase), mutation, label,
-                        "containment causal")
+                        "containment")
     stage_mutations = [
         ("manifest omission allowed", replace_once(stage, "        if actual != expected:", "        if actual < expected:"), "manifest/inventory"),
         ("manifest extra allowed", replace_once(stage, "        if actual != expected:", "        if expected <= actual:"), "manifest/inventory"),

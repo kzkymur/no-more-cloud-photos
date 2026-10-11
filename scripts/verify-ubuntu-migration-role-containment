@@ -23,16 +23,37 @@ def fail(message):
 
 
 def run(argv, **kwargs):
+    kwargs.setdefault("timeout", 18 * 60)
     return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)
 
 
 def show(*properties):
-    result = run(("/usr/bin/systemctl", "show", UNIT, *(f"--property={item}" for item in properties)),
-                 check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-    if result.returncode and not values:
-        return {"LoadState": "not-found", "ActiveState": "inactive", "InvocationID": ""}
-    return values
+    requested = tuple(dict.fromkeys(("LoadState", *properties)))
+    errors = []
+    for attempt in range(4):
+        try:
+            result = run(("/usr/bin/systemctl", "show", UNIT,
+                          *(f"--property={item}" for item in requested)), check=False,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
+            if result.returncode:
+                fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+            if not result.stdout:
+                fail("containment systemctl show returned empty output")
+            values = {}
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if not separator or not key or key in values:
+                    fail(f"containment systemctl show returned malformed output: {line!r}")
+                values[key] = value
+            missing = [name for name in requested if name not in values]
+            if missing:
+                fail(f"containment systemctl show omitted required properties: {', '.join(missing)}")
+            return values
+        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+            errors.append(error)
+            if attempt < 3:
+                time.sleep(0.05 * (2 ** attempt))
+    fail("containment unit properties remain unknown: " + "; ".join(map(str, errors)))
 
 
 def wait_path(path, timeout=900):
@@ -57,6 +78,22 @@ def reset_paths(*paths):
             os.unlink(path)
         except FileNotFoundError:
             pass
+
+
+def counter(path):
+    try:
+        with open(path, encoding="ascii") as source:
+            return int(source.read().strip())
+    except (FileNotFoundError, ValueError):
+        return 0
+
+
+def wait_counter(path, expected, timeout=30):
+    deadline = time.monotonic() + timeout
+    while counter(path) < expected:
+        if time.monotonic() >= deadline:
+            fail(f"timed out waiting for counter {path} to reach {expected}")
+        time.sleep(0.02)
 
 
 def release(name):
@@ -115,6 +152,48 @@ def fast_recovery(client, repo, commit, go_binary, context):
     assert_client_lock_reusable()
 
 
+def fault_paths(mode, boundary):
+    prefix = f"/run/nmcp-ci/{mode}.{boundary}"
+    return prefix + ".intercepted", prefix + ".attempted"
+
+
+def assert_interception(mode, boundary, *, persistent=False):
+    intercepted, attempted = fault_paths(mode, boundary)
+    minimum = 4 if persistent and boundary in ("show", "wait", "unload") else 3 if persistent else 1
+    if counter(intercepted) < minimum:
+        fail(f"command path was not intercepted as required: {mode}")
+    attempts = counter(attempted)
+    if persistent and attempts:
+        fail(f"persistent interception reached the real command path: {mode}: {attempts}")
+    if not persistent and attempts < 1:
+        fail(f"transient interception did not retry the real command path: {mode}")
+
+
+def cleanup_exact_invocation(invocation):
+    state = show("InvocationID", "ActiveState", "ControlGroup")
+    if state["LoadState"] == "not-found":
+        return
+    if state.get("InvocationID") != invocation:
+        fail(f"persistent-fault cleanup refused a different invocation: {state}")
+    run(("/usr/bin/systemctl", "stop", UNIT),
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 20
+    while True:
+        state = show("InvocationID", "ActiveState")
+        if state["LoadState"] == "not-found":
+            return
+        if state.get("InvocationID") != invocation:
+            fail(f"persistent-fault cleanup observed name reuse: {state}")
+        if state.get("ActiveState") in ("failed", "inactive"):
+            break
+        if time.monotonic() >= deadline:
+            fail(f"persistent-fault invocation did not terminate: {state}")
+        time.sleep(0.1)
+    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wait_unit_absent()
+
+
 def pid_exists(pid):
     try:
         os.kill(pid, 0)
@@ -124,6 +203,8 @@ def pid_exists(pid):
 
 
 def cgroup_pids(control_group):
+    if not control_group:
+        return []
     root = "/sys/fs/cgroup" + control_group
     found = []
     if not os.path.isdir(root):
@@ -192,12 +273,55 @@ def main():
     if os.geteuid() != 0 or len(sys.argv) != 5:
         fail("usage: containment CLIENT REPOSITORY CURRENT_COMMIT ABSOLUTE_GO")
     client, repo, commit, go_binary = sys.argv[1:]
+
+    # A stale loaded fixed name is never launch-ready merely because it is
+    # failed and cgroup-empty. The new client must fail without touching it.
+    stale_nonce = secrets.token_hex(32)
+    run(("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",
+         f"--description=NMCP migration role verifier {stale_nonce}",
+         f"--property=Environment=NMCP_VERIFIER_NONCE={stale_nonce}",
+         "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
+         "--property=TimeoutStopSec=15s", "--property=RuntimeMaxSec=15min",
+         "--property=Delegate=no", "--property=RemainAfterExit=yes",
+         "--property=User=root", "--property=Group=root", "--property=UMask=0077",
+         "--property=WorkingDirectory=/", "--property=StandardOutput=journal",
+         "--property=StandardError=journal", "/usr/bin/false"), check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 20
+    while show("ActiveState").get("ActiveState") != "failed":
+        if time.monotonic() >= deadline:
+            fail("stale fixed-unit fixture did not reach failed state")
+        time.sleep(0.1)
+    stale = show("InvocationID", "ActiveState", "ControlGroup", "Environment")
+    stale_invocation = stale["InvocationID"]
+    rejected = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+                    "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:
+        fail("client accepted a stale loaded fixed unit")
+    unchanged = show("InvocationID", "ActiveState", "Environment")
+    if (unchanged.get("InvocationID") != stale_invocation or unchanged.get("ActiveState") != "failed"
+            or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):
+        fail("rejected prelaunch client touched the stale fixed unit")
+    assert_client_lock_reusable()
+    cleanup_exact_invocation(stale_invocation)
+    wait_unit_absent()
+
     client_faults = (
         "client-fault-after-launch", "client-fault-missing-invocation",
         "client-fault-after-invocation", "client-fault-after-properties",
         "client-fault-at-terminal", "client-fault-after-journal",
+        "client-property-fault-immediate", "client-property-fault-recovery",
+        "client-property-fault-owned",
     )
+    property_boundaries = {
+        "client-property-fault-immediate": "immediate",
+        "client-property-fault-recovery": "recovery",
+        "client-property-fault-owned": "owned-state",
+    }
     for mode in client_faults:
+        boundary = property_boundaries.get(mode)
+        if boundary:
+            reset_paths(*fault_paths(mode, boundary))
         if mode == "client-fault-missing-invocation":
             reset_signal_paths(mode)
             process = subprocess.Popen(
@@ -220,15 +344,77 @@ def main():
         assert_client_failure(faulted, mode)
         if mode == "client-fault-missing-invocation" and "missing exact invocation identity" not in faulted.stderr:
             fail("matching-nonce adoption test did not exercise missing initial InvocationID")
+        if boundary:
+            assert_interception(mode, boundary)
+            if f"intercepted {boundary} command before attempt" not in faulted.stderr:
+                fail(f"property retry did not retain its initial real error: {mode}")
         fast_recovery(client, repo, commit, go_binary, mode)
 
-    for boundary in ("kill", "stop", "wait", "reset", "unload"):
+    for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):
         mode = "client-cleanup-fault-" + boundary
-        faulted = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        intercepted, attempted = fault_paths(mode, boundary)
+        blocked = f"/run/nmcp-ci/{mode}.blocked"
+        reset_paths(intercepted, attempted, blocked, f"/run/nmcp-ci/{mode}.release")
+        if boundary == "stop":
+            process = subprocess.Popen(
+                ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+                cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            wait_path(blocked, timeout=30)
+            stopped = show("ActiveState", "SubState", "InvocationID")
+            if stopped.get("ActiveState") != "active" or counter(attempted):
+                fail(f"intercepted first stop attempt acted on the unit: {stopped}")
+            release(mode)
+            fault_stdout, fault_stderr = process.communicate(timeout=30)
+            faulted = subprocess.CompletedProcess(process.args, process.returncode,
+                                                  fault_stdout, fault_stderr)
+        else:
+            faulted = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert_client_failure(faulted, mode)
-        if f"injected cleanup {boundary} failure after real action" not in faulted.stderr:
-            fail(f"cleanup fault hook did not report after its real action: {boundary}")
+        assert_interception(mode, boundary)
+        if f"intercepted {boundary} command before attempt" not in faulted.stderr:
+            fail(f"cleanup fault did not retain its initial real error: {boundary}")
+        fast_recovery(client, repo, commit, go_binary, mode)
+
+    for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):
+        mode = "client-cleanup-persistent-" + boundary
+        intercepted, attempted = fault_paths(mode, boundary)
+        handoff_ready = f"/run/nmcp-ci/{mode}.handoff.ready"
+        handoff_release = f"/run/nmcp-ci/{mode}.handoff.release"
+        reset_paths(intercepted, attempted, handoff_ready, handoff_release)
+        process = subprocess.Popen(
+            ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+            cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 3
+        wait_counter(intercepted, expected_interceptions)
+        wait_path(handoff_ready, timeout=30)
+        observed = show("InvocationID", "Description", "Environment", "ExecStart")
+        invocation = observed.get("InvocationID", "")
+        if observed["LoadState"] != "not-found":
+            if (len(invocation) != 32 or "NMCP_VERIFIER_NONCE=" not in observed.get("Environment", "")
+                    or "NMCP_VERIFIER_NONCE=" not in observed.get("ExecStart", "")):
+                fail(f"persistent-fault fixture lacks exact launch identity: {mode}: {observed}")
+        release(mode + ".handoff")
+        fault_stdout, fault_stderr = process.communicate(timeout=60)
+        faulted = subprocess.CompletedProcess(process.args, process.returncode,
+                                              fault_stdout, fault_stderr)
+        if faulted.returncode == 0 or SUCCESS in faulted.stdout:
+            fail(f"persistent command failure claimed success: {mode}")
+        assert_client_lock_reusable()
+        after_exit = show("InvocationID", "ActiveState", "ControlGroup")
+        if after_exit["LoadState"] != "not-found":
+            if not invocation or after_exit.get("InvocationID") != invocation:
+                fail(f"persistent fault changed invocation before recovery: {mode}: {after_exit}")
+            cleanup_exact_invocation(invocation)
+        wait_unit_absent()
+        if cgroup_pids("/system.slice/" + UNIT):
+            fail(f"persistent fault recovery left cgroup processes: {mode}")
+        assert_interception(mode, boundary, persistent=True)
+        if SUCCESS in faulted.stdout or not any(message in faulted.stderr for message in (
+                "remains unknown", "remains unavailable")):
+            fail(f"persistent command failure claimed success or lost unknown state: {mode}")
         fast_recovery(client, repo, commit, go_binary, mode)
 
     for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),
@@ -302,8 +488,9 @@ def main():
     # The requesting client is deliberately distinct from the service. Its
     # death must neither release transaction serialization nor kill the unit.
     os.kill(first.pid, signal.SIGKILL)
-    first.wait()
-    if show("InvocationID", "ActiveState") != {"InvocationID": invocation, "ActiveState": "active"}:
+    first.wait(timeout=30)
+    orphaned = show("InvocationID", "ActiveState")
+    if orphaned.get("InvocationID") != invocation or orphaned.get("ActiveState") != "active":
         fail("client death changed the running service invocation")
     second = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary),
                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -475,6 +662,13 @@ def main():
     for signal_name in ("int", "term", "hup", "quit"):
         for boundary in ("kill", "stop", "wait", "reset", "unload"):
             reset_paths(f"/run/nmcp-ci/client-signal-{signal_name}-{boundary}.ready")
+    for prefix in ("client-cleanup-fault-", "client-cleanup-persistent-"):
+        for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):
+            mode = prefix + boundary
+            reset_paths(*fault_paths(mode, boundary), f"/run/nmcp-ci/{mode}.blocked",
+                        f"/run/nmcp-ci/{mode}.release")
+    for mode, boundary in property_boundaries.items():
+        reset_paths(*fault_paths(mode, boundary))
     return 0
 
 
