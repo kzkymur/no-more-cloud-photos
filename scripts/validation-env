@@ -219,6 +219,39 @@ run_runtime_role_verifier() {
     --set ON_ERROR_STOP=1 --file /opt/nmcp-infra/validation/verify-runtime-roles.sql
 }
 
+run_reconciliation_runtime_execution_evidence() {
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command "
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL ROLE nmcp_check_runtime;
+SELECT count(*) FROM public.nmcp_read_check_database_references(clock_timestamp());
+DO \$\$ DECLARE rejected boolean := false; BEGIN
+  BEGIN
+    PERFORM * FROM public.nmcp_read_repair_run_by_authorization(
+      '00000000-0000-4000-8000-000000000001');
+  EXCEPTION WHEN insufficient_privilege THEN rejected := true;
+  END;
+  IF NOT rejected THEN
+    RAISE EXCEPTION 'check runtime executed repair API';
+  END IF;
+END \$\$;
+ROLLBACK;
+
+SET ROLE nmcp_repair_runtime;
+SELECT count(*) FROM public.nmcp_read_repair_run_by_authorization(
+  '00000000-0000-4000-8000-000000000001');
+DO \$\$ DECLARE rejected boolean := false; BEGIN
+  BEGIN
+    PERFORM * FROM public.nmcp_read_check_database_references(clock_timestamp());
+  EXCEPTION WHEN insufficient_privilege THEN rejected := true;
+  END;
+  IF NOT rejected THEN
+    RAISE EXCEPTION 'repair runtime executed checker API';
+  END IF;
+END \$\$;
+RESET ROLE;"
+}
+
 expect_runtime_role_verifier_denied() {
   label=$1
   expected_error=${2:-}
@@ -300,6 +333,23 @@ check_runtime_role_verifier_negatives() {
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE nmcp_check_runtime FROM nmcp_repair_runtime"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT nmcp_repair_runtime TO nmcp_check_runtime WITH INHERIT TRUE"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "DO \$\$ BEGIN
+       IF NOT pg_catalog.has_function_privilege('nmcp_check_runtime','public.nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)','EXECUTE') THEN
+         RAISE EXCEPTION 'effective repair EXECUTE drift fixture is not causal';
+       END IF;
+     END \$\$"
+  expect_runtime_role_verifier_denied \
+    "repair API inherited by checker runtime" \
+    "unintended effective EXECUTE for nmcp_check_runtime"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE nmcp_repair_runtime FROM nmcp_check_runtime"
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
@@ -477,11 +527,11 @@ check_runtime_role_verifier_negatives() {
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
-    "GRANT EXECUTE ON FUNCTION public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) TO PUBLIC"
+    "GRANT EXECUTE ON FUNCTION public.nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) TO PUBLIC"
   expect_runtime_role_verifier_denied "repair API PUBLIC EXECUTE drift"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
-    "REVOKE EXECUTE ON FUNCTION public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) FROM PUBLIC"
+    "REVOKE EXECUTE ON FUNCTION public.nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) FROM PUBLIC"
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
@@ -495,11 +545,11 @@ GRANT EXECUTE ON FUNCTION public.nmcp_finish_repair_run(nmcp_uuid_v4) TO nmcp_re
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
-    "ALTER FUNCTION public.nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4) SET search_path=pg_catalog,pg_temp"
+    "ALTER FUNCTION public.nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4) SET search_path=pg_catalog,pg_temp"
   expect_runtime_role_verifier_denied "repair API search_path drift"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
-    "ALTER FUNCTION public.nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4) SET search_path=public,pg_catalog,pg_temp"
+    "ALTER FUNCTION public.nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4) SET search_path=public,pg_catalog,pg_temp"
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
@@ -535,11 +585,24 @@ GRANT EXECUTE ON FUNCTION public.nmcp_finish_repair_run(nmcp_uuid_v4) TO nmcp_re
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
-    "GRANT EXECUTE ON FUNCTION public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) TO nmcp_repair_runtime WITH GRANT OPTION"
+    "GRANT EXECUTE ON FUNCTION public.nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text) TO nmcp_repair_runtime WITH GRANT OPTION"
   expect_runtime_role_verifier_denied "repair API EXECUTE grant option drift"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
-    "REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION public.nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text) FROM nmcp_repair_runtime"
+    "REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION public.nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text) FROM nmcp_repair_runtime"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE FUNCTION public.nmcp_unexpected_repair_definer() RETURNS void LANGUAGE sql SECURITY DEFINER SET search_path=public,pg_catalog,pg_temp AS 'SELECT'; \
+REVOKE ALL ON FUNCTION public.nmcp_unexpected_repair_definer() FROM PUBLIC; \
+ALTER FUNCTION public.nmcp_unexpected_repair_definer() OWNER TO nmcp_repair_function_owner"
+  expect_runtime_role_verifier_denied \
+    "unexpected reconciliation SECURITY DEFINER" \
+    "reconciliation SECURITY DEFINER set differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "ALTER FUNCTION public.nmcp_unexpected_repair_definer() OWNER TO nmcp_bootstrap; \
+DROP FUNCTION public.nmcp_unexpected_repair_definer()"
 
   run_runtime_role_verifier
 }
@@ -669,6 +732,7 @@ check_database_role_boundary() {
   done
   check_role_bootstrap_rerun
   run_runtime_role_verifier
+  run_reconciliation_runtime_execution_evidence
   check_runtime_role_verifier_negatives
   expect_database_denied nmcp_worker nmcp-worker-validation-only \
     "UPDATE purge_file_progress SET disposition=disposition WHERE false"

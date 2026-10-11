@@ -98,6 +98,10 @@ def validate_ubuntu_workflow(source: str) -> None:
         "go.mod",
         "go.sum",
         "infra/validation/verify-runtime-roles.sql",
+        "infra/validation/repair-mount-verifier/**",
+        "internal/reconciliation/**",
+        "internal/storage/**",
+        "scripts/verify-ubuntu-repair-mount-boundaries",
     }
     for event_name in ("pull_request", "push"):
         event = triggers.get(event_name)
@@ -160,8 +164,13 @@ def validate_ubuntu_workflow(source: str) -> None:
     require_default_run_context(dependency, "Ubuntu parser dependency step")
     dependency_commands = shell_commands(str(dependency.get("run", "")))
     require(
-        any("apt-get install" in command and "python3-yaml" in command for command in dependency_commands),
-        "Ubuntu workflow does not install its structural YAML parser",
+        any(
+            "apt-get install" in command
+            and "python3-yaml" in command
+            and "util-linux" in command
+            for command in dependency_commands
+        ),
+        "Ubuntu workflow does not install its structural YAML parser and mount tools",
     )
 
     static_index, static = workflow_step(steps, "Verify deployment assets")
@@ -172,6 +181,18 @@ def validate_ubuntu_workflow(source: str) -> None:
         "Ubuntu workflow bypasses the structural deployment verifier",
     )
 
+    mount_index, mount = workflow_step(steps, "Verify privileged repair mount boundaries")
+    require_unconditional(mount, "Ubuntu privileged repair mount step")
+    require_default_run_context(mount, "Ubuntu privileged repair mount step")
+    require(
+        shell_commands(str(mount.get("run", ""))) == [
+            "go test -c -o /tmp/nmcp-storage-repair.test ./internal/storage",
+            "go build -o /tmp/nmcp-repair-late-bind ./infra/validation/repair-mount-verifier",
+            "sudo scripts/verify-ubuntu-repair-mount-boundaries /tmp/nmcp-storage-repair.test /tmp/nmcp-repair-late-bind",
+        ],
+        "Ubuntu workflow bypasses privileged repair mount evidence",
+    )
+
     migration_index, migration = workflow_step(
         steps, "Verify migration role compatibility and hardening"
     )
@@ -179,17 +200,17 @@ def validate_ubuntu_workflow(source: str) -> None:
     require_default_run_context(migration, "Ubuntu migration compatibility step")
     expected_commands = [
         "go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin",
-        "mkdir /tmp/nmcp-v17-source",
-        "git archive ea644c9ad47a35af67b8598758eb717bd2a86e57 | tar -x -C /tmp/nmcp-v17-source",
-        "(cd /tmp/nmcp-v17-source && go build -o /tmp/nmcp-admin-v17 ./cmd/nmcp-admin)",
-        "sudo scripts/verify-ubuntu-migration-role-compatibility /tmp/nmcp-admin-current /tmp/nmcp-admin-v17",
+        "mkdir /tmp/nmcp-v18-source",
+        "git archive 172583179d860619ae2c79505971e10ae7f394fc | tar -x -C /tmp/nmcp-v18-source",
+        "(cd /tmp/nmcp-v18-source && go build -o /tmp/nmcp-admin-v18 ./cmd/nmcp-admin)",
+        "sudo scripts/verify-ubuntu-migration-role-compatibility /tmp/nmcp-admin-current /tmp/nmcp-admin-v18",
     ]
     require(
         shell_commands(str(migration.get("run", ""))) == expected_commands,
-        "Ubuntu workflow lost the executable v17-to-v18 migration binary contract",
+        "Ubuntu workflow lost the executable v18-to-v19 migration binary contract",
     )
     require(
-        checkout_index < setup_index < dependency_index < static_index < migration_index,
+        checkout_index < setup_index < dependency_index < static_index < mount_index < migration_index,
         "Ubuntu workflow evidence steps are not in dependency order",
     )
     for index, step in enumerate(steps):
@@ -266,6 +287,33 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
         "Ubuntu migration compatibility step must use the reviewed shell and working directory",
     )
 
+    disabled_mount = copy.deepcopy(workflow)
+    _, disabled_mount_step = workflow_step(
+        disabled_mount["jobs"]["verify"]["steps"],
+        "Verify privileged repair mount boundaries",
+    )
+    disabled_mount_step["if"] = False
+    expect_workflow_rejected(
+        yaml.safe_dump(disabled_mount, sort_keys=False),
+        "disabled privileged repair mount evidence",
+        "Ubuntu privileged repair mount step must be unconditional",
+    )
+
+    unprivileged_mount = copy.deepcopy(workflow)
+    _, unprivileged_mount_step = workflow_step(
+        unprivileged_mount["jobs"]["verify"]["steps"],
+        "Verify privileged repair mount boundaries",
+    )
+    unprivileged_mount_step["run"] = str(unprivileged_mount_step["run"]).replace(
+        "sudo scripts/verify-ubuntu-repair-mount-boundaries",
+        "scripts/verify-ubuntu-repair-mount-boundaries",
+    )
+    expect_workflow_rejected(
+        yaml.safe_dump(unprivileged_mount, sort_keys=False),
+        "unprivileged repair mount evidence",
+        "Ubuntu workflow bypasses privileged repair mount evidence",
+    )
+
     unrelated_step_shell = copy.deepcopy(workflow)
     _, privileged_inputs = workflow_step(
         unrelated_step_shell["jobs"]["verify"]["steps"],
@@ -300,6 +348,14 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
             f"later checker verifier exclusion in {event_name} paths",
             f"Ubuntu workflow {event_name} paths must not contain exclusions",
         )
+        missing_repair_path = copy.deepcopy(workflow)
+        repair_triggers = missing_repair_path.get("on", missing_repair_path.get(True))
+        repair_triggers[event_name]["paths"].remove("internal/storage/**")
+        expect_workflow_rejected(
+            yaml.safe_dump(missing_repair_path, sort_keys=False),
+            f"missing repair storage path in {event_name}",
+            f"Ubuntu workflow {event_name} omits checker migration evidence paths",
+        )
 
     disabled = copy.deepcopy(workflow)
     disabled_steps = disabled["jobs"]["verify"]["steps"]
@@ -321,7 +377,7 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
     expect_workflow_rejected(
         yaml.safe_dump(unused, sort_keys=False),
         "unused migration evidence block",
-        "Ubuntu workflow lost the executable v17-to-v18 migration binary contract",
+        "Ubuntu workflow lost the executable v18-to-v19 migration binary contract",
     )
 
     non_gating = copy.deepcopy(workflow)
@@ -368,6 +424,7 @@ def main() -> int:
         ROOT / "scripts" / "run-ubuntu-migration-compatibility",
         ROOT / "scripts" / "set-ubuntu-migration-role-mode",
         ROOT / "scripts" / "verify-ubuntu-migration-role-compatibility",
+        ROOT / "scripts" / "verify-ubuntu-repair-mount-boundaries",
         ROOT / "scripts" / "verify-ubuntu-migration-lock",
         ROOT / "scripts" / "verify-ubuntu-release-failures",
         ROOT / "scripts" / "verify-ubuntu-tls-certificate",
