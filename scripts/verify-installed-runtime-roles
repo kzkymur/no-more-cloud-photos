@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 0077
 
 [[ $EUID -eq 0 ]] || { printf 'must run as root\n' >&2; exit 1; }
-[[ $# -eq 1 ]] || { printf 'usage: %s REPOSITORY_ROOT\n' "$0" >&2; exit 2; }
-repo_root=$(/usr/bin/readlink -f -- "$1")
-source_path="$repo_root/infra/validation/verify-runtime-roles.sql"
-installed_path=/usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql
-[[ -f $source_path ]] || { printf 'runtime verifier source is not a regular file\n' >&2; exit 1; }
-/usr/bin/install -o root -g root -m 0644 -- "$source_path" "$installed_path"
-[[ $(/usr/bin/stat --format='%F:%u:%g:%a' -- "$installed_path") == 'regular file:0:0:644' ]] || {
-  printf 'unsafe installed runtime verifier ownership, type, or mode\n' >&2
+[[ $# -eq 1 && $1 =~ ^[0-9]+$ ]] || {
+  printf 'usage: verify-installed-runtime-roles SQL_FD\n' >&2
+  exit 2
+}
+
+sql_fd=$1
+[[ -r /proc/self/fd/$sql_fd ]] || {
+  printf 'runtime verifier descriptor is not readable\n' >&2
   exit 1
 }
-exec /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \
-  --set=ON_ERROR_STOP=1 --file="$installed_path"
+
+exec /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C HOME=/var/lib/postgresql \
+  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc \
+  --host=/var/run/postgresql --port=5432 --username=postgres --dbname=nmcp \
+  --set=ON_ERROR_STOP=1 <&"$sql_fd"

@@ -270,7 +270,169 @@ expect_runtime_role_verifier_denied() {
     "$label" "$verifier_output" >&2
 }
 
+restore_database_schema_verifier_state() {
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "DROP SCHEMA IF EXISTS nmcp_empty_schema_probe CASCADE; \
+DROP SCHEMA IF EXISTS nmcp_rogue_owner_probe CASCADE; \
+DROP SCHEMA IF EXISTS nmcp_shadow_probe CASCADE; \
+DO \$\$ DECLARE probe name; BEGIN \
+  FOREACH probe IN ARRAY ARRAY['nmcp_database_acl_probe','nmcp_database_create_probe','nmcp_database_temp_probe','nmcp_schema_owner_probe','nmcp_shadow_owner_probe'] LOOP \
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname=probe) THEN \
+      EXECUTE pg_catalog.format('REASSIGN OWNED BY %I TO nmcp_bootstrap',probe); \
+      EXECUTE pg_catalog.format('DROP OWNED BY %I',probe); \
+      EXECUTE pg_catalog.format('DROP ROLE %I',probe); \
+    END IF; \
+  END LOOP; \
+END \$\$; \
+ALTER DATABASE nmcp OWNER TO nmcp_migrator; \
+ALTER SCHEMA public OWNER TO nmcp_migrator; \
+REVOKE ALL PRIVILEGES ON DATABASE nmcp FROM PUBLIC,nmcp_bootstrap,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner,nmcp_migrator,nmcp_api,nmcp_worker; \
+REVOKE ALL PRIVILEGES ON SCHEMA public FROM PUBLIC,nmcp_bootstrap,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner,nmcp_migrator,nmcp_api,nmcp_worker; \
+SET ROLE nmcp_migrator; \
+GRANT CREATE,CONNECT,TEMPORARY ON DATABASE nmcp TO nmcp_migrator; \
+GRANT CONNECT ON DATABASE nmcp TO nmcp_api,nmcp_worker; \
+GRANT CREATE,USAGE ON SCHEMA public TO nmcp_migrator; \
+GRANT USAGE ON SCHEMA public TO nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner; \
+RESET ROLE"
+}
+
+check_database_schema_verifier_negatives() (
+  cleanup_database_schema_probes() {
+    trap - EXIT HUP INT TERM
+    restore_database_schema_verifier_state
+  }
+  trap cleanup_database_schema_probes EXIT HUP INT TERM
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command "ALTER DATABASE nmcp OWNER TO nmcp_bootstrap"
+  expect_runtime_role_verifier_denied \
+    "database owner drift" \
+    "database owner differs from nmcp_migrator"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_database_acl_probe NOLOGIN"
+  compose exec -T postgres psql --username nmcp_migrator --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE CONNECT ON DATABASE nmcp FROM nmcp_api; \
+GRANT CONNECT ON DATABASE nmcp TO nmcp_database_acl_probe WITH GRANT OPTION"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "SET ROLE nmcp_database_acl_probe; \
+GRANT CONNECT ON DATABASE nmcp TO nmcp_api; \
+RESET ROLE"
+  expect_runtime_role_verifier_denied \
+    "database CONNECT grantor drift" \
+    "database ACL differs from exact allowlist"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command "GRANT CONNECT ON DATABASE nmcp TO PUBLIC"
+  expect_runtime_role_verifier_denied \
+    "database PUBLIC CONNECT drift" \
+    "unsafe effective database privileges for nmcp_runtime"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_database_acl_probe NOLOGIN; \
+GRANT CONNECT ON DATABASE nmcp TO nmcp_database_acl_probe"
+  expect_runtime_role_verifier_denied \
+    "database arbitrary CONNECT grantee drift" \
+    "database ACL differs from exact allowlist"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT TEMPORARY ON DATABASE nmcp TO nmcp_api WITH GRANT OPTION"
+  expect_runtime_role_verifier_denied \
+    "API database TEMPORARY grant-option drift" \
+    "unsafe effective database privileges for nmcp_api"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command "GRANT CREATE ON DATABASE nmcp TO nmcp_worker"
+  expect_runtime_role_verifier_denied \
+    "Worker database CREATE drift" \
+    "unsafe effective database privileges for nmcp_worker"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_database_create_probe NOLOGIN; \
+GRANT CREATE ON DATABASE nmcp TO nmcp_database_create_probe; \
+GRANT nmcp_database_create_probe TO nmcp_api WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"
+  expect_runtime_role_verifier_denied \
+    "API inherited database CREATE drift" \
+    "unsafe effective database privileges for nmcp_api"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_database_temp_probe NOLOGIN; \
+GRANT TEMPORARY ON DATABASE nmcp TO nmcp_database_temp_probe; \
+GRANT nmcp_database_temp_probe TO nmcp_worker WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"
+  expect_runtime_role_verifier_denied \
+    "Worker inherited database TEMPORARY drift" \
+    "unsafe effective database privileges for nmcp_worker"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command "REVOKE CONNECT ON DATABASE nmcp FROM nmcp_api"
+  expect_runtime_role_verifier_denied \
+    "API missing database CONNECT" \
+    "unsafe effective database privileges for nmcp_api"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command "ALTER SCHEMA public OWNER TO nmcp_bootstrap"
+  expect_runtime_role_verifier_denied \
+    "public schema owner drift" \
+    "non-system schema inventory differs from exact allowlist"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command "REVOKE USAGE ON SCHEMA public FROM nmcp_runtime"
+  expect_runtime_role_verifier_denied \
+    "public schema missing runtime USAGE" \
+    "public schema owner or ACL differs from exact allowlist"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command "CREATE SCHEMA nmcp_empty_schema_probe"
+  expect_runtime_role_verifier_denied \
+    "unexpected empty schema" \
+    "non-system schema inventory differs from exact allowlist"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_schema_owner_probe NOLOGIN; \
+CREATE SCHEMA nmcp_rogue_owner_probe AUTHORIZATION nmcp_schema_owner_probe"
+  expect_runtime_role_verifier_denied \
+    "unexpected rogue-owned schema" \
+    "non-system schema inventory differs from exact allowlist"
+  restore_database_schema_verifier_state
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_shadow_owner_probe NOLOGIN; \
+CREATE SCHEMA nmcp_shadow_probe AUTHORIZATION nmcp_shadow_owner_probe; \
+CREATE FUNCTION nmcp_shadow_probe.nmcp_require_normal_maintenance() RETURNS void LANGUAGE sql AS 'SELECT'"
+  expect_runtime_role_verifier_denied \
+    "unexpected shadowing schema object" \
+    "non-system schema inventory differs from exact allowlist"
+  restore_database_schema_verifier_state
+  run_runtime_role_verifier
+
+  trap - EXIT HUP INT TERM
+)
+
 check_runtime_role_verifier_negatives() {
+  check_database_schema_verifier_negatives
+
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "ALTER FUNCTION public.nmcp_read_check_database_references(timestamptz) OWNER TO nmcp_repair_function_owner"

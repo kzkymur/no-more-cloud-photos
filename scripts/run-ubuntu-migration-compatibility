@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2317 # trap-dispatched handlers are reached indirectly
+# shellcheck disable=SC2317,SC2329 # trap-dispatched handlers are reached indirectly
 set -euo pipefail
 umask 0077
 
@@ -13,12 +13,16 @@ umask 0077
 }
 admin=$1
 shift
-[[ -f $admin && ! -L $admin && -x $admin ]] || {
+if [[ $admin =~ ^/proc/self/fd/[0-9]+$ ]]; then
+  [[ -f $admin && -x $admin ]]
+else
+  [[ -f $admin && ! -L $admin && -x $admin ]]
+fi || {
   printf 'run-ubuntu-migration-compatibility: unsafe admin binary\n' >&2
   exit 1
 }
 
-role_mode=/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode
+role_mode=${NMCP_ROLE_MODE:-/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode}
 migration_status=0
 signal_status=0
 finalized=false

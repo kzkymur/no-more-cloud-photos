@@ -35,7 +35,11 @@ $$;
 \set nmcp_api_role nmcp_api
 \set nmcp_worker_role nmcp_worker
 \set nmcp_roles_in_transaction 1
+\if :{?nmcp_runtime_roles_file}
+\i :nmcp_runtime_roles_file
+\else
 \ir ../postgresql/runtime-roles.sql
+\endif
 
 SELECT format('ALTER DATABASE %I OWNER TO nmcp_migrator', current_database())
 \gexec

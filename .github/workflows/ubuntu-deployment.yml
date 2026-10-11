@@ -38,6 +38,8 @@ on:
       - "scripts/verify-installed-runtime-roles"
       - "scripts/verify-ubuntu-migration-lock"
       - "scripts/verify-ubuntu-migration-role-compatibility"
+      - "scripts/verify-ubuntu-migration-role-stage"
+      - "scripts/verify-ubuntu-migration-role-supervisor"
       - "scripts/verify-ubuntu-repair-mount-boundaries"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
@@ -85,6 +87,8 @@ on:
       - "scripts/verify-installed-runtime-roles"
       - "scripts/verify-ubuntu-migration-lock"
       - "scripts/verify-ubuntu-migration-role-compatibility"
+      - "scripts/verify-ubuntu-migration-role-stage"
+      - "scripts/verify-ubuntu-migration-role-supervisor"
       - "scripts/verify-ubuntu-repair-mount-boundaries"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
@@ -108,9 +112,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -123,6 +128,46 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck util-linux
+
+      - name: Run trusted migration compatibility transaction
+        run: |
+          go_binary=$(command -v go)
+          cd /
+          /usr/bin/sudo -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C HOME=/root \
+            GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            NMCP_WORKSPACE="$GITHUB_WORKSPACE" NMCP_CURRENT_COMMIT="${{ github.sha }}" \
+            NMCP_GO_BINARY="$go_binary" /usr/bin/python3 -I -S - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          workspace = os.environ["NMCP_WORKSPACE"]
+          commit = os.environ["NMCP_CURRENT_COMMIT"]
+          go_binary = os.environ["NMCP_GO_BINARY"]
+          git_environment = {
+              "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+              "LC_ALL": "C",
+              "HOME": "/root",
+              "GIT_NO_REPLACE_OBJECTS": "1",
+              "GIT_CONFIG_NOSYSTEM": "1",
+              "GIT_CONFIG_GLOBAL": "/dev/null",
+          }
+          resolved = subprocess.run(
+              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
+               "rev-parse", "--verify", f"{commit}^{{commit}}"),
+              cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
+          ).stdout.decode("ascii").strip()
+          if resolved != commit:
+              raise SystemExit("candidate commit identity mismatch")
+          source = subprocess.run(
+              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
+               "show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"),
+              cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
+          ).stdout
+          sys.argv = ["verify-ubuntu-migration-role-supervisor", workspace, commit, go_binary]
+          namespace = {"__name__": "__main__", "__file__": f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"}
+          exec(compile(source, namespace["__file__"], "exec"), namespace)
+          PY
 
       - name: Check shell scripts
         run: |
@@ -178,15 +223,6 @@ jobs:
 
       - name: Verify migration serialization races
         run: sudo scripts/verify-ubuntu-migration-lock
-
-      - name: Verify migration role compatibility and hardening
-        run: |
-          go build -o /tmp/nmcp-admin-current ./cmd/nmcp-admin
-          mkdir /tmp/nmcp-v18-source
-          git archive 172583179d860619ae2c79505971e10ae7f394fc | tar -x -C /tmp/nmcp-v18-source
-          (cd /tmp/nmcp-v18-source && go build -o /tmp/nmcp-admin-v18 ./cmd/nmcp-admin)
-          sudo scripts/verify-ubuntu-migration-role-compatibility \
-            /tmp/nmcp-admin-current /tmp/nmcp-admin-v18
 
       - name: Verify release activation and rollback failure transactions
         run: sudo scripts/verify-ubuntu-release-failures

@@ -1,5 +1,79 @@
 \set ON_ERROR_STOP on
 
+-- The verifier is meaningful only against the production database identity.
+-- Close both the stored ACL and each managed role's effective capabilities so
+-- an inherited privilege cannot hide behind an otherwise familiar direct ACL.
+DO $$
+DECLARE
+    managed record;
+BEGIN
+    IF pg_catalog.current_database() <> 'nmcp' THEN
+        RAISE EXCEPTION 'database identity differs from nmcp';
+    END IF;
+    IF (SELECT pg_catalog.pg_get_userbyid(d.datdba)
+        FROM pg_catalog.pg_database AS d
+        WHERE d.datname=pg_catalog.current_database()) <> 'nmcp_migrator' THEN
+        RAISE EXCEPTION 'database owner differs from nmcp_migrator';
+    END IF;
+
+    FOR managed IN SELECT * FROM (VALUES
+        ('nmcp_runtime',false),
+        ('nmcp_worker_runtime',false),
+        ('nmcp_purge_function_owner',false),
+        ('nmcp_check_runtime',false),
+        ('nmcp_repair_runtime',false),
+        ('nmcp_check_function_owner',false),
+        ('nmcp_repair_function_owner',false),
+        ('nmcp_api',true),
+        ('nmcp_worker',true)
+    ) AS roles(role_name,connect_allowed)
+    LOOP
+        IF pg_catalog.has_database_privilege(
+               managed.role_name,pg_catalog.current_database(),'CREATE'
+           )
+           OR pg_catalog.has_database_privilege(
+               managed.role_name,pg_catalog.current_database(),'TEMPORARY'
+           )
+           OR pg_catalog.has_database_privilege(
+               managed.role_name,pg_catalog.current_database(),'CONNECT'
+           ) IS DISTINCT FROM managed.connect_allowed THEN
+            RAISE EXCEPTION 'unsafe effective database privileges for %',managed.role_name;
+        END IF;
+    END LOOP;
+
+    IF (SELECT count(*)
+        FROM pg_catalog.pg_database AS d
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(d.datacl,pg_catalog.acldefault('d',d.datdba))
+        ) AS acl
+        WHERE d.datname=pg_catalog.current_database()) <> 5
+       OR EXISTS (
+        WITH expected(grantee,grantor,privilege_type,is_grantable) AS (VALUES
+            ('nmcp_migrator','nmcp_migrator','CREATE',false),
+            ('nmcp_migrator','nmcp_migrator','CONNECT',false),
+            ('nmcp_migrator','nmcp_migrator','TEMPORARY',false),
+            ('nmcp_api','nmcp_migrator','CONNECT',false),
+            ('nmcp_worker','nmcp_migrator','CONNECT',false)
+        ), actual AS (
+            SELECT CASE WHEN acl.grantee=0 THEN 'PUBLIC'
+                        ELSE pg_catalog.pg_get_userbyid(acl.grantee)::text END,
+                   pg_catalog.pg_get_userbyid(acl.grantor)::text,
+                   acl.privilege_type,acl.is_grantable
+            FROM pg_catalog.pg_database AS d
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                COALESCE(d.datacl,pg_catalog.acldefault('d',d.datdba))
+            ) AS acl
+            WHERE d.datname=pg_catalog.current_database()
+        )
+        (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        UNION ALL
+        (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) THEN
+        RAISE EXCEPTION 'database ACL differs from exact allowlist';
+    END IF;
+END;
+$$;
+
 DO $$
 DECLARE
     completion regprocedure := pg_catalog.to_regprocedure(
@@ -520,14 +594,27 @@ BEGIN
 END;
 $$;
 
--- The public schema is the publication boundary for every protected relation
--- and privileged function. Close its owner and ACL catalog exactly so no role
--- can create shadow objects or publish new entry points outside the inventory.
+-- The non-system schema set is part of the publication boundary. Close the
+-- inventory plus the public owner and ACL so no role can add shadow objects or
+-- publish new entry points outside the inventory.
 DO $$
 BEGIN
-    IF (SELECT pg_catalog.pg_get_userbyid(n.nspowner) FROM pg_catalog.pg_namespace AS n WHERE n.nspname='public')
-       <> 'nmcp_migrator'
-       OR EXISTS (
+    IF EXISTS (
+        WITH expected(schema_name,owner_name) AS (VALUES
+            ('public','nmcp_migrator')
+        ), actual AS (
+            SELECT n.nspname::text,pg_catalog.pg_get_userbyid(n.nspowner)::text
+            FROM pg_catalog.pg_namespace AS n
+            WHERE n.nspname<>'information_schema'
+              AND pg_catalog.left(n.nspname,3)<>'pg_'
+        )
+        (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        UNION ALL
+        (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) THEN
+        RAISE EXCEPTION 'non-system schema inventory differs from exact allowlist';
+    END IF;
+    IF EXISTS (
         WITH expected(grantee,grantor,privilege_type,is_grantable) AS (VALUES
             ('nmcp_migrator','nmcp_migrator','CREATE',false),
             ('nmcp_migrator','nmcp_migrator','USAGE',false),

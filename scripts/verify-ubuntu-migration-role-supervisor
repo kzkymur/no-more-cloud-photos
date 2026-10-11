@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Build, seal, execute, and remove migration-role compatibility evidence.
+
+Independent review authorizes candidate bytes. Manifests and AST checks provide
+regression/integrity evidence, never authentication. Without an externally
+protected workflow they cannot defend against candidate/verifier collusion.
+The hostile-root threat model is explicitly out of scope.
+"""
+
+import fcntl
+import hashlib
+import io
+import json
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+CURRENT_ASSETS = {
+    "supervisor": ("scripts/verify-ubuntu-migration-role-supervisor", "trusted root supervisor", 0o500),
+    "phase": ("scripts/verify-ubuntu-migration-role-compatibility", "compatibility phase entrypoint", 0o500),
+    "runtime-helper": ("scripts/verify-installed-runtime-roles", "runtime boundary helper", 0o500),
+    "verify-stage": ("scripts/verify-ubuntu-migration-role-stage", "closed snapshot verifier", 0o500),
+    "role-mode": ("scripts/set-ubuntu-migration-role-mode", "migration role mode wrapper", 0o755),
+    "migration-wrapper": ("scripts/run-ubuntu-migration-compatibility", "migration compatibility wrapper", 0o755),
+    "runtime-roles.sql": ("infra/postgresql/runtime-roles.sql", "runtime role bootstrap SQL", 0o644),
+    "verify-role-graph.sql": ("infra/postgresql/verify-runtime-role-graph.sql", "role graph verifier SQL", 0o644),
+    "postgresql-roles.sql": ("infra/ubuntu/postgresql-roles.sql", "database bootstrap SQL", 0o644),
+    "verify-runtime-roles.sql": ("infra/validation/verify-runtime-roles.sql", "independent runtime verifier SQL", 0o644),
+    "nmcp.sysusers": ("infra/ubuntu/sysusers.d/nmcp.conf", "nmcp system user declaration", 0o400),
+}
+PHASES = (
+    "fresh-current", "current-rerun", "hostile-libpq", "stale-compatibility",
+    "migration-failure", "signal-int", "signal-term", "sigkill-recovery",
+    "graph-verifier-failure", "upgrade-v18-v19", "unfinished-v18-rejection",
+    "completed-v18-rejection", "writer-drain",
+)
+HISTORICAL = "172583179d860619ae2c79505971e10ae7f394fc"
+MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+ACTIVE_PHASE = None
+
+
+def die(message):
+    raise RuntimeError(message)
+
+
+def interrupted(signum, _frame):
+    raise RuntimeError(f"supervisor interrupted by signal {signum}")
+
+
+def clean_env(home="/root"):
+    return {
+        "PATH": MINIMAL_PATH, "LC_ALL": "C", "LANG": "C", "HOME": home,
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GOWORK": "off",
+        "GOFLAGS": "-mod=readonly", "GOTOOLCHAIN": "local",
+    }
+
+
+def run(argv, *, cwd="/", env=None, pass_fds=(), stdin=None, stdout=None):
+    return subprocess.run(argv, cwd=cwd, env=env or clean_env(), check=True,
+                          pass_fds=pass_fds, stdin=stdin, stdout=stdout)
+
+
+def run_phase(argv, *, env, pass_fds):
+    global ACTIVE_PHASE
+    process = subprocess.Popen(argv, cwd="/", env=env, pass_fds=pass_fds,
+                               start_new_session=True)
+    ACTIVE_PHASE = process
+    try:
+        status = process.wait()
+        if status:
+            raise subprocess.CalledProcessError(status, argv)
+    finally:
+        if process.poll() is not None:
+            ACTIVE_PHASE = None
+
+
+def git(repo, *args, stdout=None):
+    return subprocess.run(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo, *args), cwd="/", env=clean_env(),
+                          check=True, stdout=stdout or subprocess.PIPE).stdout
+
+
+def archive_tree(repo, commit, destination):
+    resolved = git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}").decode().strip()
+    if resolved != commit:
+        die(f"commit identity mismatch: {commit}")
+    tree = git(repo, "rev-parse", "--verify", f"{commit}^{{tree}}").decode().strip()
+    listing = git(repo, "ls-tree", "-r", "-z", commit).split(b"\0")
+    expected_files = {}
+    for record in filter(None, listing):
+        metadata, raw_name = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.split(b" ")
+        if kind != b"blob" or mode not in (b"100644", b"100755"):
+            die(f"submodule or unexpected git mode in {commit}: {record!r}")
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("non-UTF-8 archive name") from error
+        expected_files[name] = (
+            0o755 if mode == b"100755" else 0o644,
+            object_id.decode("ascii"),
+        )
+    expected_directories = set()
+    for name in expected_files:
+        parent = os.path.dirname(name)
+        while parent:
+            expected_directories.add(parent)
+            parent = os.path.dirname(parent)
+    archive = git(repo, "archive", "--format=tar", commit)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as source:
+        seen_files = set()
+        seen_directories = set()
+        for member in source.getmembers():
+            normalized = os.path.normpath(member.name)
+            if normalized != member.name.rstrip("/") or normalized.startswith("../") or os.path.isabs(member.name):
+                die("archive path escapes build tree")
+            if member.isdir() and normalized in expected_directories:
+                seen_directories.add(normalized)
+                if member.mode not in (0o755, 0o775):
+                    die(f"archive contains unexpected directory mode: {member.name}")
+                member.mode = 0o755
+            elif member.isreg() and normalized in expected_files:
+                seen_files.add(normalized)
+                expected_mode, _object_id = expected_files[normalized]
+                if member.mode not in (expected_mode, expected_mode | 0o020):
+                    die(f"archive contains unexpected file mode: {member.name}")
+                member.mode = expected_mode
+            else:
+                die(f"archive contains nonregular member: {member.name}")
+        if seen_files != set(expected_files) or seen_directories != expected_directories:
+            die("archive inventory differs from the commit tree")
+        source.extractall(destination, filter=lambda member, _path: member)
+    # Git attributes such as export-subst may rewrite archive members. Bind
+    # every extracted byte sequence back to its exact reviewed tree blob before
+    # any build or snapshot consumes it.
+    for name, (expected_mode, object_id) in expected_files.items():
+        path = os.path.join(destination, name)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    or stat.S_IMODE(metadata.st_mode) != expected_mode):
+                die(f"unsafe extracted archive member: {name}")
+            extracted = bytearray()
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                extracted.extend(block)
+            after = os.fstat(descriptor)
+            identity = lambda value: (
+                value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                value.st_gid, value.st_nlink, value.st_size,
+                value.st_mtime_ns, value.st_ctime_ns,
+            )
+            if identity(after) != identity(metadata):
+                die(f"archive member changed while verified: {name}")
+        finally:
+            os.close(descriptor)
+        blob = git(repo, "cat-file", "blob", object_id)
+        if extracted != blob:
+            die(f"archive member differs from reviewed Git blob: {name}")
+    return tree
+
+
+def build_admin(source, output, go_binary):
+    if not os.path.isabs(go_binary):
+        die("Go tool path must be absolute")
+    version = subprocess.run((go_binary, "version"), env=clean_env(), cwd="/",
+                             check=True, text=True, stdout=subprocess.PIPE).stdout
+    if " go1.27.1 " not in version:
+        die(f"unexpected Go toolchain: {version.strip()}")
+    env = clean_env(source)
+    env["PATH"] = os.path.dirname(go_binary) + ":/usr/bin:/bin"
+    run((go_binary, "build", "-trimpath", "-o", output, "./cmd/nmcp-admin"), cwd=source, env=env)
+    return version.strip()
+
+
+def write_all(descriptor, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            die("short write while publishing trusted input")
+        view = view[written:]
+
+
+def copy_regular(source, destination, mode):
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            die(f"unsafe source asset: {source}")
+        data = bytearray()
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(source_fd, 1024 * 1024)
+            if not block:
+                break
+            data.extend(block)
+            digest.update(block)
+        after = os.fstat(source_fd)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )
+        if identity(before) != identity(after) or len(data) != before.st_size:
+            die(f"source changed while copied: {source}")
+    finally:
+        os.close(source_fd)
+    target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        write_all(target_fd, data)
+        os.fchmod(target_fd, mode)
+        os.fsync(target_fd)
+        target = os.fstat(target_fd)
+        if target.st_nlink != 1 or target.st_size != len(data):
+            die(f"unsafe published asset: {destination}")
+    finally:
+        os.close(target_fd)
+    return digest.hexdigest(), len(data)
+
+
+def remove_owned(path, identity):
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (observed.st_dev, observed.st_ino) != identity:
+        die(f"cleanup identity changed: {path}")
+    if stat.S_ISDIR(observed.st_mode):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def open_verified(root_fd, manifest, name):
+    item = manifest[name]
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+    before = os.fstat(fd)
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    after = os.fstat(fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+    values = (after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode), after.st_size, digest.hexdigest())
+    expected = (item["uid"], item["gid"], item["mode"], item["size"], item["sha256"])
+    identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+    if identity(before) != identity(after) or after.st_nlink != 1 or not stat.S_ISREG(after.st_mode) or values != expected:
+        os.close(fd)
+        die(f"manifest binding failed: {name}")
+    return fd
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 4:
+        die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO")
+    os.chdir("/")
+    os.umask(0o077)
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
+    repo, current_commit, go_binary = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
+    if current_commit != git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip():
+        die("checkout HEAD is not the requested candidate commit")
+    os.makedirs("/run/nmcp-ci", mode=0o700, exist_ok=True)
+    run_stat = os.lstat("/run/nmcp-ci")
+    if not stat.S_ISDIR(run_stat.st_mode) or run_stat.st_uid != 0 or run_stat.st_gid != 0 or stat.S_IMODE(run_stat.st_mode) != 0o700:
+        die("unsafe /run/nmcp-ci")
+    lock_fd = os.open("/run/nmcp-ci/transaction.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock_stat = os.fstat(lock_fd)
+    if (not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != 0
+            or lock_stat.st_gid != 0 or lock_stat.st_nlink != 1
+            or stat.S_IMODE(lock_stat.st_mode) != 0o600):
+        die("unsafe transaction lock")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    run_root = tempfile.mkdtemp(prefix="transaction-", dir="/run/nmcp-ci")
+    os.chmod(run_root, 0o700)
+    run_identity = (os.lstat(run_root).st_dev, os.lstat(run_root).st_ino)
+    owned = []
+    trace = []
+    snapshot_fd = None
+    try:
+        current_source = os.path.join(run_root, "current-source")
+        historical_source = os.path.join(run_root, "v18-source")
+        os.mkdir(current_source, 0o700)
+        os.mkdir(historical_source, 0o700)
+        current_tree = archive_tree(repo, current_commit, current_source)
+        historical_tree = archive_tree(repo, HISTORICAL, historical_source)
+        current_admin = os.path.join(run_root, "nmcp-admin-current.build")
+        historical_admin = os.path.join(run_root, "nmcp-admin-v18.build")
+        current_toolchain = build_admin(current_source, current_admin, go_binary)
+        historical_toolchain = build_admin(historical_source, historical_admin, go_binary)
+        if current_toolchain != historical_toolchain:
+            die("admin builds used different Go toolchains")
+
+        snapshot = os.path.join(run_root, "snapshot")
+        snapshot_build = os.path.join(run_root, "snapshot.build")
+        os.mkdir(snapshot_build, 0o700)
+        records = []
+        for name, (relative, purpose, mode) in CURRENT_ASSETS.items():
+            digest, size = copy_regular(os.path.join(current_source, relative), os.path.join(snapshot_build, name), mode)
+            records.append({"name": name, "purpose": purpose, "provenance_commit": current_commit,
+                            "provenance_tree": current_tree, "type": "regular", "uid": 0, "gid": 0,
+                            "mode": mode, "size": size, "sha256": digest, "toolchain": None})
+        for name, source, purpose, commit, tree, toolchain in (
+            ("nmcp-admin-current", current_admin, "candidate migration admin", current_commit, current_tree, current_toolchain),
+            ("nmcp-admin-v18", historical_admin, "approved v18 migration admin", HISTORICAL, historical_tree, historical_toolchain),
+        ):
+            digest, size = copy_regular(source, os.path.join(snapshot_build, name), 0o755)
+            records.append({"name": name, "purpose": purpose, "provenance_commit": commit,
+                            "provenance_tree": tree, "type": "regular", "uid": 0, "gid": 0,
+                            "mode": 0o755, "size": size, "sha256": digest, "toolchain": toolchain})
+        records.sort(key=lambda item: item["name"])
+        raw_manifest = (json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("ascii")
+        manifest_path = os.path.join(snapshot_build, "manifest.json")
+        manifest_fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        write_all(manifest_fd, raw_manifest)
+        os.fchmod(manifest_fd, 0o400)
+        os.fsync(manifest_fd)
+        os.close(manifest_fd)
+        fsync_directory(snapshot_build)
+        os.rename(snapshot_build, snapshot)
+        fsync_directory(run_root)
+        snapshot_fd = os.open(snapshot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        manifest = {item["name"]: item for item in records}
+
+        verifier_fd = open_verified(snapshot_fd, manifest, "verify-stage")
+        try:
+            run(("/usr/bin/python3", "-I", "-S", f"/proc/self/fd/{verifier_fd}", snapshot), pass_fds=(verifier_fd,))
+        finally:
+            os.close(verifier_fd)
+
+        for path in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):
+            if os.path.lexists(path):
+                die(f"refusing existing path: {path}")
+        for path, mode in (("/usr/local/libexec/nmcp/postgresql", 0o755), ("/var/lib/nmcp/deployment", 0o700),
+                           ("/opt/nmcp-role-compatibility/current/bin", 0o755), ("/opt/nmcp-role-compatibility/v18/bin", 0o755)):
+            os.makedirs(path, mode=mode)
+            os.chmod(path, mode)
+        for path in ("/usr/local/libexec/nmcp", "/opt/nmcp-role-compatibility",
+                     "/opt/nmcp-role-compatibility/current", "/opt/nmcp-role-compatibility/v18"):
+            os.chmod(path, 0o755)
+        for top in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):
+            value = os.lstat(top)
+            owned.append((top, (value.st_dev, value.st_ino)))
+        installs = {
+            "role-mode": "/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode",
+            "migration-wrapper": "/usr/local/libexec/nmcp/run-ubuntu-migration-compatibility",
+            "runtime-helper": "/usr/local/libexec/nmcp/verify-installed-runtime-roles",
+            "runtime-roles.sql": "/usr/local/libexec/nmcp/postgresql/runtime-roles.sql",
+            "verify-role-graph.sql": "/usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql",
+            "postgresql-roles.sql": "/usr/local/libexec/nmcp/postgresql/postgresql-roles.sql",
+            "verify-runtime-roles.sql": "/usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql",
+            "nmcp-admin-current": "/opt/nmcp-role-compatibility/current/bin/nmcp-admin",
+            "nmcp-admin-v18": "/opt/nmcp-role-compatibility/v18/bin/nmcp-admin",
+        }
+        for name, destination in installs.items():
+            source_fd = open_verified(snapshot_fd, manifest, name)
+            try:
+                data = b""
+                while True:
+                    block = os.read(source_fd, 1024 * 1024)
+                    if not block: break
+                    data += block
+                target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, manifest[name]["mode"])
+                write_all(target_fd, data); os.fchmod(target_fd, manifest[name]["mode"]); os.fsync(target_fd); os.close(target_fd)
+            finally:
+                os.close(source_fd)
+        for directory in ("/usr/local/libexec/nmcp", "/usr/local/libexec/nmcp/postgresql",
+                          "/opt/nmcp-role-compatibility/current/bin", "/opt/nmcp-role-compatibility/v18/bin"):
+            fsync_directory(directory)
+        checksum = subprocess.run(("/usr/bin/sha256sum", "runtime-roles.sql", "verify-runtime-role-graph.sql"),
+                                  cwd="/usr/local/libexec/nmcp/postgresql", env=clean_env(), check=True, stdout=subprocess.PIPE).stdout
+        checksum_fd = os.open("/var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        write_all(checksum_fd, checksum); os.fsync(checksum_fd); os.close(checksum_fd)
+        fsync_directory("/var/lib/nmcp/deployment")
+        run(("/usr/bin/systemctl", "start", "postgresql"))
+        if subprocess.run(("/usr/bin/id", "nmcp"), env=clean_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            sysusers_fd = open_verified(snapshot_fd, manifest, "nmcp.sysusers")
+            try:
+                run(("/usr/bin/systemd-sysusers", f"/proc/self/fd/{sysusers_fd}"), pass_fds=(sysusers_fd,))
+            finally:
+                os.close(sysusers_fd)
+        phase_env = clean_env("/root")
+        phase_env.update({"NMCP_COMPAT_WORK": "/opt/nmcp-role-compatibility/test-work",
+                          "NMCP_DATABASE_URL": "postgres://nmcp_migrator:nmcp-migrator-wrapper-test@127.0.0.1:5432/nmcp?sslmode=disable",
+                          "NMCP_LOG_LEVEL": "info", "NMCP_SHUTDOWN_TIMEOUT": "10s"})
+        os.mkdir(phase_env["NMCP_COMPAT_WORK"], 0o755)
+        os.chmod(phase_env["NMCP_COMPAT_WORK"], 0o755)
+        for phase in PHASES:
+            trace.append(f"phase-start:{phase}")
+            phase_fd = open_verified(snapshot_fd, manifest, "phase")
+            phase_inputs = {}
+            try:
+                for variable, name in (
+                    ("NMCP_WRAPPER", "migration-wrapper"),
+                    ("NMCP_ROLE_MODE", "role-mode"),
+                    ("NMCP_CURRENT_ADMIN", "nmcp-admin-current"),
+                    ("NMCP_V18_ADMIN", "nmcp-admin-v18"),
+                    ("NMCP_POSTGRESQL_ROLES", "postgresql-roles.sql"),
+                    ("NMCP_RUNTIME_ROLES", "runtime-roles.sql"),
+                    ("NMCP_VERIFY_ROLE_GRAPH", "verify-role-graph.sql"),
+                ):
+                    installed_fd = os.open(installs[name], os.O_RDONLY | os.O_NOFOLLOW)
+                    item = manifest[name]
+                    before = os.fstat(installed_fd)
+                    digest = hashlib.sha256()
+                    while True:
+                        block = os.read(installed_fd, 1024 * 1024)
+                        if not block:
+                            break
+                        digest.update(block)
+                    after = os.fstat(installed_fd)
+                    identity = lambda value: (
+                        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                        value.st_gid, value.st_nlink, value.st_size,
+                        value.st_mtime_ns, value.st_ctime_ns,
+                    )
+                    observed = (
+                        after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode),
+                        after.st_size, digest.hexdigest(),
+                    )
+                    expected = (
+                        item["uid"], item["gid"], item["mode"], item["size"], item["sha256"],
+                    )
+                    if (identity(before) != identity(after) or not stat.S_ISREG(after.st_mode)
+                            or after.st_nlink != 1 or observed != expected):
+                        os.close(installed_fd)
+                        die(f"installed phase asset mismatch: {name}")
+                    os.lseek(installed_fd, 0, os.SEEK_SET)
+                    phase_inputs[variable] = installed_fd
+                    phase_env[variable] = f"/proc/self/fd/{installed_fd}"
+                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),
+                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))
+            finally:
+                os.close(phase_fd)
+                for descriptor in phase_inputs.values():
+                    os.close(descriptor)
+                for variable in phase_inputs:
+                    phase_env.pop(variable, None)
+            trace.append(f"phase-success:{phase}")
+            trace.append(f"boundary-start:{phase}")
+            staged_helper = open_verified(snapshot_fd, manifest, "runtime-helper")
+            staged_sql = open_verified(snapshot_fd, manifest, "verify-runtime-roles.sql")
+            installed_helper = os.open(installs["runtime-helper"], os.O_RDONLY | os.O_NOFOLLOW)
+            installed_sql = os.open(installs["verify-runtime-roles.sql"], os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                for fd, name in ((installed_helper, "runtime-helper"), (installed_sql, "verify-runtime-roles.sql")):
+                    before = os.fstat(fd)
+                    hasher = hashlib.sha256()
+                    while True:
+                        block = os.read(fd, 1024 * 1024)
+                        if not block:
+                            break
+                        hasher.update(block)
+                    observed = os.fstat(fd)
+                    digest = hasher.hexdigest()
+                    os.lseek(fd, 0, 0)
+                    item = manifest[name]
+                    identity = lambda value: (
+                        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                        value.st_gid, value.st_nlink, value.st_size,
+                        value.st_mtime_ns, value.st_ctime_ns,
+                    )
+                    if identity(before) != identity(observed) or observed.st_nlink != 1 or not stat.S_ISREG(observed.st_mode) or (observed.st_uid, observed.st_gid, stat.S_IMODE(observed.st_mode), observed.st_size, digest) != (0, 0, item["mode"], item["size"], item["sha256"]):
+                        die(f"installed boundary asset mismatch: {name}")
+                # Execute the installed helper and feed the independently opened installed SQL descriptor.
+                run(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{installed_helper}", str(installed_sql)),
+                    pass_fds=(installed_helper, installed_sql, staged_helper, staged_sql), stdout=subprocess.DEVNULL)
+            finally:
+                for fd in (staged_helper, staged_sql, installed_helper, installed_sql): os.close(fd)
+            trace.append(f"boundary-success:{phase}")
+        expected = [entry for phase in PHASES for entry in (f"phase-start:{phase}", f"phase-success:{phase}", f"boundary-start:{phase}", f"boundary-success:{phase}")]
+        if trace != expected:
+            die("final trace differs from the fixed phase table")
+        print("\n".join(trace), flush=True)
+        print("Ubuntu migration role compatibility verification passed", flush=True)
+    finally:
+        cleanup_errors = []
+        if ACTIVE_PHASE is not None and ACTIVE_PHASE.poll() is None:
+            try:
+                os.killpg(ACTIVE_PHASE.pid, signal.SIGTERM)
+                try:
+                    ACTIVE_PHASE.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(ACTIVE_PHASE.pid, signal.SIGKILL)
+                    ACTIVE_PHASE.wait()
+            except ProcessLookupError:
+                pass
+        if snapshot_fd is not None:
+            try:
+                os.close(snapshot_fd)
+            except OSError as error:
+                cleanup_errors.append(error)
+        subprocess.run(("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp"), env=clean_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc", "--dbname=postgres", "--set=ON_ERROR_STOP=1", "--command", "DROP ROLE IF EXISTS nmcp_graph_probe,nmcp_graph_bridge,nmcp_api,nmcp_worker,nmcp_migrator,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner"), env=clean_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for path, identity in reversed(owned):
+            try:
+                remove_owned(path, identity)
+            except Exception as error:
+                cleanup_errors.append(error)
+        try:
+            remove_owned(run_root, run_identity)
+        except Exception as error:
+            cleanup_errors.append(error)
+        os.close(lock_fd)
+        if cleanup_errors:
+            raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"trusted-supervisor: {error}", file=sys.stderr)
+        raise SystemExit(1)
