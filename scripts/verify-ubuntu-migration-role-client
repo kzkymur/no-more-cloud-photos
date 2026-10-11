@@ -325,7 +325,7 @@ def retry_owned_command(invocation, nonce, service_command, name, action, *argum
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             errors.append(error)
             if attempt + 1 < ACTION_ATTEMPTS:
-                time.sleep(0.05)
+                time.sleep(ACTION_RETRY_BACKOFF)
     fail(f"owned {name} command remains unavailable: " + "; ".join(map(str, errors)))
 
 

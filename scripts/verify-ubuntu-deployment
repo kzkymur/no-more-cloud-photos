@@ -548,6 +548,18 @@ def validate_client(source: str) -> None:
     tree = ast.parse(source, filename="verify-ubuntu-migration-role-client")
     require(literal_assignment(tree, "UNIT") == "nmcp-migration-role-verifier.service",
             "client fixed transient service unit name changed")
+    require_exact_assignment(tree, "RUN", 'RUN = "/run/nmcp-ci"',
+                             "client runtime directory changed")
+    require_exact_assignment(tree, "PROGRAM", 'PROGRAM = RUN + "/supervisor.py"',
+                             "client staged supervisor path changed")
+    require_exact_assignment(tree, "PATH", 'PATH = "/usr/bin:/bin:/usr/sbin:/sbin"',
+                             "client sanitized executable path changed")
+    require_exact_assignment(tree, "ENVIRONMENT", '''ENVIRONMENT = {
+    "PATH": PATH, "LC_ALL": "C", "LANG": "C", "HOME": "/root",
+    "GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+}
+''', "client sanitized environment table changed")
     require(literal_assignment(tree, "NONCE_VARIABLE") == "NMCP_VERIFIER_NONCE"
             and literal_assignment(tree, "DESCRIPTION_PREFIX") == "NMCP migration role verifier ",
             "client nonce launch labels changed")
@@ -1134,20 +1146,25 @@ finally:
     }
     forbidden_reflection = {
         "eval", "exec", "compile", "getattr", "setattr", "delattr",
-        "globals", "locals", "vars", "__import__",
+        "globals", "locals", "vars", "__import__", "_getframe",
+        "__getattribute__", "__setattr__", "__delattr__",
     }
     reflection_nodes = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Name)
         and node.id in forbidden_reflection | {"importlib", "builtins", "__builtins__"}
         or isinstance(node, ast.Attribute)
-        and node.attr in forbidden_reflection | {"__dict__", "importlib", "builtins"}
+        and node.attr in forbidden_reflection | {
+            "__dict__", "__globals__", "f_globals", "f_locals", "gi_frame", "cr_frame", "tb_frame",
+            "modules", "importlib", "builtins",
+        }
         or isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
         and node.value.id == "sys" and node.attr == "modules"
         or isinstance(node, ast.Import)
-        and any(alias.name.split(".", 1)[0] in {"importlib", "builtins"} for alias in node.names)
+        and any(alias.name.split(".", 1)[0] in {"__main__", "importlib", "builtins"}
+                for alias in node.names)
         or isinstance(node, ast.ImportFrom)
-        and (node.module or "").split(".", 1)[0] in {"importlib", "builtins"}
+        and (node.module or "").split(".", 1)[0] in {"__main__", "importlib", "builtins"}
     ]
     computed_deadline_strings = [
         node for node in ast.walk(tree)
@@ -1172,8 +1189,32 @@ finally:
             and not computed_deadline_strings,
             "client COMMAND_DEADLINE mutation surface exceeds the reviewed assignments")
     budget_constants = {
-        "PROPERTY_RETRY_BUDGET", "TOTAL_BUDGET", "CLEANUP_RESERVE",
-        "WORK_BUDGET_FAULT_SECONDS", "WORK_BUDGET_MODES",
+        "PROPERTY_RETRIES", "PROPERTY_RETRY_BUDGET", "TOTAL_BUDGET", "CLEANUP_RESERVE",
+        "CLEANUP_BUDGET", "ACTION_ATTEMPTS", "ACTION_TIMEOUTS",
+        "ACTION_RETRY_BACKOFF", "KILL_WAIT_TIMEOUT", "UNLOAD_TIMEOUT",
+        "CLEANUP_MARGIN", "CLEANUP_ENVELOPE", "WORK_BUDGET_FAULT_SECONDS",
+        "SLOW_PROPERTY_FAULT_SECONDS", "SLOW_ACTION_FAULT_SECONDS", "WORK_BUDGET_MODES",
+    }
+    security_constants = {
+        "UNIT", "RUN", "PROGRAM", "PATH", "ENVIRONMENT", "NONCE_VARIABLE",
+        "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "CLIENT_FAULTS", "CANCELLATION_SIGNALS",
+    }
+    protected_constants = budget_constants | security_constants
+    expected_protected_load_counts = {
+        "ACTION_ATTEMPTS": 6, "ACTION_RETRY_BACKOFF": 3, "ACTION_TIMEOUTS": 3,
+        "CANCELLATION_SIGNALS": 4, "CLEANUP_BUDGET": 2, "CLEANUP_ENVELOPE": 1,
+        "CLEANUP_MARGIN": 1, "CLEANUP_RESERVE": 2, "CLIENT_FAULTS": 1,
+        "DESCRIPTION_PREFIX": 2, "ENVIRONMENT": 1, "KILL_WAIT_TIMEOUT": 2,
+        "NONCE_VARIABLE": 3, "PATH": 1, "PROGRAM": 3, "PROPERTY_RETRIES": 2,
+        "PROPERTY_RETRY_BUDGET": 2, "RUN": 13, "SERVICE_PROPERTIES": 3,
+        "SLOW_ACTION_FAULT_SECONDS": 1, "SLOW_PROPERTY_FAULT_SECONDS": 1,
+        "TOTAL_BUDGET": 2, "UNIT": 3, "UNLOAD_TIMEOUT": 2,
+        "WORK_BUDGET_FAULT_SECONDS": 1, "WORK_BUDGET_MODES": 2,
+    }
+    observed_protected_load_counts = {
+        name: sum(1 for node in ast.walk(tree) if isinstance(node, ast.Name)
+                  and node.id == name and isinstance(node.ctx, ast.Load))
+        for name in protected_constants
     }
     budget_state = budget_constants | {"total_deadline", "work_deadline", "COMMAND_DEADLINE"}
     module_budget_assignments = {}
@@ -1185,20 +1226,40 @@ finally:
         ]
         require(len(matches) == 1, f"client must define budget constant {name} exactly once")
         module_budget_assignments[name] = matches[0]
+    module_security_assignments = {}
+    for name in security_constants:
+        matches = [
+            node for node in tree.body if isinstance(node, ast.Assign)
+            and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        ]
+        require(len(matches) == 1, f"client must define security constant {name} exactly once")
+        module_security_assignments[name] = matches[0]
+    allowed_protected_strings = {
+        id(node) for node in ast.walk(module_security_assignments["ENVIRONMENT"])
+        if constant_string(node) in protected_constants
+    }
+    protected_string_indirection = [
+        node for node in ast.walk(tree) if constant_string(node) in protected_constants
+        and id(node) not in allowed_protected_strings
+    ]
     total_assignment = lock_try.body[total_deadline_starts[0]]
     work_assignment = lock_try.body[total_deadline_starts[0] + 1]
     exact_budget_regions = (
         total_assignment, work_assignment,
         envelope_assignment, startup_matches[0],
-        named_function(tree, "unit_properties"), exhaust_node,
+        named_function(tree, "command_path"), named_function(tree, "unit_properties"),
+        named_function(tree, "owned_command"), named_function(tree, "retry_owned_command"),
+        named_function(tree, "wait_unloaded"), named_function(tree, "teardown_owned"), exhaust_node,
         *main_node.body[routing_starts[0]:routing_starts[0] + 2],
-        launch_try.finalbody[5],
+        launch_try.finalbody[0], launch_try.finalbody[5],
     )
     expected_constant_names = [
         assignment.targets[0] for assignment in module_budget_assignments.values()
     ] + [
         node for region in exact_budget_regions for node in ast.walk(region)
         if isinstance(node, ast.Name) and node.id in budget_constants
+        and isinstance(node.ctx, ast.Load)
     ]
     observed_constant_names = [
         node for node in ast.walk(tree)
@@ -1230,6 +1291,108 @@ finally:
         node for node in ast.walk(tree) if isinstance(node, (ast.Global, ast.Nonlocal))
         and budget_state.intersection(node.names)
     ]
+    mutable_budget_names = {
+        "ACTION_TIMEOUTS", "SLOW_ACTION_FAULT_SECONDS", "WORK_BUDGET_MODES",
+        "ENVIRONMENT", "SERVICE_PROPERTIES", "CLIENT_FAULTS", "CANCELLATION_SIGNALS",
+    }
+    mutable_budget_item_changes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name) and node.value.id in mutable_budget_names
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    mutating_methods = {
+        "add", "clear", "difference_update", "discard", "intersection_update", "pop",
+        "popitem", "remove", "setdefault", "symmetric_difference_update", "update",
+    }
+    mutable_budget_method_changes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute) and node.func.attr in mutating_methods
+        and isinstance(node.func.value, ast.Name) and node.func.value.id in mutable_budget_names
+    ]
+    mutable_alias_binders = []
+    reviewed_mutable_assignments = {
+        id(assignment) for assignment in (
+            *module_budget_assignments.values(), *module_security_assignments.values()
+        )
+    }
+    reviewed_mutable_assignment_counts = {
+        ast.dump(ast.parse('''delay = (SLOW_PROPERTY_FAULT_SECONDS if name == "show"
+         else SLOW_ACTION_FAULT_SECONDS[name])
+''').body[0]): 1,
+        ast.dump(ast.parse('''state = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState",
+                        "ControlGroup", "Description", "Environment", "ExecStart",
+                        *SERVICE_PROPERTIES, *properties, context=context)
+''').body[0]): 1,
+        ast.dump(ast.parse('''result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,
+                 timeout=ACTION_TIMEOUTS[arguments[0]])
+''').body[0]): 1,
+        ast.dump(ast.parse(
+            "previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)"
+        ).body[0]): 2,
+    }
+    observed_reviewed_mutable_assignments = {
+        dump: sum(1 for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                  and ast.dump(node) == dump)
+        for dump in reviewed_mutable_assignment_counts
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            continue
+        value = node.value
+        if (id(node) not in reviewed_mutable_assignments
+                and ast.dump(node) not in reviewed_mutable_assignment_counts and any(
+            isinstance(candidate, ast.Name) and candidate.id in mutable_budget_names
+            and isinstance(candidate.ctx, ast.Load) for candidate in ast.walk(value)
+        )):
+            mutable_alias_binders.append(node)
+    expected_protected_targets = {
+        id(assignment.targets[0])
+        for assignment in (*module_budget_assignments.values(), *module_security_assignments.values())
+    }
+    observed_protected_stores_or_deletes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Name)
+        and node.id in protected_constants and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    protected_attribute_stores_or_deletes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        and node.attr in protected_constants and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    protected_scope_declarations = [
+        node for node in ast.walk(tree) if isinstance(node, (ast.Global, ast.Nonlocal))
+        and protected_constants.intersection(node.names)
+    ]
+    reviewed_mutable_iterations = {
+        ast.dump(ast.parse('''for signum in CANCELLATION_SIGNALS:
+    signal.signal(signum, interrupted)
+''').body[0]): 1,
+        ast.dump(ast.parse('''all(state.get(name) == expected
+    for name, expected in SERVICE_PROPERTIES.items())
+''', mode="eval").body.args[0].generators[0]): 1,
+    }
+    observed_reviewed_mutable_iterations = {
+        dump: sum(1 for node in ast.walk(tree)
+                  if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension))
+                  and ast.dump(node) == dump)
+        for dump in reviewed_mutable_iterations
+    }
+    mutable_binding_escapes = []
+    for node in ast.walk(tree):
+        expressions = []
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            expressions.append(node.iter)
+        elif isinstance(node, ast.Match):
+            expressions.append(node.subject)
+        elif isinstance(node, ast.withitem):
+            expressions.append(node.context_expr)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            expressions.extend((*node.args.defaults, *[value for value in node.args.kw_defaults
+                                                        if value is not None]))
+        if (expressions and ast.dump(node) not in reviewed_mutable_iterations
+                and any(isinstance(candidate, ast.Name)
+                        and candidate.id in mutable_budget_names
+                        and isinstance(candidate.ctx, ast.Load)
+                        for expression in expressions for candidate in ast.walk(expression))):
+            mutable_binding_escapes.append(node)
     budget_string_binders = []
     for node in ast.walk(tree):
         names = []
@@ -1245,9 +1408,16 @@ finally:
             names.append(node.name)
         elif isinstance(node, ast.MatchMapping) and node.rest:
             names.append(node.rest)
-        if budget_state.intersection(names):
+        if (budget_state | protected_constants).intersection(names):
             budget_string_binders.append(node)
     require(len(observed_constant_names) == len(expected_constant_names)
+            and observed_protected_load_counts == expected_protected_load_counts
+            and not protected_string_indirection
+            and len(observed_protected_stores_or_deletes) == len(expected_protected_targets)
+            and all(id(node) in expected_protected_targets
+                    for node in observed_protected_stores_or_deletes)
+            and not protected_scope_declarations
+            and not protected_attribute_stores_or_deletes
             and all(any(node is expected for expected in expected_constant_names)
                     for node in observed_constant_names)
             and len(observed_local_budget_names) == len(expected_local_budget_names)
@@ -1259,6 +1429,12 @@ finally:
             and len(budget_scope_declarations) == len(deadline_globals)
             and all(any(node is expected for expected in deadline_globals)
                     for node in budget_scope_declarations)
+            and not mutable_budget_item_changes
+            and not mutable_budget_method_changes
+            and not mutable_alias_binders
+            and observed_reviewed_mutable_assignments == reviewed_mutable_assignment_counts
+            and not mutable_binding_escapes
+            and observed_reviewed_mutable_iterations == reviewed_mutable_iterations
             and not budget_string_binders,
             "client budget state has an unreviewed assignment, alias, deletion, or rebind")
     exhaust_calls = [
@@ -1338,7 +1514,7 @@ return result
         "for attempt in range(ACTION_ATTEMPTS):", "cleanup_boundary(name)",
         "acted = owned_command(invocation, nonce, service_command, action, *arguments)",
         "RECOVERED_ERRORS.extend(errors)", "if attempt + 1 < ACTION_ATTEMPTS:",
-        "time.sleep(0.05)", "owned {name} command remains unavailable",
+        "time.sleep(ACTION_RETRY_BACKOFF)", "owned {name} command remains unavailable",
     )
     require(all(retry_source.count(fragment) == 1 for fragment in retry_contract),
             "client cleanup actions must retry the same owned command and retain initial failures")
@@ -2562,6 +2738,167 @@ def verify_supervisor_mutations(
         ("cleanup startup assertion disabled", replace_once(client,
             'if not (CLEANUP_ENVELOPE < CLEANUP_BUDGET < CLEANUP_RESERVE < TOTAL_BUDGET):',
             'if False:')),
+        ("normal-mode conditional cleanup budget rebind", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    global CLEANUP_BUDGET\n'
+            '    if not REQUESTED_MODE:\n'
+            '        CLEANUP_BUDGET = 1\n'
+            '    if not control_group:')),
+        ("normal-mode conditional action attempts rebind", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    global ACTION_ATTEMPTS\n'
+            '    if not REQUESTED_MODE:\n'
+            '        ACTION_ATTEMPTS = 1\n'
+            '    if not control_group:')),
+        ("cleanup timeout item mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    ACTION_TIMEOUTS["stop"] = 1\n'
+            '    if not control_group:')),
+        ("cleanup timeout alias mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    cleanup_timeouts = ACTION_TIMEOUTS\n'
+            '    cleanup_timeouts["stop"] = 1\n'
+            '    if not control_group:')),
+        ("cleanup timeout dict descriptor mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    dict.__setitem__(ACTION_TIMEOUTS, "stop", 1)\n'
+            '    if not control_group:')),
+        ("cleanup timeout imported operator mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    import operator\n'
+            '    operator.setitem(ACTION_TIMEOUTS, "stop", 1)\n'
+            '    if not control_group:')),
+        ("cleanup timeout named alias mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    if (cleanup_timeouts := ACTION_TIMEOUTS):\n'
+            '        cleanup_timeouts["stop"] = 1\n'
+            '    if not control_group:')),
+        ("cleanup timeout method mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    ACTION_TIMEOUTS.update(stop=1)\n'
+            '    if not control_group:')),
+        ("cleanup budget globals mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    globals()["CLEANUP_BUDGET"] = 1\n'
+            '    if not control_group:')),
+        ("cleanup budget setattr mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    setattr(sys.modules[__name__], "CLEANUP_BUDGET", 1)\n'
+            '    if not control_group:')),
+        ("cleanup budget frame globals mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    sys._getframe().f_globals["CLEANUP_BUDGET"] = 1\n'
+            '    if not control_group:')),
+        ("work modes alias clear", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    modes = WORK_BUDGET_MODES\n'
+            '    modes.clear()\n'
+            '    if not control_group:')),
+        ("service properties alias clear", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    properties = SERVICE_PROPERTIES\n'
+            '    properties.clear()\n'
+            '    if not control_group:')),
+        ("environment alias mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    environment = ENVIRONMENT\n'
+            '    environment.update(PATH="/tmp")\n'
+            '    if not control_group:')),
+        ("unit frame globals mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    sys._getframe().f_globals["UNIT"] = "attacker.service"\n'
+            '    if not control_group:')),
+        ("unit function-name rebind", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def UNIT():\n'
+            '    return "attacker.service"\n\n\n'
+            'def cgroup_pids(control_group):\n    if not control_group:')),
+        ("unit import-alias rebind", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'import os as UNIT\n\n\n'
+            'def cgroup_pids(control_group):\n    if not control_group:')),
+        ("unit exception-target rebind", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'try:\n'
+            '    pass\n'
+            'except RuntimeError as UNIT:\n'
+            '    pass\n\n\n'
+            'def cgroup_pids(control_group):\n    if not control_group:')),
+        ("aliased sys modules unit mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    import sys as system_module\n'
+            '    system_module.modules[__name__].UNIT = "attacker.service"\n'
+            '    if not control_group:')),
+        ("main-module unit attribute mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    import __main__ as running_module\n'
+            '    running_module.UNIT = "attacker.service"\n'
+            '    if not control_group:')),
+        ("main-module imported timeout alias", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    from __main__ import ACTION_TIMEOUTS as timeouts\n'
+            '    timeouts["stop"] = 1\n'
+            '    if not control_group:')),
+        ("main-module attribute timeout alias", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    import __main__ as running_module\n'
+            '    timeouts = running_module.ACTION_TIMEOUTS\n'
+            '    timeouts["stop"] = 1\n'
+            '    if not control_group:')),
+        ("signal container loop alias mutation", replace_once(client,
+            '    for signum in CANCELLATION_SIGNALS:\n'
+            '        signal.signal(signum, interrupted)',
+            '    # for signum in CANCELLATION_SIGNALS:\n'
+            '    for signals in (CANCELLATION_SIGNALS,):\n'
+            '        signals.clear()\n'
+            '        for signum in signals:\n'
+            '            signal.signal(signum, interrupted)')),
+        ("function globals computed cleanup mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    fail.__globals__["cleanup_budget".upper()] = 1\n'
+            '    if not control_group:')),
+        ("descriptor function globals timeout mutation", replace_once(client,
+            'def cgroup_pids(control_group):\n    if not control_group:',
+            'def cgroup_pids(control_group):\n'
+            '    type(fail).__getattribute__(fail, "__globals__")['
+            '"action_timeouts".upper()]["stop"] = 1\n'
+            '    if not control_group:')),
+        ("balanced slow action alias mutation", replace_once(
+            replace_once(client,
+                '            delay = (SLOW_PROPERTY_FAULT_SECONDS if name == "show"\n'
+                '                     else SLOW_ACTION_FAULT_SECONDS[name])',
+                '            delay = (SLOW_PROPERTY_FAULT_SECONDS if name == "show"\n'
+                '                     else slow_actions[name])'),
+            '        if slow_cleanup:\n            delay =',
+            '        if slow_cleanup:\n'
+            '            slow_actions = SLOW_ACTION_FAULT_SECONDS\n'
+            '            slow_actions["stop"] = 1\n'
+            '            delay =')),
+        ("environment initialization side effect", replace_once(client,
+            '    "GIT_CONFIG_GLOBAL": "/dev/null",\n}',
+            '    "GIT_CONFIG_GLOBAL": "/dev/null",\n'
+            '    **((lambda: None).__globals__.__setitem__('
+            '"UNIT", "attacker.service") or {}),\n}')),
         ("work and teardown share deadline", replace_once(client,
             '        work_deadline = total_deadline - CLEANUP_RESERVE',
             '        work_deadline = total_deadline')),
