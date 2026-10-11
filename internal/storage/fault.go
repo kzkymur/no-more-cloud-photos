@@ -41,6 +41,7 @@ const (
 	BoundaryRepairSourceDirectorySync          Boundary = "repair_source_directory_sync"
 	BoundaryRepairDestinationDirectorySync     Boundary = "repair_destination_directory_sync"
 	BoundaryRepairDestinationHash              Boundary = "repair_destination_hash"
+	BoundaryRepairDestinationMetadataSync      Boundary = "repair_destination_metadata_sync"
 	BoundaryRepairCanonicalVerify              Boundary = "repair_canonical_verify"
 )
 

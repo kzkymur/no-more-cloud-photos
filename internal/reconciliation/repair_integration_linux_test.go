@@ -34,7 +34,22 @@ func TestRepairIntegrationCheckerDryRunApplyChecker(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	store, err := storage.Open(root, storage.Options{})
+	var denyRename atomic.Int32
+	store, err := storage.Open(root, storage.Options{Faults: storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+		if event.Boundary == storage.BoundaryRepairRename && event.Phase == storage.Before {
+			switch denyRename.Load() {
+			case 1:
+				return unix.EACCES
+			case 2:
+				return unix.ENOSPC
+			case 3:
+				return unix.EDQUOT
+			case 4:
+				return unix.EROFS
+			}
+		}
+		return nil
+	})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,13 +174,66 @@ func TestRepairIntegrationCheckerDryRunApplyChecker(t *testing.T) {
 		"ffffffff-ffff-4fff-8fff-ffffffffffff", attemptID); err == nil {
 		t.Fatal("applying event committed without a same-transaction convergence boundary")
 	}
+	for code := int32(1); code <= 4; code++ {
+		denyRename.Store(code)
+		if _, err := repairer.Execute(ctx, plan.Run.RunID); !errors.Is(err, ErrRepairRetryable) {
+			t.Fatalf("storage failure %d Execute() error = %v, want retryable", code, err)
+		}
+	}
+	failedRun, err := repairRepository.ReadRun(ctx, plan.Run.RunID)
+	if err != nil || failedRun.Result != nil {
+		t.Fatalf("retryable failure froze run: %+v, %v", failedRun, err)
+	}
+	denyRename.Store(0)
+	for index := 0; index < 333; index++ {
+		retryAttempt, idErr := newUUIDv4()
+		if idErr != nil {
+			t.Fatal(idErr)
+		}
+		prepared, idErr := newUUIDv4()
+		if idErr != nil {
+			t.Fatal(idErr)
+		}
+		if _, err := repairRepository.BeginAttempt(ctx, retryAttempt, plan.Items[0].ItemID, prepared); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := repairPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		applying, _ := newUUIDv4()
+		failed, _ := newUUIDv4()
+		if _, err = tx.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,'applying','applying',NULL,NULL,NULL)`, applying, retryAttempt); err == nil {
+			_, err = tx.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,'failed','failed','internal',NULL,NULL)`, failed, retryAttempt)
+		}
+		if err == nil {
+			err = tx.Commit(ctx)
+		} else {
+			_ = tx.Rollback(ctx)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	pagedHistory, err := repairRepository.ReadHistory(ctx, plan.Items[0].ItemID)
+	if err != nil || len(pagedHistory) != 1015 {
+		t.Fatalf("paged history length = %d, %v", len(pagedHistory), err)
+	}
+	if pagedHistory[len(pagedHistory)-1].EventType != "failed" {
+		t.Fatalf("paged history latest = %q", pagedHistory[len(pagedHistory)-1].EventType)
+	}
 	var executionIDCalls atomic.Int32
 	repairer.newID = func() (string, error) {
-		if executionIDCalls.Add(1) == 3 {
+		if executionIDCalls.Add(1) == 5 {
 			return "", errors.New("injected rename event id failure")
 		}
 		return newUUIDv4()
 	}
+	recoveredResult, err := repairer.Execute(ctx, plan.Run.RunID)
+	if err != nil || recoveredResult.Result != "succeeded" || recoveredResult.Quarantined != 1 {
+		t.Fatalf("same-plan retry Execute() = %+v, %v", recoveredResult, err)
+	}
+	repairer.newID = newUUIDv4
 
 	type execution struct {
 		result RepairExecutionResult
@@ -189,6 +257,20 @@ func TestRepairIntegrationCheckerDryRunApplyChecker(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("source remains after repair: %v", err)
+	}
+	if _, err := repairRepository.BeginAttempt(ctx, "12121212-1212-4212-8212-121212121212", plan.Items[0].ItemID, "13131313-1313-4313-8313-131313131313"); err == nil {
+		t.Fatal("finished run accepted a fresh repair attempt")
+	}
+	finishedHistory, err := repairRepository.ReadHistory(ctx, plan.Items[0].ItemID)
+	if err != nil || len(finishedHistory) == 0 {
+		t.Fatalf("finished history = %+v, %v", finishedHistory, err)
+	}
+	finishedAttemptID := finishedHistory[len(finishedHistory)-1].AttemptID
+	if _, err := repairPool.Exec(ctx, `SELECT * FROM nmcp_lock_repair_item_apply($1,$2,$3)`, plan.Run.RunID, plan.Items[0].ItemID, finishedAttemptID); err == nil {
+		t.Fatal("finished run accepted apply authority")
+	}
+	if _, err := repairPool.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,'applying','applying',NULL,NULL,NULL)`, "14141414-1414-4414-8414-141414141414", finishedAttemptID); err == nil {
+		t.Fatal("finished run accepted a journal mutation")
 	}
 	destination := filepath.Join(root, ".quarantine", plan.Items[0].QuarantineID)
 	got, err := os.ReadFile(destination)
@@ -346,9 +428,8 @@ func TestRepairIntegrationAllFourSourceTypes(t *testing.T) {
 		WHERE a.manifest_item_id=$1 AND e.event_type='completed'`, plan.Items[0].ItemID).Scan(&eventID, &attemptID, &outcome, &observedSize, &observedSHA); err != nil {
 		t.Fatal(err)
 	}
-	var replayedSequence int
-	if err := repairPool.QueryRow(ctx, `SELECT nmcp_append_repair_event($1,$2,'completed',$3,NULL,$4,$5)`, eventID, attemptID, outcome, observedSize, observedSHA).Scan(&replayedSequence); err != nil || replayedSequence < 1 {
-		t.Fatalf("exact event replay sequence=%d error=%v", replayedSequence, err)
+	if _, err := repairPool.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,'completed',$3,NULL,$4,$5)`, eventID, attemptID, outcome, observedSize, observedSHA); err == nil {
+		t.Fatal("finished run accepted an exact journal replay")
 	}
 	if _, err := repairPool.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,'completed','wrong_outcome',NULL,$3,$4)`, eventID, attemptID, observedSize, observedSHA); err == nil {
 		t.Fatal("contradictory event replay was accepted")
@@ -399,6 +480,7 @@ func TestRepairIntegrationUncertainRecoveryBecomesUnknownAndRemainsCheckable(t *
 	root := t.TempDir()
 	var recreated atomic.Bool
 	var sourcePath string
+	cancelExecution := func() {}
 	injected := errors.New("canonical verification response lost")
 	store, err := storage.Open(root, storage.Options{Faults: storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
 		if event.Boundary != storage.BoundaryRepairCanonicalVerify || event.Phase != storage.After || !recreated.CompareAndSwap(false, true) {
@@ -420,6 +502,7 @@ func TestRepairIntegrationUncertainRecoveryBecomesUnknownAndRemainsCheckable(t *
 		if writeErr := os.WriteFile(sourcePath, moved, 0o600); writeErr != nil {
 			return writeErr
 		}
+		cancelExecution()
 		return injected
 	})})
 	if err != nil {
@@ -458,7 +541,10 @@ func TestRepairIntegrationUncertainRecoveryBecomesUnknownAndRemainsCheckable(t *
 	if _, err = admin.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='uncertain-repair-test',owner='integration',entered_at=clock_timestamp() WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	result, err := repairer.Execute(ctx, plan.Run.RunID)
+	executionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cancelExecution = cancel
+	result, err := repairer.Execute(executionCtx, plan.Run.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}

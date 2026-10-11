@@ -226,7 +226,7 @@ func (repairer *Repairer) Execute(ctx context.Context, runID string) (RepairExec
 		return RepairExecutionResult{}, err
 	}
 	for index := range items {
-		if items[index].EffectiveOutcome != nil {
+		if items[index].EffectiveOutcome != nil && *items[index].EffectiveOutcome != "failed" {
 			continue
 		}
 		if err := repairer.executeItem(ctx, &items[index]); err != nil {
@@ -275,11 +275,20 @@ func (repairer *Repairer) executeItem(parent context.Context, item *RepairManife
 	}
 	item.ActiveAttemptID = &attemptID
 	for recoveryPass := 0; recoveryPass < 2; recoveryPass++ {
-		outcome, applyErr := repairer.applyAttempt(parent, item, physical || recoveryPass > 0)
+		applyCtx := parent
+		cancel := func() {}
+		if physical || recoveryPass > 0 {
+			applyCtx, cancel = context.WithTimeout(context.Background(), repairer.convergenceBudget)
+		}
+		outcome, applyErr := repairer.applyAttempt(applyCtx, item, physical || recoveryPass > 0)
+		cancel()
 		if applyErr != nil {
 			return applyErr
 		}
 		if outcome != "uncertain" {
+			if outcome == "failed" {
+				return ErrRepairRetryable
+			}
 			return nil
 		}
 		physical = true

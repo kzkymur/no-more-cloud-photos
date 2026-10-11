@@ -745,6 +745,20 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 	}
 	checkPool := reconciliationRolePool(t, databaseURL, schema, "nmcp_check_runtime")
 	repository, _ := NewPostgresRepository(checkPool)
+	payload := []byte("journaled")
+	digest := sha256.Sum256(payload)
+	sha := hex.EncodeToString(digest[:])
+	size := int64(len(payload))
+	sourceKey := "originals/99/99999999-9999-4999-8999-999999999999/original.jpg"
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, filepath.FromSlash(sourceKey))
+	if err := os.MkdirAll(filepath.Dir(sourcePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observedMTime, observedCTime, _ := repairIntegrationObservation(t, sourcePath, payload)
 	now, err := repository.DatabaseNow(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -765,13 +779,7 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	payload := []byte("journaled")
-	digest := sha256.Sum256(payload)
-	sha := hex.EncodeToString(digest[:])
-	size := int64(len(payload))
-	old := now.Add(-49 * time.Hour)
-	sourceKey := "originals/99/99999999-9999-4999-8999-999999999999/original.jpg"
-	finding := Finding{ID: findingID, Kind: "final_orphan", Reason: "unreferenced_canonical_final", SubjectType: "original", SubjectID: stringPointer("99999999-9999-4999-8999-999999999999"), RelativeKey: &sourceKey, ExpectedState: stringPointer("unreferenced"), ObservedType: "regular", ObservedSize: &size, ObservedSHA: &sha, ObservedMTime: &old, ObservedCTime: &old, ObservedAt: now}
+	finding := Finding{ID: findingID, Kind: "final_orphan", Reason: "unreferenced_canonical_final", SubjectType: "original", SubjectID: stringPointer("99999999-9999-4999-8999-999999999999"), RelativeKey: &sourceKey, ExpectedState: stringPointer("unreferenced"), ObservedType: "regular", ObservedSize: &size, ObservedSHA: &sha, ObservedMTime: &observedMTime, ObservedCTime: &observedCTime, ObservedAt: now}
 	if _, err := repository.AppendFinding(ctx, reportID, finding); err != nil {
 		t.Fatal(err)
 	}
@@ -810,15 +818,58 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	var preparedQuarantineRows int
-	if err := preparedRead.QueryRow(ctx, `SELECT count(*) FROM nmcp_read_check_database_references(clock_timestamp()) WHERE row_kind='quarantine'`).Scan(&preparedQuarantineRows); err != nil {
+	if err := preparedRead.QueryRow(ctx, `SELECT count(*) FROM nmcp_read_check_database_references(clock_timestamp()) WHERE row_kind='quarantine' AND expected_state='prepared_quarantine'`).Scan(&preparedQuarantineRows); err != nil {
 		_ = preparedRead.Rollback(ctx)
 		t.Fatal(err)
 	}
 	if err := preparedRead.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if preparedQuarantineRows != 0 {
-		t.Fatalf("prepared-only repair advertised %d possible quarantine rows", preparedQuarantineRows)
+	if preparedQuarantineRows != 1 {
+		t.Fatalf("prepared-only repair exposed %d deterministic quarantine rows", preparedQuarantineRows)
+	}
+	destination := filepath.Join(root, ".quarantine", quarantineID)
+	store, err := storage.Open(root, storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	originalKey, err := storage.ParseOriginalKey(sourceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantineKey, err := storage.ParseQuarantineID(quarantineID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destinationKey, err := storage.NewQuarantineKey(quarantineKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairOperation, _, err := store.BeginRepairOriginal(ctx, originalKey, destinationKey, storage.RepairExpectation{Size: size, SHA256: digest, MTime: observedMTime, CTime: observedCTime})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = repairOperation.Revalidate(ctx); err == nil {
+		_, err = repairOperation.Rename(ctx)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr := repairOperation.Close(); !errors.Is(closeErr, storage.ErrOutcomeUncertain) {
+		t.Fatalf("prepared-only rollback simulation close = %v", closeErr)
+	}
+	checker, _ := NewChecker(repository, store)
+	preparedPresent, err := checker.Check(ctx, ScopeAll)
+	if err != nil || preparedPresent.FindingCount != 0 {
+		t.Fatalf("prepared exact destination Check() = %+v, %v", preparedPresent, err)
+	}
+	if err := os.Remove(destination); err != nil {
+		t.Fatal(err)
+	}
+	preparedAbsent, err := checker.Check(ctx, ScopeAll)
+	if err != nil || preparedAbsent.FindingCount != 0 {
+		t.Fatalf("prepared absent destination Check() = %+v, %v", preparedAbsent, err)
 	}
 	repairTx, err := repairPool.Begin(ctx)
 	if err != nil {
@@ -848,19 +899,19 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 	if err := repairTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	root := t.TempDir()
-	if err := os.Mkdir(filepath.Join(root, ".quarantine"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, ".quarantine", quarantineID), []byte("mismatch"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := storage.Open(root, storage.Options{})
+	repairRepository, err := NewRepairPostgresRepository(repairPool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
-	checker, _ := NewChecker(repository, store)
+	cancelledFinish, cancelFinish := context.WithCancel(ctx)
+	cancelFinish()
+	finished, err := repairRepository.Finish(cancelledFinish, runID)
+	if err != nil || finished.Result != "succeeded" || finished.Quarantined != 1 {
+		t.Fatalf("finish exact replay after pre-execution cancellation = %+v, %v", finished, err)
+	}
+	if err := os.WriteFile(destination, []byte("mismatch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := admin.Exec(ctx, `REVOKE SELECT(outcome_code) ON reconciliation_repair_events FROM nmcp_check_function_owner`); err != nil {
 		t.Fatal(err)
 	}

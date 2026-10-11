@@ -13,6 +13,7 @@ var (
 	ErrRepairMaintenance    = errors.New("repair requires maintenance")
 	ErrRepairIncomplete     = errors.New("repair run is incomplete")
 	ErrRepairOutcomeUnknown = errors.New("repair outcome is unknown")
+	ErrRepairRetryable      = errors.New("repair item has a retryable failure")
 )
 
 type RepairSourceType string

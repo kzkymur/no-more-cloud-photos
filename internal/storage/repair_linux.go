@@ -210,7 +210,7 @@ func (store *Store) beginRepair(ctx context.Context, source string, destination 
 			identity, digest, validateErr := operation.validateFile(ctx, quarantineFD, operation.destinationName, destinationFD, expectation, BoundaryRepairDestinationHash, RepairStagePrepare, RepairCauseQuarantineMismatch, false)
 			_ = unix.Close(destinationFD)
 			if validateErr != nil {
-				return fail(RepairCauseQuarantineMismatch, RepairStagePrepare, validateErr)
+				return fail(repairErrorCause(validateErr), RepairStagePrepare, validateErr)
 			}
 			_ = identity
 			operation.progress.ObservedSize = expectation.Size
@@ -272,11 +272,11 @@ func (operation *RepairQuarantine) Revalidate(ctx context.Context) (RepairProgre
 		}
 		identity, digest, err := operation.validateFile(ctx, operation.sourceParentFD, operation.sourceName, fd, operation.expectation, BoundaryRepairSourceHash, RepairStageRevalidate, RepairCauseSourceChanged, true)
 		_ = unix.Close(fd)
-		if err != nil || identity != operation.sourceIdentity {
-			if err == nil {
-				err = ErrValidation
-			}
-			return operation.progress, repairFailure(RepairCauseSourceChanged, RepairStageRevalidate, operation.progress, err)
+		if err != nil {
+			return operation.progress, repairFailure(repairErrorCause(err), RepairStageRevalidate, operation.progress, err)
+		}
+		if identity != operation.sourceIdentity {
+			return operation.progress, repairFailure(RepairCauseSourceChanged, RepairStageRevalidate, operation.progress, ErrValidation)
 		}
 		operation.progress.ObservedSHA256 = digest
 	} else {
@@ -284,7 +284,7 @@ func (operation *RepairQuarantine) Revalidate(ctx context.Context) (RepairProgre
 	}
 	operation.progress.Revalidated = true
 	if err := operation.store.inject(ctx, BoundaryRepairRevalidate, After, operation.sourceKey, 0); err != nil {
-		return operation.progress, repairFailure(RepairCauseSourceChanged, RepairStageRevalidate, operation.progress, err)
+		return operation.progress, repairContextFailure(RepairStageRevalidate, operation.progress, err)
 	}
 	return operation.progress, nil
 }
@@ -314,11 +314,11 @@ func (operation *RepairQuarantine) Rename(ctx context.Context) (RepairProgress, 
 	}
 	identity, _, validateErr := operation.validateFile(ctx, operation.sourceParentFD, operation.sourceName, fd, operation.expectation, BoundaryRepairSourceHash, RepairStageRename, RepairCauseSourceChanged, true)
 	_ = unix.Close(fd)
-	if validateErr != nil || identity != operation.sourceIdentity {
-		if validateErr == nil {
-			validateErr = ErrValidation
-		}
-		return operation.progress, repairFailure(RepairCauseSourceChanged, RepairStageRename, operation.progress, validateErr)
+	if validateErr != nil {
+		return operation.progress, repairFailure(repairErrorCause(validateErr), RepairStageRename, operation.progress, validateErr)
+	}
+	if identity != operation.sourceIdentity {
+		return operation.progress, repairFailure(RepairCauseSourceChanged, RepairStageRename, operation.progress, ErrValidation)
 	}
 	if err := ctx.Err(); err != nil {
 		return operation.progress, repairContextFailure(RepairStageRename, operation.progress, err)
@@ -351,6 +351,9 @@ func (operation *RepairQuarantine) Rename(ctx context.Context) (RepairProgress, 
 			rollbackErr = errors.Join(sourceSyncErr, destinationSyncErr)
 		}
 		return operation.progress, repairFailure(RepairCauseOutcomeUncertain, RepairStageRename, operation.progress, errors.Join(ErrOutcomeUncertain, identityErr, rollbackErr))
+	}
+	if _, _, err := operation.normalizeDestinationMetadata(ctx); err != nil {
+		return operation.progress, repairFailure(repairErrorCause(err), RepairStageRename, operation.progress, err)
 	}
 	if err := operation.store.inject(ctx, BoundaryRepairRename, After, operation.destinationPath, 0); err != nil {
 		return operation.progress, repairFailure(RepairCauseOutcomeUncertain, RepairStageRename, operation.progress, errors.Join(ErrOutcomeUncertain, err))
@@ -617,6 +620,9 @@ func (operation *RepairQuarantine) validateFile(ctx context.Context, parentFD in
 	if identity.Mode&unix.S_IFMT != unix.S_IFREG || identity.Links != 1 {
 		return identity, [sha256.Size]byte{}, repairFailure(RepairCauseWrongType, stage, operation.progress, ErrUnexpectedType)
 	}
+	if identity.UID != operation.store.rootIdentity.UID || identity.GID != operation.store.rootIdentity.GID {
+		return identity, [sha256.Size]byte{}, repairFailure(RepairCausePermission, stage, operation.progress, ErrPermission)
+	}
 	if identity.MountID != operation.store.rootIdentity.MountID || identity.Size != uint64(expectation.Size) {
 		return identity, [sha256.Size]byte{}, repairFailure(mismatch, stage, operation.progress, ErrValidation)
 	}
@@ -625,22 +631,22 @@ func (operation *RepairQuarantine) validateFile(ctx context.Context, parentFD in
 		return identity, [sha256.Size]byte{}, repairFailure(RepairCauseSourceChanged, stage, operation.progress, ErrValidation)
 	}
 	if err := operation.store.inject(ctx, boundary, Before, operation.sourceKey, 0); err != nil {
-		return identity, [sha256.Size]byte{}, err
+		return identity, [sha256.Size]byte{}, repairFailure(repairCauseForError(err, RepairCauseInternal), stage, operation.progress, err)
 	}
 	digest, err := repairHashFD(ctx, fd)
 	if err != nil {
-		return identity, digest, err
+		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseInternal), stage, operation.progress, err)
 	}
 	if err := operation.store.inject(ctx, boundary, After, operation.sourceKey, 0); err != nil {
-		return identity, digest, err
+		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseInternal), stage, operation.progress, err)
 	}
 	after, err := repairIdentityAt(fd, "", unix.AT_EMPTY_PATH)
 	if err != nil {
-		return identity, digest, err
+		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseSourceChanged), stage, operation.progress, err)
 	}
 	leaf, err := repairIdentityAt(parentFD, name, unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
-		return identity, digest, err
+		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseSourceChanged), stage, operation.progress, err)
 	}
 	if identity != after || identity != leaf {
 		return identity, digest, repairFailure(RepairCauseSourceChanged, stage, operation.progress, ErrValidation)
@@ -652,14 +658,9 @@ func (operation *RepairQuarantine) validateFile(ctx context.Context, parentFD in
 }
 
 func (operation *RepairQuarantine) verifyExactDestination(ctx context.Context) error {
-	fd, err := repairOpenat2(operation.quarantineFD, operation.destinationName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_NOATIME|unix.O_CLOEXEC)
+	identity, digest, err := operation.normalizeDestinationMetadata(ctx)
 	if err != nil {
-		return repairFailure(RepairCauseQuarantineMismatch, RepairStageCanonicalVerify, operation.progress, err)
-	}
-	identity, digest, err := operation.validateFile(ctx, operation.quarantineFD, operation.destinationName, fd, operation.expectation, BoundaryRepairDestinationHash, RepairStageCanonicalVerify, RepairCauseQuarantineMismatch, false)
-	_ = unix.Close(fd)
-	if err != nil {
-		return repairFailure(RepairCauseQuarantineMismatch, RepairStageCanonicalVerify, operation.progress, err)
+		return err
 	}
 	if operation.progress.RenamePerformedByThisCall && !sameRepairFileObject(identity, operation.sourceIdentity) {
 		return repairFailure(RepairCauseNamespaceChanged, RepairStageCanonicalVerify, operation.progress, ErrValidation)
@@ -667,6 +668,36 @@ func (operation *RepairQuarantine) verifyExactDestination(ctx context.Context) e
 	operation.progress.ObservedSize = operation.expectation.Size
 	operation.progress.ObservedSHA256 = digest
 	return nil
+}
+
+func (operation *RepairQuarantine) normalizeDestinationMetadata(ctx context.Context) (repairNamespaceIdentity, [sha256.Size]byte, error) {
+	fd, err := repairOpenat2(operation.quarantineFD, operation.destinationName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_NOATIME|unix.O_CLOEXEC)
+	if err != nil {
+		return repairNamespaceIdentity{}, [sha256.Size]byte{}, repairFailure(repairCauseForError(err, RepairCauseQuarantineMismatch), RepairStageCanonicalVerify, operation.progress, err)
+	}
+	defer unix.Close(fd)
+	identity, digest, err := operation.validateFile(ctx, operation.quarantineFD, operation.destinationName, fd, operation.expectation, BoundaryRepairDestinationHash, RepairStageCanonicalVerify, RepairCauseQuarantineMismatch, false)
+	if err != nil {
+		return identity, digest, err
+	}
+	if operation.progress.RenamePerformedByThisCall && !sameRepairFileObject(identity, operation.sourceIdentity) {
+		return identity, digest, repairFailure(RepairCauseNamespaceChanged, RepairStageCanonicalVerify, operation.progress, ErrValidation)
+	}
+	if err := operation.store.inject(ctx, BoundaryRepairDestinationMetadataSync, Before, operation.destinationPath, 0); err != nil {
+		return identity, digest, repairContextFailure(RepairStageCanonicalVerify, operation.progress, err)
+	}
+	if identity.Mode&0o7777 != 0o600 {
+		if err := unix.Fchmod(fd, 0o600); err != nil {
+			return identity, digest, repairFailure(repairCauseForError(err, RepairCauseInternal), RepairStageCanonicalVerify, operation.progress, err)
+		}
+	}
+	if err := unix.Fsync(fd); err != nil {
+		return identity, digest, repairFailure(repairCauseForError(err, RepairCauseDurability), RepairStageCanonicalVerify, operation.progress, err)
+	}
+	if err := operation.store.inject(ctx, BoundaryRepairDestinationMetadataSync, After, operation.destinationPath, 0); err != nil {
+		return identity, digest, repairFailure(RepairCauseDurability, RepairStageCanonicalVerify, operation.progress, err)
+	}
+	return identity, digest, nil
 }
 
 func (operation *RepairQuarantine) requireSourceAbsent() error {
@@ -774,6 +805,8 @@ func repairErrorCause(err error) RepairCause {
 
 func repairCauseForError(err error, fallback RepairCause) RepairCause {
 	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return RepairCauseCancelled
 	case errors.Is(err, unix.EXDEV), errors.Is(err, ErrScanBoundary):
 		return RepairCauseCrossDevice
 	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM), errors.Is(err, ErrPermission):

@@ -48,13 +48,8 @@ IN ACCESS EXCLUSIVE MODE;
 
 DO $$
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM reconciliation_repair_runs AS r
-        WHERE NOT EXISTS (
-            SELECT 1 FROM reconciliation_repair_results AS result WHERE result.run_id=r.id
-        )
-    ) THEN
-        RAISE EXCEPTION 'unfinished pre-v19 repair run requires operator resolution'
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_runs) THEN
+        RAISE EXCEPTION 'pre-v19 repair history cannot acquire v19 execution authority'
             USING ERRCODE='55000';
     END IF;
     IF EXISTS (
@@ -494,6 +489,28 @@ BEGIN
         derived_decision:='stale'; derived_reason:='live_owner';
     ELSIF derived_source_type='original_final' AND EXISTS (
         SELECT 1 FROM storage_attempts AS a
+        JOIN LATERAL (
+          SELECT e.event_type,e.occurred_at FROM storage_attempt_events AS e
+          WHERE e.attempt_id=a.id ORDER BY e.sequence DESC LIMIT 1
+        ) AS latest ON true
+        WHERE a.kind='upload' AND a.original_id=finding.subject_id
+          AND latest.event_type IN ('published','aborted')
+          AND latest.occurred_at>report_row.temp_cutoff_at
+    ) THEN
+        derived_decision:='stale'; derived_reason:='recent_owner';
+    ELSIF derived_source_type='rendition_final' AND EXISTS (
+        SELECT 1 FROM storage_attempts AS a
+        JOIN LATERAL (
+          SELECT e.event_type,e.occurred_at FROM storage_attempt_events AS e
+          WHERE e.attempt_id=a.id ORDER BY e.sequence DESC LIMIT 1
+        ) AS latest ON true
+        WHERE a.kind='transform' AND a.job_id=finding.job_id
+          AND latest.event_type IN ('published','released','expired')
+          AND latest.occurred_at>report_row.temp_cutoff_at
+    ) THEN
+        derived_decision:='stale'; derived_reason:='recent_owner';
+    ELSIF derived_source_type='original_final' AND EXISTS (
+        SELECT 1 FROM storage_attempts AS a
         LEFT JOIN LATERAL (
           SELECT e.event_type,e.lease_expires_at,e.occurred_at
           FROM storage_attempt_events AS e WHERE e.attempt_id=a.id
@@ -601,6 +618,9 @@ BEGIN
     -- Adopted global order: run advisory, maintenance, source path, entities,
     -- then journal rows. Never move the path lock before maintenance.
     PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(requested_run_id::text,0));
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_results AS result WHERE result.run_id=requested_run_id) THEN
+        RAISE EXCEPTION 'completed repair run is immutable' USING ERRCODE='23514';
+    END IF;
     terminal_outcome:=nmcp_repair_effective_outcome(requested_item_id);
     IF terminal_outcome IS NOT NULL THEN
         SELECT * INTO STRICT finding FROM reconciliation_check_findings
@@ -636,6 +656,9 @@ DECLARE item reconciliation_repair_manifest_items%ROWTYPE;
 BEGIN
     SELECT * INTO STRICT item FROM reconciliation_repair_manifest_items WHERE id=repair_item_id;
     PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(item.run_id::text,0));
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_results WHERE run_id=item.run_id) THEN
+        RAISE EXCEPTION 'completed repair run is immutable' USING ERRCODE='23514';
+    END IF;
     PERFORM 1 FROM maintenance_state WHERE id=1 AND mode='maintenance' FOR SHARE;
     IF NOT FOUND THEN RAISE EXCEPTION 'repair attempt requires maintenance mode' USING ERRCODE='55000'; END IF;
     PERFORM 1 FROM reconciliation_repair_runs WHERE id=item.run_id FOR UPDATE;
@@ -805,16 +828,18 @@ CREATE OR REPLACE FUNCTION nmcp_append_repair_event(
     repair_observed_sha text
 ) RETURNS integer LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE existing reconciliation_repair_events%ROWTYPE; next_sequence integer;
-        item_id nmcp_uuid_v4; run_id nmcp_uuid_v4;
+        item_id nmcp_uuid_v4; target_run_id nmcp_uuid_v4;
 BEGIN
-    SELECT m.id,m.run_id INTO STRICT item_id,run_id
+    SELECT m.id,m.run_id INTO STRICT item_id,target_run_id
       FROM reconciliation_repair_attempts AS a
       JOIN reconciliation_repair_manifest_items AS m ON m.id=a.manifest_item_id
       WHERE a.id=repair_attempt_id;
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(target_run_id::text,0));
+    IF EXISTS (SELECT 1 FROM reconciliation_repair_results AS result WHERE result.run_id=target_run_id) THEN
+        RAISE EXCEPTION 'completed repair run is immutable' USING ERRCODE='23514';
+    END IF;
     IF repair_event_type='applying' THEN
-        PERFORM * FROM nmcp_lock_repair_item_apply(run_id,item_id,repair_attempt_id);
-    ELSE
-        PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(run_id::text,0));
+        PERFORM * FROM nmcp_lock_repair_item_apply(target_run_id,item_id,repair_attempt_id);
     END IF;
     SELECT * INTO existing FROM reconciliation_repair_events WHERE id=repair_event_id;
     IF FOUND THEN
@@ -992,7 +1017,7 @@ BEGIN
       SELECT nmcp_repair_effective_outcome(item.id) AS outcome
       FROM reconciliation_repair_manifest_items AS item WHERE item.run_id=NEW.run_id
     ) AS outcomes;
-    IF actual_manifest<>sealed_count OR incomplete<>0
+    IF actual_manifest<>sealed_count OR incomplete<>0 OR actual_failed<>0
        OR NEW.manifest_count<>actual_manifest OR NEW.quarantined_count<>actual_quarantined
        OR NEW.stale_count<>actual_stale OR NEW.resolved_count<>actual_resolved
        OR NEW.failed_count<>actual_failed OR NEW.unknown_count<>actual_unknown
@@ -1026,7 +1051,7 @@ BEGIN
       actual_failed,actual_unknown,incomplete
     FROM (SELECT nmcp_repair_effective_outcome(item.id) AS outcome
       FROM reconciliation_repair_manifest_items AS item WHERE item.run_id=repair_run_id) AS outcomes;
-    IF actual_manifest<>sealed_count OR incomplete<>0 THEN
+    IF actual_manifest<>sealed_count OR incomplete<>0 OR actual_failed<>0 THEN
         RAISE EXCEPTION 'repair run has incomplete or recoverable items' USING ERRCODE='23514';
     END IF;
     derived_result:=CASE WHEN actual_unknown>0 THEN 'unknown' WHEN actual_failed=0 THEN 'succeeded'
@@ -1060,7 +1085,7 @@ ALTER TABLE reconciliation_check_findings
     ADD CONSTRAINT reconciliation_check_findings_expected_state_check CHECK (
       expected_state IS NULL OR expected_state IN (
         'referenced','unreferenced','current','non_current','purged','cleanup_deleted',
-        'quarantined','possible_quarantine'
+        'quarantined','possible_quarantine','prepared_quarantine'
       )
     );
 
@@ -1082,8 +1107,12 @@ BEGIN
     UNION ALL
     SELECT 'quarantine'::text,item.quarantine_id::uuid,item.media_id::uuid,NULL::uuid,
       item.job_id::uuid,item.job_target_id::uuid,item.destination_relative_key,
-      CASE WHEN nmcp_repair_effective_outcome(item.id)='quarantined'
-        THEN 'quarantined' ELSE 'possible_quarantine' END,
+       CASE WHEN nmcp_repair_effective_outcome(item.id)='quarantined' THEN 'quarantined'
+         WHEN EXISTS (SELECT 1 FROM reconciliation_repair_attempts AS physical_attempt
+           JOIN reconciliation_repair_events AS physical_event ON physical_event.attempt_id=physical_attempt.id
+           WHERE physical_attempt.manifest_item_id=item.id AND physical_event.event_type IN
+             ('rename','source_directory_fsync','destination_directory_fsync','uncertain','unknown'))
+         THEN 'possible_quarantine' ELSE 'prepared_quarantine' END,
       COALESCE(latest.observed_size_bytes,item.expected_size_bytes),
       COALESCE(latest.observed_sha256,item.report_observed_sha256),
       NULL::boolean,true,true,COALESCE(latest.occurred_at,item.prepared_at)
@@ -1095,10 +1124,12 @@ BEGIN
       WHERE a.manifest_item_id=item.id
       ORDER BY a.attempt_number DESC,e.sequence DESC LIMIT 1
     ) AS latest ON true
-    WHERE EXISTS (SELECT 1 FROM reconciliation_repair_attempts AS a
-      JOIN reconciliation_repair_events AS e ON e.attempt_id=a.id
-      WHERE a.manifest_item_id=item.id AND e.event_type IN
-        ('rename','source_directory_fsync','destination_directory_fsync','uncertain','unknown'))
+    WHERE nmcp_repair_effective_outcome(item.id) IS NULL
+       OR nmcp_repair_effective_outcome(item.id) IN ('failed','quarantined')
+       OR EXISTS (SELECT 1 FROM reconciliation_repair_attempts AS visible_attempt
+         JOIN reconciliation_repair_events AS visible_event ON visible_event.attempt_id=visible_attempt.id
+         WHERE visible_attempt.manifest_item_id=item.id AND visible_event.event_type IN
+           ('rename','source_directory_fsync','destination_directory_fsync','uncertain','unknown'))
     ORDER BY 1,7 NULLS FIRST,2;
 END;
 $$;

@@ -13,6 +13,10 @@ import (
 
 type RepairPostgresRepository struct{ pool *pgxpool.Pool }
 
+type repairHistoryQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
 func NewRepairPostgresRepository(pool *pgxpool.Pool) (*RepairPostgresRepository, error) {
 	if pool == nil {
 		return nil, errors.New("repair database is required")
@@ -283,21 +287,38 @@ func (session *RepairApplySession) Rollback(ctx context.Context) error {
 }
 
 func (repository *RepairPostgresRepository) ReadHistory(ctx context.Context, itemID string) ([]RepairHistoryEvent, error) {
-	rows, err := repository.pool.Query(ctx, `SELECT * FROM nmcp_read_repair_attempt_history($1,0,0,1000)`, itemID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	return readRepairHistory(ctx, repository.pool, itemID)
+}
+
+func readRepairHistory(ctx context.Context, querier repairHistoryQuerier, itemID string) ([]RepairHistoryEvent, error) {
 	var result []RepairHistoryEvent
-	for rows.Next() {
-		var event RepairHistoryEvent
-		var txid any
-		if err := rows.Scan(&event.AttemptNumber, &event.AttemptID, &event.StartedAt, &event.Sequence, &event.EventID, &event.EventType, &event.OutcomeCode, &event.ErrorCode, &event.ObservedSize, &event.ObservedSHA, &txid, &event.OccurredAt, &event.PhysicalEffectPossible); err != nil {
+	afterAttempt, afterSequence := 0, 0
+	for {
+		rows, err := querier.Query(ctx, `SELECT * FROM nmcp_read_repair_attempt_history($1,$2,$3,256)`, itemID, afterAttempt, afterSequence)
+		if err != nil {
 			return nil, err
 		}
-		result = append(result, event)
+		count := 0
+		for rows.Next() {
+			var event RepairHistoryEvent
+			var txid any
+			if err := rows.Scan(&event.AttemptNumber, &event.AttemptID, &event.StartedAt, &event.Sequence, &event.EventID, &event.EventType, &event.OutcomeCode, &event.ErrorCode, &event.ObservedSize, &event.ObservedSHA, &txid, &event.OccurredAt, &event.PhysicalEffectPossible); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			result = append(result, event)
+			afterAttempt, afterSequence = event.AttemptNumber, event.Sequence
+			count++
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		if count < 256 {
+			return result, nil
+		}
 	}
-	return result, rows.Err()
 }
 
 func (repository *RepairPostgresRepository) ConfirmHistory(ctx context.Context, runID, itemID string) ([]RepairHistoryEvent, error) {
@@ -314,22 +335,7 @@ func (repository *RepairPostgresRepository) ConfirmHistory(ctx context.Context, 
 	if _, err = tx.Exec(ctx, `SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1,0))`, runID); err != nil {
 		return nil, err
 	}
-	rows, err := tx.Query(ctx, `SELECT * FROM nmcp_read_repair_attempt_history($1,0,0,1000)`, itemID)
-	if err != nil {
-		return nil, err
-	}
-	var result []RepairHistoryEvent
-	for rows.Next() {
-		var event RepairHistoryEvent
-		var txid any
-		if err := rows.Scan(&event.AttemptNumber, &event.AttemptID, &event.StartedAt, &event.Sequence, &event.EventID, &event.EventType, &event.OutcomeCode, &event.ErrorCode, &event.ObservedSize, &event.ObservedSHA, &txid, &event.OccurredAt, &event.PhysicalEffectPossible); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		result = append(result, event)
-	}
-	err = rows.Err()
-	rows.Close()
+	result, err := readRepairHistory(ctx, tx, itemID)
 	if err != nil {
 		return nil, err
 	}
@@ -349,13 +355,21 @@ func (repository *RepairPostgresRepository) Finish(ctx context.Context, runID st
 	if finishErr != nil || err != nil {
 		operationErr := errors.Join(finishErr, err)
 		confirmCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		run, err = repository.confirmRunOutcome(confirmCtx, runID)
-		if err != nil {
-			return RepairExecutionResult{}, errors.Join(operationErr, err)
-		}
-		if run.Result == nil {
-			return RepairExecutionResult{}, errors.Join(operationErr, ErrRepairIncomplete)
+		confirmed, confirmErr := repository.confirmRunOutcome(confirmCtx, runID)
+		cancel()
+		if confirmErr == nil && confirmed.Result != nil {
+			run = confirmed
+		} else {
+			replayCtx, replayCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_, replayErr := repository.pool.Exec(replayCtx, `SELECT nmcp_finish_repair_run($1)`, runID)
+			replayCancel()
+			finalCtx, finalCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			finalRun, finalErr := repository.confirmRunOutcome(finalCtx, runID)
+			finalCancel()
+			if finalErr != nil || finalRun.Result == nil {
+				return RepairExecutionResult{}, errors.Join(operationErr, confirmErr, replayErr, finalErr, ErrRepairIncomplete)
+			}
+			run = finalRun
 		}
 	}
 	if run.Result == nil {

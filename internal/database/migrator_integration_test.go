@@ -2374,6 +2374,57 @@ func TestRepairMigrationRejectsUnfinishedV18StateWithoutPartialDDL(t *testing.T)
 	}
 }
 
+func TestRepairMigrationRejectsCompletedV18HistoryWithoutInventingAuthority(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool := integrationPool(t, databaseURL)
+	migrator, err := NewMigrator(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newMigrator(pool, migrator.migrations[:18]).Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reportID, runID, authorizationID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_reports(
+		id,format_version,classifier_version,scope,migration_version,migration_name,migration_checksum,
+		db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at)
+		SELECT $1,1,1,'all',version,name,checksum,statement_timestamp()-interval '10 seconds',
+		statement_timestamp()-interval '9 seconds',statement_timestamp()-interval '8 seconds',
+		statement_timestamp()-interval '7 seconds',statement_timestamp()-interval '48 hours 9 seconds'
+		FROM schema_migrations WHERE version=18`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at) VALUES($1,0,clock_timestamp()-interval '6 seconds')`, []any{reportID}},
+		{`INSERT INTO reconciliation_repair_runs(id,source_report_id,authorization_id,authorized_actor) VALUES($1,$2,$3,'completed-v18')`, []any{runID, reportID, authorizationID}},
+		{`ALTER TABLE reconciliation_repair_results DISABLE TRIGGER USER`, nil},
+		{`INSERT INTO reconciliation_repair_results(run_id,result,manifest_count,quarantined_count,stale_count,resolved_count,failed_count,unknown_count) VALUES($1,'succeeded',0,0,0,0,0,0)`, []any{runID}},
+		{`ALTER TABLE reconciliation_repair_results ENABLE TRIGGER USER`, nil},
+	} {
+		if _, err := pool.Exec(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := migrator.Up(ctx); err == nil {
+		t.Fatal("migration 19 invented execution authority for completed v18 history")
+	}
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 18 {
+		t.Fatalf("completed-v18 rejection version=%d error=%v", version, err)
+	}
+	var result string
+	if err := pool.QueryRow(ctx, `SELECT result FROM reconciliation_repair_results WHERE run_id=$1`, runID).Scan(&result); err != nil || result != "succeeded" {
+		t.Fatalf("completed v18 history was not preserved: %q, %v", result, err)
+	}
+}
+
 func TestRepairMigrationDrainsExistingRepairWriter(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {

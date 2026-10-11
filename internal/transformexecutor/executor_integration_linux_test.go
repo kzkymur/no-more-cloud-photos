@@ -228,6 +228,30 @@ func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 		if _, err := pool.Exec(context.Background(), `UPDATE job_targets SET status='failed',error_code='process_failed',error_message='maintenance won',updated_at=clock_timestamp() WHERE id=$1`, targets[0]); err != nil {
 			t.Fatal(err)
 		}
+		recentRepair := prepareRenditionRepair(t, pool, root, lease, targets[0], renderOne, orphanPayload)
+		beginRepairAttempt(t, pool, recentRepair)
+		recentTx, err := pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var recentDecision, recentReason string
+		if err := recentTx.QueryRow(context.Background(), `SELECT decision,reason_code FROM nmcp_lock_repair_item_apply($1::uuid,$2::uuid,$3::uuid) LIMIT 1`, recentRepair.runID, recentRepair.itemID, recentRepair.attemptID).Scan(&recentDecision, &recentReason); err != nil {
+			_ = recentTx.Rollback(context.Background())
+			t.Fatal(err)
+		}
+		_ = recentTx.Rollback(context.Background())
+		if recentDecision != "stale" || recentReason != "recent_owner" {
+			t.Fatalf("fresh released owner authority = %q/%q, want stale/recent_owner", recentDecision, recentReason)
+		}
+		if _, err := pool.Exec(context.Background(), `ALTER TABLE storage_attempt_events DISABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(context.Background(), `UPDATE storage_attempt_events SET occurred_at=clock_timestamp()-interval '49 hours' WHERE attempt_id IN (SELECT id FROM storage_attempts WHERE job_id=$1)`, jobID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(context.Background(), `ALTER TABLE storage_attempt_events ENABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
 		repair := prepareRenditionRepair(t, pool, root, lease, targets[0], renderOne, orphanPayload)
 		beginRepairAttempt(t, pool, repair)
 		tx, err := pool.Begin(context.Background())

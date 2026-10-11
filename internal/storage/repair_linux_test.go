@@ -20,6 +20,9 @@ func TestRepairQuarantineStagesExactAuthority(t *testing.T) {
 	key, destination := testOriginalKey(t), testQuarantineKey(t)
 	payload := []byte("repair-authority-bytes")
 	publishTestObject(t, store, key, payload)
+	if err := unix.Chmod(filepath.Join(root, filepath.FromSlash(key.String())), 0o4644); err != nil {
+		t.Fatal(err)
+	}
 	expectation := repairTestExpectation(t, root, key.String(), payload)
 	operation, progress, err := store.BeginRepairOriginal(context.Background(), key, destination, expectation)
 	if err != nil || progress.Disposition != RepairSourceReady || progress.RenameObserved {
@@ -51,6 +54,10 @@ func TestRepairQuarantineStagesExactAuthority(t *testing.T) {
 	assertFinalMissing(t, root, key.String())
 	if got := readRelative(t, root, destination.String()); string(got) != string(payload) {
 		t.Fatalf("destination = %q", got)
+	}
+	var destinationStat unix.Stat_t
+	if err := unix.Stat(filepath.Join(root, filepath.FromSlash(destination.String())), &destinationStat); err != nil || destinationStat.Mode&0o7777 != 0o600 {
+		t.Fatalf("destination mode = %#o, %v", destinationStat.Mode, err)
 	}
 }
 
@@ -126,6 +133,9 @@ func TestRepairRejectsHardlinkAndRecoversExactDestination(t *testing.T) {
 		if err = operation.Close(); !errors.Is(err, ErrOutcomeUncertain) {
 			t.Fatalf("Close() = %v", err)
 		}
+		if err := unix.Chmod(filepath.Join(root, filepath.FromSlash(destination.String())), 0o2600); err != nil {
+			t.Fatal(err)
+		}
 
 		recovered, progress, err := store.BeginRepairOriginal(context.Background(), key, destination, expectation)
 		if err != nil || progress.Disposition != RepairDestinationExact || !progress.RenameObserved || progress.RenamePerformedByThisCall {
@@ -133,6 +143,10 @@ func TestRepairRejectsHardlinkAndRecoversExactDestination(t *testing.T) {
 		}
 		if _, err = recovered.Revalidate(context.Background()); err != nil {
 			t.Fatal(err)
+		}
+		var recoveredStat unix.Stat_t
+		if err := unix.Stat(filepath.Join(root, filepath.FromSlash(destination.String())), &recoveredStat); err != nil || recoveredStat.Mode&0o7777 != 0o600 {
+			t.Fatalf("recovered destination mode = %#o, %v", recoveredStat.Mode, err)
 		}
 		if progress, err = recovered.Rename(context.Background()); err != nil || progress.RenamePerformedByThisCall {
 			t.Fatalf("recovery rename = %+v, %v", progress, err)
@@ -188,6 +202,33 @@ func TestRepairPostRenameFaultPreservesTruthfulProgress(t *testing.T) {
 	}
 	if err = operation.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRepairMetadataDurabilityFailureIsPhysicalEffectUncertainty(t *testing.T) {
+	root := t.TempDir()
+	fault := errors.New("metadata fsync response lost")
+	store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+		if event.Boundary == BoundaryRepairDestinationMetadataSync && event.Phase == After {
+			return fault
+		}
+		return nil
+	})})
+	key, destination := testOriginalKey(t), testQuarantineKey(t)
+	payload := []byte("metadata-durability")
+	publishTestObject(t, store, key, payload)
+	operation, _, err := store.BeginRepairOriginal(context.Background(), key, destination, repairTestExpectation(t, root, key.String(), payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operation.Close()
+	if _, err = operation.Revalidate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := operation.Rename(context.Background())
+	assertRepairCause(t, err, RepairCauseDurability)
+	if !progress.RenameObserved {
+		t.Fatalf("metadata failure lost physical-effect evidence: %+v", progress)
 	}
 }
 
@@ -289,6 +330,85 @@ func TestRepairRejectsTypeDigestAndLateLinkChanges(t *testing.T) {
 			t.Fatalf("source missing after rejected rename: %v", err)
 		}
 	})
+}
+
+func TestRepairHashFailuresKeepTruthfulCause(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		fault error
+		want  RepairCause
+	}{
+		{name: "cancelled", fault: context.Canceled, want: RepairCauseCancelled},
+		{name: "permission", fault: unix.EACCES, want: RepairCausePermission},
+		{name: "read only", fault: unix.EROFS, want: RepairCauseReadOnly},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			key, destination := testOriginalKey(t), testQuarantineKey(t)
+			injected := false
+			store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+				if !injected && event.Boundary == BoundaryRepairSourceHash && event.Phase == Before {
+					injected = true
+					return test.fault
+				}
+				return nil
+			})})
+			payload := []byte("hash-cause")
+			publishTestObject(t, store, key, payload)
+			_, _, err := store.BeginRepairOriginal(context.Background(), key, destination, repairTestExpectation(t, root, key.String(), payload))
+			assertRepairCause(t, err, test.want)
+		})
+		t.Run("destination "+test.name, func(t *testing.T) {
+			root := t.TempDir()
+			key, destination := testOriginalKey(t), testQuarantineKey(t)
+			injectDestination := false
+			store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+				if injectDestination && event.Boundary == BoundaryRepairDestinationHash && event.Phase == Before {
+					return test.fault
+				}
+				return nil
+			})})
+			payload := []byte("destination-hash-cause")
+			publishTestObject(t, store, key, payload)
+			expectation := repairTestExpectation(t, root, key.String(), payload)
+			operation, _, err := store.BeginRepairOriginal(context.Background(), key, destination, expectation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = operation.Revalidate(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = operation.Rename(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			_ = operation.Close()
+			injectDestination = true
+			_, _, err = store.BeginRepairOriginal(context.Background(), key, destination, expectation)
+			assertRepairCause(t, err, test.want)
+		})
+	}
+}
+
+func TestRepairPostRevalidationCancellationRemainsCancelled(t *testing.T) {
+	root := t.TempDir()
+	cancelAtBoundary := false
+	store := openTestStore(t, root, Options{Faults: FaultInjectorFunc(func(_ context.Context, event FaultEvent) error {
+		if cancelAtBoundary && event.Boundary == BoundaryRepairRevalidate && event.Phase == After {
+			return context.Canceled
+		}
+		return nil
+	})})
+	key, destination := testOriginalKey(t), testQuarantineKey(t)
+	payload := []byte("revalidation-cancel")
+	publishTestObject(t, store, key, payload)
+	operation, _, err := store.BeginRepairOriginal(context.Background(), key, destination, repairTestExpectation(t, root, key.String(), payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operation.Close()
+	cancelAtBoundary = true
+	_, err = operation.Revalidate(context.Background())
+	assertRepairCause(t, err, RepairCauseCancelled)
 }
 
 func TestRepairRejectsCanonicalNamespaceReplacementAndPreRenameCancellation(t *testing.T) {

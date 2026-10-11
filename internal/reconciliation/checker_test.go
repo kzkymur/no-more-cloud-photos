@@ -316,14 +316,19 @@ func TestClassifyQuarantineOnlyAgainstDurableJournal(t *testing.T) {
 	missing := ".quarantine/01234567-89ab-4cde-8f01-23456789abcd"
 	mismatch := ".quarantine/12345678-9abc-4def-8012-3456789abcde"
 	uncertain := ".quarantine/23456789-abcd-4ef0-8123-456789abcdef"
+	preparedMissing := ".quarantine/3456789a-bcde-4f01-8234-56789abcdef0"
+	preparedPresent := ".quarantine/456789ab-cdef-4012-8345-6789abcdef01"
 	snapshot := Snapshot{References: []Reference{
 		{Kind: "quarantine", SubjectID: "01234567-89ab-4cde-8f01-23456789abcd", RelativeKey: &missing, ExpectedState: stringPointer("quarantined"), SizeBytes: &size, SHA256: &goodSHA},
 		{Kind: "quarantine", SubjectID: "12345678-9abc-4def-8012-3456789abcde", RelativeKey: &mismatch, ExpectedState: stringPointer("quarantined"), SizeBytes: &size, SHA256: &goodSHA},
 		{Kind: "quarantine", SubjectID: "23456789-abcd-4ef0-8123-456789abcdef", RelativeKey: &uncertain, SizeBytes: &size, SHA256: &goodSHA},
+		{Kind: "quarantine", SubjectID: "3456789a-bcde-4f01-8234-56789abcdef0", RelativeKey: &preparedMissing, ExpectedState: stringPointer("prepared_quarantine"), SizeBytes: &size, SHA256: &goodSHA},
+		{Kind: "quarantine", SubjectID: "456789ab-cdef-4012-8345-6789abcdef01", RelativeKey: &preparedPresent, ExpectedState: stringPointer("prepared_quarantine"), SizeBytes: &size, SHA256: &goodSHA},
 	}}
 	observations := []storage.Observation{
 		regularObservation(mismatch, size, bad, observedAt),
-		regularObservation(".quarantine/3456789a-bcde-4f01-8234-56789abcdef0", size, good, observedAt),
+		regularObservation(preparedPresent, size, good, observedAt),
+		regularObservation(".quarantine/56789abc-def0-4123-8456-789abcdef012", size, good, observedAt),
 	}
 	findings, err := classify(snapshot, observations, observedAt, ScopeAll)
 	if err != nil || len(findings) != 2 || findings[0].Kind != "quarantine_missing" || findings[1].Kind != "quarantine_mismatch" {
