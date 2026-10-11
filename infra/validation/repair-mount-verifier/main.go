@@ -82,7 +82,7 @@ func main() {
 	}()
 	_, err = operation.Revalidate(context.Background())
 	var repairErr *storage.RepairError
-	if !errors.As(err, &repairErr) || repairErr.Cause != storage.RepairCauseSourceChanged ||
+	if !errors.As(err, &repairErr) || repairErr.Cause != storage.RepairCauseCrossDevice ||
 		repairErr.Progress.Revalidated || repairErr.Progress.RenameObserved ||
 		repairErr.Progress.RenamePerformedByThisCall {
 		fail("late bind revalidation did not fail closed before rename: %#v", err)
