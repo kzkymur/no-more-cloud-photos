@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Launch and attest the fixed migration-role verification service."""
+
+import fcntl
+import os
+import stat
+import subprocess
+import sys
+import time
+
+
+UNIT = "nmcp-migration-role-verifier.service"
+RUN = "/run/nmcp-ci"
+PROGRAM = RUN + "/supervisor.py"
+PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+ENVIRONMENT = {
+    "PATH": PATH, "LC_ALL": "C", "LANG": "C", "HOME": "/root",
+    "GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+}
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def command(argv, *, check=True, stdout=subprocess.PIPE):
+    return subprocess.run(argv, cwd="/", env=ENVIRONMENT,
+                          check=check, stdout=stdout, stderr=subprocess.PIPE, text=True)
+
+
+def unit_properties(*names):
+    result = command(("/usr/bin/systemctl", "show", UNIT, *(f"--property={name}" for name in names)), check=False)
+    values = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    if result.returncode and not values:
+        return {"LoadState": "not-found", "ActiveState": "inactive", "ControlGroup": ""}
+    return values
+
+
+def cgroup_pids(control_group):
+    if not control_group:
+        return []
+    root = "/sys/fs/cgroup" + control_group
+    try:
+        root_stat = os.lstat(root)
+    except FileNotFoundError:
+        return []
+    if not stat.S_ISDIR(root_stat.st_mode):
+        fail("unit control group is not a directory")
+    found = []
+    for directory, directories, files in os.walk(root, topdown=True, followlinks=False):
+        directories[:] = [name for name in directories if not os.path.islink(os.path.join(directory, name))]
+        if "cgroup.procs" in files:
+            with open(os.path.join(directory, "cgroup.procs"), encoding="ascii") as source:
+                found.extend(int(value) for value in source.read().split())
+    return sorted(set(found))
+
+
+def wait_unloaded(timeout=30):
+    deadline = time.monotonic() + timeout
+    while True:
+        state = unit_properties("LoadState", "ActiveState", "ControlGroup")
+        if state.get("LoadState") == "not-found":
+            return
+        if time.monotonic() >= deadline:
+            fail(f"fixed unit did not unload: {state}")
+        time.sleep(0.1)
+
+
+def reap_completed_unit(state):
+    """Finish cleanup abandoned by a dead client, never a live transaction."""
+    active = state.get("ActiveState")
+    sub = state.get("SubState")
+    if active == "active" and sub == "exited" and not cgroup_pids(state.get("ControlGroup", "")):
+        command(("/usr/bin/systemctl", "stop", UNIT), check=False)
+        command(("/usr/bin/systemctl", "reset-failed", UNIT), check=False)
+        wait_unloaded()
+        return True
+    if active in ("inactive", "failed") and not cgroup_pids(state.get("ControlGroup", "")):
+        command(("/usr/bin/systemctl", "stop", UNIT), check=False)
+        command(("/usr/bin/systemctl", "reset-failed", UNIT), check=False)
+        wait_unloaded()
+        return True
+    return False
+
+
+def publish_supervisor(repo, commit):
+    resolved = command(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo,
+                        "rev-parse", "--verify", f"{commit}^{{commit}}")).stdout.strip()
+    if resolved != commit:
+        fail("candidate commit identity mismatch")
+    source = command(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo,
+                      "show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor")).stdout.encode()
+    temporary = PROGRAM + ".new"
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+    try:
+        os.write(descriptor, source)
+        os.fchmod(descriptor, 0o500)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, PROGRAM)
+    directory = os.open(RUN, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) not in (4, 5):
+        fail("usage: client REPOSITORY CURRENT_COMMIT ABSOLUTE_GO [FAULT_POINT]")
+    os.chdir("/")
+    os.umask(0o077)
+    repo, commit, go_binary = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
+    os.makedirs(RUN, mode=0o700, exist_ok=True)
+    run_stat = os.lstat(RUN)
+    if (not stat.S_ISDIR(run_stat.st_mode) or run_stat.st_uid != 0 or run_stat.st_gid != 0
+            or stat.S_IMODE(run_stat.st_mode) != 0o700):
+        fail(f"unsafe {RUN}")
+    client_lock = os.open(RUN + "/client.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(client_lock, fcntl.LOCK_EX)
+        before = unit_properties("LoadState", "ActiveState", "SubState", "ControlGroup")
+        if before.get("LoadState") == "loaded" and reap_completed_unit(before):
+            before = unit_properties("LoadState", "ActiveState", "SubState", "ControlGroup")
+        if before.get("LoadState") not in ("not-found", "loaded"):
+            fail(f"unexpected prior unit load state: {before}")
+        if before.get("ActiveState") not in ("inactive", "failed"):
+            fail(f"verification unit is occupied: {before.get('ActiveState')}")
+        occupants = cgroup_pids(before.get("ControlGroup", ""))
+        if occupants:
+            fail(f"verification unit control group is not empty: {occupants}")
+        publish_supervisor(repo, commit)
+        service_argv = (
+            "/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",
+            "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
+            "--property=TimeoutStopSec=15s", "--property=RuntimeMaxSec=15min",
+            "--property=Delegate=no", "--property=RemainAfterExit=yes",
+            "--property=User=root", "--property=Group=root",
+            "--property=UMask=0077", "--property=WorkingDirectory=/",
+            "--property=StandardOutput=journal", "--property=StandardError=journal",
+            "/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "LANG=C",
+            "HOME=/root", "/usr/bin/python3", "-I", "-S", PROGRAM,
+            repo, commit, go_binary,
+        ) + ((sys.argv[4],) if len(sys.argv) == 5 else ())
+        launched = command(service_argv, check=False)
+        if launched.returncode:
+            fail(f"fixed unit launch failed: {launched.stderr.strip()}")
+        observed = unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL",
+                                   "TimeoutStopUSec", "RuntimeMaxUSec", "Delegate", "RemainAfterExit")
+        invocation = observed.get("InvocationID", "")
+        if len(invocation) != 32 or any(character not in "0123456789abcdef" for character in invocation):
+            fail(f"missing exact invocation identity: {observed}")
+        expected = {"Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
+                    "Delegate": "no", "RemainAfterExit": "yes"}
+        if any(observed.get(key) != value for key, value in expected.items()):
+            fail(f"unsafe service properties: {observed}")
+        if observed.get("TimeoutStopUSec") != "15s" or observed.get("RuntimeMaxUSec") != "15min":
+            fail(f"service time bounds changed: {observed}")
+    finally:
+        os.close(client_lock)
+
+    deadline = time.monotonic() + 16 * 60
+    while True:
+        current = unit_properties("InvocationID", "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus", "ControlGroup")
+        if current.get("InvocationID") != invocation:
+            fail("unit invocation changed while awaiting the result")
+        if (current.get("ActiveState") == "active" and current.get("SubState") == "exited") or current.get("ActiveState") == "failed":
+            break
+        if time.monotonic() >= deadline:
+            command(("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", UNIT), check=False)
+            fail("timed out awaiting fixed verification unit")
+        time.sleep(0.2)
+    command(("/usr/bin/journalctl", "--sync"), check=False)
+    journal = command(("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
+                       f"_SYSTEMD_INVOCATION_ID={invocation}")).stdout
+    sys.stdout.write(journal)
+    successful = (current.get("Result") == "success" and current.get("ExecMainCode") == "exited"
+                  and current.get("ExecMainStatus") == "0")
+    try:
+        if not successful:
+            fail(f"verification invocation failed: {current}")
+        deadline = time.monotonic() + 5
+        while journal.count("Ubuntu migration role compatibility verification passed") != 1:
+            if time.monotonic() >= deadline:
+                fail("exact invocation journal lacks one final success marker")
+            time.sleep(0.1)
+            journal = command(("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
+                               f"_SYSTEMD_INVOCATION_ID={invocation}")).stdout
+        if cgroup_pids(current.get("ControlGroup", "")):
+            fail("successful invocation left control-group processes")
+    finally:
+        if successful:
+            command(("/usr/bin/systemctl", "stop", UNIT), check=False)
+        command(("/usr/bin/systemctl", "reset-failed", UNIT), check=False)
+        wait_unloaded()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"verification-client: {error}", file=sys.stderr)
+        raise SystemExit(1)

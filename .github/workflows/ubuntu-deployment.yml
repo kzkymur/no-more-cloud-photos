@@ -38,6 +38,8 @@ on:
       - "scripts/verify-installed-runtime-roles"
       - "scripts/verify-ubuntu-migration-lock"
       - "scripts/verify-ubuntu-migration-role-compatibility"
+      - "scripts/verify-ubuntu-migration-role-client"
+      - "scripts/verify-ubuntu-migration-role-containment"
       - "scripts/verify-ubuntu-migration-role-stage"
       - "scripts/verify-ubuntu-migration-role-supervisor"
       - "scripts/verify-ubuntu-repair-mount-boundaries"
@@ -87,6 +89,8 @@ on:
       - "scripts/verify-installed-runtime-roles"
       - "scripts/verify-ubuntu-migration-lock"
       - "scripts/verify-ubuntu-migration-role-compatibility"
+      - "scripts/verify-ubuntu-migration-role-client"
+      - "scripts/verify-ubuntu-migration-role-containment"
       - "scripts/verify-ubuntu-migration-role-stage"
       - "scripts/verify-ubuntu-migration-role-supervisor"
       - "scripts/verify-ubuntu-repair-mount-boundaries"
@@ -110,7 +114,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -161,11 +165,25 @@ jobs:
               raise SystemExit("candidate commit identity mismatch")
           source = subprocess.run(
               ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
-               "show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"),
+               "show", f"{commit}:scripts/verify-ubuntu-migration-role-containment"),
               cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
           ).stdout
-          sys.argv = ["verify-ubuntu-migration-role-supervisor", workspace, commit, go_binary]
-          namespace = {"__name__": "__main__", "__file__": f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"}
+          client = subprocess.run(
+              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
+               "show", f"{commit}:scripts/verify-ubuntu-migration-role-client"),
+              cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
+          ).stdout
+          os.makedirs("/run/nmcp-ci", mode=0o700, exist_ok=True)
+          client_path = "/run/nmcp-ci/containment-client.py"
+          descriptor = os.open(client_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o500)
+          try:
+              os.write(descriptor, client)
+              os.fchmod(descriptor, 0o500)
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          sys.argv = ["verify-ubuntu-migration-role-containment", client_path, workspace, commit, go_binary]
+          namespace = {"__name__": "__main__", "__file__": f"{commit}:scripts/verify-ubuntu-migration-role-containment"}
           exec(compile(source, namespace["__file__"], "exec"), namespace)
           PY
 

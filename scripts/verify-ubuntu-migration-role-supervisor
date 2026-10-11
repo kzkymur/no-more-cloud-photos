@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import os
+import secrets
 import shutil
 import signal
 import stat
@@ -42,6 +43,14 @@ PHASES = (
 HISTORICAL = "172583179d860619ae2c79505971e10ae7f394fc"
 MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 ACTIVE_PHASE = None
+INTENT_PATH = "/run/nmcp-ci/cleanup-intent.json"
+LOCK_KEEPER_PID_PATH = "/run/nmcp-ci/lock-keeper.pid"
+FAULT_MODE = ""
+TOP_ALLOWLISTS = {
+    "/usr/local/libexec/nmcp": {"postgresql", "set-ubuntu-migration-role-mode", "run-ubuntu-migration-compatibility", "verify-installed-runtime-roles"},
+    "/var/lib/nmcp": {"deployment"},
+    "/opt/nmcp-role-compatibility": {"current", "v18", "test-work"},
+}
 
 
 def die(message):
@@ -247,6 +256,143 @@ def fsync_directory(path):
         os.close(descriptor)
 
 
+def metadata(value):
+    return {"dev": value.st_dev, "ino": value.st_ino, "uid": value.st_uid,
+            "gid": value.st_gid, "mode": stat.S_IMODE(value.st_mode)}
+
+
+def durable_intents(entries):
+    raw = (json.dumps({"version": 1, "entries": entries}, sort_keys=True,
+                      separators=(",", ":")) + "\n").encode("ascii")
+    temporary = INTENT_PATH + ".new"
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        write_all(descriptor, raw)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, INTENT_PATH)
+    fsync_directory("/run/nmcp-ci")
+
+
+def fault(point):
+    if FAULT_MODE == point:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def remove_tree_fd(parent_fd, name, allowed):
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        names = set(os.listdir(descriptor))
+        if allowed is not None and not names <= set(allowed):
+            die(f"cleanup subtree outside allowlist: {name}: {sorted(names - set(allowed))}")
+        for child in names:
+            observed = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(observed.st_mode):
+                remove_tree_fd(descriptor, child, None)
+            elif stat.S_ISREG(observed.st_mode):
+                os.unlink(child, dir_fd=descriptor)
+            else:
+                die(f"cleanup encountered unsafe object: {name}/{child}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def recover_intents():
+    try:
+        descriptor = os.open(INTENT_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    try:
+        observed = os.fstat(descriptor)
+        if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != 0 or observed.st_gid != 0
+                or observed.st_nlink != 1 or stat.S_IMODE(observed.st_mode) != 0o600):
+            die("unsafe cleanup intent journal")
+        raw = os.read(descriptor, observed.st_size + 1)
+    finally:
+        os.close(descriptor)
+    document = json.loads(raw)
+    if set(document) != {"version", "entries"} or document["version"] != 1:
+        die("invalid cleanup intent journal")
+    for entry in reversed(document["entries"]):
+        if (set(entry) != {"path", "parent", "parent_identity", "absence_policy", "expected_metadata", "identity", "allowlist"}
+                or entry["absence_policy"] != "must-be-absent"):
+            die("invalid cleanup intent entry")
+        path = entry["path"]
+        parent = entry["parent"]
+        if os.path.dirname(path) != parent or os.path.basename(path) in ("", ".", ".."):
+            die("unsafe cleanup intent path")
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if metadata(os.fstat(parent_fd)) != entry["parent_identity"]:
+                die(f"cleanup parent identity changed: {parent}")
+            try:
+                top = os.stat(os.path.basename(path), dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISDIR(top.st_mode) or top.st_uid != entry["expected_metadata"]["uid"]
+                    or top.st_gid != entry["expected_metadata"]["gid"]
+                    or stat.S_IMODE(top.st_mode) != entry["expected_metadata"]["mode"]):
+                die(f"cleanup target metadata mismatch: {path}")
+            expected = entry["identity"]
+            if expected is not None and metadata(top) != expected:
+                die(f"cleanup target identity changed: {path}")
+            remove_tree_fd(parent_fd, os.path.basename(path), entry["allowlist"])
+        finally:
+            os.close(parent_fd)
+    os.unlink(INTENT_PATH)
+    fsync_directory("/run/nmcp-ci")
+
+
+def create_owned_top(path, mode, entries, allowlist, fault_name=None):
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})
+    parent_fd = None
+    try:
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if os.path.lexists(path):
+            die(f"refusing existing path: {path}")
+        entry = {"path": path, "parent": parent, "parent_identity": metadata(os.fstat(parent_fd)),
+                 "absence_policy": "must-be-absent", "expected_metadata": {"uid": 0, "gid": 0, "mode": mode},
+                 "identity": None, "allowlist": sorted(allowlist)}
+        entries.append(entry)
+        durable_intents(entries)
+        fault(f"{fault_name or path}:after-intent")
+        # mkdir(2) applies the process umask. Publish the exact journaled mode
+        # while the rest of this process deliberately retains umask 077.
+        previous_umask = os.umask(0)
+        try:
+            os.mkdir(name, mode, dir_fd=parent_fd)
+        finally:
+            os.umask(previous_umask)
+        os.fsync(parent_fd)
+        fault(f"{fault_name or path}:after-mkdir")
+        top_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            top = os.fstat(top_fd)
+            if top.st_uid != 0 or top.st_gid != 0 or stat.S_IMODE(top.st_mode) != mode:
+                die(f"new top directory metadata mismatch: {path}")
+            fault(f"{fault_name or path}:after-open")
+            entry["identity"] = metadata(top)
+            durable_intents(entries)
+            fault(f"{fault_name or path}:after-register")
+        finally:
+            os.close(top_fd)
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+    return entry
+
+
 def open_verified(root_fd, manifest, name):
     item = manifest[name]
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
@@ -272,12 +418,14 @@ def open_verified(root_fd, manifest, name):
 
 
 def main():
-    if os.geteuid() != 0 or len(sys.argv) != 4:
-        die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO")
+    global FAULT_MODE
+    if os.geteuid() != 0 or len(sys.argv) not in (4, 5):
+        die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO [FAULT_POINT]")
     os.chdir("/")
     os.umask(0o077)
     signal.signal(signal.SIGINT, interrupted)
     signal.signal(signal.SIGTERM, interrupted)
+    FAULT_MODE = sys.argv[4] if len(sys.argv) == 5 else ""
     repo, current_commit, go_binary = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
     if current_commit != git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip():
         die("checkout HEAD is not the requested candidate commit")
@@ -292,13 +440,36 @@ def main():
             or stat.S_IMODE(lock_stat.st_mode) != 0o600):
         die("unsafe transaction lock")
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    run_root = tempfile.mkdtemp(prefix="transaction-", dir="/run/nmcp-ci")
-    os.chmod(run_root, 0o700)
+    recover_intents()
+    intents = []
+    run_root = "/run/nmcp-ci/transaction-" + secrets.token_hex(16)
+    create_owned_top(run_root, 0o700, intents,
+                     {"current-source", "v18-source", "nmcp-admin-current.build",
+                      "nmcp-admin-v18.build", "snapshot", "snapshot.build"}, "run-root")
+    lock_keeper = subprocess.Popen(
+        ("/bin/sh", "-c", "trap '' TERM INT HUP QUIT; while :; do /usr/bin/sleep 300; done"),
+        cwd="/", env=clean_env(), pass_fds=(lock_fd,), start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    keeper_pid_fd = os.open(LOCK_KEEPER_PID_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        write_all(keeper_pid_fd, f"{lock_keeper.pid}\n".encode("ascii"))
+        os.fchmod(keeper_pid_fd, 0o600)
+        os.fsync(keeper_pid_fd)
+    finally:
+        os.close(keeper_pid_fd)
+    fsync_directory(os.path.dirname(LOCK_KEEPER_PID_PATH))
     run_identity = (os.lstat(run_root).st_dev, os.lstat(run_root).st_ino)
     owned = []
     trace = []
     snapshot_fd = None
+    retained_process = None
     try:
+        if FAULT_MODE.startswith("path:"):
+            for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
+                               ("/opt/nmcp-role-compatibility", 0o755)):
+                create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path], f"path:{path}")
+            die("path fault mode reached the end without its required SIGKILL")
         current_source = os.path.join(run_root, "current-source")
         historical_source = os.path.join(run_root, "v18-source")
         os.mkdir(current_source, 0o700)
@@ -349,9 +520,10 @@ def main():
         finally:
             os.close(verifier_fd)
 
-        for path in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):
-            if os.path.lexists(path):
-                die(f"refusing existing path: {path}")
+        for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
+                           ("/opt/nmcp-role-compatibility", 0o755)):
+            entry = create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path])
+            owned.append((path, (entry["identity"]["dev"], entry["identity"]["ino"])))
         for path, mode in (("/usr/local/libexec/nmcp/postgresql", 0o755), ("/var/lib/nmcp/deployment", 0o700),
                            ("/opt/nmcp-role-compatibility/current/bin", 0o755), ("/opt/nmcp-role-compatibility/v18/bin", 0o755)):
             os.makedirs(path, mode=mode)
@@ -359,9 +531,6 @@ def main():
         for path in ("/usr/local/libexec/nmcp", "/opt/nmcp-role-compatibility",
                      "/opt/nmcp-role-compatibility/current", "/opt/nmcp-role-compatibility/v18"):
             os.chmod(path, 0o755)
-        for top in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):
-            value = os.lstat(top)
-            owned.append((top, (value.st_dev, value.st_ino)))
         installs = {
             "role-mode": "/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode",
             "migration-wrapper": "/usr/local/libexec/nmcp/run-ubuntu-migration-compatibility",
@@ -404,6 +573,8 @@ def main():
         phase_env.update({"NMCP_COMPAT_WORK": "/opt/nmcp-role-compatibility/test-work",
                           "NMCP_DATABASE_URL": "postgres://nmcp_migrator:nmcp-migrator-wrapper-test@127.0.0.1:5432/nmcp?sslmode=disable",
                           "NMCP_LOG_LEVEL": "info", "NMCP_SHUTDOWN_TIMEOUT": "10s"})
+        if FAULT_MODE == "containment-supervisor-kill":
+            phase_env["NMCP_TEST_SUPERVISOR_CONTAINMENT"] = "1"
         os.mkdir(phase_env["NMCP_COMPAT_WORK"], 0o755)
         os.chmod(phase_env["NMCP_COMPAT_WORK"], 0o755)
         for phase in PHASES:
@@ -493,7 +664,26 @@ def main():
         if trace != expected:
             die("final trace differs from the fixed phase table")
         print("\n".join(trace), flush=True)
-        print("Ubuntu migration role compatibility verification passed", flush=True)
+        if FAULT_MODE == "retained-cleanup-dependency":
+            retained_process = subprocess.Popen(
+                ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
+                 "--dbname=nmcp", "--command", "SELECT pg_sleep(300)"),
+                cwd="/", env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            for _attempt in range(100):
+                probe = subprocess.run(
+                    ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
+                     "--dbname=postgres", "--tuples-only", "--no-align", "--command",
+                     "SELECT count(*) FROM pg_stat_activity WHERE datname='nmcp' AND query LIKE 'SELECT pg_sleep(300)%'"),
+                    cwd="/", env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                if probe.returncode == 0 and probe.stdout.strip() == "1":
+                    break
+                import time
+                time.sleep(0.05)
+            else:
+                die("retained cleanup connection did not become observable")
     finally:
         cleanup_errors = []
         if ACTIVE_PHASE is not None and ACTIVE_PHASE.poll() is None:
@@ -511,20 +701,44 @@ def main():
                 os.close(snapshot_fd)
             except OSError as error:
                 cleanup_errors.append(error)
-        subprocess.run(("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp"), env=clean_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc", "--dbname=postgres", "--set=ON_ERROR_STOP=1", "--command", "DROP ROLE IF EXISTS nmcp_graph_probe,nmcp_graph_bridge,nmcp_api,nmcp_worker,nmcp_migrator,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner"), env=clean_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for path, identity in reversed(owned):
+        for label, arguments in (
+            ("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp")),
+            ("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
+                            "--dbname=postgres", "--set=ON_ERROR_STOP=1", "--command",
+                            "DROP ROLE IF EXISTS nmcp_graph_probe,nmcp_graph_bridge,nmcp_api,nmcp_worker,nmcp_migrator,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner")),
+        ):
             try:
-                remove_owned(path, identity)
+                result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True)
+                if result.returncode:
+                    cleanup_errors.append(RuntimeError(
+                        f"{label} exited {result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"))
             except Exception as error:
-                cleanup_errors.append(error)
+                cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))
         try:
-            remove_owned(run_root, run_identity)
+            recover_intents()
         except Exception as error:
             cleanup_errors.append(error)
+        try:
+            os.killpg(lock_keeper.pid, signal.SIGTERM)
+            try:
+                lock_keeper.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                os.killpg(lock_keeper.pid, signal.SIGKILL)
+                lock_keeper.wait()
+        except ProcessLookupError:
+            pass
+        try:
+            os.unlink(LOCK_KEEPER_PID_PATH)
+            fsync_directory(os.path.dirname(LOCK_KEEPER_PID_PATH))
+        except FileNotFoundError:
+            pass
         os.close(lock_fd)
         if cleanup_errors:
             raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))
+    if retained_process is not None:
+        die("retained cleanup dependency unexpectedly permitted cleanup")
+    print("Ubuntu migration role compatibility verification passed", flush=True)
     return 0
 
 

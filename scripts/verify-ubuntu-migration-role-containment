@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Causally verify fixed-unit containment and SIGKILL recovery."""
+
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+
+UNIT = "nmcp-migration-role-verifier.service"
+READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
+PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
+ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def run(argv, **kwargs):
+    return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)
+
+
+def show(*properties):
+    result = run(("/usr/bin/systemctl", "show", UNIT, *(f"--property={item}" for item in properties)),
+                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def wait_path(path, timeout=900):
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() >= deadline:
+            fail(f"timed out waiting for {path}")
+        time.sleep(0.1)
+
+
+def pid_exists(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def cgroup_pids(control_group):
+    root = "/sys/fs/cgroup" + control_group
+    found = []
+    if not os.path.isdir(root):
+        return found
+    for directory, directories, files in os.walk(root, followlinks=False):
+        directories[:] = [name for name in directories if not os.path.islink(os.path.join(directory, name))]
+        if "cgroup.procs" in files:
+            with open(os.path.join(directory, "cgroup.procs"), encoding="ascii") as source:
+                found.extend(int(value) for value in source.read().split())
+    return sorted(set(found))
+
+
+def process_has_inode(pid, expected):
+    try:
+        names = os.listdir(f"/proc/{pid}/fd")
+    except FileNotFoundError:
+        return False
+    for name in names:
+        try:
+            value = os.stat(f"/proc/{pid}/fd/{name}")
+        except FileNotFoundError:
+            continue
+        if (value.st_dev, value.st_ino) == expected:
+            return True
+    return False
+
+
+def intent_entry(path):
+    with open("/run/nmcp-ci/cleanup-intent.json", encoding="ascii") as source:
+        document = json.load(source)
+    matches = [entry for entry in document["entries"] if entry["path"] == path]
+    if len(matches) != 1:
+        fail(f"cleanup intent does not identify exactly one target: {path}")
+    return matches[0]
+
+
+def run_root_entry():
+    with open("/run/nmcp-ci/cleanup-intent.json", encoding="ascii") as source:
+        entries = json.load(source)["entries"]
+    matches = [entry for entry in entries if entry["path"].startswith("/run/nmcp-ci/transaction-")]
+    if len(matches) != 1:
+        fail("cleanup intent does not identify exactly one transaction root")
+    return matches[0]
+
+
+def observable_identity(path, recorded):
+    try:
+        value = os.lstat(path)
+    except FileNotFoundError:
+        return recorded
+    return {"dev": value.st_dev, "ino": value.st_ino}
+
+
+def assert_replaced_or_absent(path, identity):
+    if identity is None:
+        return
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) == (identity["dev"], identity["ino"]):
+        fail(f"prior cleanup-intent inode survived recovery: {path}")
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 5:
+        fail("usage: containment CLIENT REPOSITORY CURRENT_COMMIT ABSOLUTE_GO")
+    client, repo, commit, go_binary = sys.argv[1:]
+    prior = None
+    for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):
+        faulted = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+                       f"run-root:{stage}"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted.stdout:
+            fail(f"SIGKILL fault window unexpectedly succeeded: {stage}")
+        if not os.path.exists("/run/nmcp-ci/cleanup-intent.json"):
+            fail(f"SIGKILL fault window was not durably registered: {stage}")
+        if prior is not None:
+            assert_replaced_or_absent(*prior)
+        entry = run_root_entry()
+        prior = (entry["path"], observable_identity(entry["path"], entry["identity"]))
+    for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):
+        for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):
+            faulted = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+                           f"path:{target}:{stage}"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted.stdout:
+                fail(f"persistent-path SIGKILL fault unexpectedly succeeded: {target}:{stage}")
+            if prior is not None:
+                assert_replaced_or_absent(*prior)
+            entry = intent_entry(target)
+            prior = (target, observable_identity(target, entry["identity"]))
+    first = subprocess.Popen(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+                              "containment-supervisor-kill"), cwd="/", env=ENV,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    wait_path(READY)
+    state = show("InvocationID", "MainPID", "ActiveState", "ControlGroup")
+    invocation = state["InvocationID"]
+    main_pid = int(state["MainPID"])
+    if state["ActiveState"] != "active" or main_pid <= 1:
+        fail(f"containment invocation is not active: {state}")
+    base = os.path.dirname(READY)
+    descendants = []
+    for name in PID_FILES:
+        with open(os.path.join(base, name), encoding="ascii") as source:
+            descendants.append(int(source.read().strip()))
+    if not all(pid_exists(pid) for pid in descendants):
+        fail("nested wrapper/admin descendant was not live before supervisor death")
+    all_service_pids = cgroup_pids(state["ControlGroup"])
+    if not set(descendants) <= set(all_service_pids):
+        fail("recorded nested processes are outside the fixed unit control group")
+    with open("/run/nmcp-ci/lock-keeper.pid", encoding="ascii") as source:
+        keeper_pid = int(source.read().strip())
+    lock_identity = os.stat("/run/nmcp-ci/transaction.lock")
+    if keeper_pid == main_pid or keeper_pid not in all_service_pids or not process_has_inode(
+            keeper_pid, (lock_identity.st_dev, lock_identity.st_ino)):
+        fail("independent in-cgroup lock keeper does not hold the transaction lock inode")
+
+    # The requesting client is deliberately distinct from the service. Its
+    # death must neither release transaction serialization nor kill the unit.
+    os.kill(first.pid, signal.SIGKILL)
+    first.wait()
+    if show("InvocationID", "ActiveState") != {"InvocationID": invocation, "ActiveState": "active"}:
+        fail("client death changed the running service invocation")
+    os.kill(main_pid, signal.SIGKILL)
+    if pid_exists(keeper_pid):
+        lock = os.open("/run/nmcp-ci/transaction.lock", os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                fail("live in-cgroup lock keeper released the transaction lock")
+        finally:
+            os.close(lock)
+    second = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary),
+                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if second.returncode == 0 or not any(message in second.stderr for message in ("occupied", "control group is not empty")):
+        fail("second invocation overlapped the killed supervisor control group")
+
+    deadline = time.monotonic() + 20
+    while show("InvocationID", "ActiveState")["ActiveState"] not in ("inactive", "failed"):
+        if time.monotonic() >= deadline:
+            fail("systemd did not bound containment teardown")
+        time.sleep(0.1)
+    if cgroup_pids(state["ControlGroup"]) or any(pid_exists(pid) for pid in all_service_pids):
+        fail("a service descendant escaped KillMode=control-group")
+    lock = os.open("/run/nmcp-ci/transaction.lock", os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(lock)
+
+    recovered = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary),
+                    stdout=None, stderr=None)
+    if recovered.returncode:
+        fail("clean recovery invocation failed")
+    if os.path.exists("/run/nmcp-ci/cleanup-intent.json"):
+        fail("recovery left a cleanup intent")
+    if prior is not None:
+        assert_replaced_or_absent(*prior)
+
+    retained = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+                    "retained-cleanup-dependency"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if retained.returncode == 0:
+        fail("retained database dependency did not fail cleanup")
+    if "Ubuntu migration role compatibility verification passed" in retained.stdout:
+        fail("failed retained-dependency cleanup emitted success")
+    if "drop database exited" not in retained.stdout or "drop roles exited" not in retained.stdout:
+        fail("cleanup did not independently report database and role failures")
+    recovered = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary),
+                    stdout=None, stderr=None)
+    if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):
+        fail("retained-dependency recovery did not harden and clean")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"containment-test: {error}", file=sys.stderr)
+        raise SystemExit(1)

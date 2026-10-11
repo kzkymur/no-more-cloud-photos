@@ -206,6 +206,13 @@ def validate_supervisor(source: str) -> None:
             "supervisor phase table must be the exact 13 ordered phases")
     require(literal_assignment(tree, "HISTORICAL") == "172583179d860619ae2c79505971e10ae7f394fc",
             "supervisor historical provenance changed")
+    require(literal_assignment(tree, "INTENT_PATH") == "/run/nmcp-ci/cleanup-intent.json",
+            "supervisor cleanup intent path changed")
+    require(literal_assignment(tree, "TOP_ALLOWLISTS") == {
+        "/usr/local/libexec/nmcp": {"postgresql", "set-ubuntu-migration-role-mode", "run-ubuntu-migration-compatibility", "verify-installed-runtime-roles"},
+        "/var/lib/nmcp": {"deployment"},
+        "/opt/nmcp-role-compatibility": {"current", "v18", "test-work"},
+    }, "supervisor cleanup top-level allowlists changed")
     require_exact_function(tree, "git", '''def git(repo, *args, stdout=None):
     return subprocess.run(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo, *args), cwd="/", env=clean_env(),
                           check=True, stdout=stdout or subprocess.PIPE).stdout
@@ -367,9 +374,9 @@ def validate_supervisor(source: str) -> None:
         'if (not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != 0\n'
         '            or lock_stat.st_gid != 0 or lock_stat.st_nlink != 1\n'
         '            or stat.S_IMODE(lock_stat.st_mode) != 0o600):',
-        'for path, mode in (("/usr/local/libexec/nmcp/postgresql", 0o755), ("/var/lib/nmcp/deployment", 0o700),\n'
-        '                           ("/opt/nmcp-role-compatibility/current/bin", 0o755), ("/opt/nmcp-role-compatibility/v18/bin", 0o755)):\n'
-        '            os.makedirs(path, mode=mode)\n            os.chmod(path, mode)',
+        'for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),\n'
+        '                           ("/opt/nmcp-role-compatibility", 0o755)):\n'
+        '            entry = create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path])',
         'for path in ("/usr/local/libexec/nmcp", "/opt/nmcp-role-compatibility",\n'
         '                     "/opt/nmcp-role-compatibility/current", "/opt/nmcp-role-compatibility/v18"):\n'
         '            os.chmod(path, 0o755)',
@@ -378,6 +385,8 @@ def validate_supervisor(source: str) -> None:
         'if ACTIVE_PHASE is not None and ACTIVE_PHASE.poll() is None:',
         'os.killpg(ACTIVE_PHASE.pid, signal.SIGTERM)',
         'os.killpg(ACTIVE_PHASE.pid, signal.SIGKILL)',
+        'pass_fds=(lock_fd,), start_new_session=True',
+        'recover_intents()\n    intents = []',
     )
     require(all(source.count(fragment) == 1 for fragment in hardening_fragments),
             "supervisor lock/snapshot/traversal/signal cleanup contract changed")
@@ -393,6 +402,137 @@ def validate_supervisor(source: str) -> None:
             "supervisor manifest inventory/purpose/mode/toolchain schema changed")
     require("__file__" not in source,
             "supervisor must rely on authorized loader bytes, not an __file__ path comparison")
+
+    intent_contract = (
+        'descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)',
+        'os.fsync(descriptor)',
+        'os.replace(temporary, INTENT_PATH)',
+        'fsync_directory("/run/nmcp-ci")',
+        'descriptor = os.open(INTENT_PATH, os.O_RDONLY | os.O_NOFOLLOW)',
+        '"parent_identity", "absence_policy", "expected_metadata", "identity", "allowlist"',
+        'entry["absence_policy"] != "must-be-absent"',
+        'parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)',
+        'metadata(os.fstat(parent_fd)) != entry["parent_identity"]',
+        'os.stat(os.path.basename(path), dir_fd=parent_fd, follow_symlinks=False)',
+        'expected is not None and metadata(top) != expected',
+        'remove_tree_fd(parent_fd, os.path.basename(path), entry["allowlist"])',
+        'descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)',
+        'if allowed is not None and not names <= set(allowed):',
+        'old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})',
+        'if os.path.lexists(path):',
+        '"parent_identity": metadata(os.fstat(parent_fd))',
+        '"absence_policy": "must-be-absent"',
+        'entries.append(entry)\n        durable_intents(entries)\n        fault(f"{fault_name or path}:after-intent")',
+        'os.mkdir(name, mode, dir_fd=parent_fd)',
+        'os.fsync(parent_fd)\n        fault(f"{fault_name or path}:after-mkdir")',
+        'top_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)',
+        'entry["identity"] = metadata(top)\n            durable_intents(entries)',
+        'signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)',
+    )
+    require(all(fragment in source for fragment in intent_contract)
+            and source.count('fsync_directory("/run/nmcp-ci")') == 2,
+            "supervisor durable intent/bounded cleanup contract changed")
+    cleanup_contract = (
+        'cleanup_errors = []',
+        '("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp"))',
+        '("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc"',
+        'result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,',
+        'if result.returncode:',
+        'cleanup_errors.append(RuntimeError(',
+        'cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))',
+        'if cleanup_errors:\n            raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))',
+        'if retained_process is not None:\n        die("retained cleanup dependency unexpectedly permitted cleanup")',
+        'print("Ubuntu migration role compatibility verification passed", flush=True)',
+    )
+    require(all(fragment in source for fragment in cleanup_contract),
+            "supervisor independent cleanup/result aggregation contract changed")
+    require(source.index('print("Ubuntu migration role compatibility verification passed", flush=True)')
+            > source.index('if cleanup_errors:'),
+            "supervisor success marker must follow successful cleanup")
+
+
+def validate_client(source: str) -> None:
+    tree = ast.parse(source, filename="verify-ubuntu-migration-role-client")
+    require(literal_assignment(tree, "UNIT") == "nmcp-migration-role-verifier.service",
+            "client fixed transient service unit name changed")
+    require('PROGRAM = RUN + "/supervisor.py"' in source,
+            "client published supervisor path changed")
+    contract = (
+        '"GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1"',
+        '"GIT_CONFIG_GLOBAL": "/dev/null"', 'env=ENVIRONMENT',
+        '"rev-parse", "--verify", f"{commit}^{{commit}}"',
+        'if resolved != commit:',
+        '"show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"',
+        'os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)',
+        'os.fsync(descriptor)', 'os.replace(temporary, PROGRAM)', 'os.fsync(directory)',
+        '"/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec"',
+        '"--property=KillMode=control-group", "--property=SendSIGKILL=yes"',
+        '"--property=TimeoutStopSec=15s", "--property=RuntimeMaxSec=15min"',
+        '"--property=Delegate=no", "--property=RemainAfterExit=yes"',
+        '"--property=User=root", "--property=Group=root"',
+        '"/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "LANG=C"',
+        'unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL"',
+        'expected = {"Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",',
+        '"Delegate": "no", "RemainAfterExit": "yes"',
+        'observed.get("TimeoutStopUSec") != "15s" or observed.get("RuntimeMaxUSec") != "15min"',
+        'unit_properties("InvocationID", "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus", "ControlGroup")',
+        'current.get("Result") == "success" and current.get("ExecMainCode") == "exited"',
+        'f"_SYSTEMD_INVOCATION_ID={invocation}"',
+        'journal.count("Ubuntu migration role compatibility verification passed") != 1',
+        'command(("/usr/bin/systemctl", "stop", UNIT), check=False)',
+        'command(("/usr/bin/systemctl", "reset-failed", UNIT), check=False)',
+        'if state.get("LoadState") == "not-found":',
+        'if cgroup_pids(current.get("ControlGroup", "")):',
+    )
+    require(all(fragment in source for fragment in contract)
+            and source.count("wait_unloaded()") == 3,
+            "client fixed transient service/attestation/unload contract changed")
+
+
+def validate_containment(source: str, phase: str) -> None:
+    tree = ast.parse(source, filename="verify-ubuntu-migration-role-containment")
+    require(literal_assignment(tree, "UNIT") == "nmcp-migration-role-verifier.service",
+            "containment fixed unit name changed")
+    require(literal_assignment(tree, "PID_FILES") == ("wrapper.pid", "admin.pid", "descendant.pid"),
+            "containment nested process evidence changed")
+    contract = (
+        'for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
+        'f"run-root:{stage}"', 'os.path.exists("/run/nmcp-ci/cleanup-intent.json")',
+        '"containment-supervisor-kill"', 'wait_path(READY)',
+        'if not set(descendants) <= set(all_service_pids):',
+        'os.kill(first.pid, signal.SIGKILL)',
+        'show("InvocationID", "ActiveState") != {"InvocationID": invocation, "ActiveState": "active"}',
+        'os.kill(main_pid, signal.SIGKILL)',
+        'with open("/run/nmcp-ci/lock-keeper.pid", encoding="ascii") as source:',
+        'keeper_pid not in all_service_pids or not process_has_inode(',
+        'fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)',
+        '"live in-cgroup lock keeper released the transaction lock"',
+        '"second invocation overlapped the killed supervisor control group"',
+        'cgroup_pids(state["ControlGroup"]) or any(pid_exists(pid) for pid in all_service_pids)',
+        '"clean recovery invocation failed"',
+        '"retained-cleanup-dependency"',
+        'if retained.returncode == 0:',
+        '"drop database exited" not in retained.stdout or "drop roles exited" not in retained.stdout',
+        '"failed retained-dependency cleanup emitted success"',
+        'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
+        '"retained-dependency recovery did not harden and clean"',
+        'for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):',
+        'assert_replaced_or_absent(*prior)',
+    )
+    require(all(fragment in source for fragment in contract)
+            and source.count('("after-intent", "after-mkdir", "after-open", "after-register")') == 2,
+            "containment causal death/overlap/lock/recovery/fault contract changed")
+    phase_contract = (
+        'if [[ ${NMCP_TEST_SUPERVISOR_CONTAINMENT:-} == 1 ]]; then',
+        "/usr/bin/setsid /bin/sh -c",
+        '/usr/bin/setsid "$wrapper" "$work/kill/nmcp-admin" migrate up --json &',
+        '/usr/bin/touch "$work/kill/supervisor-kill.ready"',
+        'exit 97',
+    )
+    require(all(fragment in phase for fragment in phase_contract)
+            and phase.count('/usr/bin/setsid /bin/sh -c') == 1
+            and phase.count('/usr/bin/setsid "$wrapper" "$work/kill/nmcp-admin" migrate up --json &') == 2,
+            "compatibility nested setsid containment fixture changed")
 
 
 def validate_fd_wrappers(migration_wrapper: str, role_mode: str) -> None:
@@ -464,7 +604,7 @@ def load_workflow(source: str) -> dict:
             "Ubuntu workflow must not use a top-level true: key")
     require(len(re.findall(r"(?m)^on:[ \t]*(?:#.*)?$", source)) == 1,
             "Ubuntu workflow needs exactly one top-level plain on: key")
-    require(len(re.findall(r"(?m)^    timeout-minutes: 20$", source)) == 1
+    require(len(re.findall(r"(?m)^    timeout-minutes: 60$", source)) == 1
             and len(re.findall(r"(?m)^          fetch-depth: 0$", source)) == 1,
             "Ubuntu workflow numeric scalars must use canonical lexical forms")
     try:
@@ -496,6 +636,7 @@ EXPECTED_PATHS = [
     "scripts/verify-ubuntu-firewall", "scripts/verify-ubuntu-firewall-fixtures",
     "scripts/verify-ubuntu-installed-nginx", "scripts/verify-installed-runtime-roles",
     "scripts/verify-ubuntu-migration-lock", "scripts/verify-ubuntu-migration-role-compatibility",
+    "scripts/verify-ubuntu-migration-role-client", "scripts/verify-ubuntu-migration-role-containment",
     "scripts/verify-ubuntu-migration-role-stage", "scripts/verify-ubuntu-migration-role-supervisor",
     "scripts/verify-ubuntu-repair-mount-boundaries", "scripts/verify-ubuntu-nginx-http",
     "scripts/verify-ubuntu-postgresql-dependency", "scripts/verify-ubuntu-service-gate",
@@ -547,11 +688,25 @@ if resolved != commit:
     raise SystemExit("candidate commit identity mismatch")
 source = subprocess.run(
     ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
-     "show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"),
+     "show", f"{commit}:scripts/verify-ubuntu-migration-role-containment"),
     cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
 ).stdout
-sys.argv = ["verify-ubuntu-migration-role-supervisor", workspace, commit, go_binary]
-namespace = {"__name__": "__main__", "__file__": f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"}
+client = subprocess.run(
+    ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
+     "show", f"{commit}:scripts/verify-ubuntu-migration-role-client"),
+    cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
+).stdout
+os.makedirs("/run/nmcp-ci", mode=0o700, exist_ok=True)
+client_path = "/run/nmcp-ci/containment-client.py"
+descriptor = os.open(client_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o500)
+try:
+    os.write(descriptor, client)
+    os.fchmod(descriptor, 0o500)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+sys.argv = ["verify-ubuntu-migration-role-containment", client_path, workspace, commit, go_binary]
+namespace = {"__name__": "__main__", "__file__": f"{commit}:scripts/verify-ubuntu-migration-role-containment"}
 exec(compile(source, namespace["__file__"], "exec"), namespace)
 PY
 """
@@ -579,7 +734,7 @@ def validate_ubuntu_workflow(source: str) -> None:
             and set(job) == {"runs-on", "timeout-minutes", "steps"},
             "Ubuntu verify job mapping changed")
     require(job["runs-on"] == "ubuntu-24.04" and type(job["timeout-minutes"]) is int
-            and job["timeout-minutes"] == 20, "Ubuntu verify job runner or timeout changed")
+            and job["timeout-minutes"] == 60, "Ubuntu verify job runner or timeout changed")
     steps = job["steps"]
     require(isinstance(steps, list) and all(isinstance(step, dict) for step in steps),
             "Ubuntu verify steps must be mappings")
@@ -746,7 +901,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def verify_ubuntu_workflow_mutations(source: str) -> None:
     mutations = [
-        ("YAML 1.1 octal timeout", replace_once(source, "    timeout-minutes: 20", "    timeout-minutes: 024"), "canonical lexical forms"),
+        ("YAML 1.1 octal timeout", replace_once(source, "    timeout-minutes: 60", "    timeout-minutes: 074"), "canonical lexical forms"),
         ("non-canonical fetch depth", replace_once(source, "          fetch-depth: 0", "          fetch-depth: 00"), "canonical lexical forms"),
         ("tag/unpinned checkout", replace_once(source, "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd", "actions/checkout@v6"), "checkout action"),
         ("persist credentials", replace_once(source, "persist-credentials: false", "persist-credentials: true"), "checkout action"),
@@ -768,8 +923,13 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
         ("wrong github sha", replace_once(source, '"${{ github.sha }}"', '"${{ github.ref }}"'), "authorized supervisor loader"),
         ("loader compile bypass", replace_once(source, 'exec(compile(source, namespace["__file__"], "exec"), namespace)', 'exec(source, namespace)'), "authorized supervisor loader"),
         ("missing resolve safe.directory", replace_once(source, '("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,\n               "rev-parse"', '("/usr/bin/git", "-C", workspace,\n               "rev-parse"'), "authorized supervisor loader"),
-        ("missing show safe.directory", replace_once(source, '("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,\n               "show"', '("/usr/bin/git", "-C", workspace,\n               "show"'), "authorized supervisor loader"),
-        ("workspace supervisor path execution", replace_once(source, 'source = subprocess.run(\n              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,\n               "show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"),\n              cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,\n          ).stdout', 'source = open(os.path.join(workspace, "scripts/verify-ubuntu-migration-role-supervisor"), "rb").read()'), "authorized supervisor loader"),
+        ("containment commit path", replace_once(source, '"show", f"{commit}:scripts/verify-ubuntu-migration-role-containment"', '"show", "HEAD:scripts/verify-ubuntu-migration-role-containment"'), "authorized supervisor loader"),
+        ("client commit path", replace_once(source, '"show", f"{commit}:scripts/verify-ubuntu-migration-role-client"', '"show", "HEAD:scripts/verify-ubuntu-migration-role-client"'), "authorized supervisor loader"),
+        ("missing containment show safe.directory", replace_once(source, 'source = subprocess.run(\n              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,', 'source = subprocess.run(\n              ("/usr/bin/git", "-C", workspace,'), "authorized supervisor loader"),
+        ("missing client show safe.directory", replace_once(source, 'client = subprocess.run(\n              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,', 'client = subprocess.run(\n              ("/usr/bin/git", "-C", workspace,'), "authorized supervisor loader"),
+        ("workspace containment path execution", replace_once(source, 'source = subprocess.run(\n              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,\n               "show", f"{commit}:scripts/verify-ubuntu-migration-role-containment"),\n              cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,\n          ).stdout', 'source = open(os.path.join(workspace, "scripts/verify-ubuntu-migration-role-containment"), "rb").read()'), "authorized supervisor loader"),
+        ("client publication follows symlinks", replace_once(source, "os.O_TRUNC | os.O_NOFOLLOW", "os.O_TRUNC"), "authorized supervisor loader"),
+        ("client publication not fsynced", replace_once(source, "              os.fsync(descriptor)\n", ""), "authorized supervisor loader"),
         ("post-static injection", replace_once(source, "        run: /usr/bin/python3 scripts/verify-ubuntu-deployment\n", "        run: /usr/bin/python3 scripts/verify-ubuntu-deployment\n\n      - name: Post-static injection\n        run: /bin/true\n"), "step sequence"),
     ]
     duplicate_permissions = replace_once(source, "permissions:\n  contents: read", "permissions:\n  contents: read\n  contents: write")
@@ -782,6 +942,8 @@ def verify_supervisor_mutations(
     supervisor: str,
     stage: str,
     phase: str,
+    client: str,
+    containment: str,
     helper: str,
     migration_wrapper: str,
     role_mode: str,
@@ -807,7 +969,6 @@ def verify_supervisor_mutations(
         ("run_phase invocation descriptors", replace_once(supervisor, "                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))", "                          env=phase_env, pass_fds=(phase_fd,))"), "run_phase invocation"),
         ("duplicate run_phase execution", replace_once(supervisor, '                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))', '                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))\n                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))'), "run_phase invocation"),
         ("lock metadata gap", replace_once(supervisor, "or lock_stat.st_gid != 0 or lock_stat.st_nlink != 1", "or lock_stat.st_gid != 0"), "lock/snapshot/traversal/signal cleanup"),
-        ("traversal chmod omission", replace_once(supervisor, '            os.chmod(path, 0o755)\n        for top in', '            pass\n        for top in'), "lock/snapshot/traversal/signal cleanup"),
         ("non-atomic snapshot", replace_once(supervisor, "        os.rename(snapshot_build, snapshot)", "        shutil.copytree(snapshot_build, snapshot)"), "lock/snapshot/traversal/signal cleanup"),
         ("outer SIGKILL wrong target", replace_once(supervisor, "os.killpg(ACTIVE_PHASE.pid, signal.SIGKILL)", "os.kill(ACTIVE_PHASE.pid, signal.SIGKILL)"), "lock/snapshot/traversal/signal cleanup"),
         ("helper verification gap", replace_once(supervisor, 'staged_helper = open_verified(snapshot_fd, manifest, "runtime-helper")', 'staged_helper = os.open(installs["runtime-helper"], os.O_RDONLY)'), "descriptor/trace"),
@@ -820,9 +981,65 @@ def verify_supervisor_mutations(
         ("binary toolchain omission", replace_once(supervisor, ', "toolchain": toolchain', ''), "manifest inventory/purpose/mode/toolchain"),
         ("boundary start omission", replace_once(supervisor, '            trace.append(f"boundary-start:{phase}")\n', ''), "descriptor/trace"),
         ("boundary start reorder", replace_once(supervisor, '            trace.append(f"phase-success:{phase}")\n            trace.append(f"boundary-start:{phase}")', '            trace.append(f"boundary-start:{phase}")\n            trace.append(f"phase-success:{phase}")'), "trace order"),
+        ("cleanup top allowlist widened", replace_once(supervisor, '"/var/lib/nmcp": {"deployment"}', '"/var/lib/nmcp": {"deployment", "media"}'), "top-level allowlists"),
+        ("intent not durable before mkdir", replace_once(supervisor, 'entries.append(entry)\n        durable_intents(entries)\n        fault(f"{fault_name or path}:after-intent")', 'entries.append(entry)\n        fault(f"{fault_name or path}:after-intent")'), "durable intent"),
+        ("intent parent identity omitted", replace_once(supervisor, '"parent_identity": metadata(os.fstat(parent_fd))', '"parent_identity": {}'), "durable intent"),
+        ("intent absence policy weakened", replace_once(supervisor, '"absence_policy": "must-be-absent"', '"absence_policy": "replace"'), "durable intent"),
+        ("intent signals unmasked", replace_once(supervisor, 'old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})', 'old_mask = set()'), "durable intent"),
+        ("top mkdir path based", replace_once(supervisor, 'os.mkdir(name, mode, dir_fd=parent_fd)', 'os.mkdir(path, mode)'), "durable intent"),
+        ("cleanup target follows symlink", replace_once(supervisor, 'descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)', 'descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent_fd)'), "durable intent"),
+        ("cleanup target identity omitted", replace_once(supervisor, 'if expected is not None and metadata(top) != expected:', 'if False:'), "durable intent"),
+        ("intent journal not directory fsynced", replace_once(supervisor, 'os.replace(temporary, INTENT_PATH)\n    fsync_directory("/run/nmcp-ci")', 'os.replace(temporary, INTENT_PATH)'), "durable intent"),
+        ("dropdb status unchecked", replace_once(supervisor, '                if result.returncode:\n                    cleanup_errors.append(RuntimeError(', '                if False:\n                    cleanup_errors.append(RuntimeError('), "independent cleanup"),
+        ("cleanup exceptions discarded", replace_once(supervisor, 'cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))', 'pass'), "independent cleanup"),
+        ("cleanup aggregation omitted", replace_once(supervisor, '        if cleanup_errors:\n            raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))', '        pass'), "independent cleanup"),
+        ("dropdb cleanup omitted", replace_once(supervisor, '            ("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp")),\n', ''), "independent cleanup"),
+        ("role cleanup omitted", replace_once(supervisor, '            ("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",\n', '            ("other cleanup", ("/bin/true",\n'), "independent cleanup"),
+        ("success before cleanup outcome", replace_once(supervisor, '    print("Ubuntu migration role compatibility verification passed", flush=True)', '    print("verification complete", flush=True)'), "independent cleanup"),
+        ("success emitted during cleanup", replace_once(
+            replace_once(supervisor, '    print("Ubuntu migration role compatibility verification passed", flush=True)\n', ''),
+            '    finally:\n        cleanup_errors = []',
+            '    finally:\n        print("Ubuntu migration role compatibility verification passed", flush=True)\n        cleanup_errors = []'), "success marker"),
     ]
     for label, mutation, expected in supervisor_mutations:
         expect_rejected(validate_supervisor, mutation, label, expected)
+    client_mutations = [
+        ("random transient unit", replace_once(client, 'UNIT = "nmcp-migration-role-verifier.service"', 'UNIT = "nmcp-migration-role-verifier-123.service"')),
+        ("simple service type", replace_once(client, '"--service-type=exec"', '"--service-type=simple"')),
+        ("process-only kill", replace_once(client, '"--property=KillMode=control-group"', '"--property=KillMode=process"')),
+        ("no final SIGKILL", replace_once(client, '"--property=SendSIGKILL=yes"', '"--property=SendSIGKILL=no"')),
+        ("unbounded stop", replace_once(client, '"--property=TimeoutStopSec=15s"', '"--property=TimeoutStopSec=infinity"')),
+        ("unbounded runtime", replace_once(client, '"--property=RuntimeMaxSec=15min"', '"--property=RuntimeMaxSec=infinity"')),
+        ("delegated cgroup", replace_once(client, '"--property=Delegate=no"', '"--property=Delegate=yes"')),
+        ("non-root service", replace_once(client, '"--property=User=root"', '"--property=User=nmcp"')),
+        ("inherited service environment", replace_once(client, '"/usr/bin/env", "-i",', '"/usr/bin/env",')),
+        ("no retained result", replace_once(client, '"--property=RemainAfterExit=yes"', '"--property=RemainAfterExit=no"')),
+        ("supervisor not exact commit", replace_once(client, '"show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"', '"show", "HEAD:scripts/verify-ubuntu-migration-role-supervisor"')),
+        ("invocation identity not inspected", replace_once(client, 'unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL"', 'unit_properties("UnitFileState", "ActiveState", "Type", "KillMode", "SendSIGKILL"')),
+        ("result unchecked", replace_once(client, 'current.get("Result") == "success"', 'True')),
+        ("journal not invocation scoped", client.replace('f"_SYSTEMD_INVOCATION_ID={invocation}"', '"--since=today"')),
+        ("unit not stopped", client.replace('command(("/usr/bin/systemctl", "stop", UNIT), check=False)', 'pass')),
+        ("unit unload not awaited", replace_once(client, '        wait_unloaded()\n    return 0', '        pass\n    return 0')),
+    ]
+    for label, mutation in client_mutations:
+        expect_rejected(validate_client, mutation, label, "client fixed transient")
+    containment_mutations = [
+        ("client death omitted", replace_once(containment, 'os.kill(first.pid, signal.SIGKILL)', 'first.terminate()')),
+        ("supervisor SIGKILL softened", replace_once(containment, 'os.kill(main_pid, signal.SIGKILL)', 'os.kill(main_pid, signal.SIGTERM)')),
+        ("nested cgroup evidence omitted", replace_once(containment, 'if not set(descendants) <= set(all_service_pids):', 'if False:')),
+        ("overlap accepted", replace_once(containment, 'fail("second invocation overlapped the killed supervisor control group")', 'pass')),
+        ("lock survival omitted", replace_once(containment, 'fail("live in-cgroup lock keeper released the transaction lock")', 'pass')),
+        ("recovery omitted", replace_once(containment, 'fail("clean recovery invocation failed")', 'pass')),
+        ("boundary fault omitted", replace_once(containment,
+          'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
+          'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-register"):' )),
+        ("retained failure accepted", replace_once(containment, 'if retained.returncode == 0:', 'if False:')),
+        ("cleanup failure evidence weakened", replace_once(containment, '"drop database exited" not in retained.stdout or "drop roles exited" not in retained.stdout', '"drop database exited" not in retained.stdout')),
+        ("retained recovery accepted", replace_once(containment, 'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):', 'if False:')),
+    ]
+    for label, mutation in containment_mutations:
+        expect_rejected(lambda value: validate_containment(value, phase), mutation, label,
+                        "containment causal")
     stage_mutations = [
         ("manifest omission allowed", replace_once(stage, "        if actual != expected:", "        if actual < expected:"), "manifest/inventory"),
         ("manifest extra allowed", replace_once(stage, "        if actual != expected:", "        if expected <= actual:"), "manifest/inventory"),
@@ -839,8 +1056,13 @@ def verify_supervisor_mutations(
         ("phase arm reordered", replace_once(phase, "  fresh-current)", "  current-rerun)")),
         ("phase repository read", replace_once(phase, "case $phase in", "/usr/bin/git status\ncase $phase in")),
         ("phase wrapper fd path", replace_once(phase, 'wrapper=${NMCP_WRAPPER:?missing staged wrapper descriptor}', 'wrapper=/usr/local/libexec/nmcp/run-ubuntu-migration-compatibility')),
+        ("containment nested setsid omitted", phase.replace('/usr/bin/setsid "$wrapper" "$work/kill/nmcp-admin" migrate up --json &', '"$wrapper" "$work/kill/nmcp-admin" migrate up --json &', 1)),
     ]
     for label, mutation in phase_mutations:
+        if "setsid" in label:
+            expect_rejected(lambda value: validate_containment(containment, value), mutation,
+                            label, "nested setsid containment")
+            continue
         if "repository" in label:
             expected = "must not read repository"
         elif "fd path" in label:
@@ -924,6 +1146,8 @@ def main() -> int:
         ROOT / "scripts" / "handoff-ubuntu-migration-lock",
         ROOT / "scripts" / "verify-ubuntu-migration-role-stage",
         ROOT / "scripts" / "verify-ubuntu-migration-role-supervisor",
+        ROOT / "scripts" / "verify-ubuntu-migration-role-client",
+        ROOT / "scripts" / "verify-ubuntu-migration-role-containment",
     ]
     for script in python_scripts:
         require(os.access(script, os.X_OK), f"{script.name} is not executable")
@@ -1017,16 +1241,22 @@ def main() -> int:
     )
     stage_verifier = text(ROOT / "scripts" / "verify-ubuntu-migration-role-stage")
     supervisor = text(ROOT / "scripts" / "verify-ubuntu-migration-role-supervisor")
+    client = text(ROOT / "scripts" / "verify-ubuntu-migration-role-client")
+    containment = text(ROOT / "scripts" / "verify-ubuntu-migration-role-containment")
     role_mode = text(ROOT / "scripts" / "set-ubuntu-migration-role-mode")
     validate_runtime_helper(runtime_verifier_helper)
     validate_stage_verifier(stage_verifier)
     validate_compatibility_phase(migration_role_compatibility)
     validate_supervisor(supervisor)
+    validate_client(client)
+    validate_containment(containment, migration_role_compatibility)
     validate_fd_wrappers(migration_compatibility, role_mode)
     verify_supervisor_mutations(
         supervisor,
         stage_verifier,
         migration_role_compatibility,
+        client,
+        containment,
         runtime_verifier_helper,
         migration_compatibility,
         role_mode,
