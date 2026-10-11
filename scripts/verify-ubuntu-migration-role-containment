@@ -183,7 +183,7 @@ def fault_paths(mode, boundary):
 
 def assert_interception(mode, boundary, *, persistent=False):
     intercepted, attempted = fault_paths(mode, boundary)
-    minimum = 4 if persistent and boundary in ("show", "wait", "unload") else 3 if persistent else 1
+    minimum = 4 if persistent and boundary in ("show", "wait", "unload") else 2 if persistent else 1
     if counter(intercepted) < minimum:
         fail(f"command path was not intercepted as required: {mode}")
     attempts = counter(attempted)
@@ -513,6 +513,46 @@ def main():
             fail(f"work-budget reserve timing was not bounded: {budget_boundary}: {budget_elapsed:.3f}s")
         fast_recovery(client, repo, commit, go_binary, budget_mode)
 
+    slow_mode = "client-work-budget-slow-cleanup"
+    slow_ready = f"/run/nmcp-ci/{slow_mode}.ready"
+    slow_unloaded = f"/run/nmcp-ci/{slow_mode}-unloaded.ready"
+    slow_paths = {boundary: fault_paths(slow_mode, boundary)
+                  for boundary in ("show", "kill", "stop")}
+    reset_paths(slow_ready, slow_unloaded, f"/run/nmcp-ci/{slow_mode}-unloaded.release",
+                *(path for paths in slow_paths.values() for path in paths))
+    slow = subprocess.Popen(
+        ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, slow_mode),
+        cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    wait_path(slow_ready, timeout=30)
+    slow_started = time.monotonic()
+    wait_path(slow_unloaded, timeout=175)
+    slow_elapsed = time.monotonic() - slow_started
+    expected_slow_counts = {"show": (1, 1), "kill": (2, 0), "stop": (1, 1)}
+    for boundary, (expected_intercepted, expected_attempted) in expected_slow_counts.items():
+        intercepted, attempted = slow_paths[boundary]
+        if (counter(intercepted), counter(attempted)) != (expected_intercepted, expected_attempted):
+            fail(f"slow sequential cleanup evidence changed at {boundary}")
+    if slow_elapsed < 25 or slow_elapsed > 175:
+        fail(f"slow cleanup delay/retry was not bounded: {slow_elapsed:.3f}s")
+    slow_state = show("LoadState", "ControlGroup")
+    if slow_state.get("LoadState") != "not-found":
+        fail(f"slow cleanup did not explicitly unload: {slow_state}")
+    if cgroup_pids(slow_state.get("ControlGroup", "")) or cgroup_pids("/system.slice/" + UNIT):
+        fail("slow cleanup left fixed-unit cgroup processes")
+    assert_client_lock_held()
+    release(slow_mode + "-unloaded")
+    slow_stdout, slow_stderr = slow.communicate(timeout=30)
+    slow_result = subprocess.CompletedProcess(slow.args, slow.returncode,
+                                              slow_stdout, slow_stderr)
+    assert_client_failure(slow_result, slow_mode)
+    if ("absolute client work budget exhausted at slow-cleanup" not in slow_stderr
+            or "injected slow owned show failure before action" not in slow_stderr
+            or "injected slow owned kill failure before action" not in slow_stderr
+            or "injected slow owned stop failure before action" not in slow_stderr):
+        fail("slow cleanup lost its work-cutoff or retained cleanup error")
+    fast_recovery(client, repo, commit, go_binary, slow_mode)
+
     for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):
         mode = "client-cleanup-fault-" + boundary
         intercepted, attempted = fault_paths(mode, boundary)
@@ -550,7 +590,7 @@ def main():
             ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
             cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 3
+        expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 2
         wait_counter(intercepted, expected_interceptions)
         wait_path(handoff_ready, timeout=30)
         observed = show(*LAUNCH_PROPERTIES)
@@ -819,6 +859,7 @@ def main():
             for name in (
                 *client_faults,
                 budget_mode,
+                slow_mode,
                 "client-terminal-race-a", "client-terminal-race-a-unloaded",
                 "client-terminal-race-b", "client-reuse-pause",
             )

@@ -571,11 +571,62 @@ def validate_client(source: str) -> None:
                              "client fixed total budget changed")
     require_exact_assignment(tree, "CLEANUP_RESERVE", "CLEANUP_RESERVE = 3 * 60",
                              "client exclusive cleanup reserve changed")
+    cleanup_constants = {
+        "CLEANUP_BUDGET": 170,
+        "ACTION_ATTEMPTS": 2,
+        "ACTION_TIMEOUTS": {"kill": 5, "stop": 20, "reset-failed": 5},
+        "ACTION_RETRY_BACKOFF": 0.05,
+        "KILL_WAIT_TIMEOUT": 20,
+        "UNLOAD_TIMEOUT": 30,
+        "CLEANUP_MARGIN": 20,
+    }
+    require(all(literal_assignment(tree, name) == value
+                for name, value in cleanup_constants.items()),
+            "client exact cleanup envelope constants changed")
+    require_exact_assignment(tree, "CLEANUP_ENVELOPE", '''CLEANUP_ENVELOPE = (
+    PROPERTY_RETRY_BUDGET * (1 + ACTION_ATTEMPTS * 3 + 1)
+    + ACTION_ATTEMPTS * sum(ACTION_TIMEOUTS.values())
+    + ACTION_RETRY_BACKOFF * len(ACTION_TIMEOUTS)
+    + KILL_WAIT_TIMEOUT + UNLOAD_TIMEOUT + CLEANUP_MARGIN
+)
+''', "client exact cleanup envelope formula changed")
+    envelope_assignment = next(
+        node for node in tree.body if isinstance(node, ast.Assign)
+        and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "CLEANUP_ENVELOPE"
+    )
+    envelope_namespace = {
+        "PROPERTY_RETRY_BUDGET": 3.0,
+        **cleanup_constants,
+        "sum": sum,
+        "len": len,
+    }
+    envelope_value = eval(compile(ast.Expression(envelope_assignment.value),
+                                  "<cleanup-envelope>", "eval"),
+                          {"__builtins__": {}}, envelope_namespace)
+    require(envelope_value == 154.15 and envelope_value < 170 < 180,
+            "client cleanup envelope no longer evaluates within its exact budget and reserve")
+    startup_assertion = ast.parse('''if not (CLEANUP_ENVELOPE < CLEANUP_BUDGET < CLEANUP_RESERVE < TOTAL_BUDGET):
+    raise RuntimeError("cleanup retry envelope does not fit its exclusive reserve")
+''').body[0]
+    startup_matches = [node for node in tree.body if ast.dump(node) == ast.dump(startup_assertion)]
+    work_modes_assignment = next(
+        node for node in tree.body if isinstance(node, ast.Assign)
+        and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "WORK_BUDGET_MODES"
+    )
+    require(len(startup_matches) == 1
+            and tree.body.index(startup_matches[0]) == tree.body.index(work_modes_assignment) + 1,
+            "client cleanup envelope startup assertion must remain live at module load")
     require(literal_assignment(tree, "WORK_BUDGET_FAULT_SECONDS") == 1.0
+            and literal_assignment(tree, "SLOW_PROPERTY_FAULT_SECONDS") == 2.5
+            and literal_assignment(tree, "SLOW_ACTION_FAULT_SECONDS") == {
+                "kill": 4.5, "stop": 15.0,
+            }
             and literal_assignment(tree, "WORK_BUDGET_MODES") == {
                 "client-work-budget-launch", "client-work-budget-service",
-                "client-work-budget-journal",
-            }, "client accelerated work-budget modes changed")
+                "client-work-budget-journal", "client-work-budget-slow-cleanup",
+            }, "client accelerated work-budget and slow-cleanup modes changed")
     cancellation_assignments = [
         node for node in tree.body if isinstance(node, ast.Assign)
         and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
@@ -620,11 +671,18 @@ def validate_client(source: str) -> None:
     if COMMAND_DEADLINE is not None:
         remaining = COMMAND_DEADLINE - time.monotonic()
         if remaining <= 0:
+            if CLEANUP_ACTIVE:
+                fail("absolute client cleanup deadline exhausted")
             fail("absolute client command budget exhausted")
         timeout = min(timeout, remaining)
-    return subprocess.run(argv, cwd="/", env=ENVIRONMENT,
-                          check=check, stdout=stdout, stderr=subprocess.PIPE, text=True,
-                          timeout=timeout)
+    try:
+        return subprocess.run(argv, cwd="/", env=ENVIRONMENT,
+                              check=check, stdout=stdout, stderr=subprocess.PIPE, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        if CLEANUP_ACTIVE and time.monotonic() >= COMMAND_DEADLINE:
+            raise RuntimeError("absolute client cleanup deadline exhausted") from error
+        raise
 ''', "client subprocesses must remain bounded by the absolute budget")
     require_exact_function(tree, "unit_properties", '''def unit_properties(*names, context="show"):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
@@ -633,9 +691,12 @@ def validate_client(source: str) -> None:
     for attempt in range(PROPERTY_RETRIES):
         try:
             command_path(context)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("unit property lookup deadline exhausted")
             result = command(("/usr/bin/systemctl", "show", UNIT,
                               *(f"--property={name}" for name in requested)), check=False,
-                             timeout=max(0.05, deadline - time.monotonic()))
+                             timeout=remaining)
             if result.returncode:
                 fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
             if not result.stdout:
@@ -683,7 +744,8 @@ def validate_client(source: str) -> None:
     if state.get("LoadState") == "not-found":
         return False
     command_path("reset" if arguments[0] == "reset-failed" else arguments[0])
-    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)
+    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,
+                     timeout=ACTION_TIMEOUTS[arguments[0]])
     if result.returncode:
         fail(f"owned unit command failed ({' '.join(arguments)}): {result.stderr.strip()}")
     return True
@@ -754,7 +816,10 @@ def validate_client(source: str) -> None:
         'total_deadline = time.monotonic() + TOTAL_BUDGET',
         'work_deadline = total_deadline - CLEANUP_RESERVE',
         'COMMAND_DEADLINE = work_deadline',
-        'COMMAND_DEADLINE = total_deadline',
+        'cleanup_deadline = min(total_deadline, time.monotonic() + CLEANUP_BUDGET)',
+        'COMMAND_DEADLINE = cleanup_deadline',
+        'CLEANUP_ACTIVE = True',
+        'CLEANUP_ACTIVE = False',
         'discovered = launch_state(context="recovery")',
         'except BaseException as error:\n            primary_error = error',
         'f"launched unit has no safe nonce-bound identity: {discovered}"',
@@ -952,7 +1017,9 @@ except BaseException as error:
     expected_finally = ast.parse('''try:
     pass
 finally:
-    COMMAND_DEADLINE = total_deadline
+    cleanup_deadline = min(total_deadline, time.monotonic() + CLEANUP_BUDGET)
+    COMMAND_DEADLINE = cleanup_deadline
+    CLEANUP_ACTIVE = True
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
     try:
         if launch_attempted and invocation is None:
@@ -977,6 +1044,7 @@ finally:
                 cleanup_errors.append(error)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        CLEANUP_ACTIVE = False
     if requested_mode in WORK_BUDGET_MODES:
         client_pause(requested_mode + "-unloaded")
     COMMAND_DEADLINE = work_deadline
@@ -994,15 +1062,18 @@ finally:
             and [ast.dump(node) for node in launch_try.finalbody]
             == [ast.dump(node) for node in expected_finally],
             "client post-launch failures must aggregate owned teardown errors")
-    require(ast.dump(launch_try.finalbody[0]) == ast.dump(
-                ast.parse("COMMAND_DEADLINE = total_deadline").body[0])
-            and ast.dump(launch_try.finalbody[3]) == ast.dump(
+    require(ast.dump(launch_try.finalbody[0]) == ast.dump(ast.parse(
+                "cleanup_deadline = min(total_deadline, time.monotonic() + CLEANUP_BUDGET)"
+            ).body[0])
+            and ast.dump(launch_try.finalbody[1]) == ast.dump(
+                ast.parse("COMMAND_DEADLINE = cleanup_deadline").body[0])
+            and ast.dump(launch_try.finalbody[5]) == ast.dump(
                 ast.parse('''if requested_mode in WORK_BUDGET_MODES:
     client_pause(requested_mode + "-unloaded")
 ''').body[0])
-            and ast.dump(launch_try.finalbody[4]) == ast.dump(
+            and ast.dump(launch_try.finalbody[6]) == ast.dump(
                 ast.parse("COMMAND_DEADLINE = work_deadline").body[0]),
-            "client cleanup reserve must encompass only signal-blocked owned teardown")
+            "client cleanup budget must encompass only signal-blocked owned teardown")
     deadline_assignments = [
         node for node in ast.walk(tree) if isinstance(node, ast.Assign)
         and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
@@ -1019,8 +1090,8 @@ finally:
         *top_deadline_assignments,
         *exhaust_deadline_assignments,
         lock_try.body[total_deadline_starts[0] + 2],
-        launch_try.finalbody[0],
-        launch_try.finalbody[4],
+        launch_try.finalbody[1],
+        launch_try.finalbody[6],
     )
     deadline_stores_or_deletes = [
         node for node in ast.walk(tree) if isinstance(node, ast.Name)
@@ -1028,7 +1099,10 @@ finally:
     ]
     expected_deadline_targets = [node.targets[0] for node in expected_deadline_assignments]
     exact_deadline_function_names = [
-        node for function_name in ("bounded_deadline", "command", "exhaust_work_budget")
+        node for function_name in (
+            "bounded_deadline", "command", "command_path", "exhaust_work_budget",
+            "wait_unloaded", "teardown_owned",
+        )
         for node in ast.walk(named_function(tree, function_name))
         if isinstance(node, ast.Name) and node.id == "COMMAND_DEADLINE"
     ]
@@ -1036,8 +1110,8 @@ finally:
         top_deadline_assignments[0].targets[0],
         *exact_deadline_function_names,
         lock_try.body[total_deadline_starts[0] + 2].targets[0],
-        launch_try.finalbody[0].targets[0],
-        launch_try.finalbody[4].targets[0],
+        launch_try.finalbody[1].targets[0],
+        launch_try.finalbody[6].targets[0],
     ]
     all_deadline_names = [
         node for node in ast.walk(tree)
@@ -1056,7 +1130,7 @@ finally:
     ]
     expected_globals = {
         ast.dump(ast.parse("global COMMAND_DEADLINE").body[0]),
-        ast.dump(ast.parse("global COMMAND_DEADLINE, REQUESTED_MODE").body[0]),
+        ast.dump(ast.parse("global CLEANUP_ACTIVE, COMMAND_DEADLINE, REQUESTED_MODE").body[0]),
     }
     forbidden_reflection = {
         "eval", "exec", "compile", "getattr", "setattr", "delattr",
@@ -1115,9 +1189,10 @@ finally:
     work_assignment = lock_try.body[total_deadline_starts[0] + 1]
     exact_budget_regions = (
         total_assignment, work_assignment,
+        envelope_assignment, startup_matches[0],
         named_function(tree, "unit_properties"), exhaust_node,
         *main_node.body[routing_starts[0]:routing_starts[0] + 2],
-        launch_try.finalbody[3],
+        launch_try.finalbody[5],
     )
     expected_constant_names = [
         assignment.targets[0] for assignment in module_budget_assignments.values()
@@ -1132,7 +1207,7 @@ finally:
     exact_local_budget_regions = (
         total_assignment, work_assignment,
         lock_try.body[total_deadline_starts[0] + 2],
-        launch_try.finalbody[0], launch_try.finalbody[4],
+        launch_try.finalbody[0], launch_try.finalbody[1], launch_try.finalbody[6],
     )
     expected_local_budget_names = [
         node for region in exact_local_budget_regions for node in ast.walk(region)
@@ -1193,7 +1268,7 @@ finally:
     expected_exhaust_guards = {
         ast.dump(ast.parse(f'requested_mode == "client-work-budget-{boundary}"',
                            mode="eval").body): boundary
-        for boundary in ("launch", "service", "journal")
+        for boundary in ("launch", "service", "journal", "slow-cleanup")
     }
     observed_exhaust_guards = {}
     for call in exhaust_calls:
@@ -1205,8 +1280,8 @@ finally:
                 and len(call.args) == 1 and isinstance(call.args[0], ast.Constant),
                 "client work-budget exhaustion guard changed")
         observed_exhaust_guards[ast.dump(guard.test)] = call.args[0].value
-    require(len(exhaust_calls) == 3 and observed_exhaust_guards == expected_exhaust_guards,
-            "client may accelerate work exhaustion only at launch, service, and journal")
+    require(len(exhaust_calls) == 4 and observed_exhaust_guards == expected_exhaust_guards,
+            "client may accelerate work exhaustion only at the four reviewed boundaries")
     expected_outcome = ast.parse('''if cleanup_errors:
     detail = "; ".join(map(str, cleanup_errors))
     if primary_error is not None:
@@ -1260,17 +1335,18 @@ return result
 
     retry_source = ast.get_source_segment(source, named_function(tree, "retry_owned_command")) or ""
     retry_contract = (
-        "for attempt in range(3):", "cleanup_boundary(name)",
+        "for attempt in range(ACTION_ATTEMPTS):", "cleanup_boundary(name)",
         "acted = owned_command(invocation, nonce, service_command, action, *arguments)",
-        "RECOVERED_ERRORS.extend(errors)", "if attempt < 2:",
-        "time.sleep(0.05 * (2 ** attempt))", "owned {name} command remains unavailable",
+        "RECOVERED_ERRORS.extend(errors)", "if attempt + 1 < ACTION_ATTEMPTS:",
+        "time.sleep(0.05)", "owned {name} command remains unavailable",
     )
     require(all(retry_source.count(fragment) == 1 for fragment in retry_contract),
             "client cleanup actions must retry the same owned command and retain initial failures")
     teardown = ast.get_source_segment(source, named_function(tree, "teardown_owned")) or ""
     teardown_contract = (
         'errors = []',
-        'context="show"', 'cleanup_boundary("wait")', 'context="wait"',
+        'context="show"', 'deadline = bounded_deadline(KILL_WAIT_TIMEOUT)',
+        'cleanup_boundary("wait")', 'context="wait"',
         'retry_owned_command(invocation, nonce, service_command,\n                                    "kill", "kill", "--kill-whom=all", "--signal=KILL")',
         'retry_owned_command(invocation, nonce, service_command, "stop", "stop")',
         'retry_owned_command(invocation, nonce, service_command, "reset", "reset-failed")',
@@ -1284,20 +1360,26 @@ return result
     wait_source = ast.get_source_segment(source, named_function(tree, "wait_unloaded")) or ""
     require(wait_source.count('owned_state(invocation, nonce, service_command, context="unload")') == 1
             and 'cleanup_boundary("unload")' in wait_source
-            and "deadline = bounded_deadline(timeout)" in wait_source,
+            and "timeout=UNLOAD_TIMEOUT" in wait_source
+            and "deadline = bounded_deadline(timeout)" in wait_source
+            and 'fail("absolute client cleanup deadline exhausted while awaiting owned unload")' in wait_source,
             "client unload polling/fault boundary ownership contract changed")
 
     command_path_source = ast.get_source_segment(source, named_function(tree, "command_path")) or ""
     command_path_contract = (
         'REQUESTED_MODE == "client-cleanup-fault-" + name',
+        'REQUESTED_MODE == "client-work-budget-slow-cleanup"',
         'REQUESTED_MODE == "client-cleanup-persistent-" + name',
         '"client-property-fault-immediate": "immediate"',
         '"client-property-fault-recovery": "recovery"',
         '"client-property-fault-owned": "owned-state"',
+        'slow_limit = {"show": 1, "kill": ACTION_ATTEMPTS, "stop": 1}.get(name, 0)',
         'record_counter(name + ".intercepted")', 'record_counter(name + ".attempted")',
+        'delay = (SLOW_PROPERTY_FAULT_SECONDS if name == "show"',
+        'fail(f"injected slow owned {name} failure before action")',
         'if REQUESTED_MODE == "client-cleanup-fault-stop":',
         'durable_marker(REQUESTED_MODE + ".blocked")',
-        'required = 4 if name in ("show", "wait", "unload") else 3',
+        'required = 4 if name in ("show", "wait", "unload") else ACTION_ATTEMPTS',
         'if persistent and interception == required:',
         'durable_marker(REQUESTED_MODE + ".handoff.ready")',
         'release = f"{RUN}/{REQUESTED_MODE}.handoff.release"',
@@ -1320,6 +1402,7 @@ return result
         'if requested_mode == "client-work-budget-launch":\n                    exhaust_work_budget("launch")',
         'if requested_mode == "client-work-budget-service":\n                exhaust_work_budget("service")',
         'if requested_mode == "client-work-budget-journal":\n                exhaust_work_budget("journal")',
+        'if requested_mode == "client-work-budget-slow-cleanup":\n                exhaust_work_budget("slow-cleanup")',
     )
     require(all(source.count(fragment) == 1 for fragment in fault_fragments),
             "client launch/invocation/property/terminal/journal fault boundaries changed")
@@ -1430,7 +1513,7 @@ def validate_containment(source: str, phase: str) -> None:
 ''', "containment causal fast recovery assertion changed")
     require_exact_function(tree, "assert_interception", '''def assert_interception(mode, boundary, *, persistent=False):
     intercepted, attempted = fault_paths(mode, boundary)
-    minimum = 4 if persistent and boundary in ("show", "wait", "unload") else 3 if persistent else 1
+    minimum = 4 if persistent and boundary in ("show", "wait", "unload") else 2 if persistent else 1
     if counter(intercepted) < minimum:
         fail(f"command path was not intercepted as required: {mode}")
     attempts = counter(attempted)
@@ -1668,6 +1751,56 @@ def validate_containment(source: str, phase: str) -> None:
     require(len(budget_loops) == 1
             and ast.dump(budget_loops[0]) == ast.dump(expected_budget_loop),
             "containment work-budget launch/service/journal causal ordering changed")
+    slow_starts = [
+        index for index, node in enumerate(main_node.body)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "slow_mode"
+    ]
+    expected_slow = ast.parse('''slow_mode = "client-work-budget-slow-cleanup"
+slow_ready = f"/run/nmcp-ci/{slow_mode}.ready"
+slow_unloaded = f"/run/nmcp-ci/{slow_mode}-unloaded.ready"
+slow_paths = {boundary: fault_paths(slow_mode, boundary)
+              for boundary in ("show", "kill", "stop")}
+reset_paths(slow_ready, slow_unloaded, f"/run/nmcp-ci/{slow_mode}-unloaded.release",
+            *(path for paths in slow_paths.values() for path in paths))
+slow = subprocess.Popen(
+    ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, slow_mode),
+    cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+wait_path(slow_ready, timeout=30)
+slow_started = time.monotonic()
+wait_path(slow_unloaded, timeout=175)
+slow_elapsed = time.monotonic() - slow_started
+expected_slow_counts = {"show": (1, 1), "kill": (2, 0), "stop": (1, 1)}
+for boundary, (expected_intercepted, expected_attempted) in expected_slow_counts.items():
+    intercepted, attempted = slow_paths[boundary]
+    if (counter(intercepted), counter(attempted)) != (expected_intercepted, expected_attempted):
+        fail(f"slow sequential cleanup evidence changed at {boundary}")
+if slow_elapsed < 25 or slow_elapsed > 175:
+    fail(f"slow cleanup delay/retry was not bounded: {slow_elapsed:.3f}s")
+slow_state = show("LoadState", "ControlGroup")
+if slow_state.get("LoadState") != "not-found":
+    fail(f"slow cleanup did not explicitly unload: {slow_state}")
+if cgroup_pids(slow_state.get("ControlGroup", "")) or cgroup_pids("/system.slice/" + UNIT):
+    fail("slow cleanup left fixed-unit cgroup processes")
+assert_client_lock_held()
+release(slow_mode + "-unloaded")
+slow_stdout, slow_stderr = slow.communicate(timeout=30)
+slow_result = subprocess.CompletedProcess(slow.args, slow.returncode,
+                                          slow_stdout, slow_stderr)
+assert_client_failure(slow_result, slow_mode)
+if ("absolute client work budget exhausted at slow-cleanup" not in slow_stderr
+        or "injected slow owned show failure before action" not in slow_stderr
+        or "injected slow owned kill failure before action" not in slow_stderr
+        or "injected slow owned stop failure before action" not in slow_stderr):
+    fail("slow cleanup lost its work-cutoff or retained cleanup error")
+fast_recovery(client, repo, commit, go_binary, slow_mode)
+''').body
+    require(len(slow_starts) == 1
+            and [ast.dump(node) for node in main_node.body[
+                slow_starts[0]:slow_starts[0] + len(expected_slow)
+            ]] == [ast.dump(node) for node in expected_slow],
+            "containment slow sequential kill/stop cleanup causal test changed")
     stale_starts = [
         index for index, node in enumerate(main_node.body)
         if isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -1731,7 +1864,7 @@ wait_unit_absent()
         ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
         cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 3
+    expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 2
     wait_counter(intercepted, expected_interceptions)
     wait_path(handoff_ready, timeout=30)
     observed = show(*LAUNCH_PROPERTIES)
@@ -1786,8 +1919,8 @@ wait_unit_absent()
         node.func.id for node in ast.walk(main_node)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     ]
-    require(call_names.count("assert_client_failure") == 4
-            and call_names.count("fast_recovery") == 5,
+    require(call_names.count("assert_client_failure") == 5
+            and call_names.count("fast_recovery") == 6,
             "containment causal fault families must each assert failure and fast recovery")
     race_fragments = (
         'go_binary, "client-terminal-race-a"),',
@@ -2405,6 +2538,30 @@ def verify_supervisor_mutations(
             'TOTAL_BUDGET = 17 * 60', 'TOTAL_BUDGET = 18 * 60')),
         ("cleanup reserve omitted", replace_once(client,
             'CLEANUP_RESERVE = 3 * 60', 'CLEANUP_RESERVE = 0')),
+        ("cleanup budget decreased", replace_once(client, 'CLEANUP_BUDGET = 170', 'CLEANUP_BUDGET = 160')),
+        ("cleanup action attempts increased", replace_once(client, 'ACTION_ATTEMPTS = 2', 'ACTION_ATTEMPTS = 3')),
+        ("cleanup kill timeout increased", replace_once(client,
+            'ACTION_TIMEOUTS = {"kill": 5, "stop": 20, "reset-failed": 5}',
+            'ACTION_TIMEOUTS = {"kill": 6, "stop": 20, "reset-failed": 5}')),
+        ("cleanup stop timeout increased", replace_once(client,
+            'ACTION_TIMEOUTS = {"kill": 5, "stop": 20, "reset-failed": 5}',
+            'ACTION_TIMEOUTS = {"kill": 5, "stop": 21, "reset-failed": 5}')),
+        ("cleanup reset timeout increased", replace_once(client,
+            'ACTION_TIMEOUTS = {"kill": 5, "stop": 20, "reset-failed": 5}',
+            'ACTION_TIMEOUTS = {"kill": 5, "stop": 20, "reset-failed": 6}')),
+        ("cleanup backoff increased", replace_once(client,
+            'ACTION_RETRY_BACKOFF = 0.05', 'ACTION_RETRY_BACKOFF = 0.5')),
+        ("cleanup kill wait increased", replace_once(client,
+            'KILL_WAIT_TIMEOUT = 20', 'KILL_WAIT_TIMEOUT = 21')),
+        ("cleanup unload timeout increased", replace_once(client,
+            'UNLOAD_TIMEOUT = 30', 'UNLOAD_TIMEOUT = 31')),
+        ("cleanup margin decreased", replace_once(client, 'CLEANUP_MARGIN = 20', 'CLEANUP_MARGIN = 10')),
+        ("cleanup envelope omits sequential stop", replace_once(client,
+            '+ ACTION_ATTEMPTS * sum(ACTION_TIMEOUTS.values())',
+            '+ ACTION_ATTEMPTS * (ACTION_TIMEOUTS["kill"] + ACTION_TIMEOUTS["reset-failed"])')),
+        ("cleanup startup assertion disabled", replace_once(client,
+            'if not (CLEANUP_ENVELOPE < CLEANUP_BUDGET < CLEANUP_RESERVE < TOTAL_BUDGET):',
+            'if False:')),
         ("work and teardown share deadline", replace_once(client,
             '        work_deadline = total_deadline - CLEANUP_RESERVE',
             '        work_deadline = total_deadline')),
@@ -2451,8 +2608,8 @@ def verify_supervisor_mutations(
             '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        total_deadline = time.monotonic() + TOTAL_BUDGET',
             '        total_deadline = time.monotonic() + TOTAL_BUDGET\n        fcntl.flock(client_lock, fcntl.LOCK_EX)')),
         ("teardown reserve activated after signal mask", replace_once(client,
-            '        finally:\n            # The final minute of the lock-held budget is exclusively for\n            # teardown. No launch, result, or journal path can consume it.\n            COMMAND_DEADLINE = total_deadline\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
-            '        finally:\n            # The final minute of the lock-held budget is exclusively for\n            # teardown. No launch, result, or journal path can consume it.\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n            COMMAND_DEADLINE = total_deadline')),
+            '            COMMAND_DEADLINE = cleanup_deadline\n            CLEANUP_ACTIVE = True\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
+            '            COMMAND_DEADLINE = cleanup_deadline\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n            CLEANUP_ACTIVE = True')),
         ("work deadline not restored after teardown", replace_once(client,
             '            COMMAND_DEADLINE = work_deadline\n            if CANCELLED:',
             '            COMMAND_DEADLINE = total_deadline\n            if CANCELLED:')),
@@ -2547,18 +2704,18 @@ def verify_supervisor_mutations(
         ("owned property hook omitted", replace_once(client,
             '        "client-property-fault-owned": "owned-state",', '')),
         ("cleanup retry replaced by one shot", replace_once(client,
-            '    for attempt in range(3):', '    for attempt in range(1):')),
+            '    for attempt in range(ACTION_ATTEMPTS):', '    for attempt in range(1):')),
         ("cleanup retry changes ownership target", replace_once(client,
             '            acted = owned_command(invocation, nonce, service_command, action, *arguments)',
             '            acted = owned_command("", nonce, service_command, action, *arguments)')),
         ("raising statement between finally and resolution", replace_once(client, '        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))', '        unit_properties("LoadState")\n        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))')),
         ("signal cancellation bypasses cleanup", replace_once(client, '    CANCELLED.append(signum)', '    os._exit(128 + signum)')),
         ("teardown signal block omitted", replace_once(client,
-            '            COMMAND_DEADLINE = total_deadline\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
-            '            COMMAND_DEADLINE = total_deadline\n            previous_mask = set()')),
+            '            CLEANUP_ACTIVE = True\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
+            '            CLEANUP_ACTIVE = True\n            previous_mask = set()')),
         ("cleanup interception moved after action", replace_once(client,
-            '    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])\n    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)',
-            '    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)\n    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])')),
+            '    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])\n    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,\n                     timeout=ACTION_TIMEOUTS[arguments[0]])',
+            '    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,\n                     timeout=ACTION_TIMEOUTS[arguments[0]])\n    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])')),
         ("cleanup aggregation omitted", replace_once(client,
             '    if errors:\n        raise RuntimeError("; ".join(map(str, errors)))', '    pass')),
         ("B attempting marker after flock", replace_once(client,
@@ -2571,6 +2728,11 @@ def verify_supervisor_mutations(
             '                if requested_mode == "client-work-budget-launch":\n                    exhaust_work_budget("launch")\n', '')),
         ("service work exhaustion hook omitted", replace_once(client,
             '            if requested_mode == "client-work-budget-service":\n                exhaust_work_budget("service")\n', '')),
+        ("slow cleanup work exhaustion hook omitted", replace_once(client,
+            '            if requested_mode == "client-work-budget-slow-cleanup":\n                exhaust_work_budget("slow-cleanup")\n', '')),
+        ("slow cleanup reduced to one kill", replace_once(client,
+            'slow_limit = {"show": 1, "kill": ACTION_ATTEMPTS, "stop": 1}.get(name, 0)',
+            'slow_limit = {"show": 1, "kill": 1}.get(name, 0)')),
         ("journal work exhaustion hook omitted", replace_once(client,
             '            if requested_mode == "client-work-budget-journal":\n                exhaust_work_budget("journal")\n', '')),
         ("work exhaustion marker omitted", replace_once(client,
@@ -2745,6 +2907,30 @@ def verify_supervisor_mutations(
             '        if budget_elapsed < 0.7 or budget_elapsed > 20:', '        if False:')),
         ("work budget fast recovery omitted", replace_once(containment,
             '        fast_recovery(client, repo, commit, go_binary, budget_mode)', '        pass')),
+        ("old kill-only slow cleanup test", replace_once(containment,
+            '                  for boundary in ("show", "kill", "stop")}',
+            '                  for boundary in ("show", "kill")}')),
+        ("slow cleanup exact counters weakened", replace_once(containment,
+            'expected_slow_counts = {"show": (1, 1), "kill": (2, 0), "stop": (1, 1)}',
+            'expected_slow_counts = {"show": (1, 1), "kill": (1, 0), "stop": (1, 1)}')),
+        ("slow cleanup wait bound at cleanup budget", replace_once(containment,
+            '    wait_path(slow_unloaded, timeout=175)',
+            '    wait_path(slow_unloaded, timeout=170)')),
+        ("slow cleanup wait bound at cleanup reserve", replace_once(containment,
+            '    wait_path(slow_unloaded, timeout=175)',
+            '    wait_path(slow_unloaded, timeout=180)')),
+        ("slow cleanup elapsed bound at cleanup budget", replace_once(containment,
+            '    if slow_elapsed < 25 or slow_elapsed > 175:',
+            '    if slow_elapsed < 25 or slow_elapsed > 170:')),
+        ("slow cleanup elapsed bound at cleanup reserve", replace_once(containment,
+            '    if slow_elapsed < 25 or slow_elapsed > 175:',
+            '    if slow_elapsed < 25 or slow_elapsed > 180:')),
+        ("slow cleanup retained stop error omitted", replace_once(containment,
+            '            or "injected slow owned stop failure before action" not in slow_stderr):',
+            '            or False):')),
+        ("slow cleanup lock proof omitted", replace_once(containment,
+            '    assert_client_lock_held()\n    release(slow_mode + "-unloaded")',
+            '    release(slow_mode + "-unloaded")')),
         ("signal matrix signal omitted", replace_once(containment,
             '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
             '("hup", signal.SIGHUP)):' )),

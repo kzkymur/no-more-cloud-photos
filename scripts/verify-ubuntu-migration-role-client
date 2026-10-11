@@ -40,20 +40,36 @@ CANCELLATION_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIG
 CANCELLED = []
 REQUESTED_MODE = ""
 COMMAND_DEADLINE = None
+CLEANUP_ACTIVE = False
 RECOVERED_ERRORS = []
 INTERCEPTIONS = {}
 BOUNDARIES = set()
 PROPERTY_RETRIES = 4
 PROPERTY_RETRY_BUDGET = 3.0
 TOTAL_BUDGET = 17 * 60
-# Worst-case owned teardown includes bounded property retries, the 15-second
-# systemd stop bound, cgroup draining, reset, unload polling, and margin.
 CLEANUP_RESERVE = 3 * 60
+CLEANUP_BUDGET = 170
+ACTION_ATTEMPTS = 2
+ACTION_TIMEOUTS = {"kill": 5, "stop": 20, "reset-failed": 5}
+ACTION_RETRY_BACKOFF = 0.05
+KILL_WAIT_TIMEOUT = 20
+UNLOAD_TIMEOUT = 30
+CLEANUP_MARGIN = 20
+CLEANUP_ENVELOPE = (
+    PROPERTY_RETRY_BUDGET * (1 + ACTION_ATTEMPTS * 3 + 1)
+    + ACTION_ATTEMPTS * sum(ACTION_TIMEOUTS.values())
+    + ACTION_RETRY_BACKOFF * len(ACTION_TIMEOUTS)
+    + KILL_WAIT_TIMEOUT + UNLOAD_TIMEOUT + CLEANUP_MARGIN
+)
 WORK_BUDGET_FAULT_SECONDS = 1.0
+SLOW_PROPERTY_FAULT_SECONDS = 2.5
+SLOW_ACTION_FAULT_SECONDS = {"kill": 4.5, "stop": 15.0}
 WORK_BUDGET_MODES = {
     "client-work-budget-launch", "client-work-budget-service",
-    "client-work-budget-journal",
+    "client-work-budget-journal", "client-work-budget-slow-cleanup",
 }
+if not (CLEANUP_ENVELOPE < CLEANUP_BUDGET < CLEANUP_RESERVE < TOTAL_BUDGET):
+    raise RuntimeError("cleanup retry envelope does not fit its exclusive reserve")
 
 
 def fail(message):
@@ -73,11 +89,18 @@ def command(argv, *, check=True, stdout=subprocess.PIPE, timeout=30):
     if COMMAND_DEADLINE is not None:
         remaining = COMMAND_DEADLINE - time.monotonic()
         if remaining <= 0:
+            if CLEANUP_ACTIVE:
+                fail("absolute client cleanup deadline exhausted")
             fail("absolute client command budget exhausted")
         timeout = min(timeout, remaining)
-    return subprocess.run(argv, cwd="/", env=ENVIRONMENT,
-                          check=check, stdout=stdout, stderr=subprocess.PIPE, text=True,
-                          timeout=timeout)
+    try:
+        return subprocess.run(argv, cwd="/", env=ENVIRONMENT,
+                              check=check, stdout=stdout, stderr=subprocess.PIPE, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        if CLEANUP_ACTIVE and time.monotonic() >= COMMAND_DEADLINE:
+            raise RuntimeError("absolute client cleanup deadline exhausted") from error
+        raise
 
 
 def record_counter(name):
@@ -97,6 +120,7 @@ def record_counter(name):
 
 def command_path(name):
     transient = REQUESTED_MODE == "client-cleanup-fault-" + name
+    slow_cleanup = REQUESTED_MODE == "client-work-budget-slow-cleanup"
     persistent = REQUESTED_MODE == "client-cleanup-persistent-" + name
     property_targets = {
         "client-property-fault-immediate": "immediate",
@@ -104,13 +128,23 @@ def command_path(name):
         "client-property-fault-owned": "owned-state",
     }
     transient = transient or property_targets.get(REQUESTED_MODE) == name
-    if not (transient or persistent):
+    slow_limit = {"show": 1, "kill": ACTION_ATTEMPTS, "stop": 1}.get(name, 0)
+    if not (transient or (slow_cleanup and slow_limit) or persistent):
         return
     count = INTERCEPTIONS.get(name, 0)
-    if persistent or count == 0:
+    if persistent or (slow_cleanup and count < slow_limit) or count == 0:
         interception = count + 1
         INTERCEPTIONS[name] = interception
         record_counter(name + ".intercepted")
+        if slow_cleanup:
+            delay = (SLOW_PROPERTY_FAULT_SECONDS if name == "show"
+                     else SLOW_ACTION_FAULT_SECONDS[name])
+            deadline = bounded_deadline(delay)
+            while time.monotonic() < deadline:
+                time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:
+                fail(f"absolute client cleanup deadline exhausted during slow {name} interception")
+            fail(f"injected slow owned {name} failure before action")
         if REQUESTED_MODE == "client-cleanup-fault-stop":
             durable_marker(REQUESTED_MODE + ".blocked")
             release = f"{RUN}/{REQUESTED_MODE}.release"
@@ -118,8 +152,8 @@ def command_path(name):
             while not os.path.exists(release):
                 if time.monotonic() >= deadline:
                     fail("timed out awaiting release of intercepted stop command")
-                time.sleep(0.05)
-        required = 4 if name in ("show", "wait", "unload") else 3
+                time.sleep(ACTION_RETRY_BACKOFF)
+        required = 4 if name in ("show", "wait", "unload") else ACTION_ATTEMPTS
         if persistent and interception == required:
             durable_marker(REQUESTED_MODE + ".handoff.ready")
             release = f"{RUN}/{REQUESTED_MODE}.handoff.release"
@@ -139,9 +173,12 @@ def unit_properties(*names, context="show"):
     for attempt in range(PROPERTY_RETRIES):
         try:
             command_path(context)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("unit property lookup deadline exhausted")
             result = command(("/usr/bin/systemctl", "show", UNIT,
                               *(f"--property={name}" for name in requested)), check=False,
-                             timeout=max(0.05, deadline - time.monotonic()))
+                             timeout=remaining)
             if result.returncode:
                 fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
             if not result.stdout:
@@ -231,7 +268,8 @@ def owned_command(invocation, nonce, service_command, *arguments):
     if state.get("LoadState") == "not-found":
         return False
     command_path("reset" if arguments[0] == "reset-failed" else arguments[0])
-    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)
+    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,
+                     timeout=ACTION_TIMEOUTS[arguments[0]])
     if result.returncode:
         fail(f"owned unit command failed ({' '.join(arguments)}): {result.stderr.strip()}")
     return True
@@ -277,7 +315,7 @@ def cleanup_boundary(name):
 
 def retry_owned_command(invocation, nonce, service_command, name, action, *arguments):
     errors = []
-    for attempt in range(3):
+    for attempt in range(ACTION_ATTEMPTS):
         try:
             cleanup_boundary(name)
             acted = owned_command(invocation, nonce, service_command, action, *arguments)
@@ -286,12 +324,12 @@ def retry_owned_command(invocation, nonce, service_command, name, action, *argum
             return acted
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             errors.append(error)
-            if attempt < 2:
-                time.sleep(0.05 * (2 ** attempt))
+            if attempt + 1 < ACTION_ATTEMPTS:
+                time.sleep(0.05)
     fail(f"owned {name} command remains unavailable: " + "; ".join(map(str, errors)))
 
 
-def wait_unloaded(invocation, nonce, service_command, timeout=30):
+def wait_unloaded(invocation, nonce, service_command, timeout=UNLOAD_TIMEOUT):
     deadline = bounded_deadline(timeout)
     while True:
         cleanup_boundary("unload")
@@ -299,6 +337,8 @@ def wait_unloaded(invocation, nonce, service_command, timeout=30):
         if state.get("LoadState") == "not-found":
             return
         if time.monotonic() >= deadline:
+            if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:
+                fail("absolute client cleanup deadline exhausted while awaiting owned unload")
             fail(f"fixed unit did not unload: {state}")
         time.sleep(0.1)
 
@@ -311,7 +351,7 @@ def teardown_owned(invocation, nonce, service_command):
     if state.get("LoadState") == "not-found":
         return
     kill_sent = False
-    deadline = bounded_deadline(20)
+    deadline = bounded_deadline(KILL_WAIT_TIMEOUT)
     while True:
         cleanup_boundary("wait")
         try:
@@ -361,6 +401,8 @@ def teardown_owned(invocation, nonce, service_command):
             wait_unloaded(invocation, nonce, service_command)
         except BaseException as error:
             errors.append(error)
+    if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:
+        errors.append(RuntimeError("absolute client cleanup deadline exhausted before owned unload"))
     if errors:
         raise RuntimeError("; ".join(map(str, errors)))
 
@@ -408,7 +450,7 @@ def publish_supervisor(repo, commit):
 
 
 def main():
-    global COMMAND_DEADLINE, REQUESTED_MODE
+    global CLEANUP_ACTIVE, COMMAND_DEADLINE, REQUESTED_MODE
     if os.geteuid() != 0 or len(sys.argv) not in (4, 5):
         fail("usage: client REPOSITORY CURRENT_COMMIT ABSOLUTE_GO [FAULT_POINT]")
     os.chdir("/")
@@ -530,6 +572,8 @@ def main():
                 fail("injected client failure after property attestation")
             if requested_mode == "client-work-budget-service":
                 exhaust_work_budget("service")
+            if requested_mode == "client-work-budget-slow-cleanup":
+                exhaust_work_budget("slow-cleanup")
             cleanup_test = (requested_mode.startswith("client-cleanup-fault-")
                             or requested_mode.startswith("client-cleanup-persistent-")
                             or requested_mode.startswith("client-signal-"))
@@ -583,9 +627,11 @@ def main():
         except BaseException as error:
             primary_error = error
         finally:
-            # The final minute of the lock-held budget is exclusively for
-            # teardown. No launch, result, or journal path can consume it.
-            COMMAND_DEADLINE = total_deadline
+            # Preserve the exclusive reserve without granting early failures
+            # the rest of the 17-minute transaction for teardown.
+            cleanup_deadline = min(total_deadline, time.monotonic() + CLEANUP_BUDGET)
+            COMMAND_DEADLINE = cleanup_deadline
+            CLEANUP_ACTIVE = True
             previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
             try:
                 if launch_attempted and invocation is None:
@@ -610,6 +656,7 @@ def main():
                         cleanup_errors.append(error)
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                CLEANUP_ACTIVE = False
             if requested_mode in WORK_BUDGET_MODES:
                 client_pause(requested_mode + "-unloaded")
             COMMAND_DEADLINE = work_deadline
