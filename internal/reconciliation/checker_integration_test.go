@@ -756,7 +756,6 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 	itemID := "55555555-5555-4555-8555-555555555555"
 	quarantineID := "66666666-6666-4666-8666-666666666666"
 	attemptID := "77777777-7777-4777-8777-777777777777"
-	eventID := "88888888-8888-4888-8888-888888888888"
 	snapshot := Snapshot{StartedAt: now, CutoffAt: now, EndedAt: now}
 	if err := repository.BeginReport(ctx, reportID, ScopeAll, snapshot, now); err != nil {
 		t.Fatal(err)
@@ -780,31 +779,73 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	repairPool := reconciliationRolePool(t, databaseURL, schema, "nmcp_repair_runtime")
-	if _, err := repairPool.Exec(ctx, `SELECT nmcp_begin_repair_run($1,$2,$3,'integration')`, runID, reportID, authorizationID); err != nil {
+	if _, err := repairPool.Exec(ctx, `SELECT nmcp_begin_repair_run_v2($1,$2,$3,'integration')`, runID, reportID, authorizationID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repairPool.Exec(ctx, `SELECT nmcp_prepare_repair_manifest_item($1,$2,$3,$4)`, itemID, runID, findingID, quarantineID); err != nil {
+	if _, err := repairPool.Exec(ctx, `SELECT nmcp_prepare_repair_manifest_item_v2($1,$2,$3,$4)`, itemID, runID, findingID, quarantineID); err != nil {
 		t.Fatal(err)
 	}
-	fixture, err := admin.Begin(ctx)
+	var planDigest string
+	if err := repairPool.QueryRow(ctx, `SELECT nmcp_read_repair_plan_digest($1)`, runID).Scan(&planDigest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repairPool.Exec(ctx, `SELECT nmcp_seal_repair_plan($1,$2,1::smallint,1,$3)`, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", runID, strings.Repeat("b", 64)); err == nil {
+		t.Fatal("repair plan accepted a caller-asserted noncanonical digest")
+	}
+	if _, err := repairPool.Exec(ctx, `SELECT nmcp_seal_repair_plan($1,$2,1::smallint,1,$3)`, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", runID, planDigest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='checker quarantine fixture',owner='integration',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	preparedEventID, err := newUUIDv4()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, statement := range []struct {
-		sql  string
-		args []any
+	if _, err := repairPool.Exec(ctx, `SELECT nmcp_begin_repair_attempt($1,$2,$3)`, attemptID, itemID, preparedEventID); err != nil {
+		t.Fatal(err)
+	}
+	preparedRead, err := checkPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var preparedQuarantineRows int
+	if err := preparedRead.QueryRow(ctx, `SELECT count(*) FROM nmcp_read_check_database_references(clock_timestamp()) WHERE row_kind='quarantine'`).Scan(&preparedQuarantineRows); err != nil {
+		_ = preparedRead.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := preparedRead.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if preparedQuarantineRows != 0 {
+		t.Fatalf("prepared-only repair advertised %d possible quarantine rows", preparedQuarantineRows)
+	}
+	repairTx, err := repairPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repairTx.Rollback(context.Background())
+	for _, event := range []struct {
+		eventType, outcome string
+		size               *int64
+		sha                *string
 	}{
-		{`INSERT INTO reconciliation_repair_attempts(id,manifest_item_id,attempt_number) VALUES($1,$2,1)`, []any{attemptID, itemID}},
-		{`ALTER TABLE reconciliation_repair_events DISABLE TRIGGER USER`, nil},
-		{`INSERT INTO reconciliation_repair_events(id,attempt_id,sequence,event_type,outcome_code,observed_size_bytes,observed_sha256) VALUES($1,$2,1,'completed','quarantined',$3,$4)`, []any{eventID, attemptID, size, sha}},
-		{`ALTER TABLE reconciliation_repair_events ENABLE TRIGGER USER`, nil},
+		{"applying", "applying", nil, nil},
+		{"revalidated", "matched", &size, &sha},
+		{"rename", "renamed", nil, nil},
+		{"source_directory_fsync", "durable", nil, nil},
+		{"destination_directory_fsync", "durable", nil, nil},
+		{"completed", "quarantined", &size, &sha},
 	} {
-		if _, err := fixture.Exec(ctx, statement.sql, statement.args...); err != nil {
-			_ = fixture.Rollback(ctx)
-			t.Fatalf("quarantine fixture %q: %v", statement.sql, err)
+		eventID, idErr := newUUIDv4()
+		if idErr != nil {
+			t.Fatal(idErr)
+		}
+		if _, err := repairTx.Exec(ctx, `SELECT nmcp_append_repair_event($1,$2,$3,$4,NULL,$5,$6)`, eventID, attemptID, event.eventType, event.outcome, event.size, event.sha); err != nil {
+			t.Fatalf("append legal repair event %s: %v", event.eventType, err)
 		}
 	}
-	if err := fixture.Commit(ctx); err != nil {
+	if err := repairTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
@@ -820,6 +861,15 @@ func TestCheckerIntegrationCorrelatesQuarantineJournal(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	checker, _ := NewChecker(repository, store)
+	if _, err := admin.Exec(ctx, `REVOKE SELECT(outcome_code) ON reconciliation_repair_events FROM nmcp_check_function_owner`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checker.Check(ctx, ScopeAll); err == nil {
+		t.Fatal("checker read repair outcome without its exact helper column grant")
+	}
+	if _, err := admin.Exec(ctx, `GRANT SELECT(outcome_code) ON reconciliation_repair_events TO nmcp_check_function_owner`); err != nil {
+		t.Fatal(err)
+	}
 	assertSingleCheckFinding(t, ctx, admin, checker, "quarantine_mismatch")
 	if err := os.Remove(filepath.Join(root, ".quarantine", quarantineID)); err != nil {
 		t.Fatal(err)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -38,8 +39,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 18 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version eighteen", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 19 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version nineteen", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,8 +63,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 18 || status.ExpectedVersion != 18 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version eighteen", status)
+		if status.CurrentVersion != 19 || status.ExpectedVersion != 19 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version nineteen", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
@@ -220,8 +221,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(full.migrations) != 18 {
-			t.Fatalf("migration count = %d, want 18", len(full.migrations))
+		if len(full.migrations) != 19 {
+			t.Fatalf("migration count = %d, want 19", len(full.migrations))
 		}
 		migrationUnderTest := full.migrations[17]
 		if migrationUnderTest.version != 18 || migrationUnderTest.name != "reconciliation_checker_sources" ||
@@ -681,7 +682,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 18 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 19 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
@@ -2274,12 +2275,322 @@ func TestCheckerDefinerCatalogFreshAndV17Upgrade(t *testing.T) {
 				}
 			}
 			if err := migrator.Up(ctx); err != nil {
-				t.Fatalf("apply migration 18: %v", err)
+				t.Fatalf("apply migrations through 19: %v", err)
 			}
 			assertCheckerDefinerCatalog(t, ctx, pool)
 			assertCheckerTempShadowCannotIntercept(t, ctx, pool)
 		})
 	}
+}
+
+func TestRepairMigrationCatalogFreshAndV18Upgrade(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	for _, mode := range []string{"fresh", "v18_upgrade"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pool := integrationPool(t, databaseURL)
+			migrator, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(migrator.migrations) != 19 || migrator.migrations[18].version != 19 || migrator.migrations[18].name != "reconciliation_repair_execution" {
+				t.Fatalf("migration 19 identity = %+v", migrator.migrations[18])
+			}
+			if mode == "v18_upgrade" {
+				if err := newMigrator(pool, migrator.migrations[:18]).Up(ctx); err != nil {
+					t.Fatalf("apply exact v18 prefix: %v", err)
+				}
+			}
+			if err := migrator.Up(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var version int64
+			var name, checksum string
+			if err := pool.QueryRow(ctx, `SELECT version,name,checksum FROM schema_migrations WHERE version=19 AND NOT dirty`).Scan(&version, &name, &checksum); err != nil {
+				t.Fatal(err)
+			}
+			if version != 19 || name != "reconciliation_repair_execution" || checksum != migrator.migrations[18].checksum {
+				t.Fatalf("migration row=%d/%q/%q", version, name, checksum)
+			}
+			var relation bool
+			if err := pool.QueryRow(ctx, `SELECT to_regclass('reconciliation_repair_plan_seals') IS NOT NULL`).Scan(&relation); err != nil || !relation {
+				t.Fatalf("plan seal relation=%t error=%v", relation, err)
+			}
+			assertRepairDefinerSetClosure(t, ctx, pool)
+		})
+	}
+}
+
+func TestRepairMigrationRejectsUnfinishedV18StateWithoutPartialDDL(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool := integrationPool(t, databaseURL)
+	migrator, err := NewMigrator(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newMigrator(pool, migrator.migrations[:18]).Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reportID, runID, authorizationID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_reports(
+		id,format_version,classifier_version,scope,migration_version,migration_name,migration_checksum,
+		db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at)
+		SELECT $1,1,1,'all',version,name,checksum,statement_timestamp()-interval '10 seconds',
+		statement_timestamp()-interval '9 seconds',statement_timestamp()-interval '8 seconds',
+		statement_timestamp()-interval '7 seconds',statement_timestamp()-interval '48 hours 9 seconds'
+		FROM schema_migrations WHERE version=18`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at) VALUES($1,0,clock_timestamp()-interval '6 seconds')`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_repair_runs(id,source_report_id,authorization_id,authorized_actor) VALUES($1,$2,$3,'unfinished-v18')`, runID, reportID, authorizationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.Up(ctx); err == nil {
+		t.Fatal("migration 19 accepted an unfinished v18 repair run")
+	}
+	var version int64
+	var planTable bool
+	var legacyPathConstraint bool
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('reconciliation_repair_plan_seals') IS NOT NULL`).Scan(&planTable); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='reconciliation_repair_manifest_items'::regclass AND conname='reconciliation_repair_manifest_items_source_relative_key_key')`).Scan(&legacyPathConstraint); err != nil {
+		t.Fatal(err)
+	}
+	if version != 18 || planTable || !legacyPathConstraint {
+		t.Fatalf("failed migration leaked state: version=%d plan_table=%t legacy_constraint=%t", version, planTable, legacyPathConstraint)
+	}
+}
+
+func TestRepairMigrationDrainsExistingRepairWriter(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool := integrationPool(t, databaseURL)
+	migrator, err := NewMigrator(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newMigrator(pool, migrator.migrations[:18]).Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Release()
+	blockerTx, err := blocker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockerTx.Rollback(context.Background())
+	if _, err := blockerTx.Exec(ctx, `LOCK TABLE reconciliation_repair_runs IN ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- migrator.Up(ctx) }()
+	awaitRelationLock(t, pool, ctx, 0, "reconciliation_repair_runs", "AccessExclusiveLock", false)
+	awaitRelationLock(t, pool, ctx, 0, "maintenance_state", "AccessExclusiveLock", true)
+	if err := blockerTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := awaitContextResult(t, ctx, result); err != nil {
+		t.Fatal(err)
+	}
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 19 {
+		t.Fatalf("migration version after writer drain = %d, %v", version, err)
+	}
+}
+
+func assertRepairDefinerSetClosure(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	expected := []string{
+		"nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)",
+		"nmcp_append_check_finding_once(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)",
+		"nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone)",
+		"nmcp_complete_check_source(nmcp_uuid_v4,text,text)", "nmcp_read_check_attempt_owners()",
+		"nmcp_read_check_database_references(timestamp with time zone)", "nmcp_read_check_database_references_v18(timestamp with time zone)",
+		"nmcp_read_check_report_outcome(nmcp_uuid_v4)", "nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamp with time zone)",
+		"nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)",
+		"nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)",
+		"nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)",
+		"nmcp_complete_upload_attempt(nmcp_uuid_v4,text)", "nmcp_finish_repair_run(nmcp_uuid_v4)",
+		"nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)", "nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_read_repair_plan_digest(nmcp_uuid_v4)",
+		"nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)",
+		"nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)",
+		"nmcp_read_repair_run_by_authorization(nmcp_uuid_v4)", "nmcp_read_repair_run_outcome(nmcp_uuid_v4)",
+		"nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)",
+		"nmcp_record_transform_storage_attempt()", "nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)", "nmcp_require_normal_maintenance()",
+		"nmcp_require_terminal_repair_attempt()", "nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)",
+	}
+	for index, signature := range expected {
+		if err := pool.QueryRow(ctx, `SELECT $1::regprocedure::text`, signature).Scan(&expected[index]); err != nil {
+			t.Fatalf("resolve expected definer %s: %v", signature, err)
+		}
+	}
+	rows, err := pool.Query(ctx, `SELECT p.oid::regprocedure::text
+		FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_roles AS owner ON owner.oid=p.proowner
+		WHERE p.prosecdef AND owner.rolname IN ('nmcp_check_function_owner','nmcp_repair_function_owner')
+		AND p.pronamespace=current_schema()::regnamespace ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var actual []string
+	for rows.Next() {
+		var signature string
+		if err := rows.Scan(&signature); err != nil {
+			t.Fatal(err)
+		}
+		actual = append(actual, signature)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(expected)
+	slices.Sort(actual)
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("reconciliation SECURITY DEFINER set\nactual=%q\nexpected=%q", actual, expected)
+	}
+	for _, signature := range actual {
+		var owner string
+		var searchPath []string
+		var publicExecute bool
+		if err := pool.QueryRow(ctx, `SELECT owner.rolname,p.proconfig,
+			EXISTS(SELECT 1 FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) acl WHERE acl.grantee=0 AND acl.privilege_type='EXECUTE')
+			FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_roles owner ON owner.oid=p.proowner WHERE p.oid=$1::regprocedure`, signature).Scan(&owner, &searchPath, &publicExecute); err != nil {
+			t.Fatal(err)
+		}
+		if len(searchPath) != 1 || searchPath[0] != "search_path="+schemaForPool(t, ctx, pool)+", pg_catalog, pg_temp" || publicExecute {
+			t.Fatalf("definer %s owner=%s proconfig=%v public=%t", signature, owner, searchPath, publicExecute)
+		}
+	}
+	repairRuntimeSignatures := []string{
+		"nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)",
+		"nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)",
+		"nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_read_repair_plan_digest(nmcp_uuid_v4)",
+		"nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)",
+		"nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)",
+		"nmcp_read_repair_run_outcome(nmcp_uuid_v4)",
+		"nmcp_read_repair_run_by_authorization(nmcp_uuid_v4)",
+		"nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)",
+		"nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)",
+		"nmcp_finish_repair_run(nmcp_uuid_v4)",
+	}
+	for _, signature := range repairRuntimeSignatures {
+		var exactACL bool
+		if err := pool.QueryRow(ctx, `SELECT (
+			SELECT count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee=runtime.oid AND NOT acl.is_grantable)=1
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee<>p.proowner)=1
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee NOT IN (p.proowner,runtime.oid))=0
+			   AND count(*) FILTER (WHERE acl.is_grantable)=0
+			   AND count(*) FILTER (WHERE acl.privilege_type<>'EXECUTE')=0
+			FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) AS acl
+			CROSS JOIN pg_catalog.pg_roles AS runtime WHERE runtime.rolname='nmcp_repair_runtime')
+			FROM pg_catalog.pg_proc AS p WHERE p.oid=$1::regprocedure`, signature).Scan(&exactACL); err != nil || !exactACL {
+			t.Fatalf("repair API exact ACL %s = %t, %v", signature, exactACL, err)
+		}
+	}
+	for _, revoked := range []string{
+		"nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)",
+		"nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_read_check_database_references_v18(timestamp with time zone)",
+	} {
+		var allowed bool
+		if err := pool.QueryRow(ctx, `SELECT pg_catalog.has_function_privilege('nmcp_repair_runtime',$1,'EXECUTE')`, revoked).Scan(&allowed); err != nil || allowed {
+			t.Fatalf("repair runtime revoked API %s allowed=%t error=%v", revoked, allowed, err)
+		}
+	}
+	var checkerRepairColumns []string
+	if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(c.relname||'.'||a.attname ORDER BY c.relname,a.attnum),ARRAY[]::text[])
+		FROM pg_catalog.pg_class AS c
+		JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+		WHERE c.relnamespace=current_schema()::regnamespace
+		  AND c.relname IN ('reconciliation_repair_manifest_items','reconciliation_repair_attempts','reconciliation_repair_events')
+		  AND pg_catalog.has_column_privilege('nmcp_check_function_owner',c.oid,a.attnum,'SELECT')`).Scan(&checkerRepairColumns); err != nil {
+		t.Fatal(err)
+	}
+	wantCheckerRepairColumns := []string{
+		"reconciliation_repair_attempts.id",
+		"reconciliation_repair_attempts.manifest_item_id",
+		"reconciliation_repair_attempts.attempt_number",
+		"reconciliation_repair_events.attempt_id",
+		"reconciliation_repair_events.error_code",
+		"reconciliation_repair_events.sequence",
+		"reconciliation_repair_events.event_type",
+		"reconciliation_repair_events.outcome_code",
+		"reconciliation_repair_events.observed_size_bytes",
+		"reconciliation_repair_events.observed_sha256",
+		"reconciliation_repair_events.occurred_at",
+		"reconciliation_repair_manifest_items.id",
+		"reconciliation_repair_manifest_items.quarantine_id",
+		"reconciliation_repair_manifest_items.media_id",
+		"reconciliation_repair_manifest_items.job_id",
+		"reconciliation_repair_manifest_items.job_target_id",
+		"reconciliation_repair_manifest_items.destination_relative_key",
+		"reconciliation_repair_manifest_items.expected_size_bytes",
+		"reconciliation_repair_manifest_items.report_observed_sha256",
+		"reconciliation_repair_manifest_items.prepared_at",
+	}
+	slices.Sort(checkerRepairColumns)
+	slices.Sort(wantCheckerRepairColumns)
+	if !reflect.DeepEqual(checkerRepairColumns, wantCheckerRepairColumns) {
+		t.Fatalf("checker repair column grants\nactual=%q\nexpected=%q", checkerRepairColumns, wantCheckerRepairColumns)
+	}
+	for _, relation := range []string{"reconciliation_repair_manifest_items", "reconciliation_repair_attempts", "reconciliation_repair_events"} {
+		var tableSelect bool
+		if err := pool.QueryRow(ctx, `SELECT pg_catalog.has_table_privilege('nmcp_check_function_owner',$1,'SELECT')`, relation).Scan(&tableSelect); err != nil || tableSelect {
+			t.Fatalf("checker has table-wide repair SELECT on %s: %t, %v", relation, tableSelect, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION nmcp_unexpected_repair_definer_probe() RETURNS integer LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION nmcp_unexpected_repair_definer_probe() OWNER TO nmcp_repair_function_owner`); err != nil {
+		t.Fatal(err)
+	}
+	var closureCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_roles AS owner ON owner.oid=p.proowner WHERE p.prosecdef AND owner.rolname IN ('nmcp_check_function_owner','nmcp_repair_function_owner') AND p.pronamespace=current_schema()::regnamespace`).Scan(&closureCount); err != nil {
+		t.Fatal(err)
+	}
+	if closureCount != len(expected)+1 {
+		t.Fatalf("unexpected definer was not visible to closure query: count=%d want=%d", closureCount, len(expected)+1)
+	}
+	if _, err := pool.Exec(ctx, `DROP FUNCTION nmcp_unexpected_repair_definer_probe()`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func schemaForPool(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
+	t.Helper()
+	var schema string
+	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	return schema
 }
 
 func assertCheckerDefinerCatalog(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
@@ -2345,7 +2656,7 @@ func assertCheckerTempShadowCannotIntercept(t *testing.T, ctx context.Context, p
 	if err := tx.QueryRow(ctx, `SELECT migration_version FROM reconciliation_check_reports WHERE id=$1`, reportID).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 18 {
+	if version != 19 {
 		t.Fatalf("checker definer used shadow migration history version %d", version)
 	}
 	if err := tx.Commit(ctx); err != nil {

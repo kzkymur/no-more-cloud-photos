@@ -25,6 +25,7 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
 	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/worker"
+	"golang.org/x/sys/unix"
 )
 
 func TestExecutorRealPostgreSQLCommitBoundariesIntegration(t *testing.T) {
@@ -122,7 +123,7 @@ func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		executor := integrationExecutor(t, repository, store, &fakeProcessors{}, []string{renderOne})
-		repair := prepareRenditionRepair(t, pool, lease, targets[0], renderOne, []byte("still"))
+		repair := prepareRenditionRepair(t, pool, root, lease, targets[0], renderOne, []byte("still"))
 		armed.Store(true)
 		publication := make(chan error, 1)
 		go func() { publication <- executor.Execute(ctx, lease, executionLimits()) }()
@@ -162,10 +163,17 @@ func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, applyErr := tx.Exec(context.Background(), `SELECT nmcp_append_repair_event($1,$2,'applying','applying',NULL,NULL,NULL)`, integrationUUID(t), repair.attemptID)
+		var decision, reason string
+		applyErr := tx.QueryRow(context.Background(), `SELECT decision,reason_code FROM nmcp_lock_repair_item_apply($1::uuid,$2::uuid,$3::uuid) LIMIT 1`, repair.runID, repair.itemID, repair.attemptID).Scan(&decision, &reason)
 		_ = tx.Rollback(context.Background())
-		if applyErr == nil {
-			t.Fatal("repair applying ignored the newly committed rendition reference")
+		if applyErr != nil {
+			t.Fatal(applyErr)
+		}
+		if decision != "stale" {
+			t.Fatalf("repair apply authority decision = %q, want stale for newly committed rendition reference", decision)
+		}
+		if reason != "owner_set_changed" {
+			t.Fatalf("repair apply authority reason = %q, want owner_set_changed", reason)
 		}
 	})
 
@@ -197,7 +205,6 @@ func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 		if _, err := orphanTemp.Publish(context.Background(), storage.Validation{ExpectedSize: int64(len(orphanPayload)), ExpectedSHA256: &orphanDigest}); err != nil {
 			t.Fatal(err)
 		}
-		repair := prepareRenditionRepair(t, pool, lease, targets[0], renderOne, orphanPayload)
 		if _, err := pool.Exec(context.Background(), `UPDATE maintenance_state SET mode='maintenance',reason='repair wins',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
 			t.Fatal(err)
 		}
@@ -212,12 +219,29 @@ func TestExecutorPublicationMaintenanceBarrierIntegration(t *testing.T) {
 		default:
 		}
 		assertExecutorPublicationState(t, pool, jobID, targets[0], 0, 0, "running", "pending")
+		// The maintenance barrier prevents publication, but the still-running job
+		// remains a live owner and must fence final-orphan repair. Retire that
+		// owner before exercising the repair side of the race.
+		if _, err := pool.Exec(context.Background(), `UPDATE jobs SET status='failed',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp(),error_code='process_failed',error_message='maintenance won',updated_at=clock_timestamp() WHERE id=$1`, jobID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(context.Background(), `UPDATE job_targets SET status='failed',error_code='process_failed',error_message='maintenance won',updated_at=clock_timestamp() WHERE id=$1`, targets[0]); err != nil {
+			t.Fatal(err)
+		}
+		repair := prepareRenditionRepair(t, pool, root, lease, targets[0], renderOne, orphanPayload)
 		beginRepairAttempt(t, pool, repair)
 		tx, err := pool.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(context.Background())
+		var decision string
+		if err := tx.QueryRow(context.Background(), `SELECT decision FROM nmcp_lock_repair_item_apply($1::uuid,$2::uuid,$3::uuid)`, repair.runID, repair.itemID, repair.attemptID).Scan(&decision); err != nil {
+			t.Fatal(err)
+		}
+		if decision != "apply" {
+			t.Fatalf("repair apply authority decision = %q, want apply", decision)
+		}
 		appendRepairEvent(t, tx, repair.attemptID, "applying", "applying", nil, nil)
 		size := int64(len(orphanPayload))
 		shaText := hex.EncodeToString(orphanDigest[:])
@@ -532,14 +556,23 @@ func awaitExecutorRaceResult(t *testing.T, ctx context.Context, operation string
 }
 
 type integrationRepair struct {
-	runID, itemID, attemptID, quarantineID string
+	runID, itemID, attemptID, quarantineID, authorizationID, preparedEventID string
 }
 
-func prepareRenditionRepair(t *testing.T, pool *pgxpool.Pool, lease job.Lease, targetID, renditionID string, payload []byte) integrationRepair {
+func prepareRenditionRepair(t *testing.T, pool *pgxpool.Pool, root string, lease job.Lease, targetID, renditionID string, payload []byte) integrationRepair {
 	t.Helper()
-	repair := integrationRepair{runID: integrationUUID(t), itemID: integrationUUID(t), attemptID: integrationUUID(t), quarantineID: integrationUUID(t)}
+	repair := integrationRepair{runID: integrationUUID(t), itemID: integrationUUID(t), attemptID: integrationUUID(t), quarantineID: integrationUUID(t), authorizationID: integrationUUID(t), preparedEventID: integrationUUID(t)}
 	reportID, findingID := integrationUUID(t), integrationUUID(t)
 	path := "renditions/" + lease.Original.ID[:2] + "/" + lease.Original.ID + "/" + targetID + "/" + renditionID + ".avif"
+	var stat unix.Statx_t
+	statErr := unix.Statx(unix.AT_FDCWD, filepath.Join(root, filepath.FromSlash(path)), unix.AT_SYMLINK_NOFOLLOW, unix.STATX_MTIME|unix.STATX_CTIME, &stat)
+	observedMTime, observedCTime := time.Now().UTC().Truncate(time.Microsecond), time.Now().UTC().Truncate(time.Microsecond)
+	if statErr == nil {
+		observedMTime = time.Unix(stat.Mtime.Sec, int64(stat.Mtime.Nsec)).UTC().Truncate(time.Microsecond)
+		observedCTime = time.Unix(stat.Ctime.Sec, int64(stat.Ctime.Nsec)).UTC().Truncate(time.Microsecond)
+	} else if !errors.Is(statErr, unix.ENOENT) {
+		t.Fatal(statErr)
+	}
 	digest := sha256.Sum256(payload)
 	shaText := hex.EncodeToString(digest[:])
 	ctx := context.Background()
@@ -559,18 +592,25 @@ func prepareRenditionRepair(t *testing.T, pool *pgxpool.Pool, lease job.Lease, t
 		id,report_id,ordinal,kind,reason_code,actionability,subject_type,subject_id,media_id,job_id,job_target_id,
 		relative_key,expected_state,observed_type,observed_size_bytes,observed_sha256,observed_mtime,observed_ctime,observed_at)
 		VALUES($1,$2,1,'final_orphan','publication_race','repairable','rendition',$3,$4,$5,$6,$7,'unreferenced','regular',$8,$9,
-		clock_timestamp()-interval '3 seconds',clock_timestamp()-interval '3 seconds',clock_timestamp()-interval '1 second')`,
-		findingID, reportID, renditionID, lease.MediaID, lease.ID, targetID, path, len(payload), shaText); err != nil {
+		$10,$11,clock_timestamp()-interval '1 second')`,
+		findingID, reportID, renditionID, lease.MediaID, lease.ID, targetID, path, len(payload), shaText, observedMTime, observedCTime); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at)
 		VALUES($1,1,clock_timestamp()-interval '1 second')`, reportID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `SELECT nmcp_begin_repair_run($1,$2,$3,'integration-test')`, repair.runID, reportID, integrationUUID(t)); err != nil {
+	if _, err := pool.Exec(ctx, `SELECT nmcp_begin_repair_run_v2($1,$2,$3,'integration-test')`, repair.runID, reportID, repair.authorizationID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `SELECT nmcp_prepare_repair_manifest_item($1,$2,$3,$4)`, repair.itemID, repair.runID, findingID, repair.quarantineID); err != nil {
+	if _, err := pool.Exec(ctx, `SELECT nmcp_prepare_repair_manifest_item_v2($1,$2,$3,$4)`, repair.itemID, repair.runID, findingID, repair.quarantineID); err != nil {
+		t.Fatal(err)
+	}
+	var planDigest string
+	if err := pool.QueryRow(ctx, `SELECT nmcp_read_repair_plan_digest($1)`, repair.runID).Scan(&planDigest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT nmcp_seal_repair_plan($1,$2,1::smallint,1,$3)`, integrationUUID(t), repair.runID, planDigest); err != nil {
 		t.Fatal(err)
 	}
 	return repair
@@ -578,7 +618,7 @@ func prepareRenditionRepair(t *testing.T, pool *pgxpool.Pool, lease job.Lease, t
 
 func beginRepairAttempt(t *testing.T, pool *pgxpool.Pool, repair integrationRepair) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `SELECT nmcp_begin_repair_attempt($1,$2,$3)`, repair.attemptID, repair.itemID, integrationUUID(t)); err != nil {
+	if _, err := pool.Exec(context.Background(), `SELECT nmcp_begin_repair_attempt($1,$2,$3)`, repair.attemptID, repair.itemID, repair.preparedEventID); err != nil {
 		t.Fatal(err)
 	}
 }
