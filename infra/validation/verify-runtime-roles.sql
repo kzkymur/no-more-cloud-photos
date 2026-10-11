@@ -524,11 +524,38 @@ $$;
 -- and checker-source relation. This includes the deliberately narrow owner
 -- grants used by SECURITY DEFINER functions; every other grantee, privilege,
 -- and grant option is forbidden, including grants inherited by runtime roles.
+CREATE TEMP TABLE expected_protected_relations(table_name text PRIMARY KEY);
+INSERT INTO expected_protected_relations(table_name) VALUES
+    ('maintenance_state'),('admin_audit'),('admin_batches'),('change_events'),
+    ('reconciliation_reports'),('reconciliation_check_reports'),
+    ('reconciliation_check_findings'),('reconciliation_check_source_results'),
+    ('reconciliation_check_report_seals'),('reconciliation_repair_runs'),
+    ('reconciliation_repair_plan_seals'),('reconciliation_repair_manifest_items'),
+    ('reconciliation_repair_attempts'),('reconciliation_repair_events'),
+    ('reconciliation_repair_results'),('storage_attempts'),('storage_attempt_events');
 DO $$
 DECLARE
     source_table text;
     source_privilege text;
 BEGIN
+    IF EXISTS (
+        WITH expected AS (
+            SELECT table_name,'nmcp_migrator'::text AS owner_name,'r'::"char" AS relation_kind
+            FROM expected_protected_relations
+        ), actual AS (
+            SELECT c.relname::text,pg_catalog.pg_get_userbyid(c.relowner)::text,c.relkind
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+            JOIN expected_protected_relations AS protected ON protected.table_name=c.relname
+            WHERE n.nspname='public'
+        )
+        (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        UNION ALL
+        (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    ) THEN
+        RAISE EXCEPTION 'protected relation owner or kind differs from exact inventory';
+    END IF;
+
     IF EXISTS (
         WITH expected_base(table_name,column_name,grantee,privilege_type,is_grantable) AS (VALUES
             ('change_events','position','nmcp_check_function_owner','SELECT',false),
@@ -578,17 +605,10 @@ BEGIN
                    acl.privilege_type,acl.is_grantable
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+            JOIN expected_protected_relations AS protected ON protected.table_name=c.relname
             JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.oid
             CROSS JOIN LATERAL pg_catalog.aclexplode(a.attacl) AS acl
-            WHERE n.nspname='public' AND c.relname IN (
-                'maintenance_state','change_events','reconciliation_reports',
-                'reconciliation_check_reports','reconciliation_check_findings',
-                'reconciliation_check_source_results','reconciliation_check_report_seals',
-                'reconciliation_repair_runs','reconciliation_repair_plan_seals',
-                'reconciliation_repair_manifest_items','reconciliation_repair_attempts',
-                'reconciliation_repair_events','reconciliation_repair_results',
-                'storage_attempts','storage_attempt_events'
-            ) AND a.attnum>0 AND NOT a.attisdropped
+            WHERE n.nspname='public' AND a.attnum>0 AND NOT a.attisdropped
         )
         (SELECT * FROM expected EXCEPT SELECT * FROM actual)
         UNION ALL
@@ -598,12 +618,28 @@ BEGIN
     END IF;
 
     IF EXISTS (
-        WITH expected(table_name,grantee,privilege_type,is_grantable) AS (VALUES
+        WITH expected_base(table_name,grantee,privilege_type,is_grantable) AS (VALUES
+            ('maintenance_state','nmcp_purge_function_owner','SELECT',false),
+            ('maintenance_state','nmcp_repair_function_owner','SELECT',false),
             ('change_events','nmcp_purge_function_owner','SELECT',false),
             ('change_events','nmcp_runtime','SELECT',false),
             ('change_events','nmcp_runtime','INSERT',false),
             ('change_events','nmcp_runtime','UPDATE',false),
             ('change_events','nmcp_runtime','DELETE',false),
+            ('reconciliation_check_reports','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_check_reports','nmcp_check_function_owner','INSERT',false),
+            ('reconciliation_check_reports','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_check_findings','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_check_findings','nmcp_check_function_owner','INSERT',false),
+            ('reconciliation_check_findings','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_check_source_results','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_check_source_results','nmcp_check_function_owner','INSERT',false),
+            ('reconciliation_check_source_results','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_check_report_seals','nmcp_check_function_owner','SELECT',false),
+            ('reconciliation_check_report_seals','nmcp_check_function_owner','INSERT',false),
+            ('reconciliation_check_report_seals','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_repair_runs','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_repair_runs','nmcp_repair_function_owner','INSERT',false),
             ('reconciliation_repair_manifest_items','nmcp_repair_function_owner','SELECT',false),
             ('reconciliation_repair_manifest_items','nmcp_repair_function_owner','INSERT',false),
             ('reconciliation_repair_attempts','nmcp_repair_function_owner','SELECT',false),
@@ -611,23 +647,35 @@ BEGIN
             ('reconciliation_repair_events','nmcp_repair_function_owner','SELECT',false),
             ('reconciliation_repair_events','nmcp_repair_function_owner','INSERT',false),
             ('reconciliation_repair_plan_seals','nmcp_repair_function_owner','SELECT',false),
-            ('reconciliation_repair_plan_seals','nmcp_repair_function_owner','INSERT',false)
+            ('reconciliation_repair_plan_seals','nmcp_repair_function_owner','INSERT',false),
+            ('reconciliation_repair_results','nmcp_repair_function_owner','SELECT',false),
+            ('reconciliation_repair_results','nmcp_repair_function_owner','INSERT',false),
+            ('storage_attempts','nmcp_check_function_owner','SELECT',false),
+            ('storage_attempts','nmcp_repair_function_owner','SELECT',false),
+            ('storage_attempts','nmcp_repair_function_owner','INSERT',false),
+            ('storage_attempt_events','nmcp_check_function_owner','SELECT',false),
+            ('storage_attempt_events','nmcp_repair_function_owner','SELECT',false),
+            ('storage_attempt_events','nmcp_repair_function_owner','INSERT',false)
+        ), expected AS (
+            SELECT table_name,'nmcp_migrator'::text AS grantor,
+                   grantee,privilege_type,is_grantable
+            FROM expected_base
         ), actual AS (
-            SELECT c.relname::text,pg_catalog.pg_get_userbyid(acl.grantee)::text,
+            SELECT c.relname::text,pg_catalog.pg_get_userbyid(acl.grantor)::text,
+                   CASE WHEN acl.grantee=0 THEN 'PUBLIC'
+                        ELSE pg_catalog.pg_get_userbyid(acl.grantee)::text END,
                    acl.privilege_type,acl.is_grantable
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
+            JOIN expected_protected_relations AS protected ON protected.table_name=c.relname
             CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) AS acl
-            WHERE n.nspname='public' AND c.relname IN (
-                'change_events','reconciliation_repair_plan_seals','reconciliation_repair_manifest_items',
-                'reconciliation_repair_attempts','reconciliation_repair_events'
-            ) AND acl.grantee<>c.relowner
+            WHERE n.nspname='public' AND acl.grantee<>c.relowner
         )
         (SELECT * FROM expected EXCEPT SELECT * FROM actual)
         UNION ALL
         (SELECT * FROM actual EXCEPT SELECT * FROM expected)
     ) THEN
-        RAISE EXCEPTION 'checker source table ACL catalog differs from exact allowlist';
+        RAISE EXCEPTION 'protected relation table ACL catalog differs from exact allowlist';
     END IF;
 
     FOREACH source_table IN ARRAY ARRAY[
@@ -646,6 +694,7 @@ BEGIN
     END LOOP;
 END;
 $$;
+DROP TABLE expected_protected_relations;
 
 DO $$
 DECLARE

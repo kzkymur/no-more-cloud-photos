@@ -7,6 +7,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -85,79 +86,165 @@ def require_positive_workflow_paths(patterns: list, event_name: str) -> set[str]
     return positive_paths
 
 
-def validate_migration_role_verifier(source: str) -> None:
-    verifier_source = '"$repo_root/infra/validation/verify-runtime-roles.sql"'
-    verifier_path = "/usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql"
-    install_start = "/usr/bin/install -o root -g root -m 0644 \\\n"
-    install_index = source.find(install_start)
-    install_end = source.find(
-        "  /usr/local/libexec/nmcp/postgresql/\n", install_index
+EXPECTED_RUNTIME_VERIFIER_HELPER = """#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID -eq 0 ]] || { printf 'must run as root\\n' >&2; exit 1; }
+[[ $# -eq 1 ]] || { printf 'usage: %s REPOSITORY_ROOT\\n' "$0" >&2; exit 2; }
+repo_root=$(/usr/bin/readlink -f -- "$1")
+source_path="$repo_root/infra/validation/verify-runtime-roles.sql"
+installed_path=/usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql
+[[ -f $source_path ]] || { printf 'runtime verifier source is not a regular file\\n' >&2; exit 1; }
+/usr/bin/install -o root -g root -m 0644 -- "$source_path" "$installed_path"
+[[ $(/usr/bin/stat --format='%F:%u:%g:%a' -- "$installed_path") == 'regular file:0:0:644' ]] || {
+  printf 'unsafe installed runtime verifier ownership, type, or mode\\n' >&2
+  exit 1
+}
+exec /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \\
+  --set=ON_ERROR_STOP=1 --file="$installed_path"
+"""
+
+
+def validate_migration_role_verifier(helper_source: str, compatibility_source: str) -> None:
+    require(
+        helper_source == EXPECTED_RUNTIME_VERIFIER_HELPER,
+        "installed runtime verifier helper differs from the complete reviewed program",
+    )
+    invocation = (
+        "assert_runtime_boundary() {\n"
+        '  /usr/local/libexec/nmcp/verify-installed-runtime-roles "$repo_root" >/dev/null\n'
+        "}\n"
+    )
+    invocation_context = (
+        "assert_hardened() {\n"
+        "  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc --dbname=nmcp \\\n"
+        "    --file=/usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql >/dev/null\n"
+        "}\n"
+        + invocation
+        + "assert_compatibility() {\n"
+    )
+    install_context = (
+        "/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp/postgresql \\\n"
+        "  /opt/nmcp-role-compatibility/current/bin /opt/nmcp-role-compatibility/v18/bin\n"
+        "/usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment\n"
+        "/usr/bin/install -o root -g root -m 0755 \\\n"
+        '  "$repo_root/scripts/set-ubuntu-migration-role-mode" \\\n'
+        '  "$repo_root/scripts/run-ubuntu-migration-compatibility" \\\n'
+        '  "$repo_root/scripts/verify-installed-runtime-roles" /usr/local/libexec/nmcp/\n'
+        "/usr/bin/install -o root -g root -m 0644 \\\n"
+        '  "$repo_root/infra/postgresql/runtime-roles.sql" \\\n'
+        '  "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \\\n'
+        "  /usr/local/libexec/nmcp/postgresql/\n"
     )
     require(
-        install_index >= 0
-        and install_end > install_index
-        and verifier_source in source[install_index:install_end],
-        "Ubuntu migration evidence does not install the runtime verifier root:root 0644",
-    )
-    stat_assertion = (
-        "[[ $(/usr/bin/stat --format='%F:%u:%g:%a' -- \\\n"
-        "  /usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql) "
-        "== 'regular file:0:0:644' ]]"
-    )
-    require(
-        stat_assertion in source,
-        "Ubuntu migration evidence does not verify the installed runtime verifier metadata",
-    )
-    execution = f"--file={verifier_path}"
-    require(
-        execution in source
-        and f'--file="$repo_root/infra/validation/verify-runtime-roles.sql"'
-        not in source
-        and source.index(stat_assertion) < source.index(execution),
-        "Ubuntu migration evidence does not verify then execute the installed runtime verifier",
+        compatibility_source.count(invocation) == 1
+        and compatibility_source.count(invocation_context) == 1
+        and compatibility_source.count(install_context) == 1
+        and compatibility_source.count("assert_runtime_boundary()") == 1
+        and compatibility_source.count(
+            '"$repo_root/scripts/verify-installed-runtime-roles"'
+        ) == 1
+        and compatibility_source.count(
+            '/usr/local/libexec/nmcp/verify-installed-runtime-roles "$repo_root"'
+        ) == 1
+        and "verify-runtime-roles.sql" not in compatibility_source
+        and "if false" not in compatibility_source,
+        "migration compatibility evidence does not uniquely install and invoke the reviewed helper",
     )
 
 
-def verify_migration_role_verifier_mutations(source: str) -> None:
-    unsafe_owner = source.replace(
-        "/usr/bin/install -o root -g root -m 0644 \\\n",
-        "/usr/bin/install -o postgres -g root -m 0644 \\\n",
+def verify_migration_role_verifier_mutations(
+    helper_source: str, compatibility_source: str
+) -> None:
+    unsafe_helper = helper_source.replace("-o root", "-o postgres", 1).replace(
+        "/usr/bin/stat --format='%F:%u:%g:%a'", "/usr/bin/true", 1
+    )
+    mutations = {
+        "non-root active install": helper_source.replace("-o root", "-o postgres", 1),
+        "unsafe active mode": helper_source.replace("-m 0644", "-m 0640", 1),
+        "missing active metadata check": helper_source.replace(
+            "/usr/bin/stat --format='%F:%u:%g:%a'", "/usr/bin/true", 1
+        ),
+        "source-path execution": helper_source.replace(
+            '--file="$installed_path"', '--file="$source_path"', 1
+        ),
+        "dead-code reviewed decoy with unsafe active commands": (
+            "if false; then\n" + helper_source + "fi\n" + unsafe_helper
+        ),
+        "dead function reviewed decoy": "reviewed_decoy() {\n" + helper_source + "}\n" + unsafe_helper,
+        "heredoc reviewed decoy": "cat <<'REVIEWED'\n" + helper_source + "REVIEWED\n" + unsafe_helper,
+        "commented reviewed decoy": "\n".join(
+            "# " + line for line in helper_source.splitlines()
+        ) + "\n" + unsafe_helper,
+        "duplicate reviewed helper": helper_source + helper_source,
+    }
+    for label, mutation in mutations.items():
+        try:
+            validate_migration_role_verifier(mutation, compatibility_source)
+        except RuntimeError as error:
+            require("complete reviewed program" in str(error), str(error))
+        else:
+            raise RuntimeError(f"runtime verifier validator accepted {label}")
+
+    dead_invocation = compatibility_source.replace(
+        "assert_runtime_boundary() {",
+        "if false; then\nassert_runtime_boundary() {",
+        1,
+    ).replace(
+        "}\nassert_compatibility() {",
+        "}\nfi\nassert_compatibility() {",
         1,
     )
     try:
-        validate_migration_role_verifier(unsafe_owner)
+        validate_migration_role_verifier(helper_source, dead_invocation)
     except RuntimeError as error:
-        require("install the runtime verifier root:root 0644" in str(error), str(error))
+        require("uniquely install and invoke" in str(error), str(error))
     else:
-        raise RuntimeError("runtime verifier validator accepted non-root ownership")
+        raise RuntimeError("runtime verifier validator accepted dead helper invocation")
 
-    unsafe_mode = source.replace(
-        "/usr/bin/install -o root -g root -m 0644 \\\n",
-        "/usr/bin/install -o root -g root -m 0640 \\\n",
+    install_start = compatibility_source.index(
+        "/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp/postgresql"
+    )
+    install_end = compatibility_source.index(
+        "  /usr/local/libexec/nmcp/postgresql/\n", install_start
+    ) + len("  /usr/local/libexec/nmcp/postgresql/\n")
+    reviewed_install = compatibility_source[install_start:install_end]
+    unsafe_install = reviewed_install.replace(
+        "/usr/bin/install -o root -g root -m 0755 \\\n",
+        "/usr/bin/install -o root -g root -m 0700 \\\n",
+        1,
+    )
+    dead_install = compatibility_source.replace(
+        reviewed_install,
+        "if false; then\n" + reviewed_install + "fi\n" + unsafe_install,
         1,
     )
     try:
-        validate_migration_role_verifier(unsafe_mode)
+        validate_migration_role_verifier(helper_source, dead_install)
     except RuntimeError as error:
-        require("install the runtime verifier root:root 0644" in str(error), str(error))
+        require("uniquely install and invoke" in str(error), str(error))
     else:
-        raise RuntimeError("runtime verifier validator accepted unsafe mode")
-
-    missing_stat = source.replace("/usr/bin/stat --format='%F:%u:%g:%a'", "/usr/bin/true", 1)
-    try:
-        validate_migration_role_verifier(missing_stat)
-    except RuntimeError as error:
-        require("installed runtime verifier metadata" in str(error), str(error))
-    else:
-        raise RuntimeError("runtime verifier validator accepted missing metadata evidence")
+        raise RuntimeError("runtime verifier validator accepted dead reviewed install decoy")
 
 
 def validate_ubuntu_workflow(source: str) -> None:
     require(yaml is not None, "PyYAML is required to validate the Ubuntu workflow")
     workflow = yaml.safe_load(source)
     require(isinstance(workflow, dict), "Ubuntu workflow root must be a mapping")
+    trigger_key = "on" if "on" in workflow else True
+    require(
+        set(workflow) == {"name", trigger_key, "permissions", "concurrency", "jobs"},
+        "Ubuntu workflow top-level contract changed",
+    )
+    require(workflow["name"] == "Ubuntu deployment", "Ubuntu workflow name changed")
+    require(workflow["permissions"] == {"contents": "read"}, "Ubuntu workflow permissions changed")
+    require(
+        workflow["concurrency"]
+        == {"group": "ubuntu-deployment-${{ github.ref }}", "cancel-in-progress": True},
+        "Ubuntu workflow concurrency contract changed",
+    )
     require("defaults" not in workflow, "Ubuntu workflow must not override run defaults")
-    triggers = workflow.get("on", workflow.get(True))
+    triggers = workflow[trigger_key]
     require(isinstance(triggers, dict), "Ubuntu workflow triggers must be a mapping")
     require(
         set(triggers) == {"pull_request", "push", "workflow_dispatch"},
@@ -168,42 +255,88 @@ def validate_ubuntu_workflow(source: str) -> None:
         "Ubuntu workflow_dispatch trigger must remain unconditional",
     )
     require(
-        isinstance(triggers["push"], dict),
-        "Ubuntu workflow push trigger must be a mapping",
+        isinstance(triggers["push"], dict)
+        and set(triggers["push"]) == {"branches", "paths"},
+        "Ubuntu workflow push trigger mapping changed",
     )
     require(
         triggers["push"].get("branches") == ["main"],
         "Ubuntu workflow push branches must be exactly main",
     )
-    required_paths = {
-        "cmd/nmcp-admin/**",
-        "internal/database/**",
-        "go.mod",
-        "go.sum",
+    require(
+        isinstance(triggers["pull_request"], dict)
+        and set(triggers["pull_request"]) == {"paths"},
+        "Ubuntu workflow pull_request trigger mapping changed",
+    )
+    expected_paths = [
+        ".github/workflows/ubuntu-deployment.yml",
+        "docs/ubuntu-deployment.md",
+        "infra/ubuntu/**",
+        "infra/postgresql/**",
         "infra/validation/verify-runtime-roles.sql",
         "infra/validation/repair-mount-verifier/**",
+        "cmd/nmcp-admin/**",
+        "internal/database/**",
         "internal/reconciliation/**",
         "internal/storage/**",
+        "go.mod",
+        "go.sum",
+        "scripts/assert-ubuntu-files-endpoint",
+        "scripts/capture-trusted-inputs",
+        "scripts/check-ubuntu-services",
+        "scripts/check-ubuntu-tls-expiry",
+        "scripts/install-ubuntu-host",
+        "scripts/install-ubuntu-release",
+        "scripts/acquire-ubuntu-deployment-locks",
+        "scripts/handoff-ubuntu-migration-lock",
+        "scripts/render-ubuntu-nginx",
+        "scripts/render-ubuntu-postgresql-dependency",
+        "scripts/renew-ubuntu-tls",
+        "scripts/run-ubuntu-migration",
+        "scripts/run-ubuntu-migration-compatibility",
+        "scripts/set-ubuntu-migration-role-mode",
+        "scripts/validate-ubuntu-config",
+        "scripts/verify-ubuntu-deployment",
+        "scripts/verify-ubuntu-config-boundaries",
+        "scripts/verify-ubuntu-firewall",
+        "scripts/verify-ubuntu-firewall-fixtures",
+        "scripts/verify-ubuntu-installed-nginx",
+        "scripts/verify-installed-runtime-roles",
+        "scripts/verify-ubuntu-migration-lock",
+        "scripts/verify-ubuntu-migration-role-compatibility",
         "scripts/verify-ubuntu-repair-mount-boundaries",
-    }
+        "scripts/verify-ubuntu-nginx-http",
+        "scripts/verify-ubuntu-postgresql-dependency",
+        "scripts/verify-ubuntu-service-gate",
+        "scripts/verify-ubuntu-release-failures",
+        "scripts/verify-ubuntu-tls-certificate",
+        "scripts/verify-ubuntu-systemd-mounts",
+        "scripts/verify-ubuntu-systemd-environment",
+        "scripts/verify-ubuntu-trusted-inputs",
+    ]
     for event_name in ("pull_request", "push"):
         event = triggers.get(event_name)
         require(isinstance(event, dict), f"Ubuntu workflow {event_name} trigger must be a mapping")
         event_paths = event.get("paths")
         require(isinstance(event_paths, list), f"Ubuntu workflow {event_name} paths must be a list")
-        positive_paths = require_positive_workflow_paths(event_paths, event_name)
+        require_positive_workflow_paths(event_paths, event_name)
         require(
-            required_paths.issubset(positive_paths),
-            f"Ubuntu workflow {event_name} omits checker migration evidence paths",
+            event_paths == expected_paths,
+            f"Ubuntu workflow {event_name} paths differ from the exact reviewed list",
         )
     jobs = workflow.get("jobs")
     require(isinstance(jobs, dict), "Ubuntu workflow jobs must be a mapping")
     require(set(jobs) == {"verify"}, "Ubuntu workflow evidence must run in the verify job")
     job = jobs["verify"]
     require(isinstance(job, dict), "Ubuntu verify job must be a mapping")
+    require(
+        set(job) == {"runs-on", "timeout-minutes", "steps"},
+        "Ubuntu verify job mapping changed",
+    )
     require_unconditional(job, "Ubuntu verify job")
     require("defaults" not in job, "Ubuntu verify job must not override run defaults")
     require(job.get("runs-on") == "ubuntu-24.04", "Ubuntu verify job runner changed")
+    require(job.get("timeout-minutes") == 20, "Ubuntu verify job timeout changed")
     require("container" not in job, "Ubuntu verify job must execute on the host runner")
     steps = job.get("steps")
     require(isinstance(steps, list), "Ubuntu verify job steps must be a list")
@@ -216,6 +349,7 @@ def validate_ubuntu_workflow(source: str) -> None:
     require(len(checkout_matches) == 1, "Ubuntu workflow needs exactly one active checkout step")
     checkout_index, checkout = checkout_matches[0]
     require_unconditional(checkout, "Ubuntu checkout step")
+    require(set(checkout) == {"uses", "with"}, "Ubuntu checkout step mapping changed")
     require(checkout.get("uses") == "actions/checkout@v6", "Ubuntu checkout action changed")
     checkout_with = checkout.get("with")
     require(
@@ -227,6 +361,10 @@ def validate_ubuntu_workflow(source: str) -> None:
 
     setup_index, setup = workflow_step(steps, "Install Go")
     require_unconditional(setup, "Ubuntu Go setup step")
+    require(
+        set(setup) == {"name", "uses", "with"},
+        "Ubuntu Go setup step mapping changed",
+    )
     require(
         setup.get("uses")
         == "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
@@ -245,22 +383,28 @@ def validate_ubuntu_workflow(source: str) -> None:
     )
     require_unconditional(dependency, "Ubuntu parser dependency step")
     require_default_run_context(dependency, "Ubuntu parser dependency step")
+    require(
+        set(dependency) == {"name", "run"},
+        "Ubuntu parser dependency step mapping changed",
+    )
     dependency_commands = shell_commands(str(dependency.get("run", "")))
     require(
-        any(
-            "apt-get install" in command
-            and "python3-yaml" in command
-            and "util-linux" in command
-            for command in dependency_commands
-        ),
-        "Ubuntu workflow does not install its structural YAML parser and mount tools",
+        dependency_commands == [
+            "sudo apt-get update",
+            "sudo apt-get install --yes --no-install-recommends ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck util-linux",
+        ],
+        "Ubuntu workflow parser dependency commands changed",
     )
 
     shellcheck_index, shellcheck = workflow_step(steps, "Check shell scripts")
     require_unconditional(shellcheck, "Ubuntu ShellCheck step")
     require_default_run_context(shellcheck, "Ubuntu ShellCheck step")
+    require(
+        set(shellcheck) == {"name", "run"},
+        "Ubuntu ShellCheck step mapping changed",
+    )
     expected_shellcheck = (
-        "shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release "
+        "/usr/bin/shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release "
         "scripts/check-ubuntu-tls-expiry scripts/renew-ubuntu-tls "
         "scripts/run-ubuntu-migration scripts/run-ubuntu-migration-compatibility "
         "scripts/set-ubuntu-migration-role-mode scripts/verify-ubuntu-migration-lock "
@@ -270,7 +414,7 @@ def validate_ubuntu_workflow(source: str) -> None:
         "scripts/verify-ubuntu-postgresql-dependency scripts/verify-ubuntu-release-failures "
         "scripts/verify-ubuntu-service-gate scripts/verify-ubuntu-tls-certificate "
         "scripts/verify-ubuntu-systemd-environment scripts/verify-ubuntu-systemd-mounts "
-        "scripts/verify-ubuntu-trusted-inputs"
+        "scripts/verify-ubuntu-trusted-inputs scripts/verify-installed-runtime-roles"
     )
     require(
         shell_commands(str(shellcheck.get("run", ""))) == [expected_shellcheck],
@@ -314,7 +458,8 @@ def validate_ubuntu_workflow(source: str) -> None:
         "Ubuntu workflow lost the executable v18-to-v19 migration binary contract",
     )
     require(
-        checkout_index < setup_index < dependency_index < shellcheck_index
+        (checkout_index, setup_index, dependency_index, shellcheck_index) == (0, 1, 2, 3)
+        and shellcheck_index
         < static_index < mount_index < migration_index,
         "Ubuntu workflow evidence steps are not in dependency order",
     )
@@ -356,6 +501,32 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
         "wrong push branch",
         "Ubuntu workflow push branches must be exactly main",
     )
+
+    for route_key, route_value in (
+        ("tags", ["*"]),
+        ("tags-ignore", ["release-* "]),
+        ("branches-ignore", ["develop"]),
+    ):
+        extra_push_route = copy.deepcopy(workflow)
+        extra_push_route.get("on", extra_push_route.get(True))["push"][route_key] = route_value
+        expect_workflow_rejected(
+            yaml.safe_dump(extra_push_route, sort_keys=False),
+            f"extra push {route_key} route",
+            "Ubuntu workflow push trigger mapping changed",
+        )
+
+    for route_key, route_value in (
+        ("branches", ["main"]),
+        ("branches-ignore", ["develop"]),
+        ("types", ["opened"]),
+    ):
+        extra_pr_route = copy.deepcopy(workflow)
+        extra_pr_route.get("on", extra_pr_route.get(True))["pull_request"][route_key] = route_value
+        expect_workflow_rejected(
+            yaml.safe_dump(extra_pr_route, sort_keys=False),
+            f"extra pull_request {route_key} route",
+            "Ubuntu workflow pull_request trigger mapping changed",
+        )
 
     extra_trigger = copy.deepcopy(workflow)
     extra_trigger.get("on", extra_trigger.get(True))["schedule"] = [
@@ -423,6 +594,33 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
         "Ubuntu ShellCheck step must fail closed",
     )
 
+    shadowed_shellcheck = copy.deepcopy(workflow)
+    shadowed_shellcheck_steps = shadowed_shellcheck["jobs"]["verify"]["steps"]
+    shellcheck_index, shadowed_shellcheck_step = workflow_step(
+        shadowed_shellcheck_steps, "Check shell scripts"
+    )
+    shadowed_shellcheck_steps.insert(
+        shellcheck_index,
+        {"name": "Shadow ShellCheck", "run": "printf '#!/bin/sh\\nexit 0\\n' > /tmp/shellcheck"},
+    )
+    shadowed_shellcheck_step["env"] = {"PATH": "/tmp:/usr/bin:/bin"}
+    expect_workflow_rejected(
+        yaml.safe_dump(shadowed_shellcheck, sort_keys=False),
+        "PATH-shadowed ShellCheck with prior executable step",
+        "Ubuntu ShellCheck step mapping changed",
+    )
+
+    shellcheck_env = copy.deepcopy(workflow)
+    _, shellcheck_env_step = workflow_step(
+        shellcheck_env["jobs"]["verify"]["steps"], "Check shell scripts"
+    )
+    shellcheck_env_step["env"] = {"PATH": "/tmp:/usr/bin:/bin"}
+    expect_workflow_rejected(
+        yaml.safe_dump(shellcheck_env, sort_keys=False),
+        "ShellCheck PATH override",
+        "Ubuntu ShellCheck step mapping changed",
+    )
+
     unused_shellcheck = copy.deepcopy(workflow)
     unused_shellcheck_steps = unused_shellcheck["jobs"]["verify"]["steps"]
     shellcheck_index, shellcheck_step = workflow_step(
@@ -434,7 +632,7 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
     expect_workflow_rejected(
         yaml.safe_dump(unused_shellcheck, sort_keys=False),
         "unused ShellCheck evidence block",
-        "Ubuntu workflow needs exactly one active Check shell scripts step",
+        "Ubuntu workflow top-level contract changed",
     )
 
     reordered_shellcheck = copy.deepcopy(workflow)
@@ -459,7 +657,7 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
     expect_workflow_rejected(
         yaml.safe_dump(workflow_defaults, sort_keys=False),
         "workflow-level neutralizing shell default",
-        "Ubuntu workflow must not override run defaults",
+        "Ubuntu workflow top-level contract changed",
     )
 
     job_defaults = copy.deepcopy(workflow)
@@ -467,7 +665,7 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
     expect_workflow_rejected(
         yaml.safe_dump(job_defaults, sort_keys=False),
         "job-level neutralizing shell default",
-        "Ubuntu verify job must not override run defaults",
+        "Ubuntu verify job mapping changed",
     )
 
     historical_checkout = copy.deepcopy(workflow)
@@ -554,7 +752,7 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
     expect_workflow_rejected(
         yaml.safe_dump(missing_path, sort_keys=False),
         "missing checker verifier workflow path",
-        "Ubuntu workflow pull_request omits checker migration evidence paths",
+        "Ubuntu workflow pull_request paths differ from the exact reviewed list",
     )
 
     for event_name in ("pull_request", "push"):
@@ -574,7 +772,7 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
         expect_workflow_rejected(
             yaml.safe_dump(missing_repair_path, sort_keys=False),
             f"missing repair storage path in {event_name}",
-            f"Ubuntu workflow {event_name} omits checker migration evidence paths",
+            f"Ubuntu workflow {event_name} paths differ from the exact reviewed list",
         )
 
     disabled = copy.deepcopy(workflow)
@@ -597,7 +795,7 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
     expect_workflow_rejected(
         yaml.safe_dump(unused, sort_keys=False),
         "unused migration evidence block",
-        "Ubuntu workflow lost the executable v18-to-v19 migration binary contract",
+        "Ubuntu workflow top-level contract changed",
     )
 
     non_gating = copy.deepcopy(workflow)
@@ -745,11 +943,19 @@ def main() -> int:
     require("User=root" in migrate_unit, "migration serializer must own the root-only lock")
     migration_runner = text(ROOT / "scripts" / "run-ubuntu-migration")
     migration_compatibility = text(ROOT / "scripts" / "run-ubuntu-migration-compatibility")
-    migration_role_verifier = text(
+    migration_role_compatibility = text(
         ROOT / "scripts" / "verify-ubuntu-migration-role-compatibility"
     )
-    validate_migration_role_verifier(migration_role_verifier)
-    verify_migration_role_verifier_mutations(migration_role_verifier)
+    runtime_verifier_helper_path = ROOT / "scripts" / "verify-installed-runtime-roles"
+    runtime_verifier_helper = text(runtime_verifier_helper_path)
+    require(
+        stat.S_IMODE(runtime_verifier_helper_path.stat().st_mode) == 0o755,
+        "installed runtime verifier helper must be executable mode 0755",
+    )
+    validate_migration_role_verifier(runtime_verifier_helper, migration_role_compatibility)
+    verify_migration_role_verifier_mutations(
+        runtime_verifier_helper, migration_role_compatibility
+    )
     role_mode = text(ROOT / "scripts" / "set-ubuntu-migration-role-mode")
     release_installer = text(ROOT / "scripts" / "install-ubuntu-release")
     require(

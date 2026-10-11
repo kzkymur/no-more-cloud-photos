@@ -383,7 +383,7 @@ check_runtime_role_verifier_negatives() {
     "GRANT SELECT ON public.change_events TO nmcp_checker_table_acl_probe"
   expect_runtime_role_verifier_denied \
     "checker source arbitrary table SELECT grantee drift" \
-    "checker source table ACL catalog differs from exact allowlist"
+    "protected relation table ACL catalog differs from exact allowlist"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE SELECT ON public.change_events FROM nmcp_checker_table_acl_probe"
@@ -392,7 +392,7 @@ check_runtime_role_verifier_negatives() {
     "GRANT UPDATE ON public.reconciliation_repair_attempts TO nmcp_checker_table_acl_probe WITH GRANT OPTION"
   expect_runtime_role_verifier_denied \
     "checker source arbitrary table write grant-option drift" \
-    "checker source table ACL catalog differs from exact allowlist"
+    "protected relation table ACL catalog differs from exact allowlist"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE UPDATE ON public.reconciliation_repair_attempts FROM nmcp_checker_table_acl_probe"
@@ -405,7 +405,7 @@ check_runtime_role_verifier_negatives() {
     "GRANT SELECT ON public.reconciliation_repair_manifest_items TO nmcp_check_runtime"
   expect_runtime_role_verifier_denied \
     "checker source runtime table SELECT drift" \
-    "checker source table ACL catalog differs from exact allowlist"
+    "protected relation table ACL catalog differs from exact allowlist"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE SELECT ON public.reconciliation_repair_manifest_items FROM nmcp_check_runtime"
@@ -414,7 +414,7 @@ check_runtime_role_verifier_negatives() {
     "GRANT DELETE ON public.reconciliation_repair_events TO nmcp_repair_runtime WITH GRANT OPTION"
   expect_runtime_role_verifier_denied \
     "checker source runtime table write grant-option drift" \
-    "checker source table ACL catalog differs from exact allowlist"
+    "protected relation table ACL catalog differs from exact allowlist"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE DELETE ON public.reconciliation_repair_events FROM nmcp_repair_runtime"
@@ -550,6 +550,40 @@ DROP ROLE nmcp_evidence_acl_probe"
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
     "REVOKE UPDATE(repair_disposition) ON public.reconciliation_reports FROM nmcp_worker"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_admin_acl_probe NOLOGIN; \
+GRANT SELECT(error_message) ON public.admin_audit TO nmcp_admin_acl_probe"
+  expect_runtime_role_verifier_denied \
+    "admin audit arbitrary column grantee drift" \
+    "protected relation column ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE SELECT(error_message) ON public.admin_audit FROM nmcp_admin_acl_probe; \
+DROP ROLE nmcp_admin_acl_probe"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "GRANT UPDATE(id) ON public.admin_batches TO nmcp_runtime WITH GRANT OPTION"
+  expect_runtime_role_verifier_denied \
+    "admin batch inherited column grant-option drift" \
+    "protected relation column ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE UPDATE(id) ON public.admin_batches FROM nmcp_runtime"
+
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "CREATE ROLE nmcp_table_acl_probe NOLOGIN; \
+GRANT SELECT ON public.reconciliation_reports TO nmcp_table_acl_probe"
+  expect_runtime_role_verifier_denied \
+    "protected evidence arbitrary table grantee drift" \
+    "protected relation table ACL catalog differs from exact allowlist"
+  compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
+    --set ON_ERROR_STOP=1 --command \
+    "REVOKE SELECT ON public.reconciliation_reports FROM nmcp_table_acl_probe; \
+DROP ROLE nmcp_table_acl_probe"
 
   compose exec -T postgres psql --username nmcp_bootstrap --dbname nmcp \
     --set ON_ERROR_STOP=1 --command \
