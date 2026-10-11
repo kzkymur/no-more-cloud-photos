@@ -46,6 +46,16 @@ def persistent_failure_classification(stdout, stderr):
     }
 
 
+def persistent_result_violation(returncode, classification, lock_handoff_error, cleanup_error,
+                                lock_reuse_error, post_cleanup, post_cleanup_cgroup):
+    return bool(
+        returncode == 0 or classification["success_in_stdout"]
+        or not (classification["property_unknown"] or classification["action_unavailable"])
+        or lock_handoff_error or cleanup_error or lock_reuse_error
+        or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup
+    )
+
+
 def bounded_sanitized_repr(value):
     text = str(value)
     index = 0
@@ -84,7 +94,8 @@ def sanitized_state(state):
 
 def persistent_failure_diagnostics(mode, boundary, faulted, classification, intercepted,
                                    attempted, observed, after_exit, signed_cleanup_ran,
-                                   post_cleanup):
+                                   post_cleanup, lock_handoff_error, cleanup_error,
+                                   lock_reuse_error, post_cleanup_cgroup):
     return (
         f"mode={mode!r}; boundary={boundary!r}; returncode={faulted.returncode!r}; "
         f"success_in_stdout={classification['success_in_stdout']!r}; "
@@ -96,7 +107,11 @@ def persistent_failure_diagnostics(mode, boundary, faulted, classification, inte
         f"observed_signature={sanitized_state(observed)}; "
         f"after_exit={sanitized_state(after_exit)}; "
         f"signed_external_cleanup_ran={signed_cleanup_ran!r}; "
-        f"post_cleanup={sanitized_state(post_cleanup)}"
+        f"post_cleanup={sanitized_state(post_cleanup)}; "
+        f"lock_handoff_error={bounded_sanitized_repr(lock_handoff_error)}; "
+        f"cleanup_error={bounded_sanitized_repr(cleanup_error)}; "
+        f"lock_reuse_error={bounded_sanitized_repr(lock_reuse_error)}; "
+        f"post_cleanup_cgroup={bounded_sanitized_repr(post_cleanup_cgroup)}"
     )
 
 
@@ -117,6 +132,20 @@ def assert_persistent_failure_contract():
     rendered = bounded_sanitized_repr(secret + ":" + "x" * DIAGNOSTIC_TEXT_LIMIT)
     if secret in rendered or "<redacted-hex64>" not in rendered or "<truncated>" not in rendered:
         fail("persistent failure diagnostics lost redaction or bounded output")
+    property_failure = persistent_failure_classification("", cases[0][1])
+    success_failure = persistent_failure_classification(SUCCESS, "")
+    unrelated_failure = persistent_failure_classification("", cases[3][1])
+    absent = {"LoadState": "not-found"}
+    scenarios = (
+        (persistent_result_violation(0, property_failure, "", "", "", absent, []), True),
+        (persistent_result_violation(1, success_failure, "", "", "", absent, []), True),
+        (persistent_result_violation(1, unrelated_failure, "", "", "", absent, []), True),
+        (persistent_result_violation(1, property_failure, "", "cleanup failed", "", absent, []), True),
+        (persistent_result_violation(1, property_failure, "lock failed", "", "", absent, []), True),
+        (persistent_result_violation(1, property_failure, "", "", "", absent, []), False),
+    )
+    if any(observed is not expected for observed, expected in scenarios):
+        fail("persistent cleanup-first result classification changed")
 
 
 def run(argv, **kwargs):
@@ -767,31 +796,68 @@ def main():
         fault_stdout, fault_stderr = process.communicate(timeout=60)
         faulted = subprocess.CompletedProcess(process.args, process.returncode,
                                               fault_stdout, fault_stderr)
-        if faulted.returncode == 0 or SUCCESS in faulted.stdout:
-            fail(f"persistent command failure claimed success: {mode}")
-        assert_client_lock_reusable()
-        if signature is None:
-            after_exit = show("LoadState")
-            if after_exit["LoadState"] != "not-found":
-                fail(f"persistent fault loaded without an attested launch signature: {mode}")
-        else:
-            after_exit = signed_launch_state(signature)
-        signed_cleanup_ran = False
-        if after_exit["LoadState"] != "not-found":
-            signed_cleanup_ran = True
-            cleanup_signed_launch(signature)
-        post_cleanup = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
-        if cgroup_pids("/system.slice/" + UNIT):
-            fail(f"persistent fault recovery left cgroup processes: {mode}")
-        assert_interception(mode, boundary, persistent=True)
         classification = persistent_failure_classification(faulted.stdout, faulted.stderr)
-        if (classification["success_in_stdout"]
-                or not (classification["property_unknown"]
-                        or classification["action_unavailable"])):
+        cleanup_error = ""
+        try:
+            after_exit = show("LoadState") if signature is None else signed_launch_state(signature)
+        except BaseException as error:
+            after_exit = {"EvidenceError": str(error)}
+            cleanup_error = f"post-exit state capture failed: {error}"
+        cleanup_lock = None
+        lock_held = False
+        lock_handoff_error = ""
+        try:
+            cleanup_lock = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
+            fcntl.flock(cleanup_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_held = True
+        except BaseException as error:
+            lock_handoff_error = str(error)
+        signed_cleanup_ran = False
+        try:
+            if after_exit.get("LoadState") != "not-found":
+                if signature is None:
+                    raise RuntimeError("loaded post-exit unit lacks an attested launch signature")
+                signed_cleanup_ran = True
+                cleanup_signed_launch(signature)
+        except BaseException as error:
+            cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+        try:
+            post_cleanup = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+        except BaseException as error:
+            post_cleanup = {"EvidenceError": str(error)}
+            cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+        try:
+            post_cleanup_cgroup = cgroup_pids("/system.slice/" + UNIT)
+        except BaseException as error:
+            post_cleanup_cgroup = [f"evidence-error: {error}"]
+            cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+        finally:
+            if cleanup_lock is not None:
+                if lock_held:
+                    try:
+                        fcntl.flock(cleanup_lock, fcntl.LOCK_UN)
+                    except BaseException as error:
+                        cleanup_error = "; ".join(
+                            item for item in (cleanup_error, f"lock release failed: {error}") if item)
+                try:
+                    os.close(cleanup_lock)
+                except BaseException as error:
+                    cleanup_error = "; ".join(
+                        item for item in (cleanup_error, f"lock close failed: {error}") if item)
+        lock_reuse_error = ""
+        try:
+            assert_client_lock_reusable()
+        except BaseException as error:
+            lock_reuse_error = str(error)
+        if persistent_result_violation(
+                faulted.returncode, classification, lock_handoff_error, cleanup_error,
+                lock_reuse_error, post_cleanup, post_cleanup_cgroup):
             diagnostics = persistent_failure_diagnostics(
                 mode, boundary, faulted, classification, counter(intercepted), counter(attempted),
-                signature, after_exit, signed_cleanup_ran, post_cleanup)
-            fail("persistent command failure claimed success or lost unknown state: " + diagnostics)
+                signature, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error,
+                cleanup_error, lock_reuse_error, post_cleanup_cgroup)
+            fail("persistent command result violated failure contract: " + diagnostics)
+        assert_interception(mode, boundary, persistent=True)
         fast_recovery(client, repo, commit, go_binary, mode)
 
     for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),
