@@ -70,6 +70,21 @@ def shell_commands(run_text: str) -> list[str]:
     ]
 
 
+def require_positive_workflow_paths(patterns: list, event_name: str) -> set[str]:
+    positive_paths = set()
+    for pattern in patterns:
+        require(
+            isinstance(pattern, str),
+            f"Ubuntu workflow {event_name} paths must contain only strings",
+        )
+        require(
+            not pattern.startswith("!"),
+            f"Ubuntu workflow {event_name} paths must not contain exclusions",
+        )
+        positive_paths.add(pattern)
+    return positive_paths
+
+
 def validate_ubuntu_workflow(source: str) -> None:
     require(yaml is not None, "PyYAML is required to validate the Ubuntu workflow")
     workflow = yaml.safe_load(source)
@@ -89,8 +104,9 @@ def validate_ubuntu_workflow(source: str) -> None:
         require(isinstance(event, dict), f"Ubuntu workflow {event_name} trigger must be a mapping")
         event_paths = event.get("paths")
         require(isinstance(event_paths, list), f"Ubuntu workflow {event_name} paths must be a list")
+        positive_paths = require_positive_workflow_paths(event_paths, event_name)
         require(
-            required_paths.issubset(set(event_paths)),
+            required_paths.issubset(positive_paths),
             f"Ubuntu workflow {event_name} omits checker migration evidence paths",
         )
     jobs = workflow.get("jobs")
@@ -272,6 +288,18 @@ def verify_ubuntu_workflow_mutations(source: str) -> None:
         "missing checker verifier workflow path",
         "Ubuntu workflow pull_request omits checker migration evidence paths",
     )
+
+    for event_name in ("pull_request", "push"):
+        excluded_path = copy.deepcopy(workflow)
+        excluded_triggers = excluded_path.get("on", excluded_path.get(True))
+        excluded_triggers[event_name]["paths"].append(
+            "!infra/validation/verify-runtime-roles.sql"
+        )
+        expect_workflow_rejected(
+            yaml.safe_dump(excluded_path, sort_keys=False),
+            f"later checker verifier exclusion in {event_name} paths",
+            f"Ubuntu workflow {event_name} paths must not contain exclusions",
+        )
 
     disabled = copy.deepcopy(workflow)
     disabled_steps = disabled["jobs"]["verify"]["steps"]
