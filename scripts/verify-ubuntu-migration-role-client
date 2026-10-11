@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -18,10 +19,19 @@ ENVIRONMENT = {
     "GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_CONFIG_GLOBAL": "/dev/null",
 }
+CLIENT_FAULTS = {
+    "client-fault-after-launch", "client-fault-after-invocation",
+    "client-fault-after-properties", "client-fault-at-terminal",
+    "client-fault-after-journal",
+}
 
 
 def fail(message):
     raise RuntimeError(message)
+
+
+def interrupted(signum, _frame):
+    fail(f"verification client interrupted by signal {signum}")
 
 
 def command(argv, *, check=True, stdout=subprocess.PIPE):
@@ -60,10 +70,30 @@ def cgroup_pids(control_group):
     return sorted(set(found))
 
 
-def wait_unloaded(timeout=30):
+def owned_state(invocation, *properties):
+    state = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState",
+                            "ControlGroup", *properties)
+    if state.get("LoadState") == "not-found":
+        return state
+    if state.get("InvocationID") != invocation:
+        fail(f"fixed unit ownership lost; refusing name-based cleanup: {state}")
+    return state
+
+
+def owned_command(invocation, *arguments):
+    state = owned_state(invocation)
+    if state.get("LoadState") == "not-found":
+        return False
+    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)
+    if result.returncode:
+        fail(f"owned unit command failed ({' '.join(arguments)}): {result.stderr.strip()}")
+    return True
+
+
+def wait_unloaded(invocation, timeout=30):
     deadline = time.monotonic() + timeout
     while True:
-        state = unit_properties("LoadState", "ActiveState", "ControlGroup")
+        state = owned_state(invocation)
         if state.get("LoadState") == "not-found":
             return
         if time.monotonic() >= deadline:
@@ -71,21 +101,63 @@ def wait_unloaded(timeout=30):
         time.sleep(0.1)
 
 
+def teardown_owned(invocation):
+    """Remove only one attested invocation while the client lock is held."""
+    state = owned_state(invocation, "Result", "ExecMainCode", "ExecMainStatus")
+    if state.get("LoadState") == "not-found":
+        return
+    kill_sent = False
+    deadline = time.monotonic() + 20
+    while True:
+        state = owned_state(invocation)
+        if state.get("LoadState") == "not-found":
+            return
+        occupants = cgroup_pids(state.get("ControlGroup", ""))
+        if occupants and not kill_sent:
+            owned_command(invocation, "kill", "--kill-whom=all", "--signal=KILL")
+            kill_sent = True
+            continue
+        if (state.get("ActiveState") in ("failed", "inactive")
+                or (state.get("ActiveState") == "active" and state.get("SubState") == "exited")):
+            if not occupants:
+                break
+        if time.monotonic() >= deadline:
+            fail(f"owned unit did not terminate its control group: {state}")
+        time.sleep(0.1)
+    if state.get("ActiveState") == "active":
+        owned_command(invocation, "stop")
+    state = owned_state(invocation)
+    if state.get("LoadState") != "not-found":
+        owned_command(invocation, "reset-failed")
+    wait_unloaded(invocation)
+
+
 def reap_completed_unit(state):
     """Finish cleanup abandoned by a dead client, never a live transaction."""
     active = state.get("ActiveState")
     sub = state.get("SubState")
-    if active == "active" and sub == "exited" and not cgroup_pids(state.get("ControlGroup", "")):
-        command(("/usr/bin/systemctl", "stop", UNIT), check=False)
-        command(("/usr/bin/systemctl", "reset-failed", UNIT), check=False)
-        wait_unloaded()
-        return True
-    if active in ("inactive", "failed") and not cgroup_pids(state.get("ControlGroup", "")):
-        command(("/usr/bin/systemctl", "stop", UNIT), check=False)
-        command(("/usr/bin/systemctl", "reset-failed", UNIT), check=False)
-        wait_unloaded()
+    invocation = state.get("InvocationID", "")
+    terminal = ((active == "active" and sub == "exited") or active in ("inactive", "failed"))
+    if terminal and len(invocation) == 32 and not cgroup_pids(state.get("ControlGroup", "")):
+        teardown_owned(invocation)
         return True
     return False
+
+
+def client_pause(name):
+    ready = f"{RUN}/{name}.ready"
+    release = f"{RUN}/{name}.release"
+    descriptor = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(descriptor)
+    deadline = time.monotonic() + 60
+    while not os.path.exists(release):
+        if time.monotonic() >= deadline:
+            fail(f"timed out awaiting {release}")
+        time.sleep(0.05)
+
+
+def valid_invocation(value):
+    return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
 def publish_supervisor(repo, commit):
@@ -120,7 +192,15 @@ def main():
         fail("usage: client REPOSITORY CURRENT_COMMIT ABSOLUTE_GO [FAULT_POINT]")
     os.chdir("/")
     os.umask(0o077)
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, interrupted)
     repo, commit, go_binary = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
+    requested_mode = sys.argv[4] if len(sys.argv) == 5 else ""
+    supervisor_mode = requested_mode
+    if requested_mode in CLIENT_FAULTS or requested_mode == "client-terminal-race-a":
+        supervisor_mode = ""
+    elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
+        supervisor_mode = "run-root:after-intent"
     os.makedirs(RUN, mode=0o700, exist_ok=True)
     run_stat = os.lstat(RUN)
     if (not stat.S_ISDIR(run_stat.st_mode) or run_stat.st_uid != 0 or run_stat.st_gid != 0
@@ -129,7 +209,7 @@ def main():
     client_lock = os.open(RUN + "/client.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(client_lock, fcntl.LOCK_EX)
-        before = unit_properties("LoadState", "ActiveState", "SubState", "ControlGroup")
+        before = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup")
         if before.get("LoadState") == "loaded" and reap_completed_unit(before):
             before = unit_properties("LoadState", "ActiveState", "SubState", "ControlGroup")
         if before.get("LoadState") not in ("not-found", "loaded"):
@@ -151,59 +231,112 @@ def main():
             "/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "LANG=C",
             "HOME=/root", "/usr/bin/python3", "-I", "-S", PROGRAM,
             repo, commit, go_binary,
-        ) + ((sys.argv[4],) if len(sys.argv) == 5 else ())
-        launched = command(service_argv, check=False)
-        if launched.returncode:
-            fail(f"fixed unit launch failed: {launched.stderr.strip()}")
-        observed = unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL",
-                                   "TimeoutStopUSec", "RuntimeMaxUSec", "Delegate", "RemainAfterExit")
-        invocation = observed.get("InvocationID", "")
-        if len(invocation) != 32 or any(character not in "0123456789abcdef" for character in invocation):
-            fail(f"missing exact invocation identity: {observed}")
-        expected = {"Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
-                    "Delegate": "no", "RemainAfterExit": "yes"}
-        if any(observed.get(key) != value for key, value in expected.items()):
-            fail(f"unsafe service properties: {observed}")
-        if observed.get("TimeoutStopUSec") != "15s" or observed.get("RuntimeMaxUSec") != "15min":
-            fail(f"service time bounds changed: {observed}")
-    finally:
-        os.close(client_lock)
-
-    deadline = time.monotonic() + 16 * 60
-    while True:
-        current = unit_properties("InvocationID", "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus", "ControlGroup")
-        if current.get("InvocationID") != invocation:
-            fail("unit invocation changed while awaiting the result")
-        if (current.get("ActiveState") == "active" and current.get("SubState") == "exited") or current.get("ActiveState") == "failed":
-            break
-        if time.monotonic() >= deadline:
-            command(("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", UNIT), check=False)
-            fail("timed out awaiting fixed verification unit")
-        time.sleep(0.2)
-    command(("/usr/bin/journalctl", "--sync"), check=False)
-    journal = command(("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
-                       f"_SYSTEMD_INVOCATION_ID={invocation}")).stdout
-    sys.stdout.write(journal)
-    successful = (current.get("Result") == "success" and current.get("ExecMainCode") == "exited"
-                  and current.get("ExecMainStatus") == "0")
-    try:
-        if not successful:
-            fail(f"verification invocation failed: {current}")
-        deadline = time.monotonic() + 5
-        while journal.count("Ubuntu migration role compatibility verification passed") != 1:
-            if time.monotonic() >= deadline:
-                fail("exact invocation journal lacks one final success marker")
-            time.sleep(0.1)
+        ) + ((supervisor_mode,) if supervisor_mode else ())
+        launch_attempted = False
+        invocation = None
+        primary_error = None
+        cleanup_errors = []
+        result = 1
+        try:
+            blocked = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+            try:
+                launch_attempted = True
+                launched = command(service_argv, check=False)
+                observed = unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL",
+                                           "TimeoutStopUSec", "RuntimeMaxUSec", "Delegate", "RemainAfterExit")
+                candidate_invocation = observed.get("InvocationID", "")
+                if valid_invocation(candidate_invocation):
+                    invocation = candidate_invocation
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if launched.returncode:
+                fail(f"fixed unit launch failed: {launched.stderr.strip()}")
+            if invocation is None:
+                fail(f"missing exact invocation identity: {observed}")
+            if requested_mode == "client-fault-after-launch":
+                fail("injected client failure after launch")
+            owned_state(invocation)
+            if requested_mode == "client-fault-after-invocation":
+                fail("injected client failure after invocation capture")
+            expected = {"Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
+                        "Delegate": "no", "RemainAfterExit": "yes"}
+            if any(observed.get(key) != value for key, value in expected.items()):
+                fail(f"unsafe service properties: {observed}")
+            if observed.get("TimeoutStopUSec") != "15s" or observed.get("RuntimeMaxUSec") != "15min":
+                fail(f"service time bounds changed: {observed}")
+            if requested_mode == "client-fault-after-properties":
+                fail("injected client failure after property attestation")
+            if requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
+                client_pause(requested_mode)
+            deadline = time.monotonic() + 16 * 60
+            while True:
+                current = owned_state(invocation, "Result", "ExecMainCode", "ExecMainStatus")
+                if ((current.get("ActiveState") == "active" and current.get("SubState") == "exited")
+                        or current.get("ActiveState") == "failed"):
+                    break
+                if time.monotonic() >= deadline:
+                    fail("timed out awaiting fixed verification unit")
+                time.sleep(0.2)
+            if requested_mode == "client-terminal-race-a":
+                client_pause("client-terminal-race-a")
+            if requested_mode == "client-fault-at-terminal":
+                fail("injected client failure at terminal state")
+            command(("/usr/bin/journalctl", "--sync"), check=False)
             journal = command(("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
                                f"_SYSTEMD_INVOCATION_ID={invocation}")).stdout
-        if cgroup_pids(current.get("ControlGroup", "")):
-            fail("successful invocation left control-group processes")
+            sys.stdout.write(journal)
+            if requested_mode == "client-fault-after-journal":
+                fail("injected client failure after journal capture")
+            successful = (current.get("Result") == "success" and current.get("ExecMainCode") == "exited"
+                          and current.get("ExecMainStatus") == "0")
+            if not successful:
+                fail(f"verification invocation failed: {current}")
+            deadline = time.monotonic() + 5
+            while journal.count("Ubuntu migration role compatibility verification passed") != 1:
+                if time.monotonic() >= deadline:
+                    fail("exact invocation journal lacks one final success marker")
+                time.sleep(0.1)
+                owned_state(invocation)
+                journal = command(("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
+                                   f"_SYSTEMD_INVOCATION_ID={invocation}")).stdout
+            if cgroup_pids(current.get("ControlGroup", "")):
+                fail("successful invocation left control-group processes")
+            result = 0
+        except BaseException as error:
+            primary_error = error
+        finally:
+            if launch_attempted and invocation is None:
+                try:
+                    discovered = unit_properties("LoadState", "InvocationID", "ActiveState", "ControlGroup")
+                    candidate_invocation = discovered.get("InvocationID", "")
+                    if discovered.get("LoadState") == "not-found":
+                        pass
+                    elif valid_invocation(candidate_invocation):
+                        invocation = candidate_invocation
+                        teardown_owned(invocation)
+                    else:
+                        cleanup_errors.append(RuntimeError(
+                            f"launched unit has no safe owned invocation identity: {discovered}"))
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            elif launch_attempted:
+                try:
+                    teardown_owned(invocation)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+        if cleanup_errors:
+            detail = "; ".join(map(str, cleanup_errors))
+            if primary_error is not None:
+                raise RuntimeError(f"{primary_error}; cleanup failed: {detail}") from primary_error
+            fail(f"cleanup failed: {detail}")
+        if primary_error is not None:
+            raise primary_error
+        if requested_mode == "client-terminal-race-a":
+            client_pause("client-terminal-race-a-unloaded")
+        return result
     finally:
-        if successful:
-            command(("/usr/bin/systemctl", "stop", UNIT), check=False)
-        command(("/usr/bin/systemctl", "reset-failed", UNIT), check=False)
-        wait_unloaded()
-    return 0
+        os.close(client_lock)
 
 
 if __name__ == "__main__":

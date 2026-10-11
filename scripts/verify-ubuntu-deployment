@@ -455,8 +455,88 @@ def validate_client(source: str) -> None:
     tree = ast.parse(source, filename="verify-ubuntu-migration-role-client")
     require(literal_assignment(tree, "UNIT") == "nmcp-migration-role-verifier.service",
             "client fixed transient service unit name changed")
+    require(literal_assignment(tree, "CLIENT_FAULTS") == {
+        "client-fault-after-launch", "client-fault-after-invocation",
+        "client-fault-after-properties", "client-fault-at-terminal",
+        "client-fault-after-journal",
+    }, "client exact fault boundary table changed")
     require('PROGRAM = RUN + "/supervisor.py"' in source,
             "client published supervisor path changed")
+    require_exact_function(tree, "interrupted", '''def interrupted(signum, _frame):
+    fail(f"verification client interrupted by signal {signum}")
+''', "client signal handler must fail through transaction cleanup")
+    require_exact_function(tree, "owned_state", '''def owned_state(invocation, *properties):
+    state = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState",
+                            "ControlGroup", *properties)
+    if state.get("LoadState") == "not-found":
+        return state
+    if state.get("InvocationID") != invocation:
+        fail(f"fixed unit ownership lost; refusing name-based cleanup: {state}")
+    return state
+''', "client ownership mismatch must refuse name-based action")
+    require_exact_function(tree, "owned_command", '''def owned_command(invocation, *arguments):
+    state = owned_state(invocation)
+    if state.get("LoadState") == "not-found":
+        return False
+    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False)
+    if result.returncode:
+        fail(f"owned unit command failed ({' '.join(arguments)}): {result.stderr.strip()}")
+    return True
+''', "client must revalidate exact ownership immediately before name-based commands")
+    require_exact_function(tree, "wait_unloaded", '''def wait_unloaded(invocation, timeout=30):
+    deadline = time.monotonic() + timeout
+    while True:
+        state = owned_state(invocation)
+        if state.get("LoadState") == "not-found":
+            return
+        if time.monotonic() >= deadline:
+            fail(f"fixed unit did not unload: {state}")
+        time.sleep(0.1)
+''', "client unload polls must revalidate ownership and confirm not-found")
+    require_exact_function(tree, "teardown_owned", '''def teardown_owned(invocation):
+    """Remove only one attested invocation while the client lock is held."""
+    state = owned_state(invocation, "Result", "ExecMainCode", "ExecMainStatus")
+    if state.get("LoadState") == "not-found":
+        return
+    kill_sent = False
+    deadline = time.monotonic() + 20
+    while True:
+        state = owned_state(invocation)
+        if state.get("LoadState") == "not-found":
+            return
+        occupants = cgroup_pids(state.get("ControlGroup", ""))
+        if occupants and not kill_sent:
+            owned_command(invocation, "kill", "--kill-whom=all", "--signal=KILL")
+            kill_sent = True
+            continue
+        if (state.get("ActiveState") in ("failed", "inactive")
+                or (state.get("ActiveState") == "active" and state.get("SubState") == "exited")):
+            if not occupants:
+                break
+        if time.monotonic() >= deadline:
+            fail(f"owned unit did not terminate its control group: {state}")
+        time.sleep(0.1)
+    if state.get("ActiveState") == "active":
+        owned_command(invocation, "stop")
+    state = owned_state(invocation)
+    if state.get("LoadState") != "not-found":
+        owned_command(invocation, "reset-failed")
+    wait_unloaded(invocation)
+''', "client owned teardown/kill/stop/reset/unload contract changed")
+    require_exact_function(tree, "reap_completed_unit", '''def reap_completed_unit(state):
+    """Finish cleanup abandoned by a dead client, never a live transaction."""
+    active = state.get("ActiveState")
+    sub = state.get("SubState")
+    invocation = state.get("InvocationID", "")
+    terminal = ((active == "active" and sub == "exited") or active in ("inactive", "failed"))
+    if terminal and len(invocation) == 32 and not cgroup_pids(state.get("ControlGroup", "")):
+        teardown_owned(invocation)
+        return True
+    return False
+''', "client stale reap must use the exact InvocationID-owned teardown")
+    require_exact_function(tree, "valid_invocation", '''def valid_invocation(value):
+    return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
+''', "client exact InvocationID validator changed")
     contract = (
         '"GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1"',
         '"GIT_CONFIG_GLOBAL": "/dev/null"', 'env=ENVIRONMENT',
@@ -472,21 +552,212 @@ def validate_client(source: str) -> None:
         '"--property=User=root", "--property=Group=root"',
         '"/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "LANG=C"',
         'unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL"',
+        'if valid_invocation(candidate_invocation):',
+        'fail(f"missing exact invocation identity: {observed}")',
         'expected = {"Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",',
         '"Delegate": "no", "RemainAfterExit": "yes"',
         'observed.get("TimeoutStopUSec") != "15s" or observed.get("RuntimeMaxUSec") != "15min"',
-        'unit_properties("InvocationID", "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus", "ControlGroup")',
+        'current = owned_state(invocation, "Result", "ExecMainCode", "ExecMainStatus")',
         'current.get("Result") == "success" and current.get("ExecMainCode") == "exited"',
         'f"_SYSTEMD_INVOCATION_ID={invocation}"',
         'journal.count("Ubuntu migration role compatibility verification passed") != 1',
-        'command(("/usr/bin/systemctl", "stop", UNIT), check=False)',
-        'command(("/usr/bin/systemctl", "reset-failed", UNIT), check=False)',
-        'if state.get("LoadState") == "not-found":',
+        'teardown_owned(invocation)',
+        'wait_unloaded(invocation)',
         'if cgroup_pids(current.get("ControlGroup", "")):',
+        'for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):',
+        'signal.signal(signum, interrupted)',
+        'previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)',
+        'signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)',
+        'launch_attempted = False',
+        'launch_attempted = True',
+        'discovered = unit_properties("LoadState", "InvocationID", "ActiveState", "ControlGroup")',
+        'except BaseException as error:\n            primary_error = error',
+        'f"launched unit has no safe owned invocation identity: {discovered}"',
+        'cleanup_errors.append(error)',
+        'raise RuntimeError(f"{primary_error}; cleanup failed: {detail}") from primary_error',
+        'client_pause("client-terminal-race-a-unloaded")',
     )
-    require(all(fragment in source for fragment in contract)
-            and source.count("wait_unloaded()") == 3,
-            "client fixed transient service/attestation/unload contract changed")
+    require(all(fragment in source for fragment in contract),
+            "client fixed transient service/attestation/owned cleanup contract changed")
+
+    main_node = named_function(tree, "main")
+    parents = {}
+    for parent in ast.walk(main_node):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    lock_calls = [
+        node for node in ast.walk(main_node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "fcntl"
+        and node.func.attr == "flock"
+    ]
+    require(len(lock_calls) == 1, "client must acquire client.lock exactly once")
+    lock_try = parents.get(lock_calls[0])
+    while lock_try is not None and not isinstance(lock_try, ast.Try):
+        lock_try = parents.get(lock_try)
+    expected_close = ast.parse("os.close(client_lock)").body[0]
+    require(isinstance(lock_try, ast.Try) and len(lock_try.finalbody) == 1
+            and ast.dump(lock_try.finalbody[0]) == ast.dump(expected_close),
+            "client.lock must encompass the complete transaction through owned unload")
+    lock_source = ast.get_source_segment(source, lock_try) or ""
+    ordered_lock_fragments = (
+        "fcntl.flock(client_lock, fcntl.LOCK_EX)",
+        "reap_completed_unit(before)",
+        "publish_supervisor(repo, commit)",
+        "launch_attempted = True",
+        "launched = command(service_argv, check=False)",
+        'owned_state(invocation)',
+        'current = owned_state(invocation, "Result", "ExecMainCode", "ExecMainStatus")',
+        'f"_SYSTEMD_INVOCATION_ID={invocation}"',
+        'if cgroup_pids(current.get("ControlGroup", "")):',
+        "teardown_owned(invocation)",
+        "raise primary_error",
+        'client_pause("client-terminal-race-a-unloaded")',
+        "return result",
+        "os.close(client_lock)",
+    )
+    positions = [lock_source.find(fragment) for fragment in ordered_lock_fragments]
+    require(all(position >= 0 for position in positions)
+            and positions == sorted(positions),
+            "client.lock lifecycle ordering no longer covers reap through confirmed unload")
+
+    launch_assignments = [
+        node for node in ast.walk(main_node)
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "launched" for target in node.targets
+        )
+    ]
+    require(len(launch_assignments) == 1, "client must launch the fixed unit exactly once")
+    launch_tries = [
+        node for node in lock_try.body
+        if isinstance(node, ast.Try) and launch_assignments[0] in ast.walk(node)
+    ]
+    require(len(launch_tries) == 1, "client needs one encompassing post-launch try/finally")
+    launch_try = launch_tries[0]
+    signal_tries = [
+        node for node in launch_try.body
+        if isinstance(node, ast.Try) and launch_assignments[0] in ast.walk(node)
+    ]
+    require(len(signal_tries) == 1,
+            "client systemd-run and immediate InvocationID capture must share one signal-masked try")
+    signal_try = signal_tries[0]
+    require(parents.get(launch_try) is lock_try and parents.get(signal_try) is launch_try,
+            "client systemd-run return and all post-launch checks need one encompassing try/finally")
+    expected_masked_launch = ast.parse('''blocked = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+try:
+    launch_attempted = True
+    launched = command(service_argv, check=False)
+    observed = unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL",
+                               "TimeoutStopUSec", "RuntimeMaxUSec", "Delegate", "RemainAfterExit")
+    candidate_invocation = observed.get("InvocationID", "")
+    if valid_invocation(candidate_invocation):
+        invocation = candidate_invocation
+finally:
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+''').body
+    require([ast.dump(node) for node in launch_try.body[:3]]
+            == [ast.dump(node) for node in expected_masked_launch],
+            "client launch attempt, systemd-run, and immediate InvocationID capture must stay signal-masked")
+    expected_launch_failures = ast.parse('''if launched.returncode:
+    fail(f"fixed unit launch failed: {launched.stderr.strip()}")
+if invocation is None:
+    fail(f"missing exact invocation identity: {observed}")
+''').body
+    require([ast.dump(node) for node in launch_try.body[3:5]]
+            == [ast.dump(node) for node in expected_launch_failures],
+            "client nonzero launch and missing InvocationID must fail into owned recovery")
+    expected_handler = ast.parse('''try:
+    pass
+except BaseException as error:
+    primary_error = error
+''').body[0].handlers[0]
+    expected_finally = ast.parse('''try:
+    pass
+finally:
+    if launch_attempted and invocation is None:
+        try:
+            discovered = unit_properties("LoadState", "InvocationID", "ActiveState", "ControlGroup")
+            candidate_invocation = discovered.get("InvocationID", "")
+            if discovered.get("LoadState") == "not-found":
+                pass
+            elif valid_invocation(candidate_invocation):
+                invocation = candidate_invocation
+                teardown_owned(invocation)
+            else:
+                cleanup_errors.append(RuntimeError(
+                    f"launched unit has no safe owned invocation identity: {discovered}"))
+        except BaseException as error:
+            cleanup_errors.append(error)
+    elif launch_attempted:
+        try:
+            teardown_owned(invocation)
+        except BaseException as error:
+            cleanup_errors.append(error)
+''').body[0].finalbody
+    require(len(launch_try.handlers) == 1
+            and ast.dump(launch_try.handlers[0]) == ast.dump(expected_handler)
+            and [ast.dump(node) for node in launch_try.finalbody]
+            == [ast.dump(node) for node in expected_finally],
+            "client post-launch failures must aggregate owned teardown errors")
+    expected_outcome = ast.parse('''if cleanup_errors:
+    detail = "; ".join(map(str, cleanup_errors))
+    if primary_error is not None:
+        raise RuntimeError(f"{primary_error}; cleanup failed: {detail}") from primary_error
+    fail(f"cleanup failed: {detail}")
+if primary_error is not None:
+    raise primary_error
+if requested_mode == "client-terminal-race-a":
+    client_pause("client-terminal-race-a-unloaded")
+return result
+''').body
+    launch_index = lock_try.body.index(launch_try)
+    require([ast.dump(node) for node in lock_try.body[launch_index + 1:]]
+            == [ast.dump(node) for node in expected_outcome],
+            "client must immediately resolve primary/cleanup errors after the inner finally")
+
+    invocation_assignments = [
+        node for node in ast.walk(main_node)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "invocation"
+    ]
+    null_assignments = [
+        node for node in invocation_assignments
+        if isinstance(node.value, ast.Constant) and node.value.value is None
+    ]
+    validated_assignments = [node for node in invocation_assignments if node not in null_assignments]
+    expected_validation = ast.parse("valid_invocation(candidate_invocation)", mode="eval").body
+    require(len(null_assignments) == 1 and len(validated_assignments) == 2
+            and all(isinstance(parents.get(node), ast.If)
+                    and ast.dump(parents[node].test) == ast.dump(expected_validation)
+                    and parents[node].body[0] is node
+                    for node in validated_assignments),
+            "client may assign an owned InvocationID only after exact validation")
+
+    literal_systemctl = []
+    for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+        for call in ast.walk(function):
+            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                    and call.func.id == "command" and call.args
+                    and isinstance(call.args[0], ast.Tuple) and call.args[0].elts
+                    and isinstance(call.args[0].elts[0], ast.Constant)
+                    and call.args[0].elts[0].value == "/usr/bin/systemctl"
+                    and (len(call.args[0].elts) < 2
+                         or not isinstance(call.args[0].elts[1], ast.Constant)
+                         or call.args[0].elts[1].value != "show")):
+                literal_systemctl.append(function.name)
+    require(literal_systemctl == ["owned_command"],
+            "client name-based systemctl action bypasses exact InvocationID revalidation")
+
+    fault_fragments = (
+        'if requested_mode == "client-fault-after-launch":\n                fail("injected client failure after launch")',
+        'owned_state(invocation)\n            if requested_mode == "client-fault-after-invocation":',
+        'if requested_mode == "client-fault-after-properties":\n                fail("injected client failure after property attestation")',
+        'if requested_mode == "client-fault-at-terminal":\n                fail("injected client failure at terminal state")',
+        'if requested_mode == "client-fault-after-journal":\n                fail("injected client failure after journal capture")',
+    )
+    require(all(source.count(fragment) == 1 for fragment in fault_fragments),
+            "client launch/invocation/property/terminal/journal fault boundaries changed")
 
 
 def validate_containment(source: str, phase: str) -> None:
@@ -507,9 +778,17 @@ def validate_containment(source: str, phase: str) -> None:
         'keeper_pid not in all_service_pids or not process_has_inode(',
         'fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)',
         '"live in-cgroup lock keeper released the transaction lock"',
-        '"second invocation overlapped the killed supervisor control group"',
+        '"second invocation overlapped the live orphaned client service"',
         'cgroup_pids(state["ControlGroup"]) or any(pid_exists(pid) for pid in all_service_pids)',
-        '"clean recovery invocation failed"',
+        '"client B did not block behind terminal-state client A"',
+        '"client B replaced client A before A unloaded"',
+        'for name in ("client-terminal-race-a", "client-terminal-race-a-unloaded",',
+        '"client A reported teardown before the fixed name unloaded"',
+        '"client B acquired client.lock before A confirmed unload"',
+        '"client B did not launch a distinct post-unload invocation"',
+        '"client B fault transaction unexpectedly succeeded"',
+        '"client did not fail safely after fixed-name ownership loss"',
+        '"old client teardown touched the reused-name sentinel"',
         '"retained-cleanup-dependency"',
         'if retained.returncode == 0:',
         '"drop database exited" not in retained.stdout or "drop roles exited" not in retained.stdout',
@@ -522,6 +801,48 @@ def validate_containment(source: str, phase: str) -> None:
     require(all(fragment in source for fragment in contract)
             and source.count('("after-intent", "after-mkdir", "after-open", "after-register")') == 2,
             "containment causal death/overlap/lock/recovery/fault contract changed")
+    race_fragments = (
+        'go_binary, "client-terminal-race-a"),',
+        'wait_path("/run/nmcp-ci/client-terminal-race-a.ready")',
+        'go_binary, "client-terminal-race-b"),',
+        'if waiting.poll() is not None or os.path.exists("/run/nmcp-ci/client-terminal-race-b.ready"):',
+        'if show("InvocationID")["InvocationID"] != invocation_a:',
+        'release("client-terminal-race-a")',
+        'wait_path("/run/nmcp-ci/client-terminal-race-a-unloaded.ready", timeout=60)',
+        'if show("LoadState").get("LoadState") != "not-found":',
+        'if waiting.poll() is not None or os.path.exists("/run/nmcp-ci/client-terminal-race-b.ready"):',
+        'release("client-terminal-race-a-unloaded")',
+        'recovered_stdout, recovered_stderr = recovered.communicate(timeout=60)',
+        'wait_path("/run/nmcp-ci/client-terminal-race-b.ready", timeout=60)',
+        'if terminal_b["InvocationID"] == invocation_a:',
+        'release("client-terminal-race-b")',
+    )
+    race_positions = []
+    race_offset = 0
+    for fragment in race_fragments:
+        position = source.find(fragment, race_offset)
+        race_positions.append(position)
+        if position >= 0:
+            race_offset = position + len(fragment)
+    require(all(position >= 0 for position in race_positions),
+            "containment causal terminal two-client serialization race changed")
+    reuse_fragments = (
+        '"client-reuse-pause")',
+        'wait_path("/run/nmcp-ci/client-reuse-pause.ready", timeout=60)',
+        'replaced_invocation = replaced_a["InvocationID"]',
+        '("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", UNIT)',
+        '("/usr/bin/systemctl", "reset-failed", UNIT)',
+        'wait_unit_absent()',
+        '("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec"',
+        'sentinel_invocation = sentinel_state["InvocationID"]',
+        'release("client-reuse-pause")',
+        'if replaced.returncode == 0 or "ownership lost" not in replaced.stderr:',
+        'if after_replaced["InvocationID"] != sentinel_invocation or after_replaced["ActiveState"] != "active":',
+    )
+    reuse_positions = [source.find(fragment, race_positions[-1]) for fragment in reuse_fragments]
+    require(all(position >= 0 for position in reuse_positions)
+            and reuse_positions == sorted(reuse_positions),
+            "containment causal actual reused-name sentinel counterexample changed")
     phase_contract = (
         'if [[ ${NMCP_TEST_SUPERVISOR_CONTAINMENT:-} == 1 ]]; then',
         "/usr/bin/setsid /bin/sh -c",
@@ -1016,20 +1337,63 @@ def verify_supervisor_mutations(
         ("no retained result", replace_once(client, '"--property=RemainAfterExit=yes"', '"--property=RemainAfterExit=no"')),
         ("supervisor not exact commit", replace_once(client, '"show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"', '"show", "HEAD:scripts/verify-ubuntu-migration-role-supervisor"')),
         ("invocation identity not inspected", replace_once(client, 'unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL"', 'unit_properties("UnitFileState", "ActiveState", "Type", "KillMode", "SendSIGKILL"')),
+        ("invocation identity syntax weakened", replace_once(client, 'return len(value) == 32 and all(character in "0123456789abcdef" for character in value)', 'return bool(value)')),
+        ("terminal ownership not revalidated", replace_once(client, 'current = owned_state(invocation, "Result", "ExecMainCode", "ExecMainStatus")', 'current = unit_properties("Result", "ExecMainCode", "ExecMainStatus")')),
         ("result unchecked", replace_once(client, 'current.get("Result") == "success"', 'True')),
         ("journal not invocation scoped", client.replace('f"_SYSTEMD_INVOCATION_ID={invocation}"', '"--since=today"')),
-        ("unit not stopped", client.replace('command(("/usr/bin/systemctl", "stop", UNIT), check=False)', 'pass')),
-        ("unit unload not awaited", replace_once(client, '        wait_unloaded()\n    return 0', '        pass\n    return 0')),
+        ("successful cgroup unchecked", replace_once(client, '            if cgroup_pids(current.get("ControlGroup", "")):', '            if False:')),
+        ("owned kill omitted", replace_once(client, '            owned_command(invocation, "kill", "--kill-whom=all", "--signal=KILL")', '            kill_sent = True')),
+        ("unit not stopped", replace_once(client, '        owned_command(invocation, "stop")', '        pass')),
+        ("unit not reset", replace_once(client, '        owned_command(invocation, "reset-failed")', '        pass')),
+        ("unit unload not awaited", replace_once(client, '    wait_unloaded(invocation)\n\n\ndef reap_completed_unit', '    pass\n\n\ndef reap_completed_unit')),
+        ("ownership mismatch accepted", replace_once(client, '    if state.get("InvocationID") != invocation:', '    if state.get("InvocationID") == invocation:')),
+        ("command ownership revalidation omitted", replace_once(client, 'def owned_command(invocation, *arguments):\n    state = owned_state(invocation)', 'def owned_command(invocation, *arguments):\n    state = unit_properties("LoadState")')),
+        ("unload ownership revalidation omitted", replace_once(client, '    while True:\n        state = owned_state(invocation)\n        if state.get("LoadState") == "not-found":\n            return\n        if time.monotonic() >= deadline:\n            fail(f"fixed unit did not unload: {state}")', '    while True:\n        state = unit_properties("LoadState")\n        if state.get("LoadState") == "not-found":\n            return\n        if time.monotonic() >= deadline:\n            fail(f"fixed unit did not unload: {state}")')),
+        ("client lock released before launch", replace_once(client, '        publish_supervisor(repo, commit)\n', '        publish_supervisor(repo, commit)\n        os.close(client_lock)\n')),
+        ("launch outside cleanup try", replace_once(
+            replace_once(client, '                launched = command(service_argv, check=False)', '                launched = launched'),
+            '        result = 1\n        try:', '        result = 1\n        launched = command(service_argv, check=False)\n        try:')),
+        ("launch signals not blocked", replace_once(client, 'signal.pthread_sigmask(signal.SIG_BLOCK, blocked)', 'signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)')),
+        ("launch signal mask not restored", replace_once(client, '                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)', '                pass')),
+        ("immediate invocation capture omitted", replace_once(client, '                observed = unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL",', '                observed = {}  # unit properties read deferred\n                ignored = unit_properties("InvocationID", "ActiveState", "Type", "KillMode", "SendSIGKILL",')),
+        ("launch attempt marked too late", replace_once(client, '                launch_attempted = True\n                launched = command(service_argv, check=False)', '                launched = command(service_argv, check=False)\n                launch_attempted = True')),
+        ("launch recovery disabled", replace_once(client, '        launch_attempted = False', '        launch_attempted = None')),
+        ("nonzero launch accepted", replace_once(client, '            if launched.returncode:', '            if False:')),
+        ("missing launch InvocationID accepted", replace_once(client, '            if invocation is None:\n                fail(f"missing exact invocation identity: {observed}")', '            if False:\n                fail(f"missing exact invocation identity: {observed}")')),
+        ("missing ID recovery discovery omitted", replace_once(client, '                    discovered = unit_properties("LoadState", "InvocationID", "ActiveState", "ControlGroup")', '                    discovered = {"LoadState": "not-found"}')),
+        ("recovered InvocationID accepted unchecked", replace_once(client, '                    elif valid_invocation(candidate_invocation):', '                    elif candidate_invocation:')),
+        ("owned InvocationID assigned unchecked", client.replace('if valid_invocation(candidate_invocation):', 'if candidate_invocation:')),
+        ("teardown failure discarded", replace_once(client, '            elif launch_attempted:\n                try:\n                    teardown_owned(invocation)\n                except BaseException as error:\n                    cleanup_errors.append(error)', '            elif launch_attempted:\n                try:\n                    teardown_owned(invocation)\n                except BaseException:\n                    pass')),
+        ("teardown aggregation bypassed", replace_once(client, '        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))', '        if False:\n            detail = "; ".join(map(str, cleanup_errors))')),
+        ("raising statement between finally and resolution", replace_once(client, '        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))', '        unit_properties("LoadState")\n        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))')),
+        ("signal cancellation bypasses cleanup", replace_once(client, '    fail(f"verification client interrupted by signal {signum}")', '    os._exit(128 + signum)')),
+        ("stale reap bypasses owned teardown", replace_once(client, '        teardown_owned(invocation)\n        return True', '        return True')),
+        ("launch fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-launch":\n                fail("injected client failure after launch")\n', '')),
+        ("invocation fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-invocation":\n                fail("injected client failure after invocation capture")\n', '')),
+        ("property fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-properties":\n                fail("injected client failure after property attestation")\n', '')),
+        ("terminal fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-at-terminal":\n                fail("injected client failure at terminal state")\n', '')),
+        ("journal fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-journal":\n                fail("injected client failure after journal capture")\n', '')),
+        ("post-unload lock-held pause omitted", replace_once(client, '        if requested_mode == "client-terminal-race-a":\n            client_pause("client-terminal-race-a-unloaded")\n', '')),
     ]
     for label, mutation in client_mutations:
-        expect_rejected(validate_client, mutation, label, "client fixed transient")
+        expect_rejected(validate_client, mutation, label, "client")
     containment_mutations = [
         ("client death omitted", replace_once(containment, 'os.kill(first.pid, signal.SIGKILL)', 'first.terminate()')),
         ("supervisor SIGKILL softened", replace_once(containment, 'os.kill(main_pid, signal.SIGKILL)', 'os.kill(main_pid, signal.SIGTERM)')),
         ("nested cgroup evidence omitted", replace_once(containment, 'if not set(descendants) <= set(all_service_pids):', 'if False:')),
-        ("overlap accepted", replace_once(containment, 'fail("second invocation overlapped the killed supervisor control group")', 'pass')),
+        ("overlap accepted", replace_once(containment, 'fail("second invocation overlapped the live orphaned client service")', 'pass')),
         ("lock survival omitted", replace_once(containment, 'fail("live in-cgroup lock keeper released the transaction lock")', 'pass')),
-        ("recovery omitted", replace_once(containment, 'fail("clean recovery invocation failed")', 'pass')),
+        ("terminal client B not blocked", replace_once(containment, 'fail("client B did not block behind terminal-state client A")', 'pass')),
+        ("terminal unit replaced early", replace_once(containment, 'fail("client B replaced client A before A unloaded")', 'pass')),
+        ("terminal post-unload pause omitted", replace_once(containment, 'wait_path("/run/nmcp-ci/client-terminal-race-a-unloaded.ready", timeout=60)', 'time.sleep(0.1)')),
+        ("terminal unload state unchecked", replace_once(containment, 'fail("client A reported teardown before the fixed name unloaded")', 'pass')),
+        ("terminal B post-unload block unchecked", replace_once(containment, 'fail("client B acquired client.lock before A confirmed unload")', 'pass')),
+        ("terminal A lock released early", replace_once(containment, 'release("client-terminal-race-a-unloaded")', 'pass')),
+        ("terminal invocation reused", replace_once(containment, 'fail("client B did not launch a distinct post-unload invocation")', 'pass')),
+        ("terminal A completion not awaited", replace_once(containment, 'recovered_stdout, recovered_stderr = recovered.communicate(timeout=60)', 'recovered_stdout, recovered_stderr = "", ""')),
+        ("reuse ownership loss accepted", replace_once(containment, 'fail("client did not fail safely after fixed-name ownership loss")', 'pass')),
+        ("reuse sentinel touch accepted", replace_once(containment, 'fail("old client teardown touched the reused-name sentinel")', 'pass')),
+        ("reuse sentinel fake", replace_once(containment, '("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",', '("/bin/true",')),
         ("boundary fault omitted", replace_once(containment,
           'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
           'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-register"):' )),

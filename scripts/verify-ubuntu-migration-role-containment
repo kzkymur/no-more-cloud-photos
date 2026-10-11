@@ -26,8 +26,11 @@ def run(argv, **kwargs):
 
 def show(*properties):
     result = run(("/usr/bin/systemctl", "show", UNIT, *(f"--property={item}" for item in properties)),
-                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+                 check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if result.returncode and not values:
+        return {"LoadState": "not-found", "ActiveState": "inactive", "InvocationID": ""}
+    return values
 
 
 def wait_path(path, timeout=900):
@@ -35,6 +38,28 @@ def wait_path(path, timeout=900):
     while not os.path.exists(path):
         if time.monotonic() >= deadline:
             fail(f"timed out waiting for {path}")
+        time.sleep(0.1)
+
+
+def reset_signal_paths(name):
+    for suffix in ("ready", "release"):
+        try:
+            os.unlink(f"/run/nmcp-ci/{name}.{suffix}")
+        except FileNotFoundError:
+            pass
+
+
+def release(name):
+    descriptor = os.open(f"/run/nmcp-ci/{name}.release",
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(descriptor)
+
+
+def wait_unit_absent(timeout=30):
+    deadline = time.monotonic() + timeout
+    while show("LoadState").get("LoadState") != "not-found":
+        if time.monotonic() >= deadline:
+            fail("fixed unit did not unload during containment test")
         time.sleep(0.1)
 
 
@@ -169,6 +194,10 @@ def main():
     first.wait()
     if show("InvocationID", "ActiveState") != {"InvocationID": invocation, "ActiveState": "active"}:
         fail("client death changed the running service invocation")
+    second = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary),
+                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if second.returncode == 0 or not any(message in second.stderr for message in ("occupied", "control group is not empty")):
+        fail("second invocation overlapped the live orphaned client service")
     os.kill(main_pid, signal.SIGKILL)
     if pid_exists(keeper_pid):
         lock = os.open("/run/nmcp-ci/transaction.lock", os.O_RDWR | os.O_NOFOLLOW)
@@ -181,11 +210,6 @@ def main():
                 fail("live in-cgroup lock keeper released the transaction lock")
         finally:
             os.close(lock)
-    second = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary),
-                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if second.returncode == 0 or not any(message in second.stderr for message in ("occupied", "control group is not empty")):
-        fail("second invocation overlapped the killed supervisor control group")
-
     deadline = time.monotonic() + 20
     while show("InvocationID", "ActiveState")["ActiveState"] not in ("inactive", "failed"):
         if time.monotonic() >= deadline:
@@ -199,14 +223,101 @@ def main():
     finally:
         os.close(lock)
 
-    recovered = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary),
-                    stdout=None, stderr=None)
+    # Client A must retain client.lock after its service reaches terminal state.
+    # Client B cannot reap/reuse the name until A attests and fully unloads it.
+    for name in ("client-terminal-race-a", "client-terminal-race-a-unloaded",
+                 "client-terminal-race-b"):
+        reset_signal_paths(name)
+    recovered = subprocess.Popen(
+        ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, "client-terminal-race-a"),
+        cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    wait_path("/run/nmcp-ci/client-terminal-race-a.ready")
+    terminal_a = show("InvocationID", "ActiveState", "SubState", "ControlGroup")
+    invocation_a = terminal_a["InvocationID"]
+    if terminal_a["ActiveState"] != "active" or terminal_a["SubState"] != "exited":
+        fail(f"client A did not pause at terminal state: {terminal_a}")
+    waiting = subprocess.Popen(
+        ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, "client-terminal-race-b"),
+        cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    time.sleep(0.5)
+    if waiting.poll() is not None or os.path.exists("/run/nmcp-ci/client-terminal-race-b.ready"):
+        fail("client B did not block behind terminal-state client A")
+    if show("InvocationID")["InvocationID"] != invocation_a:
+        fail("client B replaced client A before A unloaded")
+    release("client-terminal-race-a")
+    wait_path("/run/nmcp-ci/client-terminal-race-a-unloaded.ready", timeout=60)
+    if show("LoadState").get("LoadState") != "not-found":
+        fail("client A reported teardown before the fixed name unloaded")
+    if waiting.poll() is not None or os.path.exists("/run/nmcp-ci/client-terminal-race-b.ready"):
+        fail("client B acquired client.lock before A confirmed unload")
+    release("client-terminal-race-a-unloaded")
+    recovered_stdout, recovered_stderr = recovered.communicate(timeout=60)
     if recovered.returncode:
-        fail("clean recovery invocation failed")
+        fail(f"clean recovery client A failed: {recovered_stdout} {recovered_stderr}")
+    wait_path("/run/nmcp-ci/client-terminal-race-b.ready", timeout=60)
+    terminal_b = show("InvocationID", "ActiveState")
+    if terminal_b["InvocationID"] == invocation_a:
+        fail("client B did not launch a distinct post-unload invocation")
+    release("client-terminal-race-b")
+    waiting.communicate(timeout=60)
+    if waiting.returncode == 0:
+        fail("client B fault transaction unexpectedly succeeded")
     if os.path.exists("/run/nmcp-ci/cleanup-intent.json"):
-        fail("recovery left a cleanup intent")
+        # B intentionally SIGKILLed its supervisor after proving serialization;
+        # the following invocation must recover this durable intent.
+        pass
     if prior is not None:
         assert_replaced_or_absent(*prior)
+
+    # Replace an owned unit behind a paused client. Its finally block must
+    # detect InvocationID loss and never issue a name-based command to B.
+    reset_signal_paths("client-reuse-pause")
+    replaced = subprocess.Popen(
+        ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, "client-reuse-pause"),
+        cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    wait_path("/run/nmcp-ci/client-reuse-pause.ready", timeout=60)
+    replaced_a = show("InvocationID", "ActiveState", "ControlGroup")
+    replaced_invocation = replaced_a["InvocationID"]
+    run(("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", UNIT),
+        check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 20
+    while show("InvocationID", "ActiveState")["ActiveState"] not in ("failed", "inactive"):
+        if time.monotonic() >= deadline:
+            fail("reused-name source invocation did not stop")
+        time.sleep(0.1)
+    if show("InvocationID")["InvocationID"] != replaced_invocation:
+        fail("reused-name source changed before reset")
+    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wait_unit_absent()
+    sentinel = run(("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",
+                    "--property=KillMode=control-group", "/usr/bin/sleep", "300"),
+                   check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    del sentinel
+    sentinel_state = show("InvocationID", "ActiveState", "MainPID")
+    sentinel_invocation = sentinel_state["InvocationID"]
+    if sentinel_invocation == replaced_invocation or sentinel_state["ActiveState"] != "active":
+        fail("reused-name sentinel did not own a distinct live invocation")
+    release("client-reuse-pause")
+    replaced.communicate(timeout=60)
+    if replaced.returncode == 0 or "ownership lost" not in replaced.stderr:
+        fail("client did not fail safely after fixed-name ownership loss")
+    after_replaced = show("InvocationID", "ActiveState", "MainPID")
+    if after_replaced["InvocationID"] != sentinel_invocation or after_replaced["ActiveState"] != "active":
+        fail("old client teardown touched the reused-name sentinel")
+    run(("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", UNIT), check=False,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 20
+    while show("ActiveState").get("ActiveState") not in ("failed", "inactive"):
+        if time.monotonic() >= deadline:
+            fail("reused-name sentinel did not stop")
+        time.sleep(0.1)
+    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=False,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wait_unit_absent()
 
     retained = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                     "retained-cleanup-dependency"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
