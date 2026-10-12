@@ -46,6 +46,8 @@ ACTIVE_PHASE = None
 INTENT_PATH = "/run/nmcp-ci/cleanup-intent.json"
 LOCK_KEEPER_PID_PATH = "/run/nmcp-ci/lock-keeper.pid"
 FAULT_MODE = ""
+CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
+CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
 TOP_ALLOWLISTS = {
     "/usr/local/libexec/nmcp": {"postgresql", "set-ubuntu-migration-role-mode", "run-ubuntu-migration-compatibility", "verify-installed-runtime-roles"},
     "/var/lib/nmcp": {"deployment"},
@@ -720,13 +722,17 @@ def main():
                             "DROP ROLE IF EXISTS nmcp_graph_probe,nmcp_graph_bridge,nmcp_api,nmcp_worker,nmcp_migrator,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner")),
         )
         for label, arguments in cleanup_commands:
+            marker = (CLEANUP_DATABASE_FAILURE if label == "drop database"
+                      else CLEANUP_ROLES_FAILURE)
             try:
                 result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True)
                 if result.returncode:
+                    print(marker, file=sys.stderr, flush=True)
                     cleanup_errors.append(RuntimeError(
                         f"{label} exited {result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"))
             except Exception as error:
+                print(marker, file=sys.stderr, flush=True)
                 cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))
         try:
             recover_intents()

@@ -25,9 +25,12 @@ ENVIRONMENT = {
 NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
 DESCRIPTION_PREFIX = "NMCP migration role verifier "
 SUCCESS = "Ubuntu migration role compatibility verification passed"
+CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
+CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
 JOURNAL_TIMEOUT = 5
 JOURNAL_BYTE_LIMIT = 256
-JOURNAL_LINE_LIMIT = 1
+JOURNAL_LINE_LIMIT = 3
+JOURNAL_QUERY_LINE_LIMIT = 4
 SERVICE_PROPERTIES = {
     "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
     "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
@@ -151,20 +154,27 @@ def parse_journal_evidence(payload):
     except UnicodeDecodeError:
         fail("journal evidence was not ASCII")
     if not output:
-        return ""
+        return (False, False, False)
     lines = output.splitlines(keepends=True)
     if len(lines) > JOURNAL_LINE_LIMIT:
         fail("journal evidence contained extra lines")
-    if lines != [SUCCESS + "\n"]:
-        fail("journal evidence was not one canonical success line")
-    return SUCCESS + "\n"
+    allowed = (CLEANUP_DATABASE_FAILURE, CLEANUP_ROLES_FAILURE, SUCCESS)
+    observed = [line[:-1] for line in lines if line.endswith("\n")]
+    if (len(observed) != len(lines) or len(set(observed)) != len(observed)
+            or any(line not in allowed for line in observed)
+            or observed != [line for line in allowed if line in observed]
+            or (SUCCESS in observed and len(observed) != 1)):
+        fail("journal evidence was not an exact ordered allowlist")
+    return (SUCCESS in observed, CLEANUP_DATABASE_FAILURE in observed,
+            CLEANUP_ROLES_FAILURE in observed)
 
 
 def bounded_journal_evidence(invocation):
     deadline = bounded_deadline(JOURNAL_TIMEOUT)
     argv = ("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
-            "--case-sensitive=yes", "--since=-20min", "--lines=2",
-            f"--grep=^{SUCCESS}$", f"_SYSTEMD_INVOCATION_ID={invocation}")
+            "--case-sensitive=yes", "--since=-20min", f"--lines={JOURNAL_QUERY_LINE_LIMIT}",
+            f"--grep=^({CLEANUP_DATABASE_FAILURE}|{CLEANUP_ROLES_FAILURE}|{SUCCESS})$",
+            f"_SYSTEMD_INVOCATION_ID={invocation}")
     try:
         process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
@@ -743,9 +753,19 @@ def main():
                 fail("injected client failure after journal capture")
             successful = successful_terminal_state(current)
             if not successful:
-                fail(f"verification invocation failed: {sanitized_state(current)}")
+                if requested_mode == "retained-cleanup-dependency":
+                    category_deadline = bounded_deadline(5)
+                    while not (journal_evidence[1] and journal_evidence[2]):
+                        if time.monotonic() >= category_deadline:
+                            break
+                        time.sleep(0.1)
+                        owned_state(invocation, nonce, exec_argv)
+                        journal_evidence = bounded_journal_evidence(invocation)
+                fail(f"verification invocation failed: {sanitized_state(current)}; "
+                     f"cleanup_database_failed={journal_evidence[1]}; "
+                     f"cleanup_roles_failed={journal_evidence[2]}")
             deadline = bounded_deadline(5)
-            while not journal_evidence:
+            while not journal_evidence[0]:
                 if time.monotonic() >= deadline:
                     fail("exact invocation journal lacks one final success marker")
                 time.sleep(0.1)

@@ -34,7 +34,19 @@ def run(command, **kwargs):
 
 
 def text(path: pathlib.Path) -> str:
-    return path.read_text(encoding="utf-8")
+    raw = path.read_bytes()
+    require(raw.endswith(b"\n") and b"\r" not in raw,
+            f"{path} must use canonical UTF-8/LF source bytes")
+    return raw.decode("utf-8", errors="strict")
+
+
+def stable_source_digest(source: str) -> str:
+    require(isinstance(source, str) and source.endswith("\n") and "\r" not in source,
+            "reviewed source must use canonical UTF-8/LF text")
+    encoded = source.encode("utf-8", errors="strict")
+    require(encoded.decode("utf-8", errors="strict") == source,
+            "reviewed source did not round-trip canonical UTF-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def verify_nonce_safe_diagnostics(client_path: pathlib.Path, containment_path: pathlib.Path) -> None:
@@ -88,8 +100,14 @@ def verify_nonce_safe_diagnostics(client_path: pathlib.Path, containment_path: p
     require(secret not in state_rendered, "client owned state retained redacted fields")
 
     success = client["SUCCESS"]
+    database_failure = client["CLEANUP_DATABASE_FAILURE"]
+    roles_failure = client["CLEANUP_ROLES_FAILURE"]
     require(client["parse_journal_evidence"]((success + "\n").encode("ascii"))
-            == success + "\n" and client["parse_journal_evidence"](b"") == "",
+            == (True, False, False)
+            and client["parse_journal_evidence"](b"") == (False, False, False)
+            and client["parse_journal_evidence"](
+                (database_failure + "\n" + roles_failure + "\n").encode("ascii"))
+            == (False, True, True),
             "client journal parser rejected canonical or absent evidence")
     separated = {
         label: separator.join(nonce[index:index + 2] for index in range(0, len(nonce), 2))
@@ -107,6 +125,9 @@ def verify_nonce_safe_diagnostics(client_path: pathlib.Path, containment_path: p
         "NFKC": "Ｕ" + success[1:] + "\n",
         "field fragments": "MESSAGE=" + success + "\n",
         "multiline aggregation": success + "\n" + nonce + "\n",
+        "duplicate category": database_failure + "\n" + database_failure + "\n",
+        "reordered categories": roles_failure + "\n" + database_failure + "\n",
+        "success with failure": database_failure + "\n" + success + "\n",
         "truncated canonical": success,
         "boundary padding": success + "\n" + "x" * (client["JOURNAL_BYTE_LIMIT"] - len(success) - 1),
     }
@@ -159,7 +180,7 @@ def verify_nonce_safe_diagnostics(client_path: pathlib.Path, containment_path: p
     try:
         subprocess.Popen = lambda *_args, **_kwargs: FakeJournalProcess(
             (success + "\n").encode("ascii"))
-        require(client["bounded_journal_evidence"]("a" * 32) == success + "\n",
+        require(client["bounded_journal_evidence"]("a" * 32) == (True, False, False),
                 "client bounded journal acquisition rejected canonical evidence")
         subprocess.Popen = lambda *_args, **_kwargs: FakeJournalProcess(overflow)
         try:
@@ -688,10 +709,14 @@ def validate_supervisor(source: str) -> None:
             "supervisor durable intent/bounded cleanup contract changed")
     cleanup_contract = (
         'cleanup_errors = []',
+        'CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"',
+        'CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"',
         '("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp"))',
         '("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc"',
         'result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,',
         'if result.returncode:',
+        'marker = (CLEANUP_DATABASE_FAILURE if label == "drop database"',
+        'print(marker, file=sys.stderr, flush=True)',
         'cleanup_errors.append(RuntimeError(',
         'cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))',
         'if cleanup_errors:\n            raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))',
@@ -728,6 +753,7 @@ def validate_supervisor(source: str) -> None:
     checked_cleanup_fragments = {
         'result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,': 1,
         'if result.returncode:': 1,
+        'print(marker, file=sys.stderr, flush=True)': 2,
         'cleanup_errors.append(RuntimeError(': 2,
         'cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))': 1,
     }
@@ -753,16 +779,16 @@ def validate_supervisor(source: str) -> None:
             "supervisor nonce argv/environment validation changed")
 
 
-def validate_client(source: str) -> None:
+def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
     tree = ast.parse(source, filename="verify-ubuntu-migration-role-client")
     # This client handles nonce-bearing argv, captured subprocess streams, and
-    # journal bytes. Bind the complete executable AST so an unreviewed call or
-    # alias cannot introduce a new output sink outside the inventories below.
-    normalized_digest = hashlib.sha256(
-        ast.dump(tree, include_attributes=False).encode("utf-8")
-    ).hexdigest()
-    require(normalized_digest == "69f1e6a3a94ab2d9efc9f50a10c32c187f9c2e1601b99f7122dac42724ec8222",
-            "client reviewed executable AST contract changed")
+    # journal bytes. Bind its canonical UTF-8/LF source as version-neutral
+    # defense in depth, never as source authentication; semantic mutation tests
+    # bypass this snapshot and must be rejected by the detailed inventories below.
+    if enforce_snapshot:
+        require(stable_source_digest(source)
+                == "b2ad8d86708468eb082cd9cacbf521ec3e8e69127473ff66879d35fbc2edea38",
+                "client reviewed stable UTF-8/LF source snapshot changed")
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     expected_imports = ast.parse('''import fcntl
 import os
@@ -806,9 +832,14 @@ import time
             "client nonce launch labels changed")
     require(literal_assignment(tree, "SUCCESS")
                 == "Ubuntu migration role compatibility verification passed"
+            and literal_assignment(tree, "CLEANUP_DATABASE_FAILURE")
+                == "NMCP cleanup result: drop database failed"
+            and literal_assignment(tree, "CLEANUP_ROLES_FAILURE")
+                == "NMCP cleanup result: drop roles failed"
             and literal_assignment(tree, "JOURNAL_TIMEOUT") == 5
             and literal_assignment(tree, "JOURNAL_BYTE_LIMIT") == 256
-            and literal_assignment(tree, "JOURNAL_LINE_LIMIT") == 1,
+            and literal_assignment(tree, "JOURNAL_LINE_LIMIT") == 3
+            and literal_assignment(tree, "JOURNAL_QUERY_LINE_LIMIT") == 4,
             "client bounded journal evidence constants changed")
     require_exact_function(tree, "sanitized_diagnostic", '''def sanitized_diagnostic(value, nonce):
     if isinstance(value, subprocess.TimeoutExpired):
@@ -851,19 +882,26 @@ import time
     except UnicodeDecodeError:
         fail("journal evidence was not ASCII")
     if not output:
-        return ""
+        return (False, False, False)
     lines = output.splitlines(keepends=True)
     if len(lines) > JOURNAL_LINE_LIMIT:
         fail("journal evidence contained extra lines")
-    if lines != [SUCCESS + "\\n"]:
-        fail("journal evidence was not one canonical success line")
-    return SUCCESS + "\\n"
-''', "client journal parser must accept only one exact canonical line")
+    allowed = (CLEANUP_DATABASE_FAILURE, CLEANUP_ROLES_FAILURE, SUCCESS)
+    observed = [line[:-1] for line in lines if line.endswith("\\n")]
+    if (len(observed) != len(lines) or len(set(observed)) != len(observed)
+            or any(line not in allowed for line in observed)
+            or observed != [line for line in allowed if line in observed]
+            or (SUCCESS in observed and len(observed) != 1)):
+        fail("journal evidence was not an exact ordered allowlist")
+    return (SUCCESS in observed, CLEANUP_DATABASE_FAILURE in observed,
+            CLEANUP_ROLES_FAILURE in observed)
+''', "client journal parser must accept only exact ordered category lines")
     require_exact_function(tree, "bounded_journal_evidence", '''def bounded_journal_evidence(invocation):
     deadline = bounded_deadline(JOURNAL_TIMEOUT)
     argv = ("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
-            "--case-sensitive=yes", "--since=-20min", "--lines=2",
-            f"--grep=^{SUCCESS}$", f"_SYSTEMD_INVOCATION_ID={invocation}")
+            "--case-sensitive=yes", "--since=-20min", f"--lines={JOURNAL_QUERY_LINE_LIMIT}",
+            f"--grep=^({CLEANUP_DATABASE_FAILURE}|{CLEANUP_ROLES_FAILURE}|{SUCCESS})$",
+            f"_SYSTEMD_INVOCATION_ID={invocation}")
     try:
         process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
@@ -905,6 +943,35 @@ import time
         process.stdout.close()
     return parse_journal_evidence(bytes(payload))
 ''', "client journal acquisition must be byte/line/time bounded and status-only")
+    early_print_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "print"
+    ]
+    early_expected_stdout = ast.parse("print(SUCCESS, flush=True)").body[0].value
+    early_expected_stderr = ast.parse(
+        "print('verification-client: ' + sanitized_diagnostic(error, None), file=sys.stderr)"
+    ).body[0].value
+    require(len(early_print_calls) == 2
+            and sorted(ast.dump(node) for node in early_print_calls)
+                == sorted((ast.dump(early_expected_stdout), ast.dump(early_expected_stderr)))
+            and not any(isinstance(node, ast.Attribute)
+                        and isinstance(node.value, ast.Name) and node.value.id == "sys"
+                        and node.attr == "stdout" for node in ast.walk(tree)),
+            "client output sinks must retain only canonical success and sanitized stderr")
+    retained_category_contract = '''                if requested_mode == "retained-cleanup-dependency":
+                    category_deadline = bounded_deadline(5)
+                    while not (journal_evidence[1] and journal_evidence[2]):
+                        if time.monotonic() >= category_deadline:
+                            break
+                        time.sleep(0.1)
+                        owned_state(invocation, nonce, exec_argv)
+                        journal_evidence = bounded_journal_evidence(invocation)
+                fail(f"verification invocation failed: {sanitized_state(current)}; "
+                     f"cleanup_database_failed={journal_evidence[1]}; "
+                     f"cleanup_roles_failed={journal_evidence[2]}")
+'''
+    require(source.count(retained_category_contract) == 1,
+            "client retained cleanup category evidence changed")
     require(literal_assignment(tree, "SERVICE_PROPERTIES") == {
         "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
         "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
@@ -1187,7 +1254,11 @@ import time
         'current = owned_state(invocation, nonce, exec_argv,',
         'successful = successful_terminal_state(current)',
         'journal_evidence = bounded_journal_evidence(invocation)',
-        'while not journal_evidence:',
+        'requested_mode == "retained-cleanup-dependency"',
+        'while not (journal_evidence[1] and journal_evidence[2]):',
+        'cleanup_database_failed={journal_evidence[1]}',
+        'cleanup_roles_failed={journal_evidence[2]}',
+        'while not journal_evidence[0]:',
         'print(SUCCESS, flush=True)',
         'teardown_owned(invocation, nonce, exec_argv)',
         'if cgroup_pids(current.get("ControlGroup", "")):',
@@ -1775,19 +1846,23 @@ finally:
     security_constants = {
         "UNIT", "RUN", "PROGRAM", "PATH", "ENVIRONMENT", "NONCE_VARIABLE",
         "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "CLIENT_FAULTS", "CANCELLATION_SIGNALS",
-        "SUCCESS", "JOURNAL_TIMEOUT", "JOURNAL_BYTE_LIMIT", "JOURNAL_LINE_LIMIT",
+        "SUCCESS", "CLEANUP_DATABASE_FAILURE", "CLEANUP_ROLES_FAILURE",
+        "JOURNAL_TIMEOUT", "JOURNAL_BYTE_LIMIT", "JOURNAL_LINE_LIMIT",
+        "JOURNAL_QUERY_LINE_LIMIT",
     }
     protected_constants = budget_constants | security_constants
     expected_protected_load_counts = {
         "ACTION_ATTEMPTS": 6, "ACTION_RETRY_BACKOFF": 3, "ACTION_TIMEOUTS": 3,
         "CANCELLATION_SIGNALS": 4, "CLEANUP_BUDGET": 2, "CLEANUP_ENVELOPE": 1,
+        "CLEANUP_DATABASE_FAILURE": 3, "CLEANUP_ROLES_FAILURE": 3,
         "CLEANUP_MARGIN": 1, "CLEANUP_RESERVE": 2, "CLIENT_FAULTS": 1,
         "DESCRIPTION_PREFIX": 2, "ENVIRONMENT": 2, "JOURNAL_BYTE_LIMIT": 3,
-        "JOURNAL_LINE_LIMIT": 1, "JOURNAL_TIMEOUT": 1, "KILL_WAIT_TIMEOUT": 2,
+        "JOURNAL_LINE_LIMIT": 1, "JOURNAL_QUERY_LINE_LIMIT": 1,
+        "JOURNAL_TIMEOUT": 1, "KILL_WAIT_TIMEOUT": 2,
         "NONCE_VARIABLE": 3, "PATH": 1, "PROGRAM": 3, "PROPERTY_RETRIES": 2,
         "PROPERTY_RETRY_BUDGET": 2, "RUN": 13, "SERVICE_PROPERTIES": 3,
         "SLOW_ACTION_FAULT_SECONDS": 1, "SLOW_PROPERTY_FAULT_SECONDS": 1,
-        "SUCCESS": 4, "TOTAL_BUDGET": 2, "UNIT": 3, "UNLOAD_TIMEOUT": 2,
+        "SUCCESS": 5, "TOTAL_BUDGET": 2, "UNIT": 3, "UNLOAD_TIMEOUT": 2,
         "WORK_BUDGET_FAULT_SECONDS": 1, "WORK_BUDGET_MODES": 2,
     }
     observed_protected_load_counts = {
@@ -2546,7 +2621,8 @@ def validate_containment(source: str, phase: str) -> None:
     ]
     module_assignments = [node for node in tree.body if isinstance(node, ast.Assign)]
     expected_module_assignments = {
-        "UNIT", "READY", "PID_FILES", "ENV", "SUCCESS", "PERSISTENT_PROPERTY_ERROR",
+        "UNIT", "CLEANUP_DATABASE_FAILURE", "CLEANUP_ROLES_FAILURE",
+        "READY", "PID_FILES", "ENV", "SUCCESS", "PERSISTENT_PROPERTY_ERROR",
         "PERSISTENT_ACTION_ERROR", "DIAGNOSTIC_TEXT_LIMIT", "PROGRAM", "NONCE_VARIABLE",
         "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "IDENTITY_PROPERTIES",
         "SYSTEMD_UNIT_OBJECT",
@@ -2556,6 +2632,8 @@ def validate_containment(source: str, phase: str) -> None:
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
     ]
     expected_assignment_nodes = ast.parse('''UNIT = "nmcp-migration-role-verifier.service"
+CLEANUP_DATABASE_FAILURE = "cleanup_database_failed=True"
+CLEANUP_ROLES_FAILURE = "cleanup_roles_failed=True"
 READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
@@ -2625,6 +2703,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     reviewed_persistent_assignments = []
     expected_persistent_constants = {
         "SUCCESS": "Ubuntu migration role compatibility verification passed",
+        "CLEANUP_DATABASE_FAILURE": "cleanup_database_failed=True",
+        "CLEANUP_ROLES_FAILURE": "cleanup_roles_failed=True",
         "PERSISTENT_PROPERTY_ERROR": "unit properties remain unknown:",
         "PERSISTENT_ACTION_ERROR": " command remains unavailable:",
         "DIAGNOSTIC_TEXT_LIMIT": 512,
@@ -2643,7 +2723,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         and node.targets[0] not in reviewed_persistent_assignments
     )
     expected_constant_loads = {
-        "UNIT": 20, "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 6,
+        "UNIT": 20, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
+        "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 6,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "DIAGNOSTIC_TEXT_LIMIT": 5, "PROGRAM": 2, "NONCE_VARIABLE": 2,
         "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 6, "IDENTITY_PROPERTIES": 1,
@@ -2896,14 +2977,25 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                                       type(parent).__name__, field, ast.dump(node)))
     # These normalized AST fingerprints only guard the exact reviewed inventory/context;
     # they are not source authentication and never replace the semantic inventories above.
-    require(hashlib.sha256(repr(sorted(call_target_counts.items())).encode()).hexdigest()
-                == "e412c9eff18b9195d2ce6f4678da7655726ef30747829094c99d1adf77913eca"
-            and hashlib.sha256(repr(sorted(call_contexts)).encode()).hexdigest()
-                == "df97966adfd1e9b28ebe3c68a214273b926426eb09511173996824667e66efaa"
-            and hashlib.sha256(repr(sorted(security_call_contexts)).encode()).hexdigest()
-                == "ecd4072a1215c77bb9e4346d379edbec324ab227cdd8724d47886abe573f0351"
-            and hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest()
-                == "876a82a6aebe9724f9090794c9efa4d7e2a12944f683cd4191b746b5b704b086",
+    observed_call_fingerprints = (
+        hashlib.sha256(repr(sorted(call_target_counts.items())).encode()).hexdigest(),
+        hashlib.sha256(repr(sorted(call_contexts)).encode()).hexdigest(),
+        hashlib.sha256(repr(sorted(security_call_contexts)).encode()).hexdigest(),
+        hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
+    )
+    reviewed_call_fingerprints = {
+        # CPython 3.14 local verifier AST representation.
+        ("e412c9eff18b9195d2ce6f4678da7655726ef30747829094c99d1adf77913eca",
+         "df97966adfd1e9b28ebe3c68a214273b926426eb09511173996824667e66efaa",
+         "ecd4072a1215c77bb9e4346d379edbec324ab227cdd8724d47886abe573f0351",
+         "4d422c364aab13293424b227c6a06d24eb99fb556cd3cb7b1ce85b95b727a80f"),
+        # Ubuntu 24.04 workflow CPython 3.12 verifier AST representation.
+        ("4546fb55fab0f129445eaf03475889f29ef217d664aed8c2ef7019c3eb3f69be",
+         "4b2f918df8d0ac1780411eb6a328e849a2bd23276100f1f343ada407b789ff4a",
+         "c575fcb5eb71bf1138e9fe87e07c3d7e333a9dd1ad5f56b65c1967a32ab136fe",
+         "fa68130a1fea8f9699224592bfc3ecd7739ffb46928649246508e1fa7ff22bd3"),
+    }
+    require(observed_call_fingerprints in reviewed_call_fingerprints,
             "containment call targets, arguments, or use-site contexts changed")
     protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
     expected_call_root_stores = {
@@ -2932,7 +3024,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                                              type(parent).__name__, field, ast.dump(parent)))
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
-                == "b4dc3a95067fe2c2dba7bc61097d8b032f15beb119acbd702c723da69fc43218"
+                in {"b4dc3a95067fe2c2dba7bc61097d8b032f15beb119acbd702c723da69fc43218",
+                    "d3e165d6739578d5914ab1fc17e4a3122c7b69fba82b2496bf0c905d12103399"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -2950,7 +3043,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 372, "AugAssign": 2, "Break": 9, "Continue": 6, "Delete": 1,
+        "Assign": 374, "AugAssign": 2, "Break": 9, "Continue": 6, "Delete": 1,
         "Expr": 277, "For": 37, "FunctionDef": 53, "If": 175, "Import": 9,
         "Pass": 5, "Raise": 4, "Return": 59, "Try": 42, "While": 15, "With": 6,
     }
@@ -2966,7 +3059,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     # The recursive semantic call/module/binding inventories above remain independently required.
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
-                == "7c8fc4e9f57e6f5578190e318d01a981b92ccaebd29409d2eb1eb7e3d706f778",
+                in {"ebfcd16a322c1c012d46afb933c52190b967784a199d990690a44c3f2b29c48e",
+                    "1d65a7f977059995f0dea5d35570cca64e95c8d66fac6f955031a10866d11430"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -3288,7 +3382,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         '"old client teardown touched the reused-name sentinel"',
         '"retained-cleanup-dependency"',
         'if retained.returncode == 0:',
-        '"drop database exited" not in retained.stdout or "drop roles exited" not in retained.stdout',
+        'CLEANUP_DATABASE_FAILURE not in retained.stderr',
+        'CLEANUP_ROLES_FAILURE not in retained.stderr',
         '"failed retained-dependency cleanup emitted success"',
         'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
         '"retained-dependency recovery did not harden and clean"',
@@ -3436,7 +3531,8 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
                     and node.func.id == "cleanup_signed_launch_until"
                     for statement in stale_phase_tries[0].finalbody for node in ast.walk(statement))
             and hashlib.sha256(repr([ast.dump(node) for node in stale_nodes]).encode()).hexdigest()
-                == "e3f7360ede32bccfe8ab6627fe3e5a9e5a3ecd457959b3425e96fbc7e47dd80b",
+                in {"e3f7360ede32bccfe8ab6627fe3e5a9e5a3ecd457959b3425e96fbc7e47dd80b",
+                    "f621abbcb669f1170e20ecda304ea37810013d467abdbeee123c5766c6a1295b"},
             "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
 
     persistent_loops = []
@@ -4126,7 +4222,12 @@ def verify_supervisor_mutations(
         ("cleanup target follows symlink", replace_once(supervisor, 'descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)', 'descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent_fd)'), "durable intent"),
         ("cleanup target identity omitted", replace_once(supervisor, 'if expected is not None and metadata(top) != expected:', 'if False:'), "durable intent"),
         ("intent journal not directory fsynced", replace_once(supervisor, 'os.replace(temporary, INTENT_PATH)\n    fsync_directory("/run/nmcp-ci")', 'os.replace(temporary, INTENT_PATH)'), "durable intent"),
-        ("dropdb status unchecked", replace_once(supervisor, '                if result.returncode:\n                    cleanup_errors.append(RuntimeError(', '                if False:\n                    cleanup_errors.append(RuntimeError('), "cleanup"),
+        ("dropdb status unchecked", replace_once(supervisor,
+            '                if result.returncode:\n                    print(marker, file=sys.stderr, flush=True)\n                    cleanup_errors.append(RuntimeError(',
+            '                if False:\n                    print(marker, file=sys.stderr, flush=True)\n                    cleanup_errors.append(RuntimeError('), "cleanup"),
+        ("cleanup result marker omitted", replace_once(supervisor,
+            '                    print(marker, file=sys.stderr, flush=True)\n                    cleanup_errors.append(RuntimeError(',
+            '                    cleanup_errors.append(RuntimeError('), "cleanup"),
         ("cleanup exceptions discarded", replace_once(supervisor, 'cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))', 'pass'), "cleanup"),
         ("cleanup aggregation omitted", replace_once(supervisor, '        if cleanup_errors:\n            raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))', '        pass'), "independent cleanup"),
         ("dropdb cleanup omitted", replace_once(supervisor, '            ("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp")),\n', ''), "cleanup"),
@@ -4156,27 +4257,47 @@ def verify_supervisor_mutations(
     for label, mutation, expected in supervisor_mutations:
         expect_rejected(validate_supervisor, mutation, label, expected)
     client_mutations = [
+        ("journal unreviewed import", replace_once(client,
+            "import select\n", "import select\nimport socket\n")),
         ("journal byte cap widened", replace_once(client,
             "JOURNAL_BYTE_LIMIT = 256", "JOURNAL_BYTE_LIMIT = 4096")),
         ("journal line cap widened", replace_once(client,
-            "JOURNAL_LINE_LIMIT = 1", "JOURNAL_LINE_LIMIT = 2")),
+            "JOURNAL_LINE_LIMIT = 3", "JOURNAL_LINE_LIMIT = 4")),
+        ("journal query line cap widened", replace_once(client,
+            "JOURNAL_QUERY_LINE_LIMIT = 4", "JOURNAL_QUERY_LINE_LIMIT = 40")),
         ("journal timeout widened", replace_once(client,
             "JOURNAL_TIMEOUT = 5", "JOURNAL_TIMEOUT = 50")),
         ("journal Unicode decoding allowed", replace_once(client,
             '        output = payload.decode("ascii")',
             '        output = payload.decode("utf-8")')),
         ("journal substring accepted", replace_once(client,
-            '    if lines != [SUCCESS + "\\n"]:',
-            '    if SUCCESS not in output:')),
+            '            or any(line not in allowed for line in observed)',
+            '            or False')),
+        ("journal duplicate category accepted", replace_once(client,
+            'len(set(observed)) != len(observed)', 'False')),
+        ("journal mixed success accepted", replace_once(client,
+            '(SUCCESS in observed and len(observed) != 1)', 'False')),
         ("journal stderr retained", replace_once(client,
             '                                   stderr=subprocess.DEVNULL)',
             '                                   stderr=subprocess.PIPE)')),
         ("journal invocation binding omitted", replace_once(client,
-            '            f"--grep=^{SUCCESS}$", f"_SYSTEMD_INVOCATION_ID={invocation}")',
-            '            f"--grep=^{SUCCESS}$")')),
+            '            f"_SYSTEMD_INVOCATION_ID={invocation}")',
+            '            "_SYSTEMD_UNIT=nmcp-migration-role-verifier.service")')),
         ("journal nonzero accepted", replace_once(client,
             '        if status:\n            fail(f"journal evidence query failed with status {status}")',
             '        if status:\n            pass')),
+        ("retained cleanup category polling omitted", replace_once(client,
+            '                if requested_mode == "retained-cleanup-dependency":\n'
+            '                    category_deadline = bounded_deadline(5)\n'
+            '                    while not (journal_evidence[1] and journal_evidence[2]):\n'
+            '                        if time.monotonic() >= category_deadline:\n'
+            '                            break\n'
+            '                        time.sleep(0.1)\n'
+            '                        owned_state(invocation, nonce, exec_argv)\n'
+            '                        journal_evidence = bounded_journal_evidence(invocation)\n', '')),
+        ("retained cleanup roles category omitted", replace_once(client,
+            '                     f"cleanup_roles_failed={journal_evidence[2]}")',
+            '                     "cleanup_roles_failed=False")')),
         ("raw journal written to stdout", replace_once(client,
             '    print(SUCCESS, flush=True)\n    return result',
             '    sys.stdout.write(journal_evidence)\n    return result')),
@@ -4707,6 +4828,40 @@ def verify_supervisor_mutations(
         ("journal fault hook omitted", replace_once(client, '            if requested_mode == "client-fault-after-journal":\n                fail("injected client failure after journal capture")\n', '')),
         ("post-unload lock-held pause omitted", replace_once(client, '        if requested_mode == "client-terminal-race-a":\n            client_pause("client-terminal-race-a-unloaded")\n', '')),
     ]
+    journal_mutation_categories = {
+        "journal unreviewed import": "client imports",
+        "journal byte cap widened": "bounded journal evidence constants",
+        "journal line cap widened": "bounded journal evidence constants",
+        "journal query line cap widened": "bounded journal evidence constants",
+        "journal timeout widened": "bounded journal evidence constants",
+        "journal Unicode decoding allowed": "client journal parser",
+        "journal substring accepted": "client journal parser",
+        "journal duplicate category accepted": "client journal parser",
+        "journal mixed success accepted": "client journal parser",
+        "journal stderr retained": "client journal acquisition",
+        "journal invocation binding omitted": "client journal acquisition",
+        "journal nonzero accepted": "client journal acquisition",
+        "retained cleanup category polling omitted": "retained cleanup category evidence",
+        "retained cleanup roles category omitted": "retained cleanup category evidence",
+        "raw journal written to stdout": "client output sinks",
+        "raw journal written to numeric stdout": "client output sinks",
+        "raw stderr written to computed stdout": "client output sinks",
+        "raw stderr written through descriptor alias": "client output sinks",
+        "subprocess stderr written to numeric stderr": "client output sinks",
+        "nonce argv written to special stderr path": "client output sinks",
+        "nonce argv written to keyword stderr path": "client output sinks",
+        "nonce argv emitted by inherited subprocess": "client output sinks",
+        "nonce argv emitted by aliased print": "client output sinks",
+        "raw stderr emitted by aliased os write": "client output sinks",
+        "nonce argv emitted by aliased open": "client output sinks",
+        "nonce argv emitted by aliased subprocess": "client output sinks",
+        "nonce argv emitted by os spawn": "client output sinks",
+        "raw stderr emitted through os path module": "client output sinks",
+        "nonce argv spawned through os path module": "client output sinks",
+        "raw stderr emitted through subprocess os": "client output sinks",
+        "nonce argv emitted through subprocess sys": "client output sinks",
+        "success emitted before cleanup": "emit success only after client.lock",
+    }
     callable_binding_mutations = [
         ("reviewer reproduced terminal helper widening", replace_once(client,
             '\n\ndef cgroup_pids(control_group):',
@@ -4794,12 +4949,53 @@ def verify_supervisor_mutations(
             'lambda state: True\n\n\n'
             'def cgroup_pids(control_group):' )),
     ]
+    snapshot_only_mutation = replace_once(
+        client, '"""Launch and attest the fixed migration-role verification service."""',
+        '"""Launch and attest the fixed migration-role verification service."""\n'
+        '# Stable snapshot separation fixture.')
+    validate_client(snapshot_only_mutation, enforce_snapshot=False)
+    expect_rejected(validate_client, snapshot_only_mutation, "stable source snapshot fixture",
+                    "stable UTF-8/LF source snapshot")
+    try:
+        stable_source_digest(client.replace("\n", "\r\n"))
+    except RuntimeError as error:
+        require("canonical UTF-8/LF" in str(error),
+                "CRLF snapshot fixture failed for the wrong reason")
+    else:
+        raise RuntimeError("stable source snapshot accepted CRLF bytes")
+    with tempfile.TemporaryDirectory(prefix="nmcp-source-bytes-") as directory:
+        crlf_path = pathlib.Path(directory) / "client"
+        crlf_path.write_bytes(client.replace("\n", "\r\n").encode("utf-8"))
+        try:
+            text(crlf_path)
+        except RuntimeError as error:
+            require("canonical UTF-8/LF source bytes" in str(error),
+                    "CRLF source-loader fixture failed for the wrong reason")
+        else:
+            raise RuntimeError("source loader normalized CRLF bytes before validation")
+        crlf_path.write_bytes(client.rstrip("\n").encode("utf-8"))
+        try:
+            text(crlf_path)
+        except RuntimeError as error:
+            require("canonical UTF-8/LF source bytes" in str(error),
+                    "missing-final-LF fixture failed for the wrong reason")
+        else:
+            raise RuntimeError("source loader accepted missing final LF")
+        crlf_path.write_bytes(b"\xff\n")
+        try:
+            text(crlf_path)
+        except UnicodeDecodeError:
+            pass
+        else:
+            raise RuntimeError("source loader accepted invalid UTF-8")
     for label, mutation in callable_binding_mutations:
         ast.parse(mutation, filename=f"<client mutation: {label}>")
         compile(mutation, f"<client mutation: {label}>", "exec")
-        expect_rejected(validate_client, mutation, label, "client")
+        expect_rejected(lambda candidate: validate_client(candidate, enforce_snapshot=False),
+                        mutation, label, "client")
     for label, mutation in client_mutations:
-        expect_rejected(validate_client, mutation, label, "client")
+        expect_rejected(lambda candidate: validate_client(candidate, enforce_snapshot=False),
+                        mutation, label, journal_mutation_categories.get(label, "client"))
     containment_mutations = [
         ("persistent diagnostic streams exposed", replace_once(containment,
             '        f"stdout_present={bool(faulted.stdout)!r}; stderr_present={bool(faulted.stderr)!r}; "',
@@ -5645,7 +5841,9 @@ def verify_supervisor_mutations(
           'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
           'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-register"):' )),
         ("retained failure accepted", replace_once(containment, 'if retained.returncode == 0:', 'if False:')),
-        ("cleanup failure evidence weakened", replace_once(containment, '"drop database exited" not in retained.stdout or "drop roles exited" not in retained.stdout', '"drop database exited" not in retained.stdout')),
+        ("cleanup failure evidence weakened", replace_once(containment,
+            'CLEANUP_DATABASE_FAILURE not in retained.stderr\n            or CLEANUP_ROLES_FAILURE not in retained.stderr',
+            'CLEANUP_DATABASE_FAILURE not in retained.stderr')),
         ("retained recovery accepted", replace_once(containment, 'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):', 'if False:')),
     ]
     runtime_valid_containment_mutations = {

@@ -13,6 +13,8 @@ import time
 
 
 UNIT = "nmcp-migration-role-verifier.service"
+CLEANUP_DATABASE_FAILURE = "cleanup_database_failed=True"
+CLEANUP_ROLES_FAILURE = "cleanup_roles_failed=True"
 READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
@@ -1638,7 +1640,8 @@ raise SystemExit(73)
         fail("retained database dependency did not fail cleanup")
     if "Ubuntu migration role compatibility verification passed" in retained.stdout:
         fail("failed retained-dependency cleanup emitted success")
-    if "drop database exited" not in retained.stdout or "drop roles exited" not in retained.stdout:
+    if (CLEANUP_DATABASE_FAILURE not in retained.stderr
+            or CLEANUP_ROLES_FAILURE not in retained.stderr):
         fail("cleanup did not independently report database and role failures")
     recovered = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary),
                     stdout=None, stderr=None)
