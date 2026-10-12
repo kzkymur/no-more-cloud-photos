@@ -3,6 +3,7 @@
 
 import fcntl
 import os
+import select
 import secrets
 import shlex
 import signal
@@ -23,6 +24,10 @@ ENVIRONMENT = {
 }
 NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
 DESCRIPTION_PREFIX = "NMCP migration role verifier "
+SUCCESS = "Ubuntu migration role compatibility verification passed"
+JOURNAL_TIMEOUT = 5
+JOURNAL_BYTE_LIMIT = 256
+JOURNAL_LINE_LIMIT = 1
 SERVICE_PROPERTIES = {
     "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
     "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
@@ -136,6 +141,70 @@ def command(argv, *, check=True, stdout=subprocess.PIPE, timeout=30):
         if CLEANUP_ACTIVE and time.monotonic() >= COMMAND_DEADLINE:
             raise RuntimeError("absolute client cleanup deadline exhausted") from None
         raise RuntimeError("client subprocess timed out") from None
+
+
+def parse_journal_evidence(payload):
+    if len(payload) > JOURNAL_BYTE_LIMIT:
+        fail("journal evidence exceeded byte limit")
+    try:
+        output = payload.decode("ascii")
+    except UnicodeDecodeError:
+        fail("journal evidence was not ASCII")
+    if not output:
+        return ""
+    lines = output.splitlines(keepends=True)
+    if len(lines) > JOURNAL_LINE_LIMIT:
+        fail("journal evidence contained extra lines")
+    if lines != [SUCCESS + "\n"]:
+        fail("journal evidence was not one canonical success line")
+    return SUCCESS + "\n"
+
+
+def bounded_journal_evidence(invocation):
+    deadline = bounded_deadline(JOURNAL_TIMEOUT)
+    argv = ("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
+            "--case-sensitive=yes", "--since=-20min", "--lines=2",
+            f"--grep=^{SUCCESS}$", f"_SYSTEMD_INVOCATION_ID={invocation}")
+    try:
+        process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+    except OSError as error:
+        fail("journal evidence query could not start: " + sanitized_diagnostic(error, None))
+    payload = bytearray()
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("journal evidence query timed out")
+            readable, _writable, _exceptional = select.select(
+                (process.stdout.fileno(),), (), (), remaining)
+            if not readable:
+                fail("journal evidence query timed out")
+            chunk = os.read(process.stdout.fileno(), JOURNAL_BYTE_LIMIT + 1 - len(payload))
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > JOURNAL_BYTE_LIMIT:
+                fail("journal evidence exceeded byte limit")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("journal evidence query timed out")
+        try:
+            status = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            fail("journal evidence query timed out")
+        if status:
+            fail(f"journal evidence query failed with status {status}")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        process.stdout.close()
+    return parse_journal_evidence(bytes(payload))
 
 
 def record_counter(name):
@@ -669,23 +738,19 @@ def main():
                 fail("injected client failure at terminal state")
             if requested_mode == "client-work-budget-journal":
                 exhaust_work_budget("journal")
-            command(("/usr/bin/journalctl", "--sync"), check=False)
-            journal = command(("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
-                               f"_SYSTEMD_INVOCATION_ID={invocation}")).stdout
-            sys.stdout.write(journal)
+            journal_evidence = bounded_journal_evidence(invocation)
             if requested_mode == "client-fault-after-journal":
                 fail("injected client failure after journal capture")
             successful = successful_terminal_state(current)
             if not successful:
                 fail(f"verification invocation failed: {sanitized_state(current)}")
             deadline = bounded_deadline(5)
-            while journal.count("Ubuntu migration role compatibility verification passed") != 1:
+            while not journal_evidence:
                 if time.monotonic() >= deadline:
                     fail("exact invocation journal lacks one final success marker")
                 time.sleep(0.1)
                 owned_state(invocation, nonce, exec_argv)
-                journal = command(("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
-                                   f"_SYSTEMD_INVOCATION_ID={invocation}")).stdout
+                journal_evidence = bounded_journal_evidence(invocation)
             if cgroup_pids(current.get("ControlGroup", "")):
                 fail("successful invocation left control-group processes")
             result = 0
@@ -745,9 +810,10 @@ def main():
             raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None
         if requested_mode == "client-terminal-race-a":
             client_pause("client-terminal-race-a-unloaded")
-        return result
     finally:
         os.close(client_lock)
+    print(SUCCESS, flush=True)
+    return result
 
 
 if __name__ == "__main__":

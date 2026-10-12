@@ -87,6 +87,114 @@ def verify_nonce_safe_diagnostics(client_path: pathlib.Path, containment_path: p
     assert_clean(state_rendered, "client owned state")
     require(secret not in state_rendered, "client owned state retained redacted fields")
 
+    success = client["SUCCESS"]
+    require(client["parse_journal_evidence"]((success + "\n").encode("ascii"))
+            == success + "\n" and client["parse_journal_evidence"](b"") == "",
+            "client journal parser rejected canonical or absent evidence")
+    separated = {
+        label: separator.join(nonce[index:index + 2] for index in range(0, len(nonce), 2))
+        for label, separator in (("colon", ":"), ("space", " "), ("hyphen", "-"))
+    }
+    hostile_journal = {
+        "uppercase hex": success + ":" + nonce.upper() + "\n",
+        **{label: success + ":" + value + "\n" for label, value in separated.items()},
+        "CRLF": success + "\r\n",
+        "ANSI": "\x1b[32m" + success + "\x1b[0m\n",
+        "C0": success + "\x00\n",
+        "C1": success + "\u0085\n",
+        "zero width": success[:8] + "\u200d" + success[8:] + "\n",
+        "bidi": success[:8] + "\u202e" + success[8:] + "\n",
+        "NFKC": "Ｕ" + success[1:] + "\n",
+        "field fragments": "MESSAGE=" + success + "\n",
+        "multiline aggregation": success + "\n" + nonce + "\n",
+        "truncated canonical": success,
+        "boundary padding": success + "\n" + "x" * (client["JOURNAL_BYTE_LIMIT"] - len(success) - 1),
+    }
+    for label, value in hostile_journal.items():
+        payload = value.encode("utf-8")
+        try:
+            client["parse_journal_evidence"](payload)
+        except RuntimeError as error:
+            rendered = client["sanitized_diagnostic"](error, nonce)
+            assert_clean(rendered, f"client journal {label}")
+            require(value not in rendered and success not in rendered,
+                    f"client journal {label} diagnostic retained raw evidence")
+        else:
+            raise RuntimeError(f"client journal parser accepted {label}")
+    overflow = (success + "\n").encode("ascii") + b"x" * client["JOURNAL_BYTE_LIMIT"]
+    try:
+        client["parse_journal_evidence"](overflow)
+    except RuntimeError as error:
+        assert_clean(client["sanitized_diagnostic"](error, nonce), "client journal overflow")
+    else:
+        raise RuntimeError("client journal parser accepted byte overflow")
+
+    class FakeJournalProcess:
+        def __init__(self, payload, status=0):
+            read_fd, write_fd = os.pipe()
+            os.write(write_fd, payload)
+            os.close(write_fd)
+            self.stdout = self
+            self.read_fd = read_fd
+            self.status = status
+
+        def fileno(self):
+            return self.read_fd
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.status
+
+        def poll(self):
+            return self.status
+
+        def kill(self):
+            self.status = -9
+
+        def close(self):
+            os.close(self.read_fd)
+
+    original_popen = subprocess.Popen
+    original_select = client["select"].select
+    try:
+        subprocess.Popen = lambda *_args, **_kwargs: FakeJournalProcess(
+            (success + "\n").encode("ascii"))
+        require(client["bounded_journal_evidence"]("a" * 32) == success + "\n",
+                "client bounded journal acquisition rejected canonical evidence")
+        subprocess.Popen = lambda *_args, **_kwargs: FakeJournalProcess(overflow)
+        try:
+            client["bounded_journal_evidence"]("a" * 32)
+        except RuntimeError as error:
+            assert_clean(client["sanitized_diagnostic"](error, nonce),
+                         "client acquired journal overflow")
+        else:
+            raise RuntimeError("client bounded journal acquisition accepted overflow")
+        subprocess.Popen = lambda *_args, **_kwargs: FakeJournalProcess(
+            (success + "\n").encode("ascii"), status=7)
+        try:
+            client["bounded_journal_evidence"]("a" * 32)
+        except RuntimeError as error:
+            rendered = client["sanitized_diagnostic"](error, nonce)
+            assert_clean(rendered, "client journal nonzero")
+            require("status 7" in rendered and success not in rendered,
+                    "client journal nonzero diagnostic lost status or retained evidence")
+        else:
+            raise RuntimeError("client bounded journal acquisition accepted nonzero status")
+        subprocess.Popen = lambda *_args, **_kwargs: FakeJournalProcess(b"")
+        client["select"].select = lambda *_args, **_kwargs: ((), (), ())
+        try:
+            client["bounded_journal_evidence"]("a" * 32)
+        except RuntimeError as error:
+            rendered = client["sanitized_diagnostic"](error, nonce)
+            assert_clean(rendered, "client journal timeout")
+            require("timed out" in rendered,
+                    "client journal timeout diagnostic lost fixed classification")
+        else:
+            raise RuntimeError("client bounded journal acquisition accepted timeout")
+    finally:
+        client["select"].select = original_select
+        subprocess.Popen = original_popen
+
     malformed = subprocess.CompletedProcess(
         ("systemctl", "show"), 0, "LoadState=loaded\n" + secret + nonce + "\n", "")
     try:
@@ -647,6 +755,28 @@ def validate_supervisor(source: str) -> None:
 
 def validate_client(source: str) -> None:
     tree = ast.parse(source, filename="verify-ubuntu-migration-role-client")
+    # This client handles nonce-bearing argv, captured subprocess streams, and
+    # journal bytes. Bind the complete executable AST so an unreviewed call or
+    # alias cannot introduce a new output sink outside the inventories below.
+    normalized_digest = hashlib.sha256(
+        ast.dump(tree, include_attributes=False).encode("utf-8")
+    ).hexdigest()
+    require(normalized_digest == "69f1e6a3a94ab2d9efc9f50a10c32c187f9c2e1601b99f7122dac42724ec8222",
+            "client reviewed executable AST contract changed")
+    imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    expected_imports = ast.parse('''import fcntl
+import os
+import select
+import secrets
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import time
+''').body
+    require([ast.dump(node) for node in imports] == [ast.dump(node) for node in expected_imports],
+            "client imports must remain the reviewed closed module set")
     expected_guard = ast.parse('''if __name__ == "__main__":
     try:
         raise SystemExit(main())
@@ -674,6 +804,12 @@ def validate_client(source: str) -> None:
     require(literal_assignment(tree, "NONCE_VARIABLE") == "NMCP_VERIFIER_NONCE"
             and literal_assignment(tree, "DESCRIPTION_PREFIX") == "NMCP migration role verifier ",
             "client nonce launch labels changed")
+    require(literal_assignment(tree, "SUCCESS")
+                == "Ubuntu migration role compatibility verification passed"
+            and literal_assignment(tree, "JOURNAL_TIMEOUT") == 5
+            and literal_assignment(tree, "JOURNAL_BYTE_LIMIT") == 256
+            and literal_assignment(tree, "JOURNAL_LINE_LIMIT") == 1,
+            "client bounded journal evidence constants changed")
     require_exact_function(tree, "sanitized_diagnostic", '''def sanitized_diagnostic(value, nonce):
     if isinstance(value, subprocess.TimeoutExpired):
         text = "subprocess timed out"
@@ -707,6 +843,68 @@ def validate_client(source: str) -> None:
                   "Result", "ExecMainCode", "ExecMainStatus")
     return {name: state.get(name) for name in safe_names if name in state}
 ''', "client state diagnostics must use the strict safe-property allowlist")
+    require_exact_function(tree, "parse_journal_evidence", '''def parse_journal_evidence(payload):
+    if len(payload) > JOURNAL_BYTE_LIMIT:
+        fail("journal evidence exceeded byte limit")
+    try:
+        output = payload.decode("ascii")
+    except UnicodeDecodeError:
+        fail("journal evidence was not ASCII")
+    if not output:
+        return ""
+    lines = output.splitlines(keepends=True)
+    if len(lines) > JOURNAL_LINE_LIMIT:
+        fail("journal evidence contained extra lines")
+    if lines != [SUCCESS + "\\n"]:
+        fail("journal evidence was not one canonical success line")
+    return SUCCESS + "\\n"
+''', "client journal parser must accept only one exact canonical line")
+    require_exact_function(tree, "bounded_journal_evidence", '''def bounded_journal_evidence(invocation):
+    deadline = bounded_deadline(JOURNAL_TIMEOUT)
+    argv = ("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
+            "--case-sensitive=yes", "--since=-20min", "--lines=2",
+            f"--grep=^{SUCCESS}$", f"_SYSTEMD_INVOCATION_ID={invocation}")
+    try:
+        process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+    except OSError as error:
+        fail("journal evidence query could not start: " + sanitized_diagnostic(error, None))
+    payload = bytearray()
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("journal evidence query timed out")
+            readable, _writable, _exceptional = select.select(
+                (process.stdout.fileno(),), (), (), remaining)
+            if not readable:
+                fail("journal evidence query timed out")
+            chunk = os.read(process.stdout.fileno(), JOURNAL_BYTE_LIMIT + 1 - len(payload))
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > JOURNAL_BYTE_LIMIT:
+                fail("journal evidence exceeded byte limit")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("journal evidence query timed out")
+        try:
+            status = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            fail("journal evidence query timed out")
+        if status:
+            fail(f"journal evidence query failed with status {status}")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        process.stdout.close()
+    return parse_journal_evidence(bytes(payload))
+''', "client journal acquisition must be byte/line/time bounded and status-only")
     require(literal_assignment(tree, "SERVICE_PROPERTIES") == {
         "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
         "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
@@ -988,8 +1186,9 @@ def validate_client(source: str) -> None:
         'fail(f"missing exact invocation identity: {sanitized_state(observed)}")',
         'current = owned_state(invocation, nonce, exec_argv,',
         'successful = successful_terminal_state(current)',
-        'f"_SYSTEMD_INVOCATION_ID={invocation}"',
-        'journal.count("Ubuntu migration role compatibility verification passed") != 1',
+        'journal_evidence = bounded_journal_evidence(invocation)',
+        'while not journal_evidence:',
+        'print(SUCCESS, flush=True)',
         'teardown_owned(invocation, nonce, exec_argv)',
         'if cgroup_pids(current.get("ControlGroup", "")):',
         'for signum in CANCELLATION_SIGNALS:',
@@ -1021,6 +1220,140 @@ def validate_client(source: str) -> None:
     for parent in ast.walk(main_node):
         for child in ast.iter_child_nodes(parent):
             parents[child] = parent
+    print_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "print"
+    ]
+    expected_stdout = ast.parse("print(SUCCESS, flush=True)").body[0].value
+    expected_stderr = ast.parse(
+        "print('verification-client: ' + sanitized_diagnostic(error, None), file=sys.stderr)"
+    ).body[0].value
+    sys_output_attributes = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name) and node.value.id == "sys"
+        and node.attr in {"stdout", "stderr"}
+    ]
+    numeric_output_sinks = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id == "os"
+        and (
+            node.func.attr in {"write", "fdopen"} and node.args
+            and isinstance(node.args[0], ast.Constant) and node.args[0].value in {1, 2}
+            or node.func.attr == "dup2" and len(node.args) > 1
+            and isinstance(node.args[1], ast.Constant) and node.args[1].value in {1, 2}
+        )
+    ]
+    special_output_paths = {
+        "/dev/stdout", "/dev/stderr", "/dev/fd/1", "/dev/fd/2",
+        "/proc/self/fd/1", "/proc/self/fd/2",
+    }
+    special_output_opens = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call) and node.args
+        and ((isinstance(node.func, ast.Name) and node.func.id == "open")
+             or isinstance(node.func, ast.Attribute) and node.func.attr in {"open", "write_text", "write_bytes"})
+        and constant_string(node.args[0]) in special_output_paths
+    ]
+    os_write_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "os" and node.func.attr == "write"
+    ]
+    expected_os_writes = [
+        ast.parse('os.write(descriptor, b"ready\\n")').body[0].value,
+        ast.parse("os.write(descriptor, source)").body[0].value,
+    ]
+    builtin_open_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "open"
+    ]
+    expected_builtin_open = ast.parse(
+        "open(os.path.join(directory, 'cgroup.procs'), encoding='ascii')"
+    ).body[0].value
+    fdopen_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "os" and node.func.attr == "fdopen"
+    ]
+    expected_fdopen = ast.parse("os.fdopen(descriptor, 'r+', encoding='ascii')").body[0].value
+    subprocess_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ]
+    expected_subprocess_calls = [
+        ast.parse('''subprocess.run(argv, cwd="/", env=ENVIRONMENT, check=check,
+                   stdout=stdout, stderr=subprocess.PIPE, text=True, timeout=timeout)
+''').body[0].value,
+        ast.parse('''subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
+                     stderr=subprocess.DEVNULL)
+''').body[0].value,
+    ]
+    sys_attributes = [
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name) and node.value.id == "sys"
+    ]
+    forbidden_os_output_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "os"
+        and node.func.attr in {"writev", "sendfile", "splice", "copy_file_range", "system", "popen"}
+    ]
+    print_loads = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Name)
+        and node.id == "print" and isinstance(node.ctx, ast.Load)
+    ]
+    open_loads = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Name)
+        and node.id == "open" and isinstance(node.ctx, ast.Load)
+    ]
+    os_sink_references = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name) and node.value.id == "os"
+        and node.attr in {"write", "fdopen"}
+    ]
+    subprocess_launcher_references = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name) and node.value.id == "subprocess"
+        and node.attr in {"run", "Popen", "call", "check_call", "check_output",
+                          "getoutput", "getstatusoutput"}
+    ]
+    os_launcher_references = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name) and node.value.id == "os"
+        and (node.attr.startswith("exec") or node.attr.startswith("spawn")
+             or node.attr in {"system", "popen"})
+    ]
+    transitive_sensitive_references = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Attribute) and node.value.attr in {"os", "sys"}
+        and (node.attr in {"write", "writev", "fdopen", "dup2", "sendfile", "splice",
+                           "copy_file_range", "system", "popen", "stdout", "stderr"}
+             or node.attr.startswith("exec") or node.attr.startswith("spawn"))
+    ]
+    require(len(print_calls) == 2
+            and any(ast.dump(node) == ast.dump(expected_stdout) for node in print_calls)
+            and any(ast.dump(node) == ast.dump(expected_stderr) for node in print_calls)
+            and len(sys_output_attributes) == 1
+            and sys_output_attributes[0].attr == "stderr"
+            and not numeric_output_sinks and not special_output_opens
+            and [ast.dump(node) for node in os_write_calls]
+                == [ast.dump(node) for node in expected_os_writes]
+            and len(builtin_open_calls) == 1
+            and ast.dump(builtin_open_calls[0]) == ast.dump(expected_builtin_open)
+            and len(fdopen_calls) == 1 and ast.dump(fdopen_calls[0]) == ast.dump(expected_fdopen)
+            and [ast.dump(node) for node in subprocess_calls]
+                == [ast.dump(node) for node in expected_subprocess_calls]
+            and sorted(sys_attributes) == sorted(["argv"] * 6 + ["stderr"])
+            and not forbidden_os_output_calls
+            and print_loads == [node.func for node in print_calls]
+            and open_loads == [builtin_open_calls[0].func]
+            and sorted(ast.dump(node) for node in os_sink_references)
+                == sorted(ast.dump(node.func) for node in (*os_write_calls, fdopen_calls[0]))
+            and sorted(ast.dump(node) for node in subprocess_launcher_references)
+                == sorted(ast.dump(node.func) for node in subprocess_calls)
+            and not os_launcher_references and not transitive_sensitive_references,
+            "client output sinks must be the canonical success line and sanitized stderr only")
     routing_starts = [
         index for index, node in enumerate(main_node.body)
         if isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -1079,12 +1412,11 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
         "launched = command(service_argv, check=False)",
         'owned_state(invocation, nonce, exec_argv)',
         'current = owned_state(invocation, nonce, exec_argv,',
-        'f"_SYSTEMD_INVOCATION_ID={invocation}"',
+        "journal_evidence = bounded_journal_evidence(invocation)",
         'if cgroup_pids(current.get("ControlGroup", "")):',
         "teardown_owned(invocation, nonce, exec_argv)",
         "raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None",
         'client_pause("client-terminal-race-a-unloaded")',
-        "return result",
         "os.close(client_lock)",
     )
     positions = [lock_source.find(fragment) for fragment in ordered_lock_fragments]
@@ -1311,7 +1643,7 @@ finally:
     expected_deadline_targets = [node.targets[0] for node in expected_deadline_assignments]
     exact_deadline_function_names = [
         node for function_name in (
-            "bounded_deadline", "command", "command_path", "exhaust_work_budget",
+            "bounded_deadline", "bounded_journal_evidence", "command", "command_path", "exhaust_work_budget",
             "wait_unloaded", "teardown_owned",
         )
         for node in ast.walk(named_function(tree, function_name))
@@ -1443,17 +1775,19 @@ finally:
     security_constants = {
         "UNIT", "RUN", "PROGRAM", "PATH", "ENVIRONMENT", "NONCE_VARIABLE",
         "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "CLIENT_FAULTS", "CANCELLATION_SIGNALS",
+        "SUCCESS", "JOURNAL_TIMEOUT", "JOURNAL_BYTE_LIMIT", "JOURNAL_LINE_LIMIT",
     }
     protected_constants = budget_constants | security_constants
     expected_protected_load_counts = {
         "ACTION_ATTEMPTS": 6, "ACTION_RETRY_BACKOFF": 3, "ACTION_TIMEOUTS": 3,
         "CANCELLATION_SIGNALS": 4, "CLEANUP_BUDGET": 2, "CLEANUP_ENVELOPE": 1,
         "CLEANUP_MARGIN": 1, "CLEANUP_RESERVE": 2, "CLIENT_FAULTS": 1,
-        "DESCRIPTION_PREFIX": 2, "ENVIRONMENT": 1, "KILL_WAIT_TIMEOUT": 2,
+        "DESCRIPTION_PREFIX": 2, "ENVIRONMENT": 2, "JOURNAL_BYTE_LIMIT": 3,
+        "JOURNAL_LINE_LIMIT": 1, "JOURNAL_TIMEOUT": 1, "KILL_WAIT_TIMEOUT": 2,
         "NONCE_VARIABLE": 3, "PATH": 1, "PROGRAM": 3, "PROPERTY_RETRIES": 2,
         "PROPERTY_RETRY_BUDGET": 2, "RUN": 13, "SERVICE_PROPERTIES": 3,
         "SLOW_ACTION_FAULT_SECONDS": 1, "SLOW_PROPERTY_FAULT_SECONDS": 1,
-        "TOTAL_BUDGET": 2, "UNIT": 3, "UNLOAD_TIMEOUT": 2,
+        "SUCCESS": 4, "TOTAL_BUDGET": 2, "UNIT": 3, "UNLOAD_TIMEOUT": 2,
         "WORK_BUDGET_FAULT_SECONDS": 1, "WORK_BUDGET_MODES": 2,
     }
     observed_protected_load_counts = {
@@ -1574,6 +1908,9 @@ finally:
         ast.dump(ast.parse(
             "previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)"
         ).body[0]): 2,
+        ast.dump(ast.parse('''process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL)
+''').body[0]): 1,
     }
     observed_reviewed_mutable_assignments = {
         dump: sum(1 for node in ast.walk(tree) if isinstance(node, ast.Assign)
@@ -1714,11 +2051,17 @@ if primary_error is not None:
     raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None
 if requested_mode == "client-terminal-race-a":
     client_pause("client-terminal-race-a-unloaded")
-return result
 ''').body
     require([ast.dump(node) for node in lock_try.body[launch_index + 1:]]
             == [ast.dump(node) for node in expected_outcome],
             "client must immediately resolve primary/cleanup errors after the inner finally")
+    expected_post_lock = ast.parse('''print(SUCCESS, flush=True)
+return result
+''').body
+    lock_index = main_node.body.index(lock_try)
+    require([ast.dump(node) for node in main_node.body[lock_index + 1:]]
+            == [ast.dump(node) for node in expected_post_lock],
+            "client must emit success only after client.lock closes successfully")
 
     invocation_assignments = [
         node for node in ast.walk(main_node)
@@ -3813,6 +4156,83 @@ def verify_supervisor_mutations(
     for label, mutation, expected in supervisor_mutations:
         expect_rejected(validate_supervisor, mutation, label, expected)
     client_mutations = [
+        ("journal byte cap widened", replace_once(client,
+            "JOURNAL_BYTE_LIMIT = 256", "JOURNAL_BYTE_LIMIT = 4096")),
+        ("journal line cap widened", replace_once(client,
+            "JOURNAL_LINE_LIMIT = 1", "JOURNAL_LINE_LIMIT = 2")),
+        ("journal timeout widened", replace_once(client,
+            "JOURNAL_TIMEOUT = 5", "JOURNAL_TIMEOUT = 50")),
+        ("journal Unicode decoding allowed", replace_once(client,
+            '        output = payload.decode("ascii")',
+            '        output = payload.decode("utf-8")')),
+        ("journal substring accepted", replace_once(client,
+            '    if lines != [SUCCESS + "\\n"]:',
+            '    if SUCCESS not in output:')),
+        ("journal stderr retained", replace_once(client,
+            '                                   stderr=subprocess.DEVNULL)',
+            '                                   stderr=subprocess.PIPE)')),
+        ("journal invocation binding omitted", replace_once(client,
+            '            f"--grep=^{SUCCESS}$", f"_SYSTEMD_INVOCATION_ID={invocation}")',
+            '            f"--grep=^{SUCCESS}$")')),
+        ("journal nonzero accepted", replace_once(client,
+            '        if status:\n            fail(f"journal evidence query failed with status {status}")',
+            '        if status:\n            pass')),
+        ("raw journal written to stdout", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    sys.stdout.write(journal_evidence)\n    return result')),
+        ("raw journal written to numeric stdout", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    os.write(1, journal_evidence.encode("ascii"))\n    return result')),
+        ("raw stderr written to computed stdout", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    os.write(1 + 0, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+        ("raw stderr written through descriptor alias", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    output_fd = 2\n    os.write(output_fd, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+        ("subprocess stderr written to numeric stderr", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    os.write(2, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv written to special stderr path", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    open("/dev/stderr", "w").write(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv written to keyword stderr path", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    open(file="/dev/stderr", mode="w").write(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv emitted by inherited subprocess", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    subprocess.run(("/bin/echo", repr(service_argv)))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv emitted by aliased print", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    emit = print\n    emit(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("raw stderr emitted by aliased os write", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    emit = os.write\n    emit(2, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv emitted by aliased open", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    emit = open\n    emit("/dev/stderr", "w").write(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv emitted by aliased subprocess", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    runner = subprocess.run\n    runner(("/bin/echo", repr(service_argv)))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv emitted by os spawn", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    os.spawnv(os.P_WAIT, "/bin/echo", ("echo", repr(service_argv)))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("raw stderr emitted through os path module", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    os.path.os.write(2, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv spawned through os path module", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    os.path.os.spawnv(os.P_WAIT, "/bin/echo", ("echo", repr(service_argv)))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("raw stderr emitted through subprocess os", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    subprocess.os.write(2, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+        ("nonce argv emitted through subprocess sys", replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    subprocess.sys.stdout.write(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+        ("success emitted before cleanup", replace_once(replace_once(client,
+            '    print(SUCCESS, flush=True)\n    return result',
+            '    return result'),
+            '            result = 0\n        except BaseException as error:',
+            '            print(SUCCESS, flush=True)\n            result = 0\n        except BaseException as error:')),
         ("client active nonce replacement omitted", replace_once(client,
             '    if nonce:\n        text = text.replace(nonce, "<redacted-nonce>")',
             '    if nonce:\n        pass')),
