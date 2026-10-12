@@ -6,7 +6,6 @@ import json
 import os
 import runpy
 import secrets
-import shlex
 import signal
 import subprocess
 import sys
@@ -30,8 +29,8 @@ SERVICE_PROPERTIES = {
     "RemainAfterExit": "yes", "User": "root", "Group": "root", "UMask": "0077",
     "WorkingDirectory": "/", "StandardOutput": "journal", "StandardError": "journal",
 }
-LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
-                     *SERVICE_PROPERTIES)
+IDENTITY_PROPERTIES = ("InvocationID", "Description", "Environment", *SERVICE_PROPERTIES)
+SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2dverifier_2eservice"
 
 
 def fail(message):
@@ -86,7 +85,8 @@ def sanitized_state(state):
     if state is None:
         return "explicit-absence"
     redacted = {
-        name: ("<redacted>" if name in ("Description", "Environment", "ExecStart") else value)
+        name: ("<redacted>"
+               if name in ("Description", "Environment", "ExecStart", "Command") else value)
         for name, value in sorted(state.items())
     }
     return bounded_sanitized_repr(redacted)
@@ -410,16 +410,186 @@ def cleanup_fixture_invocation(invocation):
     wait_unit_absent()
 
 
-def exec_start_argv(value):
-    marker = "argv[]="
-    start = value.find(marker)
-    end = value.find(" ;", start)
-    if start < 0 or end < 0:
-        return None
+def unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"duplicate key in structured command property: {key}")
+        value[key] = item
+    return value
+
+
+def parse_structured_command(result, property_name):
+    if result.returncode:
+        fail(f"busctl {property_name} failed ({result.returncode}): {result.stderr.strip()}")
     try:
-        return tuple(shlex.split(value[start + len(marker):end]))
-    except ValueError:
-        return None
+        payload = json.loads(result.stdout, object_pairs_hook=unique_json_object)
+    except (TypeError, ValueError) as error:
+        fail(f"busctl {property_name} returned malformed JSON: {error}")
+    expected_type = "a(sasbttttuii)" if property_name == "ExecStart" else "a(sasasttttuii)"
+    if (type(payload) is not dict or set(payload) != {"type", "data"}
+            or payload.get("type") != expected_type
+            or type(payload.get("data")) is not list or len(payload["data"]) != 1):
+        fail(f"busctl {property_name} returned an unexpected exact property shape")
+    record = payload["data"][0]
+    if type(record) is not list or len(record) != 10:
+        fail(f"busctl {property_name} did not return exactly one complete command tuple")
+    path, argv, behavior, *runtime = record
+    strings = [path, *(argv if type(argv) is list else [])]
+    if (type(path) is not str or not path.startswith("/") or type(argv) is not list
+            or not argv or any(type(item) is not str for item in argv)
+            or argv[0] != path or any(not item or any(not character.isprintable()
+                                                     for character in item)
+                                     for item in strings)):
+        fail(f"busctl {property_name} returned an invalid exact path or argv")
+    if ((property_name == "ExecStart" and type(behavior) is not bool)
+            or (property_name == "ExecStartEx"
+                and (type(behavior) is not list
+                     or any(type(flag) is not str for flag in behavior)))):
+        fail(f"busctl {property_name} returned an invalid behavior field")
+    if behavior not in (False, []):
+        fail(f"busctl {property_name} enabled unsupported ignore-failure or command flags")
+    if (any(type(value) is not int for value in runtime)
+            or any(value < 0 or value > 2 ** 64 - 1 for value in runtime[:4])
+            or runtime[4] < 0 or runtime[4] > 2 ** 32 - 1
+            or any(value < -(2 ** 31) or value > 2 ** 31 - 1 for value in runtime[5:])):
+        fail(f"busctl {property_name} returned invalid runtime metadata")
+    return {"path": path, "argv": tuple(argv)}
+
+
+def structured_command_identity(exec_start_result, exec_start_ex_result):
+    command = parse_structured_command(exec_start_result, "ExecStart")
+    extended = parse_structured_command(exec_start_ex_result, "ExecStartEx")
+    if command != extended:
+        fail("structured ExecStart and ExecStartEx command identities disagree")
+    return command
+
+
+def launch_identity_signature(invocation, description, environment, path, argv):
+    return {
+        "InvocationID": invocation, "Description": description, "Environment": environment,
+        "Command": {"path": path, "argv": tuple(argv)}, **SERVICE_PROPERTIES,
+    }
+
+
+def launch_identity_matches(state, signature):
+    expected_keys = {"InvocationID", "Description", "Environment", "Command",
+                     *SERVICE_PROPERTIES}
+    return (set(signature) == expected_keys and state.get("LoadState") == "loaded"
+            and all(state.get(name) == expected for name, expected in signature.items()))
+
+
+def stale_terminal_matches(state, signature, expected_main_pid, control_group_pids):
+    return (launch_identity_matches(state, signature)
+            and state.get("ActiveState") == "failed" and state.get("SubState") == "failed"
+            and state.get("Result") == "exit-code"
+            and state.get("ExecMainCode") in ("1", "exited")
+            and state.get("ExecMainStatus") == "73"
+            and state.get("ExecMainPID") == expected_main_pid and not control_group_pids)
+
+
+def structured_command_fixture_result(property_name, path, argv, behavior, runtime):
+    property_type = "a(sasbttttuii)" if property_name == "ExecStart" else "a(sasasttttuii)"
+    payload = {"type": property_type, "data": [[path, list(argv), behavior, *runtime]]}
+    return subprocess.CompletedProcess(("busctl", property_name), 0, json.dumps(payload), "")
+
+
+def assert_launch_identity_contract():
+    path = "/usr/bin/env"
+    argv = (path, "-i", "KEY=value", "/opt/nmcp/helper", "--mode", "exact")
+    active_runtime = (100, 10, 0, 0, 1234, 0, 0)
+    terminal_runtime = (100, 10, 200, 20, 1234, 1, 73)
+    active_command = structured_command_identity(
+        structured_command_fixture_result("ExecStart", path, argv, False, active_runtime),
+        structured_command_fixture_result("ExecStartEx", path, argv, [], active_runtime))
+    terminal_command = structured_command_identity(
+        structured_command_fixture_result("ExecStart", path, argv, False, terminal_runtime),
+        structured_command_fixture_result("ExecStartEx", path, argv, [], terminal_runtime))
+    signature = launch_identity_signature("a" * 32, "exact fixture", "KEY=value", path, argv)
+    active = {"LoadState": "loaded", "Command": active_command,
+              "InvocationID": "a" * 32, "Description": "exact fixture",
+              "Environment": "KEY=value", **SERVICE_PROPERTIES}
+    terminal = {**active, "Command": terminal_command, "ActiveState": "failed",
+                "SubState": "failed", "Result": "exit-code", "ExecMainCode": "1",
+                "ExecMainStatus": "73", "ExecMainPID": "1234"}
+    if (not launch_identity_matches(active, signature)
+            or not stale_terminal_matches(terminal, signature, "1234", [])):
+        fail("launch identity rejected valid mutable runtime metadata transition")
+    changed_commands = (
+        {"path": "/bin/false", "argv": argv},
+        {"path": path, "argv": ("/bin/false", *argv[1:])},
+        {"path": path, "argv": (*argv[:-1], "wrong")},
+        {"path": path, "argv": (*argv[:-2], argv[-1], argv[-2])},
+        {"path": path, "argv": argv[:-1]},
+        {"path": path, "argv": (*argv, "extra")},
+    )
+    for command in changed_commands:
+        if launch_identity_matches({**terminal, "Command": command}, signature):
+            fail("launch identity accepted changed path, argv value, order, or count")
+    changed_states = (
+        {**terminal, "InvocationID": "b" * 32},
+        {**terminal, "Environment": "KEY=wrong"},
+        {**terminal, "ActiveState": "inactive"},
+        {**terminal, "Result": "success"},
+        {**terminal, "ExecMainStatus": "0"},
+    )
+    if any(stale_terminal_matches(state, signature, "1234", []) for state in changed_states):
+        fail("terminal phase accepted changed identity or terminal status")
+    if (stale_terminal_matches({**terminal, "ExecMainPID": "999"}, signature, "1234", [])
+            or stale_terminal_matches(terminal, signature, "1234", [1234])):
+        fail("terminal phase accepted cgroup residue")
+    rejected_results = (
+        subprocess.CompletedProcess(("busctl",), 1, "", "structured query failed"),
+        subprocess.CompletedProcess(("busctl",), 0, '{"type":"x","type":"y","data":[]}', ""),
+        subprocess.CompletedProcess(("busctl",), 0, '{"type":"x","data":[]} trailing', ""),
+        subprocess.CompletedProcess(("busctl",), 0, '{"type":"x\\q","data":[]}', ""),
+        subprocess.CompletedProcess(("busctl",), 0, '[]', ""),
+        subprocess.CompletedProcess(("busctl",), 0,
+                                    json.dumps({"type": "a(sasbttttuii)", "data": []}), ""),
+        subprocess.CompletedProcess(("busctl",), 0,
+                                    json.dumps({"type": "a(sasbttttuii)",
+                                                "data": [[path, list(argv), False,
+                                                          *active_runtime],
+                                                         [path, list(argv), False,
+                                                          *active_runtime]]}), ""),
+        subprocess.CompletedProcess(("busctl",), 0,
+                                    json.dumps({"type": "a(sasbttttuii)",
+                                                "data": [[path, list(argv), False]]}), ""),
+        structured_command_fixture_result("ExecStart", "relative", argv, False, active_runtime),
+        structured_command_fixture_result("ExecStart", path, ("/bin/false", *argv[1:]),
+                                          False, active_runtime),
+        structured_command_fixture_result("ExecStart", path, (path, "bad\narg"), False,
+                                          active_runtime),
+        structured_command_fixture_result("ExecStart", path, (path, "bad\u0085arg"), False,
+                                          active_runtime),
+        structured_command_fixture_result("ExecStart", path, argv, False,
+                                          (2 ** 64, *active_runtime[1:])),
+        structured_command_fixture_result("ExecStart", path, argv, False,
+                                          (*active_runtime[:4], 2 ** 32,
+                                           *active_runtime[5:])),
+        structured_command_fixture_result("ExecStart", path, argv, False,
+                                          (*active_runtime[:5], 2 ** 31,
+                                           active_runtime[6])),
+        structured_command_fixture_result("ExecStart", path, argv, True, active_runtime),
+        structured_command_fixture_result("ExecStartEx", path, argv, ["ignore-failure"],
+                                          active_runtime),
+    )
+    for result in rejected_results:
+        property_name = "ExecStartEx" if "ExecStartEx" in result.args else "ExecStart"
+        try:
+            parse_structured_command(result, property_name)
+        except RuntimeError:
+            continue
+        fail("structured command parser accepted malformed, multiple, or unsafe command data")
+    disagreement = structured_command_fixture_result(
+        "ExecStartEx", path, (*argv[:-1], "wrong"), [], terminal_runtime)
+    try:
+        structured_command_identity(
+            structured_command_fixture_result("ExecStart", path, argv, False, terminal_runtime),
+            disagreement)
+    except RuntimeError:
+        return
+    fail("structured ExecStartEx disagreement was accepted")
 
 
 def persistent_supervisor_mode(mode):
@@ -438,7 +608,8 @@ def persistent_launch_signature(state, repo, commit, go_binary, mode):
     if (len(nonce) != 64
             or any(character not in "0123456789abcdef" for character in nonce)
             or environment != prefix + nonce):
-        fail(f"persistent-fault fixture has invalid exact nonce environment: {mode}: {state}")
+        fail(f"persistent-fault fixture has invalid exact nonce environment: {mode}: "
+             f"{sanitized_state(state)}")
     supervisor_argv = ("/usr/bin/python3", "-I", "-S", PROGRAM,
                        os.path.abspath(os.path.join("/", repo)), commit, go_binary, nonce,
                        persistent_supervisor_mode(mode))
@@ -448,19 +619,21 @@ def persistent_launch_signature(state, repo, commit, go_binary, mode):
     invocation = state.get("InvocationID", "")
     valid_invocation = (len(invocation) == 32
                         and all(character in "0123456789abcdef" for character in invocation))
-    if (state.get("LoadState") != "loaded" or not valid_invocation
-            or state.get("Description") != DESCRIPTION_PREFIX + nonce
-            or exec_start_argv(state.get("ExecStart", "")) != expected_argv
-            or any(state.get(name) != expected for name, expected in SERVICE_PROPERTIES.items())):
-        fail(f"persistent-fault fixture lacks exact launch signature: {mode}: {state}")
-    return {name: state[name] for name in LAUNCH_PROPERTIES}
+    signature = launch_identity_signature(invocation, DESCRIPTION_PREFIX + nonce, prefix + nonce,
+                                          "/usr/bin/env", expected_argv)
+    if not valid_invocation or not launch_identity_matches(state, signature):
+        fail(f"persistent-fault fixture lacks exact launch signature: {mode}: "
+             f"{sanitized_state(state)}")
+    return signature
 
 
 def assert_launch_signature_counterexamples(state, repo, commit, go_binary, mode):
     mutations = {
         "description": ("Description", "wrong verifier description"),
         "environment": ("Environment", f"{NONCE_VARIABLE}={'0' * 64}"),
-        "exec-start": ("ExecStart", state["ExecStart"].replace(PROGRAM, "/bin/false", 1)),
+        "exec-start": ("Command", {"path": "/usr/bin/env",
+                                     "argv": tuple("/bin/false" if item == PROGRAM else item
+                                                   for item in state["Command"]["argv"])}),
         "fixed-property": ("KillMode", "process"),
     }
     for label, (property_name, replacement) in mutations.items():
@@ -474,44 +647,40 @@ def assert_launch_signature_counterexamples(state, repo, commit, go_binary, mode
 
 
 def signed_launch_state(signature):
-    state = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
-    if state.get("LoadState") == "not-found":
-        return state
-    if (state.get("LoadState") != "loaded"
-            or any(state.get(name) != expected for name, expected in signature.items())):
-        fail(f"persistent-fault launch signature changed; refusing name action: {state}")
-    return state
+    return signed_launch_state_until(signature, time.monotonic() + 10)
 
 
 def cleanup_signed_launch(signature):
-    state = signed_launch_state(signature)
+    deadline = time.monotonic() + 20
+    state = signed_launch_state_until(signature, deadline)
     if state["LoadState"] == "not-found":
         return
-    state = signed_launch_state(signature)
+    state = signed_launch_state_until(signature, deadline)
     if state["LoadState"] == "not-found":
         return
+    timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 20)
     stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,
-                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if stopped.returncode:
         fail(f"persistent-fault stop failed: {stopped.stderr.strip()}")
-    deadline = time.monotonic() + 20
     while True:
-        state = signed_launch_state(signature)
+        state = signed_launch_state_until(signature, deadline)
         if state["LoadState"] == "not-found":
             return
         if state.get("ActiveState") in ("failed", "inactive"):
             break
         if time.monotonic() >= deadline:
-            fail(f"persistent-fault signed launch did not terminate: {state}")
+            fail("persistent-fault signed launch did not terminate: " + sanitized_state(state))
         time.sleep(0.1)
-    state = signed_launch_state(signature)
+    deadline = time.monotonic() + 30
+    state = signed_launch_state_until(signature, deadline)
     if state["LoadState"] == "not-found":
         return
+    timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 5)
     run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    deadline = time.monotonic() + 30
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     while True:
-        state = signed_launch_state(signature)
+        state = signed_launch_state_until(signature, deadline)
         if state["LoadState"] == "not-found":
             return
         if time.monotonic() >= deadline:
@@ -557,13 +726,31 @@ def show_until(deadline, *properties):
     fail("bounded stale unit properties remain unknown: " + "; ".join(map(str, errors)))
 
 
+def read_structured_command_until(deadline):
+    results = []
+    for property_name in ("ExecStart", "ExecStartEx"):
+        timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 1)
+        results.append(run(("/usr/bin/busctl", "--system", "--json=short", "get-property",
+                            "org.freedesktop.systemd1", SYSTEMD_UNIT_OBJECT,
+                            "org.freedesktop.systemd1.Service", property_name), check=False,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout))
+    return structured_command_identity(*results)
+
+
+def show_identity_until(deadline, *properties):
+    state = show_until(deadline, *IDENTITY_PROPERTIES, *properties)
+    if state.get("LoadState") == "loaded":
+        state["Command"] = read_structured_command_until(deadline)
+    return state
+
+
 def signed_launch_state_until(signature, deadline):
-    state = show_until(deadline, *LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+    state = show_identity_until(deadline, "ActiveState", "ControlGroup")
     if state.get("LoadState") == "not-found":
         return state
-    if (state.get("LoadState") != "loaded"
-            or any(state.get(name) != expected for name, expected in signature.items())):
-        fail(f"bounded stale launch signature changed; refusing name action: {state}")
+    if not launch_identity_matches(state, signature):
+        fail("bounded stale launch signature changed; refusing name action: "
+             + sanitized_state(state))
     return state
 
 
@@ -682,6 +869,7 @@ def main():
     assert_property_parser_contract(client)
     assert_persistent_failure_contract()
     assert_cleanup_deadline_contract()
+    assert_launch_identity_contract()
 
     # A stale loaded fixed name is never launch-ready merely because it is
     # failed and cgroup-empty. The new client must fail without touching it.
@@ -739,6 +927,7 @@ raise SystemExit(73)
         **SERVICE_PROPERTIES,
     }
     stale_invocation = None
+    stale_main_pid = None
     stale_signature = None
     stale_observed = {}
     stale_failure = None
@@ -801,35 +990,37 @@ raise SystemExit(73)
             fail("stale fixed-unit launch failed before ready handoff")
         wait_path(stale_ready, timeout=30)
         stale_ready_seen = True
-        stale_observed = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
-                              "MainPID", "ControlGroup")
+        stale_observed = show_identity_until(
+            time.monotonic() + 10, "ActiveState", "SubState", "Result", "MainPID",
+            "ExecMainPID", "ControlGroup")
         stale_invocation = stale_observed.get("InvocationID")
+        stale_main_pid = stale_observed.get("MainPID")
         stale_recorded_cgroup = stale_observed.get("ControlGroup", "")
         valid_stale_invocation = (len(stale_invocation or "") == 32
                                   and all(character in "0123456789abcdef"
                                           for character in stale_invocation))
-        if (stale_observed.get("LoadState") != "loaded" or not valid_stale_invocation
+        stale_signature = launch_identity_signature(
+            stale_invocation, stale_expected_properties["Description"],
+            stale_expected_environment, "/usr/bin/python3", stale_expected_argv)
+        if (not valid_stale_invocation
+                or not launch_identity_matches(stale_observed, stale_signature)
                 or stale_observed.get("SubState") != "running"
                 or stale_observed.get("ActiveState") != "active"
-                or int(stale_observed.get("MainPID", "0")) <= 0
-                or exec_start_argv(stale_observed.get("ExecStart", "")) != stale_expected_argv
-                or any(stale_observed.get(name) != expected
-                       for name, expected in stale_expected_properties.items())):
+                or int(stale_main_pid or "0") <= 0
+                or stale_observed.get("ExecMainPID") != stale_main_pid):
             fail("stale fixed-unit did not reach its exact synchronized running state")
-        stale_signature = {name: stale_observed[name] for name in LAUNCH_PROPERTIES}
         release(stale_signal_name)
         stale_release_seen = True
         wait_path(stale_release_ack, timeout=30)
         stale_release_ack_seen = True
         deadline = time.monotonic() + 20
         while True:
-            stale_observed = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
-                                  "ExecMainCode", "ExecMainStatus", "ControlGroup")
+            stale_observed = show_identity_until(
+                deadline, "ActiveState", "SubState", "Result", "ExecMainPID",
+                "ExecMainCode", "ExecMainStatus", "ControlGroup")
             stale_recorded_cgroup = (stale_observed.get("ControlGroup", "")
                                      or stale_recorded_cgroup)
-            if (stale_observed.get("LoadState") != "loaded"
-                    or any(stale_observed.get(name) != expected
-                           for name, expected in stale_signature.items())):
+            if not launch_identity_matches(stale_observed, stale_signature):
                 fail("stale fixed-unit identity changed or disappeared before failure attestation")
             if stale_observed.get("ActiveState") == "failed":
                 break
@@ -837,31 +1028,23 @@ raise SystemExit(73)
                 fail("released stale fixed-unit did not reach failed state: "
                      f"state={sanitized_state(stale_observed)}")
             time.sleep(0.1)
-        if (stale_observed.get("InvocationID") != stale_invocation
-                or stale_observed.get("SubState") != "failed"
-                or stale_observed.get("Result") != "exit-code"
-                or stale_observed.get("ExecMainCode") not in ("1", "exited")
-                or stale_observed.get("ExecMainStatus") != "73"
-                or cgroup_pids(stale_observed.get("ControlGroup", ""))):
+        if not stale_terminal_matches(
+                stale_observed, stale_signature, stale_main_pid,
+                cgroup_pids(stale_observed.get("ControlGroup", ""))):
             fail("released stale fixed-unit had an unexpected exact terminal state")
         rejected = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                         "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stale_rejected_return = rejected.returncode
         stale_rejected_stdout = rejected.stdout
         stale_rejected_stderr = rejected.stderr
-        stale_after_client = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
-                                  "ExecMainCode", "ExecMainStatus", "ControlGroup")
+        stale_after_client = show_identity_until(
+            time.monotonic() + 10, "ActiveState", "SubState", "Result", "ExecMainPID",
+            "ExecMainCode", "ExecMainStatus", "ControlGroup")
         if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:
             fail("client accepted a stale loaded fixed unit")
-        if (stale_after_client.get("LoadState") != "loaded"
-                or any(stale_after_client.get(name) != expected
-                       for name, expected in stale_signature.items())
-                or stale_after_client.get("ActiveState") != "failed"
-                or stale_after_client.get("SubState") != "failed"
-                or stale_after_client.get("Result") != "exit-code"
-                or stale_after_client.get("ExecMainCode") not in ("1", "exited")
-                or stale_after_client.get("ExecMainStatus") != "73"
-                or cgroup_pids(stale_after_client.get("ControlGroup", ""))):
+        if not stale_terminal_matches(
+                stale_after_client, stale_signature, stale_main_pid,
+                cgroup_pids(stale_after_client.get("ControlGroup", ""))):
             fail("rejected prelaunch client touched the exact stale fixed-unit evidence")
         assert_client_lock_reusable()
     except Exception as error:
@@ -884,8 +1067,7 @@ raise SystemExit(73)
         stale_absence_confirmed = False
         while time.monotonic() < cleanup_deadline:
             try:
-                partial = show_until(cleanup_deadline, *LAUNCH_PROPERTIES,
-                                     "ActiveState", "ControlGroup")
+                partial = show_identity_until(cleanup_deadline, "ActiveState", "ControlGroup")
             except Exception as error:
                 stale_state_error = bounded_sanitized_repr(error)
                 if time.monotonic() >= cleanup_deadline:
@@ -898,18 +1080,15 @@ raise SystemExit(73)
             if partial.get("LoadState") == "not-found":
                 stale_absence_confirmed = True
                 break
-            if (stale_signature is None
-                    and partial.get("LoadState") == "loaded"
-                    and len(partial.get("InvocationID", "")) == 32
-                    and all(character in "0123456789abcdef"
-                            for character in partial.get("InvocationID", ""))
-                    and exec_start_argv(partial.get("ExecStart", "")) == stale_expected_argv
-                    and all(partial.get(name) == expected
-                            for name, expected in stale_expected_properties.items())):
-                stale_signature = {name: partial[name] for name in LAUNCH_PROPERTIES}
-            if (stale_signature is None
-                    or any(partial.get(name) != expected
-                           for name, expected in stale_signature.items())):
+            if stale_signature is None and len(partial.get("InvocationID", "")) == 32:
+                candidate_signature = launch_identity_signature(
+                    partial.get("InvocationID"), stale_expected_properties["Description"],
+                    stale_expected_environment, "/usr/bin/python3", stale_expected_argv)
+                if (all(character in "0123456789abcdef"
+                        for character in partial.get("InvocationID", ""))
+                        and launch_identity_matches(partial, candidate_signature)):
+                    stale_signature = candidate_signature
+            if stale_signature is None or not launch_identity_matches(partial, stale_signature):
                 stale_identity_error = bounded_sanitized_repr(
                     f"ownership={sanitized_state(partial)}")
                 if time.monotonic() >= cleanup_deadline:
@@ -1138,7 +1317,7 @@ raise SystemExit(73)
         expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 2
         wait_counter(intercepted, expected_interceptions)
         wait_path(handoff_ready, timeout=30)
-        observed = show(*LAUNCH_PROPERTIES)
+        observed = show_identity_until(time.monotonic() + 10)
         signature = None
         if observed["LoadState"] != "not-found":
             signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)
@@ -1173,7 +1352,8 @@ raise SystemExit(73)
         except BaseException as error:
             cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
         try:
-            post_cleanup = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+            post_cleanup = show_identity_until(time.monotonic() + 10,
+                                               "ActiveState", "ControlGroup")
         except BaseException as error:
             post_cleanup = {"EvidenceError": str(error)}
             cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
