@@ -2243,14 +2243,22 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
     call_target_counts = {}
     call_contexts = []
     security_call_contexts = []
+    control_flow_call_contexts = []
     node_regions = {}
+    node_paths = {}
 
-    def record_regions(node, region="<module>"):
+    def record_regions(node, region="<module>", path="tree"):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             region = node.name
         node_regions[id(node)] = region
-        for child in ast.iter_child_nodes(node):
-            record_regions(child, region)
+        node_paths[id(node)] = path
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                record_regions(value, region, path + "." + field)
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    if isinstance(child, ast.AST):
+                        record_regions(child, region, f"{path}.{field}[{index}]")
 
     record_regions(tree)
     child_relations = {}
@@ -2306,6 +2314,12 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         context = (node_regions[id(node)], target, type(parent).__name__, field,
                    ast.dump(node))
         call_contexts.append(context)
+        statement = node
+        while not isinstance(statement, ast.stmt):
+            statement = child_relations[id(statement)][0]
+        control_flow_call_contexts.append((node_regions[id(node)], target,
+                                           node_paths[id(node)], node_paths[id(statement)],
+                                           ast.dump(statement)))
         if (target == "name:run"
                 or target.startswith(("attr:subprocess.", "attr:os.", "attr:fcntl.",
                                       "attr:runpy."))):
@@ -2324,7 +2338,9 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
             and hashlib.sha256(repr(sorted(call_contexts)).encode()).hexdigest()
                 == "57e22d63131e8733c0b4c08a0c3e47fef9604a19b3f20501fb6c602384c6735e"
             and hashlib.sha256(repr(sorted(security_call_contexts)).encode()).hexdigest()
-                == "7125573755f57fb77b90bfbdcdc4ea9f7c3d92a8694b58afba2643ebd289b6d3",
+                == "7125573755f57fb77b90bfbdcdc4ea9f7c3d92a8694b58afba2643ebd289b6d3"
+            and hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest()
+                == "fe97a91b744a29e84a33f8ff083142724248c6bee9c57654bfce717e4f4b81ec",
             "containment call targets, arguments, or use-site contexts changed")
     protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
     expected_call_root_stores = {
@@ -2366,6 +2382,25 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
                             in protected_call_roots
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
+    expected_statement_inventory = {
+        "Assign": 234, "AugAssign": 2, "Break": 3, "Continue": 2, "Delete": 1,
+        "Expr": 224, "For": 31, "FunctionDef": 39, "If": 128, "Import": 10,
+        "Pass": 5, "Raise": 4, "Return": 45, "Try": 29, "While": 11, "With": 6,
+    }
+    actual_statement_inventory = {}
+    statement_contexts = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.stmt):
+            kind = type(node).__name__
+            actual_statement_inventory[kind] = actual_statement_inventory.get(kind, 0) + 1
+            statement_contexts.append((node_regions[id(node)], node_paths[id(node)], kind,
+                                       ast.dump(node)))
+    # This is exact normalized structural regression integrity, not source authentication.
+    # The recursive semantic call/module/binding inventories above remain independently required.
+    require(actual_statement_inventory == expected_statement_inventory
+            and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
+                == "5fecb7cd84e1e5a02001b1bb316a5c29fe084099f1891aac6b1c83015c40df0a",
+            "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
         'kwargs.setdefault("timeout", 18 * 60)', mode="eval").body)
@@ -4266,6 +4301,37 @@ def verify_supervisor_mutations(
         ("persistent builtin callee exception shadow", replace_once(containment,
             'def main():\n', 'def main():\n    try:\n        raise RuntimeError("shadow")\n'
             '    except RuntimeError as all:\n        pass\n')),
+        ("persistent relocated cleanup intent assertion", replace_once(containment,
+            '    if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
+            '        fail("retained-dependency recovery did not harden and clean")',
+            '    if False or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
+            '        pass\n'
+            '    # Original cleanup-intent call deliberately omitted here.\n'
+            '    if recovered.returncode:\n'
+            '        fail("retained-dependency recovery did not harden and clean")')),
+        ("persistent padded cleanup intent assertion", replace_once(containment,
+            'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
+            'if (recovered.returncode or '
+            'os.path.exists("/run/nmcp-ci/cleanup-intent.json")) and True:')),
+        ("persistent split cleanup intent assertion", replace_once(containment,
+            '    if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
+            '        fail("retained-dependency recovery did not harden and clean")',
+            '    cleanup_intent_remains = '
+            'os.path.exists("/run/nmcp-ci/cleanup-intent.json")\n'
+            '    if recovered.returncode or cleanup_intent_remains:\n'
+            '        fail("retained-dependency recovery did not harden and clean")')),
+        ("persistent alternate cleanup intent branch", replace_once(containment,
+            '    if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
+            '        fail("retained-dependency recovery did not harden and clean")',
+            '    if recovered.returncode:\n'
+            '        fail("retained-dependency recovery did not harden and clean")\n'
+            '    elif os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
+            '        pass')),
+        ("persistent early return before retained cleanup", replace_once(containment,
+            '    del sentinel\n', '    return\n')),
+        ("persistent inverted sentinel nonce condition", replace_once(containment,
+            'if replaced_environment == f"NMCP_VERIFIER_NONCE={sentinel_nonce}":',
+            'if replaced_environment != f"NMCP_VERIFIER_NONCE={sentinel_nonce}":')),
         ("persistent constant builtins setattr", replace_once(containment,
             '\n\ndef run(argv, **kwargs):',
             '\n\nimport builtins\nbuiltins.setattr('
@@ -4585,6 +4651,12 @@ def verify_supervisor_mutations(
         "persistent builtin callee lambda shadow",
         "persistent builtin callee pattern shadow",
         "persistent builtin callee exception shadow",
+        "persistent relocated cleanup intent assertion",
+        "persistent padded cleanup intent assertion",
+        "persistent split cleanup intent assertion",
+        "persistent alternate cleanup intent branch",
+        "persistent early return before retained cleanup",
+        "persistent inverted sentinel nonce condition",
     }
     for label, mutation in containment_mutations:
         if label in runtime_valid_containment_mutations:
