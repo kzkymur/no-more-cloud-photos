@@ -6,6 +6,7 @@ import hashlib
 import os
 import pathlib
 import re
+import runpy
 import shutil
 import stat
 import subprocess
@@ -34,6 +35,105 @@ def run(command, **kwargs):
 
 def text(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def verify_nonce_safe_diagnostics(client_path: pathlib.Path, containment_path: pathlib.Path) -> None:
+    client = runpy.run_path(str(client_path), run_name="nmcp_client_diagnostic_fixture")
+    containment = runpy.run_path(
+        str(containment_path), run_name="nmcp_containment_diagnostic_fixture")
+    nonce = "0123456789abcdef" * 4
+    other_hex64 = "f" * 64
+    derived_path = "/run/nmcp-ci/" + nonce + "/owned"
+    secret = "nonce-bearing-secret"
+
+    def assert_clean(rendered, label):
+        require(nonce not in rendered and other_hex64 not in rendered
+                and derived_path not in rendered
+                and re.search(r"(?i)[0-9a-f]{64}", rendered) is None,
+                f"{label} diagnostic retained nonce-bearing data")
+        require(len(rendered) <= 540, f"{label} diagnostic is not bounded")
+
+    service_argv = ("/usr/bin/systemd-run", f"--description={nonce}", derived_path)
+    timeout = subprocess.TimeoutExpired(
+        service_argv, 1, output=secret + nonce, stderr=other_hex64 + derived_path)
+    original_run = subprocess.run
+    try:
+        subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(timeout)
+        try:
+            client["command"](service_argv)
+        except RuntimeError as error:
+            rendered = client["sanitized_diagnostic"](error, nonce)
+        else:
+            raise RuntimeError("client timeout diagnostic fixture did not fail")
+    finally:
+        subprocess.run = original_run
+    assert_clean(rendered, "client TimeoutExpired")
+    require("timed out" in rendered and "/usr/bin/systemd-run" not in rendered
+            and secret not in rendered,
+            "client TimeoutExpired diagnostic is not status-only")
+
+    client_cases = (
+        RuntimeError("launch stderr " + secret + nonce + derived_path),
+        RuntimeError("cleanup state Description=" + secret + " ExecStart=" + other_hex64),
+        RuntimeError("top fallback " + nonce + derived_path + "x" * 900),
+    )
+    for index, error in enumerate(client_cases):
+        assert_clean(client["sanitized_diagnostic"](error, nonce), f"client case {index}")
+    state = {"LoadState": "loaded", "InvocationID": "a" * 32,
+             "ActiveState": "failed", "Result": "exit-code",
+             "Description": secret + nonce, "Environment": nonce,
+             "ExecStart": derived_path, "Command": service_argv}
+    state_rendered = str(client["sanitized_state"](state))
+    assert_clean(state_rendered, "client owned state")
+    require(secret not in state_rendered, "client owned state retained redacted fields")
+
+    malformed = subprocess.CompletedProcess(
+        ("systemctl", "show"), 0, "LoadState=loaded\n" + secret + nonce + "\n", "")
+    try:
+        client["parse_unit_properties"](malformed, ("LoadState",))
+    except RuntimeError as error:
+        rendered = client["sanitized_diagnostic"](error, nonce)
+        assert_clean(rendered, "client malformed property")
+        require(secret not in rendered, "client malformed-property diagnostic retained raw line")
+    else:
+        raise RuntimeError("client malformed-property diagnostic fixture did not fail")
+
+    containment_cases = (timeout, RuntimeError(secret + nonce + derived_path + "x" * 900))
+    for index, error in enumerate(containment_cases):
+        assert_clean(containment["bounded_sanitized_repr"](error, nonce),
+                     f"containment case {index}")
+    busctl_failure = subprocess.CompletedProcess(
+        ("busctl",), 7, "", secret + nonce + derived_path)
+    try:
+        containment["parse_structured_command"](busctl_failure, "ExecStart")
+    except RuntimeError as error:
+        rendered = containment["bounded_sanitized_repr"](error, nonce)
+        assert_clean(rendered, "containment busctl stderr")
+        require("status 7" in rendered and secret not in rendered,
+                "containment busctl diagnostic lost safe status or retained stderr")
+    else:
+        raise RuntimeError("containment busctl diagnostic fixture did not fail")
+    duplicate = subprocess.CompletedProcess(
+        ("busctl",), 0, '{"' + nonce + '":1,"' + nonce + '":2}', "")
+    try:
+        containment["parse_structured_command"](duplicate, "ExecStart")
+    except RuntimeError as error:
+        assert_clean(containment["bounded_sanitized_repr"](error, nonce),
+                     "containment duplicate key")
+    else:
+        raise RuntimeError("containment duplicate-key diagnostic fixture did not fail")
+    faulted = subprocess.CompletedProcess(
+        service_argv, 1, secret + nonce + derived_path, other_hex64 + secret)
+    classification = {"success_in_stdout": False, "property_unknown": True,
+                      "action_unavailable": False}
+    persistent = containment["persistent_failure_diagnostics"](
+        "fixture", "show", faulted, classification, 4, 0, state, state, True,
+        {"LoadState": "not-found"}, "", "", "", [])
+    assert_clean(persistent, "containment persistent failure")
+    require(secret not in persistent and "stdout_present=True" in persistent
+            and "stderr_present=True" in persistent and "LoadState" in persistent
+            and "ActiveState" in persistent and "Result" in persistent,
+            "containment diagnostics retained streams or lost safe state/boolean evidence")
 
 
 def require_default_run_context(mapping: dict, label: str) -> None:
@@ -547,6 +647,16 @@ def validate_supervisor(source: str) -> None:
 
 def validate_client(source: str) -> None:
     tree = ast.parse(source, filename="verify-ubuntu-migration-role-client")
+    expected_guard = ast.parse('''if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print("verification-client: " + sanitized_diagnostic(error, None), file=sys.stderr)
+        raise SystemExit(1)
+''').body[0]
+    guards = [node for node in tree.body if isinstance(node, ast.If)]
+    require(len(guards) == 2 and ast.dump(guards[-1]) == ast.dump(expected_guard),
+            "client top-level diagnostic sink must remain bounded and sanitized")
     require(literal_assignment(tree, "UNIT") == "nmcp-migration-role-verifier.service",
             "client fixed transient service unit name changed")
     require_exact_assignment(tree, "RUN", 'RUN = "/run/nmcp-ci"',
@@ -564,6 +674,39 @@ def validate_client(source: str) -> None:
     require(literal_assignment(tree, "NONCE_VARIABLE") == "NMCP_VERIFIER_NONCE"
             and literal_assignment(tree, "DESCRIPTION_PREFIX") == "NMCP migration role verifier ",
             "client nonce launch labels changed")
+    require_exact_function(tree, "sanitized_diagnostic", '''def sanitized_diagnostic(value, nonce):
+    if isinstance(value, subprocess.TimeoutExpired):
+        text = "subprocess timed out"
+    elif isinstance(value, subprocess.CalledProcessError):
+        text = f"subprocess failed with status {value.returncode}"
+    elif isinstance(value, OSError):
+        text = f"operating system error errno={value.errno}"
+    else:
+        text = str(value)
+    if nonce:
+        text = text.replace(nonce, "<redacted-nonce>")
+    if any(marker in text for name in ("Description", "Environment", "ExecStart", "Command")
+           for marker in (name + "=", "'" + name + "':", '"' + name + '\":')):
+        text = "diagnostic contained redacted launch identity"
+    hexadecimal = "0123456789abcdefABCDEF"
+    index = 0
+    redacted = []
+    while index < len(text):
+        candidate = text[index:index + 64]
+        if len(candidate) == 64 and all(character in hexadecimal for character in candidate):
+            redacted.append("<redacted-hex64>")
+            index += 64
+        else:
+            redacted.append(text[index])
+            index += 1
+    text = "".join(redacted)
+    return text[:512] + ("...<truncated>" if len(text) > 512 else "")
+''', "client diagnostic sanitizer must redact nonce/identity data and remain bounded")
+    require_exact_function(tree, "sanitized_state", '''def sanitized_state(state):
+    safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+                  "Result", "ExecMainCode", "ExecMainStatus")
+    return {name: state.get(name) for name in safe_names if name in state}
+''', "client state diagnostics must use the strict safe-property allowlist")
     require(literal_assignment(tree, "SERVICE_PROPERTIES") == {
         "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
         "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
@@ -694,19 +837,19 @@ def validate_client(source: str) -> None:
                               timeout=timeout)
     except subprocess.TimeoutExpired as error:
         if CLEANUP_ACTIVE and time.monotonic() >= COMMAND_DEADLINE:
-            raise RuntimeError("absolute client cleanup deadline exhausted") from error
-        raise
+            raise RuntimeError("absolute client cleanup deadline exhausted") from None
+        raise RuntimeError("client subprocess timed out") from None
 ''', "client subprocesses must remain bounded by the absolute budget")
     require_exact_function(tree, "parse_unit_properties", '''def parse_unit_properties(result, requested):
     if result.returncode:
-        fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+        fail(f"systemctl show failed with status {result.returncode}")
     if not result.stdout:
         fail("systemctl show returned empty output")
     values = {}
     for line in result.stdout.splitlines():
         key, separator, value = line.partition("=")
         if not separator or not key or key in values:
-            fail(f"systemctl show returned malformed output: {line!r}")
+            fail("systemctl show returned malformed output")
         values[key] = value
     if values.get("LoadState") == "not-found":
         return values
@@ -757,7 +900,8 @@ def validate_client(source: str) -> None:
             if attempt + 1 >= PROPERTY_RETRIES or time.monotonic() >= deadline:
                 break
             time.sleep(min(0.05 * (2 ** attempt), max(0, deadline - time.monotonic())))
-    fail("unit properties remain unknown: " + "; ".join(map(str, errors)))
+    detail = "; ".join(sanitized_diagnostic(error, None) for error in errors)
+    fail("unit properties remain unknown: " + sanitized_diagnostic(detail, None))
 ''', "client property reads must fail closed with bounded retry and retained errors")
     require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
             "client must not infer absence from an empty or failed property query")
@@ -773,9 +917,11 @@ def validate_client(source: str) -> None:
     if state.get("LoadState") == "not-found":
         return state
     if not launch_matches(state, nonce, service_command):
-        fail(f"fixed unit launch identity lost; refusing name-based cleanup: {state}")
+        fail("fixed unit launch identity lost; refusing name-based cleanup: "
+             f"{sanitized_state(state)}")
     if state.get("InvocationID") != invocation:
-        fail(f"fixed unit ownership lost; refusing name-based cleanup: {state}")
+        fail("fixed unit ownership lost; refusing name-based cleanup: "
+             f"{sanitized_state(state)}")
     return state
 ''', "client owned state must bind launch identity and InvocationID")
     require_exact_function(tree, "owned_command", '''def owned_command(invocation, nonce, service_command, *arguments):
@@ -786,7 +932,7 @@ def validate_client(source: str) -> None:
     result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,
                      timeout=ACTION_TIMEOUTS[arguments[0]])
     if result.returncode:
-        fail(f"owned unit command failed ({' '.join(arguments)}): {result.stderr.strip()}")
+        fail(f"owned unit {arguments[0]} command failed with status {result.returncode}")
     return True
 ''', "client must revalidate exact ownership immediately before name-based commands")
     require_exact_function(tree, "durable_marker", '''def durable_marker(name):
@@ -839,7 +985,7 @@ def validate_client(source: str) -> None:
         '"--property=StandardOutput=journal", "--property=StandardError=journal"',
         '*exec_argv,',
         'if valid_invocation(candidate_invocation) and launch_matches(observed, nonce, exec_argv):',
-        'fail(f"missing exact invocation identity: {observed}")',
+        'fail(f"missing exact invocation identity: {sanitized_state(observed)}")',
         'current = owned_state(invocation, nonce, exec_argv,',
         'successful = successful_terminal_state(current)',
         'f"_SYSTEMD_INVOCATION_ID={invocation}"',
@@ -861,9 +1007,9 @@ def validate_client(source: str) -> None:
         'CLEANUP_ACTIVE = False',
         'discovered = launch_state(context="recovery")',
         'except BaseException as error:\n            primary_error = error',
-        'f"launched unit has no safe nonce-bound identity: {discovered}"',
+        'f"{sanitized_state(discovered)}"',
         'cleanup_errors.append(error)',
-        'raise RuntimeError(f"{primary_error}; cleanup failed: {detail}") from primary_error',
+        'raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None',
         'client_pause("client-terminal-race-a-unloaded")',
         'Hostile root is explicitly outside this verifier\'s threat model.',
     )
@@ -936,7 +1082,7 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
         'f"_SYSTEMD_INVOCATION_ID={invocation}"',
         'if cgroup_pids(current.get("ControlGroup", "")):',
         "teardown_owned(invocation, nonce, exec_argv)",
-        "raise primary_error",
+        "raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None",
         'client_pause("client-terminal-race-a-unloaded")',
         "return result",
         "os.close(client_lock)",
@@ -957,7 +1103,8 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
     expected_prelaunch = ast.parse('''before = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
                          context="prelaunch")
 if before.get("LoadState") != "not-found":
-    fail(f"fixed verification unit is not explicitly absent: {before}")
+    fail("fixed verification unit is not explicitly absent: "
+         f"{sanitized_state(before)}")
 occupants = cgroup_pids(before.get("ControlGroup", ""))
 if occupants:
     fail(f"verification unit control group is not empty: {occupants}")
@@ -1063,11 +1210,11 @@ finally:
             == [ast.dump(node) for node in expected_masked_launch],
             "client launch attempt, systemd-run, and immediate InvocationID capture must stay signal-masked")
     expected_launch_failures = ast.parse('''if launched.returncode:
-    fail(f"fixed unit launch failed: {launched.stderr.strip()}")
+    fail(f"fixed unit launch failed with status {launched.returncode}")
 if capture_error is not None:
     raise capture_error
 if invocation is None:
-    fail(f"missing exact invocation identity: {observed}")
+    fail(f"missing exact invocation identity: {sanitized_state(observed)}")
 ''').body
     require([ast.dump(node) for node in launch_try.body[2:4] + launch_try.body[5:6]]
             == [ast.dump(node) for node in expected_launch_failures],
@@ -1097,7 +1244,8 @@ finally:
                     teardown_owned(invocation, nonce, exec_argv)
                 else:
                     cleanup_errors.append(RuntimeError(
-                        f"launched unit has no safe nonce-bound identity: {discovered}"))
+                        "launched unit has no safe nonce-bound identity: "
+                        f"{sanitized_state(discovered)}"))
             except BaseException as error:
                 cleanup_errors.append(error)
         elif launch_attempted:
@@ -1556,12 +1704,14 @@ finally:
     require(len(exhaust_calls) == 4 and observed_exhaust_guards == expected_exhaust_guards,
             "client may accelerate work exhaustion only at the four reviewed boundaries")
     expected_outcome = ast.parse('''if cleanup_errors:
-    detail = "; ".join(map(str, cleanup_errors))
+    detail = sanitized_diagnostic(
+        "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)
     if primary_error is not None:
-        raise RuntimeError(f"{primary_error}; cleanup failed: {detail}") from primary_error
+        primary = sanitized_diagnostic(primary_error, nonce)
+        raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None
     fail(f"cleanup failed: {detail}")
 if primary_error is not None:
-    raise primary_error
+    raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None
 if requested_mode == "client-terminal-race-a":
     client_pause("client-terminal-race-a-unloaded")
 return result
@@ -1624,9 +1774,10 @@ return result
         'retry_owned_command(invocation, nonce, service_command, "stop", "stop")',
         'retry_owned_command(invocation, nonce, service_command, "reset", "reset-failed")',
         'wait_unloaded(invocation, nonce, service_command)',
-        'if errors:\n        raise RuntimeError("; ".join(map(str, errors)))',
     )
-    require(all(teardown.count(fragment) == 1 for fragment in teardown_contract),
+    require(all(teardown.count(fragment) == 1 for fragment in teardown_contract)
+            and teardown.count(
+                '"; ".join(sanitized_diagnostic(error, nonce) for error in errors)') == 2,
             "client teardown must retry pre-action failures and aggregate kill/stop/wait/reset/unload errors")
     require(teardown.count("owned_state(invocation, nonce, service_command") == 3,
             "client teardown must revalidate full ownership before each poll/name operation")
@@ -1718,14 +1869,14 @@ def validate_containment(source: str, phase: str) -> None:
 ''', "containment subprocesses must have a bounded default wait")
     require_exact_function(tree, "parse_unit_properties", '''def parse_unit_properties(result, requested):
     if result.returncode:
-        fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+        fail(f"containment systemctl show failed with status {result.returncode}")
     if not result.stdout:
         fail("containment systemctl show returned empty output")
     values = {}
     for line in result.stdout.splitlines():
         key, separator, value = line.partition("=")
         if not separator or not key or key in values:
-            fail(f"containment systemctl show returned malformed output: {line!r}")
+            fail("containment systemctl show returned malformed output")
         values[key] = value
     if values.get("LoadState") == "not-found":
         return values
@@ -1748,7 +1899,8 @@ def validate_containment(source: str, phase: str) -> None:
             errors.append(error)
             if attempt < 3:
                 time.sleep(0.05 * (2 ** attempt))
-    fail("containment unit properties remain unknown: " + "; ".join(map(str, errors)))
+    fail("containment unit properties remain unknown: "
+         + "; ".join(bounded_sanitized_repr(error) for error in errors))
 ''', "containment property reads must fail closed with bounded retry")
     require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
             "containment must not infer absence from an empty or failed property query")
@@ -1843,21 +1995,31 @@ def validate_containment(source: str, phase: str) -> None:
         or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup
     )
 ''', "containment persistent cleanup-first result predicate changed")
-    require_exact_function(tree, "bounded_sanitized_repr", '''def bounded_sanitized_repr(value):
-    text = str(value)
+    require_exact_function(tree, "bounded_sanitized_repr", '''def bounded_sanitized_repr(value, active_nonce=None):
+    if isinstance(value, subprocess.TimeoutExpired):
+        text = "subprocess timed out"
+    elif isinstance(value, subprocess.CalledProcessError):
+        text = f"subprocess failed with status {value.returncode}"
+    elif isinstance(value, OSError):
+        text = f"operating system error errno={value.errno}"
+    else:
+        text = str(value)
+    if active_nonce:
+        text = text.replace(active_nonce, "<redacted-nonce>")
+    if any(marker in text for name in ("Description", "Environment", "ExecStart", "Command")
+           for marker in (name + "=", "'" + name + "':", '"' + name + '\":')):
+        text = "diagnostic contained redacted launch identity"
     index = 0
     parts = []
     hexadecimal = "0123456789abcdefABCDEF"
     while index < len(text):
         candidate = text[index:index + 64]
-        left_hex = index > 0 and text[index - 1] in hexadecimal
-        right_hex = index + 64 < len(text) and text[index + 64] in hexadecimal
         candidate_hex = True
         for character in candidate:
             if character not in hexadecimal:
                 candidate_hex = False
                 break
-        if len(candidate) == 64 and candidate_hex and not left_hex and not right_hex:
+        if len(candidate) == 64 and candidate_hex:
             parts.append("<redacted-hex64>")
             index += 64
         else:
@@ -1866,29 +2028,29 @@ def validate_containment(source: str, phase: str) -> None:
     text = "".join(parts)
     if len(text) > DIAGNOSTIC_TEXT_LIMIT:
         text = text[:DIAGNOSTIC_TEXT_LIMIT] + "...<truncated>"
-    return repr(text)
+    rendered = repr(text)
+    return (rendered[:DIAGNOSTIC_TEXT_LIMIT] + "...<truncated>"
+            if len(rendered) > DIAGNOSTIC_TEXT_LIMIT else rendered)
 ''', "containment persistent diagnostics redaction or bound changed")
     require_exact_function(tree, "sanitized_state", '''def sanitized_state(state):
     if state is None:
         return "explicit-absence"
-    redacted = {
-        name: ("<redacted>"
-               if name in ("Description", "Environment", "ExecStart", "Command") else value)
-        for name, value in sorted(state.items())
-    }
-    return bounded_sanitized_repr(redacted)
+    safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+                  "Result", "ExecMainCode", "ExecMainStatus", "ExecMainPID", "MainPID",
+                  "EvidenceError", *SERVICE_PROPERTIES)
+    safe = {name: state.get(name) for name in safe_names if name in state}
+    return bounded_sanitized_repr(safe)
 ''', "containment persistent state diagnostics sanitization changed")
     require_exact_function(tree, "persistent_failure_diagnostics", '''def persistent_failure_diagnostics(mode, boundary, faulted, classification, intercepted,
                                    attempted, observed, after_exit, signed_cleanup_ran,
                                    post_cleanup, lock_handoff_error, cleanup_error,
                                    lock_reuse_error, post_cleanup_cgroup):
-    return (
+    detail = (
         f"mode={mode!r}; boundary={boundary!r}; returncode={faulted.returncode!r}; "
         f"success_in_stdout={classification['success_in_stdout']!r}; "
         f"property_unknown={classification['property_unknown']!r}; "
         f"action_unavailable={classification['action_unavailable']!r}; "
-        f"stdout={bounded_sanitized_repr(faulted.stdout)}; "
-        f"stderr={bounded_sanitized_repr(faulted.stderr)}; "
+        f"stdout_present={bool(faulted.stdout)!r}; stderr_present={bool(faulted.stderr)!r}; "
         f"intercepted={intercepted!r}; attempted={attempted!r}; "
         f"observed_signature={sanitized_state(observed)}; "
         f"after_exit={sanitized_state(after_exit)}; "
@@ -1899,6 +2061,7 @@ def validate_containment(source: str, phase: str) -> None:
         f"lock_reuse_error={bounded_sanitized_repr(lock_reuse_error)}; "
         f"post_cleanup_cgroup={bounded_sanitized_repr(post_cleanup_cgroup)}"
     )
+    return bounded_sanitized_repr(detail)
 ''', "containment persistent assertion diagnostics changed")
     require_exact_function(tree, "assert_persistent_failure_contract", '''def assert_persistent_failure_contract():
     cases = (
@@ -1967,7 +2130,7 @@ def validate_containment(source: str, phase: str) -> None:
     expected_function_signatures = (
         ("fail", "message"), ("persistent_failure_classification", "stdout, stderr"),
         ("persistent_result_violation", "returncode, classification, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup, post_cleanup_cgroup"),
-        ("bounded_sanitized_repr", "value"), ("sanitized_state", "state"),
+        ("bounded_sanitized_repr", "value, active_nonce=None"), ("sanitized_state", "state"),
         ("persistent_failure_diagnostics", "mode, boundary, faulted, classification, intercepted, attempted, observed, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup_cgroup"),
         ("assert_persistent_failure_contract", ""), ("run", "argv, **kwargs"),
         ("parse_unit_properties", "result, requested"), ("show", "*properties"),
@@ -2016,6 +2179,7 @@ def validate_containment(source: str, phase: str) -> None:
         "wait_counter": [ast.dump(ast.Constant(value=30))],
         "wait_unit_absent": [ast.dump(ast.Constant(value=30))],
         "assert_interception": [ast.dump(ast.Constant(value=False))],
+        "bounded_sanitized_repr": [ast.dump(ast.Constant(value=None))],
     }
     protected_persistent_bindings.update(node.name for node in reviewed_persistent_functions)
     require(actual_containment_functions == expected_containment_functions
@@ -2105,7 +2269,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     try:
         raise SystemExit(main())
     except Exception as error:
-        print(f"containment-test: {error}", file=sys.stderr)
+        print("containment-test: " + bounded_sanitized_repr(error), file=sys.stderr)
         raise SystemExit(1)
 ''').body[0]
     module_guards = [node for node in tree.body if isinstance(node, ast.If)]
@@ -2136,10 +2300,10 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         and node.targets[0] not in reviewed_persistent_assignments
     )
     expected_constant_loads = {
-        "UNIT": 20, "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 5,
+        "UNIT": 20, "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 6,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
-        "DIAGNOSTIC_TEXT_LIMIT": 3, "PROGRAM": 2, "NONCE_VARIABLE": 2,
-        "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 5, "IDENTITY_PROPERTIES": 1,
+        "DIAGNOSTIC_TEXT_LIMIT": 5, "PROGRAM": 2, "NONCE_VARIABLE": 2,
+        "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 6, "IDENTITY_PROPERTIES": 1,
         "SYSTEMD_UNIT_OBJECT": 1,
     }
     actual_constant_loads = {name: 0 for name in expected_module_assignments}
@@ -2157,7 +2321,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
             ast.dump(ast.parse('call(env=ENV)', mode="eval").body.keywords[0]): 11,
         },
         "SERVICE_PROPERTIES": {
-            ast.dump(ast.parse('(*SERVICE_PROPERTIES,)', mode="eval").body.elts[0]): 2,
+            ast.dump(ast.parse('(*SERVICE_PROPERTIES,)', mode="eval").body.elts[0]): 3,
             ast.dump(ast.parse(
                 '{"Description": DESCRIPTION_PREFIX + stale_fixture_id, '
                 '"Environment": stale_expected_environment, **SERVICE_PROPERTIES}',
@@ -2207,7 +2371,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     protected_persistent_bindings.update(reviewed_imports)
     expected_module_loads = {
         "fcntl": 17, "json": 7, "os": 87, "runpy": 1, "secrets": 2,
-        "signal": 6, "subprocess": 102, "sys": 3, "time": 66,
+        "signal": 6, "subprocess": 104, "sys": 3, "time": 66,
     }
     actual_module_loads = {name: 0 for name in reviewed_imports}
     for node in ast.walk(tree):
@@ -2229,7 +2393,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2,
         ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 2,
         ("signal", "SIGQUIT"): 1, ("signal", "SIGTERM"): 1,
-        ("subprocess", "CompletedProcess"): 21, ("subprocess", "PIPE"): 68,
+        ("subprocess", "CalledProcessError"): 1, ("subprocess", "CompletedProcess"): 21,
+        ("subprocess", "PIPE"): 68, ("subprocess", "TimeoutExpired"): 1,
         ("subprocess", "Popen"): 10, ("subprocess", "SubprocessError"): 2,
         ("subprocess", "run"): 1, ("sys", "argv"): 2, ("sys", "stderr"): 1,
         ("time", "monotonic"): 48, ("time", "sleep"): 18,
@@ -2248,7 +2413,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         "runpy.run_path": 1, "secrets.token_hex": 2,
         "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 2,
         "signal.SIGQUIT": 1, "signal.SIGTERM": 1,
-        "subprocess.CompletedProcess": 21, "subprocess.PIPE": 68,
+        "subprocess.CalledProcessError": 1, "subprocess.CompletedProcess": 21,
+        "subprocess.PIPE": 68, "subprocess.TimeoutExpired": 1,
         "subprocess.Popen": 10, "subprocess.SubprocessError": 2,
         "subprocess.run": 1, "sys.argv": 2, "sys.stderr": 1,
         "time.monotonic": 48, "time.sleep": 18,
@@ -2321,7 +2487,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         "bounded_cleanup_timeout", "bounded_sanitized_repr", "cgroup_pids",
         "cleanup_fixture_invocation", "cleanup_signed_launch", "cleanup_signed_launch_until",
         "counter", "dict", "fail",
-        "fast_recovery", "fault_paths", "int", "intent_entry", "iter", "len", "main", "min",
+        "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
         "launch_identity_matches", "launch_identity_signature", "list", "map", "next",
         "observable_identity", "open", "parse_structured_command",
         "parse_unit_properties", "parser",
@@ -2346,7 +2512,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         "path", "payload", "results", "signature", "slow", "slow_paths", "slow_state", "source", "state",
         "stale_after_client", "stale_observed",
         "stale_post_cleanup", "stale_post_cleanup_cgroup", "stale_program",
-        "stopped", "reset", "subprocess", "time", "values", "waiting",
+        "stopped", "reset", "subprocess", "text", "time", "values", "waiting",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -2388,13 +2554,13 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     # These normalized AST fingerprints only guard the exact reviewed inventory/context;
     # they are not source authentication and never replace the semantic inventories above.
     require(hashlib.sha256(repr(sorted(call_target_counts.items())).encode()).hexdigest()
-                == "14facf8815076f464342e62cbd56e889377b864c1b5406cf4f5d99e2b83534ec"
+                == "e412c9eff18b9195d2ce6f4678da7655726ef30747829094c99d1adf77913eca"
             and hashlib.sha256(repr(sorted(call_contexts)).encode()).hexdigest()
-                == "b9369355f7189defadb88ee0f9d44fa4383d97201fbe56d8ac50954083c94db0"
+                == "df97966adfd1e9b28ebe3c68a214273b926426eb09511173996824667e66efaa"
             and hashlib.sha256(repr(sorted(security_call_contexts)).encode()).hexdigest()
                 == "ecd4072a1215c77bb9e4346d379edbec324ab227cdd8724d47886abe573f0351"
             and hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest()
-                == "657cd99cc041fd8bef505ee24294231105a4f95774ff4a067b5322d79d93f72a",
+                == "876a82a6aebe9724f9090794c9efa4d7e2a12944f683cd4191b746b5b704b086",
             "containment call targets, arguments, or use-site contexts changed")
     protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
     expected_call_root_stores = {
@@ -2409,7 +2575,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         "slow_paths": 1, "slow_state": 1, "source": 6, "stale_after_client": 2,
         "stale_observed": 3, "stale_post_cleanup": 3,
         "stale_post_cleanup_cgroup": 2, "stale_program": 1,
-        "state": 17, "stopped": 3, "successful_terminal_state": 1, "values": 2,
+        "state": 17, "stopped": 3, "successful_terminal_state": 1, "text": 8, "values": 2,
         "waiting": 1,
     }
     actual_call_root_stores = {}
@@ -2423,7 +2589,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                                              type(parent).__name__, field, ast.dump(parent)))
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
-                == "a9802d53bf526776557400f68ebf0b41b12c064e505fe4b2a2e49205ae402edd"
+                == "b4dc3a95067fe2c2dba7bc61097d8b032f15beb119acbd702c723da69fc43218"
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -2441,8 +2607,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 366, "AugAssign": 2, "Break": 9, "Continue": 6, "Delete": 1,
-        "Expr": 277, "For": 37, "FunctionDef": 53, "If": 170, "Import": 9,
+        "Assign": 372, "AugAssign": 2, "Break": 9, "Continue": 6, "Delete": 1,
+        "Expr": 277, "For": 37, "FunctionDef": 53, "If": 175, "Import": 9,
         "Pass": 5, "Raise": 4, "Return": 59, "Try": 42, "While": 15, "With": 6,
     }
     actual_statement_inventory = {}
@@ -2457,7 +2623,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     # The recursive semantic call/module/binding inventories above remain independently required.
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
-                == "88d018c8e18a3f176befaad389422cd274a36c75ced77a323d43004d7b90f76f",
+                == "7c8fc4e9f57e6f5578190e318d01a981b92ccaebd29409d2eb1eb7e3d706f778",
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -2566,9 +2732,9 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
     state = show("LoadState", "ControlGroup")
     if state.get("LoadState") != "not-found":
-        fail(f"client fault left the fixed unit loaded: {mode}: {state}")
+        fail(f"client fault left the fixed unit loaded: {mode}: {sanitized_state(state)}")
     if cgroup_pids(state.get("ControlGroup", "")):
-        fail(f"client fault left control-group processes: {mode}: {state}")
+        fail(f"client fault left control-group processes: {mode}: {sanitized_state(state)}")
     if cgroup_pids("/system.slice/" + UNIT):
         fail(f"client fault left processes in the fixed unit cgroup: {mode}")
     assert_client_lock_reusable()
@@ -2577,7 +2743,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     recovered = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                      "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if recovered.returncode or recovered.stdout.count(SUCCESS) != 1:
-        fail(f"fast clean recovery failed after {context}: {recovered.stdout} {recovered.stderr}")
+        fail(f"fast clean recovery failed after {context} with status {recovered.returncode}; "
+             f"success_count={recovered.stdout.count(SUCCESS)}")
     wait_unit_absent()
     assert_client_lock_reusable()
 ''', "containment causal fast recovery assertion changed")
@@ -2597,7 +2764,8 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     if state["LoadState"] == "not-found":
         return
     if state.get("InvocationID") != invocation:
-        fail(f"persistent-fault cleanup refused a different invocation: {state}")
+        fail("persistent-fault cleanup refused a different invocation: "
+             + sanitized_state(state))
     run(("/usr/bin/systemctl", "stop", UNIT),
         check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     deadline = time.monotonic() + 20
@@ -2606,11 +2774,11 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         if state["LoadState"] == "not-found":
             return
         if state.get("InvocationID") != invocation:
-            fail(f"persistent-fault cleanup observed name reuse: {state}")
+            fail("persistent-fault cleanup observed name reuse: " + sanitized_state(state))
         if state.get("ActiveState") in ("failed", "inactive"):
             break
         if time.monotonic() >= deadline:
-            fail(f"persistent-fault invocation did not terminate: {state}")
+            fail("persistent-fault invocation did not terminate: " + sanitized_state(state))
         time.sleep(0.1)
     run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2682,7 +2850,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,
                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if stopped.returncode:
-        fail(f"persistent-fault stop failed: {stopped.stderr.strip()}")
+        fail(f"persistent-fault stop failed with status {stopped.returncode}")
     while True:
         state = signed_launch_state_until(signature, deadline)
         if state["LoadState"] == "not-found":
@@ -2871,7 +3039,7 @@ if slow_elapsed < 25 or slow_elapsed > 175:
     fail(f"slow cleanup delay/retry was not bounded: {slow_elapsed:.3f}s")
 slow_state = show("LoadState", "ControlGroup")
 if slow_state.get("LoadState") != "not-found":
-    fail(f"slow cleanup did not explicitly unload: {slow_state}")
+    fail("slow cleanup did not explicitly unload: " + sanitized_state(slow_state))
 if cgroup_pids(slow_state.get("ControlGroup", "")) or cgroup_pids("/system.slice/" + UNIT):
     fail("slow cleanup left fixed-unit cgroup processes")
 assert_client_lock_held()
@@ -2925,7 +3093,7 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
                     and node.func.id == "cleanup_signed_launch_until"
                     for statement in stale_phase_tries[0].finalbody for node in ast.walk(statement))
             and hashlib.sha256(repr([ast.dump(node) for node in stale_nodes]).encode()).hexdigest()
-                == "d3a7638eb906e8582b5e65dc92819915250bd7bd3d8443c32fed97a37ea32065",
+                == "e3f7360ede32bccfe8ab6627fe3e5a9e5a3ecd457959b3425e96fbc7e47dd80b",
             "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
 
     persistent_loops = []
@@ -2967,9 +3135,9 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
     cleanup_error = ""
     try:
         after_exit = show("LoadState") if signature is None else signed_launch_state(signature)
-    except BaseException as error:
-        after_exit = {"EvidenceError": str(error)}
-        cleanup_error = f"post-exit state capture failed: {error}"
+    except BaseException:
+        after_exit = {"EvidenceError": "post-exit state capture failed"}
+        cleanup_error = "post-exit state capture failed"
     cleanup_lock = None
     lock_held = False
     lock_handoff_error = ""
@@ -2977,8 +3145,8 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
         cleanup_lock = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
         fcntl.flock(cleanup_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         lock_held = True
-    except BaseException as error:
-        lock_handoff_error = str(error)
+    except BaseException:
+        lock_handoff_error = "cleanup lock handoff failed"
     signed_cleanup_ran = False
     try:
         if after_exit.get("LoadState") != "not-found":
@@ -2986,37 +3154,40 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
                 raise RuntimeError("loaded post-exit unit lacks an attested launch signature")
             signed_cleanup_ran = True
             cleanup_signed_launch(signature)
-    except BaseException as error:
-        cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+    except BaseException:
+        cleanup_error = "; ".join(
+            item for item in (cleanup_error, "signed cleanup failed") if item)
     try:
         post_cleanup = show_identity_until(time.monotonic() + 10,
                                            "ActiveState", "ControlGroup")
-    except BaseException as error:
-        post_cleanup = {"EvidenceError": str(error)}
-        cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+    except BaseException:
+        post_cleanup = {"EvidenceError": "post-cleanup state capture failed"}
+        cleanup_error = "; ".join(
+            item for item in (cleanup_error, "post-cleanup state capture failed") if item)
     try:
         post_cleanup_cgroup = cgroup_pids("/system.slice/" + UNIT)
-    except BaseException as error:
-        post_cleanup_cgroup = [f"evidence-error: {error}"]
-        cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+    except BaseException:
+        post_cleanup_cgroup = ["cgroup evidence capture failed"]
+        cleanup_error = "; ".join(
+            item for item in (cleanup_error, "cgroup evidence capture failed") if item)
     finally:
         if cleanup_lock is not None:
             if lock_held:
                 try:
                     fcntl.flock(cleanup_lock, fcntl.LOCK_UN)
-                except BaseException as error:
+                except BaseException:
                     cleanup_error = "; ".join(
-                        item for item in (cleanup_error, f"lock release failed: {error}") if item)
+                        item for item in (cleanup_error, "lock release failed") if item)
             try:
                 os.close(cleanup_lock)
-            except BaseException as error:
+            except BaseException:
                 cleanup_error = "; ".join(
-                    item for item in (cleanup_error, f"lock close failed: {error}") if item)
+                    item for item in (cleanup_error, "lock close failed") if item)
     lock_reuse_error = ""
     try:
         assert_client_lock_reusable()
-    except BaseException as error:
-        lock_reuse_error = str(error)
+    except BaseException:
+        lock_reuse_error = "client lock reuse check failed"
     if persistent_result_violation(
             faulted.returncode, classification, lock_handoff_error, cleanup_error,
             lock_reuse_error, post_cleanup, post_cleanup_cgroup):
@@ -3642,6 +3813,36 @@ def verify_supervisor_mutations(
     for label, mutation, expected in supervisor_mutations:
         expect_rejected(validate_supervisor, mutation, label, expected)
     client_mutations = [
+        ("client active nonce replacement omitted", replace_once(client,
+            '    if nonce:\n        text = text.replace(nonce, "<redacted-nonce>")',
+            '    if nonce:\n        pass')),
+        ("client hex64 defense omitted", replace_once(client,
+            '        if len(candidate) == 64 and all(character in hexadecimal for character in candidate):',
+            '        if False:')),
+        ("client identity field redaction omitted", replace_once(client,
+            '        text = "diagnostic contained redacted launch identity"',
+            '        pass')),
+        ("timeout exposes subprocess exception", replace_once(client,
+            '        raise RuntimeError("client subprocess timed out") from None',
+            '        raise error')),
+        ("launch exposes stderr", replace_once(client,
+            '                fail(f"fixed unit launch failed with status {launched.returncode}")',
+            '                fail(f"fixed unit launch failed: {launched.stderr}")')),
+        ("malformed property exposes line", replace_once(client,
+            '            fail("systemctl show returned malformed output")',
+            '            fail(f"systemctl show returned malformed output: {line!r}")')),
+        ("owned state exposes blob", replace_once(client,
+            '        fail("fixed unit launch identity lost; refusing name-based cleanup: "\n             f"{sanitized_state(state)}")',
+            '        fail(f"fixed unit launch identity lost; refusing name-based cleanup: {state}")')),
+        ("recovery state exposes blob", replace_once(client,
+            '                                f"{sanitized_state(discovered)}"))',
+            '                                f"{discovered}"))')),
+        ("cleanup exposes exception strings", replace_once(client,
+            '            detail = sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)',
+            '            detail = "; ".join(map(str, cleanup_errors))')),
+        ("client top fallback unsanitized", replace_once(client,
+            '        print("verification-client: " + sanitized_diagnostic(error, None), file=sys.stderr)',
+            '        print(f"verification-client: {error}", file=sys.stderr)')),
         ("random transient unit", replace_once(client, 'UNIT = "nmcp-migration-role-verifier.service"', 'UNIT = "nmcp-migration-role-verifier-123.service"')),
         ("simple service type", replace_once(client, '"--service-type=exec"', '"--service-type=simple"')),
         ("process-only kill", replace_once(client, '"--property=KillMode=control-group"', '"--property=KillMode=process"')),
@@ -3654,7 +3855,7 @@ def verify_supervisor_mutations(
         ("no retained result", replace_once(client, '"--property=RemainAfterExit=yes"', '"--property=RemainAfterExit=no"')),
         ("supervisor not exact commit", replace_once(client, '"show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"', '"show", "HEAD:scripts/verify-ubuntu-migration-role-supervisor"')),
         ("property nonzero treated as absent", replace_once(client,
-            '    if result.returncode:\n        fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
+            '    if result.returncode:\n        fail(f"systemctl show failed with status {result.returncode}")',
             '    if result.returncode:\n        return {"LoadState": "not-found"}')),
         ("empty property result accepted", replace_once(client,
             '    if not result.stdout:\n        fail("systemctl show returned empty output")',
@@ -3916,8 +4117,8 @@ def verify_supervisor_mutations(
         ("subprocess ignores absolute budget", replace_once(client,
             '        timeout = min(timeout, remaining)', '        timeout = timeout')),
         ("prelaunch loaded unit accepted", replace_once(client,
-            '        if before.get("LoadState") != "not-found":\n            fail(f"fixed verification unit is not explicitly absent: {before}")',
-            '        if False:\n            fail(f"fixed verification unit is not explicitly absent: {before}")')),
+            '        if before.get("LoadState") != "not-found":\n            fail("fixed verification unit is not explicitly absent: "\n                 f"{sanitized_state(before)}")',
+            '        if False:\n            fail("fixed verification unit is not explicitly absent: "\n                 f"{sanitized_state(before)}")')),
         ("terminal recovery uses fast supervisor", replace_once(client,
             '        supervisor_mode = ""\n    elif (requested_mode.startswith("client-cleanup-fault-")',
             '        supervisor_mode = "fast-success"\n    elif (requested_mode.startswith("client-cleanup-fault-")')),
@@ -4021,7 +4222,7 @@ def verify_supervisor_mutations(
         ("launch attempt marked too late", replace_once(client, '                launch_attempted = True\n                launched = command(service_argv, check=False)', '                launched = command(service_argv, check=False)\n                launch_attempted = True')),
         ("launch recovery disabled", replace_once(client, '        launch_attempted = False', '        launch_attempted = None')),
         ("nonzero launch accepted", replace_once(client, '            if launched.returncode:', '            if False:')),
-        ("missing launch InvocationID accepted", replace_once(client, '            if invocation is None:\n                fail(f"missing exact invocation identity: {observed}")', '            if False:\n                fail(f"missing exact invocation identity: {observed}")')),
+        ("missing launch InvocationID accepted", replace_once(client, '            if invocation is None:\n                fail(f"missing exact invocation identity: {sanitized_state(observed)}")', '            if False:\n                fail(f"missing exact invocation identity: {sanitized_state(observed)}")')),
         ("missing ID recovery discovery omitted", replace_once(client,
             '                        discovered = launch_state(context="recovery")', '                        discovered = {"LoadState": "not-found"}')),
         ("recovered InvocationID nonce unchecked", replace_once(client,
@@ -4033,7 +4234,7 @@ def verify_supervisor_mutations(
         ("teardown failure discarded", replace_once(client,
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException as error:\n                        cleanup_errors.append(error)',
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException:\n                        pass')),
-        ("teardown aggregation bypassed", replace_once(client, '        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))', '        if False:\n            detail = "; ".join(map(str, cleanup_errors))')),
+        ("teardown aggregation bypassed", replace_once(client, '        if cleanup_errors:\n            detail = sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)', '        if False:\n            detail = sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)')),
         ("recovered property errors discarded", replace_once(client,
             '            if RECOVERED_ERRORS:\n                cleanup_errors.extend(RECOVERED_ERRORS)',
             '            if RECOVERED_ERRORS:\n                pass')),
@@ -4048,7 +4249,7 @@ def verify_supervisor_mutations(
         ("cleanup retry changes ownership target", replace_once(client,
             '            acted = owned_command(invocation, nonce, service_command, action, *arguments)',
             '            acted = owned_command("", nonce, service_command, action, *arguments)')),
-        ("raising statement between finally and resolution", replace_once(client, '        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))', '        unit_properties("LoadState")\n        if cleanup_errors:\n            detail = "; ".join(map(str, cleanup_errors))')),
+        ("raising statement between finally and resolution", replace_once(client, '        if cleanup_errors:\n            detail = sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)', '        unit_properties("LoadState")\n        if cleanup_errors:\n            detail = sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)')),
         ("signal cancellation bypasses cleanup", replace_once(client, '    CANCELLED.append(signum)', '    os._exit(128 + signum)')),
         ("teardown signal block omitted", replace_once(client,
             '            CLEANUP_ACTIVE = True\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
@@ -4057,7 +4258,7 @@ def verify_supervisor_mutations(
             '    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])\n    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,\n                     timeout=ACTION_TIMEOUTS[arguments[0]])',
             '    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,\n                     timeout=ACTION_TIMEOUTS[arguments[0]])\n    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])')),
         ("cleanup aggregation omitted", replace_once(client,
-            '    if errors:\n        raise RuntimeError("; ".join(map(str, errors)))', '    pass')),
+            '    if errors:\n        raise RuntimeError(\n            sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)) from None', '    pass')),
         ("B attempting marker after flock", replace_once(client,
             '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.attempting")\n        fcntl.flock(client_lock, fcntl.LOCK_EX)',
             '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.attempting")')),
@@ -4180,6 +4381,34 @@ def verify_supervisor_mutations(
     for label, mutation in client_mutations:
         expect_rejected(validate_client, mutation, label, "client")
     containment_mutations = [
+        ("persistent diagnostic streams exposed", replace_once(containment,
+            '        f"stdout_present={bool(faulted.stdout)!r}; stderr_present={bool(faulted.stderr)!r}; "',
+            '        f"stdout={faulted.stdout}; stderr={faulted.stderr}; "')),
+        ("slow cleanup state exposed", replace_once(containment,
+            '        fail("slow cleanup did not explicitly unload: " + sanitized_state(slow_state))',
+            '        fail(f"slow cleanup did not explicitly unload: {slow_state}")')),
+        ("terminal state exposed", replace_once(containment,
+            '        fail("client A did not pause at terminal state: " + sanitized_state(terminal_a))',
+            '        fail(f"client A did not pause at terminal state: {terminal_a}")')),
+        ("recovery streams exposed", replace_once(containment,
+            '        fail(f"clean recovery client A failed with status {recovered.returncode}; "\n'
+            '             f"stdout_present={bool(recovered_stdout)}; stderr_present={bool(recovered_stderr)}")',
+            '        fail(f"clean recovery client A failed: {recovered_stdout} {recovered_stderr}")')),
+        ("busctl exposes stderr", replace_once(containment,
+            '        fail(f"busctl {property_name} failed with status {result.returncode}")',
+            '        fail(f"busctl {property_name} failed: {result.stderr}")')),
+        ("duplicate JSON key exposed", replace_once(containment,
+            '            fail("duplicate key in structured command property")',
+            '            fail(f"duplicate key in structured command property: {key}")')),
+        ("containment top fallback unsanitized", replace_once(containment,
+            '        print("containment-test: " + bounded_sanitized_repr(error), file=sys.stderr)',
+            '        print(f"containment-test: {error}", file=sys.stderr)')),
+        ("active nonce replacement omitted", replace_once(containment,
+            '    if active_nonce:\n        text = text.replace(active_nonce, "<redacted-nonce>")',
+            '    if active_nonce:\n        pass')),
+        ("hex64 defense omitted", replace_once(containment,
+            '        if len(candidate) == 64 and candidate_hex:',
+            '        if False:')),
         ("persistent property classifier uses wrong singular verb", replace_once(containment,
             'PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"',
             'PERSISTENT_PROPERTY_ERROR = "unit properties remains unknown:"')),
@@ -4428,7 +4657,7 @@ def verify_supervisor_mutations(
             '        assert_client_lock_reusable()\n'
             '        cleanup_error = ""')),
         ("containment nonzero show treated as absent", replace_once(containment,
-            '    if result.returncode:\n        fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")',
+            '    if result.returncode:\n        fail(f"containment systemctl show failed with status {result.returncode}")',
             '    if result.returncode:\n        return {"LoadState": "not-found"}')),
         ("containment empty show accepted", replace_once(containment,
             '    if not result.stdout:\n        fail("containment systemctl show returned empty output")',
@@ -4521,10 +4750,10 @@ def verify_supervisor_mutations(
         ("stale cleanup subprocess timeout unbounded", replace_once(containment,
             '                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
             '    if stopped.returncode:\n'
-            '        fail(f"bounded stale stop failed: {stopped.stderr.strip()}")',
+            '        fail(f"bounded stale stop failed with status {stopped.returncode}")',
             '                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n'
             '    if stopped.returncode:\n'
-            '        fail(f"bounded stale stop failed: {stopped.stderr.strip()}")')),
+            '        fail(f"bounded stale stop failed with status {stopped.returncode}")')),
         ("stale bounded show subprocess timeout omitted", replace_once(containment,
             '                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
             '            return parse_unit_properties(result, requested)',
@@ -4556,12 +4785,12 @@ def verify_supervisor_mutations(
             '    stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,\n'
             '                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
             '    if stopped.returncode:\n'
-            '        fail(f"bounded stale stop failed: {stopped.stderr.strip()}")',
+            '        fail(f"bounded stale stop failed with status {stopped.returncode}")',
             '    timeout = 20\n'
             '    stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,\n'
             '                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
             '    if stopped.returncode:\n'
-            '        fail(f"bounded stale stop failed: {stopped.stderr.strip()}")')),
+            '        fail(f"bounded stale stop failed with status {stopped.returncode}")')),
         ("stale active poll loses shared deadline", replace_once(containment,
             '        state = signed_launch_state_until(signature, deadline)\n'
             '        if state["LoadState"] == "not-found":\n'
@@ -4643,9 +4872,9 @@ def verify_supervisor_mutations(
         ("stale mismatched identity cleanup allowed", replace_once(containment,
             '            if stale_signature is None or not launch_identity_matches(partial, stale_signature):',
             '            if False:')),
-        ("stale diagnostic launch stderr omitted", replace_once(containment,
-            '             f"launch_stderr={bounded_sanitized_repr(stale_launch_stderr)}; "',
-            '             "launch_stderr=omitted; "')),
+        ("stale diagnostic launch stderr exposed", replace_once(containment,
+            '             f"launch_stderr_present={bool(stale_launch_stderr)}; "',
+            '             f"launch_stderr={stale_launch_stderr}; "')),
         ("stale signal paths not reset before launch", replace_once(containment,
             '        reset_paths(stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",\n'
             '                    stale_release, stale_release_ack, stale_release_ack + ".new")\n'
@@ -4705,10 +4934,11 @@ def verify_supervisor_mutations(
         ("stale client diagnostic return omitted", replace_once(containment,
             '             f"client_return={stale_rejected_return}; "',
             '             "client_return=omitted; "')),
-        ("stale client diagnostic streams omitted", replace_once(containment,
-            '             f"client_stdout={bounded_sanitized_repr(stale_rejected_stdout)}; "\n'
-            '             f"client_stderr={bounded_sanitized_repr(stale_rejected_stderr)}; "',
-            '             "client_streams=omitted; "')),
+        ("stale client diagnostic streams exposed", replace_once(containment,
+            '             f"client_stdout_present={bool(stale_rejected_stdout)}; "\n'
+            '             f"client_stderr_present={bool(stale_rejected_stderr)}; "',
+            '             f"client_stdout={stale_rejected_stdout}; "\n'
+            '             f"client_stderr={stale_rejected_stderr}; "')),
         ("stale after-client state substituted", replace_once(containment,
             '             f"after_client={sanitized_state(stale_after_client)}; "',
             '             f"after_client={sanitized_state(stale_observed)}; "')),
@@ -4830,9 +5060,9 @@ def verify_supervisor_mutations(
         ("persistent normalized identity omitted", replace_once(containment,
             '    if not valid_invocation or not launch_identity_matches(state, signature):',
             '    if not valid_invocation:')),
-        ("command diagnostics redaction omitted", replace_once(containment,
-            '("Description", "Environment", "ExecStart", "Command")',
-            '("Description", "Environment", "ExecStart")')),
+        ("safe state categories omitted", replace_once(containment,
+            '    safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",',
+            '    safe_names = ("InvocationID", "ActiveState", "SubState", "ControlGroup",')),
         ("persistent InvocationID comparison omitted", replace_once(containment,
             '    valid_invocation = (len(invocation) == 32\n                        and all(character in "0123456789abcdef" for character in invocation))',
             '    valid_invocation = True')),
@@ -5291,6 +5521,10 @@ def main() -> int:
     validate_supervisor(supervisor)
     validate_client(client)
     validate_containment(containment, migration_role_compatibility)
+    verify_nonce_safe_diagnostics(
+        ROOT / "scripts" / "verify-ubuntu-migration-role-client",
+        ROOT / "scripts" / "verify-ubuntu-migration-role-containment",
+    )
     validate_fd_wrappers(migration_compatibility, role_mode)
     verify_supervisor_mutations(
         supervisor,

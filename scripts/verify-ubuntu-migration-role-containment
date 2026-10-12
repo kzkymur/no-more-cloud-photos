@@ -55,21 +55,31 @@ def persistent_result_violation(returncode, classification, lock_handoff_error, 
     )
 
 
-def bounded_sanitized_repr(value):
-    text = str(value)
+def bounded_sanitized_repr(value, active_nonce=None):
+    if isinstance(value, subprocess.TimeoutExpired):
+        text = "subprocess timed out"
+    elif isinstance(value, subprocess.CalledProcessError):
+        text = f"subprocess failed with status {value.returncode}"
+    elif isinstance(value, OSError):
+        text = f"operating system error errno={value.errno}"
+    else:
+        text = str(value)
+    if active_nonce:
+        text = text.replace(active_nonce, "<redacted-nonce>")
+    if any(marker in text for name in ("Description", "Environment", "ExecStart", "Command")
+           for marker in (name + "=", "'" + name + "':", '"' + name + '\":')):
+        text = "diagnostic contained redacted launch identity"
     index = 0
     parts = []
     hexadecimal = "0123456789abcdefABCDEF"
     while index < len(text):
         candidate = text[index:index + 64]
-        left_hex = index > 0 and text[index - 1] in hexadecimal
-        right_hex = index + 64 < len(text) and text[index + 64] in hexadecimal
         candidate_hex = True
         for character in candidate:
             if character not in hexadecimal:
                 candidate_hex = False
                 break
-        if len(candidate) == 64 and candidate_hex and not left_hex and not right_hex:
+        if len(candidate) == 64 and candidate_hex:
             parts.append("<redacted-hex64>")
             index += 64
         else:
@@ -78,31 +88,31 @@ def bounded_sanitized_repr(value):
     text = "".join(parts)
     if len(text) > DIAGNOSTIC_TEXT_LIMIT:
         text = text[:DIAGNOSTIC_TEXT_LIMIT] + "...<truncated>"
-    return repr(text)
+    rendered = repr(text)
+    return (rendered[:DIAGNOSTIC_TEXT_LIMIT] + "...<truncated>"
+            if len(rendered) > DIAGNOSTIC_TEXT_LIMIT else rendered)
 
 
 def sanitized_state(state):
     if state is None:
         return "explicit-absence"
-    redacted = {
-        name: ("<redacted>"
-               if name in ("Description", "Environment", "ExecStart", "Command") else value)
-        for name, value in sorted(state.items())
-    }
-    return bounded_sanitized_repr(redacted)
+    safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+                  "Result", "ExecMainCode", "ExecMainStatus", "ExecMainPID", "MainPID",
+                  "EvidenceError", *SERVICE_PROPERTIES)
+    safe = {name: state.get(name) for name in safe_names if name in state}
+    return bounded_sanitized_repr(safe)
 
 
 def persistent_failure_diagnostics(mode, boundary, faulted, classification, intercepted,
                                    attempted, observed, after_exit, signed_cleanup_ran,
                                    post_cleanup, lock_handoff_error, cleanup_error,
                                    lock_reuse_error, post_cleanup_cgroup):
-    return (
+    detail = (
         f"mode={mode!r}; boundary={boundary!r}; returncode={faulted.returncode!r}; "
         f"success_in_stdout={classification['success_in_stdout']!r}; "
         f"property_unknown={classification['property_unknown']!r}; "
         f"action_unavailable={classification['action_unavailable']!r}; "
-        f"stdout={bounded_sanitized_repr(faulted.stdout)}; "
-        f"stderr={bounded_sanitized_repr(faulted.stderr)}; "
+        f"stdout_present={bool(faulted.stdout)!r}; stderr_present={bool(faulted.stderr)!r}; "
         f"intercepted={intercepted!r}; attempted={attempted!r}; "
         f"observed_signature={sanitized_state(observed)}; "
         f"after_exit={sanitized_state(after_exit)}; "
@@ -113,6 +123,7 @@ def persistent_failure_diagnostics(mode, boundary, faulted, classification, inte
         f"lock_reuse_error={bounded_sanitized_repr(lock_reuse_error)}; "
         f"post_cleanup_cgroup={bounded_sanitized_repr(post_cleanup_cgroup)}"
     )
+    return bounded_sanitized_repr(detail)
 
 
 def assert_persistent_failure_contract():
@@ -155,14 +166,14 @@ def run(argv, **kwargs):
 
 def parse_unit_properties(result, requested):
     if result.returncode:
-        fail(f"containment systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+        fail(f"containment systemctl show failed with status {result.returncode}")
     if not result.stdout:
         fail("containment systemctl show returned empty output")
     values = {}
     for line in result.stdout.splitlines():
         key, separator, value = line.partition("=")
         if not separator or not key or key in values:
-            fail(f"containment systemctl show returned malformed output: {line!r}")
+            fail("containment systemctl show returned malformed output")
         values[key] = value
     if values.get("LoadState") == "not-found":
         return values
@@ -186,7 +197,8 @@ def show(*properties):
             errors.append(error)
             if attempt < 3:
                 time.sleep(0.05 * (2 ** attempt))
-    fail("containment unit properties remain unknown: " + "; ".join(map(str, errors)))
+    fail("containment unit properties remain unknown: "
+         + "; ".join(bounded_sanitized_repr(error) for error in errors))
 
 
 def assert_property_parser_contract(client):
@@ -351,9 +363,9 @@ def assert_client_failure(result, mode):
         fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
     state = show("LoadState", "ControlGroup")
     if state.get("LoadState") != "not-found":
-        fail(f"client fault left the fixed unit loaded: {mode}: {state}")
+        fail(f"client fault left the fixed unit loaded: {mode}: {sanitized_state(state)}")
     if cgroup_pids(state.get("ControlGroup", "")):
-        fail(f"client fault left control-group processes: {mode}: {state}")
+        fail(f"client fault left control-group processes: {mode}: {sanitized_state(state)}")
     if cgroup_pids("/system.slice/" + UNIT):
         fail(f"client fault left processes in the fixed unit cgroup: {mode}")
     assert_client_lock_reusable()
@@ -363,7 +375,8 @@ def fast_recovery(client, repo, commit, go_binary, context):
     recovered = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                      "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if recovered.returncode or recovered.stdout.count(SUCCESS) != 1:
-        fail(f"fast clean recovery failed after {context}: {recovered.stdout} {recovered.stderr}")
+        fail(f"fast clean recovery failed after {context} with status {recovered.returncode}; "
+             f"success_count={recovered.stdout.count(SUCCESS)}")
     wait_unit_absent()
     assert_client_lock_reusable()
 
@@ -390,7 +403,8 @@ def cleanup_fixture_invocation(invocation):
     if state["LoadState"] == "not-found":
         return
     if state.get("InvocationID") != invocation:
-        fail(f"persistent-fault cleanup refused a different invocation: {state}")
+        fail("persistent-fault cleanup refused a different invocation: "
+             + sanitized_state(state))
     run(("/usr/bin/systemctl", "stop", UNIT),
         check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     deadline = time.monotonic() + 20
@@ -399,11 +413,11 @@ def cleanup_fixture_invocation(invocation):
         if state["LoadState"] == "not-found":
             return
         if state.get("InvocationID") != invocation:
-            fail(f"persistent-fault cleanup observed name reuse: {state}")
+            fail("persistent-fault cleanup observed name reuse: " + sanitized_state(state))
         if state.get("ActiveState") in ("failed", "inactive"):
             break
         if time.monotonic() >= deadline:
-            fail(f"persistent-fault invocation did not terminate: {state}")
+            fail("persistent-fault invocation did not terminate: " + sanitized_state(state))
         time.sleep(0.1)
     run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -414,18 +428,18 @@ def unique_json_object(pairs):
     value = {}
     for key, item in pairs:
         if key in value:
-            fail(f"duplicate key in structured command property: {key}")
+            fail("duplicate key in structured command property")
         value[key] = item
     return value
 
 
 def parse_structured_command(result, property_name):
     if result.returncode:
-        fail(f"busctl {property_name} failed ({result.returncode}): {result.stderr.strip()}")
+        fail(f"busctl {property_name} failed with status {result.returncode}")
     try:
         payload = json.loads(result.stdout, object_pairs_hook=unique_json_object)
-    except (TypeError, ValueError) as error:
-        fail(f"busctl {property_name} returned malformed JSON: {error}")
+    except (TypeError, ValueError):
+        fail(f"busctl {property_name} returned malformed JSON")
     expected_type = "a(sasbttttuii)" if property_name == "ExecStart" else "a(sasasttttuii)"
     if (type(payload) is not dict or set(payload) != {"type", "data"}
             or payload.get("type") != expected_type
@@ -662,7 +676,7 @@ def cleanup_signed_launch(signature):
     stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,
                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if stopped.returncode:
-        fail(f"persistent-fault stop failed: {stopped.stderr.strip()}")
+        fail(f"persistent-fault stop failed with status {stopped.returncode}")
     while True:
         state = signed_launch_state_until(signature, deadline)
         if state["LoadState"] == "not-found":
@@ -723,7 +737,8 @@ def show_until(deadline, *properties):
                 delay = bounded_cleanup_timeout(deadline - time.monotonic(),
                                                   0.05 * (2 ** attempt))
                 time.sleep(delay)
-    fail("bounded stale unit properties remain unknown: " + "; ".join(map(str, errors)))
+    fail("bounded stale unit properties remain unknown: "
+         + "; ".join(bounded_sanitized_repr(error) for error in errors))
 
 
 def read_structured_command_until(deadline):
@@ -762,7 +777,7 @@ def cleanup_signed_launch_until(signature, deadline):
     stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,
                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if stopped.returncode:
-        fail(f"bounded stale stop failed: {stopped.stderr.strip()}")
+        fail(f"bounded stale stop failed with status {stopped.returncode}")
     while True:
         state = signed_launch_state_until(signature, deadline)
         if state["LoadState"] == "not-found":
@@ -778,7 +793,7 @@ def cleanup_signed_launch_until(signature, deadline):
     reset = run(("/usr/bin/systemctl", "reset-failed", UNIT), check=False,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if reset.returncode:
-        fail(f"bounded stale reset failed: {reset.stderr.strip()}")
+        fail(f"bounded stale reset failed with status {reset.returncode}")
     while True:
         state = signed_launch_state_until(signature, deadline)
         if state["LoadState"] == "not-found":
@@ -1140,14 +1155,14 @@ raise SystemExit(73)
         fail("stale fixed-unit fixture failed: "
              f"error={bounded_sanitized_repr(stale_failure)}; "
              f"launch_return={stale_launch_return}; "
-             f"launch_stdout={bounded_sanitized_repr(stale_launch_stdout)}; "
-             f"launch_stderr={bounded_sanitized_repr(stale_launch_stderr)}; "
+             f"launch_stdout_present={bool(stale_launch_stdout)}; "
+             f"launch_stderr_present={bool(stale_launch_stderr)}; "
              f"ready={stale_ready_seen}; release={stale_release_seen}; "
              f"release_ack={stale_release_ack_seen}; "
              f"signature={sanitized_state(stale_signature or {})}; "
              f"client_return={stale_rejected_return}; "
-             f"client_stdout={bounded_sanitized_repr(stale_rejected_stdout)}; "
-             f"client_stderr={bounded_sanitized_repr(stale_rejected_stderr)}; "
+             f"client_stdout_present={bool(stale_rejected_stdout)}; "
+             f"client_stderr_present={bool(stale_rejected_stderr)}; "
              f"after_client={sanitized_state(stale_after_client)}; "
              f"cleanup_attempted={stale_cleanup_attempted}; "
              f"cleanup_release={bounded_sanitized_repr(stale_release_error)}; "
@@ -1261,7 +1276,7 @@ raise SystemExit(73)
         fail(f"slow cleanup delay/retry was not bounded: {slow_elapsed:.3f}s")
     slow_state = show("LoadState", "ControlGroup")
     if slow_state.get("LoadState") != "not-found":
-        fail(f"slow cleanup did not explicitly unload: {slow_state}")
+        fail("slow cleanup did not explicitly unload: " + sanitized_state(slow_state))
     if cgroup_pids(slow_state.get("ControlGroup", "")) or cgroup_pids("/system.slice/" + UNIT):
         fail("slow cleanup left fixed-unit cgroup processes")
     assert_client_lock_held()
@@ -1290,7 +1305,8 @@ raise SystemExit(73)
             wait_path(blocked, timeout=30)
             stopped = show("ActiveState", "SubState", "InvocationID")
             if stopped.get("ActiveState") != "active" or counter(attempted):
-                fail(f"intercepted first stop attempt acted on the unit: {stopped}")
+                fail("intercepted first stop attempt acted on the unit: "
+                     + sanitized_state(stopped))
             release(mode)
             fault_stdout, fault_stderr = process.communicate(timeout=30)
             faulted = subprocess.CompletedProcess(process.args, process.returncode,
@@ -1330,9 +1346,9 @@ raise SystemExit(73)
         cleanup_error = ""
         try:
             after_exit = show("LoadState") if signature is None else signed_launch_state(signature)
-        except BaseException as error:
-            after_exit = {"EvidenceError": str(error)}
-            cleanup_error = f"post-exit state capture failed: {error}"
+        except BaseException:
+            after_exit = {"EvidenceError": "post-exit state capture failed"}
+            cleanup_error = "post-exit state capture failed"
         cleanup_lock = None
         lock_held = False
         lock_handoff_error = ""
@@ -1340,8 +1356,8 @@ raise SystemExit(73)
             cleanup_lock = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
             fcntl.flock(cleanup_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             lock_held = True
-        except BaseException as error:
-            lock_handoff_error = str(error)
+        except BaseException:
+            lock_handoff_error = "cleanup lock handoff failed"
         signed_cleanup_ran = False
         try:
             if after_exit.get("LoadState") != "not-found":
@@ -1349,37 +1365,40 @@ raise SystemExit(73)
                     raise RuntimeError("loaded post-exit unit lacks an attested launch signature")
                 signed_cleanup_ran = True
                 cleanup_signed_launch(signature)
-        except BaseException as error:
-            cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+        except BaseException:
+            cleanup_error = "; ".join(
+                item for item in (cleanup_error, "signed cleanup failed") if item)
         try:
             post_cleanup = show_identity_until(time.monotonic() + 10,
                                                "ActiveState", "ControlGroup")
-        except BaseException as error:
-            post_cleanup = {"EvidenceError": str(error)}
-            cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+        except BaseException:
+            post_cleanup = {"EvidenceError": "post-cleanup state capture failed"}
+            cleanup_error = "; ".join(
+                item for item in (cleanup_error, "post-cleanup state capture failed") if item)
         try:
             post_cleanup_cgroup = cgroup_pids("/system.slice/" + UNIT)
-        except BaseException as error:
-            post_cleanup_cgroup = [f"evidence-error: {error}"]
-            cleanup_error = "; ".join(item for item in (cleanup_error, str(error)) if item)
+        except BaseException:
+            post_cleanup_cgroup = ["cgroup evidence capture failed"]
+            cleanup_error = "; ".join(
+                item for item in (cleanup_error, "cgroup evidence capture failed") if item)
         finally:
             if cleanup_lock is not None:
                 if lock_held:
                     try:
                         fcntl.flock(cleanup_lock, fcntl.LOCK_UN)
-                    except BaseException as error:
+                    except BaseException:
                         cleanup_error = "; ".join(
-                            item for item in (cleanup_error, f"lock release failed: {error}") if item)
+                            item for item in (cleanup_error, "lock release failed") if item)
                 try:
                     os.close(cleanup_lock)
-                except BaseException as error:
+                except BaseException:
                     cleanup_error = "; ".join(
-                        item for item in (cleanup_error, f"lock close failed: {error}") if item)
+                        item for item in (cleanup_error, "lock close failed") if item)
         lock_reuse_error = ""
         try:
             assert_client_lock_reusable()
-        except BaseException as error:
-            lock_reuse_error = str(error)
+        except BaseException:
+            lock_reuse_error = "client lock reuse check failed"
         if persistent_result_violation(
                 faulted.returncode, classification, lock_handoff_error, cleanup_error,
                 lock_reuse_error, post_cleanup, post_cleanup_cgroup):
@@ -1441,7 +1460,7 @@ raise SystemExit(73)
     invocation = state["InvocationID"]
     main_pid = int(state["MainPID"])
     if state["ActiveState"] != "active" or main_pid <= 1:
-        fail(f"containment invocation is not active: {state}")
+        fail("containment invocation is not active: " + sanitized_state(state))
     base = os.path.dirname(READY)
     descendants = []
     for name in PID_FILES:
@@ -1517,7 +1536,7 @@ raise SystemExit(73)
     terminal_a = show("InvocationID", "ActiveState", "SubState", "ControlGroup")
     invocation_a = terminal_a["InvocationID"]
     if terminal_a["ActiveState"] != "active" or terminal_a["SubState"] != "exited":
-        fail(f"client A did not pause at terminal state: {terminal_a}")
+        fail("client A did not pause at terminal state: " + sanitized_state(terminal_a))
     waiting = subprocess.Popen(
         ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, "client-terminal-race-b"),
         cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1538,7 +1557,8 @@ raise SystemExit(73)
     release("client-terminal-race-a-unloaded")
     recovered_stdout, recovered_stderr = recovered.communicate(timeout=60)
     if recovered.returncode:
-        fail(f"clean recovery client A failed: {recovered_stdout} {recovered_stderr}")
+        fail(f"clean recovery client A failed with status {recovered.returncode}; "
+             f"stdout_present={bool(recovered_stdout)}; stderr_present={bool(recovered_stderr)}")
     wait_path(acquired_b, timeout=60)
     wait_path(started_b, timeout=60)
     wait_path("/run/nmcp-ci/client-terminal-race-b.ready", timeout=60)
@@ -1652,5 +1672,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
-        print(f"containment-test: {error}", file=sys.stderr)
+        print("containment-test: " + bounded_sanitized_repr(error), file=sys.stderr)
         raise SystemExit(1)

@@ -76,6 +76,41 @@ def fail(message):
     raise RuntimeError(message)
 
 
+def sanitized_diagnostic(value, nonce):
+    if isinstance(value, subprocess.TimeoutExpired):
+        text = "subprocess timed out"
+    elif isinstance(value, subprocess.CalledProcessError):
+        text = f"subprocess failed with status {value.returncode}"
+    elif isinstance(value, OSError):
+        text = f"operating system error errno={value.errno}"
+    else:
+        text = str(value)
+    if nonce:
+        text = text.replace(nonce, "<redacted-nonce>")
+    if any(marker in text for name in ("Description", "Environment", "ExecStart", "Command")
+           for marker in (name + "=", "'" + name + "':", '"' + name + '\":')):
+        text = "diagnostic contained redacted launch identity"
+    hexadecimal = "0123456789abcdefABCDEF"
+    index = 0
+    redacted = []
+    while index < len(text):
+        candidate = text[index:index + 64]
+        if len(candidate) == 64 and all(character in hexadecimal for character in candidate):
+            redacted.append("<redacted-hex64>")
+            index += 64
+        else:
+            redacted.append(text[index])
+            index += 1
+    text = "".join(redacted)
+    return text[:512] + ("...<truncated>" if len(text) > 512 else "")
+
+
+def sanitized_state(state):
+    safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+                  "Result", "ExecMainCode", "ExecMainStatus")
+    return {name: state.get(name) for name in safe_names if name in state}
+
+
 def interrupted(signum, _frame):
     CANCELLED.append(signum)
 
@@ -99,8 +134,8 @@ def command(argv, *, check=True, stdout=subprocess.PIPE, timeout=30):
                               timeout=timeout)
     except subprocess.TimeoutExpired as error:
         if CLEANUP_ACTIVE and time.monotonic() >= COMMAND_DEADLINE:
-            raise RuntimeError("absolute client cleanup deadline exhausted") from error
-        raise
+            raise RuntimeError("absolute client cleanup deadline exhausted") from None
+        raise RuntimeError("client subprocess timed out") from None
 
 
 def record_counter(name):
@@ -115,7 +150,8 @@ def record_counter(name):
             counter.flush()
             os.fsync(counter.fileno())
     except (OSError, ValueError) as error:
-        fail(f"could not record command interception evidence: {error}")
+        fail("could not record command interception evidence: "
+             + sanitized_diagnostic(error, None))
 
 
 def command_path(name):
@@ -168,14 +204,14 @@ def command_path(name):
 
 def parse_unit_properties(result, requested):
     if result.returncode:
-        fail(f"systemctl show failed ({result.returncode}): {result.stderr.strip()}")
+        fail(f"systemctl show failed with status {result.returncode}")
     if not result.stdout:
         fail("systemctl show returned empty output")
     values = {}
     for line in result.stdout.splitlines():
         key, separator, value = line.partition("=")
         if not separator or not key or key in values:
-            fail(f"systemctl show returned malformed output: {line!r}")
+            fail("systemctl show returned malformed output")
         values[key] = value
     if values.get("LoadState") == "not-found":
         return values
@@ -219,7 +255,8 @@ def unit_properties(*names, context="show"):
             if attempt + 1 >= PROPERTY_RETRIES or time.monotonic() >= deadline:
                 break
             time.sleep(min(0.05 * (2 ** attempt), max(0, deadline - time.monotonic())))
-    fail("unit properties remain unknown: " + "; ".join(map(str, errors)))
+    detail = "; ".join(sanitized_diagnostic(error, None) for error in errors)
+    fail("unit properties remain unknown: " + sanitized_diagnostic(detail, None))
 
 
 def cgroup_pids(control_group):
@@ -276,9 +313,11 @@ def owned_state(invocation, nonce, service_command, *properties, context="owned-
     if state.get("LoadState") == "not-found":
         return state
     if not launch_matches(state, nonce, service_command):
-        fail(f"fixed unit launch identity lost; refusing name-based cleanup: {state}")
+        fail("fixed unit launch identity lost; refusing name-based cleanup: "
+             f"{sanitized_state(state)}")
     if state.get("InvocationID") != invocation:
-        fail(f"fixed unit ownership lost; refusing name-based cleanup: {state}")
+        fail("fixed unit ownership lost; refusing name-based cleanup: "
+             f"{sanitized_state(state)}")
     return state
 
 
@@ -290,7 +329,7 @@ def owned_command(invocation, nonce, service_command, *arguments):
     result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,
                      timeout=ACTION_TIMEOUTS[arguments[0]])
     if result.returncode:
-        fail(f"owned unit command failed ({' '.join(arguments)}): {result.stderr.strip()}")
+        fail(f"owned unit {arguments[0]} command failed with status {result.returncode}")
     return True
 
 
@@ -345,7 +384,9 @@ def retry_owned_command(invocation, nonce, service_command, name, action, *argum
             errors.append(error)
             if attempt + 1 < ACTION_ATTEMPTS:
                 time.sleep(ACTION_RETRY_BACKOFF)
-    fail(f"owned {name} command remains unavailable: " + "; ".join(map(str, errors)))
+    detail = sanitized_diagnostic(
+        "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)
+    fail(f"owned {name} command remains unavailable: {detail}")
 
 
 def wait_unloaded(invocation, nonce, service_command, timeout=UNLOAD_TIMEOUT):
@@ -358,7 +399,7 @@ def wait_unloaded(invocation, nonce, service_command, timeout=UNLOAD_TIMEOUT):
         if time.monotonic() >= deadline:
             if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:
                 fail("absolute client cleanup deadline exhausted while awaiting owned unload")
-            fail(f"fixed unit did not unload: {state}")
+            fail(f"fixed unit did not unload: {sanitized_state(state)}")
         time.sleep(0.1)
 
 
@@ -395,7 +436,8 @@ def teardown_owned(invocation, nonce, service_command):
             if not occupants:
                 break
         if time.monotonic() >= deadline:
-            errors.append(RuntimeError(f"owned unit did not terminate its control group: {state}"))
+            errors.append(RuntimeError(
+                f"owned unit did not terminate its control group: {sanitized_state(state)}"))
             break
         time.sleep(0.1)
     if state.get("ActiveState") == "active":
@@ -409,7 +451,9 @@ def teardown_owned(invocation, nonce, service_command):
         errors.append(error)
         state = None
     if state is None:
-        raise RuntimeError("; ".join(map(str, errors)))
+        raise RuntimeError(
+            sanitized_diagnostic(
+                "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)) from None
     if state.get("LoadState") != "not-found":
         try:
             retry_owned_command(invocation, nonce, service_command, "reset", "reset-failed")
@@ -423,7 +467,9 @@ def teardown_owned(invocation, nonce, service_command):
     if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:
         errors.append(RuntimeError("absolute client cleanup deadline exhausted before owned unload"))
     if errors:
-        raise RuntimeError("; ".join(map(str, errors)))
+        raise RuntimeError(
+            sanitized_diagnostic(
+                "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)) from None
 
 
 def client_pause(name):
@@ -527,7 +573,8 @@ def main():
         before = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
                                  context="prelaunch")
         if before.get("LoadState") != "not-found":
-            fail(f"fixed verification unit is not explicitly absent: {before}")
+            fail("fixed verification unit is not explicitly absent: "
+                 f"{sanitized_state(before)}")
         occupants = cgroup_pids(before.get("ControlGroup", ""))
         if occupants:
             fail(f"verification unit control group is not empty: {occupants}")
@@ -573,20 +620,20 @@ def main():
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             if launched.returncode:
-                fail(f"fixed unit launch failed: {launched.stderr.strip()}")
+                fail(f"fixed unit launch failed with status {launched.returncode}")
             if capture_error is not None:
                 raise capture_error
             if requested_mode == "client-fault-missing-invocation":
                 client_pause("client-fault-missing-invocation")
             if invocation is None:
-                fail(f"missing exact invocation identity: {observed}")
+                fail(f"missing exact invocation identity: {sanitized_state(observed)}")
             if requested_mode == "client-fault-after-launch":
                 fail("injected client failure after launch")
             owned_state(invocation, nonce, exec_argv)
             if requested_mode == "client-fault-after-invocation":
                 fail("injected client failure after invocation capture")
             if not launch_matches(observed, nonce, exec_argv):
-                fail(f"unsafe service properties: {observed}")
+                fail(f"unsafe service properties: {sanitized_state(observed)}")
             if requested_mode == "client-fault-after-properties":
                 fail("injected client failure after property attestation")
             if requested_mode == "client-work-budget-service":
@@ -630,7 +677,7 @@ def main():
                 fail("injected client failure after journal capture")
             successful = successful_terminal_state(current)
             if not successful:
-                fail(f"verification invocation failed: {current}")
+                fail(f"verification invocation failed: {sanitized_state(current)}")
             deadline = bounded_deadline(5)
             while journal.count("Ubuntu migration role compatibility verification passed") != 1:
                 if time.monotonic() >= deadline:
@@ -664,7 +711,8 @@ def main():
                             teardown_owned(invocation, nonce, exec_argv)
                         else:
                             cleanup_errors.append(RuntimeError(
-                                f"launched unit has no safe nonce-bound identity: {discovered}"))
+                                "launched unit has no safe nonce-bound identity: "
+                                f"{sanitized_state(discovered)}"))
                     except BaseException as error:
                         cleanup_errors.append(error)
                 elif launch_attempted:
@@ -687,12 +735,14 @@ def main():
             if RECOVERED_ERRORS:
                 cleanup_errors.extend(RECOVERED_ERRORS)
         if cleanup_errors:
-            detail = "; ".join(map(str, cleanup_errors))
+            detail = sanitized_diagnostic(
+                "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)
             if primary_error is not None:
-                raise RuntimeError(f"{primary_error}; cleanup failed: {detail}") from primary_error
+                primary = sanitized_diagnostic(primary_error, nonce)
+                raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None
             fail(f"cleanup failed: {detail}")
         if primary_error is not None:
-            raise primary_error
+            raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None
         if requested_mode == "client-terminal-race-a":
             client_pause("client-terminal-race-a-unloaded")
         return result
@@ -704,5 +754,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
-        print(f"verification-client: {error}", file=sys.stderr)
+        print("verification-client: " + sanitized_diagnostic(error, None), file=sys.stderr)
         raise SystemExit(1)
