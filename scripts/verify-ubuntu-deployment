@@ -2115,7 +2115,7 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         "UNIT": 16, "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 5,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "DIAGNOSTIC_TEXT_LIMIT": 3, "PROGRAM": 2, "NONCE_VARIABLE": 2,
-        "DESCRIPTION_PREFIX": 1, "SERVICE_PROPERTIES": 2, "LAUNCH_PROPERTIES": 4,
+        "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 3, "LAUNCH_PROPERTIES": 10,
     }
     actual_constant_loads = {name: 0 for name in expected_module_assignments}
     for node in ast.walk(tree):
@@ -2133,6 +2133,10 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         },
         "SERVICE_PROPERTIES": {
             ast.dump(ast.parse('(*SERVICE_PROPERTIES,)', mode="eval").body.elts[0]): 1,
+            ast.dump(ast.parse(
+                '{"Description": DESCRIPTION_PREFIX + stale_fixture_id, '
+                '"Environment": stale_expected_environment, **SERVICE_PROPERTIES}',
+                mode="eval").body): 1,
             ast.dump(ast.parse('SERVICE_PROPERTIES.items()', mode="eval").body.func): 1,
         },
     }
@@ -2167,7 +2171,7 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
             "containment imports exceed the reviewed modules")
     protected_persistent_bindings.update(reviewed_imports)
     expected_module_loads = {
-        "fcntl": 17, "json": 2, "os": 65, "runpy": 1, "secrets": 2,
+        "fcntl": 17, "json": 2, "os": 82, "runpy": 1, "secrets": 2,
         "shlex": 1, "signal": 6, "subprocess": 84, "sys": 3, "time": 35,
     }
     actual_module_loads = {name: 0 for name in reviewed_imports}
@@ -2177,13 +2181,15 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
             actual_module_loads[node.id] += 1
     expected_module_attributes = {
         ("fcntl", "LOCK_EX"): 5, ("fcntl", "LOCK_NB"): 5, ("fcntl", "LOCK_UN"): 1,
-        ("fcntl", "flock"): 6, ("json", "load"): 2, ("os", "O_CREAT"): 1,
-        ("os", "O_DIRECTORY"): 1, ("os", "O_EXCL"): 1, ("os", "O_NOFOLLOW"): 7,
-        ("os", "O_RDONLY"): 1, ("os", "O_RDWR"): 5, ("os", "O_WRONLY"): 1,
-        ("os", "close"): 7, ("os", "fsync"): 2, ("os", "geteuid"): 1,
+        ("fcntl", "flock"): 6, ("json", "load"): 2, ("os", "O_CREAT"): 2,
+        ("os", "O_DIRECTORY"): 2, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 9,
+        ("os", "O_RDONLY"): 2, ("os", "O_RDWR"): 5, ("os", "O_WRONLY"): 2,
+        ("os", "close"): 9, ("os", "fchmod"): 1, ("os", "fsync"): 4,
+        ("os", "geteuid"): 1,
         ("os", "kill"): 4, ("os", "listdir"): 1, ("os", "lstat"): 2,
-        ("os", "open"): 7, ("os", "path"): 18, ("os", "stat"): 2,
-        ("os", "unlink"): 2, ("os", "walk"): 1, ("os", "write"): 1,
+        ("os", "open"): 9, ("os", "path"): 19, ("os", "replace"): 1,
+        ("os", "stat"): 2,
+        ("os", "unlink"): 2, ("os", "walk"): 1, ("os", "write"): 2,
         ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2, ("shlex", "split"): 1,
         ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 2,
         ("signal", "SIGQUIT"): 1, ("signal", "SIGTERM"): 1,
@@ -2194,14 +2200,14 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
     }
     expected_recursive_module_attributes = {
         "fcntl.LOCK_EX": 5, "fcntl.LOCK_NB": 5, "fcntl.LOCK_UN": 1,
-        "fcntl.flock": 6, "json.load": 2, "os.O_CREAT": 1,
-        "os.O_DIRECTORY": 1, "os.O_EXCL": 1, "os.O_NOFOLLOW": 7,
-        "os.O_RDONLY": 1, "os.O_RDWR": 5, "os.O_WRONLY": 1,
-        "os.close": 7, "os.fsync": 2, "os.geteuid": 1, "os.kill": 4,
-        "os.listdir": 1, "os.lstat": 2, "os.open": 7, "os.path": 18,
-        "os.path.abspath": 1, "os.path.dirname": 1, "os.path.exists": 10,
+        "fcntl.flock": 6, "json.load": 2, "os.O_CREAT": 2,
+        "os.O_DIRECTORY": 2, "os.O_EXCL": 2, "os.O_NOFOLLOW": 9,
+        "os.O_RDONLY": 2, "os.O_RDWR": 5, "os.O_WRONLY": 2,
+        "os.close": 9, "os.fchmod": 1, "os.fsync": 4, "os.geteuid": 1,
+        "os.kill": 4, "os.listdir": 1, "os.lstat": 2, "os.open": 9, "os.path": 19,
+        "os.path.abspath": 1, "os.path.dirname": 1, "os.path.exists": 11,
         "os.path.isdir": 1, "os.path.islink": 1, "os.path.join": 4,
-        "os.stat": 2, "os.unlink": 2, "os.walk": 1, "os.write": 1,
+        "os.replace": 1, "os.stat": 2, "os.unlink": 2, "os.walk": 1, "os.write": 2,
         "runpy.run_path": 1, "secrets.token_hex": 2, "shlex.split": 1,
         "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 2,
         "signal.SIGQUIT": 1, "signal.SIGTERM": 1,
@@ -2290,9 +2296,11 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         "dict", "environment", "errors", "expected_slow_counts", "fcntl", "first",
         "found", "json", "kwargs", "line", "loaded", "matching", "mode", "mutations",
         "orphaned", "os", "parts", "post_cleanup", "process", "property_boundaries",
-        "recovered", "replaced", "result", "runpy", "secrets", "sentinel_state",
+        "partial", "recovered", "replaced", "result", "runpy", "secrets", "sentinel_state",
         "shlex", "signature", "slow", "slow_paths", "slow_state", "source", "state",
-        "stopped", "subprocess", "time", "unchanged", "value", "values", "waiting",
+        "stale_cleanup_errors", "stale_expected_properties", "stale_observed",
+        "stale_post_cleanup", "stale_program", "stale_signature", "stopped", "subprocess", "time",
+        "unchanged", "value", "values", "waiting",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -2334,23 +2342,26 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
     # These normalized AST fingerprints only guard the exact reviewed inventory/context;
     # they are not source authentication and never replace the semantic inventories above.
     require(hashlib.sha256(repr(sorted(call_target_counts.items())).encode()).hexdigest()
-                == "55b76e21b30b36548017a0e3e6b12ab5c4a0d795f5fa47924bcb2a53321a7b86"
+                == "2e4a3e1f17272028310b370cbb38badbf7a1ef22a435f46cbee7f186a81b3e23"
             and hashlib.sha256(repr(sorted(call_contexts)).encode()).hexdigest()
-                == "57e22d63131e8733c0b4c08a0c3e47fef9604a19b3f20501fb6c602384c6735e"
+                == "447e591332eb34dce722ae67d13a1b4dc265769c3843bd29818e3fdcc99c6da7"
             and hashlib.sha256(repr(sorted(security_call_contexts)).encode()).hexdigest()
-                == "7125573755f57fb77b90bfbdcdc4ea9f7c3d92a8694b58afba2643ebd289b6d3"
+                == "fa942e4cc9cfa753676afb6f35af82108977c32f6e47fec45b3723ce1dd70888"
             and hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest()
-                == "fe97a91b744a29e84a33f8ff083142724248c6bee9c57654bfce717e4f4b81ec",
+                == "e84fdd5b2f08af896a0717fdbaf57e273fb106fa5fb4cfb6a2ee10103ea82728",
             "containment call targets, arguments, or use-site contexts changed")
     protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
     expected_call_root_stores = {
         "SERVICE_PROPERTIES": 1, "after_exit": 2, "budgeted": 1, "cancelled": 1,
         "descendants": 1, "environment": 1, "errors": 1, "expected_slow_counts": 1,
         "first": 1, "found": 1, "line": 1, "loaded": 1, "matching": 1, "mode": 6,
-        "mutations": 1, "orphaned": 1, "parser": 1, "parts": 1, "post_cleanup": 2,
+        "mutations": 1, "orphaned": 1, "parser": 1, "partial": 1, "parts": 1,
+        "post_cleanup": 2,
         "process": 3, "property_boundaries": 1, "recovered": 3, "replaced": 1,
         "result": 3, "sentinel_state": 1, "signature": 2, "slow": 1,
-        "slow_paths": 1, "slow_state": 1, "source": 6, "state": 11, "stopped": 2,
+        "slow_paths": 1, "slow_state": 1, "source": 6, "stale_cleanup_errors": 1,
+        "stale_expected_properties": 1, "stale_observed": 3, "stale_post_cleanup": 2,
+        "stale_program": 1, "stale_signature": 3, "state": 11, "stopped": 2,
         "successful_terminal_state": 1, "unchanged": 1, "value": 10, "values": 2,
         "waiting": 1,
     }
@@ -2365,7 +2376,7 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
                                              type(parent).__name__, field, ast.dump(parent)))
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
-                == "49347ef0ecea9f39915ae1760a572b64917842b332b200ecc951720976051d86"
+                == "6ce8060751020fcc9ff6cd3c4d6d82a19b74315d4f5d7d4762ae1fee5e4bff55"
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -2383,9 +2394,9 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 234, "AugAssign": 2, "Break": 3, "Continue": 2, "Delete": 1,
-        "Expr": 224, "For": 31, "FunctionDef": 39, "If": 128, "Import": 10,
-        "Pass": 5, "Raise": 4, "Return": 45, "Try": 29, "While": 11, "With": 6,
+        "Assign": 274, "AugAssign": 2, "Break": 4, "Continue": 2, "Delete": 1,
+        "Expr": 247, "For": 31, "FunctionDef": 39, "If": 139, "Import": 10,
+        "Pass": 5, "Raise": 4, "Return": 45, "Try": 37, "While": 11, "With": 6,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -2399,7 +2410,7 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
     # The recursive semantic call/module/binding inventories above remain independently required.
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
-                == "5fecb7cd84e1e5a02001b1bb316a5c29fe084099f1891aac6b1c83015c40df0a",
+                == "8e9e1dafaece7e96842a9f8afaff04e95c28269de0f0cf4cc903b924c9f4417d",
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -2835,41 +2846,37 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
     stale_starts = [
         index for index, node in enumerate(main_node.body)
         if isinstance(node, ast.Assign) and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "stale_nonce"
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "stale_fixture_id"
     ]
-    expected_stale = ast.parse('''stale_nonce = secrets.token_hex(32)
-run(("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",
-     f"--description=NMCP migration role verifier {stale_nonce}",
-     f"--property=Environment=NMCP_VERIFIER_NONCE={stale_nonce}",
-     "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
-     "--property=TimeoutStopSec=15s", "--property=RuntimeMaxSec=15min",
-     "--property=Delegate=no", "--property=RemainAfterExit=yes",
-     "--property=User=root", "--property=Group=root", "--property=UMask=0077",
-     "--property=WorkingDirectory=/", "--property=StandardOutput=journal",
-     "--property=StandardError=journal", "/usr/bin/false"), check=True,
-    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-deadline = time.monotonic() + 20
-while show("ActiveState").get("ActiveState") != "failed":
-    if time.monotonic() >= deadline:
-        fail("stale fixed-unit fixture did not reach failed state")
-    time.sleep(0.1)
-stale = show("InvocationID", "ActiveState", "ControlGroup", "Environment")
-stale_invocation = stale["InvocationID"]
-rejected = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
-                "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:
-    fail("client accepted a stale loaded fixed unit")
-unchanged = show("InvocationID", "ActiveState", "Environment")
-if (unchanged.get("InvocationID") != stale_invocation or unchanged.get("ActiveState") != "failed"
-        or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):
-    fail("rejected prelaunch client touched the stale fixed unit")
-assert_client_lock_reusable()
-cleanup_fixture_invocation(stale_invocation)
-wait_unit_absent()
-''').body
-    require(len(stale_starts) == 1
-            and [ast.dump(node) for node in main_node.body[stale_starts[0]:stale_starts[0] + len(expected_stale)]]
-            == [ast.dump(node) for node in expected_stale],
+    stale_ends = [
+        index for index, node in enumerate(main_node.body)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "client_faults"
+    ]
+    stale_nodes = (main_node.body[stale_starts[0]:stale_ends[0]]
+                   if len(stale_starts) == 1 and len(stale_ends) == 1 else [])
+    stale_tries = [node for node in stale_nodes if isinstance(node, ast.Try)]
+    stale_phase_tries = [node for node in stale_tries
+                         if any(isinstance(child, ast.Constant)
+                                and child.value == "/usr/bin/systemd-run"
+                                for child in ast.walk(node))]
+    stale_calls = [node for statement in stale_nodes for node in ast.walk(statement)
+                   if isinstance(node, ast.Call)]
+    stale_run_calls = [node for node in stale_calls if isinstance(node.func, ast.Name)
+                       and node.func.id == "run"
+                       and any(isinstance(child, ast.Constant)
+                               and child.value == "/usr/bin/systemd-run"
+                               for child in ast.walk(node))]
+    require(len(stale_nodes) == 25 and len(stale_tries) == 1
+            and len(stale_phase_tries) == 1 and bool(stale_phase_tries[0].finalbody)
+            and len(stale_run_calls) == 1
+            and any(keyword.arg == "check" and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is False for keyword in stale_run_calls[0].keywords)
+            and any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "cleanup_signed_launch"
+                    for statement in stale_phase_tries[0].finalbody for node in ast.walk(statement))
+            and hashlib.sha256(repr([ast.dump(node) for node in stale_nodes]).encode()).hexdigest()
+                == "79232624a8d56a3e47ae60d3431c5dc6aa0b6cef69e0aba8d2ba514a1fa26e08",
             "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
 
     persistent_loops = []
@@ -4422,11 +4429,66 @@ def verify_supervisor_mutations(
             '    if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:',
             '    if False:')),
         ("stale loaded identity change accepted", replace_once(containment,
-            '    if (unchanged.get("InvocationID") != stale_invocation or unchanged.get("ActiveState") != "failed"\n            or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):',
-            '    if False:')),
+            '                or unchanged.get("ExecMainStatus") != "73"',
+            '                or False')),
         ("stale loaded cleanup omitted", replace_once(containment,
-            '    cleanup_fixture_invocation(stale_invocation)\n    wait_unit_absent()',
-            '    wait_unit_absent()')),
+            '                    cleanup_signed_launch(stale_signature)',
+            '                    pass')),
+        ("stale ready wait omitted", replace_once(containment,
+            '        wait_path(stale_ready, timeout=30)',
+            '        stale_ready_seen = True')),
+        ("stale release omitted before classification", replace_once(containment,
+            '        release(stale_signal_name)\n        stale_release_seen = True\n'
+            '        deadline = time.monotonic() + 20',
+            '        stale_release_seen = True\n'
+            '        deadline = time.monotonic() + 20')),
+        ("stale failure classified before release", replace_once(containment,
+            '            if stale_observed.get("ActiveState") == "failed":\n                break',
+            '            if stale_observed.get("ActiveState") in ("active", "failed"):\n'
+            '                break')),
+        ("stale invocation pin omitted", replace_once(containment,
+            '            if (stale_observed.get("LoadState") != "loaded"\n'
+            '                    or any(stale_observed.get(name) != expected\n'
+            '                           for name, expected in stale_signature.items())):',
+            '            if stale_observed.get("LoadState") != "loaded":')),
+        ("stale result check omitted", replace_once(containment,
+            '                or stale_observed.get("Result") != "exit-code"',
+            '                or False')),
+        ("stale distinctive status check omitted", replace_once(containment,
+            '                or stale_observed.get("ExecMainStatus") != "73"',
+            '                or False')),
+        ("stale failure timeout omitted", replace_once(containment,
+            '            if time.monotonic() >= deadline:\n'
+            '                fail("released stale fixed-unit did not reach failed state: "',
+            '            if False:\n'
+            '                fail("released stale fixed-unit did not reach failed state: "')),
+        ("stale cleanup finally disabled", replace_once(containment,
+            '    finally:\n        if not os.path.exists(stale_release):',
+            '    finally:\n        if False:')),
+        ("stale mismatched identity cleanup allowed", replace_once(containment,
+            '                if (stale_signature is None\n'
+            '                        or any(partial.get(name) != expected\n'
+            '                               for name, expected in stale_signature.items())):',
+            '                if False:')),
+        ("stale diagnostic launch stderr omitted", replace_once(containment,
+            '             f"launch_stderr={bounded_sanitized_repr(stale_launch_stderr)}; "',
+            '             "launch_stderr=omitted; "')),
+        ("stale signal paths not reset before launch", replace_once(containment,
+            '        reset_paths(stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",\n'
+            '                    stale_release)\n'
+            '        stale_helper_descriptor =',
+            '        stale_helper_descriptor =')),
+        ("stale helper atomic publication omitted", replace_once(containment,
+            '        os.replace(stale_helper_new, stale_helper)',
+            '        pass')),
+        ("stale ready publication made non-atomic", replace_once(
+            replace_once(containment,
+                'descriptor = os.open(ready_new, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)',
+                'descriptor = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)'),
+            'os.replace(ready_new, ready)', 'pass')),
+        ("stale immediate exit race restored", replace_once(containment,
+            '                        "--property=StandardError=journal", *stale_expected_argv), check=False,',
+            '                        "--property=StandardError=journal", "/usr/bin/false"), check=True,')),
         ("one client fault omitted", replace_once(containment,
             '        "client-fault-at-terminal", "client-fault-after-journal",\n',
             '        "client-fault-at-terminal",\n')),
@@ -4657,6 +4719,20 @@ def verify_supervisor_mutations(
         "persistent alternate cleanup intent branch",
         "persistent early return before retained cleanup",
         "persistent inverted sentinel nonce condition",
+        "stale ready wait omitted",
+        "stale release omitted before classification",
+        "stale failure classified before release",
+        "stale invocation pin omitted",
+        "stale result check omitted",
+        "stale distinctive status check omitted",
+        "stale failure timeout omitted",
+        "stale cleanup finally disabled",
+        "stale mismatched identity cleanup allowed",
+        "stale diagnostic launch stderr omitted",
+        "stale signal paths not reset before launch",
+        "stale helper atomic publication omitted",
+        "stale ready publication made non-atomic",
+        "stale immediate exit race restored",
     }
     for label, mutation in containment_mutations:
         if label in runtime_valid_containment_mutations:

@@ -603,35 +603,213 @@ def main():
 
     # A stale loaded fixed name is never launch-ready merely because it is
     # failed and cgroup-empty. The new client must fail without touching it.
-    stale_nonce = secrets.token_hex(32)
-    run(("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",
-         f"--description=NMCP migration role verifier {stale_nonce}",
-         f"--property=Environment=NMCP_VERIFIER_NONCE={stale_nonce}",
-         "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
-         "--property=TimeoutStopSec=15s", "--property=RuntimeMaxSec=15min",
-         "--property=Delegate=no", "--property=RemainAfterExit=yes",
-         "--property=User=root", "--property=Group=root", "--property=UMask=0077",
-         "--property=WorkingDirectory=/", "--property=StandardOutput=journal",
-         "--property=StandardError=journal", "/usr/bin/false"), check=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    deadline = time.monotonic() + 20
-    while show("ActiveState").get("ActiveState") != "failed":
-        if time.monotonic() >= deadline:
-            fail("stale fixed-unit fixture did not reach failed state")
-        time.sleep(0.1)
-    stale = show("InvocationID", "ActiveState", "ControlGroup", "Environment")
-    stale_invocation = stale["InvocationID"]
-    rejected = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
-                    "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:
-        fail("client accepted a stale loaded fixed unit")
-    unchanged = show("InvocationID", "ActiveState", "Environment")
-    if (unchanged.get("InvocationID") != stale_invocation or unchanged.get("ActiveState") != "failed"
-            or unchanged.get("Environment") != f"NMCP_VERIFIER_NONCE={stale_nonce}"):
-        fail("rejected prelaunch client touched the stale fixed unit")
-    assert_client_lock_reusable()
-    cleanup_fixture_invocation(stale_invocation)
-    wait_unit_absent()
+    stale_fixture_id = secrets.token_hex(32)
+    stale_signal_name = f"stale-fixed-{stale_fixture_id}"
+    stale_helper = f"/run/nmcp-ci/{stale_signal_name}.py"
+    stale_helper_new = stale_helper + ".new"
+    stale_ready = f"/run/nmcp-ci/{stale_signal_name}.ready"
+    stale_release = f"/run/nmcp-ci/{stale_signal_name}.release"
+    stale_program = """import os
+import sys
+import time
+ready, release = sys.argv[1:]
+ready_new = ready + ".new"
+descriptor = os.open(ready_new, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    os.write(descriptor, b"ready\\n")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+os.replace(ready_new, ready)
+directory = os.open("/run/nmcp-ci", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+deadline = time.monotonic() + 120
+while not os.path.exists(release):
+    if time.monotonic() >= deadline:
+        raise SystemExit(2)
+    time.sleep(0.02)
+raise SystemExit(73)
+"""
+    stale_expected_environment = f"NMCP_VERIFIER_NONCE={stale_fixture_id}"
+    stale_expected_argv = ("/usr/bin/python3", "-I", "-S", stale_helper, stale_ready,
+                           stale_release)
+    stale_expected_properties = {
+        "Description": DESCRIPTION_PREFIX + stale_fixture_id,
+        "Environment": stale_expected_environment,
+        **SERVICE_PROPERTIES,
+    }
+    stale_invocation = None
+    stale_signature = None
+    stale_observed = {}
+    stale_failure = None
+    stale_launch_return = None
+    stale_launch_stdout = ""
+    stale_launch_stderr = ""
+    stale_ready_seen = False
+    stale_release_seen = False
+    stale_cleanup_attempted = False
+    stale_cleanup_errors = []
+    stale_post_cleanup = {}
+    stale_post_cleanup_cgroup = []
+    try:
+        reset_paths(stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",
+                    stale_release)
+        stale_helper_descriptor = os.open(
+            stale_helper_new, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+        try:
+            os.write(stale_helper_descriptor, stale_program.encode("ascii"))
+            os.fchmod(stale_helper_descriptor, 0o500)
+            os.fsync(stale_helper_descriptor)
+        finally:
+            os.close(stale_helper_descriptor)
+        os.replace(stale_helper_new, stale_helper)
+        stale_directory = os.open(
+            "/run/nmcp-ci", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(stale_directory)
+        finally:
+            os.close(stale_directory)
+        launched = run(("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}",
+                        "--service-type=exec",
+                        f"--description={stale_expected_properties['Description']}",
+                        f"--property=Environment={stale_expected_environment}",
+                        "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
+                        "--property=TimeoutStopSec=15s", "--property=RuntimeMaxSec=15min",
+                        "--property=Delegate=no", "--property=RemainAfterExit=yes",
+                        "--property=User=root", "--property=Group=root", "--property=UMask=0077",
+                        "--property=WorkingDirectory=/", "--property=StandardOutput=journal",
+                        "--property=StandardError=journal", *stale_expected_argv), check=False,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stale_launch_return = launched.returncode
+        stale_launch_stdout = launched.stdout
+        stale_launch_stderr = launched.stderr
+        if launched.returncode:
+            fail("stale fixed-unit launch failed before ready handoff")
+        wait_path(stale_ready, timeout=30)
+        stale_ready_seen = True
+        stale_observed = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
+                              "MainPID", "ControlGroup")
+        stale_invocation = stale_observed.get("InvocationID")
+        valid_stale_invocation = (len(stale_invocation or "") == 32
+                                  and all(character in "0123456789abcdef"
+                                          for character in stale_invocation))
+        if (stale_observed.get("LoadState") != "loaded" or not valid_stale_invocation
+                or stale_observed.get("SubState") != "running"
+                or stale_observed.get("ActiveState") != "active"
+                or int(stale_observed.get("MainPID", "0")) <= 0
+                or exec_start_argv(stale_observed.get("ExecStart", "")) != stale_expected_argv
+                or any(stale_observed.get(name) != expected
+                       for name, expected in stale_expected_properties.items())):
+            fail("stale fixed-unit did not reach its exact synchronized running state")
+        stale_signature = {name: stale_observed[name] for name in LAUNCH_PROPERTIES}
+        release(stale_signal_name)
+        stale_release_seen = True
+        deadline = time.monotonic() + 20
+        while True:
+            stale_observed = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
+                                  "ExecMainCode", "ExecMainStatus", "ControlGroup")
+            if (stale_observed.get("LoadState") != "loaded"
+                    or any(stale_observed.get(name) != expected
+                           for name, expected in stale_signature.items())):
+                fail("stale fixed-unit identity changed or disappeared before failure attestation")
+            if stale_observed.get("ActiveState") == "failed":
+                break
+            if time.monotonic() >= deadline:
+                fail("released stale fixed-unit did not reach failed state: "
+                     f"state={sanitized_state(stale_observed)}")
+            time.sleep(0.1)
+        if (stale_observed.get("InvocationID") != stale_invocation
+                or stale_observed.get("SubState") != "failed"
+                or stale_observed.get("Result") != "exit-code"
+                or stale_observed.get("ExecMainCode") not in ("1", "exited")
+                or stale_observed.get("ExecMainStatus") != "73"
+                or cgroup_pids(stale_observed.get("ControlGroup", ""))):
+            fail("released stale fixed-unit had an unexpected exact terminal state")
+        rejected = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+                        "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:
+            fail("client accepted a stale loaded fixed unit")
+        unchanged = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
+                         "ExecMainCode", "ExecMainStatus", "ControlGroup")
+        if (unchanged.get("LoadState") != "loaded"
+                or any(unchanged.get(name) != expected
+                       for name, expected in stale_signature.items())
+                or unchanged.get("ActiveState") != "failed"
+                or unchanged.get("SubState") != "failed"
+                or unchanged.get("Result") != "exit-code"
+                or unchanged.get("ExecMainCode") not in ("1", "exited")
+                or unchanged.get("ExecMainStatus") != "73"
+                or cgroup_pids(unchanged.get("ControlGroup", ""))):
+            fail("rejected prelaunch client touched the exact stale fixed-unit evidence")
+        assert_client_lock_reusable()
+    except Exception as error:
+        stale_failure = error
+    finally:
+        if not os.path.exists(stale_release):
+            try:
+                release(stale_signal_name)
+                stale_release_seen = True
+            except Exception as error:
+                stale_cleanup_errors.append(f"release={bounded_sanitized_repr(error)}")
+        try:
+            partial = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+            if partial.get("LoadState") != "not-found":
+                if (stale_signature is None
+                        and partial.get("LoadState") == "loaded"
+                        and len(partial.get("InvocationID", "")) == 32
+                        and all(character in "0123456789abcdef"
+                                for character in partial.get("InvocationID", ""))
+                        and exec_start_argv(partial.get("ExecStart", "")) == stale_expected_argv
+                        and all(partial.get(name) == expected
+                                for name, expected in stale_expected_properties.items())):
+                    stale_signature = {name: partial[name] for name in LAUNCH_PROPERTIES}
+                if (stale_signature is None
+                        or any(partial.get(name) != expected
+                               for name, expected in stale_signature.items())):
+                    stale_cleanup_errors.append(
+                        f"ownership={sanitized_state(partial)}")
+                else:
+                    stale_cleanup_attempted = True
+                    cleanup_signed_launch(stale_signature)
+        except Exception as error:
+            stale_cleanup_errors.append(f"unit={bounded_sanitized_repr(error)}")
+        try:
+            stale_post_cleanup = show("LoadState", "ControlGroup")
+            stale_post_cleanup_cgroup = cgroup_pids(
+                stale_observed.get("ControlGroup", "")
+                or stale_post_cleanup.get("ControlGroup", ""))
+            if (stale_post_cleanup.get("LoadState") != "not-found"
+                    or stale_post_cleanup_cgroup):
+                stale_cleanup_errors.append(
+                    f"post={sanitized_state(stale_post_cleanup)}; "
+                    f"cgroup={bounded_sanitized_repr(stale_post_cleanup_cgroup)}")
+        except Exception as error:
+            stale_cleanup_errors.append(f"post={bounded_sanitized_repr(error)}")
+        try:
+            assert_client_lock_reusable()
+        except Exception as error:
+            stale_cleanup_errors.append(f"lock={bounded_sanitized_repr(error)}")
+        try:
+            reset_paths(stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",
+                        stale_release)
+        except Exception as error:
+            stale_cleanup_errors.append(f"signals={bounded_sanitized_repr(error)}")
+    if stale_failure is not None or stale_cleanup_errors:
+        fail("stale fixed-unit fixture failed: "
+             f"error={bounded_sanitized_repr(stale_failure)}; "
+             f"launch_return={stale_launch_return}; "
+             f"launch_stdout={bounded_sanitized_repr(stale_launch_stdout)}; "
+             f"launch_stderr={bounded_sanitized_repr(stale_launch_stderr)}; "
+             f"ready={stale_ready_seen}; release={stale_release_seen}; "
+             f"signature={sanitized_state(stale_signature or {})}; "
+             f"cleanup_attempted={stale_cleanup_attempted}; "
+             f"cleanup={bounded_sanitized_repr(stale_cleanup_errors)}; "
+             f"state={sanitized_state(stale_observed)}; "
+             f"post_cleanup={sanitized_state(stale_post_cleanup)}; "
+             f"post_cgroup={bounded_sanitized_repr(stale_post_cleanup_cgroup)}")
 
     client_faults = (
         "client-fault-after-launch", "client-fault-missing-invocation",
