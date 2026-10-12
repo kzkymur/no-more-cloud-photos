@@ -609,6 +609,7 @@ def main():
     stale_helper_new = stale_helper + ".new"
     stale_ready = f"/run/nmcp-ci/{stale_signal_name}.ready"
     stale_release = f"/run/nmcp-ci/{stale_signal_name}.release"
+    stale_release_ack = stale_release + ".seen"
     stale_program = """import os
 import sys
 import time
@@ -631,6 +632,20 @@ while not os.path.exists(release):
     if time.monotonic() >= deadline:
         raise SystemExit(2)
     time.sleep(0.02)
+release_ack = release + ".seen"
+release_ack_new = release_ack + ".new"
+descriptor = os.open(release_ack_new, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    os.write(descriptor, b"seen\\n")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+os.replace(release_ack_new, release_ack)
+directory = os.open("/run/nmcp-ci", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
 raise SystemExit(73)
 """
     stale_expected_environment = f"NMCP_VERIFIER_NONCE={stale_fixture_id}"
@@ -650,13 +665,27 @@ raise SystemExit(73)
     stale_launch_stderr = ""
     stale_ready_seen = False
     stale_release_seen = False
+    stale_release_ack_seen = False
     stale_cleanup_attempted = False
-    stale_cleanup_errors = []
+    stale_release_error = None
+    stale_state_error = None
+    stale_identity_error = None
+    stale_action_error = None
+    stale_post_error = None
+    stale_lock_error = None
+    stale_path_error = None
+    stale_artifacts_removed = False
     stale_post_cleanup = {}
-    stale_post_cleanup_cgroup = []
+    stale_post_cleanup_cgroup = None
+    stale_post_evidence_complete = False
+    stale_recorded_cgroup = ""
+    stale_rejected_return = None
+    stale_rejected_stdout = ""
+    stale_rejected_stderr = ""
+    stale_after_client = {}
     try:
         reset_paths(stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",
-                    stale_release)
+                    stale_release, stale_release_ack, stale_release_ack + ".new")
         stale_helper_descriptor = os.open(
             stale_helper_new, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
         try:
@@ -693,6 +722,7 @@ raise SystemExit(73)
         stale_observed = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
                               "MainPID", "ControlGroup")
         stale_invocation = stale_observed.get("InvocationID")
+        stale_recorded_cgroup = stale_observed.get("ControlGroup", "")
         valid_stale_invocation = (len(stale_invocation or "") == 32
                                   and all(character in "0123456789abcdef"
                                           for character in stale_invocation))
@@ -707,10 +737,14 @@ raise SystemExit(73)
         stale_signature = {name: stale_observed[name] for name in LAUNCH_PROPERTIES}
         release(stale_signal_name)
         stale_release_seen = True
+        wait_path(stale_release_ack, timeout=30)
+        stale_release_ack_seen = True
         deadline = time.monotonic() + 20
         while True:
             stale_observed = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
                                   "ExecMainCode", "ExecMainStatus", "ControlGroup")
+            stale_recorded_cgroup = (stale_observed.get("ControlGroup", "")
+                                     or stale_recorded_cgroup)
             if (stale_observed.get("LoadState") != "loaded"
                     or any(stale_observed.get(name) != expected
                            for name, expected in stale_signature.items())):
@@ -730,19 +764,22 @@ raise SystemExit(73)
             fail("released stale fixed-unit had an unexpected exact terminal state")
         rejected = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                         "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stale_rejected_return = rejected.returncode
+        stale_rejected_stdout = rejected.stdout
+        stale_rejected_stderr = rejected.stderr
+        stale_after_client = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
+                                  "ExecMainCode", "ExecMainStatus", "ControlGroup")
         if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:
             fail("client accepted a stale loaded fixed unit")
-        unchanged = show(*LAUNCH_PROPERTIES, "ActiveState", "SubState", "Result",
-                         "ExecMainCode", "ExecMainStatus", "ControlGroup")
-        if (unchanged.get("LoadState") != "loaded"
-                or any(unchanged.get(name) != expected
+        if (stale_after_client.get("LoadState") != "loaded"
+                or any(stale_after_client.get(name) != expected
                        for name, expected in stale_signature.items())
-                or unchanged.get("ActiveState") != "failed"
-                or unchanged.get("SubState") != "failed"
-                or unchanged.get("Result") != "exit-code"
-                or unchanged.get("ExecMainCode") not in ("1", "exited")
-                or unchanged.get("ExecMainStatus") != "73"
-                or cgroup_pids(unchanged.get("ControlGroup", ""))):
+                or stale_after_client.get("ActiveState") != "failed"
+                or stale_after_client.get("SubState") != "failed"
+                or stale_after_client.get("Result") != "exit-code"
+                or stale_after_client.get("ExecMainCode") not in ("1", "exited")
+                or stale_after_client.get("ExecMainStatus") != "73"
+                or cgroup_pids(stale_after_client.get("ControlGroup", ""))):
             fail("rejected prelaunch client touched the exact stale fixed-unit evidence")
         assert_client_lock_reusable()
     except Exception as error:
@@ -753,60 +790,107 @@ raise SystemExit(73)
                 release(stale_signal_name)
                 stale_release_seen = True
             except Exception as error:
-                stale_cleanup_errors.append(f"release={bounded_sanitized_repr(error)}")
-        try:
-            partial = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
-            if partial.get("LoadState") != "not-found":
-                if (stale_signature is None
-                        and partial.get("LoadState") == "loaded"
-                        and len(partial.get("InvocationID", "")) == 32
-                        and all(character in "0123456789abcdef"
-                                for character in partial.get("InvocationID", ""))
-                        and exec_start_argv(partial.get("ExecStart", "")) == stale_expected_argv
-                        and all(partial.get(name) == expected
-                                for name, expected in stale_expected_properties.items())):
-                    stale_signature = {name: partial[name] for name in LAUNCH_PROPERTIES}
-                if (stale_signature is None
-                        or any(partial.get(name) != expected
-                               for name, expected in stale_signature.items())):
-                    stale_cleanup_errors.append(
-                        f"ownership={sanitized_state(partial)}")
-                else:
-                    stale_cleanup_attempted = True
-                    cleanup_signed_launch(stale_signature)
-        except Exception as error:
-            stale_cleanup_errors.append(f"unit={bounded_sanitized_repr(error)}")
+                stale_release_error = bounded_sanitized_repr(error)
+        if os.path.exists(stale_ready) and not os.path.exists(stale_release_ack):
+            release_deadline = time.monotonic() + 5
+            while not os.path.exists(stale_release_ack) and time.monotonic() < release_deadline:
+                time.sleep(0.02)
+        stale_release_ack_seen = os.path.exists(stale_release_ack)
+        if os.path.exists(stale_ready) and not stale_release_ack_seen:
+            stale_release_error = stale_release_error or "ready helper did not acknowledge release"
+        cleanup_deadline = time.monotonic() + 90
+        stale_absence_confirmed = False
+        while time.monotonic() < cleanup_deadline:
+            try:
+                partial = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+            except Exception as error:
+                stale_state_error = bounded_sanitized_repr(error)
+                time.sleep(0.1)
+                continue
+            stale_state_error = None
+            stale_post_cleanup = partial
+            stale_recorded_cgroup = partial.get("ControlGroup", "") or stale_recorded_cgroup
+            if partial.get("LoadState") == "not-found":
+                stale_absence_confirmed = True
+                break
+            if (stale_signature is None
+                    and partial.get("LoadState") == "loaded"
+                    and len(partial.get("InvocationID", "")) == 32
+                    and all(character in "0123456789abcdef"
+                            for character in partial.get("InvocationID", ""))
+                    and exec_start_argv(partial.get("ExecStart", "")) == stale_expected_argv
+                    and all(partial.get(name) == expected
+                            for name, expected in stale_expected_properties.items())):
+                stale_signature = {name: partial[name] for name in LAUNCH_PROPERTIES}
+            if (stale_signature is None
+                    or any(partial.get(name) != expected
+                           for name, expected in stale_signature.items())):
+                stale_identity_error = bounded_sanitized_repr(
+                    f"ownership={sanitized_state(partial)}")
+                time.sleep(0.1)
+                continue
+            stale_cleanup_attempted = True
+            try:
+                cleanup_signed_launch(stale_signature)
+                stale_action_error = None
+            except Exception as error:
+                stale_action_error = bounded_sanitized_repr(error)
+            time.sleep(0.1)
+        if not stale_absence_confirmed:
+            stale_identity_error = stale_identity_error or "explicit unit absence remained unknown"
         try:
             stale_post_cleanup = show("LoadState", "ControlGroup")
-            stale_post_cleanup_cgroup = cgroup_pids(
-                stale_observed.get("ControlGroup", "")
-                or stale_post_cleanup.get("ControlGroup", ""))
+            stale_post_cleanup_cgroup = {
+                "recorded": cgroup_pids(stale_recorded_cgroup),
+                "canonical": cgroup_pids("/system.slice/" + UNIT),
+            }
+            stale_post_evidence_complete = True
             if (stale_post_cleanup.get("LoadState") != "not-found"
-                    or stale_post_cleanup_cgroup):
-                stale_cleanup_errors.append(
+                    or any(stale_post_cleanup_cgroup.values())):
+                stale_post_error = bounded_sanitized_repr(
                     f"post={sanitized_state(stale_post_cleanup)}; "
-                    f"cgroup={bounded_sanitized_repr(stale_post_cleanup_cgroup)}")
+                    f"cgroup={stale_post_cleanup_cgroup}")
         except Exception as error:
-            stale_cleanup_errors.append(f"post={bounded_sanitized_repr(error)}")
+            stale_post_error = bounded_sanitized_repr(error)
         try:
             assert_client_lock_reusable()
         except Exception as error:
-            stale_cleanup_errors.append(f"lock={bounded_sanitized_repr(error)}")
-        try:
-            reset_paths(stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",
-                        stale_release)
-        except Exception as error:
-            stale_cleanup_errors.append(f"signals={bounded_sanitized_repr(error)}")
-    if stale_failure is not None or stale_cleanup_errors:
+            stale_lock_error = bounded_sanitized_repr(error)
+        if (stale_post_evidence_complete and stale_post_error is None
+                and stale_post_cleanup.get("LoadState") == "not-found"
+                and not any(stale_post_cleanup_cgroup.values())):
+            try:
+                reset_paths(stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",
+                            stale_release, stale_release_ack, stale_release_ack + ".new")
+                stale_artifacts_removed = True
+            except Exception as error:
+                stale_path_error = bounded_sanitized_repr(error)
+        else:
+            stale_path_error = "owned helper and release preserved pending confirmed absence"
+    if (stale_failure is not None or stale_release_error or stale_state_error or stale_identity_error
+            or stale_action_error or stale_post_error or stale_lock_error or stale_path_error):
         fail("stale fixed-unit fixture failed: "
              f"error={bounded_sanitized_repr(stale_failure)}; "
              f"launch_return={stale_launch_return}; "
              f"launch_stdout={bounded_sanitized_repr(stale_launch_stdout)}; "
              f"launch_stderr={bounded_sanitized_repr(stale_launch_stderr)}; "
              f"ready={stale_ready_seen}; release={stale_release_seen}; "
+             f"release_ack={stale_release_ack_seen}; "
              f"signature={sanitized_state(stale_signature or {})}; "
+             f"client_return={stale_rejected_return}; "
+             f"client_stdout={bounded_sanitized_repr(stale_rejected_stdout)}; "
+             f"client_stderr={bounded_sanitized_repr(stale_rejected_stderr)}; "
+             f"after_client={sanitized_state(stale_after_client)}; "
              f"cleanup_attempted={stale_cleanup_attempted}; "
-             f"cleanup={bounded_sanitized_repr(stale_cleanup_errors)}; "
+             f"cleanup_release={bounded_sanitized_repr(stale_release_error)}; "
+             f"cleanup_state={bounded_sanitized_repr(stale_state_error)}; "
+             f"cleanup_identity={bounded_sanitized_repr(stale_identity_error)}; "
+             f"cleanup_action={bounded_sanitized_repr(stale_action_error)}; "
+             f"cleanup_post={bounded_sanitized_repr(stale_post_error)}; "
+             f"cleanup_lock={bounded_sanitized_repr(stale_lock_error)}; "
+             f"cleanup_paths={bounded_sanitized_repr(stale_path_error)}; "
+             f"artifacts_removed={stale_artifacts_removed}; "
+             f"post_evidence_complete={stale_post_evidence_complete}; "
              f"state={sanitized_state(stale_observed)}; "
              f"post_cleanup={sanitized_state(stale_post_cleanup)}; "
              f"post_cgroup={bounded_sanitized_repr(stale_post_cleanup_cgroup)}")
