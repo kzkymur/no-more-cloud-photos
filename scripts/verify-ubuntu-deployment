@@ -1949,7 +1949,9 @@ def validate_containment(source: str, phase: str) -> None:
         "fast_recovery", "fault_paths", "assert_interception", "cleanup_fixture_invocation",
         "exec_start_argv", "persistent_supervisor_mode", "persistent_launch_signature",
         "assert_launch_signature_counterexamples", "signed_launch_state",
-        "cleanup_signed_launch", "pid_exists", "cgroup_pids", "process_has_inode",
+        "cleanup_signed_launch", "bounded_cleanup_timeout", "assert_cleanup_deadline_contract",
+        "show_until", "signed_launch_state_until", "cleanup_signed_launch_until",
+        "pid_exists", "cgroup_pids", "process_has_inode",
         "intent_entry", "run_root_entry", "observable_identity", "assert_replaced_or_absent",
         "main",
     }
@@ -1974,6 +1976,10 @@ def validate_containment(source: str, phase: str) -> None:
         ("persistent_launch_signature", "state, repo, commit, go_binary, mode"),
         ("assert_launch_signature_counterexamples", "state, repo, commit, go_binary, mode"),
         ("signed_launch_state", "signature"), ("cleanup_signed_launch", "signature"),
+        ("bounded_cleanup_timeout", "remaining, cap"),
+        ("assert_cleanup_deadline_contract", ""), ("show_until", "deadline, *properties"),
+        ("signed_launch_state_until", "signature, deadline"),
+        ("cleanup_signed_launch_until", "signature, deadline"),
         ("pid_exists", "pid"), ("cgroup_pids", "control_group"),
         ("process_has_inode", "pid, expected"), ("intent_entry", "path"),
         ("run_root_entry", ""), ("observable_identity", "path, recorded"),
@@ -2112,10 +2118,10 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         and node.targets[0] not in reviewed_persistent_assignments
     )
     expected_constant_loads = {
-        "UNIT": 17, "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 5,
+        "UNIT": 20, "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 5,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "DIAGNOSTIC_TEXT_LIMIT": 3, "PROGRAM": 2, "NONCE_VARIABLE": 2,
-        "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 3, "LAUNCH_PROPERTIES": 10,
+        "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 3, "LAUNCH_PROPERTIES": 11,
     }
     actual_constant_loads = {name: 0 for name in expected_module_assignments}
     for node in ast.walk(tree):
@@ -2172,7 +2178,7 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
     protected_persistent_bindings.update(reviewed_imports)
     expected_module_loads = {
         "fcntl": 17, "json": 2, "os": 87, "runpy": 1, "secrets": 2,
-        "shlex": 1, "signal": 6, "subprocess": 84, "sys": 3, "time": 43,
+        "shlex": 1, "signal": 6, "subprocess": 91, "sys": 3, "time": 58,
     }
     actual_module_loads = {name: 0 for name in reviewed_imports}
     for node in ast.walk(tree):
@@ -2193,10 +2199,10 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2, ("shlex", "split"): 1,
         ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 2,
         ("signal", "SIGQUIT"): 1, ("signal", "SIGTERM"): 1,
-        ("subprocess", "CompletedProcess"): 12, ("subprocess", "PIPE"): 60,
-        ("subprocess", "Popen"): 10, ("subprocess", "SubprocessError"): 1,
+        ("subprocess", "CompletedProcess"): 12, ("subprocess", "PIPE"): 66,
+        ("subprocess", "Popen"): 10, ("subprocess", "SubprocessError"): 2,
         ("subprocess", "run"): 1, ("sys", "argv"): 2, ("sys", "stderr"): 1,
-        ("time", "monotonic"): 28, ("time", "sleep"): 15,
+        ("time", "monotonic"): 40, ("time", "sleep"): 18,
     }
     expected_recursive_module_attributes = {
         "fcntl.LOCK_EX": 5, "fcntl.LOCK_NB": 5, "fcntl.LOCK_UN": 1,
@@ -2211,10 +2217,10 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         "runpy.run_path": 1, "secrets.token_hex": 2, "shlex.split": 1,
         "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 2,
         "signal.SIGQUIT": 1, "signal.SIGTERM": 1,
-        "subprocess.CompletedProcess": 12, "subprocess.PIPE": 60,
-        "subprocess.Popen": 10, "subprocess.SubprocessError": 1,
+        "subprocess.CompletedProcess": 12, "subprocess.PIPE": 66,
+        "subprocess.Popen": 10, "subprocess.SubprocessError": 2,
         "subprocess.run": 1, "sys.argv": 2, "sys.stderr": 1,
-        "time.monotonic": 28, "time.sleep": 15,
+        "time.monotonic": 40, "time.sleep": 18,
     }
 
     def rooted_attribute_chain(node):
@@ -2277,17 +2283,20 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
     reviewed_name_callees = {
         "RuntimeError", "SystemExit", "all", "any", "assert_client_failure",
         "assert_client_lock_held", "assert_client_lock_reusable", "assert_interception",
-        "assert_launch_signature_counterexamples", "assert_persistent_failure_contract",
+        "assert_cleanup_deadline_contract", "assert_launch_signature_counterexamples",
+        "assert_persistent_failure_contract",
         "assert_property_parser_contract", "assert_replaced_or_absent", "bool",
-        "bounded_sanitized_repr", "cgroup_pids", "cleanup_fixture_invocation",
-        "cleanup_signed_launch", "counter", "dict", "exec_start_argv", "fail",
-        "fast_recovery", "fault_paths", "int", "intent_entry", "iter", "len", "main",
+        "bounded_cleanup_timeout", "bounded_sanitized_repr", "cgroup_pids",
+        "cleanup_fixture_invocation", "cleanup_signed_launch", "cleanup_signed_launch_until",
+        "counter", "dict", "exec_start_argv", "fail",
+        "fast_recovery", "fault_paths", "int", "intent_entry", "iter", "len", "main", "min",
         "map", "next", "observable_identity", "open", "parse_unit_properties", "parser",
         "persistent_failure_classification", "persistent_failure_diagnostics",
         "persistent_launch_signature", "persistent_result_violation",
         "persistent_supervisor_mode", "pid_exists", "print", "process_has_inode",
         "range", "release", "repr", "reset_paths", "reset_signal_paths", "run",
-        "run_root_entry", "sanitized_state", "set", "show", "signed_launch_state",
+        "run_root_entry", "sanitized_state", "set", "show", "show_until",
+        "signed_launch_state", "signed_launch_state_until",
         "sorted", "str", "successful_terminal_state", "tuple", "wait_counter",
         "wait_path", "wait_unit_absent",
     }
@@ -2300,7 +2309,7 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         "shlex", "signature", "slow", "slow_paths", "slow_state", "source", "state",
         "stale_after_client", "stale_expected_properties", "stale_observed",
         "stale_post_cleanup", "stale_post_cleanup_cgroup", "stale_program",
-        "stale_signature", "stopped", "subprocess", "time", "value", "values", "waiting",
+        "stale_signature", "stopped", "reset", "subprocess", "time", "value", "values", "waiting",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -2342,27 +2351,27 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
     # These normalized AST fingerprints only guard the exact reviewed inventory/context;
     # they are not source authentication and never replace the semantic inventories above.
     require(hashlib.sha256(repr(sorted(call_target_counts.items())).encode()).hexdigest()
-                == "5c2edb7f1b5f2fd729d542d409d32200e1e2e95c9ef31d89b6c3c3a295b7559f"
+                == "7393199e4a27c8ea0c7fc459be0fbd89d8f38f1f17ec9da53c174ae386a3d4ff"
             and hashlib.sha256(repr(sorted(call_contexts)).encode()).hexdigest()
-                == "514d0017a12142e8cb3f5272f9e7fad13c83e43d4b4fcd17d44063b825a17ead"
+                == "3b913c7aebfbb10f1a4546727734436b2dd53cd4a6b23148c1ffba9de01505f7"
             and hashlib.sha256(repr(sorted(security_call_contexts)).encode()).hexdigest()
-                == "8f8c31dc37e3936277c53c747979979a867b76b1339314c83e546c2aa0359dc4"
+                == "131070d7f0984a2712f1bf858f53772e2362f1ceea8a6bc8e98ca3f307aeb8c8"
             and hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest()
-                == "a4f9c21aa01cedde31bc818b98f5b0aab3a5f17f931685b54574297f77a05e90",
+                == "41d9f86e8c44cb5d3b9ea8d5aef5cae9469565fc42e51cfe6da9fe6826a93ffb",
             "containment call targets, arguments, or use-site contexts changed")
     protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
     expected_call_root_stores = {
         "SERVICE_PROPERTIES": 1, "after_exit": 2, "budgeted": 1, "cancelled": 1,
-        "descendants": 1, "environment": 1, "errors": 1, "expected_slow_counts": 1,
+        "descendants": 1, "environment": 1, "errors": 2, "expected_slow_counts": 1,
         "first": 1, "found": 1, "line": 1, "loaded": 1, "matching": 1, "mode": 6,
         "mutations": 1, "orphaned": 1, "parser": 1, "partial": 1, "parts": 1,
         "post_cleanup": 2,
         "process": 3, "property_boundaries": 1, "recovered": 3, "replaced": 1,
-        "result": 3, "sentinel_state": 1, "signature": 2, "slow": 1,
+        "reset": 1, "result": 4, "sentinel_state": 1, "signature": 2, "slow": 1,
         "slow_paths": 1, "slow_state": 1, "source": 6, "stale_after_client": 2,
         "stale_expected_properties": 1, "stale_observed": 3, "stale_post_cleanup": 3,
         "stale_post_cleanup_cgroup": 2, "stale_program": 1, "stale_signature": 3,
-        "state": 11, "stopped": 2, "successful_terminal_state": 1, "value": 10, "values": 2,
+        "state": 16, "stopped": 3, "successful_terminal_state": 1, "value": 10, "values": 2,
         "waiting": 1,
     }
     actual_call_root_stores = {}
@@ -2376,7 +2385,7 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
                                              type(parent).__name__, field, ast.dump(parent)))
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
-                == "9bcf241bb848cfbce95afb8d9c5c51603a447a70ab45cd46cd8baa99bfbfda15"
+                == "104843af81ec84fe0741f4c963cca84b6ac462c2f725ed2ad2df109bc48f368a"
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -2394,9 +2403,9 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 317, "AugAssign": 2, "Break": 5, "Continue": 4, "Delete": 1,
-        "Expr": 245, "For": 31, "FunctionDef": 39, "If": 143, "Import": 10,
-        "Pass": 5, "Raise": 4, "Return": 45, "Try": 38, "While": 13, "With": 6,
+        "Assign": 333, "AugAssign": 2, "Break": 9, "Continue": 5, "Delete": 1,
+        "Expr": 258, "For": 33, "FunctionDef": 44, "If": 158, "Import": 10,
+        "Pass": 5, "Raise": 4, "Return": 53, "Try": 40, "While": 15, "With": 6,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -2410,7 +2419,7 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
     # The recursive semantic call/module/binding inventories above remain independently required.
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
-                == "a6ef4580a267a9ba26c44f571fccb53ffa53f6181bd90f458959f8cc66897a95",
+                == "69da00f06fd2ede5d15022007a9434dc3069389664bdc86d51839d3ec05e18f1",
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -2693,6 +2702,11 @@ LAUNCH_PROPERTIES = ("InvocationID", "Description", "Environment", "ExecStart",
         'PERSISTENT_ACTION_ERROR = " command remains unavailable:"',
         'DIAGNOSTIC_TEXT_LIMIT = 512',
         'assert_persistent_failure_contract()',
+        'assert_cleanup_deadline_contract()',
+        'cleanup_signed_launch_until(stale_signature, cleanup_deadline)',
+        'partial = show_until(cleanup_deadline, *LAUNCH_PROPERTIES,',
+        'stale_action_error = stale_action_error or bounded_sanitized_repr(error)',
+        'and stale_identity_error is None and stale_action_error is None',
         'classification = persistent_failure_classification(faulted.stdout, faulted.stderr)',
         'persistent_failure_diagnostics(',
         'for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),',
@@ -2873,10 +2887,10 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
             and any(keyword.arg == "check" and isinstance(keyword.value, ast.Constant)
                     and keyword.value.value is False for keyword in stale_run_calls[0].keywords)
             and any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id == "cleanup_signed_launch"
+                    and node.func.id == "cleanup_signed_launch_until"
                     for statement in stale_phase_tries[0].finalbody for node in ast.walk(statement))
             and hashlib.sha256(repr([ast.dump(node) for node in stale_nodes]).encode()).hexdigest()
-                == "79bcc7e0267b2da6a8bfb35fbc9d7414f7aca128a5affc3bd69ce727f249dfb0",
+                == "7df946d86c6c5c3333e70c1e52791c780f0894fc2a1f3527673682127ccbce79",
             "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
 
     persistent_loops = []
@@ -4422,7 +4436,14 @@ def verify_supervisor_mutations(
             '    if any(successful_terminal_state(state) for state in rejected_terminal_states):',
             '    if False and any(successful_terminal_state(state) for state in rejected_terminal_states):')),
         ("containment show retries omitted", replace_once(containment,
-            '    for attempt in range(4):', '    for attempt in range(1):')),
+            'def show(*properties):\n'
+            '    requested = tuple(dict.fromkeys(("LoadState", *properties)))\n'
+            '    errors = []\n'
+            '    for attempt in range(4):',
+            'def show(*properties):\n'
+            '    requested = tuple(dict.fromkeys(("LoadState", *properties)))\n'
+            '    errors = []\n'
+            '    for attempt in range(1):')),
         ("containment subprocess wait unbounded", replace_once(containment,
             '    kwargs.setdefault("timeout", 18 * 60)', '    pass')),
         ("stale loaded client success accepted", replace_once(containment,
@@ -4432,8 +4453,95 @@ def verify_supervisor_mutations(
             '                or stale_after_client.get("ExecMainStatus") != "73"',
             '                or False')),
         ("stale loaded cleanup omitted", replace_once(containment,
-            '                cleanup_signed_launch(stale_signature)',
+            '                cleanup_signed_launch_until(stale_signature, cleanup_deadline)',
             '                pass')),
+        ("stale cleanup shared deadline omitted", replace_once(containment,
+            '                cleanup_signed_launch_until(stale_signature, cleanup_deadline)',
+            '                cleanup_signed_launch(stale_signature)')),
+        ("stale cleanup query deadline omitted", replace_once(containment,
+            '                partial = show_until(cleanup_deadline, *LAUNCH_PROPERTIES,',
+            '                partial = show(*LAUNCH_PROPERTIES,')),
+        ("stale final post query deadline omitted", replace_once(containment,
+            '            stale_post_cleanup = show_until(cleanup_deadline, "LoadState", "ControlGroup")',
+            '            stale_post_cleanup = show("LoadState", "ControlGroup")')),
+        ("stale outer retry sleep unbudgeted", replace_once(containment,
+            '            except Exception as error:\n'
+            '                stale_state_error = bounded_sanitized_repr(error)\n'
+            '                if time.monotonic() >= cleanup_deadline:\n'
+            '                    break\n'
+            '                time.sleep(bounded_cleanup_timeout(cleanup_deadline - time.monotonic(), 0.1))\n'
+            '                continue',
+            '            except Exception as error:\n'
+            '                stale_state_error = bounded_sanitized_repr(error)\n'
+            '                if time.monotonic() >= cleanup_deadline:\n'
+            '                    break\n'
+            '                time.sleep(0.1)\n'
+            '                continue')),
+        ("stale cleanup subprocess timeout unbounded", replace_once(containment,
+            '                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
+            '    if stopped.returncode:',
+            '                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n'
+            '    if stopped.returncode:')),
+        ("stale bounded show subprocess timeout omitted", replace_once(containment,
+            '                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
+            '            return parse_unit_properties(result, requested)',
+            '                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n'
+            '            return parse_unit_properties(result, requested)')),
+        ("stale bounded show retry sleep unbudgeted", replace_once(containment,
+            '                delay = bounded_cleanup_timeout(deadline - time.monotonic(),\n'
+            '                                                  0.05 * (2 ** attempt))\n'
+            '                time.sleep(delay)',
+            '                time.sleep(0.05 * (2 ** attempt))')),
+        ("stale stop starts without positive budget", replace_once(containment,
+            '    timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 20)\n'
+            '    stopped = run(',
+            '    timeout = 20\n'
+            '    stopped = run(')),
+        ("stale active poll loses shared deadline", replace_once(containment,
+            '        state = signed_launch_state_until(signature, deadline)\n'
+            '        if state["LoadState"] == "not-found":\n'
+            '            return\n'
+            '        if state.get("ActiveState") in ("failed", "inactive"):',
+            '        state = signed_launch_state(signature)\n'
+            '        if state["LoadState"] == "not-found":\n'
+            '            return\n'
+            '        if state.get("ActiveState") in ("failed", "inactive"):')),
+        ("stale active poll sleep unbudgeted", replace_once(containment,
+            '        if state.get("ActiveState") in ("failed", "inactive"):\n'
+            '            break\n'
+            '        delay = bounded_cleanup_timeout(deadline - time.monotonic(), 0.1)\n'
+            '        time.sleep(delay)',
+            '        if state.get("ActiveState") in ("failed", "inactive"):\n'
+            '            break\n'
+            '        time.sleep(0.1)')),
+        ("stale reset starts without positive budget", replace_once(containment,
+            '    timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 5)\n'
+            '    reset = run(',
+            '    timeout = 5\n'
+            '    reset = run(')),
+        ("stale reset subprocess timeout unbounded", replace_once(containment,
+            '                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
+            '    if reset.returncode:',
+            '                stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n'
+            '    if reset.returncode:')),
+        ("stale unload poll sleep unbudgeted", replace_once(containment,
+            '    while True:\n'
+            '        state = signed_launch_state_until(signature, deadline)\n'
+            '        if state["LoadState"] == "not-found":\n'
+            '            return\n'
+            '        delay = bounded_cleanup_timeout(deadline - time.monotonic(), 0.1)\n'
+            '        time.sleep(delay)\n\n\ndef pid_exists',
+            '    while True:\n'
+            '        state = signed_launch_state_until(signature, deadline)\n'
+            '        if state["LoadState"] == "not-found":\n'
+            '            return\n'
+            '        time.sleep(0.1)\n\n\ndef pid_exists')),
+        ("stale cleanup deadline pure fixture dead", replace_once(containment,
+            '    assert_cleanup_deadline_contract()',
+            '    if False:\n        assert_cleanup_deadline_contract()')),
+        ("stale cleanup cap ignores near deadline", replace_once(containment,
+            '    return min(remaining, cap)',
+            '    return cap')),
         ("stale ready wait omitted", replace_once(containment,
             '        wait_path(stale_ready, timeout=30)',
             '        stale_ready_seen = True')),
@@ -4489,23 +4597,32 @@ def verify_supervisor_mutations(
         ("stale immediate exit race restored", replace_once(containment,
             '                        "--property=StandardError=journal", *stale_expected_argv), check=False,',
             '                        "--property=StandardError=journal", "/usr/bin/false"), check=True,')),
-        ("stale artifacts removed after identity failure", replace_once(containment,
-            '        if (stale_post_evidence_complete and stale_post_error is None\n'
-            '                and stale_post_cleanup.get("LoadState") == "not-found"\n'
-            '                and not any(stale_post_cleanup_cgroup.values())):',
-            '        if stale_identity_error:')),
-        ("stale artifacts removed after cleanup failure", replace_once(containment,
-            '        if (stale_post_evidence_complete and stale_post_error is None\n'
-            '                and stale_post_cleanup.get("LoadState") == "not-found"\n'
-            '                and not any(stale_post_cleanup_cgroup.values())):',
-            '        if stale_action_error:')),
+        ("stale identity preservation conjunct omitted", replace_once(containment,
+            '                and stale_identity_error is None and stale_action_error is None\n',
+            '                and stale_action_error is None\n')),
+        ("stale action preservation conjunct omitted", replace_once(containment,
+            '                and stale_identity_error is None and stale_action_error is None\n',
+            '                and stale_identity_error is None\n')),
+        ("stale action failure made transient", replace_once(containment,
+            '                stale_action_error = stale_action_error or bounded_sanitized_repr(error)',
+            '                stale_action_error = bounded_sanitized_repr(error)\n'
+            '            else:\n'
+            '                stale_action_error = None')),
+        ("stale sticky identity evidence cleared", replace_once(containment,
+            '            stale_state_error = None\n'
+            '            stale_post_cleanup = partial',
+            '            stale_state_error = None\n'
+            '            stale_identity_error = None\n'
+            '            stale_post_cleanup = partial')),
         ("stale artifacts removed after post-state failure", replace_once(containment,
             '        if (stale_post_evidence_complete and stale_post_error is None\n'
+            '                and stale_identity_error is None and stale_action_error is None\n'
             '                and stale_post_cleanup.get("LoadState") == "not-found"\n'
             '                and not any(stale_post_cleanup_cgroup.values())):',
             '        if stale_post_error:')),
         ("stale release deleted without confirmed absence", replace_once(containment,
             '        if (stale_post_evidence_complete and stale_post_error is None\n'
+            '                and stale_identity_error is None and stale_action_error is None\n'
             '                and stale_post_cleanup.get("LoadState") == "not-found"\n'
             '                and not any(stale_post_cleanup_cgroup.values())):',
             '        if True:')),
@@ -4612,7 +4729,17 @@ def verify_supervisor_mutations(
         ("persistent property counterexample omitted", replace_once(containment,
             '        "fixed-property": ("KillMode", "process"),\n', '')),
         ("retained signature revalidation omitted", replace_once(containment,
+            'def signed_launch_state(signature):\n'
+            '    state = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")\n'
+            '    if state.get("LoadState") == "not-found":\n'
+            '        return state\n'
+            '    if (state.get("LoadState") != "loaded"\n'
             '            or any(state.get(name) != expected for name, expected in signature.items())):',
+            'def signed_launch_state(signature):\n'
+            '    state = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")\n'
+            '    if state.get("LoadState") == "not-found":\n'
+            '        return state\n'
+            '    if (state.get("LoadState") != "loaded"\n'
             '            or False):')),
         ("persistent cleanup unbounded", replace_once(containment,
             '    if stopped.returncode:\n        fail(f"persistent-fault stop failed: {stopped.stderr.strip()}")\n    deadline = time.monotonic() + 20',

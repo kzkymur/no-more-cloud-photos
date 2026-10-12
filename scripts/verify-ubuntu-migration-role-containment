@@ -519,6 +519,87 @@ def cleanup_signed_launch(signature):
         time.sleep(0.1)
 
 
+def bounded_cleanup_timeout(remaining, cap):
+    if remaining <= 0 or cap <= 0:
+        fail("stale cleanup deadline exhausted")
+    return min(remaining, cap)
+
+
+def assert_cleanup_deadline_contract():
+    cases = ((7, 3, 3), (2, 5, 2), (0.000001, 20, 0.000001), (90, 18 * 60, 90))
+    if any(bounded_cleanup_timeout(remaining, cap) != expected
+           for remaining, cap, expected in cases):
+        fail("stale cleanup timeout capping changed")
+    for remaining, cap in ((0, 1), (-1, 1), (1, 0)):
+        try:
+            bounded_cleanup_timeout(remaining, cap)
+        except RuntimeError:
+            continue
+        fail("stale cleanup accepted a nonpositive remaining budget")
+
+
+def show_until(deadline, *properties):
+    requested = tuple(dict.fromkeys(("LoadState", *properties)))
+    errors = []
+    for attempt in range(4):
+        try:
+            timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 1)
+            result = run(("/usr/bin/systemctl", "show", UNIT,
+                          *(f"--property={item}" for item in requested)), check=False,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+            return parse_unit_properties(result, requested)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+            errors.append(error)
+            if attempt < 3:
+                delay = bounded_cleanup_timeout(deadline - time.monotonic(),
+                                                  0.05 * (2 ** attempt))
+                time.sleep(delay)
+    fail("bounded stale unit properties remain unknown: " + "; ".join(map(str, errors)))
+
+
+def signed_launch_state_until(signature, deadline):
+    state = show_until(deadline, *LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+    if state.get("LoadState") == "not-found":
+        return state
+    if (state.get("LoadState") != "loaded"
+            or any(state.get(name) != expected for name, expected in signature.items())):
+        fail(f"bounded stale launch signature changed; refusing name action: {state}")
+    return state
+
+
+def cleanup_signed_launch_until(signature, deadline):
+    state = signed_launch_state_until(signature, deadline)
+    if state["LoadState"] == "not-found":
+        return
+    timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 20)
+    stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    if stopped.returncode:
+        fail(f"bounded stale stop failed: {stopped.stderr.strip()}")
+    while True:
+        state = signed_launch_state_until(signature, deadline)
+        if state["LoadState"] == "not-found":
+            return
+        if state.get("ActiveState") in ("failed", "inactive"):
+            break
+        delay = bounded_cleanup_timeout(deadline - time.monotonic(), 0.1)
+        time.sleep(delay)
+    state = signed_launch_state_until(signature, deadline)
+    if state["LoadState"] == "not-found":
+        return
+    timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 5)
+    reset = run(("/usr/bin/systemctl", "reset-failed", UNIT), check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    if reset.returncode:
+        fail(f"bounded stale reset failed: {reset.stderr.strip()}")
+    while True:
+        state = signed_launch_state_until(signature, deadline)
+        if state["LoadState"] == "not-found":
+            return
+        delay = bounded_cleanup_timeout(deadline - time.monotonic(), 0.1)
+        time.sleep(delay)
+
+
 def pid_exists(pid):
     try:
         os.kill(pid, 0)
@@ -600,6 +681,7 @@ def main():
     client, repo, commit, go_binary = sys.argv[1:]
     assert_property_parser_contract(client)
     assert_persistent_failure_contract()
+    assert_cleanup_deadline_contract()
 
     # A stale loaded fixed name is never launch-ready merely because it is
     # failed and cgroup-empty. The new client must fail without touching it.
@@ -802,10 +884,13 @@ raise SystemExit(73)
         stale_absence_confirmed = False
         while time.monotonic() < cleanup_deadline:
             try:
-                partial = show(*LAUNCH_PROPERTIES, "ActiveState", "ControlGroup")
+                partial = show_until(cleanup_deadline, *LAUNCH_PROPERTIES,
+                                     "ActiveState", "ControlGroup")
             except Exception as error:
                 stale_state_error = bounded_sanitized_repr(error)
-                time.sleep(0.1)
+                if time.monotonic() >= cleanup_deadline:
+                    break
+                time.sleep(bounded_cleanup_timeout(cleanup_deadline - time.monotonic(), 0.1))
                 continue
             stale_state_error = None
             stale_post_cleanup = partial
@@ -827,19 +912,22 @@ raise SystemExit(73)
                            for name, expected in stale_signature.items())):
                 stale_identity_error = bounded_sanitized_repr(
                     f"ownership={sanitized_state(partial)}")
-                time.sleep(0.1)
+                if time.monotonic() >= cleanup_deadline:
+                    break
+                time.sleep(bounded_cleanup_timeout(cleanup_deadline - time.monotonic(), 0.1))
                 continue
             stale_cleanup_attempted = True
             try:
-                cleanup_signed_launch(stale_signature)
-                stale_action_error = None
+                cleanup_signed_launch_until(stale_signature, cleanup_deadline)
             except Exception as error:
-                stale_action_error = bounded_sanitized_repr(error)
-            time.sleep(0.1)
+                stale_action_error = stale_action_error or bounded_sanitized_repr(error)
+            if time.monotonic() >= cleanup_deadline:
+                break
+            time.sleep(bounded_cleanup_timeout(cleanup_deadline - time.monotonic(), 0.1))
         if not stale_absence_confirmed:
             stale_identity_error = stale_identity_error or "explicit unit absence remained unknown"
         try:
-            stale_post_cleanup = show("LoadState", "ControlGroup")
+            stale_post_cleanup = show_until(cleanup_deadline, "LoadState", "ControlGroup")
             stale_post_cleanup_cgroup = {
                 "recorded": cgroup_pids(stale_recorded_cgroup),
                 "canonical": cgroup_pids("/system.slice/" + UNIT),
@@ -857,6 +945,7 @@ raise SystemExit(73)
         except Exception as error:
             stale_lock_error = bounded_sanitized_repr(error)
         if (stale_post_evidence_complete and stale_post_error is None
+                and stale_identity_error is None and stale_action_error is None
                 and stale_post_cleanup.get("LoadState") == "not-found"
                 and not any(stale_post_cleanup_cgroup.values())):
             try:
