@@ -787,7 +787,7 @@ def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
     # bypass this snapshot and must be rejected by the detailed inventories below.
     if enforce_snapshot:
         require(stable_source_digest(source)
-                == "7aa7c460151fa6f2b1ded9a84fffc9e519b4c0f5f048b5e301f5feb8cd3c0d30",
+                == "9d64a5d8afed40e8c65c0555da1ad67788e42f6612b9a3cd85876127485b1538",
                 "client reviewed stable UTF-8/LF source snapshot changed")
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     expected_imports = ast.parse('''import fcntl
@@ -805,6 +805,16 @@ import time
 ''').body
     require([ast.dump(node) for node in imports] == [ast.dump(node) for node in expected_imports],
             "client imports must remain the reviewed closed module set")
+    evidence_classes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EvidenceFailure"
+    ]
+    expected_evidence_class = ast.parse('''class EvidenceFailure(RuntimeError):
+    pass
+''').body[0]
+    require(len(evidence_classes) == 1
+            and ast.dump(evidence_classes[0]) == ast.dump(expected_evidence_class),
+            "client categorized evidence failure type changed")
     require(literal_assignment(tree, "CGROUP_SNAPSHOT_ATTEMPTS") == 4
             and literal_assignment(tree, "RECORDED_CGROUP_LIMIT") == 64
             and literal_assignment(tree, "CANONICAL_CGROUP")
@@ -827,7 +837,7 @@ import time
             or resource_class not in DIAGNOSTIC_RESOURCES):
         phase, operation, resource_class = "uncategorized", "unknown", "unknown"
     number = error.errno if isinstance(error, OSError) and type(error.errno) is int else errno.EIO
-    return RuntimeError(
+    return EvidenceFailure(
         f"phase={phase} operation={operation} resource={resource_class} errno={number}")
 ''', "client OS evidence diagnostics must use only closed literal categories and numeric errno")
     require_exact_function(tree, "top_level_diagnostic", '''def top_level_diagnostic(error):
@@ -891,19 +901,39 @@ import time
     require_exact_function(tree, "fixed_cgroup_paths", '''def fixed_cgroup_paths():
     return tuple(dict.fromkeys((*RECORDED_CGROUP, CANONICAL_CGROUP)))
 ''', "client fixed cgroup paths must include retained and canonical paths exactly once")
+    require_exact_function(tree, "cgroup_observation_error", '''def cgroup_observation_error(phase, error):
+    if isinstance(error, EvidenceFailure):
+        return error
+    if isinstance(error, OSError):
+        return evidence_failure(phase, "unknown", "cgroup", error)
+    return evidence_failure(phase, "unknown", "cgroup", OSError(errno.EIO, "observation failed"))
+''', "client cgroup observation errors must retain only typed closed diagnostics")
+    require_exact_function(tree, "append_unique_diagnostic", '''def append_unique_diagnostic(diagnostics, diagnostic):
+    if type(diagnostic) is not str:
+        fail("diagnostic aggregation requires a string")
+    if diagnostic not in diagnostics:
+        diagnostics.append(diagnostic)
+''', "client diagnostic aggregation must preserve ordered distinct safe strings exactly once")
     require_exact_function(tree, "fixed_cgroup_residue", '''def fixed_cgroup_residue(phase):
     residue = {}
+    errors = []
     for control_group in fixed_cgroup_paths():
-        pids = cgroup_pids(control_group, phase)
+        try:
+            pids = cgroup_pids(control_group, phase)
+        except BaseException as error:
+            diagnostic = cgroup_observation_error(phase, error)
+            append_unique_diagnostic(errors, str(diagnostic))
+            continue
         if pids:
             residue[control_group] = pids
-    return residue
-''', "client must inspect every retained/canonical fixed cgroup")
+    return residue, tuple(errors)
+''', "client must exhaustively retain residue and deduplicated observation failures")
     require_exact_function(tree, "assert_fixed_cgroups_empty", '''def assert_fixed_cgroups_empty(phase):
-    residue = fixed_cgroup_residue(phase)
-    if residue:
-        fail(CGROUP_RESIDUE_FAILURE)
-''', "client must fail closed with a fixed safe retained/canonical cgroup residue category")
+    residue, errors = fixed_cgroup_residue(phase)
+    failures = ([CGROUP_RESIDUE_FAILURE] if residue else []) + list(errors)
+    if failures:
+        fail(sanitized_diagnostic("; ".join(failures), None))
+''', "client must prioritize residue and bound safe exhaustive cgroup observation failures")
     require_exact_function(tree, "assert_prelaunch_absent", '''def assert_prelaunch_absent(state):
     retain_control_group(state)
     assert_fixed_cgroups_empty("prelaunch")
@@ -915,15 +945,19 @@ import time
     try:
         assert_fixed_cgroups_empty("final-close")
     except BaseException as final_error:
-        errors = [final_error]
+        errors = []
+        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))
         if primary_error is not None:
-            errors.append(primary_error)
-        errors.extend(cleanup_errors)
-        detail = "; ".join(sanitized_diagnostic(error, nonce) for error in errors)
+            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))
+        for error in cleanup_errors:
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
+        detail = "; ".join(errors)
         raise RuntimeError(sanitized_diagnostic(detail, nonce)) from None
     if cleanup_errors:
-        detail = sanitized_diagnostic(
-            "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)
+        errors = []
+        for error in cleanup_errors:
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
+        detail = sanitized_diagnostic("; ".join(errors), nonce)
         if primary_error is not None:
             primary = sanitized_diagnostic(primary_error, nonce)
             raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None
@@ -2376,14 +2410,19 @@ return result
         'errors = []',
         'context="show"', 'deadline = bounded_deadline(KILL_WAIT_TIMEOUT)',
         'cleanup_boundary("wait")', 'context="wait"',
+        'occupants, observation_errors = fixed_cgroup_residue("teardown")',
+        'for diagnostic in observation_errors:\n            append_unique_diagnostic(errors, diagnostic)',
+        'if occupants and not kill_sent:',
         'retry_owned_command(invocation, nonce, service_command,\n                                    "kill", "kill", "--kill-whom=all", "--signal=KILL")',
         'retry_owned_command(invocation, nonce, service_command, "stop", "stop")',
         'retry_owned_command(invocation, nonce, service_command, "reset", "reset-failed")',
         'wait_unloaded(invocation, nonce, service_command)',
     )
     require(all(teardown.count(fragment) == 1 for fragment in teardown_contract)
-            and teardown.count(
-                '"; ".join(sanitized_diagnostic(error, nonce) for error in errors)') == 2,
+            and teardown.count("append_unique_diagnostic(") == 11
+            and teardown.count('assert_fixed_cgroups_empty("teardown")') == 3
+            and teardown.count('"; ".join(errors)') == 2
+            and "errors.append(" not in teardown and "errors.extend(" not in teardown,
             "client teardown must retry pre-action failures and aggregate kill/stop/wait/reset/unload errors")
     require(teardown.count('owned_state("teardown", invocation, nonce, service_command') == 3,
             "client teardown must revalidate full ownership before each poll/name operation")
@@ -4758,7 +4797,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "a1c7f22fd0cde0a9b013964e8c29f7dceb714a729fa10a6de9e3a6258fc8c508",
+            == "ea66f5aa464a3d284a179e2aa3e43b68098f6cd1d58b579559ca87e8338b7f64",
             "diagnostic fixture source snapshot changed")
 
 
@@ -5010,13 +5049,16 @@ def verify_supervisor_mutations(
             '                                f"{sanitized_state(discovered)}"))',
             '                                f"{discovered}"))')),
         ("cleanup exposes exception strings", replace_once(client,
-            '        detail = sanitized_diagnostic(\n            "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)',
+            '        errors = []\n'
+            '        for error in cleanup_errors:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
+            '        detail = sanitized_diagnostic("; ".join(errors), nonce)',
             '        detail = "; ".join(map(str, cleanup_errors))')),
         ("client top fallback unsanitized", replace_once(client,
             '        print("verification-client: " + top_level_diagnostic(error), file=sys.stderr)',
             '        print(f"verification-client: {error}", file=sys.stderr)')),
         ("client OS diagnostic uses raw error", replace_once(client,
-            '    return RuntimeError(\n        f"phase={phase} operation={operation} resource={resource_class} errno={number}")',
+            '    return EvidenceFailure(\n        f"phase={phase} operation={operation} resource={resource_class} errno={number}")',
             '    return RuntimeError(str(error))')),
         ("client diagnostic categories attacker controlled", replace_once(client,
             '    if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS\n'
@@ -5126,6 +5168,47 @@ def verify_supervisor_mutations(
         ("client only latest retained cgroup checked", replace_once(client,
             '    return tuple(dict.fromkeys((*RECORDED_CGROUP, CANONICAL_CGROUP)))',
             '    return tuple(dict.fromkeys((*RECORDED_CGROUP[-1:], CANONICAL_CGROUP)))')),
+        ("client cgroup observation raises early", replace_once(client,
+            '            append_unique_diagnostic(errors, str(diagnostic))\n            continue',
+            '            raise diagnostic')),
+        ("client cgroup observation returns early", replace_once(client,
+            '            append_unique_diagnostic(errors, str(diagnostic))\n            continue',
+            '            append_unique_diagnostic(errors, str(diagnostic))\n'
+            '            return residue, tuple(errors)')),
+        ("client cgroup scan short-circuits after residue", replace_once(client,
+            '        if pids:\n            residue[control_group] = pids',
+            '        if pids:\n            residue[control_group] = pids\n            break')),
+        ("client cgroup scan drops known residue on error", replace_once(client,
+            '        except BaseException as error:\n'
+            '            diagnostic = cgroup_observation_error(phase, error)',
+            '        except BaseException as error:\n'
+            '            residue.clear()\n'
+            '            diagnostic = cgroup_observation_error(phase, error)')),
+        ("client cgroup scan skips later and canonical paths", replace_once(client,
+            '    for control_group in fixed_cgroup_paths():',
+            '    for control_group in fixed_cgroup_paths()[:1]:')),
+        ("client cgroup observation exposes arbitrary error", replace_once(client,
+            '    return evidence_failure(phase, "unknown", "cgroup", OSError(errno.EIO, "observation failed"))',
+            '    return RuntimeError(str(error))')),
+        ("client cgroup observation outranks residue", replace_once(client,
+            '    failures = ([CGROUP_RESIDUE_FAILURE] if residue else []) + list(errors)',
+            '    failures = list(errors) + ([CGROUP_RESIDUE_FAILURE] if residue else [])')),
+        ("client cgroup observation prevents known-residue kill", replace_once(client,
+            '        if occupants and not kill_sent:',
+            '        if occupants and not observation_errors and not kill_sent:')),
+        ("client diagnostic append dedup broken", replace_once(client,
+            '    if diagnostic not in diagnostics:\n        diagnostics.append(diagnostic)',
+            '    if True:\n        diagnostics.append(diagnostic)')),
+        ("client diagnostic append over-deduplicates distinct evidence", replace_once(client,
+            '    if diagnostic not in diagnostics:\n        diagnostics.append(diagnostic)',
+            '    if not diagnostics:\n        diagnostics.append(diagnostic)')),
+        ("client final cgroup diagnostic raw append", replace_once(client,
+            '        except BaseException as error:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
+            '    if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:',
+            '        except BaseException as error:\n'
+            '            errors.append(error)\n'
+            '    if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:')),
         ("client counter seek mislabeled", replace_once(client,
             '        os_call(phase, "seek", "evidence", counter.seek, 0)',
             '        os_call(phase, "write", "evidence", counter.seek, 0)')),
@@ -5547,26 +5630,37 @@ def verify_supervisor_mutations(
             '        assert_fixed_cgroups_empty("final-close")',
             '        pass')),
         ("final cgroup evidence error discarded", replace_once(client,
+            'def resolve_outcome(primary_error, cleanup_errors, nonce):\n'
             '    try:\n        assert_fixed_cgroups_empty("final-close")\n'
-            '    except BaseException as final_error:\n        errors = [final_error]\n'
-            '        if primary_error is not None:\n            errors.append(primary_error)\n'
-            '        errors.extend(cleanup_errors)\n'
-            '        detail = "; ".join(sanitized_diagnostic(error, nonce) for error in errors)\n'
+            '    except BaseException as final_error:\n        errors = []\n'
+            '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))\n'
+            '        if primary_error is not None:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))\n'
+            '        for error in cleanup_errors:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
+            '        detail = "; ".join(errors)\n'
             '        raise RuntimeError(sanitized_diagnostic(detail, nonce)) from None',
+            'def resolve_outcome(primary_error, cleanup_errors, nonce):\n'
             '    try:\n        assert_fixed_cgroups_empty("final-close")\n'
             '    except BaseException:\n        pass')),
         ("final cgroup evidence omitted from aggregate", replace_once(client,
-            '        errors = [final_error]', '        errors = []')),
+            '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))',
+            '        pass')),
         ("final cgroup evidence appended after prior errors", replace_once(client,
-            '        errors = [final_error]\n'
-            '        if primary_error is not None:\n            errors.append(primary_error)\n'
-            '        errors.extend(cleanup_errors)',
             '        errors = []\n'
-            '        if primary_error is not None:\n            errors.append(primary_error)\n'
-            '        errors.extend(cleanup_errors)\n'
-            '        errors.append(final_error)')),
+            '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))\n'
+            '        if primary_error is not None:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))\n'
+            '        for error in cleanup_errors:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))',
+            '        errors = []\n'
+            '        if primary_error is not None:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))\n'
+            '        for error in cleanup_errors:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
+            '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))')),
         ("final cgroup residue exposes paths and PIDs", replace_once(client,
-            '        fail(CGROUP_RESIDUE_FAILURE)',
+            '        fail(sanitized_diagnostic("; ".join(failures), None))',
             '        fail(f"fixed unit control groups are not empty: {residue}")')),
         ("primary error raised before final cgroup evidence", replace_once(client,
             'def resolve_outcome(primary_error, cleanup_errors, nonce):\n    try:',
@@ -5635,7 +5729,15 @@ def verify_supervisor_mutations(
         ("teardown failure discarded", replace_once(client,
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException as error:\n                        cleanup_errors.append(error)',
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException:\n                        pass')),
-        ("teardown aggregation bypassed", replace_once(client, '    if cleanup_errors:\n        detail = sanitized_diagnostic(\n            "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)', '    if False:\n        detail = sanitized_diagnostic(\n            "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)')),
+        ("teardown aggregation bypassed", replace_once(client,
+            '    if cleanup_errors:\n        errors = []\n'
+            '        for error in cleanup_errors:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
+            '        detail = sanitized_diagnostic("; ".join(errors), nonce)',
+            '    if False:\n        errors = []\n'
+            '        for error in cleanup_errors:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
+            '        detail = sanitized_diagnostic("; ".join(errors), nonce)')),
         ("recovered property errors discarded", replace_once(client,
             '            if RECOVERED_ERRORS:\n                cleanup_errors.extend(RECOVERED_ERRORS)',
             '            if RECOVERED_ERRORS:\n                pass')),
@@ -5666,7 +5768,7 @@ def verify_supervisor_mutations(
             '                     timeout=ACTION_TIMEOUTS[arguments[0]])\n'
             '    command_path("teardown", "reset" if arguments[0] == "reset-failed" else arguments[0])')),
         ("cleanup aggregation omitted", replace_once(client,
-            '    if errors:\n        raise RuntimeError(\n            sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)) from None', '    pass')),
+            '    if errors:\n        raise RuntimeError(\n            sanitized_diagnostic(\n                "; ".join(errors), nonce)) from None', '    pass')),
         ("B attempting marker after flock", replace_once(client,
             '        if requested_mode == "client-terminal-race-b":\n'
             '            durable_marker("startup", "client-terminal-race-b.attempting")\n'
@@ -7192,6 +7294,18 @@ def main() -> int:
         "    if False:\n        client_final_residue_diagnostic_cases(client)")
     expect_rejected(validate_diagnostic_fixture, dead_final_residue_fixture,
                     "client final residue fixture call is dead", "source snapshot changed")
+    dead_cgroup_observation_fixture = replace_once(
+        diagnostic_fixture,
+        "    client_cgroup_observation_cases(client)",
+        "    if False:\n        client_cgroup_observation_cases(client)")
+    expect_rejected(validate_diagnostic_fixture, dead_cgroup_observation_fixture,
+                    "client cgroup observation fixture call is dead", "source snapshot changed")
+    dead_cgroup_dedup_fixture = replace_once(
+        diagnostic_fixture,
+        "    client_cgroup_diagnostic_dedup_cases(client)",
+        "    if False:\n        client_cgroup_diagnostic_dedup_cases(client)")
+    expect_rejected(validate_diagnostic_fixture, dead_cgroup_dedup_fixture,
+                    "client cgroup diagnostic dedup fixture call is dead", "source snapshot changed")
     dead_phase_routing_fixture = replace_once(
         diagnostic_fixture,
         "    client_phase_routing_cases(client)",

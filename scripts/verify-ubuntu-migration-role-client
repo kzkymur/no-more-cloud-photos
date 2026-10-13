@@ -101,6 +101,10 @@ if not (CLEANUP_ENVELOPE < CLEANUP_BUDGET < CLEANUP_RESERVE < TOTAL_BUDGET):
     raise RuntimeError("cleanup retry envelope does not fit its exclusive reserve")
 
 
+class EvidenceFailure(RuntimeError):
+    pass
+
+
 def fail(message):
     raise RuntimeError(message)
 
@@ -110,7 +114,7 @@ def evidence_failure(phase, operation, resource_class, error):
             or resource_class not in DIAGNOSTIC_RESOURCES):
         phase, operation, resource_class = "uncategorized", "unknown", "unknown"
     number = error.errno if isinstance(error, OSError) and type(error.errno) is int else errno.EIO
-    return RuntimeError(
+    return EvidenceFailure(
         f"phase={phase} operation={operation} resource={resource_class} errno={number}")
 
 
@@ -609,19 +613,41 @@ def fixed_cgroup_paths():
     return tuple(dict.fromkeys((*RECORDED_CGROUP, CANONICAL_CGROUP)))
 
 
+def cgroup_observation_error(phase, error):
+    if isinstance(error, EvidenceFailure):
+        return error
+    if isinstance(error, OSError):
+        return evidence_failure(phase, "unknown", "cgroup", error)
+    return evidence_failure(phase, "unknown", "cgroup", OSError(errno.EIO, "observation failed"))
+
+
+def append_unique_diagnostic(diagnostics, diagnostic):
+    if type(diagnostic) is not str:
+        fail("diagnostic aggregation requires a string")
+    if diagnostic not in diagnostics:
+        diagnostics.append(diagnostic)
+
+
 def fixed_cgroup_residue(phase):
     residue = {}
+    errors = []
     for control_group in fixed_cgroup_paths():
-        pids = cgroup_pids(control_group, phase)
+        try:
+            pids = cgroup_pids(control_group, phase)
+        except BaseException as error:
+            diagnostic = cgroup_observation_error(phase, error)
+            append_unique_diagnostic(errors, str(diagnostic))
+            continue
         if pids:
             residue[control_group] = pids
-    return residue
+    return residue, tuple(errors)
 
 
 def assert_fixed_cgroups_empty(phase):
-    residue = fixed_cgroup_residue(phase)
-    if residue:
-        fail(CGROUP_RESIDUE_FAILURE)
+    residue, errors = fixed_cgroup_residue(phase)
+    failures = ([CGROUP_RESIDUE_FAILURE] if residue else []) + list(errors)
+    if failures:
+        fail(sanitized_diagnostic("; ".join(failures), None))
 
 
 def assert_prelaunch_absent(state):
@@ -636,15 +662,19 @@ def resolve_outcome(primary_error, cleanup_errors, nonce):
     try:
         assert_fixed_cgroups_empty("final-close")
     except BaseException as final_error:
-        errors = [final_error]
+        errors = []
+        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))
         if primary_error is not None:
-            errors.append(primary_error)
-        errors.extend(cleanup_errors)
-        detail = "; ".join(sanitized_diagnostic(error, nonce) for error in errors)
+            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))
+        for error in cleanup_errors:
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
+        detail = "; ".join(errors)
         raise RuntimeError(sanitized_diagnostic(detail, nonce)) from None
     if cleanup_errors:
-        detail = sanitized_diagnostic(
-            "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)
+        errors = []
+        for error in cleanup_errors:
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
+        detail = sanitized_diagnostic("; ".join(errors), nonce)
         if primary_error is not None:
             primary = sanitized_diagnostic(primary_error, nonce)
             raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None
@@ -800,19 +830,24 @@ def teardown_owned(invocation, nonce, service_command):
         try:
             state = owned_state("teardown", invocation, nonce, service_command, context="wait")
         except BaseException as error:
-            errors.append(error)
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
             break
         if state.get("LoadState") == "not-found":
-            assert_fixed_cgroups_empty("teardown")
+            try:
+                assert_fixed_cgroups_empty("teardown")
+            except BaseException as error:
+                append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
             break
-        occupants = fixed_cgroup_residue("teardown")
+        occupants, observation_errors = fixed_cgroup_residue("teardown")
+        for diagnostic in observation_errors:
+            append_unique_diagnostic(errors, diagnostic)
         if occupants and not kill_sent:
             try:
                 retry_owned_command(invocation, nonce, service_command,
                                     "kill", "kill", "--kill-whom=all", "--signal=KILL")
                 kill_sent = True
             except BaseException as error:
-                errors.append(error)
+                append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
                 break
             continue
         if (state.get("ActiveState") in ("failed", "inactive")
@@ -820,45 +855,46 @@ def teardown_owned(invocation, nonce, service_command):
             if not occupants:
                 break
         if time.monotonic() >= deadline:
-            errors.append(RuntimeError(
-                f"owned unit did not terminate its control group: {sanitized_state(state)}"))
+            append_unique_diagnostic(
+                errors, f"owned unit did not terminate its control group: {sanitized_state(state)}")
             break
         time.sleep(0.1)
     if state.get("ActiveState") == "active":
         try:
             retry_owned_command(invocation, nonce, service_command, "stop", "stop")
         except BaseException as error:
-            errors.append(error)
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
     try:
         state = owned_state("teardown", invocation, nonce, service_command)
     except BaseException as error:
-        errors.append(error)
+        append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
         state = None
     if state is None:
         raise RuntimeError(
             sanitized_diagnostic(
-                "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)) from None
+                "; ".join(errors), nonce)) from None
     if state.get("LoadState") != "not-found":
         try:
             retry_owned_command(invocation, nonce, service_command, "reset", "reset-failed")
         except BaseException as error:
-            errors.append(error)
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
     if state.get("LoadState") != "not-found":
         try:
             wait_unloaded(invocation, nonce, service_command)
         except BaseException as error:
-            errors.append(error)
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
     else:
         try:
             assert_fixed_cgroups_empty("teardown")
         except BaseException as error:
-            errors.append(error)
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
     if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:
-        errors.append(RuntimeError("absolute client cleanup deadline exhausted before owned unload"))
+        append_unique_diagnostic(
+            errors, "absolute client cleanup deadline exhausted before owned unload")
     if errors:
         raise RuntimeError(
             sanitized_diagnostic(
-                "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)) from None
+                "; ".join(errors), nonce)) from None
 
 
 def client_pause(phase, name):

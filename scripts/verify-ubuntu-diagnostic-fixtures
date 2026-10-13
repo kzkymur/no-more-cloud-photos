@@ -656,6 +656,191 @@ def client_final_residue_diagnostic_cases(client):
         globals_["cgroup_pids"] = original_cgroup_pids
 
 
+def client_cgroup_observation_cases(client):
+    globals_ = client["fixed_cgroup_residue"].__globals__
+    recorded = globals_["RECORDED_CGROUP"]
+    canonical = globals_["CANONICAL_CGROUP"]
+    original_recorded = list(recorded)
+    original_cgroup_pids = globals_["cgroup_pids"]
+    original_owned_state = globals_["owned_state"]
+    original_retry_owned_command = globals_["retry_owned_command"]
+    calls = []
+    residue_paths = set()
+    error_paths = set()
+
+    def fake_cgroup_pids(control_group, phase):
+        calls.append((control_group, phase))
+        if control_group in error_paths:
+            raise client["evidence_failure"](phase, "walk", "evidence", injected())
+        return [987654] if control_group in residue_paths else []
+
+    try:
+        globals_["cgroup_pids"] = fake_cgroup_pids
+        permutations = (
+            ("error-before-residue", ("/error-first", "/residue-second", "/later")),
+            ("residue-before-error", ("/residue-first", "/error-second", "/later")),
+        )
+        for label, paths in permutations:
+            error_path = next(path for path in paths if "error" in path)
+            residue_path = next(path for path in paths if "residue" in path)
+            expected = [*(path for path in paths), canonical]
+            recorded[:] = list(paths)
+            error_paths.clear()
+            error_paths.add(error_path)
+            residue_paths.clear()
+            residue_paths.add(residue_path)
+
+            calls.clear()
+            residue, errors = client["fixed_cgroup_residue"]("final-close")
+            require(residue == {residue_path: [987654]},
+                    f"{label} lost confidential known residue")
+            require(tuple(map(str, errors)) == (
+                "phase=final-close operation=walk resource=evidence errno=13",),
+                f"{label} lost or changed its safe observation diagnostic")
+            require(calls == [(path, "final-close") for path in expected],
+                    f"{label} did not exhaustively inspect later/canonical paths")
+
+            calls.clear()
+            try:
+                client["resolve_outcome"](RuntimeError("primary-original"), [], "n" * 64)
+            except RuntimeError as error:
+                diagnostic = str(error)
+            else:
+                raise RuntimeError(f"{label} final outcome unexpectedly succeeded")
+            require(diagnostic.startswith(
+                "fixed-cgroup-residue=true; phase=final-close ")
+                and "primary-original" in diagnostic,
+                f"{label} did not prioritize residue before observation/primary errors")
+            require(calls == [(path, "final-close") for path in expected],
+                    f"{label} final rescan skipped later/canonical paths")
+            require(all(path not in diagnostic for path in expected)
+                    and "987654" not in diagnostic and SECRET not in diagnostic,
+                    f"{label} final diagnostic leaked path, PID, or error details")
+
+            owned_calls = 0
+            kill_calls = []
+
+            def fake_owned_state(*_args, **_kwargs):
+                nonlocal owned_calls
+                owned_calls += 1
+                if owned_calls <= 3:
+                    return {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead"}
+                return {"LoadState": "not-found"}
+
+            def fake_retry_owned_command(_invocation, _nonce, _service_command,
+                                         name, action, *_arguments):
+                kill_calls.append((name, action))
+                residue_paths.clear()
+                return True
+
+            globals_["owned_state"] = fake_owned_state
+            globals_["retry_owned_command"] = fake_retry_owned_command
+            calls.clear()
+            try:
+                client["teardown_owned"]("i" * 32, "n" * 64, ("/fixture",))
+            except RuntimeError as error:
+                teardown_diagnostic = str(error)
+            else:
+                raise RuntimeError(f"{label} teardown discarded its observation error")
+            require(kill_calls == [("kill", "kill")],
+                    f"{label} observation error prevented known-residue cleanup")
+            expected_scan = [(path, "teardown") for path in expected]
+            require(calls and len(calls) % len(expected_scan) == 0
+                    and all(calls[index:index + len(expected_scan)] == expected_scan
+                            for index in range(0, len(calls), len(expected_scan))),
+                    f"{label} teardown scan skipped later/canonical paths")
+            require("phase=teardown operation=walk resource=evidence errno=13"
+                    in teardown_diagnostic
+                    and all(path not in teardown_diagnostic for path in expected)
+                    and "987654" not in teardown_diagnostic and SECRET not in teardown_diagnostic,
+                    f"{label} teardown lost or leaked its safe observation failure")
+
+        recorded[:] = ["/arbitrary-error", "/later"]
+        error_paths.clear()
+        residue_paths.clear()
+
+        def arbitrary_error(control_group, phase):
+            calls.append((control_group, phase))
+            if control_group == "/arbitrary-error":
+                raise RuntimeError(f"hostile {SECRET} {control_group} pid=987654")
+            return []
+
+        globals_["cgroup_pids"] = arbitrary_error
+        calls.clear()
+        assert_fails_with(lambda: client["assert_fixed_cgroups_empty"]("final-close"),
+                          "phase=final-close operation=unknown resource=cgroup errno=5")
+        require(calls == [("/arbitrary-error", "final-close"),
+                          ("/later", "final-close"), (canonical, "final-close")],
+                "no-residue observation failure skipped later/canonical paths")
+    finally:
+        recorded[:] = original_recorded
+        globals_["cgroup_pids"] = original_cgroup_pids
+        globals_["owned_state"] = original_owned_state
+        globals_["retry_owned_command"] = original_retry_owned_command
+
+
+def client_cgroup_diagnostic_dedup_cases(client):
+    globals_ = client["teardown_owned"].__globals__
+    recorded = globals_["RECORDED_CGROUP"]
+    canonical = globals_["CANONICAL_CGROUP"]
+    original_recorded = list(recorded)
+    original_cgroup_pids = globals_["cgroup_pids"]
+    original_owned_state = globals_["owned_state"]
+    original_retry_owned_command = globals_["retry_owned_command"]
+    original_command_deadline = globals_["COMMAND_DEADLINE"]
+    calls = []
+    owned_calls = 0
+
+    def persistent_error(control_group, phase):
+        calls.append((control_group, phase))
+        raise client["evidence_failure"](phase, "walk", "evidence", injected())
+
+    def fake_owned_state(*_args, **_kwargs):
+        nonlocal owned_calls
+        owned_calls += 1
+        if owned_calls <= 2:
+            return {"LoadState": "loaded", "ActiveState": "active", "SubState": "exited"}
+        return {"LoadState": "not-found"}
+
+    def cleanup_error(_invocation, _nonce, _service_command, name, action, *_arguments):
+        require((name, action) == ("stop", "stop"),
+                "persistent observation fixture reached an unexpected cleanup action")
+        raise RuntimeError("distinct-cleanup-evidence")
+
+    try:
+        recorded[:] = ["/persistent-error"]
+        globals_["cgroup_pids"] = persistent_error
+        globals_["owned_state"] = fake_owned_state
+        globals_["retry_owned_command"] = cleanup_error
+        globals_["COMMAND_DEADLINE"] = globals_["time"].monotonic() - 1
+        try:
+            client["teardown_owned"]("i" * 32, "n" * 64, ("/fixture",))
+        except RuntimeError as error:
+            diagnostic = str(error)
+        else:
+            raise RuntimeError("persistent observation diagnostic fixture unexpectedly succeeded")
+        observation = "phase=teardown operation=walk resource=evidence errno=13"
+        cleanup = "distinct-cleanup-evidence"
+        deadline = "absolute client cleanup deadline exhausted before owned unload"
+        require(diagnostic.count(observation) == 1,
+                "persistent identical cgroup diagnostic was not appended exactly once")
+        require(cleanup in diagnostic and deadline in diagnostic
+                and diagnostic.index(observation) < diagnostic.index(cleanup) < diagnostic.index(deadline),
+                "distinct cleanup/deadline diagnostics were lost, reordered, or over-deduplicated")
+        require(len(diagnostic) <= 526,
+                "deduplicated teardown diagnostic exceeded the sanitizer bound")
+        require(calls == [
+            ("/persistent-error", "teardown"), (canonical, "teardown"),
+            ("/persistent-error", "teardown"), (canonical, "teardown"),
+        ], "polling/final persistent-error scans were not both exhaustive")
+    finally:
+        recorded[:] = original_recorded
+        globals_["cgroup_pids"] = original_cgroup_pids
+        globals_["owned_state"] = original_owned_state
+        globals_["retry_owned_command"] = original_retry_owned_command
+        globals_["COMMAND_DEADLINE"] = original_command_deadline
+
+
 def client_phase_routing_cases(client):
     globals_ = client["unit_properties"].__globals__
     module_os = globals_["os"]
@@ -909,6 +1094,8 @@ def main():
     signed_cleanup_lock_cases(containment)
     client_cgroup_lifecycle_cases(client)
     client_final_residue_diagnostic_cases(client)
+    client_cgroup_observation_cases(client)
+    client_cgroup_diagnostic_dedup_cases(client)
     client_phase_routing_cases(client)
     actual_boundary_cases(client, containment)
     for namespace in (client, containment):
