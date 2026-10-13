@@ -467,7 +467,7 @@ def successful_terminal_state(state):
             and state.get("ActiveState") == "active" and state.get("SubState") == "exited")
 
 
-def unit_properties(phase, *names, context="show"):
+def unit_properties(phase, *names, context="show", retain=True):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
     deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
     errors = []
@@ -482,7 +482,7 @@ def unit_properties(phase, *names, context="show"):
                               phase, check=False,
                              timeout=remaining)
             values = parse_unit_properties(result, requested)
-            if "ControlGroup" in requested:
+            if retain and "ControlGroup" in requested:
                 retain_control_group(values)
             if errors:
                 RECOVERED_ERRORS.extend(errors)
@@ -597,9 +597,9 @@ def cgroup_pids(control_group, phase):
 
 
 def retain_control_group(state):
-    if state.get("LoadState") == "not-found":
-        return
     control_group = state.get("ControlGroup")
+    if state.get("LoadState") == "not-found" and not control_group:
+        return
     if (type(control_group) is not str or not control_group.startswith("/")
             or control_group == "/" or os.path.normpath(control_group) != control_group):
         fail("loaded fixed unit has an invalid control group path")
@@ -651,11 +651,11 @@ def assert_fixed_cgroups_empty(phase):
 
 
 def assert_prelaunch_absent(state):
-    retain_control_group(state)
-    assert_fixed_cgroups_empty("prelaunch")
     if state.get("LoadState") != "not-found":
         fail("fixed verification unit is not explicitly absent: "
              f"{sanitized_state(state)}")
+    retain_control_group(state)
+    assert_fixed_cgroups_empty("prelaunch")
 
 
 def resolve_outcome(primary_error, cleanup_errors, nonce):
@@ -1003,7 +1003,7 @@ def main():
                      "HOME=/root", f"{NONCE_VARIABLE}={nonce}", *supervisor_argv)
         before = unit_properties("prelaunch", "LoadState", "InvocationID", "ActiveState",
                                  "SubState", "ControlGroup",
-                                 context="prelaunch")
+                                 context="prelaunch", retain=False)
         assert_prelaunch_absent(before)
         publish_supervisor(repo, commit)
         if CANCELLED:

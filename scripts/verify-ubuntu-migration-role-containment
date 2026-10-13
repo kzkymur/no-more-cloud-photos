@@ -24,6 +24,7 @@ ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOM
 SUCCESS = "Ubuntu migration role compatibility verification passed"
 PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"
 PERSISTENT_ACTION_ERROR = " command remains unavailable:"
+STALE_REJECTION_PREFIX = "verification-client: fixed verification unit is not explicitly absent: "
 DIAGNOSTIC_TEXT_LIMIT = 512
 PROGRAM = "/run/nmcp-ci/supervisor.py"
 NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
@@ -238,6 +239,72 @@ def persistent_result_violation(returncode, classification, lock_handoff_error, 
         or lock_handoff_error or cleanup_error or lock_reuse_error
         or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup
     )
+
+
+def stale_expected_rejection(state):
+    safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup")
+    safe = {name: state.get(name) for name in safe_names if name in state}
+    return STALE_REJECTION_PREFIX + str(safe) + "\n"
+
+
+def stale_client_classification(attempted, returncode, stdout, stderr, expected_stderr):
+    result_available = attempted and type(returncode) is int
+    success_marker = result_available and SUCCESS in stdout
+    accepted = result_available and (returncode == 0 or success_marker)
+    expected_rejection = bool(
+        result_available and returncode != 0 and not success_marker
+        and stderr == expected_stderr)
+    return {
+        "attempted": bool(attempted),
+        "result_available": result_available,
+        "accepted": accepted,
+        "success_marker": success_marker,
+        "expected_rejection": expected_rejection,
+        "wrong_reason": (result_available and returncode != 0
+                         and not success_marker and not expected_rejection),
+    }
+
+
+def diagnostic_bit(value):
+    return "1" if bool(value) else "0"
+
+
+def stale_failure_message(failure_category, client_zero, classification, unit_absent,
+                          recorded_empty, canonical_empty, identity_unchanged,
+                          cleanup_attempted, cleanup_succeeded, lock_reusable,
+                          artifacts_removed, post_evidence_complete, ready, released, ack,
+                          error_category, fixture_error, client_output, client_diagnostic,
+                          cleanup_error):
+    if failure_category not in ("accepted", "wrong-reason", "fixture-error", "cleanup-error"):
+        failure_category = "invalid"
+    if error_category not in ("none", "fixture", "release", "state", "identity",
+                              "action", "post", "lock", "paths"):
+        error_category = "invalid"
+    message = (
+        f"stale fixed-unit fixture failed: scenario=stale;failure_category={failure_category};"
+        f"attempted={diagnostic_bit(classification['attempted'])};"
+        f"result_available={diagnostic_bit(classification['result_available'])};"
+        f"client_zero={diagnostic_bit(client_zero)};"
+        f"success_marker={diagnostic_bit(classification['success_marker'])};"
+        f"expected_rejection={diagnostic_bit(classification['expected_rejection'])};"
+        f"wrong_reason={diagnostic_bit(classification['wrong_reason'])};"
+        f"unit_absent={diagnostic_bit(unit_absent)};recorded_empty={diagnostic_bit(recorded_empty)};"
+        f"canonical_empty={diagnostic_bit(canonical_empty)};"
+        f"identity_unchanged={diagnostic_bit(identity_unchanged)};"
+        f"cleanup_attempted={diagnostic_bit(cleanup_attempted)};"
+        f"cleanup_succeeded={diagnostic_bit(cleanup_succeeded)};"
+        f"lock_reusable={diagnostic_bit(lock_reusable)};"
+        f"artifacts_removed={diagnostic_bit(artifacts_removed)};"
+        f"post_evidence_complete={diagnostic_bit(post_evidence_complete)};"
+        f"ready={diagnostic_bit(ready)};release={diagnostic_bit(released)};ack={diagnostic_bit(ack)};"
+        f"error_category={error_category};fixture_error={diagnostic_bit(fixture_error)};"
+        f"client_output={diagnostic_bit(client_output)};"
+        f"client_diagnostic={diagnostic_bit(client_diagnostic)};"
+        f"cleanup_error={diagnostic_bit(cleanup_error)}"
+    )
+    if len("containment-test: ''\n") + len(message) > DIAGNOSTIC_TEXT_LIMIT:
+        fail("stale fixed-unit diagnostic schema exceeded its fixed bound")
+    return message
 
 
 def bounded_sanitized_repr(value, active_nonce=None):
@@ -1294,6 +1361,11 @@ raise SystemExit(73)
     stale_rejected_return = None
     stale_rejected_stdout = ""
     stale_rejected_stderr = ""
+    stale_client_attempted = False
+    stale_expected_stderr = ""
+    stale_client_class = stale_client_classification(False, None, "", "", "")
+    stale_identity_unchanged = False
+    stale_lock_reusable = False
     stale_after_client = {}
     try:
         reset_paths("stale-setup", stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",
@@ -1382,21 +1454,28 @@ raise SystemExit(73)
                 stale_observed, stale_signature, stale_main_pid,
                 cgroup_pids(stale_observed.get("ControlGroup", ""), "stale-attestation")):
             fail("released stale fixed-unit had an unexpected exact terminal state")
+        stale_expected_stderr = stale_expected_rejection(stale_observed)
+        stale_client_attempted = True
         rejected = run("stale-attestation", ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                         "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stale_rejected_return = rejected.returncode
         stale_rejected_stdout = rejected.stdout
         stale_rejected_stderr = rejected.stderr
+        stale_client_class = stale_client_classification(
+            stale_client_attempted, rejected.returncode, rejected.stdout, rejected.stderr,
+            stale_expected_stderr)
         stale_after_client = show_identity_until("stale-attestation",
             time.monotonic() + 10, "ActiveState", "SubState", "Result", "ExecMainPID",
             "ExecMainCode", "ExecMainStatus", "ControlGroup")
-        if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:
+        if not stale_client_class["expected_rejection"]:
             fail("client accepted a stale loaded fixed unit")
-        if not stale_terminal_matches(
+        stale_identity_unchanged = stale_terminal_matches(
                 stale_after_client, stale_signature, stale_main_pid,
-                cgroup_pids(stale_after_client.get("ControlGroup", ""), "stale-attestation")):
+                cgroup_pids(stale_after_client.get("ControlGroup", ""), "stale-attestation"))
+        if not stale_identity_unchanged:
             fail("rejected prelaunch client touched the exact stale fixed-unit evidence")
         assert_client_lock_reusable()
+        stale_lock_reusable = True
     except Exception as error:
         stale_failure = error
     finally:
@@ -1475,6 +1554,7 @@ raise SystemExit(73)
             stale_post_error = bounded_sanitized_repr(error)
         try:
             assert_client_lock_reusable()
+            stale_lock_reusable = True
         except Exception as error:
             stale_lock_error = bounded_sanitized_repr(error)
         if (stale_post_evidence_complete and stale_post_error is None
@@ -1491,31 +1571,44 @@ raise SystemExit(73)
             stale_path_error = "owned helper and release preserved pending confirmed absence"
     if (stale_failure is not None or stale_release_error or stale_state_error or stale_identity_error
             or stale_action_error or stale_post_error or stale_lock_error or stale_path_error):
-        fail("stale fixed-unit fixture failed: "
-             f"error={bounded_sanitized_repr(stale_failure)}; "
-             f"launch_return={stale_launch_return}; "
-             f"launch_stdout_present={bool(stale_launch_stdout)}; "
-             f"launch_stderr_present={bool(stale_launch_stderr)}; "
-             f"ready={stale_ready_seen}; release={stale_release_seen}; "
-             f"release_ack={stale_release_ack_seen}; "
-             f"signature={sanitized_state(stale_signature or {})}; "
-             f"client_return={stale_rejected_return}; "
-             f"client_stdout_present={bool(stale_rejected_stdout)}; "
-             f"client_stderr_present={bool(stale_rejected_stderr)}; "
-             f"after_client={sanitized_state(stale_after_client)}; "
-             f"cleanup_attempted={stale_cleanup_attempted}; "
-             f"cleanup_release={bounded_sanitized_repr(stale_release_error)}; "
-             f"cleanup_state={bounded_sanitized_repr(stale_state_error)}; "
-             f"cleanup_identity={bounded_sanitized_repr(stale_identity_error)}; "
-             f"cleanup_action={bounded_sanitized_repr(stale_action_error)}; "
-             f"cleanup_post={bounded_sanitized_repr(stale_post_error)}; "
-             f"cleanup_lock={bounded_sanitized_repr(stale_lock_error)}; "
-             f"cleanup_paths={bounded_sanitized_repr(stale_path_error)}; "
-             f"artifacts_removed={stale_artifacts_removed}; "
-             f"post_evidence_complete={stale_post_evidence_complete}; "
-             f"state={sanitized_state(stale_observed)}; "
-             f"post_cleanup={sanitized_state(stale_post_cleanup)}; "
-             f"post_cgroup={bounded_sanitized_repr(stale_post_cleanup_cgroup)}")
+        stale_client_class = stale_client_classification(
+            stale_client_attempted, stale_rejected_return, stale_rejected_stdout,
+            stale_rejected_stderr, stale_expected_stderr)
+        recorded_empty = bool(stale_post_evidence_complete and stale_post_cleanup_cgroup
+                              and not stale_post_cleanup_cgroup["recorded"])
+        canonical_empty = bool(stale_post_evidence_complete and stale_post_cleanup_cgroup
+                               and not stale_post_cleanup_cgroup["canonical"])
+        unit_absent = bool(stale_post_evidence_complete
+                           and stale_post_cleanup.get("LoadState") == "not-found")
+        cleanup_error = bool(stale_release_error or stale_state_error or stale_identity_error
+                             or stale_action_error or stale_post_error or stale_lock_error
+                             or stale_path_error)
+        cleanup_succeeded = bool(unit_absent and recorded_empty and canonical_empty
+                                 and stale_lock_reusable and stale_artifacts_removed
+                                 and not cleanup_error)
+        if stale_client_class["accepted"]:
+            failure_category = "accepted"
+        elif stale_client_class["wrong_reason"]:
+            failure_category = "wrong-reason"
+        elif stale_failure is not None:
+            failure_category = "fixture-error"
+        else:
+            failure_category = "cleanup-error"
+        error_flags = (
+            ("fixture", stale_failure is not None), ("release", bool(stale_release_error)),
+            ("state", bool(stale_state_error)), ("identity", bool(stale_identity_error)),
+            ("action", bool(stale_action_error)), ("post", bool(stale_post_error)),
+            ("lock", bool(stale_lock_error)), ("paths", bool(stale_path_error)),
+        )
+        error_category = next((name for name, present in error_flags if present), "none")
+        fail(stale_failure_message(
+            failure_category, stale_rejected_return == 0, stale_client_class, unit_absent,
+            recorded_empty, canonical_empty, stale_identity_unchanged,
+            stale_cleanup_attempted, cleanup_succeeded, stale_lock_reusable,
+            stale_artifacts_removed, stale_post_evidence_complete, stale_ready_seen,
+            stale_release_seen, stale_release_ack_seen, error_category,
+            stale_failure is not None, bool(stale_rejected_stdout),
+            bool(stale_rejected_stderr), cleanup_error))
 
     client_faults = (
         "client-fault-after-launch", "client-fault-missing-invocation",

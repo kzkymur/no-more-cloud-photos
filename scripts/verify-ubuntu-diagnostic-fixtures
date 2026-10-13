@@ -458,6 +458,88 @@ def signed_cleanup_lock_cases(containment):
             "signed cleanup callback did not run exactly once with owned identity")
 
 
+def stale_diagnostic_cases(containment):
+    classify = containment["stale_client_classification"]
+    diagnostic = containment["stale_failure_message"]
+    expected = containment["stale_expected_rejection"]({
+        "LoadState": "loaded", "InvocationID": "i" * 32, "ActiveState": "failed",
+        "SubState": "failed", "ControlGroup": "", "Result": "exit-code",
+        "ExecMainCode": "1", "ExecMainStatus": "73",
+    })
+    require(expected == containment["STALE_REJECTION_PREFIX"]
+            + "{'LoadState': 'loaded', 'InvocationID': '" + "i" * 32
+            + "', 'ActiveState': 'failed', 'SubState': 'failed', 'ControlGroup': ''}\n",
+            "stale expected rejection did not match the exact prelaunch state diagnostic")
+    cases = (
+        (False, None, containment["SUCCESS"], expected,
+         (False, False, False, False, False, False)),
+        (True, None, containment["SUCCESS"], expected,
+         (True, False, False, False, False, False)),
+        (True, 0, "", expected, (True, True, True, False, False, False)),
+        (True, 1, containment["SUCCESS"], expected,
+         (True, True, True, True, False, False)),
+        (True, 1, "", expected, (True, True, False, False, True, False)),
+        (True, 1, "", expected + "appended", (True, True, False, False, False, True)),
+        (True, 1, "", expected.replace("loaded", "failed"),
+         (True, True, False, False, False, True)),
+        (True, 1, "", containment["STALE_REJECTION_PREFIX"],
+         (True, True, False, False, False, True)),
+        (True, 1, "", expected + "second-line\n",
+         (True, True, False, False, False, True)),
+    )
+    for attempted, returncode, stdout, stderr, wanted in cases:
+        observed = classify(attempted, returncode, stdout, stderr, expected)
+        require(tuple(observed[name] for name in (
+            "attempted", "result_available", "accepted", "success_marker",
+            "expected_rejection", "wrong_reason")) == wanted,
+            "stale client outcome classification lost exact result/rejection semantics")
+
+    classification = classify(True, 1, "", "verification-client: unrelated failure\n", expected)
+    rendered = diagnostic(
+        "wrong-reason", False, classification, True, True, True, True,
+        True, True, True, True, True, True, True, True, "fixture", True,
+        False, True, False)
+    fields = (
+        "scenario=stale;", ";failure_category=wrong-reason;", ";attempted=1;",
+        ";result_available=1;", ";client_zero=0;", ";success_marker=0;",
+        ";expected_rejection=0;", ";wrong_reason=1;", ";unit_absent=1;",
+        ";recorded_empty=1;", ";canonical_empty=1;", ";identity_unchanged=1;",
+        ";cleanup_attempted=1;", ";cleanup_succeeded=1;", ";lock_reusable=1;",
+        ";artifacts_removed=1;", ";post_evidence_complete=1;", ";ready=1;",
+        ";release=1;", ";ack=1;", ";error_category=fixture;", ";fixture_error=1;",
+        ";client_output=0;", ";client_diagnostic=1;", ";cleanup_error=0",
+    )
+    positions = [rendered.index(field) for field in fields]
+    require(positions == sorted(positions) and all(rendered.count(field) == 1 for field in fields),
+            "stale diagnostic lost a leading outcome/cleanup field or field order")
+    hostile = "x" * 4096
+    equivalents = (RuntimeError(hostile), {"Description": hostile}, ("signature", hostile))
+    messages = []
+    for failure_category in ("accepted", "wrong-reason", "fixture-error", "cleanup-error",
+                             hostile):
+        for error_category in ("none", "fixture", "release", "state", "identity",
+                               "action", "post", "lock", "paths", hostile):
+            message = diagnostic(
+                failure_category, False, classification, False, False, False, False,
+                True, False, False, False, False, True, True, True, error_category,
+                True, True, True, True)
+            emitted = "containment-test: " + containment["top_level_diagnostic"](
+                RuntimeError(message)) + "\n"
+            require(len(emitted.encode("ascii")) <= 512 and "<truncated>" not in emitted,
+                    "complete stale diagnostic exceeded its final emitted bound")
+            messages.append(emitted)
+    require(all(value for value in equivalents) and all(hostile not in value for value in messages),
+            "stale diagnostic depended on hostile error/signature/state equivalents")
+    emitted = "containment-test: " + containment["top_level_diagnostic"](
+        RuntimeError(rendered)) + "\n"
+    require(len(emitted.encode("ascii")) <= 512 and "<truncated>" not in emitted,
+            "required stale diagnostic fields were truncated by top-level rendering")
+    forbidden = ("signature=", "state=", "InvocationID", "Description", "Environment",
+                 "Command", "stdout=", "stderr=", "/run/", "pid=", "nonce")
+    require(not any(item in emitted for item in forbidden),
+            "stale diagnostic leaked forbidden identity, stream, path, PID, or nonce evidence")
+
+
 def client_cgroup_lifecycle_cases(client):
     globals_ = client["retain_control_group"].__globals__
     recorded = globals_["RECORDED_CGROUP"]
@@ -480,7 +562,11 @@ def client_cgroup_lifecycle_cases(client):
         })
         client["retain_control_group"]({"LoadState": "loaded", "ControlGroup": "/recorded-a"})
         client["retain_control_group"]({"LoadState": "not-found"})
-        require(client["fixed_cgroup_paths"]() == ("/recorded-a", "/recorded-b", canonical),
+        client["retain_control_group"]({
+            "LoadState": "not-found", "ControlGroup": "/recorded-not-found",
+        })
+        require(client["fixed_cgroup_paths"]() == (
+                    "/recorded-a", "/recorded-b", "/recorded-not-found", canonical),
                 "later/mismatched/minimal states replaced retained control groups")
         for invalid in (None, "", "relative", "/"):
             state = {"LoadState": "loaded"}
@@ -488,7 +574,8 @@ def client_cgroup_lifecycle_cases(client):
                 state["ControlGroup"] = invalid
             assert_fails_with(lambda state=state: client["retain_control_group"](state),
                               "loaded fixed unit has an invalid control group path")
-        require(client["fixed_cgroup_paths"]() == ("/recorded-a", "/recorded-b", canonical),
+        require(client["fixed_cgroup_paths"]() == (
+                    "/recorded-a", "/recorded-b", "/recorded-not-found", canonical),
                 "invalid loaded state changed the retained control group")
         recorded[:] = [f"/recorded-{index}" for index in range(globals_["RECORDED_CGROUP_LIMIT"])]
         assert_fails_with(lambda: client["retain_control_group"]({
@@ -508,11 +595,12 @@ def client_cgroup_lifecycle_cases(client):
 
         calls.clear()
         assert_fails_with(lambda: client["assert_prelaunch_absent"]({
-            "LoadState": "loaded", "ControlGroup": "/recorded-b",
-        }), "fixed-cgroup-residue=true")
-        require(calls == [("/recorded-a", "prelaunch"), ("/recorded-b", "prelaunch"),
-                          (canonical, "prelaunch")],
-                "prelaunch loaded-state rejection bypassed cgroup evidence")
+            "LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
+            "ExecMainStatus": "73", "ControlGroup": "",
+        }), "fixed verification unit is not explicitly absent: "
+            "{'LoadState': 'loaded', 'ActiveState': 'failed', 'SubState': 'failed', "
+            "'ControlGroup': '', 'ExecMainStatus': '73'}")
+        require(not calls, "loaded prelaunch rejection scanned cgroups before LoadState")
 
         calls.clear()
         residue.clear()
@@ -525,13 +613,12 @@ def client_cgroup_lifecycle_cases(client):
 
         calls.clear()
         residue.clear()
-        assert_fails_with(lambda: client["assert_prelaunch_absent"]({
-            "LoadState": "loaded", "ControlGroup": "/recorded-b",
-        }), "fixed verification unit is not explicitly absent: "
-            "{'LoadState': 'loaded', 'ControlGroup': '/recorded-b'}")
+        client["assert_prelaunch_absent"]({
+            "LoadState": "not-found", "ControlGroup": "/recorded-not-found",
+        })
         require(calls == [("/recorded-a", "prelaunch"), ("/recorded-b", "prelaunch"),
-                          (canonical, "prelaunch")],
-                "empty loaded prelaunch state was rejected before cgroup evidence")
+                          ("/recorded-not-found", "prelaunch"), (canonical, "prelaunch")],
+                "explicit absence did not retain and scan recorded/canonical cgroups")
 
         calls.clear()
         residue.clear()
@@ -587,6 +674,65 @@ def client_cgroup_lifecycle_cases(client):
         recorded[:] = original_recorded
         globals_["cgroup_pids"] = original_cgroup_pids
         globals_["owned_state"] = original_owned_state
+
+
+def client_prelaunch_production_path_case(client):
+    globals_ = client["unit_properties"].__globals__
+    recorded = globals_["RECORDED_CGROUP"]
+    canonical = globals_["CANONICAL_CGROUP"]
+    originals = (
+        list(recorded), globals_["command"], globals_["command_path"],
+        globals_["cgroup_pids"], globals_["PROPERTY_RETRIES"],
+    )
+    response = ""
+    scans = []
+
+    def fake_command(*_args, **_kwargs):
+        return subprocess.CompletedProcess(("systemctl", "show"), 0, response, "")
+
+    def fake_cgroup_pids(control_group, phase):
+        scans.append((control_group, phase))
+        return []
+
+    try:
+        recorded[:] = ["/prior"]
+        globals_["command"] = fake_command
+        globals_["command_path"] = lambda *_args, **_kwargs: None
+        globals_["cgroup_pids"] = fake_cgroup_pids
+        globals_["PROPERTY_RETRIES"] = 1
+
+        response = ("LoadState=loaded\nInvocationID=fixture\nActiveState=failed\n"
+                    "SubState=failed\nControlGroup=\n")
+        loaded = client["unit_properties"](
+            "prelaunch", "LoadState", "InvocationID", "ActiveState", "SubState",
+            "ControlGroup", context="prelaunch", retain=False)
+        assert_fails_with(lambda: client["assert_prelaunch_absent"](loaded),
+                          "fixed verification unit is not explicitly absent: "
+                          "{'LoadState': 'loaded', 'InvocationID': 'fixture', "
+                          "'ActiveState': 'failed', 'SubState': 'failed', 'ControlGroup': ''}")
+        require(recorded == ["/prior"] and not scans,
+                "production prelaunch loaded read retained or scanned before LoadState rejection")
+
+        response = "LoadState=not-found\nControlGroup=/current-not-found\n"
+        absent = client["unit_properties"](
+            "prelaunch", "LoadState", "ControlGroup", context="prelaunch", retain=False)
+        client["assert_prelaunch_absent"](absent)
+        require(recorded == ["/prior", "/current-not-found"],
+                "production explicit-absence path did not retain its nonempty current cgroup")
+        require(scans == [("/prior", "prelaunch"), ("/current-not-found", "prelaunch"),
+                          (canonical, "prelaunch")],
+                "production explicit-absence path skipped accumulated or canonical evidence")
+
+        response = "LoadState=loaded\nControlGroup=/work-observed\n"
+        client["unit_properties"]("work", "LoadState", "ControlGroup")
+        require(recorded[-1] == "/work-observed",
+                "non-prelaunch unit property observation lost required cgroup retention")
+    finally:
+        recorded[:] = originals[0]
+        globals_["command"] = originals[1]
+        globals_["command_path"] = originals[2]
+        globals_["cgroup_pids"] = originals[3]
+        globals_["PROPERTY_RETRIES"] = originals[4]
 
 
 def client_final_residue_diagnostic_cases(client):
@@ -654,6 +800,63 @@ def client_final_residue_diagnostic_cases(client):
     finally:
         recorded[:] = original_recorded
         globals_["cgroup_pids"] = original_cgroup_pids
+
+
+def client_terminal_teardown_reachability_case(client):
+    globals_ = client["teardown_owned"].__globals__
+    recorded = globals_["RECORDED_CGROUP"]
+    canonical = globals_["CANONICAL_CGROUP"]
+    originals = (
+        list(recorded), globals_["owned_state"], globals_["cgroup_pids"],
+        globals_["retry_owned_command"], globals_["wait_unloaded"],
+    )
+    owned_calls = 0
+    actions = []
+    scans = []
+
+    def fake_owned_state(*_args, **_kwargs):
+        nonlocal owned_calls
+        owned_calls += 1
+        if owned_calls <= 3:
+            return {
+                "LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
+                "ControlGroup": "/terminal-empty",
+            }
+        return {"LoadState": "not-found"}
+
+    def fake_cgroup_pids(control_group, phase):
+        scans.append((control_group, phase))
+        return []
+
+    def fake_retry(_invocation, _nonce, _service_command, name, action, *_arguments):
+        actions.append((name, action))
+        return True
+
+    original_wait_unloaded = globals_["wait_unloaded"]
+
+    def tracked_wait_unloaded(*args, **kwargs):
+        actions.append(("wait_unloaded", "entered"))
+        return original_wait_unloaded(*args, **kwargs)
+
+    try:
+        recorded[:] = ["/terminal-empty"]
+        globals_["owned_state"] = fake_owned_state
+        globals_["cgroup_pids"] = fake_cgroup_pids
+        globals_["retry_owned_command"] = fake_retry
+        globals_["wait_unloaded"] = tracked_wait_unloaded
+        client["teardown_owned"]("i" * 32, "n" * 64, ("/fixture",))
+        require(actions == [("reset", "reset-failed"), ("wait_unloaded", "entered")],
+                "loaded empty terminal teardown did not reach reset and unload wait")
+        require(scans == [
+            ("/terminal-empty", "teardown"), (canonical, "teardown"),
+            ("/terminal-empty", "unload"), (canonical, "unload"),
+        ], "loaded empty terminal teardown did not reach its final cgroup assertion")
+    finally:
+        recorded[:] = originals[0]
+        globals_["owned_state"] = originals[1]
+        globals_["cgroup_pids"] = originals[2]
+        globals_["retry_owned_command"] = originals[3]
+        globals_["wait_unloaded"] = originals[4]
 
 
 def client_cgroup_observation_cases(client):
@@ -1092,8 +1295,11 @@ def main():
     diagnostic_cases(client, containment)
     explicit_marker_phase_cases(containment)
     signed_cleanup_lock_cases(containment)
+    stale_diagnostic_cases(containment)
     client_cgroup_lifecycle_cases(client)
+    client_prelaunch_production_path_case(client)
     client_final_residue_diagnostic_cases(client)
+    client_terminal_teardown_reachability_case(client)
     client_cgroup_observation_cases(client)
     client_cgroup_diagnostic_dedup_cases(client)
     client_phase_routing_cases(client)

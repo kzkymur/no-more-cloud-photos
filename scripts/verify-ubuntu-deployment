@@ -787,7 +787,7 @@ def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
     # bypass this snapshot and must be rejected by the detailed inventories below.
     if enforce_snapshot:
         require(stable_source_digest(source)
-                == "9d64a5d8afed40e8c65c0555da1ad67788e42f6612b9a3cd85876127485b1538",
+                == "edbdb66526b803a44ec6c0cb07ef7423ea33b078054ee7662ee0372add11220b",
                 "client reviewed stable UTF-8/LF source snapshot changed")
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     expected_imports = ast.parse('''import fcntl
@@ -887,9 +887,9 @@ import time
     require_exact_assignment(tree, "RECORDED_CGROUP", "RECORDED_CGROUP = []",
                              "client retained control-group state changed")
     require_exact_function(tree, "retain_control_group", '''def retain_control_group(state):
-    if state.get("LoadState") == "not-found":
-        return
     control_group = state.get("ControlGroup")
+    if state.get("LoadState") == "not-found" and not control_group:
+        return
     if (type(control_group) is not str or not control_group.startswith("/")
             or control_group == "/" or os.path.normpath(control_group) != control_group):
         fail("loaded fixed unit has an invalid control group path")
@@ -897,7 +897,7 @@ import time
         RECORDED_CGROUP.append(control_group)
     if len(RECORDED_CGROUP) > RECORDED_CGROUP_LIMIT:
         fail("too many fixed unit control group paths were observed")
-''', "client must append every valid loaded-state control group across explicit absence")
+''', "client must append every valid nonempty control group across explicit absence")
     require_exact_function(tree, "fixed_cgroup_paths", '''def fixed_cgroup_paths():
     return tuple(dict.fromkeys((*RECORDED_CGROUP, CANONICAL_CGROUP)))
 ''', "client fixed cgroup paths must include retained and canonical paths exactly once")
@@ -935,12 +935,12 @@ import time
         fail(sanitized_diagnostic("; ".join(failures), None))
 ''', "client must prioritize residue and bound safe exhaustive cgroup observation failures")
     require_exact_function(tree, "assert_prelaunch_absent", '''def assert_prelaunch_absent(state):
-    retain_control_group(state)
-    assert_fixed_cgroups_empty("prelaunch")
     if state.get("LoadState") != "not-found":
         fail("fixed verification unit is not explicitly absent: "
              f"{sanitized_state(state)}")
-''', "client prelaunch must inspect retained/canonical cgroups before loaded-state rejection")
+    retain_control_group(state)
+    assert_fixed_cgroups_empty("prelaunch")
+''', "client prelaunch must reject loaded state before explicit-absence cgroup evidence")
     require_exact_function(tree, "resolve_outcome", '''def resolve_outcome(primary_error, cleanup_errors, nonce):
     try:
         assert_fixed_cgroups_empty("final-close")
@@ -1364,7 +1364,7 @@ import time
     return (state.get("Result") == "success" and exited and zero_status
             and state.get("ActiveState") == "active" and state.get("SubState") == "exited")
 ''', "client terminal success must use the exact raw typed systemd state contract")
-    require_exact_function(tree, "unit_properties", '''def unit_properties(phase, *names, context="show"):
+    require_exact_function(tree, "unit_properties", '''def unit_properties(phase, *names, context="show", retain=True):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
     deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
     errors = []
@@ -1379,7 +1379,7 @@ import time
                               phase, check=False,
                              timeout=remaining)
             values = parse_unit_properties(result, requested)
-            if "ControlGroup" in requested:
+            if retain and "ControlGroup" in requested:
                 retain_control_group(values)
             if errors:
                 RECOVERED_ERRORS.extend(errors)
@@ -1391,7 +1391,7 @@ import time
             time.sleep(min(0.05 * (2 ** attempt), max(0, deadline - time.monotonic())))
     detail = "; ".join(sanitized_diagnostic(error, None) for error in errors)
     fail("unit properties remain unknown: " + sanitized_diagnostic(detail, None))
-''', "client property reads must fail closed with bounded retry and retained errors")
+''', "client property reads must retain cgroups by default with one explicit prelaunch exception")
     require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
             "client must not infer absence from an empty or failed property query")
     require_exact_function(tree, "launch_state", '''def launch_state(phase, *, context="show"):
@@ -1733,13 +1733,13 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
         and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "before"
     ]
     expected_prelaunch = ast.parse('''before = unit_properties("prelaunch", "LoadState", "InvocationID", "ActiveState",
-                         "SubState", "ControlGroup", context="prelaunch")
+                         "SubState", "ControlGroup", context="prelaunch", retain=False)
 assert_prelaunch_absent(before)
 ''').body
     require(len(prelaunch_starts) == 1
             and [ast.dump(node) for node in lock_try.body[prelaunch_starts[0]:prelaunch_starts[0] + 2]]
             == [ast.dump(node) for node in expected_prelaunch],
-            "client prelaunch must inspect cgroups before rejecting every non-not-found state")
+            "client prelaunch must reject LoadState before retaining explicit-absence cgroups")
     total_deadline_starts = [
         index for index, node in enumerate(lock_try.body)
         if isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -2424,6 +2424,9 @@ return result
             and teardown.count('"; ".join(errors)') == 2
             and "errors.append(" not in teardown and "errors.extend(" not in teardown,
             "client teardown must retry pre-action failures and aggregate kill/stop/wait/reset/unload errors")
+    require('if not occupants:\n                break' in teardown
+            and 'if not occupants:\n                return' not in teardown,
+            "client loaded empty terminal teardown must continue through reset and unload")
     require(teardown.count('owned_state("teardown", invocation, nonce, service_command') == 3,
             "client teardown must revalidate full ownership before each poll/name operation")
     wait_source = ast.get_source_segment(source, named_function(tree, "wait_unloaded")) or ""
@@ -2791,6 +2794,68 @@ def validate_containment(source: str, phase: str) -> None:
         or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup
     )
 ''', "containment persistent cleanup-first result predicate changed")
+    require_exact_function(tree, "stale_expected_rejection", '''def stale_expected_rejection(state):
+    safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup")
+    safe = {name: state.get(name) for name in safe_names if name in state}
+    return STALE_REJECTION_PREFIX + str(safe) + "\\n"
+''', "containment must derive the one exact canonical stale rejection")
+    require_exact_function(tree, "stale_client_classification", '''def stale_client_classification(attempted, returncode, stdout, stderr, expected_stderr):
+    result_available = attempted and type(returncode) is int
+    success_marker = result_available and SUCCESS in stdout
+    accepted = result_available and (returncode == 0 or success_marker)
+    expected_rejection = bool(
+        result_available and returncode != 0 and not success_marker
+        and stderr == expected_stderr)
+    return {
+        "attempted": bool(attempted),
+        "result_available": result_available,
+        "accepted": accepted,
+        "success_marker": success_marker,
+        "expected_rejection": expected_rejection,
+        "wrong_reason": (result_available and returncode != 0
+                         and not success_marker and not expected_rejection),
+    }
+''', "containment stale client outcomes require an attempted available exact result")
+    require_exact_function(tree, "diagnostic_bit", '''def diagnostic_bit(value):
+    return "1" if bool(value) else "0"
+''', "containment stale diagnostic flags must use fixed one-byte tokens")
+    require_exact_function(tree, "stale_failure_message", '''def stale_failure_message(failure_category, client_zero, classification, unit_absent,
+                          recorded_empty, canonical_empty, identity_unchanged,
+                          cleanup_attempted, cleanup_succeeded, lock_reusable,
+                          artifacts_removed, post_evidence_complete, ready, released, ack,
+                          error_category, fixture_error, client_output, client_diagnostic,
+                          cleanup_error):
+    if failure_category not in ("accepted", "wrong-reason", "fixture-error", "cleanup-error"):
+        failure_category = "invalid"
+    if error_category not in ("none", "fixture", "release", "state", "identity",
+                              "action", "post", "lock", "paths"):
+        error_category = "invalid"
+    message = (
+        f"stale fixed-unit fixture failed: scenario=stale;failure_category={failure_category};"
+        f"attempted={diagnostic_bit(classification['attempted'])};"
+        f"result_available={diagnostic_bit(classification['result_available'])};"
+        f"client_zero={diagnostic_bit(client_zero)};"
+        f"success_marker={diagnostic_bit(classification['success_marker'])};"
+        f"expected_rejection={diagnostic_bit(classification['expected_rejection'])};"
+        f"wrong_reason={diagnostic_bit(classification['wrong_reason'])};"
+        f"unit_absent={diagnostic_bit(unit_absent)};recorded_empty={diagnostic_bit(recorded_empty)};"
+        f"canonical_empty={diagnostic_bit(canonical_empty)};"
+        f"identity_unchanged={diagnostic_bit(identity_unchanged)};"
+        f"cleanup_attempted={diagnostic_bit(cleanup_attempted)};"
+        f"cleanup_succeeded={diagnostic_bit(cleanup_succeeded)};"
+        f"lock_reusable={diagnostic_bit(lock_reusable)};"
+        f"artifacts_removed={diagnostic_bit(artifacts_removed)};"
+        f"post_evidence_complete={diagnostic_bit(post_evidence_complete)};"
+        f"ready={diagnostic_bit(ready)};release={diagnostic_bit(released)};ack={diagnostic_bit(ack)};"
+        f"error_category={error_category};fixture_error={diagnostic_bit(fixture_error)};"
+        f"client_output={diagnostic_bit(client_output)};"
+        f"client_diagnostic={diagnostic_bit(client_diagnostic)};"
+        f"cleanup_error={diagnostic_bit(cleanup_error)}"
+    )
+    if len("containment-test: ''\\n") + len(message) > DIAGNOSTIC_TEXT_LIMIT:
+        fail("stale fixed-unit diagnostic schema exceeded its fixed bound")
+    return message
+''', "containment stale failure message must remain complete through top-level rendering")
     require_exact_function(tree, "bounded_sanitized_repr", '''def bounded_sanitized_repr(value, active_nonce=None):
     if isinstance(value, subprocess.TimeoutExpired):
         text = "subprocess timed out"
@@ -2893,10 +2958,13 @@ def validate_containment(source: str, phase: str) -> None:
         fail("persistent cleanup-first result classification changed")
 ''', "containment persistent diagnostic pure fixtures changed")
     protected_persistent_bindings = {
-        "SUCCESS", "PERSISTENT_PROPERTY_ERROR", "PERSISTENT_ACTION_ERROR", "DIAGNOSTIC_TEXT_LIMIT",
+        "SUCCESS", "PERSISTENT_PROPERTY_ERROR", "PERSISTENT_ACTION_ERROR",
+        "STALE_REJECTION_PREFIX", "DIAGNOSTIC_TEXT_LIMIT",
         "persistent_failure_classification", "bounded_sanitized_repr", "sanitized_state",
         "persistent_failure_diagnostics", "assert_persistent_failure_contract",
-        "len", "str", "repr", "sorted", "bool", "any",
+        "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
+        "stale_failure_message",
+        "len", "str", "repr", "sorted", "bool", "any", "next",
     }
     protected_persistent_string_bindings = set(protected_persistent_bindings)
     reviewed_persistent_functions = {
@@ -2911,6 +2979,8 @@ def validate_containment(source: str, phase: str) -> None:
         "open_transaction_lock", "lock_transaction", "close_transaction_lock",
         "load_cleanup_intent", "top_level_diagnostic",
         "persistent_failure_classification", "persistent_result_violation",
+        "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
+        "stale_failure_message",
         "bounded_sanitized_repr", "sanitized_state", "persistent_failure_diagnostics",
         "assert_persistent_failure_contract", "run", "parse_unit_properties", "show",
         "assert_property_parser_contract", "wait_path", "reset_signal_paths", "reset_paths",
@@ -2952,6 +3022,10 @@ def validate_containment(source: str, phase: str) -> None:
         ("load_cleanup_intent", ""),
         ("persistent_failure_classification", "stdout, stderr"),
         ("persistent_result_violation", "returncode, classification, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup, post_cleanup_cgroup"),
+        ("stale_expected_rejection", "state"),
+        ("stale_client_classification", "attempted, returncode, stdout, stderr, expected_stderr"),
+        ("diagnostic_bit", "value"),
+        ("stale_failure_message", "failure_category, client_zero, classification, unit_absent, recorded_empty, canonical_empty, identity_unchanged, cleanup_attempted, cleanup_succeeded, lock_reusable, artifacts_removed, post_evidence_complete, ready, released, ack, error_category, fixture_error, client_output, client_diagnostic, cleanup_error"),
         ("bounded_sanitized_repr", "value, active_nonce=None"),
         ("top_level_diagnostic", "error"), ("sanitized_state", "state"),
         ("persistent_failure_diagnostics", "mode, boundary, faulted, classification, intercepted, attempted, observed, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup_cgroup"),
@@ -3086,7 +3160,8 @@ try_nonblocking_flock(cleanup_lock, "persistent-cleanup", "lock")
     expected_module_assignments = {
         "UNIT", "CLEANUP_DATABASE_FAILURE", "CLEANUP_ROLES_FAILURE",
         "READY", "PID_FILES", "ENV", "SUCCESS", "PERSISTENT_PROPERTY_ERROR",
-        "PERSISTENT_ACTION_ERROR", "DIAGNOSTIC_TEXT_LIMIT", "PROGRAM", "NONCE_VARIABLE",
+        "PERSISTENT_ACTION_ERROR", "STALE_REJECTION_PREFIX", "DIAGNOSTIC_TEXT_LIMIT",
+        "PROGRAM", "NONCE_VARIABLE",
         "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "IDENTITY_PROPERTIES",
         "SYSTEMD_UNIT_OBJECT", "CGROUP_SNAPSHOT_ATTEMPTS", "DIAGNOSTIC_PHASES",
         "DIAGNOSTIC_OPERATIONS", "DIAGNOSTIC_RESOURCES",
@@ -3104,6 +3179,7 @@ ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOM
 SUCCESS = "Ubuntu migration role compatibility verification passed"
 PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"
 PERSISTENT_ACTION_ERROR = " command remains unavailable:"
+STALE_REJECTION_PREFIX = "verification-client: fixed verification unit is not explicitly absent: "
 DIAGNOSTIC_TEXT_LIMIT = 512
 PROGRAM = "/run/nmcp-ci/supervisor.py"
 NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
@@ -3188,6 +3264,7 @@ DIAGNOSTIC_RESOURCES = (
         "CLEANUP_ROLES_FAILURE": "cleanup_roles_failed=True",
         "PERSISTENT_PROPERTY_ERROR": "unit properties remain unknown:",
         "PERSISTENT_ACTION_ERROR": " command remains unavailable:",
+        "STALE_REJECTION_PREFIX": "verification-client: fixed verification unit is not explicitly absent: ",
         "DIAGNOSTIC_TEXT_LIMIT": 512,
     }
     for name, value in expected_persistent_constants.items():
@@ -3205,9 +3282,10 @@ DIAGNOSTIC_RESOURCES = (
     )
     expected_constant_loads = {
         "UNIT": 20, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
-        "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 6,
+        "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 7,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
-        "DIAGNOSTIC_TEXT_LIMIT": 5, "PROGRAM": 2, "NONCE_VARIABLE": 2,
+        "STALE_REJECTION_PREFIX": 1, "DIAGNOSTIC_TEXT_LIMIT": 6,
+        "PROGRAM": 2, "NONCE_VARIABLE": 2,
         "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 6, "IDENTITY_PROPERTIES": 1,
         "SYSTEMD_UNIT_OBJECT": 1, "CGROUP_SNAPSHOT_ATTEMPTS": 1,
         "DIAGNOSTIC_PHASES": 1, "DIAGNOSTIC_OPERATIONS": 1,
@@ -3418,6 +3496,8 @@ DIAGNOSTIC_RESOURCES = (
         "sanitized_state", "set", "show", "show_identity_until", "show_until",
         "signed_launch_state", "signed_launch_state_until",
         "sorted", "stale_terminal_matches", "str", "structured_command_fixture_result",
+        "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
+        "stale_failure_message",
         "structured_command_identity", "successful_terminal_state", "tuple", "type",
         "top_level_diagnostic", "try_nonblocking_flock", "unique_json_object", "wait_counter",
         "wait_path", "wait_unit_absent",
@@ -3430,6 +3510,7 @@ DIAGNOSTIC_RESOURCES = (
         "partial", "recovered", "replaced", "result", "runpy", "secrets", "sentinel_state",
         "identities", "kept", "path", "payload", "results", "signature", "slow", "slow_paths",
         "slow_state", "source", "stat", "state",
+        "stderr",
         "stale_after_client", "stale_observed",
         "stale_post_cleanup", "stale_post_cleanup_cgroup", "stale_program",
         "stopped", "reset", "subprocess", "text", "time", "value", "values", "waiting",
@@ -3480,6 +3561,14 @@ DIAGNOSTIC_RESOURCES = (
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        ("fd76a0edab190ce914c0c7e9bb81b79cff7af5515c916d201ce1c12363e574fa",
+         "e7caa3477c10db49031199a22f3d2bc39d6c0d7ce517b2310bb08e7e9c9c46a7",
+         "5e7b5ce30598ca6fb6ff12516c05fc8ca1d5d8c06e5d3e3be2e372707fcf0ec9",
+         "968bf7f3f6dd30ff6ad84ed0770709c19f6897660cdf668cdc62e8036c016d50"),
+        ("7d94e89ec850cd8849f1221d3189599d3f8faa07d411e58355c2219933485ad5",
+         "9ae2257505e9ed6f4bdd11bc74fae989469c0449a160d4882d7931d628739f1b",
+         "4c9e85d8ab38f69e735dcb79510d83d372ec8826e32abe92cdb11a5985bde69b",
+         "7adb40b2aab4ae3b8c6b1ca48c2d5b9049dc16a29188627cddc5daac659e179b"),
         ("03a6dc8d2b0af61da6e07ae24b37f2ca816056f4bb837bdd6e45dd8f4e1b0507",
          "880bfb4ccbaa5ed9b7b7dd6ebae541ffe0da6636e41a9d2a4e27f7835cb25ac9",
          "4c9e85d8ab38f69e735dcb79510d83d372ec8826e32abe92cdb11a5985bde69b",
@@ -3587,7 +3676,7 @@ DIAGNOSTIC_RESOURCES = (
         "slow_paths": 1, "slow_state": 1, "source": 5, "stale_after_client": 2,
         "stale_observed": 3, "stale_post_cleanup": 3,
         "stale_post_cleanup_cgroup": 2, "stale_program": 1,
-        "state": 17, "stopped": 3, "successful_terminal_state": 1, "text": 8,
+        "state": 17, "stderr": 1, "stopped": 3, "successful_terminal_state": 1, "text": 8,
         "value": 15, "values": 3,
         "waiting": 1,
     }
@@ -3617,7 +3706,9 @@ DIAGNOSTIC_RESOURCES = (
                     "a64897465c42d41f67aabf9b0fe6ea01d54afeb57f702371bcba5ba6a9d36d89",
                     "d3e165d6739578d5914ab1fc17e4a3122c7b69fba82b2496bf0c905d12103399",
                     "736c9b5a8e87836eb660f8102fe944f814adc5adbae303dbc014dfedd5678a25",
-                    "95414aa17f539723cba5d48ffbefa65592d669ec867dcfaa77899dde7508a869"}
+                    "95414aa17f539723cba5d48ffbefa65592d669ec867dcfaa77899dde7508a869",
+                    "ed10b7120c2bc595e9b4f73c486d646f4bb2c6678489e8679bf00d23dbde5ab1",
+                    "53c119c1c4cbaf56920df306779652455ddedbe4e6a8e7411b408a539bea08db"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -3635,9 +3726,9 @@ DIAGNOSTIC_RESOURCES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 423, "AugAssign": 2, "Break": 9, "ClassDef": 1, "Continue": 8,
-        "Delete": 1, "Expr": 298, "For": 44, "FunctionDef": 77, "If": 199,
-        "Import": 12, "Pass": 5, "Raise": 42, "Return": 82, "Try": 61, "While": 15,
+        "Assign": 456, "AugAssign": 2, "Break": 9, "ClassDef": 1, "Continue": 8,
+        "Delete": 1, "Expr": 299, "For": 44, "FunctionDef": 81, "If": 205,
+        "Import": 12, "Pass": 5, "Raise": 42, "Return": 86, "Try": 61, "While": 15,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -3677,7 +3768,9 @@ DIAGNOSTIC_RESOURCES = (
                     "c39553a9aff837822c58f00fe333c62adace4b3cbfe177873351fefc89ecd47a",
                      "ab7bdc6b21ae1992a00b2ad235b8ad1e27cb603bcfa9b0c5de138dd9a993203c",
                      "f74acaeeeaf1f7ed2beb5cacf98e8cb9a78a743cb64940d6e3610bd3b443b3cf",
-                     "c9ab6c5cded9b3ffdca0633480aaaa873815bda5adfea087da2f72d6769ef061"},
+                     "c9ab6c5cded9b3ffdca0633480aaaa873815bda5adfea087da2f72d6769ef061",
+                     "48259ed81b8dd831d48860744cae5818810ffe6f4d4f75cf3dffb31413e150c5",
+                     "f53efc98374c18c692b5be647e8967e63093f57aa70c0c8cfbd5085b2dfeec9c"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -4155,7 +4248,7 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
                        and any(isinstance(child, ast.Constant)
                                  and child.value == "/usr/bin/systemd-run"
                                  for child in ast.walk(node))]
-    require(len(stale_nodes) == 41 and len(stale_tries) == 1
+    require(len(stale_nodes) == 46 and len(stale_tries) == 1
             and len(stale_phase_tries) == 1 and bool(stale_phase_tries[0].finalbody)
             and len(stale_run_calls) == 1
             and any(keyword.arg == "check" and isinstance(keyword.value, ast.Constant)
@@ -4173,7 +4266,9 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
                     "44b3ded67385ff441f98244bb00be423aa246c927deac1b14cc55272f90e71c1",
                     "b9b2ed1b8a384d28e3e44a3de9edaa0e6c2b803d369106985def5dbd37b78ef5",
                     "096540731117a03c72bef00ab0ba0a4ad3668e9f27e631637468b1f8f8872658",
-                    "f621abbcb669f1170e20ecda304ea37810013d467abdbeee123c5766c6a1295b"},
+                     "f621abbcb669f1170e20ecda304ea37810013d467abdbeee123c5766c6a1295b",
+                     "f373dac7efd8e4c82403c9b1fd0c9bd8bd6e3129c77514bda5948e008941999e",
+                     "20c79e55ce002919f44642434a25b8e1eb9e20242cc36feb10b31b4478e8a7fc"},
             "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
 
     persistent_loops = []
@@ -4797,7 +4892,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "ea66f5aa464a3d284a179e2aa3e43b68098f6cd1d58b579559ca87e8338b7f64",
+            == "4503beaed9bf17b0811ee17716f59a659427ac4d869d521314d34fd35fde821b",
             "diagnostic fixture source snapshot changed")
 
 
@@ -5131,8 +5226,11 @@ def verify_supervisor_mutations(
             '    if not control_group:\n        fail("unit control group path is missing")',
             '    if not control_group:\n        return []')),
         ("client recorded cgroup cleared on not-found", replace_once(client,
-            '    if state.get("LoadState") == "not-found":\n        return\n    control_group = state.get("ControlGroup")',
-            '    if state.get("LoadState") == "not-found":\n        RECORDED_CGROUP.clear()\n        return\n    control_group = state.get("ControlGroup")')),
+            '    control_group = state.get("ControlGroup")\n'
+            '    if state.get("LoadState") == "not-found" and not control_group:\n        return',
+            '    control_group = state.get("ControlGroup")\n'
+            '    if state.get("LoadState") == "not-found" and not control_group:\n'
+            '        RECORDED_CGROUP.clear()\n        return')),
         ("client loaded cgroup not retained", replace_once(client,
             '        RECORDED_CGROUP.append(control_group)', '        pass')),
         ("client recorded cgroup overwritten", replace_once(client,
@@ -5533,20 +5631,41 @@ def verify_supervisor_mutations(
             '    if state.get("LoadState") != "not-found":\n        fail("fixed verification unit is not explicitly absent: "\n             f"{sanitized_state(state)}")',
             '    if False:\n        fail("fixed verification unit is not explicitly absent: "\n             f"{sanitized_state(state)}")')),
         ("prelaunch fixed cgroups unchecked", replace_once(client,
-            '    assert_fixed_cgroups_empty("prelaunch")\n    if state.get("LoadState") != "not-found":',
-            '    if state.get("LoadState") != "not-found":')),
-        ("prelaunch loaded cgroup not retained", replace_once(client,
+            '    retain_control_group(state)\n    assert_fixed_cgroups_empty("prelaunch")',
+            '    retain_control_group(state)')),
+        ("prelaunch explicit-absence cgroup not retained", replace_once(client,
             '    retain_control_group(state)\n    assert_fixed_cgroups_empty("prelaunch")',
             '    assert_fixed_cgroups_empty("prelaunch")')),
-        ("prelaunch loaded rejection precedes cgroup evidence", replace_once(client,
-            '    assert_fixed_cgroups_empty("prelaunch")\n'
-            '    if state.get("LoadState") != "not-found":\n'
-            '        fail("fixed verification unit is not explicitly absent: "\n'
-            '             f"{sanitized_state(state)}")',
+        ("prelaunch retain restored before LoadState", replace_once(client,
             '    if state.get("LoadState") != "not-found":\n'
             '        fail("fixed verification unit is not explicitly absent: "\n'
             '             f"{sanitized_state(state)}")\n'
-            '    assert_fixed_cgroups_empty("prelaunch")')),
+            '    retain_control_group(state)',
+            '    retain_control_group(state)\n'
+            '    if state.get("LoadState") != "not-found":\n'
+            '        fail("fixed verification unit is not explicitly absent: "\n'
+            '             f"{sanitized_state(state)}")')),
+        ("prelaunch property read retains before assertion", replace_once(client,
+            '                                 context="prelaunch", retain=False)',
+            '                                 context="prelaunch", retain=True)')),
+        ("prelaunch retention exception omitted", replace_once(client,
+            '                                 context="prelaunch", retain=False)',
+            '                                 context="prelaunch")')),
+        ("non-prelaunch retention default disabled", replace_once(client,
+            'def unit_properties(phase, *names, context="show", retain=True):',
+            'def unit_properties(phase, *names, context="show", retain=False):')),
+        ("required observed cgroup retention omitted", replace_once(client,
+            '            if retain and "ControlGroup" in requested:',
+            '            if False and "ControlGroup" in requested:')),
+        ("explicit absence empty cgroup treated as invalid", replace_once(client,
+            '    if state.get("LoadState") == "not-found" and not control_group:\n        return',
+            '    if state.get("LoadState") == "not-found" and control_group is None:\n        return')),
+        ("loaded empty cgroup rejected at wrong layer", replace_once(client,
+            '    if state.get("LoadState") == "not-found" and not control_group:',
+            '    if not control_group:')),
+        ("explicit absence nonempty cgroup validation weakened", replace_once(client,
+            '    if state.get("LoadState") == "not-found" and not control_group:',
+            '    if state.get("LoadState") == "not-found":')),
         ("terminal recovery uses fast supervisor", replace_once(client,
             '        supervisor_mode = ""\n    elif (requested_mode.startswith("client-cleanup-fault-")',
             '        supervisor_mode = "fast-success"\n    elif (requested_mode.startswith("client-cleanup-fault-")')),
@@ -5620,8 +5739,8 @@ def verify_supervisor_mutations(
             '            successful = successful_terminal_state(current)',
             '            successful = current.get("Result") == "success"')),
         ("duplicate divergent terminal helper", replace_once(client,
-            '\n\ndef unit_properties(phase, *names, context="show"):',
-            '\n\ndef successful_terminal_state(state):\n    return True\n\n\ndef unit_properties(*names, context="show"):' )),
+            '\n\ndef unit_properties(phase, *names, context="show", retain=True):',
+            '\n\ndef successful_terminal_state(state):\n    return True\n\n\ndef unit_properties(*names, context="show", retain=True):' )),
         ("journal not invocation scoped", client.replace('f"_SYSTEMD_INVOCATION_ID={invocation}"', '"--since=today"')),
         ("successful cgroup unchecked", replace_once(client,
             '            assert_fixed_cgroups_empty("work")',
@@ -5677,6 +5796,9 @@ def verify_supervisor_mutations(
         ("unit not reset", replace_once(client, '            retry_owned_command(invocation, nonce, service_command, "reset", "reset-failed")', '            pass')),
         ("unit unload not awaited", replace_once(client,
             '            wait_unloaded(invocation, nonce, service_command)', '            pass')),
+        ("loaded empty terminal teardown returns early", replace_once(client,
+            '            if not occupants:\n                break',
+            '            if not occupants:\n                return')),
         ("teardown early not-found cgroups unchecked", replace_once(client,
             '    if state.get("LoadState") == "not-found":\n        assert_fixed_cgroups_empty("teardown")\n        return\n    kill_sent = False',
             '    if state.get("LoadState") == "not-found":\n        return\n    kill_sent = False')),
@@ -6422,13 +6544,14 @@ def verify_supervisor_mutations(
         ("containment subprocess wait unbounded", replace_once(containment,
             '    kwargs.setdefault("timeout", 18 * 60)', '    pass')),
         ("stale loaded client success accepted", replace_once(containment,
-            '    if rejected.returncode == 0 or "not explicitly absent" not in rejected.stderr:',
+            '        if not stale_client_class["expected_rejection"]:',
             '    if False:')),
         ("stale loaded identity change accepted", replace_once(containment,
-            '        if not stale_terminal_matches(\n'
+            '        stale_identity_unchanged = stale_terminal_matches(\n'
             '                stale_after_client, stale_signature, stale_main_pid,\n'
-            '                cgroup_pids(stale_after_client.get("ControlGroup", ""), "stale-attestation")):',
-            '        if False:')),
+            '                cgroup_pids(stale_after_client.get("ControlGroup", ""), "stale-attestation"))\n'
+            '        if not stale_identity_unchanged:',
+            '        stale_identity_unchanged = True\n        if False:')),
         ("stale live normalized identity omitted", replace_once(containment,
             '                or not launch_identity_matches(stale_observed, stale_signature)\n',
             '                or False\n')),
@@ -6584,9 +6707,57 @@ def verify_supervisor_mutations(
         ("stale mismatched identity cleanup allowed", replace_once(containment,
             '            if stale_signature is None or not launch_identity_matches(partial, stale_signature):',
             '            if False:')),
-        ("stale diagnostic launch stderr exposed", replace_once(containment,
-            '             f"launch_stderr_present={bool(stale_launch_stderr)}; "',
-            '             f"launch_stderr={stale_launch_stderr}; "')),
+        ("stale acceptance ignores zero return", replace_once(containment,
+            '    accepted = result_available and (returncode == 0 or success_marker)',
+            '    accepted = result_available and success_marker')),
+        ("stale acceptance ignores success marker", replace_once(containment,
+            '    accepted = result_available and (returncode == 0 or success_marker)',
+            '    accepted = result_available and returncode == 0')),
+        ("stale unavailable result treated as available", replace_once(containment,
+            '    result_available = attempted and type(returncode) is int',
+            '    result_available = attempted')),
+        ("stale attempted evidence omitted", replace_once(containment,
+            '        "attempted": bool(attempted),', '        "attempted": True,')),
+        ("stale expected rejection uses substring", replace_once(containment,
+            '        and stderr == expected_stderr)',
+            '        and expected_stderr in stderr)')),
+        ("stale expected rejection accepts a changed suffix", replace_once(containment,
+            '        and stderr == expected_stderr)',
+            '        and stderr.startswith(STALE_REJECTION_PREFIX))')),
+        ("stale wrong reason collapsed", replace_once(containment,
+            '        "wrong_reason": (result_available and returncode != 0\n'
+            '                         and not success_marker and not expected_rejection),',
+            '        "wrong_reason": False,')),
+        ("stale unavailable result classified as wrong reason", replace_once(containment,
+            '        "wrong_reason": (result_available and returncode != 0',
+            '        "wrong_reason": (attempted and returncode != 0')),
+        ("stale diagnostic leading scenario omitted", replace_once(containment,
+            '        f"stale fixed-unit fixture failed: scenario=stale;failure_category={failure_category};"',
+            '        f"stale fixed-unit fixture failed: failure_category={failure_category};"')),
+        ("stale diagnostic leading outcome order changed", replace_once(containment,
+            '        f"stale fixed-unit fixture failed: scenario=stale;failure_category={failure_category};"',
+            '        f"stale fixed-unit fixture failed: failure_category={failure_category};scenario=stale;"')),
+        ("stale diagnostic attempted field omitted", replace_once(containment,
+            '        f"attempted={diagnostic_bit(classification[\'attempted\'])};"', '')),
+        ("stale diagnostic result availability omitted", replace_once(containment,
+            '        f"result_available={diagnostic_bit(classification[\'result_available\'])};"', '')),
+        ("stale diagnostic cleanup field omitted", replace_once(containment,
+            '        f"cleanup_attempted={diagnostic_bit(cleanup_attempted)};"', '')),
+        ("stale diagnostic bound omitted", replace_once(containment,
+            '    if len("containment-test: \'\'\\n") + len(message) > DIAGNOSTIC_TEXT_LIMIT:',
+            '    if False:')),
+        ("stale diagnostic bound ignores outer rendering", replace_once(containment,
+            '    if len("containment-test: \'\'\\n") + len(message) > DIAGNOSTIC_TEXT_LIMIT:',
+            '    if len(message) > DIAGNOSTIC_TEXT_LIMIT:')),
+        ("stale diagnostic flags made verbose", replace_once(containment,
+            '    return "1" if bool(value) else "0"',
+            '    return str(bool(value))')),
+        ("stale diagnostic raw state leaked", replace_once(containment,
+            '    return message\n\n\ndef bounded_sanitized_repr',
+            '    return message + str(stale_observed)\n\n\ndef bounded_sanitized_repr')),
+        ("stale diagnostic nested representation restored", replace_once(containment,
+            '    return message\n\n\ndef bounded_sanitized_repr',
+            '    return repr(message)\n\n\ndef bounded_sanitized_repr')),
         ("stale signal paths not reset before launch", replace_once(containment,
             '        reset_paths("stale-setup", stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",\n'
             '                    stale_release, stale_release_ack, stale_release_ack + ".new")\n'
@@ -6641,20 +6812,21 @@ def verify_supervisor_mutations(
         ("stale release acknowledgment wait omitted", replace_once(containment,
             '        wait_path("stale-attestation", stale_release_ack, timeout=30)',
             '        pass')),
+        ("stale client attempt evidence omitted", replace_once(containment,
+            '        stale_client_attempted = True\n        rejected = run(',
+            '        rejected = run(')),
+        ("stale exact expected diagnostic omitted", replace_once(containment,
+            '        stale_expected_stderr = stale_expected_rejection(stale_observed)',
+            '        stale_expected_stderr = STALE_REJECTION_PREFIX')),
         ("stale client stdout capture omitted", replace_once(containment,
             '        stale_rejected_stdout = rejected.stdout',
             '        stale_rejected_stdout = ""')),
-        ("stale client diagnostic return omitted", replace_once(containment,
-            '             f"client_return={stale_rejected_return}; "',
-            '             "client_return=omitted; "')),
-        ("stale client diagnostic streams exposed", replace_once(containment,
-            '             f"client_stdout_present={bool(stale_rejected_stdout)}; "\n'
-            '             f"client_stderr_present={bool(stale_rejected_stderr)}; "',
-            '             f"client_stdout={stale_rejected_stdout}; "\n'
-            '             f"client_stderr={stale_rejected_stderr}; "')),
-        ("stale after-client state substituted", replace_once(containment,
-            '             f"after_client={sanitized_state(stale_after_client)}; "',
-            '             f"after_client={sanitized_state(stale_observed)}; "')),
+        ("stale wrong-reason category hidden", replace_once(containment,
+            '        elif stale_client_class["wrong_reason"]:\n            failure_category = "wrong-reason"',
+            '        elif stale_client_class["wrong_reason"]:\n            failure_category = "fixture-error"')),
+        ("stale diagnostic call omits cleanup finality", replace_once(containment,
+            '            bool(stale_rejected_stderr), cleanup_error))',
+            '            bool(stale_rejected_stderr), False))')),
         ("stale ownership mismatch made transient", replace_once(containment,
             '                stale_identity_error = bounded_sanitized_repr(\n'
             '                    f"ownership={sanitized_state(partial)}")',
@@ -6776,7 +6948,9 @@ def verify_supervisor_mutations(
             '    if not valid_invocation or not launch_identity_matches(state, signature):',
             '    if not valid_invocation:')),
         ("safe state categories omitted", replace_once(containment,
+            'def sanitized_state(state):\n    if state is None:\n        return "explicit-absence"\n'
             '    safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",',
+            'def sanitized_state(state):\n    if state is None:\n        return "explicit-absence"\n'
             '    safe_names = ("InvocationID", "ActiveState", "SubState", "ControlGroup",')),
         ("persistent InvocationID comparison omitted", replace_once(containment,
             '    valid_invocation = (len(invocation) == 32\n                        and all(character in "0123456789abcdef" for character in invocation))',
