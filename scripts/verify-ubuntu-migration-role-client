@@ -2,6 +2,8 @@
 """Launch and attest the fixed migration-role verification service."""
 
 import fcntl
+import errno
+import functools
 import os
 import select
 import secrets
@@ -31,6 +33,20 @@ JOURNAL_TIMEOUT = 5
 JOURNAL_BYTE_LIMIT = 256
 JOURNAL_LINE_LIMIT = 3
 JOURNAL_QUERY_LINE_LIMIT = 4
+CGROUP_SNAPSHOT_ATTEMPTS = 4
+DIAGNOSTIC_PHASES = (
+    "final-close", "journal", "launch", "ownership-read", "prelaunch", "source-publication",
+    "startup", "teardown", "transaction-lock", "uncategorized", "unload", "work",
+)
+DIAGNOSTIC_OPERATIONS = (
+    "chdir", "chmod", "close", "fdopen", "flock", "flush", "fsync", "kill", "mkdir", "open",
+    "popen", "read", "replace", "run", "seek", "set-blocking", "stat", "truncate",
+    "unknown", "unlink", "wait", "walk", "write",
+)
+DIAGNOSTIC_RESOURCES = (
+    "cgroup", "counter", "directory", "evidence", "helper", "journal", "lock", "marker",
+    "process", "runtime-root", "unknown",
+)
 SERVICE_PROPERTIES = {
     "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
     "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
@@ -84,13 +100,118 @@ def fail(message):
     raise RuntimeError(message)
 
 
+def evidence_failure(phase, operation, resource_class, error):
+    if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS
+            or resource_class not in DIAGNOSTIC_RESOURCES):
+        phase, operation, resource_class = "uncategorized", "unknown", "unknown"
+    number = error.errno if isinstance(error, OSError) and type(error.errno) is int else errno.EIO
+    return RuntimeError(
+        f"phase={phase} operation={operation} resource={resource_class} errno={number}")
+
+
+def os_call(phase, operation, resource_class, function, *args, **kwargs):
+    try:
+        return function(*args, **kwargs)
+    except OSError as error:
+        raise evidence_failure(phase, operation, resource_class, error) from None
+
+
+def raise_walk_error(error):
+    raise error
+
+
+def cgroup_walk_error(phase, error):
+    if isinstance(error, FileNotFoundError):
+        raise error
+    raise evidence_failure(phase, "walk", "cgroup", error) from None
+
+
+def cgroup_stat(phase, path, resource_class="cgroup"):
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise evidence_failure(phase, "stat", resource_class, error) from None
+
+
+def cgroup_walk(phase, root):
+    try:
+        yield from os.walk(
+            root, topdown=True, onerror=functools.partial(cgroup_walk_error, phase),
+            followlinks=False)
+    except (FileNotFoundError, RuntimeError):
+        raise
+    except OSError as error:
+        raise evidence_failure(phase, "walk", "cgroup", error) from None
+
+
+def cgroup_open(phase, path):
+    try:
+        return open(path, encoding="ascii")
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise evidence_failure(phase, "open", "cgroup", error) from None
+
+
+def cgroup_fstat(phase, source):
+    try:
+        return os.fstat(source.fileno())
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise evidence_failure(phase, "stat", "evidence", error) from None
+
+
+def cgroup_read(phase, source):
+    try:
+        return source.read()
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise evidence_failure(phase, "read", "evidence", error) from None
+
+
+def cgroup_close(phase, source):
+    try:
+        source.close()
+    except OSError as error:
+        raise evidence_failure(phase, "close", "evidence", error) from None
+
+
+def marker_exists(path):
+    try:
+        os.stat(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise evidence_failure("work", "stat", "marker", error) from None
+
+
+def open_client_lock():
+    return os_call("startup", "open", "lock", os.open,
+                   RUN + "/client.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+
+
+def lock_client(descriptor):
+    os_call("startup", "flock", "lock", fcntl.flock,
+            descriptor, fcntl.LOCK_EX)
+
+
+def close_client_lock(descriptor):
+    os_call("final-close", "close", "lock", os.close, descriptor)
+
+
 def sanitized_diagnostic(value, nonce):
     if isinstance(value, subprocess.TimeoutExpired):
         text = "subprocess timed out"
     elif isinstance(value, subprocess.CalledProcessError):
         text = f"subprocess failed with status {value.returncode}"
     elif isinstance(value, OSError):
-        text = f"operating system error errno={value.errno}"
+        number = value.errno if type(value.errno) is int else errno.EIO
+        text = f"phase=uncategorized operation=unknown resource=unknown errno={number}"
     else:
         text = str(value)
     if nonce:
@@ -119,6 +240,12 @@ def sanitized_state(state):
     return {name: state.get(name) for name in safe_names if name in state}
 
 
+def top_level_diagnostic(error):
+    if isinstance(error, OSError):
+        return str(evidence_failure("uncategorized", "unknown", "unknown", error))
+    return sanitized_diagnostic(error, None)
+
+
 def interrupted(signum, _frame):
     CANCELLED.append(signum)
 
@@ -128,7 +255,7 @@ def bounded_deadline(seconds):
     return min(deadline, COMMAND_DEADLINE) if COMMAND_DEADLINE is not None else deadline
 
 
-def command(argv, *, check=True, stdout=subprocess.PIPE, timeout=30):
+def command(argv, phase, *, check=True, stdout=subprocess.PIPE, timeout=30):
     if COMMAND_DEADLINE is not None:
         remaining = COMMAND_DEADLINE - time.monotonic()
         if remaining <= 0:
@@ -144,6 +271,8 @@ def command(argv, *, check=True, stdout=subprocess.PIPE, timeout=30):
         if CLEANUP_ACTIVE and time.monotonic() >= COMMAND_DEADLINE:
             raise RuntimeError("absolute client cleanup deadline exhausted") from None
         raise RuntimeError("client subprocess timed out") from None
+    except OSError as error:
+        raise evidence_failure(phase, "run", "process", error) from None
 
 
 def parse_journal_evidence(payload):
@@ -179,19 +308,22 @@ def bounded_journal_evidence(invocation):
         process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
     except OSError as error:
-        fail("journal evidence query could not start: " + sanitized_diagnostic(error, None))
+        raise evidence_failure("journal", "popen", "journal", error) from None
     payload = bytearray()
     try:
-        os.set_blocking(process.stdout.fileno(), False)
+        os_call("journal", "set-blocking", "journal", os.set_blocking,
+                process.stdout.fileno(), False)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 fail("journal evidence query timed out")
-            readable, _writable, _exceptional = select.select(
+            readable, _writable, _exceptional = os_call(
+                "journal", "read", "journal", select.select,
                 (process.stdout.fileno(),), (), (), remaining)
             if not readable:
                 fail("journal evidence query timed out")
-            chunk = os.read(process.stdout.fileno(), JOURNAL_BYTE_LIMIT + 1 - len(payload))
+            chunk = os_call("journal", "read", "journal", os.read, process.stdout.fileno(),
+                            JOURNAL_BYTE_LIMIT + 1 - len(payload))
             if not chunk:
                 break
             payload.extend(chunk)
@@ -201,36 +333,50 @@ def bounded_journal_evidence(invocation):
         if remaining <= 0:
             fail("journal evidence query timed out")
         try:
-            status = process.wait(timeout=remaining)
+            status = os_call("journal", "wait", "journal", process.wait, timeout=remaining)
         except subprocess.TimeoutExpired:
             fail("journal evidence query timed out")
         if status:
             fail(f"journal evidence query failed with status {status}")
     finally:
         if process.poll() is None:
-            process.kill()
+            os_call("journal", "kill", "journal", process.kill)
             try:
-                process.wait(timeout=1)
+                os_call("journal", "wait", "journal", process.wait, timeout=1)
             except subprocess.TimeoutExpired:
                 pass
-        process.stdout.close()
+        os_call("journal", "close", "journal", process.stdout.close)
     return parse_journal_evidence(bytes(payload))
 
 
 def record_counter(name):
     path = f"{RUN}/{REQUESTED_MODE}.{name}"
+    descriptor = None
+    counter = None
     try:
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(descriptor, "r+", encoding="ascii") as counter:
-            value = counter.read().strip()
-            counter.seek(0)
-            counter.truncate()
-            counter.write(str((int(value) if value else 0) + 1) + "\n")
-            counter.flush()
-            os.fsync(counter.fileno())
-    except (OSError, ValueError) as error:
-        fail("could not record command interception evidence: "
-             + sanitized_diagnostic(error, None))
+        descriptor = os_call("work", "open", "evidence", os.open, path,
+                             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            counter = os_call("work", "fdopen", "counter", os.fdopen,
+                              descriptor, "r+", encoding="ascii")
+        except BaseException:
+            os_call("work", "close", "counter", os.close, descriptor)
+            raise
+        descriptor = None
+        value = os_call("work", "read", "evidence", counter.read).strip()
+        os_call("work", "seek", "evidence", counter.seek, 0)
+        os_call("work", "truncate", "evidence", counter.truncate)
+        os_call("work", "write", "evidence", counter.write,
+                str((int(value) if value else 0) + 1) + "\n")
+        os_call("work", "flush", "evidence", counter.flush)
+        os_call("work", "fsync", "evidence", os.fsync, counter.fileno())
+    except OSError as error:
+        raise evidence_failure("work", "write", "evidence", error) from None
+    except ValueError:
+        fail("command interception evidence was malformed")
+    finally:
+        if counter is not None:
+            os_call("work", "close", "evidence", counter.close)
 
 
 def command_path(name):
@@ -264,7 +410,7 @@ def command_path(name):
             durable_marker(REQUESTED_MODE + ".blocked")
             release = f"{RUN}/{REQUESTED_MODE}.release"
             deadline = bounded_deadline(30)
-            while not os.path.exists(release):
+            while not marker_exists(release):
                 if time.monotonic() >= deadline:
                     fail("timed out awaiting release of intercepted stop command")
                 time.sleep(ACTION_RETRY_BACKOFF)
@@ -273,7 +419,7 @@ def command_path(name):
             durable_marker(REQUESTED_MODE + ".handoff.ready")
             release = f"{RUN}/{REQUESTED_MODE}.handoff.release"
             deadline = bounded_deadline(30)
-            while not os.path.exists(release):
+            while not marker_exists(release):
                 if time.monotonic() >= deadline:
                     fail("timed out awaiting persistent-fault teardown handoff")
                 time.sleep(0.05)
@@ -323,7 +469,8 @@ def unit_properties(*names, context="show"):
             if remaining <= 0:
                 fail("unit property lookup deadline exhausted")
             result = command(("/usr/bin/systemctl", "show", UNIT,
-                              *(f"--property={name}" for name in requested)), check=False,
+                              *(f"--property={name}" for name in requested)),
+                             "ownership-read", check=False,
                              timeout=remaining)
             values = parse_unit_properties(result, requested)
             if errors:
@@ -338,23 +485,101 @@ def unit_properties(*names, context="show"):
     fail("unit properties remain unknown: " + sanitized_diagnostic(detail, None))
 
 
-def cgroup_pids(control_group):
+def cgroup_pids(control_group, phase):
     if not control_group:
         return []
     root = "/sys/fs/cgroup" + control_group
-    try:
-        root_stat = os.lstat(root)
-    except FileNotFoundError:
-        return []
-    if not stat.S_ISDIR(root_stat.st_mode):
-        fail("unit control group is not a directory")
-    found = []
-    for directory, directories, files in os.walk(root, topdown=True, followlinks=False):
-        directories[:] = [name for name in directories if not os.path.islink(os.path.join(directory, name))]
-        if "cgroup.procs" in files:
-            with open(os.path.join(directory, "cgroup.procs"), encoding="ascii") as source:
-                found.extend(int(value) for value in source.read().split())
-    return sorted(set(found))
+    previous = None
+    root_anchor = None
+    topology_anchor = None
+    previous_absent = False
+    residue_seen = False
+    for _attempt in range(CGROUP_SNAPSHOT_ATTEMPTS):
+        try:
+            root_stat = cgroup_stat(phase, root)
+            previous_absent = False
+            if not stat.S_ISDIR(root_stat.st_mode):
+                fail("unit control group is not a directory")
+            root_identity = (root_stat.st_dev, root_stat.st_ino)
+            if root_anchor is None:
+                root_anchor = root_identity
+            elif root_identity != root_anchor:
+                raise evidence_failure(
+                    phase, "stat", "evidence", OSError(errno.ESTALE, "reused"))
+            found = []
+            identities = []
+
+            for directory, directories, files in cgroup_walk(phase, root):
+                directory_stat = cgroup_stat(phase, directory)
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    fail("unit control group traversal changed type")
+                relative = os.path.relpath(directory, root)
+                identities.append((relative, directory, directory_stat.st_dev, directory_stat.st_ino))
+                kept = []
+                for name in directories:
+                    child = os.path.join(directory, name)
+                    child_stat = cgroup_stat(phase, child)
+                    if stat.S_ISDIR(child_stat.st_mode):
+                        kept.append(name)
+                directories[:] = kept
+                if "cgroup.procs" in files:
+                    path = os.path.join(directory, "cgroup.procs")
+                    source = cgroup_open(phase, path)
+                    try:
+                        before = cgroup_fstat(phase, source)
+                        values = cgroup_read(phase, source).split()
+                        after = cgroup_fstat(phase, source)
+                    finally:
+                        cgroup_close(phase, source)
+                    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                        raise evidence_failure(
+                            phase, "stat", "evidence", OSError(errno.ESTALE, "reused"))
+                    parsed = [int(value) for value in values]
+                    found.extend(parsed)
+                    residue_seen = residue_seen or bool(parsed)
+            after_root = cgroup_stat(phase, root)
+            if not stat.S_ISDIR(after_root.st_mode):
+                fail("unit control group changed type")
+            if (after_root.st_dev, after_root.st_ino) != root_anchor:
+                raise evidence_failure(
+                    phase, "stat", "evidence", OSError(errno.ESTALE, "reused"))
+            canonical = tuple(sorted((relative, device, inode)
+                                     for relative, _directory, device, inode in identities))
+            if topology_anchor is None:
+                topology_anchor = canonical
+            elif canonical != topology_anchor:
+                raise evidence_failure(
+                    phase, "stat", "evidence", OSError(errno.ESTALE, "topology changed"))
+            for _relative, directory, device, inode in identities:
+                current = cgroup_stat(phase, directory)
+                if not stat.S_ISDIR(current.st_mode):
+                    fail("unit control group traversal changed type")
+                if (current.st_dev, current.st_ino) != (device, inode):
+                    raise evidence_failure(
+                        phase, "stat", "evidence", OSError(errno.ESTALE, "reused"))
+            snapshot = (root_identity, canonical, tuple(sorted(set(found))))
+        except FileNotFoundError:
+            try:
+                rechecked = cgroup_stat(phase, root)
+            except FileNotFoundError:
+                if not residue_seen and previous_absent:
+                    return []
+                previous_absent = True
+                continue
+            except OSError as error:
+                raise evidence_failure(phase, "stat", "cgroup", error) from None
+            if not stat.S_ISDIR(rechecked.st_mode):
+                fail("unit control group changed type")
+            if root_anchor is not None and (rechecked.st_dev, rechecked.st_ino) != root_anchor:
+                raise evidence_failure(
+                    phase, "stat", "evidence", OSError(errno.ESTALE, "reused"))
+            continue
+        except ValueError:
+            fail("unit control group contained malformed process evidence")
+        if snapshot == previous and (not residue_seen or bool(snapshot[2])):
+            return list(snapshot[2])
+        previous = snapshot
+    raise evidence_failure(phase, "walk", "evidence", OSError(errno.EAGAIN, "unstable"))
 
 
 def exec_start_argv(value):
@@ -405,7 +630,7 @@ def owned_command(invocation, nonce, service_command, *arguments):
     if state.get("LoadState") == "not-found":
         return False
     command_path("reset" if arguments[0] == "reset-failed" else arguments[0])
-    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,
+    result = command(("/usr/bin/systemctl", *arguments, UNIT), "teardown", check=False,
                      timeout=ACTION_TIMEOUTS[arguments[0]])
     if result.returncode:
         fail(f"owned unit {arguments[0]} command failed with status {result.returncode}")
@@ -414,17 +639,19 @@ def owned_command(invocation, nonce, service_command, *arguments):
 
 def durable_marker(name):
     path = f"{RUN}/{name}"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    descriptor = os_call("work", "open", "marker", os.open, path,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(descriptor, b"ready\n")
-        os.fsync(descriptor)
+        os_call("work", "write", "marker", os.write, descriptor, b"ready\n")
+        os_call("work", "fsync", "marker", os.fsync, descriptor)
     finally:
-        os.close(descriptor)
-    directory = os.open(RUN, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os_call("work", "close", "marker", os.close, descriptor)
+    directory = os_call("work", "open", "directory", os.open, RUN,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        os.fsync(directory)
+        os_call("work", "fsync", "directory", os.fsync, directory)
     finally:
-        os.close(directory)
+        os_call("work", "close", "directory", os.close, directory)
 
 
 def exhaust_work_budget(boundary):
@@ -500,7 +727,7 @@ def teardown_owned(invocation, nonce, service_command):
             break
         if state.get("LoadState") == "not-found":
             break
-        occupants = cgroup_pids(state.get("ControlGroup", ""))
+        occupants = cgroup_pids(state.get("ControlGroup", ""), "teardown")
         if occupants and not kill_sent:
             try:
                 retry_owned_command(invocation, nonce, service_command,
@@ -556,7 +783,7 @@ def client_pause(name):
     release = f"{RUN}/{name}.release"
     durable_marker(name + ".ready")
     deadline = bounded_deadline(60)
-    while not os.path.exists(release):
+    while not marker_exists(release):
         if time.monotonic() >= deadline:
             fail(f"timed out awaiting {release}")
         time.sleep(0.05)
@@ -568,36 +795,42 @@ def valid_invocation(value):
 
 def publish_supervisor(repo, commit):
     resolved = command(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo,
-                        "rev-parse", "--verify", f"{commit}^{{commit}}")).stdout.strip()
+                        "rev-parse", "--verify", f"{commit}^{{commit}}"),
+                       "source-publication").stdout.strip()
     if resolved != commit:
         fail("candidate commit identity mismatch")
     source = command(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo,
-                      "show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor")).stdout.encode()
+                      "show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"),
+                     "source-publication").stdout.encode()
     temporary = PROGRAM + ".new"
     try:
         os.unlink(temporary)
     except FileNotFoundError:
         pass
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+    except OSError as error:
+        raise evidence_failure("source-publication", "unlink", "helper", error) from None
+    descriptor = os_call("source-publication", "open", "helper", os.open, temporary,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
     try:
-        os.write(descriptor, source)
-        os.fchmod(descriptor, 0o500)
-        os.fsync(descriptor)
+        os_call("source-publication", "write", "helper", os.write, descriptor, source)
+        os_call("source-publication", "chmod", "helper", os.fchmod, descriptor, 0o500)
+        os_call("source-publication", "fsync", "helper", os.fsync, descriptor)
     finally:
-        os.close(descriptor)
-    os.replace(temporary, PROGRAM)
-    directory = os.open(RUN, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os_call("source-publication", "close", "helper", os.close, descriptor)
+    os_call("source-publication", "replace", "helper", os.replace, temporary, PROGRAM)
+    directory = os_call("source-publication", "open", "directory", os.open, RUN,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        os.fsync(directory)
+        os_call("source-publication", "fsync", "directory", os.fsync, directory)
     finally:
-        os.close(directory)
+        os_call("source-publication", "close", "directory", os.close, directory)
 
 
 def main():
     global CLEANUP_ACTIVE, COMMAND_DEADLINE, REQUESTED_MODE
     if os.geteuid() != 0 or len(sys.argv) not in (4, 5):
         fail("usage: client REPOSITORY CURRENT_COMMIT ABSOLUTE_GO [FAULT_POINT]")
-    os.chdir("/")
+    os_call("startup", "chdir", "runtime-root", os.chdir, "/")
     os.umask(0o077)
     for signum in CANCELLATION_SIGNALS:
         signal.signal(signum, interrupted)
@@ -625,16 +858,16 @@ def main():
         supervisor_mode = "fast-success" if requested_mode.endswith("-journal") else "fast-hold"
     elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
         supervisor_mode = "run-root:after-intent"
-    os.makedirs(RUN, mode=0o700, exist_ok=True)
-    run_stat = os.lstat(RUN)
+    os_call("startup", "mkdir", "runtime-root", os.makedirs, RUN, mode=0o700, exist_ok=True)
+    run_stat = os_call("startup", "stat", "runtime-root", os.lstat, RUN)
     if (not stat.S_ISDIR(run_stat.st_mode) or run_stat.st_uid != 0 or run_stat.st_gid != 0
             or stat.S_IMODE(run_stat.st_mode) != 0o700):
         fail(f"unsafe {RUN}")
-    client_lock = os.open(RUN + "/client.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    client_lock = open_client_lock()
     try:
         if requested_mode == "client-terminal-race-b":
             durable_marker("client-terminal-race-b.attempting")
-        fcntl.flock(client_lock, fcntl.LOCK_EX)
+        lock_client(client_lock)
         total_deadline = time.monotonic() + TOTAL_BUDGET
         work_deadline = total_deadline - CLEANUP_RESERVE
         COMMAND_DEADLINE = work_deadline
@@ -654,7 +887,7 @@ def main():
         if before.get("LoadState") != "not-found":
             fail("fixed verification unit is not explicitly absent: "
                  f"{sanitized_state(before)}")
-        occupants = cgroup_pids(before.get("ControlGroup", ""))
+        occupants = cgroup_pids(before.get("ControlGroup", ""), "prelaunch")
         if occupants:
             fail(f"verification unit control group is not empty: {occupants}")
         publish_supervisor(repo, commit)
@@ -681,7 +914,7 @@ def main():
             previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
             try:
                 launch_attempted = True
-                launched = command(service_argv, check=False)
+                launched = command(service_argv, "launch", check=False)
                 if requested_mode == "client-work-budget-launch":
                     exhaust_work_budget("launch")
                 capture_error = None
@@ -771,7 +1004,7 @@ def main():
                 time.sleep(0.1)
                 owned_state(invocation, nonce, exec_argv)
                 journal_evidence = bounded_journal_evidence(invocation)
-            if cgroup_pids(current.get("ControlGroup", "")):
+            if cgroup_pids(current.get("ControlGroup", ""), "work"):
                 fail("successful invocation left control-group processes")
             result = 0
         except BaseException as error:
@@ -831,7 +1064,7 @@ def main():
         if requested_mode == "client-terminal-race-a":
             client_pause("client-terminal-race-a-unloaded")
     finally:
-        os.close(client_lock)
+        close_client_lock(client_lock)
     print(SUCCESS, flush=True)
     return result
 
@@ -840,5 +1073,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
-        print("verification-client: " + sanitized_diagnostic(error, None), file=sys.stderr)
+        print("verification-client: " + top_level_diagnostic(error), file=sys.stderr)
         raise SystemExit(1)

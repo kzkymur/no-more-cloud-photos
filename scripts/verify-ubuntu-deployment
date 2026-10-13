@@ -72,7 +72,7 @@ def verify_nonce_safe_diagnostics(client_path: pathlib.Path, containment_path: p
     try:
         subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(timeout)
         try:
-            client["command"](service_argv)
+            client["command"](service_argv, "launch")
         except RuntimeError as error:
             rendered = client["sanitized_diagnostic"](error, nonce)
         else:
@@ -787,10 +787,12 @@ def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
     # bypass this snapshot and must be rejected by the detailed inventories below.
     if enforce_snapshot:
         require(stable_source_digest(source)
-                == "b2ad8d86708468eb082cd9cacbf521ec3e8e69127473ff66879d35fbc2edea38",
+                == "158da2aaaba326386a40f30bfcfaf4ff995d4f2768f14b6831b6386fbb192ae1",
                 "client reviewed stable UTF-8/LF source snapshot changed")
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     expected_imports = ast.parse('''import fcntl
+import errno
+import functools
 import os
 import select
 import secrets
@@ -803,11 +805,73 @@ import time
 ''').body
     require([ast.dump(node) for node in imports] == [ast.dump(node) for node in expected_imports],
             "client imports must remain the reviewed closed module set")
+    require(literal_assignment(tree, "CGROUP_SNAPSHOT_ATTEMPTS") == 4
+            and literal_assignment(tree, "DIAGNOSTIC_PHASES") == (
+                "final-close", "journal", "launch", "ownership-read", "prelaunch",
+                "source-publication", "startup", "teardown", "transaction-lock",
+                "uncategorized", "unload", "work")
+            and literal_assignment(tree, "DIAGNOSTIC_OPERATIONS") == (
+                "chdir", "chmod", "close", "fdopen", "flock", "flush", "fsync", "kill", "mkdir", "open",
+                "popen", "read", "replace", "run", "seek", "set-blocking", "stat", "truncate",
+                "unknown", "unlink", "wait", "walk", "write")
+            and literal_assignment(tree, "DIAGNOSTIC_RESOURCES") == (
+                "cgroup", "counter", "directory", "evidence", "helper", "journal", "lock", "marker",
+                "process", "runtime-root", "unknown"),
+            "client closed diagnostic/cgroup constants changed")
+    require_exact_function(tree, "evidence_failure", '''def evidence_failure(phase, operation, resource_class, error):
+    if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS
+            or resource_class not in DIAGNOSTIC_RESOURCES):
+        phase, operation, resource_class = "uncategorized", "unknown", "unknown"
+    number = error.errno if isinstance(error, OSError) and type(error.errno) is int else errno.EIO
+    return RuntimeError(
+        f"phase={phase} operation={operation} resource={resource_class} errno={number}")
+''', "client OS evidence diagnostics must use only closed literal categories and numeric errno")
+    require_exact_function(tree, "top_level_diagnostic", '''def top_level_diagnostic(error):
+    if isinstance(error, OSError):
+        return str(evidence_failure("uncategorized", "unknown", "unknown", error))
+    return sanitized_diagnostic(error, None)
+''', "client top-level fallback must retain the exact uncategorized OSError alarm")
+    cgroup_source = ast.get_source_segment(source, named_function(tree, "cgroup_pids")) or ""
+    cgroup_contract = (
+        "for _attempt in range(CGROUP_SNAPSHOT_ATTEMPTS):",
+        "cgroup_walk(phase, root)", "before = cgroup_fstat(phase, source)",
+        "after = cgroup_fstat(phase, source)", "after_root = cgroup_stat(phase, root)",
+        "if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):",
+        "if root_anchor is None:", "elif root_identity != root_anchor:",
+        "if (after_root.st_dev, after_root.st_ino) != root_anchor:",
+        "if root_anchor is not None and (rechecked.st_dev, rechecked.st_ino) != root_anchor:",
+        "canonical = tuple(sorted((relative, device, inode)",
+        "for _relative, directory, device, inode in identities:",
+        "if (current.st_dev, current.st_ino) != (device, inode):",
+        "residue_seen = False", "parsed = [int(value) for value in values]",
+        "found.extend(parsed)", "residue_seen = residue_seen or bool(parsed)",
+        "if not residue_seen and previous_absent:",
+        'except ValueError:\n            fail("unit control group contained malformed process evidence")',
+        "if snapshot == previous and (not residue_seen or bool(snapshot[2])):",
+        'raise evidence_failure(phase, "walk", "evidence", OSError(errno.EAGAIN, "unstable"))',
+    )
+    require(all(cgroup_source.count(fragment) == 1 for fragment in cgroup_contract)
+            and cgroup_source.count("except FileNotFoundError:") == 2
+            and cgroup_source.count("if not stat.S_ISDIR(current.st_mode):") == 1
+            and cgroup_source.count("return []") == 2,
+            "client coherent cgroup snapshot/retry contract changed")
+    client_cgroup_boundaries = {
+        "cgroup_walk_error": '(phase, "walk", "cgroup", error)',
+        "cgroup_stat": '(phase, "stat", resource_class, error)',
+        "cgroup_walk": 'functools.partial(cgroup_walk_error, phase)',
+        "cgroup_open": '(phase, "open", "cgroup", error)',
+        "cgroup_fstat": '(phase, "stat", "evidence", error)',
+        "cgroup_read": '(phase, "read", "evidence", error)',
+        "cgroup_close": '(phase, "close", "evidence", error)',
+    }
+    require(all(fragment in (ast.get_source_segment(source, named_function(tree, name)) or "")
+                for name, fragment in client_cgroup_boundaries.items()),
+            "client cgroup boundaries lost exact closed operation labels")
     expected_guard = ast.parse('''if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
-        print("verification-client: " + sanitized_diagnostic(error, None), file=sys.stderr)
+        print("verification-client: " + top_level_diagnostic(error), file=sys.stderr)
         raise SystemExit(1)
 ''').body[0]
     guards = [node for node in tree.body if isinstance(node, ast.If)]
@@ -847,7 +911,8 @@ import time
     elif isinstance(value, subprocess.CalledProcessError):
         text = f"subprocess failed with status {value.returncode}"
     elif isinstance(value, OSError):
-        text = f"operating system error errno={value.errno}"
+        number = value.errno if type(value.errno) is int else errno.EIO
+        text = f"phase=uncategorized operation=unknown resource=unknown errno={number}"
     else:
         text = str(value)
     if nonce:
@@ -906,19 +971,22 @@ import time
         process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
     except OSError as error:
-        fail("journal evidence query could not start: " + sanitized_diagnostic(error, None))
+        raise evidence_failure("journal", "popen", "journal", error) from None
     payload = bytearray()
     try:
-        os.set_blocking(process.stdout.fileno(), False)
+        os_call("journal", "set-blocking", "journal", os.set_blocking,
+                process.stdout.fileno(), False)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 fail("journal evidence query timed out")
-            readable, _writable, _exceptional = select.select(
+            readable, _writable, _exceptional = os_call(
+                "journal", "read", "journal", select.select,
                 (process.stdout.fileno(),), (), (), remaining)
             if not readable:
                 fail("journal evidence query timed out")
-            chunk = os.read(process.stdout.fileno(), JOURNAL_BYTE_LIMIT + 1 - len(payload))
+            chunk = os_call("journal", "read", "journal", os.read, process.stdout.fileno(),
+                            JOURNAL_BYTE_LIMIT + 1 - len(payload))
             if not chunk:
                 break
             payload.extend(chunk)
@@ -928,19 +996,19 @@ import time
         if remaining <= 0:
             fail("journal evidence query timed out")
         try:
-            status = process.wait(timeout=remaining)
+            status = os_call("journal", "wait", "journal", process.wait, timeout=remaining)
         except subprocess.TimeoutExpired:
             fail("journal evidence query timed out")
         if status:
             fail(f"journal evidence query failed with status {status}")
     finally:
         if process.poll() is None:
-            process.kill()
+            os_call("journal", "kill", "journal", process.kill)
             try:
-                process.wait(timeout=1)
+                os_call("journal", "wait", "journal", process.wait, timeout=1)
             except subprocess.TimeoutExpired:
                 pass
-        process.stdout.close()
+        os_call("journal", "close", "journal", process.stdout.close)
     return parse_journal_evidence(bytes(payload))
 ''', "client journal acquisition must be byte/line/time bounded and status-only")
     early_print_calls = [
@@ -949,7 +1017,7 @@ import time
     ]
     early_expected_stdout = ast.parse("print(SUCCESS, flush=True)").body[0].value
     early_expected_stderr = ast.parse(
-        "print('verification-client: ' + sanitized_diagnostic(error, None), file=sys.stderr)"
+        "print('verification-client: ' + top_level_diagnostic(error), file=sys.stderr)"
     ).body[0].value
     require(len(early_print_calls) == 2
             and sorted(ast.dump(node) for node in early_print_calls)
@@ -1088,7 +1156,7 @@ import time
     deadline = time.monotonic() + seconds
     return min(deadline, COMMAND_DEADLINE) if COMMAND_DEADLINE is not None else deadline
 ''', "client deadlines must remain subordinate to its absolute budget")
-    require_exact_function(tree, "command", '''def command(argv, *, check=True, stdout=subprocess.PIPE, timeout=30):
+    require_exact_function(tree, "command", '''def command(argv, phase, *, check=True, stdout=subprocess.PIPE, timeout=30):
     if COMMAND_DEADLINE is not None:
         remaining = COMMAND_DEADLINE - time.monotonic()
         if remaining <= 0:
@@ -1104,6 +1172,8 @@ import time
         if CLEANUP_ACTIVE and time.monotonic() >= COMMAND_DEADLINE:
             raise RuntimeError("absolute client cleanup deadline exhausted") from None
         raise RuntimeError("client subprocess timed out") from None
+    except OSError as error:
+        raise evidence_failure(phase, "run", "process", error) from None
 ''', "client subprocesses must remain bounded by the absolute budget")
     require_exact_function(tree, "parse_unit_properties", '''def parse_unit_properties(result, requested):
     if result.returncode:
@@ -1154,7 +1224,8 @@ import time
             if remaining <= 0:
                 fail("unit property lookup deadline exhausted")
             result = command(("/usr/bin/systemctl", "show", UNIT,
-                              *(f"--property={name}" for name in requested)), check=False,
+                              *(f"--property={name}" for name in requested)),
+                             "ownership-read", check=False,
                              timeout=remaining)
             values = parse_unit_properties(result, requested)
             if errors:
@@ -1194,7 +1265,7 @@ import time
     if state.get("LoadState") == "not-found":
         return False
     command_path("reset" if arguments[0] == "reset-failed" else arguments[0])
-    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,
+    result = command(("/usr/bin/systemctl", *arguments, UNIT), "teardown", check=False,
                      timeout=ACTION_TIMEOUTS[arguments[0]])
     if result.returncode:
         fail(f"owned unit {arguments[0]} command failed with status {result.returncode}")
@@ -1202,17 +1273,19 @@ import time
 ''', "client must revalidate exact ownership immediately before name-based commands")
     require_exact_function(tree, "durable_marker", '''def durable_marker(name):
     path = f"{RUN}/{name}"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    descriptor = os_call("work", "open", "marker", os.open, path,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(descriptor, b"ready\\n")
-        os.fsync(descriptor)
+        os_call("work", "write", "marker", os.write, descriptor, b"ready\\n")
+        os_call("work", "fsync", "marker", os.fsync, descriptor)
     finally:
-        os.close(descriptor)
-    directory = os.open(RUN, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os_call("work", "close", "marker", os.close, descriptor)
+    directory = os_call("work", "open", "directory", os.open, RUN,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        os.fsync(directory)
+        os_call("work", "fsync", "directory", os.fsync, directory)
     finally:
-        os.close(directory)
+        os_call("work", "close", "directory", os.close, directory)
 ''', "client attempting/acquired markers must be durably fsynced")
     require_exact_function(tree, "exhaust_work_budget", '''def exhaust_work_budget(boundary):
     global COMMAND_DEADLINE
@@ -1232,8 +1305,10 @@ import time
         '"rev-parse", "--verify", f"{commit}^{{commit}}"',
         'if resolved != commit:',
         '"show", f"{commit}:scripts/verify-ubuntu-migration-role-supervisor"',
-        'os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)',
-        'os.fsync(descriptor)', 'os.replace(temporary, PROGRAM)', 'os.fsync(directory)',
+        'os_call("source-publication", "open", "helper", os.open, temporary,',
+        'os_call("source-publication", "fsync", "helper", os.fsync, descriptor)',
+        'os_call("source-publication", "replace", "helper", os.replace, temporary, PROGRAM)',
+        'os_call("source-publication", "fsync", "directory", os.fsync, directory)',
         'nonce = secrets.token_hex(32)',
         'supervisor_argv = ("/usr/bin/python3", "-I", "-S", PROGRAM,',
         'repo, commit, go_binary, nonce) + ((supervisor_mode,) if supervisor_mode else ())',
@@ -1261,7 +1336,7 @@ import time
         'while not journal_evidence[0]:',
         'print(SUCCESS, flush=True)',
         'teardown_owned(invocation, nonce, exec_argv)',
-        'if cgroup_pids(current.get("ControlGroup", "")):',
+        'if cgroup_pids(current.get("ControlGroup", ""), "work"):',
         'for signum in CANCELLATION_SIGNALS:',
         'signal.signal(signum, interrupted)',
         'previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
@@ -1297,7 +1372,7 @@ import time
     ]
     expected_stdout = ast.parse("print(SUCCESS, flush=True)").body[0].value
     expected_stderr = ast.parse(
-        "print('verification-client: ' + sanitized_diagnostic(error, None), file=sys.stderr)"
+        "print('verification-client: ' + top_level_diagnostic(error), file=sys.stderr)"
     ).body[0].value
     sys_output_attributes = [
         node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
@@ -1330,23 +1405,25 @@ import time
         and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "os" and node.func.attr == "write"
     ]
-    expected_os_writes = [
-        ast.parse('os.write(descriptor, b"ready\\n")').body[0].value,
-        ast.parse("os.write(descriptor, source)").body[0].value,
-    ]
+    expected_os_writes = []
     builtin_open_calls = [
         node for node in ast.walk(tree) if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name) and node.func.id == "open"
     ]
     expected_builtin_open = ast.parse(
-        "open(os.path.join(directory, 'cgroup.procs'), encoding='ascii')"
+        "open(path, encoding='ascii')"
     ).body[0].value
     fdopen_calls = [
         node for node in ast.walk(tree) if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "os" and node.func.attr == "fdopen"
     ]
-    expected_fdopen = ast.parse("os.fdopen(descriptor, 'r+', encoding='ascii')").body[0].value
+    expected_fdopen = ast.parse("os.fdopen", mode="eval").body
+    expected_os_sink_references = [
+        ast.parse("os.write", mode="eval").body,
+        ast.parse("os.write", mode="eval").body,
+        expected_fdopen,
+    ]
     subprocess_calls = [
         node for node in ast.walk(tree) if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
@@ -1412,7 +1489,7 @@ import time
                 == [ast.dump(node) for node in expected_os_writes]
             and len(builtin_open_calls) == 1
             and ast.dump(builtin_open_calls[0]) == ast.dump(expected_builtin_open)
-            and len(fdopen_calls) == 1 and ast.dump(fdopen_calls[0]) == ast.dump(expected_fdopen)
+            and not fdopen_calls
             and [ast.dump(node) for node in subprocess_calls]
                 == [ast.dump(node) for node in expected_subprocess_calls]
             and sorted(sys_attributes) == sorted(["argv"] * 6 + ["stderr"])
@@ -1420,7 +1497,7 @@ import time
             and print_loads == [node.func for node in print_calls]
             and open_loads == [builtin_open_calls[0].func]
             and sorted(ast.dump(node) for node in os_sink_references)
-                == sorted(ast.dump(node.func) for node in (*os_write_calls, fdopen_calls[0]))
+                == sorted(ast.dump(node) for node in expected_os_sink_references)
             and sorted(ast.dump(node) for node in subprocess_launcher_references)
                 == sorted(ast.dump(node.func) for node in subprocess_calls)
             and not os_launcher_references and not transitive_sensitive_references,
@@ -1457,22 +1534,21 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
             "client mode routing must reserve full cleanup for terminal-race-a and fast modes for hook tests")
     lock_calls = [
         node for node in ast.walk(main_node)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name) and node.func.value.id == "fcntl"
-        and node.func.attr == "flock"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "lock_client"
     ]
     require(len(lock_calls) == 1, "client must acquire client.lock exactly once")
     lock_try = parents.get(lock_calls[0])
     while lock_try is not None and not isinstance(lock_try, ast.Try):
         lock_try = parents.get(lock_try)
-    expected_close = ast.parse("os.close(client_lock)").body[0]
+    expected_close = ast.parse("close_client_lock(client_lock)").body[0]
     require(isinstance(lock_try, ast.Try) and len(lock_try.finalbody) == 1
             and ast.dump(lock_try.finalbody[0]) == ast.dump(expected_close),
             "client.lock must encompass the complete transaction through owned unload")
     lock_source = ast.get_source_segment(source, lock_try) or ""
     ordered_lock_fragments = (
         'durable_marker("client-terminal-race-b.attempting")',
-        "fcntl.flock(client_lock, fcntl.LOCK_EX)",
+        "lock_client(client_lock)",
         "total_deadline = time.monotonic() + TOTAL_BUDGET",
         "work_deadline = total_deadline - CLEANUP_RESERVE",
         "COMMAND_DEADLINE = work_deadline",
@@ -1480,15 +1556,15 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
         "nonce = secrets.token_hex(32)",
         "publish_supervisor(repo, commit)",
         "launch_attempted = True",
-        "launched = command(service_argv, check=False)",
+        'launched = command(service_argv, "launch", check=False)',
         'owned_state(invocation, nonce, exec_argv)',
         'current = owned_state(invocation, nonce, exec_argv,',
         "journal_evidence = bounded_journal_evidence(invocation)",
-        'if cgroup_pids(current.get("ControlGroup", "")):',
+        'if cgroup_pids(current.get("ControlGroup", ""), "work"):',
         "teardown_owned(invocation, nonce, exec_argv)",
         "raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None",
         'client_pause("client-terminal-race-a-unloaded")',
-        "os.close(client_lock)",
+        "close_client_lock(client_lock)",
     )
     positions = [lock_source.find(fragment) for fragment in ordered_lock_fragments]
     require(all(position >= 0 for position in positions)
@@ -1496,7 +1572,7 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
             "client.lock lifecycle ordering no longer covers reap through confirmed unload")
     require(lock_source.count('durable_marker("client-terminal-race-b.started")') == 1
             and lock_source.index('durable_marker("client-terminal-race-b.started")')
-            > lock_source.index("launched = command(service_argv, check=False)"),
+            > lock_source.index('launched = command(service_argv, "launch", check=False)'),
             "client B started marker must follow its distinct service launch")
     prelaunch_starts = [
         index for index, node in enumerate(lock_try.body)
@@ -1508,7 +1584,7 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
 if before.get("LoadState") != "not-found":
     fail("fixed verification unit is not explicitly absent: "
          f"{sanitized_state(before)}")
-occupants = cgroup_pids(before.get("ControlGroup", ""))
+occupants = cgroup_pids(before.get("ControlGroup", ""), "prelaunch")
 if occupants:
     fail(f"verification unit control group is not empty: {occupants}")
 ''').body
@@ -1591,7 +1667,7 @@ COMMAND_DEADLINE = work_deadline
     expected_masked_launch = ast.parse('''previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
 try:
     launch_attempted = True
-    launched = command(service_argv, check=False)
+    launched = command(service_argv, "launch", check=False)
     if requested_mode == "client-work-budget-launch":
         exhaust_work_budget("launch")
     capture_error = None
@@ -1977,7 +2053,7 @@ finally:
                         "ControlGroup", "Description", "Environment", "ExecStart",
                         *SERVICE_PROPERTIES, *properties, context=context)
 ''').body[0]): 1,
-        ast.dump(ast.parse('''result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,
+        ast.dump(ast.parse('''result = command(("/usr/bin/systemctl", *arguments, UNIT), "teardown", check=False,
                  timeout=ACTION_TIMEOUTS[arguments[0]])
 ''').body[0]): 1,
         ast.dump(ast.parse(
@@ -2207,6 +2283,35 @@ return result
             and 'fail("absolute client cleanup deadline exhausted while awaiting owned unload")' in wait_source,
             "client unload polling/fault boundary ownership contract changed")
 
+    require_exact_function(tree, "record_counter", '''def record_counter(name):
+    path = f"{RUN}/{REQUESTED_MODE}.{name}"
+    descriptor = None
+    counter = None
+    try:
+        descriptor = os_call("work", "open", "evidence", os.open, path,
+                             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            counter = os_call("work", "fdopen", "counter", os.fdopen,
+                              descriptor, "r+", encoding="ascii")
+        except BaseException:
+            os_call("work", "close", "counter", os.close, descriptor)
+            raise
+        descriptor = None
+        value = os_call("work", "read", "evidence", counter.read).strip()
+        os_call("work", "seek", "evidence", counter.seek, 0)
+        os_call("work", "truncate", "evidence", counter.truncate)
+        os_call("work", "write", "evidence", counter.write,
+                str((int(value) if value else 0) + 1) + "\\n")
+        os_call("work", "flush", "evidence", counter.flush)
+        os_call("work", "fsync", "evidence", os.fsync, counter.fileno())
+    except OSError as error:
+        raise evidence_failure("work", "write", "evidence", error) from None
+    except ValueError:
+        fail("command interception evidence was malformed")
+    finally:
+        if counter is not None:
+            os_call("work", "close", "evidence", counter.close)
+''', "client counter fdopen ownership transfer and exact operation labels changed")
     command_path_source = ast.get_source_segment(source, named_function(tree, "command_path")) or ""
     command_path_contract = (
         'REQUESTED_MODE == "client-cleanup-fault-" + name',
@@ -2252,6 +2357,40 @@ return result
 
 def validate_containment(source: str, phase: str) -> None:
     tree = ast.parse(source, filename="verify-ubuntu-migration-role-containment")
+    require_exact_function(tree, "retained_diagnostic", '''def retained_diagnostic(error, fallback):
+    return str(error) if isinstance(error, EvidenceFailure) else fallback
+''', "containment aggregation may retain only typed categorized diagnostics")
+    cgroup_source = ast.get_source_segment(source, named_function(tree, "cgroup_pids")) or ""
+    cgroup_contract = (
+        "cgroup_walk(phase, root)", "before = cgroup_fstat(phase, source)",
+        "after = cgroup_fstat(phase, source)", "after_root = cgroup_stat(phase, root)",
+        "if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):",
+        "canonical = tuple(sorted((relative, device, inode)",
+        "elif canonical != topology_anchor:",
+        "if (current.st_dev, current.st_ino) != (device, inode):",
+        "residue_seen = False", "parsed = [int(value) for value in values]",
+        "found.extend(parsed)", "residue_seen = residue_seen or bool(parsed)",
+        "if not residue_seen and previous_absent:",
+        'except ValueError:\n            fail("unit control group contained malformed process evidence")',
+        "snapshot = (root_identity, canonical, tuple(sorted(set(found))))",
+        "if snapshot == previous and (not residue_seen or bool(snapshot[2])):",
+        'raise evidence_failure(phase, "walk", "evidence", OSError(errno.EAGAIN, "unstable"))',
+    )
+    require(all(cgroup_source.count(fragment) == 1 for fragment in cgroup_contract)
+            and cgroup_source.count("if not stat.S_ISDIR(current.st_mode):") == 1,
+            "containment cgroup snapshot must bind canonical paths and identities")
+    containment_cgroup_boundaries = {
+        "cgroup_walk_error": '(phase, "walk", "cgroup", error)',
+        "cgroup_stat": '(phase, "stat", resource_class, error)',
+        "cgroup_walk": 'functools.partial(cgroup_walk_error, phase)',
+        "cgroup_open": '(phase, "open", "cgroup", error)',
+        "cgroup_fstat": '(phase, "stat", "evidence", error)',
+        "cgroup_read": '(phase, "read", "evidence", error)',
+        "cgroup_close": '(phase, "close", "evidence", error)',
+    }
+    require(all(fragment in (ast.get_source_segment(source, named_function(tree, name)) or "")
+                for name, fragment in containment_cgroup_boundaries.items()),
+            "containment cgroup boundaries lost exact closed operation labels")
     require(literal_assignment(tree, "UNIT") == "nmcp-migration-role-verifier.service",
             "containment fixed unit name changed")
     require(literal_assignment(tree, "PID_FILES") == ("wrapper.pid", "admin.pid", "descendant.pid"),
@@ -2281,9 +2420,12 @@ def validate_containment(source: str, phase: str) -> None:
             and literal_assignment(tree, "SYSTEMD_UNIT_OBJECT")
                 == "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2dverifier_2eservice",
             "containment retained full launch signature fields changed")
-    require_exact_function(tree, "run", '''def run(argv, **kwargs):
+    require_exact_function(tree, "run", '''def run(phase, argv, **kwargs):
     kwargs.setdefault("timeout", 18 * 60)
-    return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)
+    try:
+        return subprocess.run(argv, cwd="/", env=ENV, text=True, **kwargs)
+    except OSError as error:
+        raise evidence_failure(phase, "run", "process", error) from None
 ''', "containment subprocesses must have a bounded default wait")
     require_exact_function(tree, "parse_unit_properties", '''def parse_unit_properties(result, requested):
     if result.returncode:
@@ -2303,12 +2445,12 @@ def validate_containment(source: str, phase: str) -> None:
         fail(f"containment systemctl show omitted required properties: {', '.join(missing)}")
     return values
 ''', "containment property parser must completely parse explicit absence and full loaded identity")
-    require_exact_function(tree, "show", '''def show(*properties):
+    require_exact_function(tree, "show", '''def show(phase, *properties):
     requested = tuple(dict.fromkeys(("LoadState", *properties)))
     errors = []
     for attempt in range(4):
         try:
-            result = run(("/usr/bin/systemctl", "show", UNIT,
+            result = run(phase, ("/usr/bin/systemctl", "show", UNIT,
                           *(f"--property={item}" for item in requested)), check=False,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1)
             values = parse_unit_properties(result, requested)
@@ -2320,10 +2462,92 @@ def validate_containment(source: str, phase: str) -> None:
     fail("containment unit properties remain unknown: "
          + "; ".join(bounded_sanitized_repr(error) for error in errors))
 ''', "containment property reads must fail closed with bounded retry")
+    closed_phases = set(literal_assignment(tree, "DIAGNOSTIC_PHASES"))
+    phase_argument_indexes = {
+        "run": 0, "popen": 0, "process_wait": 0, "process_communicate": 0,
+        "pid_exists": 1, "read_pid": 1, "process_has_inode": 2,
+        "wait_path": 0, "release": 0, "reset_signal_paths": 0, "reset_paths": 0,
+        "counter": 0, "wait_counter": 0, "assert_interception": 2,
+    }
+    forwarding_regions = {
+        "show", "assert_client_failure", "fast_recovery", "cleanup_fixture_invocation",
+        "cleanup_signed_launch",
+        "show_until", "read_structured_command_until", "cleanup_signed_launch_until",
+        "wait_counter", "assert_interception",
+    }
+    main_phase_inventory = {}
+    for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+        for call in ast.walk(function):
+            if (not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name)
+                    or call.func.id not in phase_argument_indexes):
+                continue
+            index = phase_argument_indexes[call.func.id]
+            require(len(call.args) > index, "containment process boundary lacks an explicit phase")
+            argument = call.args[index]
+            if function.name in forwarding_regions:
+                require(isinstance(argument, ast.Name) and argument.id == "phase",
+                        "containment forwarding process phase changed")
+            else:
+                require(isinstance(argument, ast.Constant)
+                        and type(argument.value) is str and argument.value in closed_phases,
+                        "containment process boundary phase must be a closed literal")
+            if function.name == "main":
+                key = (call.func.id, argument.value)
+                main_phase_inventory[key] = main_phase_inventory.get(key, 0) + 1
+    require(main_phase_inventory == {
+        ("pid_exists", "preflight"): 1, ("pid_exists", "service-death"): 1,
+        ("popen", "client-fault"): 1, ("popen", "name-reuse"): 1,
+        ("popen", "persistent-cleanup"): 1, ("popen", "preflight"): 1,
+        ("popen", "signal-cleanup"): 1, ("popen", "slow-cleanup"): 1,
+        ("popen", "terminal-race"): 2, ("popen", "transient-cleanup"): 1,
+        ("popen", "work-budget"): 1,
+        ("process_communicate", "client-fault"): 1,
+        ("process_communicate", "name-reuse"): 1,
+        ("process_communicate", "persistent-cleanup"): 1,
+        ("process_communicate", "signal-cleanup"): 1,
+        ("process_communicate", "slow-cleanup"): 1,
+        ("process_communicate", "terminal-race"): 2,
+        ("process_communicate", "transient-cleanup"): 1,
+        ("process_communicate", "work-budget"): 1,
+        ("process_has_inode", "preflight"): 1,
+        ("process_wait", "client-death"): 1, ("read_pid", "preflight"): 2,
+        ("run", "client-death"): 1, ("run", "client-fault"): 1,
+        ("run", "intent-window"): 2, ("run", "name-reuse"): 5,
+        ("run", "retained-cleanup"): 2, ("run", "service-death"): 1,
+        ("run", "stale-attestation"): 1, ("run", "stale-setup"): 1,
+        ("run", "transient-cleanup"): 1,
+        ("assert_interception", "persistent-cleanup"): 1,
+        ("assert_interception", "transient-cleanup"): 2,
+        ("counter", "persistent-cleanup"): 2, ("counter", "slow-cleanup"): 2,
+        ("counter", "transient-cleanup"): 1,
+        ("release", "client-fault"): 1, ("release", "name-reuse"): 1,
+        ("release", "persistent-cleanup"): 1, ("release", "slow-cleanup"): 1,
+        ("release", "stale-attestation"): 1, ("release", "stale-cleanup"): 1,
+        ("release", "terminal-race"): 3, ("release", "transient-cleanup"): 1,
+        ("release", "work-budget"): 1,
+        ("reset_paths", "client-fault"): 1, ("reset_paths", "name-reuse"): 1,
+        ("reset_paths", "persistent-cleanup"): 2,
+        ("reset_paths", "signal-cleanup"): 2, ("reset_paths", "slow-cleanup"): 2,
+        ("reset_paths", "stale-cleanup"): 1, ("reset_paths", "stale-setup"): 1,
+        ("reset_paths", "terminal-race"): 2,
+        ("reset_paths", "transient-cleanup"): 4, ("reset_paths", "work-budget"): 2,
+        ("reset_signal_paths", "client-fault"): 1,
+        ("reset_signal_paths", "name-reuse"): 1,
+        ("reset_signal_paths", "terminal-race"): 1,
+        ("wait_counter", "persistent-cleanup"): 1,
+        ("wait_path", "client-fault"): 1, ("wait_path", "name-reuse"): 1,
+        ("wait_path", "persistent-cleanup"): 1, ("wait_path", "preflight"): 1,
+        ("wait_path", "signal-cleanup"): 1, ("wait_path", "slow-cleanup"): 2,
+        ("wait_path", "stale-attestation"): 2, ("wait_path", "terminal-race"): 6,
+        ("wait_path", "transient-cleanup"): 1, ("wait_path", "work-budget"): 2,
+    }, "containment process lifecycle phase inventory changed")
     require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
             "containment must not infer absence from an empty or failed property query")
     require_exact_function(tree, "assert_property_parser_contract", '''def assert_property_parser_contract(client):
-    client_namespace = runpy.run_path(client, run_name="nmcp_client_parser_fixture")
+    try:
+        client_namespace = runpy.run_path(client, run_name="nmcp_client_parser_fixture")
+    except OSError as error:
+        raise evidence_failure("runpy", "read", "client", error) from None
     client_parser = client_namespace["parse_unit_properties"]
     successful_terminal_state = client_namespace["successful_terminal_state"]
     requested = ("LoadState", "ExecStart")
@@ -2419,7 +2643,8 @@ def validate_containment(source: str, phase: str) -> None:
     elif isinstance(value, subprocess.CalledProcessError):
         text = f"subprocess failed with status {value.returncode}"
     elif isinstance(value, OSError):
-        text = f"operating system error errno={value.errno}"
+        number = value.errno if type(value.errno) is int else errno.EIO
+        text = f"phase=uncategorized operation=unknown resource=unknown errno={number}"
     else:
         text = str(value)
     if active_nonce:
@@ -2524,7 +2749,14 @@ def validate_containment(source: str, phase: str) -> None:
         node for node in tree.body if isinstance(node, ast.FunctionDef)
     }
     expected_containment_functions = {
-        "fail", "persistent_failure_classification", "persistent_result_violation",
+        "fail", "evidence_failure", "retained_diagnostic",
+        "os_call", "try_nonblocking_flock", "popen", "raise_walk_error",
+        "cgroup_walk_error", "cgroup_stat", "cgroup_walk", "cgroup_open",
+        "cgroup_fstat", "cgroup_read", "cgroup_close",
+        "path_exists", "process_communicate", "process_wait", "read_pid",
+        "open_transaction_lock", "lock_transaction", "close_transaction_lock",
+        "load_cleanup_intent", "top_level_diagnostic",
+        "persistent_failure_classification", "persistent_result_violation",
         "bounded_sanitized_repr", "sanitized_state", "persistent_failure_diagnostics",
         "assert_persistent_failure_contract", "run", "parse_unit_properties", "show",
         "assert_property_parser_contract", "wait_path", "reset_signal_paths", "reset_paths",
@@ -2537,30 +2769,53 @@ def validate_containment(source: str, phase: str) -> None:
         "structured_command_fixture_result", "assert_launch_identity_contract",
         "persistent_supervisor_mode", "persistent_launch_signature",
         "assert_launch_signature_counterexamples", "signed_launch_state",
-        "cleanup_signed_launch", "bounded_cleanup_timeout", "assert_cleanup_deadline_contract",
+        "cleanup_signed_launch", "cleanup_signed_launch_if_owned",
+        "bounded_cleanup_timeout", "assert_cleanup_deadline_contract",
         "show_until", "read_structured_command_until", "show_identity_until",
         "signed_launch_state_until", "cleanup_signed_launch_until",
-        "pid_exists", "cgroup_pids", "process_has_inode",
+        "pid_exists", "cgroup_pids", "process_has_inode", "assert_keeper_lock_coherent",
         "intent_entry", "run_root_entry", "observable_identity", "assert_replaced_or_absent",
         "main",
     }
     actual_containment_functions = {node.name for node in reviewed_persistent_functions}
     expected_function_signatures = (
-        ("fail", "message"), ("persistent_failure_classification", "stdout, stderr"),
+        ("fail", "message"),
+        ("evidence_failure", "phase, operation, resource_class, error"),
+        ("retained_diagnostic", "error, fallback"),
+        ("os_call", "phase, operation, resource_class, function, *args, **kwargs"),
+        ("try_nonblocking_flock", "descriptor, phase, resource_class"),
+        ("popen", "phase, argv, **kwargs"), ("raise_walk_error", "error"),
+        ("cgroup_walk_error", "phase, error"),
+        ("cgroup_stat", "phase, path, resource_class='cgroup'"),
+        ("cgroup_walk", "phase, root"), ("cgroup_open", "phase, path"),
+        ("cgroup_fstat", "phase, source"), ("cgroup_read", "phase, source"),
+        ("cgroup_close", "phase, source"),
+        ("path_exists", "phase, resource_class, path"),
+        ("process_communicate", "phase, process, timeout"),
+        ("process_wait", "phase, process, timeout"),
+        ("read_pid", "path, phase"), ("open_transaction_lock", ""),
+        ("lock_transaction", "descriptor"), ("close_transaction_lock", "descriptor"),
+        ("load_cleanup_intent", ""),
+        ("persistent_failure_classification", "stdout, stderr"),
         ("persistent_result_violation", "returncode, classification, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup, post_cleanup_cgroup"),
-        ("bounded_sanitized_repr", "value, active_nonce=None"), ("sanitized_state", "state"),
+        ("bounded_sanitized_repr", "value, active_nonce=None"),
+        ("top_level_diagnostic", "error"), ("sanitized_state", "state"),
         ("persistent_failure_diagnostics", "mode, boundary, faulted, classification, intercepted, attempted, observed, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup_cgroup"),
-        ("assert_persistent_failure_contract", ""), ("run", "argv, **kwargs"),
-        ("parse_unit_properties", "result, requested"), ("show", "*properties"),
-        ("assert_property_parser_contract", "client"), ("wait_path", "path, timeout=900"),
-        ("reset_signal_paths", "name"), ("reset_paths", "*paths"), ("counter", "path"),
-        ("wait_counter", "path, expected, timeout=30"), ("release", "name"),
-        ("wait_unit_absent", "timeout=30"), ("assert_client_lock_reusable", ""),
-        ("assert_client_lock_held", ""), ("assert_client_failure", "result, mode"),
-        ("fast_recovery", "client, repo, commit, go_binary, context"),
+        ("assert_persistent_failure_contract", ""), ("run", "phase, argv, **kwargs"),
+        ("parse_unit_properties", "result, requested"), ("show", "phase, *properties"),
+        ("assert_property_parser_contract", "client"),
+        ("wait_path", "phase, path, timeout=900"),
+        ("reset_signal_paths", "phase, name"), ("reset_paths", "phase, *paths"),
+        ("counter", "phase, path"),
+        ("wait_counter", "phase, path, expected, timeout=30"),
+        ("release", "phase, name"),
+        ("wait_unit_absent", "phase, timeout=30"), ("assert_client_lock_reusable", ""),
+        ("assert_client_lock_held", ""),
+        ("assert_client_failure", "result, mode, phase"),
+        ("fast_recovery", "client, repo, commit, go_binary, context, phase"),
         ("fault_paths", "mode, boundary"),
-        ("assert_interception", "mode, boundary, *, persistent=False"),
-        ("cleanup_fixture_invocation", "invocation"), ("unique_json_object", "pairs"),
+        ("assert_interception", "mode, boundary, phase, *, persistent=False"),
+        ("cleanup_fixture_invocation", "invocation, phase"), ("unique_json_object", "pairs"),
         ("parse_structured_command", "result, property_name"),
         ("structured_command_identity", "exec_start_result, exec_start_ex_result"),
         ("launch_identity_signature", "invocation, description, environment, path, argv"),
@@ -2571,15 +2826,19 @@ def validate_containment(source: str, phase: str) -> None:
         ("persistent_supervisor_mode", "mode"),
         ("persistent_launch_signature", "state, repo, commit, go_binary, mode"),
         ("assert_launch_signature_counterexamples", "state, repo, commit, go_binary, mode"),
-        ("signed_launch_state", "signature"), ("cleanup_signed_launch", "signature"),
+        ("signed_launch_state", "signature, phase"),
+        ("cleanup_signed_launch", "signature, phase"),
+        ("cleanup_signed_launch_if_owned", "lock_held, signature, state, phase, cleanup"),
         ("bounded_cleanup_timeout", "remaining, cap"),
-        ("assert_cleanup_deadline_contract", ""), ("show_until", "deadline, *properties"),
-        ("read_structured_command_until", "deadline"),
-        ("show_identity_until", "deadline, *properties"),
-        ("signed_launch_state_until", "signature, deadline"),
-        ("cleanup_signed_launch_until", "signature, deadline"),
-        ("pid_exists", "pid"), ("cgroup_pids", "control_group"),
-        ("process_has_inode", "pid, expected"), ("intent_entry", "path"),
+        ("assert_cleanup_deadline_contract", ""),
+        ("show_until", "phase, deadline, *properties"),
+        ("read_structured_command_until", "phase, deadline"),
+        ("show_identity_until", "phase, deadline, *properties"),
+        ("signed_launch_state_until", "signature, phase, deadline"),
+        ("cleanup_signed_launch_until", "signature, phase, deadline"),
+        ("pid_exists", "pid, phase"), ("cgroup_pids", "control_group, phase"),
+        ("process_has_inode", "pid, expected, phase"),
+        ("assert_keeper_lock_coherent", "keeper_pid, expected"), ("intent_entry", "path"),
         ("run_root_entry", ""), ("observable_identity", "path, recorded"),
         ("assert_replaced_or_absent", "path, identity"), ("main", ""),
     )
@@ -2593,12 +2852,17 @@ def validate_containment(source: str, phase: str) -> None:
         if any(value is not None for value in (*node.args.defaults, *node.args.kw_defaults))
     }
     expected_function_defaults = {
+        "cgroup_stat": [ast.dump(ast.Constant(value="cgroup"))],
         "wait_path": [ast.dump(ast.Constant(value=900))],
         "wait_counter": [ast.dump(ast.Constant(value=30))],
         "wait_unit_absent": [ast.dump(ast.Constant(value=30))],
         "assert_interception": [ast.dump(ast.Constant(value=False))],
         "bounded_sanitized_repr": [ast.dump(ast.Constant(value=None))],
     }
+    evidence_classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    expected_evidence_class = ast.parse('''class EvidenceFailure(RuntimeError):
+    pass
+''').body[0]
     protected_persistent_bindings.update(node.name for node in reviewed_persistent_functions)
     require(actual_containment_functions == expected_containment_functions
             and actual_function_signatures == expected_function_signatures
@@ -2612,9 +2876,54 @@ def validate_containment(source: str, phase: str) -> None:
             and not any(node.decorator_list for node in reviewed_persistent_functions)
             and {node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
                 == reviewed_persistent_functions
-            and not any(isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef))
-                        for node in ast.walk(tree)),
+            and len(evidence_classes) == 1
+            and ast.dump(evidence_classes[0]) == ast.dump(expected_evidence_class)
+            and not any(isinstance(node, ast.AsyncFunctionDef) for node in ast.walk(tree))
+            and {node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+                == set(evidence_classes),
             "containment top-level callable names must be unique protected bindings")
+    require_exact_function(tree, "try_nonblocking_flock", '''def try_nonblocking_flock(descriptor, phase, resource_class):
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError as error:
+        if error.errno == errno.EWOULDBLOCK:
+            return False
+        raise evidence_failure(phase, "flock", resource_class, error) from None
+    except OSError as error:
+        raise evidence_failure(phase, "flock", resource_class, error) from None
+''', "containment nonblocking flock must distinguish only reviewed contention")
+    require_exact_function(tree, "assert_keeper_lock_coherent", '''def assert_keeper_lock_coherent(keeper_pid, expected):
+    if not pid_exists(keeper_pid, "service-death"):
+        return
+    lock = open_transaction_lock()
+    try:
+        if (lock_transaction(lock)
+                and process_has_inode(keeper_pid, expected, "service-death")):
+            fail("live matching in-cgroup lock keeper released the transaction lock")
+    finally:
+        close_transaction_lock(lock)
+''', "containment keeper-lock evidence must recheck the live matching inode after acquisition")
+    nonblocking_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "try_nonblocking_flock"
+    ]
+    expected_nonblocking_calls = ast.parse('''try_nonblocking_flock(
+    descriptor, "transaction-lock", "transaction")
+try_nonblocking_flock(descriptor, "transaction-lock", "lock")
+try_nonblocking_flock(descriptor, "transaction-lock", "lock")
+try_nonblocking_flock(cleanup_lock, "persistent-cleanup", "lock")
+''').body
+    direct_flock_calls = [
+        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "fcntl" and node.func.attr == "flock"
+    ]
+    require(sorted(ast.dump(node) for node in nonblocking_calls)
+            == sorted(ast.dump(node.value) for node in expected_nonblocking_calls)
+            and len(direct_flock_calls) == 1
+            and direct_flock_calls[0] in ast.walk(named_function(tree, "try_nonblocking_flock")),
+            "containment nonblocking flock sites must use only the closed contention helper")
     module_docstrings = [
         node for node in tree.body if isinstance(node, ast.Expr)
         and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
@@ -2625,7 +2934,8 @@ def validate_containment(source: str, phase: str) -> None:
         "READY", "PID_FILES", "ENV", "SUCCESS", "PERSISTENT_PROPERTY_ERROR",
         "PERSISTENT_ACTION_ERROR", "DIAGNOSTIC_TEXT_LIMIT", "PROGRAM", "NONCE_VARIABLE",
         "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "IDENTITY_PROPERTIES",
-        "SYSTEMD_UNIT_OBJECT",
+        "SYSTEMD_UNIT_OBJECT", "CGROUP_SNAPSHOT_ATTEMPTS", "DIAGNOSTIC_PHASES",
+        "DIAGNOSTIC_OPERATIONS", "DIAGNOSTIC_RESOURCES",
     }
     actual_module_assignment_names = [
         node.targets[0].id for node in module_assignments
@@ -2652,11 +2962,28 @@ SERVICE_PROPERTIES = {
 }
 IDENTITY_PROPERTIES = ("InvocationID", "Description", "Environment", *SERVICE_PROPERTIES)
 SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2dverifier_2eservice"
+CGROUP_SNAPSHOT_ATTEMPTS = 4
+DIAGNOSTIC_PHASES = (
+    "client-death", "client-fault", "intent-window", "name-reuse",
+    "persistent-cleanup", "preflight", "property-inspection", "retained-cleanup", "runpy",
+    "service-death", "signal-cleanup", "slow-cleanup", "stale-attestation", "stale-cleanup",
+    "stale-setup", "terminal-race", "transaction-lock", "transient-cleanup", "uncategorized",
+    "work-budget",
+)
+DIAGNOSTIC_OPERATIONS = (
+    "chdir", "chmod", "close", "communicate", "flock", "fsync", "kill", "listdir", "open",
+    "popen", "read", "replace", "run", "stat", "unknown", "unlink", "wait", "walk",
+    "write",
+)
+DIAGNOSTIC_RESOURCES = (
+    "cgroup", "cleanup-intent", "client", "counter", "directory", "evidence", "helper",
+    "lock", "marker", "pid", "process", "release", "transaction", "unknown",
+)
 ''').body
     expected_module_sequence = (
         ["doc"] + ["import:" + name for name in (
-            "fcntl", "json", "os", "runpy", "secrets", "signal", "subprocess",
-            "sys", "time")]
+            "fcntl", "errno", "functools", "json", "os", "runpy", "secrets", "signal", "stat",
+            "subprocess", "sys", "time")]
         + ["assign:" + name for name in actual_module_assignment_names]
         + ["function:" + name for name, _signature in expected_function_signatures]
         + ["guard"]
@@ -2690,14 +3017,14 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     try:
         raise SystemExit(main())
     except Exception as error:
-        print("containment-test: " + bounded_sanitized_repr(error), file=sys.stderr)
+        print("containment-test: " + top_level_diagnostic(error), file=sys.stderr)
         raise SystemExit(1)
 ''').body[0]
     module_guards = [node for node in tree.body if isinstance(node, ast.If)]
     require(len(module_guards) == 1
             and ast.dump(module_guards[0]) == ast.dump(expected_main_guard)
             and all(node is module_docstrings[0]
-                    or isinstance(node, (ast.Import, ast.Assign, ast.FunctionDef, ast.If))
+                    or isinstance(node, (ast.Import, ast.Assign, ast.ClassDef, ast.FunctionDef, ast.If))
                     for node in tree.body),
             "containment module scope gained executable statements")
     reviewed_persistent_assignments = []
@@ -2728,7 +3055,9 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "DIAGNOSTIC_TEXT_LIMIT": 5, "PROGRAM": 2, "NONCE_VARIABLE": 2,
         "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 6, "IDENTITY_PROPERTIES": 1,
-        "SYSTEMD_UNIT_OBJECT": 1,
+        "SYSTEMD_UNIT_OBJECT": 1, "CGROUP_SNAPSHOT_ATTEMPTS": 1,
+        "DIAGNOSTIC_PHASES": 1, "DIAGNOSTIC_OPERATIONS": 1,
+        "DIAGNOSTIC_RESOURCES": 1,
     }
     actual_constant_loads = {name: 0 for name in expected_module_assignments}
     for node in ast.walk(tree):
@@ -2775,7 +3104,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     require(actual_mutable_constant_contexts == expected_mutable_constant_contexts,
             "containment mutable constant use sites exceed the reviewed inventory")
     reviewed_imports = {
-        "fcntl", "json", "os", "runpy", "secrets", "signal",
+        "fcntl", "errno", "functools", "json", "os", "runpy", "secrets", "signal", "stat",
         "subprocess", "sys", "time",
     }
     actual_imports = [
@@ -2794,8 +3123,9 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
             "containment imports exceed the reviewed modules")
     protected_persistent_bindings.update(reviewed_imports)
     expected_module_loads = {
-        "fcntl": 17, "json": 7, "os": 87, "runpy": 1, "secrets": 2,
-        "signal": 6, "subprocess": 104, "sys": 3, "time": 66,
+        "errno": 10, "fcntl": 5, "functools": 1, "json": 6, "os": 69,
+        "runpy": 1, "secrets": 2,
+        "signal": 6, "stat": 6, "subprocess": 95, "sys": 3, "time": 66,
     }
     actual_module_loads = {name: 0 for name in reviewed_imports}
     for node in ast.walk(tree):
@@ -2803,43 +3133,49 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                 and node.id in actual_module_loads):
             actual_module_loads[node.id] += 1
     expected_module_attributes = {
-        ("fcntl", "LOCK_EX"): 5, ("fcntl", "LOCK_NB"): 5, ("fcntl", "LOCK_UN"): 1,
-        ("fcntl", "flock"): 6, ("json", "dumps"): 4, ("json", "load"): 2,
+        ("errno", "EAGAIN"): 1, ("errno", "EIO"): 2, ("errno", "ESTALE"): 6,
+        ("errno", "EWOULDBLOCK"): 1,
+        ("fcntl", "LOCK_EX"): 1, ("fcntl", "LOCK_NB"): 1, ("fcntl", "LOCK_UN"): 1,
+        ("fcntl", "flock"): 2, ("functools", "partial"): 1,
+        ("json", "dumps"): 4, ("json", "load"): 1,
         ("json", "loads"): 1, ("os", "O_CREAT"): 2,
-        ("os", "O_DIRECTORY"): 2, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 9,
-        ("os", "O_RDONLY"): 2, ("os", "O_RDWR"): 5, ("os", "O_WRONLY"): 2,
-        ("os", "close"): 9, ("os", "fchmod"): 1, ("os", "fsync"): 4,
+        ("os", "O_DIRECTORY"): 2, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 8,
+        ("os", "O_RDONLY"): 2, ("os", "O_RDWR"): 4, ("os", "O_WRONLY"): 2,
+        ("os", "close"): 8, ("os", "fchmod"): 1, ("os", "fstat"): 1, ("os", "fsync"): 4,
         ("os", "geteuid"): 1,
-        ("os", "kill"): 4, ("os", "listdir"): 1, ("os", "lstat"): 2,
-        ("os", "open"): 9, ("os", "path"): 24, ("os", "replace"): 1,
-        ("os", "stat"): 2,
+        ("os", "kill"): 4, ("os", "listdir"): 1, ("os", "lstat"): 3,
+        ("os", "open"): 8, ("os", "path"): 7, ("os", "replace"): 1,
+        ("os", "stat"): 3,
         ("os", "unlink"): 2, ("os", "walk"): 1, ("os", "write"): 2,
-        ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2,
+        ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2, ("stat", "S_ISDIR"): 6,
         ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 2,
         ("signal", "SIGQUIT"): 1, ("signal", "SIGTERM"): 1,
         ("subprocess", "CalledProcessError"): 1, ("subprocess", "CompletedProcess"): 21,
         ("subprocess", "PIPE"): 68, ("subprocess", "TimeoutExpired"): 1,
-        ("subprocess", "Popen"): 10, ("subprocess", "SubprocessError"): 2,
+        ("subprocess", "Popen"): 1, ("subprocess", "SubprocessError"): 2,
         ("subprocess", "run"): 1, ("sys", "argv"): 2, ("sys", "stderr"): 1,
         ("time", "monotonic"): 48, ("time", "sleep"): 18,
     }
     expected_recursive_module_attributes = {
-        "fcntl.LOCK_EX": 5, "fcntl.LOCK_NB": 5, "fcntl.LOCK_UN": 1,
-        "fcntl.flock": 6, "json.dumps": 4, "json.load": 2, "json.loads": 1,
+        "errno.EAGAIN": 1, "errno.EIO": 2, "errno.ESTALE": 6,
+        "errno.EWOULDBLOCK": 1,
+        "fcntl.LOCK_EX": 1, "fcntl.LOCK_NB": 1, "fcntl.LOCK_UN": 1,
+        "fcntl.flock": 2, "functools.partial": 1,
+        "json.dumps": 4, "json.load": 1, "json.loads": 1,
         "os.O_CREAT": 2,
-        "os.O_DIRECTORY": 2, "os.O_EXCL": 2, "os.O_NOFOLLOW": 9,
-        "os.O_RDONLY": 2, "os.O_RDWR": 5, "os.O_WRONLY": 2,
-        "os.close": 9, "os.fchmod": 1, "os.fsync": 4, "os.geteuid": 1,
-        "os.kill": 4, "os.listdir": 1, "os.lstat": 2, "os.open": 9, "os.path": 24,
-        "os.path.abspath": 1, "os.path.dirname": 1, "os.path.exists": 16,
-        "os.path.isdir": 1, "os.path.islink": 1, "os.path.join": 4,
-        "os.replace": 1, "os.stat": 2, "os.unlink": 2, "os.walk": 1, "os.write": 2,
-        "runpy.run_path": 1, "secrets.token_hex": 2,
+        "os.O_DIRECTORY": 2, "os.O_EXCL": 2, "os.O_NOFOLLOW": 8,
+        "os.O_RDONLY": 2, "os.O_RDWR": 4, "os.O_WRONLY": 2,
+        "os.close": 8, "os.fchmod": 1, "os.fstat": 1, "os.fsync": 4, "os.geteuid": 1,
+        "os.kill": 4, "os.listdir": 1, "os.lstat": 3, "os.open": 8, "os.path": 7,
+        "os.path.abspath": 1, "os.path.dirname": 1,
+        "os.path.join": 4, "os.path.relpath": 1,
+        "os.replace": 1, "os.stat": 3, "os.unlink": 2, "os.walk": 1, "os.write": 2,
+        "runpy.run_path": 1, "secrets.token_hex": 2, "stat.S_ISDIR": 6,
         "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 2,
         "signal.SIGQUIT": 1, "signal.SIGTERM": 1,
         "subprocess.CalledProcessError": 1, "subprocess.CompletedProcess": 21,
         "subprocess.PIPE": 68, "subprocess.TimeoutExpired": 1,
-        "subprocess.Popen": 10, "subprocess.SubprocessError": 2,
+        "subprocess.Popen": 1, "subprocess.SubprocessError": 2,
         "subprocess.run": 1, "sys.argv": 2, "sys.stderr": 1,
         "time.monotonic": 48, "time.sleep": 18,
     }
@@ -2902,41 +3238,47 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                 if isinstance(child, ast.AST):
                     child_relations[id(child)] = (parent, field)
     reviewed_name_callees = {
-        "RuntimeError", "SystemExit", "all", "any", "assert_client_failure",
+        "EvidenceFailure", "OSError", "RuntimeError", "SystemExit", "all", "any", "assert_client_failure",
         "assert_client_lock_held", "assert_client_lock_reusable", "assert_interception",
         "assert_cleanup_deadline_contract", "assert_launch_identity_contract",
         "assert_launch_signature_counterexamples",
-        "assert_persistent_failure_contract",
+        "assert_keeper_lock_coherent", "assert_persistent_failure_contract",
         "assert_property_parser_contract", "assert_replaced_or_absent", "bool",
-        "bounded_cleanup_timeout", "bounded_sanitized_repr", "cgroup_pids",
-        "cleanup_fixture_invocation", "cleanup_signed_launch", "cleanup_signed_launch_until",
-        "counter", "dict", "fail",
+        "bounded_cleanup_timeout", "bounded_sanitized_repr", "cgroup_close", "cgroup_fstat",
+        "cgroup_open", "cgroup_pids", "cgroup_read", "cgroup_stat", "cgroup_walk",
+        "cleanup", "cleanup_fixture_invocation", "cleanup_signed_launch",
+        "cleanup_signed_launch_if_owned", "cleanup_signed_launch_until",
+        "close_transaction_lock",
+        "counter", "dict", "evidence_failure", "fail", "function",
         "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
-        "launch_identity_matches", "launch_identity_signature", "list", "map", "next",
-        "observable_identity", "open", "parse_structured_command",
+        "launch_identity_matches", "launch_identity_signature", "list", "load_cleanup_intent",
+        "lock_transaction", "map", "next", "observable_identity", "open",
+        "open_transaction_lock", "os_call", "parse_structured_command", "path_exists", "popen",
         "parse_unit_properties", "parser",
         "persistent_failure_classification", "persistent_failure_diagnostics",
         "persistent_launch_signature", "persistent_result_violation",
-        "persistent_supervisor_mode", "pid_exists", "print", "process_has_inode",
-        "range", "read_structured_command_until", "release",
-        "repr", "reset_paths", "reset_signal_paths", "run", "run_root_entry",
+        "persistent_supervisor_mode", "pid_exists", "print", "process_communicate",
+        "process_has_inode", "process_wait", "range", "read_pid",
+        "read_structured_command_until", "release",
+        "repr", "reset_paths", "reset_signal_paths", "retained_diagnostic", "run", "run_root_entry",
         "sanitized_state", "set", "show", "show_identity_until", "show_until",
         "signed_launch_state", "signed_launch_state_until",
         "sorted", "stale_terminal_matches", "str", "structured_command_fixture_result",
         "structured_command_identity", "successful_terminal_state", "tuple", "type",
-        "unique_json_object", "wait_counter",
+        "top_level_diagnostic", "try_nonblocking_flock", "unique_json_object", "wait_counter",
         "wait_path", "wait_unit_absent",
     }
     reviewed_attribute_callee_roots = {
         "after_exit", "budgeted", "cancelled", "character", "descendants",
-        "dict", "environment", "errors", "expected_slow_counts", "fcntl", "first",
+        "dict", "environment", "errors", "expected_slow_counts", "fcntl", "first", "functools",
         "found", "json", "kwargs", "line", "loaded", "matching", "mode", "mutations",
         "orphaned", "os", "parts", "post_cleanup", "process", "property_boundaries",
         "partial", "recovered", "replaced", "result", "runpy", "secrets", "sentinel_state",
-        "path", "payload", "results", "signature", "slow", "slow_paths", "slow_state", "source", "state",
+        "identities", "kept", "path", "payload", "results", "signature", "slow", "slow_paths",
+        "slow_state", "source", "stat", "state",
         "stale_after_client", "stale_observed",
         "stale_post_cleanup", "stale_post_cleanup_cgroup", "stale_program",
-        "stopped", "reset", "subprocess", "text", "time", "values", "waiting",
+        "stopped", "reset", "subprocess", "text", "time", "value", "values", "waiting",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -2984,16 +3326,96 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        ("03a6dc8d2b0af61da6e07ae24b37f2ca816056f4bb837bdd6e45dd8f4e1b0507",
+         "880bfb4ccbaa5ed9b7b7dd6ebae541ffe0da6636e41a9d2a4e27f7835cb25ac9",
+         "4c9e85d8ab38f69e735dcb79510d83d372ec8826e32abe92cdb11a5985bde69b",
+         "05a97ce5341e5c7aea2c39edcafdc2e3e8ef80365325bf1e9d97a7742c85a978"),
+        ("b23f418cd240143b927d282c1890c6b831058582fe3d095ee423b16be82057eb",
+         "b498ac5be27f122c42a40dbd783f6854b325703118af9a55f6688d217ed098be",
+         "5e7b5ce30598ca6fb6ff12516c05fc8ca1d5d8c06e5d3e3be2e372707fcf0ec9",
+         "344063f9c2a234f49ec44a99a48d2d399b131bf68679dd91eaeff887e7dd353b"),
+        ("dae16ee0ad8b518a698b0a40164cfba29e5db468d34cbce5dddeb4eaac97d58c",
+         "a21b2309a1677ec5b38daf34371d98d340b4c7727857f71ab9aeec468d4b54f0",
+         "4c9e85d8ab38f69e735dcb79510d83d372ec8826e32abe92cdb11a5985bde69b",
+         "1daf8aeddf9ee046f265c2b4501e73bcfe64306b5db142ea18db2ba2e374fff4"),
+        ("b23f418cd240143b927d282c1890c6b831058582fe3d095ee423b16be82057eb",
+         "c3d127cfa4b0fc2faa3831a49b128ab26e506e8f132d02f0395c6da4eebfe030",
+         "5e7b5ce30598ca6fb6ff12516c05fc8ca1d5d8c06e5d3e3be2e372707fcf0ec9",
+         "ffaf515583c1fb9b8cfb9b2320cd1edb9da8242e3affa5c19d9a27809a5bb98d"),
+        ("dae16ee0ad8b518a698b0a40164cfba29e5db468d34cbce5dddeb4eaac97d58c",
+         "c2d76e33c837ef855d292acedfad26d86904637a3e2920883c6a16c2f289f10f",
+         "4c9e85d8ab38f69e735dcb79510d83d372ec8826e32abe92cdb11a5985bde69b",
+         "6489bacb5c7ac848c287a49ae32fae74cfa668c9436017d61987af41535196c9"),
         # CPython 3.14 local verifier AST representation.
+        ("9f46c6238cb24271d628fb6fcb8de94c965a7bde426bfa821fa558fc4747ba8d",
+         "27b5a63309befda5ba18c3aafbb6081d5926fde5ed627e9ac5f3d9cc1b6b16b3",
+         "4c9e85d8ab38f69e735dcb79510d83d372ec8826e32abe92cdb11a5985bde69b",
+         "8291da66bc1cbb83de77d11d63afa28f0823e7cc152217bac89b0bb9e569f5b3"),
+        ("d1c1eee15981d34455eabb9d0cc345b7b4a1048d6e1528985d4382974cfd8d1d",
+         "fffce6f6c8b471a96ae6af2837b0a2bde985de4c8d95dc8b5311e16233817ffc",
+         "4c9e85d8ab38f69e735dcb79510d83d372ec8826e32abe92cdb11a5985bde69b",
+         "dc9ddab9656b1342ea4cc10d538a255cf9fabe8972050045c14cf80db4235aab"),
+        ("9989d59f9274483ccf30f090cfa83fbf355d7deb7adec01c683f922505a0b187",
+         "a091ccdd3aa1c9ec5c522f942feb91c03ebfa4dc7f3e2ae2bd661015377b803f",
+         "4c9e85d8ab38f69e735dcb79510d83d372ec8826e32abe92cdb11a5985bde69b",
+         "7a1c89ae6f763d9cb7e7976b20fa6b382e985b5b5f7cca5a98a0da41028b422f"),
+        ("8905fb7ec0ec754cf8b0be60f027826eb7643b9e0c0e3a1572dfef8a74da7497",
+         "113c5a5ed7fd024439d2cbbc8cfaa53580cefb23a2e30580308820ef89d971c1",
+         "e25f0404ed0dbb82b52bc4ab8002f61778c2832139e83cf76acd2f1ef712e79d",
+         "16c5e9b102997315cbc30d58caf45aa8238ee2d77e6615a3f5c7c0e158b59661"),
+        ("58212a04d15930fd828d8e39984a01df21918bdda6ae3f32dfdeb37b3031a310",
+         "1f38c66b5695d7da77b501cb572fd093f35d9d6cfd4e7381f228dcf942dec257",
+         "a7a6c38a6a2dd34178bac8e057242027a5082de2ce4f097d3701143725d43b31",
+         "e20903bbdaa5c419bdca47b4722e81c4d3cecc37b559cb9d26642ba79e318ec6"),
+        ("e43b374eac8b87565f61de8deeb3e36108b4dd5c83fcbde7545eb79d8c71b088",
+         "9f2b4e9e1d47c6d1731b9e54c2324e7303472942898add97dedb2ab599f2cd73",
+         "d3e576e6673e5e1fe17cf6d67e05cf9ddea2056da83fd859d34e02b1274ce288",
+         "1e757f2f81565ecab6099fb3b6dcdb1e9ac71cd93f35bb8b73ddc83a575364de"),
         ("e412c9eff18b9195d2ce6f4678da7655726ef30747829094c99d1adf77913eca",
          "df97966adfd1e9b28ebe3c68a214273b926426eb09511173996824667e66efaa",
          "ecd4072a1215c77bb9e4346d379edbec324ab227cdd8724d47886abe573f0351",
          "4d422c364aab13293424b227c6a06d24eb99fb556cd3cb7b1ce85b95b727a80f"),
         # Ubuntu 24.04 workflow CPython 3.12 verifier AST representation.
+        ("3d9797fcbe17232795e9b30fabdc01d0a1c45a620fdd4fce01e630ab2a6a878a",
+         "8f47300d09ec0243fb1e3e82eb5cfb1bb168b1597b22624176ef8cd08fd88c2d",
+         "5e7b5ce30598ca6fb6ff12516c05fc8ca1d5d8c06e5d3e3be2e372707fcf0ec9",
+         "5bf309aa2723959a7d64ec2c6029e27b1730862f3c7fc29a90bdc955b4bb8985"),
+        ("4be894fc83623783ff2cd9c7d550954b17a278e93877db9b6794f69fa59c4290",
+         "465e89d09b63dd609e15dcde21ec2908e5eccb7bea597f2b92fb9b64f4c72f39",
+         "5e7b5ce30598ca6fb6ff12516c05fc8ca1d5d8c06e5d3e3be2e372707fcf0ec9",
+         "9b311545a2f0070e75dcebcabebf1fb7e832880acfd81c18c1473c71088670aa"),
+        ("6770dcd68bd021b08fbd6464b90bb1f2d9c53d19c1454b4eefd23c5dc9ad9e24",
+         "6079a0f1dd0f999a83eb2432e7350f9aef4e6d9fb82ba60dec5e38f294c69bb4",
+         "5e7b5ce30598ca6fb6ff12516c05fc8ca1d5d8c06e5d3e3be2e372707fcf0ec9",
+         "cde690c0e2617355e7e8b60f6444344db0a197864fc5baa857de3fb9caf3a719"),
+        ("7ab2508363322127ecdbeaa21c890007b29fcdea2bfe77303afd8ec407d5f7ab",
+         "4c89b50a494c2bb48c730611057540315c070d87d14d1c2c5087d51e1ff1c067",
+         "5e7b5ce30598ca6fb6ff12516c05fc8ca1d5d8c06e5d3e3be2e372707fcf0ec9",
+         "64de25f2eda6009064095eb2619fd2fa4500216bce397d4ed59cda9da948b1aa"),
+        ("4959ff22123ac84a1fea166ff192be44bdd04798b8d31fdcff1f4303f8c215a2",
+         "8e789fbc41e8395a945af724681ddd402ec151821180e5cd264fd767ed59e5b5",
+         "a7509c6fa5f1cfc075491313605faabd120378389d545496e826c5c3d636cdcd",
+         "6b6bc7985bb90744898959bf09c2874b4f36e2d1fdb0e03a031696dba696f159"),
+        ("36c195a48c04e54bef683b01aa366dc1e8c6023af50f11d561b258056d01bef6",
+         "cb5e97e7aa10ff60f77ef54a84192b874227c3066676916cd71f14b50bfa94bf",
+         "e99d4273df32147cab221af87de49350c30eac10283aa5f33f44b3555630a6a2",
+         "d19761207cc9c1c50d03bd1f2b837699ddfe76508bdf6441b4daf23bcf99582f"),
+        ("6a95583e76bd8ae94c155ac42b530c46b17692120b91244c9877a0f5524aca5c",
+         "7050025d4e95d8b946b89b91efd0a541e134a8a84a4d8b014e68175a2c5d6278",
+         "a57d1fdec35dafc50e198c5df5adcd385d3d72d12e0eb86786597592c576f400",
+         "59c87dcdd198a7fe76d5584d4457aa8473f130004b6340cbd26d14e7a8500e5e"),
         ("4546fb55fab0f129445eaf03475889f29ef217d664aed8c2ef7019c3eb3f69be",
          "4b2f918df8d0ac1780411eb6a328e849a2bd23276100f1f343ada407b789ff4a",
          "c575fcb5eb71bf1138e9fe87e07c3d7e333a9dd1ad5f56b65c1967a32ab136fe",
-         "fa68130a1fea8f9699224592bfc3ecd7739ffb46928649246508e1fa7ff22bd3"),
+          "fa68130a1fea8f9699224592bfc3ecd7739ffb46928649246508e1fa7ff22bd3"),
+        ("eaa5162afc9e17bc9c71cc6bb1df9765ffd438fa7c95f188e6ef0b9e8215123c",
+         "0f93cd34e3f8aab9680f77ab9db0e210f7a1d6b24027c1db29104be372d5978f",
+         "9f5ce0e5abac6c9a487a72793625ed3efe967f11b82d8dd35efa0e3dc14a9afa",
+         "04baafe986002181f71b882e73993ce737e1f9ebf51fea9344f23c14a876e135"),
+        ("70de017644766a40dd23c577ad7ce0cf747c80cd50de38daca86a2f4c6acf125",
+         "998ad0381b9003eb93bab41950efb56ec98af4e4b89f92d2753f9d29a228f321",
+         "9f5ce0e5abac6c9a487a72793625ed3efe967f11b82d8dd35efa0e3dc14a9afa",
+         "4079f6946f084c5477d3d2bcd8497d5ae29b5b8d36a66c0fd2911ccd7b6aa955"),
     }
     require(observed_call_fingerprints in reviewed_call_fingerprints,
             "containment call targets, arguments, or use-site contexts changed")
@@ -3001,16 +3423,18 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     expected_call_root_stores = {
         "after_exit": 2, "budgeted": 1, "cancelled": 1, "character": 6,
         "descendants": 1, "environment": 1, "errors": 2, "expected_slow_counts": 1,
-        "first": 1, "found": 1, "line": 1, "loaded": 1, "matching": 1, "mode": 6,
+        "first": 1, "found": 1, "identities": 1, "kept": 1, "line": 1,
+        "loaded": 1, "matching": 1, "mode": 7,
         "mutations": 1, "orphaned": 1, "parser": 1, "partial": 1, "parts": 1,
         "path": 6, "payload": 2,
         "post_cleanup": 2,
         "process": 3, "property_boundaries": 1, "recovered": 3, "replaced": 1,
         "reset": 1, "result": 5, "results": 1, "sentinel_state": 1, "signature": 4, "slow": 1,
-        "slow_paths": 1, "slow_state": 1, "source": 6, "stale_after_client": 2,
+        "slow_paths": 1, "slow_state": 1, "source": 5, "stale_after_client": 2,
         "stale_observed": 3, "stale_post_cleanup": 3,
         "stale_post_cleanup_cgroup": 2, "stale_program": 1,
-        "state": 17, "stopped": 3, "successful_terminal_state": 1, "text": 8, "values": 2,
+        "state": 17, "stopped": 3, "successful_terminal_state": 1, "text": 8,
+        "value": 15, "values": 3,
         "waiting": 1,
     }
     actual_call_root_stores = {}
@@ -3024,8 +3448,22 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                                              type(parent).__name__, field, ast.dump(parent)))
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
-                in {"b4dc3a95067fe2c2dba7bc61097d8b032f15beb119acbd702c723da69fc43218",
-                    "d3e165d6739578d5914ab1fc17e4a3122c7b69fba82b2496bf0c905d12103399"}
+                in {"049ae2817fbd2bacf89f1efb7a0a2749adbc82cfe6793b46ab69269b11a297fd",
+                    "35c269712dfb27277c12293fb43526b3c119084a519f2a8433e568530f0e07af",
+                    "92325fbe9bfadec6357d2ca5e9478e5a12c6b7e9db7ba68edff016deb362a030",
+                    "5798e627cf5014cdb27979e21bf80dde6edbf97e093e8625e4a63f30b6285e4d",
+                    "dc0aae5b5426d107ac7fe02cfe9be92fbbae2afaa5283a0fdd535262e1457c1e",
+                    "11782b47ac90016bec41c11e7b7515788ca6aa931f3214067a6662f0d92a5c65",
+                    "963ba005a9cf7cfc4019459e72065f5cbc38e81eaa009a6feadaf282a268e22f",
+                    "03d26ff219230a8bff48f6043a9b32dda830188985f7168d500fd8f2e73043fb",
+                    "b4dc3a95067fe2c2dba7bc61097d8b032f15beb119acbd702c723da69fc43218",
+                    "c0fb58f0cbc3413eb12b7c67d016998a13ae32bb7011b4d2d15d16fca6a13ffe",
+                    "8c9a9d005cfe8cdab26c399705b95be3be2572e2261b2d259404090070ee1d60",
+                    "759be258313040aaa5771f6d71d2a68ff2de3c2ed61596ee9f8d63510220fb46",
+                    "a64897465c42d41f67aabf9b0fe6ea01d54afeb57f702371bcba5ba6a9d36d89",
+                    "d3e165d6739578d5914ab1fc17e4a3122c7b69fba82b2496bf0c905d12103399",
+                    "736c9b5a8e87836eb660f8102fe944f814adc5adbae303dbc014dfedd5678a25",
+                    "95414aa17f539723cba5d48ffbefa65592d669ec867dcfaa77899dde7508a869"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -3043,9 +3481,9 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 374, "AugAssign": 2, "Break": 9, "Continue": 6, "Delete": 1,
-        "Expr": 277, "For": 37, "FunctionDef": 53, "If": 175, "Import": 9,
-        "Pass": 5, "Raise": 4, "Return": 59, "Try": 42, "While": 15, "With": 6,
+        "Assign": 420, "AugAssign": 2, "Break": 9, "ClassDef": 1, "Continue": 8,
+        "Delete": 1, "Expr": 298, "For": 44, "FunctionDef": 77, "If": 199,
+        "Import": 12, "Pass": 5, "Raise": 42, "Return": 82, "Try": 61, "While": 15,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -3059,8 +3497,31 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     # The recursive semantic call/module/binding inventories above remain independently required.
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
-                in {"ebfcd16a322c1c012d46afb933c52190b967784a199d990690a44c3f2b29c48e",
-                    "1d65a7f977059995f0dea5d35570cca64e95c8d66fac6f955031a10866d11430"},
+                in {"0673d4566507eebacdf055d5938c880dcf62b6ad5a1e718cda7f895f6879865e",
+                    "32ce581a1c4adf392e0bc4fced83e60db91b2e31850da3b96c893559051ad146",
+                    "8d30efb743830eb157e2162201b4c36c7ac1aceb29c8696718ac47869a2c925b",
+                    "d395275476563815ca9020a28d2754c7e5a7a376797c34eae05b70588ffb445e",
+                    "d6e2400ee070040208b4c44fa523c9e61d4d41114c3841dddb23a3fbad969d79",
+                    "bcaaa35a7233eab3074fe566a5ebf77ecde765e2fbf63b4d8e440f9506b17e10",
+                    "c40668768edf9a53fe42c19e3ca70f9e377783e5b05b972d0e4dd0d0ca4e8c1c",
+                    "ccd2955c161fbfa3ae00c92cad81a088e765a5bfee1b746b174936cce214e35e",
+                    "8a974cb8bab4373b0c9a6b1a87d163371c80b9642a7409968497624e753ed2f8",
+                    "9d1fa45b39bb203ce70fae90814566d9c0a3753bf699773a34920bf6ff7dc9c7",
+                    "9b155537e50c2f0eb1e6069d75fbaa4f571cdd0f0c85999c169c404d3b5d6fec",
+                    "631d852ca433ee317214ed273d3594a5b9ea82427d545024322b770042966efa",
+                    "8b5edf176073404cf66d387ee3e0d7afd50ba1805c0635842563098b893cf371",
+                    "70af22ff2388cc846b55baec0ab68a336444ab3f0b5f5ad56df1f56805885717",
+                    "02fd989a5289fdf82858b2800f27ad08279cdbb5bdf16c42871cd773be19d211",
+                    "ebfcd16a322c1c012d46afb933c52190b967784a199d990690a44c3f2b29c48e",
+                    "0d066f7771f187eb24024429bf4ba81aa42d4b15beb30eac17d0b4f5a40e6622",
+                    "93e5b3c29851892e871d70fd6e57879963d914eedfbe495ead26e0c52c85cc78",
+                    "47bbff9024711a8b196e5e0bb085e6cf4705f682ab6a96842949eccc710dcf4c",
+                    "0139b92f5f1954dc4f9e4499fde08be61fd26e75dbc5b568ab1b67eceb8ca901",
+                    "5897f54d778e9b69be2d01f54f8e7982dde671eea9cf80128d3f63d50fbaec9f",
+                    "8e44902acb3852fe2beb9a17b77f888aec9267534915cce3b4132182efd59e07",
+                    "1d65a7f977059995f0dea5d35570cca64e95c8d66fac6f955031a10866d11430",
+                    "c39553a9aff837822c58f00fe333c62adace4b3cbfe177873351fefc89ecd47a",
+                    "ab7bdc6b21ae1992a00b2ad235b8ad1e27cb603bcfa9b0c5de138dd9a993203c"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -3145,69 +3606,68 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     require(not persistent_binding_violations,
             "containment persistent classification/diagnostic binding has a mutation path")
     require_exact_function(tree, "assert_client_lock_reusable", '''def assert_client_lock_reusable():
-    descriptor = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
+    descriptor = os_call("transaction-lock", "open", "lock", os.open, "/run/nmcp-ci/client.lock",
+                         os.O_RDWR | os.O_NOFOLLOW)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        fail("client lock was not reusable after client exit")
+        if not try_nonblocking_flock(descriptor, "transaction-lock", "lock"):
+            fail("client lock was not reusable after client exit")
     finally:
-        os.close(descriptor)
+        os_call("transaction-lock", "close", "lock", os.close, descriptor)
 ''', "containment client-lock acquisition/release assertion changed")
     require_exact_function(tree, "assert_client_lock_held", '''def assert_client_lock_held():
-    descriptor = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
+    descriptor = os_call("transaction-lock", "open", "lock", os.open, "/run/nmcp-ci/client.lock",
+                         os.O_RDWR | os.O_NOFOLLOW)
     try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not try_nonblocking_flock(descriptor, "transaction-lock", "lock"):
             return
         fail("client released its lock before proving owned unload")
     finally:
-        os.close(descriptor)
+        os_call("transaction-lock", "close", "lock", os.close, descriptor)
 ''', "containment work-budget teardown must prove the client lock remains held")
-    require_exact_function(tree, "assert_client_failure", '''def assert_client_failure(result, mode):
+    require_exact_function(tree, "assert_client_failure", '''def assert_client_failure(result, mode, phase):
     if result.returncode == 0 or SUCCESS in result.stdout:
         fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
-    state = show("LoadState", "ControlGroup")
+    state = show(phase, "LoadState", "ControlGroup")
     if state.get("LoadState") != "not-found":
         fail(f"client fault left the fixed unit loaded: {mode}: {sanitized_state(state)}")
-    if cgroup_pids(state.get("ControlGroup", "")):
+    if cgroup_pids(state.get("ControlGroup", ""), phase):
         fail(f"client fault left control-group processes: {mode}: {sanitized_state(state)}")
-    if cgroup_pids("/system.slice/" + UNIT):
+    if cgroup_pids("/system.slice/" + UNIT, phase):
         fail(f"client fault left processes in the fixed unit cgroup: {mode}")
     assert_client_lock_reusable()
 ''', "containment causal client failure residue/lock assertions changed")
-    require_exact_function(tree, "fast_recovery", '''def fast_recovery(client, repo, commit, go_binary, context):
-    recovered = run(("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
+    require_exact_function(tree, "fast_recovery", '''def fast_recovery(client, repo, commit, go_binary, context, phase):
+    recovered = run(phase, ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                      "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if recovered.returncode or recovered.stdout.count(SUCCESS) != 1:
         fail(f"fast clean recovery failed after {context} with status {recovered.returncode}; "
              f"success_count={recovered.stdout.count(SUCCESS)}")
-    wait_unit_absent()
+    wait_unit_absent(phase)
     assert_client_lock_reusable()
 ''', "containment causal fast recovery assertion changed")
-    require_exact_function(tree, "assert_interception", '''def assert_interception(mode, boundary, *, persistent=False):
+    require_exact_function(tree, "assert_interception", '''def assert_interception(mode, boundary, phase, *, persistent=False):
     intercepted, attempted = fault_paths(mode, boundary)
     minimum = 4 if persistent and boundary in ("show", "wait", "unload") else 2 if persistent else 1
-    if counter(intercepted) < minimum:
+    if counter(phase, intercepted) < minimum:
         fail(f"command path was not intercepted as required: {mode}")
-    attempts = counter(attempted)
+    attempts = counter(phase, attempted)
     if persistent and attempts:
         fail(f"persistent interception reached the real command path: {mode}: {attempts}")
     if not persistent and attempts < 1:
         fail(f"transient interception did not retry the real command path: {mode}")
 ''', "containment interception counters changed")
-    require_exact_function(tree, "cleanup_fixture_invocation", '''def cleanup_fixture_invocation(invocation):
-    state = show("InvocationID", "ActiveState", "ControlGroup")
+    require_exact_function(tree, "cleanup_fixture_invocation", '''def cleanup_fixture_invocation(invocation, phase):
+    state = show(phase, "InvocationID", "ActiveState", "ControlGroup")
     if state["LoadState"] == "not-found":
         return
     if state.get("InvocationID") != invocation:
         fail("persistent-fault cleanup refused a different invocation: "
              + sanitized_state(state))
-    run(("/usr/bin/systemctl", "stop", UNIT),
+    run(phase, ("/usr/bin/systemctl", "stop", UNIT),
         check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     deadline = time.monotonic() + 20
     while True:
-        state = show("InvocationID", "ActiveState")
+        state = show(phase, "InvocationID", "ActiveState")
         if state["LoadState"] == "not-found":
             return
         if state.get("InvocationID") != invocation:
@@ -3217,9 +3677,9 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         if time.monotonic() >= deadline:
             fail("persistent-fault invocation did not terminate: " + sanitized_state(state))
         time.sleep(0.1)
-    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
+    run(phase, ("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    wait_unit_absent()
+    wait_unit_absent(phase)
 ''', "containment stale fixture cleanup must bind the exact InvocationID")
     require_exact_function(tree, "persistent_supervisor_mode", '''def persistent_supervisor_mode(mode):
     boundary = mode.rsplit("-", 1)[1]
@@ -3272,24 +3732,24 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
             continue
         fail(f"persistent launch signature accepted mismatched {label}")
 ''', "containment live launch-signature counterexamples changed")
-    require_exact_function(tree, "signed_launch_state", '''def signed_launch_state(signature):
-    return signed_launch_state_until(signature, time.monotonic() + 10)
+    require_exact_function(tree, "signed_launch_state", '''def signed_launch_state(signature, phase):
+    return signed_launch_state_until(signature, phase, time.monotonic() + 10)
 ''', "containment persistent loaded polls must revalidate the retained full signature")
-    require_exact_function(tree, "cleanup_signed_launch", '''def cleanup_signed_launch(signature):
+    require_exact_function(tree, "cleanup_signed_launch", '''def cleanup_signed_launch(signature, phase):
     deadline = time.monotonic() + 20
-    state = signed_launch_state_until(signature, deadline)
+    state = signed_launch_state_until(signature, phase, deadline)
     if state["LoadState"] == "not-found":
         return
-    state = signed_launch_state_until(signature, deadline)
+    state = signed_launch_state_until(signature, phase, deadline)
     if state["LoadState"] == "not-found":
         return
     timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 20)
-    stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,
+    stopped = run(phase, ("/usr/bin/systemctl", "stop", UNIT), check=False,
                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     if stopped.returncode:
         fail(f"persistent-fault stop failed with status {stopped.returncode}")
     while True:
-        state = signed_launch_state_until(signature, deadline)
+        state = signed_launch_state_until(signature, phase, deadline)
         if state["LoadState"] == "not-found":
             return
         if state.get("ActiveState") in ("failed", "inactive"):
@@ -3298,53 +3758,65 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
             fail("persistent-fault signed launch did not terminate: " + sanitized_state(state))
         time.sleep(0.1)
     deadline = time.monotonic() + 30
-    state = signed_launch_state_until(signature, deadline)
+    state = signed_launch_state_until(signature, phase, deadline)
     if state["LoadState"] == "not-found":
         return
     timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 5)
-    run(("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
+    run(phase, ("/usr/bin/systemctl", "reset-failed", UNIT), check=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     while True:
-        state = signed_launch_state_until(signature, deadline)
+        state = signed_launch_state_until(signature, phase, deadline)
         if state["LoadState"] == "not-found":
             return
         if time.monotonic() >= deadline:
             fail("persistent-fault signed launch did not unload")
         time.sleep(0.1)
 ''', "containment persistent cleanup must revalidate before actions and every loaded poll")
+    require_exact_function(tree, "cleanup_signed_launch_if_owned", '''def cleanup_signed_launch_if_owned(lock_held, signature, state, phase, cleanup):
+    if state.get("LoadState") != "loaded" or not lock_held:
+        return False
+    if signature is None:
+        raise RuntimeError("loaded post-exit unit lacks an attested launch signature")
+    cleanup(signature, phase)
+    return True
+''', "containment external signed cleanup requires loaded, locked, attested ownership")
     contract = (
         'client_faults = (\n        "client-fault-after-launch", "client-fault-missing-invocation",\n        "client-fault-after-invocation", "client-fault-after-properties",\n        "client-fault-at-terminal", "client-fault-after-journal",\n        "client-property-fault-immediate", "client-property-fault-recovery",\n        "client-property-fault-owned",\n    )',
         '"client-property-fault-immediate": "immediate"',
         '"client-property-fault-recovery": "recovery"',
         '"client-property-fault-owned": "owned-state"',
         'for mode in client_faults:',
-        'matching = show("LoadState", "InvocationID", "Description", "Environment", "ExecStart")',
+        '"client-fault", "LoadState", "InvocationID", "Description", "Environment",',
         '"NMCP_VERIFIER_NONCE=" not in matching.get("Environment", "")',
         '"NMCP_VERIFIER_NONCE=" not in matching.get("ExecStart", "")',
         '"matching-nonce adoption fixture lacks the real launched service identity"',
         '"matching-nonce adoption test did not exercise missing initial InvocationID"',
-        'assert_client_failure(faulted, mode)',
-        'fast_recovery(client, repo, commit, go_binary, mode)',
+        'assert_client_failure(faulted, mode, "client-fault")',
+        'fast_recovery(client, repo, commit, go_binary, mode, "client-fault")',
         'for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):',
         'f"intercepted {boundary} command before attempt" not in faulted.stderr',
         'mode = "client-cleanup-persistent-" + boundary',
         'signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)',
         'assert_launch_signature_counterexamples(observed, repo, commit, go_binary, mode)',
-        'after_exit = show("LoadState") if signature is None else signed_launch_state(signature)',
-        'cleanup_signed_launch(signature)',
+        'show("persistent-cleanup", "LoadState") if signature is None',
+        'signed_launch_state(signature, "persistent-cleanup")',
+        'cleanup_signed_launch_if_owned(\n                lock_held, signature, after_exit, "persistent-cleanup", cleanup_signed_launch)',
         'PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"',
         'PERSISTENT_ACTION_ERROR = " command remains unavailable:"',
         'DIAGNOSTIC_TEXT_LIMIT = 512',
         'assert_persistent_failure_contract()',
         'assert_cleanup_deadline_contract()',
         'assert_launch_identity_contract()',
-        'observed = show_identity_until(time.monotonic() + 10)',
-        'state = show_identity_until(deadline, "ActiveState", "ControlGroup")',
+        'observed = show_identity_until("persistent-cleanup", time.monotonic() + 10)',
+        'show_identity_until(phase, deadline, "ActiveState", "ControlGroup")',
         'structured_command_identity(*results)',
         'launch_identity_matches(state, signature)',
         'stale_terminal_matches(',
-        'cleanup_signed_launch_until(stale_signature, cleanup_deadline)',
-        'partial = show_identity_until(cleanup_deadline, "ActiveState", "ControlGroup")',
+        'wait_path("stale-attestation", stale_ready, timeout=30)',
+        'release("stale-attestation", stale_signal_name)',
+        'wait_path("stale-attestation", stale_release_ack, timeout=30)',
+        'cleanup_signed_launch_until(stale_signature, "stale-cleanup", cleanup_deadline)',
+        '"stale-cleanup", cleanup_deadline, "ActiveState", "ControlGroup")',
         'stale_action_error = stale_action_error or bounded_sanitized_repr(error)',
         'and stale_identity_error is None and stale_action_error is None',
         'classification = persistent_failure_classification(faulted.stdout, faulted.stderr)',
@@ -3352,25 +3824,28 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         'for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),',
         '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
         'mode = f"client-signal-{signal_name}-{boundary}"',
-        'os.kill(cancelled.pid, signum)',
+        'os_call("signal-cleanup", "kill", "process", os.kill, cancelled.pid, signum)',
         '"cancelled by signal" not in cancelled_stderr',
         'if result.returncode == 0 or SUCCESS in result.stdout:',
         'state.get("LoadState") != "not-found"',
-        'cgroup_pids("/system.slice/" + UNIT)',
+        'cgroup_pids("/system.slice/" + UNIT, phase)',
         'assert_client_lock_reusable()',
         'for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
-        'f"run-root:{stage}"', 'os.path.exists("/run/nmcp-ci/cleanup-intent.json")',
-        '"containment-supervisor-kill"', 'wait_path(READY)',
+        'f"run-root:{stage}"',
+        'path_exists("intent-window", "cleanup-intent",',
+        '"containment-supervisor-kill"', 'wait_path("preflight", READY)',
         'if not set(descendants) <= set(all_service_pids):',
-        'os.kill(first.pid, signal.SIGKILL)',
+        'os_call("preflight", "kill", "process", os.kill, first.pid, signal.SIGKILL)',
         'orphaned.get("InvocationID") != invocation or orphaned.get("ActiveState") != "active"',
-        'os.kill(main_pid, signal.SIGKILL)',
-        'with open("/run/nmcp-ci/lock-keeper.pid", encoding="ascii") as source:',
+        'os_call("service-death", "kill", "process", os.kill, main_pid, signal.SIGKILL)',
+        'keeper_pid = read_pid("/run/nmcp-ci/lock-keeper.pid", "preflight")',
         'keeper_pid not in all_service_pids or not process_has_inode(',
-        'fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)',
-        '"live in-cgroup lock keeper released the transaction lock"',
+        'assert_keeper_lock_coherent(keeper_pid, (lock_identity.st_dev, lock_identity.st_ino))',
+        '"live matching in-cgroup lock keeper released the transaction lock"',
+        'process_wait("client-death", first, 30)',
         '"second invocation overlapped the live orphaned client service"',
-        'cgroup_pids(state["ControlGroup"]) or any(pid_exists(pid) for pid in all_service_pids)',
+        'cgroup_pids(state["ControlGroup"], "service-death")\n'
+        '            or any(pid_exists(pid, "service-death") for pid in all_service_pids)',
         '"client B did not block behind terminal-state client A"',
         '"client B replaced client A before A unloaded"',
         'for name in ("client-terminal-race-a", "client-terminal-race-a-unloaded",',
@@ -3385,7 +3860,7 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
         'CLEANUP_DATABASE_FAILURE not in retained.stderr',
         'CLEANUP_ROLES_FAILURE not in retained.stderr',
         '"failed retained-dependency cleanup emitted success"',
-        'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
+        'if (recovered.returncode\n            or path_exists(',
         '"retained-dependency recovery did not harden and clean"',
         'for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):',
         'assert_replaced_or_absent(*prior)',
@@ -3419,31 +3894,31 @@ SYSTEMD_UNIT_OBJECT = "/org/freedesktop/systemd1/unit/nmcp_2dmigration_2drole_2d
     budget_mode = f"client-work-budget-{budget_boundary}"
     budget_ready = f"/run/nmcp-ci/{budget_mode}.ready"
     unloaded_ready = f"/run/nmcp-ci/{budget_mode}-unloaded.ready"
-    reset_paths(budget_ready, unloaded_ready,
+    reset_paths("work-budget", budget_ready, unloaded_ready,
                 f"/run/nmcp-ci/{budget_mode}-unloaded.release")
-    budgeted = subprocess.Popen(
+    budgeted = popen("work-budget",
         ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, budget_mode),
         cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    wait_path(budget_ready, timeout=30)
+    wait_path("work-budget", budget_ready, timeout=30)
     budget_started = time.monotonic()
-    wait_path(unloaded_ready, timeout=30)
+    wait_path("work-budget", unloaded_ready, timeout=30)
     budget_elapsed = time.monotonic() - budget_started
-    if show("LoadState", "ControlGroup").get("LoadState") != "not-found":
+    if show("work-budget", "LoadState", "ControlGroup").get("LoadState") != "not-found":
         fail(f"work-budget teardown did not explicitly unload: {budget_boundary}")
-    if cgroup_pids("/system.slice/" + UNIT):
+    if cgroup_pids("/system.slice/" + UNIT, "work-budget"):
         fail(f"work-budget teardown left cgroup processes: {budget_boundary}")
     assert_client_lock_held()
-    release(budget_mode + "-unloaded")
-    budget_stdout, budget_stderr = budgeted.communicate(timeout=30)
+    release("work-budget", budget_mode + "-unloaded")
+    budget_stdout, budget_stderr = process_communicate("work-budget", budgeted, 30)
     budget_result = subprocess.CompletedProcess(budgeted.args, budgeted.returncode,
                                                 budget_stdout, budget_stderr)
-    assert_client_failure(budget_result, budget_mode)
+    assert_client_failure(budget_result, budget_mode, "work-budget")
     if f"absolute client work budget exhausted at {budget_boundary}" not in budget_stderr:
         fail(f"work-budget fault did not exhaust at {budget_boundary}")
     if budget_elapsed < 0.7 or budget_elapsed > 20:
         fail(f"work-budget reserve timing was not bounded: {budget_boundary}: {budget_elapsed:.3f}s")
-    fast_recovery(client, repo, commit, go_binary, budget_mode)
+    fast_recovery(client, repo, commit, go_binary, budget_mode, "work-budget")
 ''').body[0]
     require(len(budget_loops) == 1
             and ast.dump(budget_loops[0]) == ast.dump(expected_budget_loop),
@@ -3458,40 +3933,42 @@ slow_ready = f"/run/nmcp-ci/{slow_mode}.ready"
 slow_unloaded = f"/run/nmcp-ci/{slow_mode}-unloaded.ready"
 slow_paths = {boundary: fault_paths(slow_mode, boundary)
               for boundary in ("show", "kill", "stop")}
-reset_paths(slow_ready, slow_unloaded, f"/run/nmcp-ci/{slow_mode}-unloaded.release",
+reset_paths("slow-cleanup", slow_ready, slow_unloaded, f"/run/nmcp-ci/{slow_mode}-unloaded.release",
             *(path for paths in slow_paths.values() for path in paths))
-slow = subprocess.Popen(
+slow = popen("slow-cleanup",
     ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, slow_mode),
     cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
 )
-wait_path(slow_ready, timeout=30)
+wait_path("slow-cleanup", slow_ready, timeout=30)
 slow_started = time.monotonic()
-wait_path(slow_unloaded, timeout=175)
+wait_path("slow-cleanup", slow_unloaded, timeout=175)
 slow_elapsed = time.monotonic() - slow_started
 expected_slow_counts = {"show": (1, 1), "kill": (2, 0), "stop": (1, 1)}
 for boundary, (expected_intercepted, expected_attempted) in expected_slow_counts.items():
     intercepted, attempted = slow_paths[boundary]
-    if (counter(intercepted), counter(attempted)) != (expected_intercepted, expected_attempted):
+    if (counter("slow-cleanup", intercepted), counter("slow-cleanup", attempted)) != (
+            expected_intercepted, expected_attempted):
         fail(f"slow sequential cleanup evidence changed at {boundary}")
 if slow_elapsed < 25 or slow_elapsed > 175:
     fail(f"slow cleanup delay/retry was not bounded: {slow_elapsed:.3f}s")
-slow_state = show("LoadState", "ControlGroup")
+slow_state = show("slow-cleanup", "LoadState", "ControlGroup")
 if slow_state.get("LoadState") != "not-found":
     fail("slow cleanup did not explicitly unload: " + sanitized_state(slow_state))
-if cgroup_pids(slow_state.get("ControlGroup", "")) or cgroup_pids("/system.slice/" + UNIT):
+if (cgroup_pids(slow_state.get("ControlGroup", ""), "slow-cleanup")
+        or cgroup_pids("/system.slice/" + UNIT, "slow-cleanup")):
     fail("slow cleanup left fixed-unit cgroup processes")
 assert_client_lock_held()
-release(slow_mode + "-unloaded")
-slow_stdout, slow_stderr = slow.communicate(timeout=30)
+release("slow-cleanup", slow_mode + "-unloaded")
+slow_stdout, slow_stderr = process_communicate("slow-cleanup", slow, 30)
 slow_result = subprocess.CompletedProcess(slow.args, slow.returncode,
                                           slow_stdout, slow_stderr)
-assert_client_failure(slow_result, slow_mode)
+assert_client_failure(slow_result, slow_mode, "slow-cleanup")
 if ("absolute client work budget exhausted at slow-cleanup" not in slow_stderr
         or "injected slow owned show failure before action" not in slow_stderr
         or "injected slow owned kill failure before action" not in slow_stderr
         or "injected slow owned stop failure before action" not in slow_stderr):
     fail("slow cleanup lost its work-cutoff or retained cleanup error")
-fast_recovery(client, repo, commit, go_binary, slow_mode)
+fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
 ''').body
     require(len(slow_starts) == 1
             and [ast.dump(node) for node in main_node.body[
@@ -3520,8 +3997,8 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
     stale_run_calls = [node for node in stale_calls if isinstance(node.func, ast.Name)
                        and node.func.id == "run"
                        and any(isinstance(child, ast.Constant)
-                               and child.value == "/usr/bin/systemd-run"
-                               for child in ast.walk(node))]
+                                 and child.value == "/usr/bin/systemd-run"
+                                 for child in ast.walk(node))]
     require(len(stale_nodes) == 41 and len(stale_tries) == 1
             and len(stale_phase_tries) == 1 and bool(stale_phase_tries[0].finalbody)
             and len(stale_run_calls) == 1
@@ -3531,7 +4008,15 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
                     and node.func.id == "cleanup_signed_launch_until"
                     for statement in stale_phase_tries[0].finalbody for node in ast.walk(statement))
             and hashlib.sha256(repr([ast.dump(node) for node in stale_nodes]).encode()).hexdigest()
-                in {"e3f7360ede32bccfe8ab6627fe3e5a9e5a3ecd457959b3425e96fbc7e47dd80b",
+                in {"686755eb0557367fbbc54c7cf4e51f1014bfc795ca65fada633ade44bea9f001",
+                    "0a9d5e996123bb631e1abb54cfed33b66c156df0a65b9a3ae5faea5471d6c632",
+                    "96e77967a8120f608cee6e82710dc3caa458191972d539782c1b9a7660b6af89",
+                    "3634e83eb56d91061b9ae0cda15f7711f8a7ca7164cd6be6bf0aee19b84419af",
+                    "e3f7360ede32bccfe8ab6627fe3e5a9e5a3ecd457959b3425e96fbc7e47dd80b",
+                    "c4a2f99b17215f2b3abb84c80e6e70e7683343bee602f9c8a0374223e3193fc1",
+                    "44b3ded67385ff441f98244bb00be423aa246c927deac1b14cc55272f90e71c1",
+                    "b9b2ed1b8a384d28e3e44a3de9edaa0e6c2b803d369106985def5dbd37b78ef5",
+                    "096540731117a03c72bef00ab0ba0a4ad3668e9f27e631637468b1f8f8872658",
                     "f621abbcb669f1170e20ecda304ea37810013d467abdbeee123c5766c6a1295b"},
             "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
 
@@ -3553,90 +4038,104 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
     intercepted, attempted = fault_paths(mode, boundary)
     handoff_ready = f"/run/nmcp-ci/{mode}.handoff.ready"
     handoff_release = f"/run/nmcp-ci/{mode}.handoff.release"
-    reset_paths(intercepted, attempted, handoff_ready, handoff_release)
-    process = subprocess.Popen(
+    reset_paths("persistent-cleanup", intercepted, attempted, handoff_ready, handoff_release)
+    process = popen("persistent-cleanup",
         ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
         cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     expected_interceptions = 4 if boundary in ("show", "wait", "unload") else 2
-    wait_counter(intercepted, expected_interceptions)
-    wait_path(handoff_ready, timeout=30)
-    observed = show_identity_until(time.monotonic() + 10)
+    wait_counter("persistent-cleanup", intercepted, expected_interceptions)
+    wait_path("persistent-cleanup", handoff_ready, timeout=30)
+    observed = show_identity_until("persistent-cleanup", time.monotonic() + 10)
     signature = None
     if observed["LoadState"] != "not-found":
         signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)
         assert_launch_signature_counterexamples(observed, repo, commit, go_binary, mode)
-    release(mode + ".handoff")
-    fault_stdout, fault_stderr = process.communicate(timeout=60)
+    release("persistent-cleanup", mode + ".handoff")
+    fault_stdout, fault_stderr = process_communicate("persistent-cleanup", process, 60)
     faulted = subprocess.CompletedProcess(process.args, process.returncode,
                                           fault_stdout, fault_stderr)
     classification = persistent_failure_classification(faulted.stdout, faulted.stderr)
     cleanup_error = ""
     try:
-        after_exit = show("LoadState") if signature is None else signed_launch_state(signature)
-    except BaseException:
+        after_exit = (show("persistent-cleanup", "LoadState") if signature is None
+                      else signed_launch_state(signature, "persistent-cleanup"))
+    except BaseException as error:
         after_exit = {"EvidenceError": "post-exit state capture failed"}
-        cleanup_error = "post-exit state capture failed"
+        cleanup_error = retained_diagnostic(error, "post-exit state capture failed")
     cleanup_lock = None
     lock_held = False
     lock_handoff_error = ""
     try:
-        cleanup_lock = os.open("/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
-        fcntl.flock(cleanup_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_held = True
-    except BaseException:
-        lock_handoff_error = "cleanup lock handoff failed"
+        cleanup_lock = os_call("persistent-cleanup", "open", "lock", os.open,
+                               "/run/nmcp-ci/client.lock", os.O_RDWR | os.O_NOFOLLOW)
+        if try_nonblocking_flock(cleanup_lock, "persistent-cleanup", "lock"):
+            lock_held = True
+        else:
+            lock_handoff_error = "cleanup lock handoff failed"
+    except BaseException as error:
+        lock_handoff_error = retained_diagnostic(error, "cleanup lock handoff failed")
     signed_cleanup_ran = False
     try:
-        if after_exit.get("LoadState") != "not-found":
-            if signature is None:
-                raise RuntimeError("loaded post-exit unit lacks an attested launch signature")
-            signed_cleanup_ran = True
-            cleanup_signed_launch(signature)
-    except BaseException:
+        signed_cleanup_ran = cleanup_signed_launch_if_owned(
+            lock_held, signature, after_exit, "persistent-cleanup", cleanup_signed_launch)
+    except BaseException as error:
         cleanup_error = "; ".join(
-            item for item in (cleanup_error, "signed cleanup failed") if item)
+            item for item in (cleanup_error, retained_diagnostic(error, "signed cleanup failed"))
+            if item)
     try:
-        post_cleanup = show_identity_until(time.monotonic() + 10,
+        post_cleanup = show_identity_until("persistent-cleanup", time.monotonic() + 10,
                                            "ActiveState", "ControlGroup")
-    except BaseException:
+    except BaseException as error:
         post_cleanup = {"EvidenceError": "post-cleanup state capture failed"}
         cleanup_error = "; ".join(
-            item for item in (cleanup_error, "post-cleanup state capture failed") if item)
+            item for item in (
+                cleanup_error, retained_diagnostic(error, "post-cleanup state capture failed"))
+            if item)
     try:
-        post_cleanup_cgroup = cgroup_pids("/system.slice/" + UNIT)
-    except BaseException:
+        post_cleanup_cgroup = cgroup_pids(
+            "/system.slice/" + UNIT, "persistent-cleanup")
+    except BaseException as error:
         post_cleanup_cgroup = ["cgroup evidence capture failed"]
         cleanup_error = "; ".join(
-            item for item in (cleanup_error, "cgroup evidence capture failed") if item)
+            item for item in (
+                cleanup_error, retained_diagnostic(error, "cgroup evidence capture failed"))
+            if item)
     finally:
         if cleanup_lock is not None:
             if lock_held:
                 try:
-                    fcntl.flock(cleanup_lock, fcntl.LOCK_UN)
-                except BaseException:
+                    os_call("persistent-cleanup", "flock", "lock", fcntl.flock,
+                            cleanup_lock, fcntl.LOCK_UN)
+                except BaseException as error:
                     cleanup_error = "; ".join(
-                        item for item in (cleanup_error, "lock release failed") if item)
+                        item for item in (
+                            cleanup_error, retained_diagnostic(error, "lock release failed"))
+                        if item)
             try:
-                os.close(cleanup_lock)
-            except BaseException:
+                os_call("persistent-cleanup", "close", "lock", os.close, cleanup_lock)
+            except BaseException as error:
                 cleanup_error = "; ".join(
-                    item for item in (cleanup_error, "lock close failed") if item)
+                    item for item in (
+                        cleanup_error, retained_diagnostic(error, "lock close failed"))
+                    if item)
     lock_reuse_error = ""
     try:
         assert_client_lock_reusable()
-    except BaseException:
-        lock_reuse_error = "client lock reuse check failed"
+    except BaseException as error:
+        lock_reuse_error = retained_diagnostic(error, "client lock reuse check failed")
     if persistent_result_violation(
             faulted.returncode, classification, lock_handoff_error, cleanup_error,
             lock_reuse_error, post_cleanup, post_cleanup_cgroup):
         diagnostics = persistent_failure_diagnostics(
-            mode, boundary, faulted, classification, counter(intercepted), counter(attempted),
+            mode, boundary, faulted, classification,
+            counter("persistent-cleanup", intercepted),
+            counter("persistent-cleanup", attempted),
             signature, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error,
             cleanup_error, lock_reuse_error, post_cleanup_cgroup)
         fail("persistent command result violated failure contract: " + diagnostics)
-    assert_interception(mode, boundary, persistent=True)
-    fast_recovery(client, repo, commit, go_binary, mode)
+    assert_interception(mode, boundary, "persistent-cleanup", persistent=True)
+    fast_recovery(client, repo, commit, go_binary, mode, "persistent-cleanup")
 ''').body[0]
     require(len(persistent_loops) == 1
             and ast.dump(persistent_loops[0]) == ast.dump(expected_persistent),
@@ -3667,22 +4166,22 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
             "containment causal fault families must each assert failure and fast recovery")
     race_fragments = (
         'go_binary, "client-terminal-race-a"),',
-        'wait_path("/run/nmcp-ci/client-terminal-race-a.ready")',
+        'wait_path("terminal-race", "/run/nmcp-ci/client-terminal-race-a.ready")',
         'go_binary, "client-terminal-race-b"),',
-        'wait_path(attempting_b, timeout=30)',
-        'or os.path.exists(acquired_b) or os.path.exists(started_b)',
-        'if show("InvocationID")["InvocationID"] != invocation_a:',
-        'release("client-terminal-race-a")',
-        'wait_path("/run/nmcp-ci/client-terminal-race-a-unloaded.ready", timeout=60)',
-        'if show("LoadState").get("LoadState") != "not-found":',
-        'or os.path.exists(acquired_b) or os.path.exists(started_b)',
-        'release("client-terminal-race-a-unloaded")',
-        'recovered_stdout, recovered_stderr = recovered.communicate(timeout=60)',
-        'wait_path(acquired_b, timeout=60)',
-        'wait_path(started_b, timeout=60)',
-        'wait_path("/run/nmcp-ci/client-terminal-race-b.ready", timeout=60)',
+        'wait_path("terminal-race", attempting_b, timeout=30)',
+        'or path_exists("terminal-race", "marker", acquired_b)',
+        'if show("terminal-race", "InvocationID")["InvocationID"] != invocation_a:',
+        'release("terminal-race", "client-terminal-race-a")',
+        'wait_path("terminal-race", "/run/nmcp-ci/client-terminal-race-a-unloaded.ready", timeout=60)',
+        'if show("terminal-race", "LoadState").get("LoadState") != "not-found":',
+        'or path_exists("terminal-race", "marker", acquired_b)',
+        'release("terminal-race", "client-terminal-race-a-unloaded")',
+        'recovered_stdout, recovered_stderr = process_communicate("terminal-race", recovered, 60)',
+        'wait_path("terminal-race", acquired_b, timeout=60)',
+        'wait_path("terminal-race", started_b, timeout=60)',
+        'wait_path("terminal-race", "/run/nmcp-ci/client-terminal-race-b.ready", timeout=60)',
         'if terminal_b["InvocationID"] == invocation_a:',
-        'release("client-terminal-race-b")',
+        'release("terminal-race", "client-terminal-race-b")',
     )
     race_positions = []
     race_offset = 0
@@ -3695,12 +4194,12 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
             "containment causal terminal two-client serialization race changed")
     reuse_fragments = (
         '"client-reuse-pause")',
-        'wait_path("/run/nmcp-ci/client-reuse-pause.ready", timeout=60)',
+        'wait_path("name-reuse", "/run/nmcp-ci/client-reuse-pause.ready", timeout=60)',
         'replaced_invocation = replaced_a["InvocationID"]',
         'replaced_environment = replaced_a["Environment"]',
         '("/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=KILL", UNIT)',
         '("/usr/bin/systemctl", "reset-failed", UNIT)',
-        'wait_unit_absent()',
+        'wait_unit_absent("name-reuse")',
         'sentinel_nonce = secrets.token_hex(32)',
         '("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec"',
         'f"--description=NMCP migration role verifier {sentinel_nonce}"',
@@ -3708,7 +4207,7 @@ fast_recovery(client, repo, commit, go_binary, slow_mode)
         'sentinel_invocation = sentinel_state["InvocationID"]',
         'sentinel_state.get("Environment") != f"NMCP_VERIFIER_NONCE={sentinel_nonce}"',
         '"reused-name sentinel did not expose its mismatched nonce"',
-        'release("client-reuse-pause")',
+        'release("name-reuse", "client-reuse-pause")',
         'if replaced.returncode == 0 or "launch identity lost" not in replaced.stderr:',
         'if after_replaced["InvocationID"] != sentinel_invocation or after_replaced["ActiveState"] != "active":',
     )
@@ -3864,7 +4363,8 @@ EXPECTED_PATHS = [
     "scripts/render-ubuntu-postgresql-dependency", "scripts/renew-ubuntu-tls",
     "scripts/run-ubuntu-migration", "scripts/run-ubuntu-migration-compatibility",
     "scripts/set-ubuntu-migration-role-mode", "scripts/validate-ubuntu-config",
-    "scripts/verify-ubuntu-deployment", "scripts/verify-ubuntu-config-boundaries",
+    "scripts/verify-ubuntu-deployment", "scripts/verify-ubuntu-diagnostic-fixtures",
+    "scripts/verify-ubuntu-config-boundaries",
     "scripts/verify-ubuntu-firewall", "scripts/verify-ubuntu-firewall-fixtures",
     "scripts/verify-ubuntu-installed-nginx", "scripts/verify-installed-runtime-roles",
     "scripts/verify-ubuntu-migration-lock", "scripts/verify-ubuntu-migration-role-compatibility",
@@ -4106,6 +4606,14 @@ sudo rm -f /tmp/nmcp-deploy-lock-held /tmp/nmcp-orphan-migration-held
 
 
 def replace_once(source: str, old: str, new: str) -> str:
+    if source.count(old) != 1 and "def cgroup_pids(control_group):" in old:
+        old = old.replace("def cgroup_pids(control_group):",
+                          "def cgroup_pids(control_group, phase):")
+        new = new.replace("def cgroup_pids(control_group):",
+                          "def cgroup_pids(control_group, phase):")
+    if source.count(old) != 1 and 'path_exists("cleanup-intent", "cleanup-intent",' in old:
+        old = old.replace('path_exists("cleanup-intent", "cleanup-intent",',
+                          'path_exists("retained-cleanup", "cleanup-intent",')
     require(source.count(old) == 1, f"mutation target is not unique: {old[:40]}")
     return source.replace(old, new, 1)
 
@@ -4129,6 +4637,12 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
         require(expected in str(error), f"{label} failed for the wrong reason: {error}")
         return
     raise RuntimeError(f"validator accepted mutation: {label}")
+
+
+def validate_diagnostic_fixture(source: str) -> None:
+    require(stable_source_digest(source)
+            == "246283ba6033c2c0024820b15e52b3779cdb2426f53fe9529368cfa355ff4618",
+            "diagnostic fixture source snapshot changed")
 
 
 def verify_ubuntu_workflow_mutations(source: str) -> None:
@@ -4382,8 +4896,86 @@ def verify_supervisor_mutations(
             '            detail = sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)',
             '            detail = "; ".join(map(str, cleanup_errors))')),
         ("client top fallback unsanitized", replace_once(client,
-            '        print("verification-client: " + sanitized_diagnostic(error, None), file=sys.stderr)',
+            '        print("verification-client: " + top_level_diagnostic(error), file=sys.stderr)',
             '        print(f"verification-client: {error}", file=sys.stderr)')),
+        ("client OS diagnostic uses raw error", replace_once(client,
+            '    return RuntimeError(\n        f"phase={phase} operation={operation} resource={resource_class} errno={number}")',
+            '    return RuntimeError(str(error))')),
+        ("client diagnostic categories attacker controlled", replace_once(client,
+            '    if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS\n'
+            '            or resource_class not in DIAGNOSTIC_RESOURCES):',
+            '    if False:')),
+        ("client subprocess wrapper mislabeled", replace_once(client,
+            '        raise evidence_failure(phase, "run", "process", error) from None',
+            '        raise evidence_failure("journal", "read", "journal", error) from None')),
+        ("client generic errno-only fallback", replace_once(client,
+            '        return str(evidence_failure("uncategorized", "unknown", "unknown", error))',
+            '        return f"errno={error.errno}"')),
+        ("client blanket cgroup ENOENT acceptance", replace_once(client,
+            '        except FileNotFoundError:\n            try:\n                rechecked = cgroup_stat(phase, root)',
+            '        except FileNotFoundError:\n            return []\n            try:\n                rechecked = cgroup_stat(phase, root)')),
+        ("client cgroup retry bound weakened", replace_once(client,
+            'CGROUP_SNAPSHOT_ATTEMPTS = 4', 'CGROUP_SNAPSHOT_ATTEMPTS = 1')),
+        ("client cgroup root identity check removed", replace_once(client,
+            '            if (after_root.st_dev, after_root.st_ino) != root_anchor:',
+            '            if False:')),
+        ("client cross-attempt root anchor removed", replace_once(client,
+            '            elif root_identity != root_anchor:',
+            '            elif False:')),
+        ("client cgroup category dead", replace_once(client,
+            '    "cgroup", "counter", "directory", "evidence", "helper",',
+            '    "counter", "directory", "evidence", "helper",')),
+        ("client cgroup topology path omitted", replace_once(client,
+            'canonical = tuple(sorted((relative, device, inode)',
+            'canonical = tuple(sorted((device, inode)')),
+        ("client cgroup open wrapper bypassed", replace_once(client,
+            'source = cgroup_open(phase, path)', 'source = open(path, encoding="ascii")')),
+        ("client cgroup procs inode recheck removed", replace_once(client,
+            '                    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):',
+            '                    if False:')),
+        ("client final directory identity recheck removed", replace_once(client,
+            '                if (current.st_dev, current.st_ino) != (device, inode):',
+            '                if False:')),
+        ("client final directory type recheck removed", replace_once(client,
+            '                if not stat.S_ISDIR(current.st_mode):',
+            '                if False:')),
+        ("client legitimate empty cgroup removal rejected", replace_once(client,
+            '                if not residue_seen and previous_absent:',
+            '                if previous is None and previous_absent:')),
+        ("client disappearance accepted after cgroup residue", replace_once(client,
+            '                if not residue_seen and previous_absent:',
+            '                if previous_absent:')),
+        ("client partial cgroup residue sticky update deleted", replace_once(client,
+            '                    residue_seen = residue_seen or bool(parsed)',
+            '                    pass')),
+        ("client partial cgroup residue sticky update delayed", replace_once(
+            replace_once(client,
+                '                    residue_seen = residue_seen or bool(parsed)\n', ''),
+            '            snapshot = (root_identity, canonical, tuple(sorted(set(found))))',
+            '            snapshot = (root_identity, canonical, tuple(sorted(set(found))))\n'
+            '            residue_seen = residue_seen or bool(snapshot[2])')),
+        ("client malformed cgroup pid accepted", replace_once(client,
+            '        except ValueError:\n            fail("unit control group contained malformed process evidence")',
+            '        except ValueError:\n            return []')),
+        ("client counter seek mislabeled", replace_once(client,
+            '        os_call("work", "seek", "evidence", counter.seek, 0)',
+            '        os_call("work", "write", "evidence", counter.seek, 0)')),
+        ("client counter truncate mislabeled", replace_once(client,
+            '        os_call("work", "truncate", "evidence", counter.truncate)',
+            '        os_call("work", "write", "evidence", counter.truncate)')),
+        ("client fdopen failure raw close omitted", replace_once(client,
+            '            os_call("work", "close", "counter", os.close, descriptor)',
+            '            pass')),
+        ("client fdopen transfer double closes descriptor", replace_once(client,
+            '        descriptor = None\n        value = os_call("work", "read", "evidence", counter.read).strip()',
+            '        os_call("work", "close", "counter", os.close, descriptor)\n'
+            '        value = os_call("work", "read", "evidence", counter.read).strip()')),
+        ("client fdopen operation mislabeled", replace_once(client,
+            'counter = os_call("work", "fdopen", "counter", os.fdopen,',
+            'counter = os_call("work", "open", "counter", os.fdopen,')),
+        ("client ownership phase flattened", replace_once(client,
+            '                             "ownership-read", check=False,',
+            '                             "work", check=False,')),
         ("random transient unit", replace_once(client, 'UNIT = "nmcp-migration-role-verifier.service"', 'UNIT = "nmcp-migration-role-verifier-123.service"')),
         ("simple service type", replace_once(client, '"--service-type=exec"', '"--service-type=simple"')),
         ("process-only kill", replace_once(client, '"--property=KillMode=control-group"', '"--property=KillMode=process"')),
@@ -4647,8 +5239,10 @@ def verify_supervisor_mutations(
             '"COMMAND_" + "DEADLINE = None", sys.modules[__name__].__dict__)\n'
             '        if requested_mode == "client-terminal-race-b":')),
         ("deadline established before lock", replace_once(client,
-            '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        total_deadline = time.monotonic() + TOTAL_BUDGET',
-            '        total_deadline = time.monotonic() + TOTAL_BUDGET\n        fcntl.flock(client_lock, fcntl.LOCK_EX)')),
+            '        lock_client(client_lock)\n'
+            '        total_deadline = time.monotonic() + TOTAL_BUDGET',
+            '        total_deadline = time.monotonic() + TOTAL_BUDGET\n'
+            '        lock_client(client_lock)')),
         ("teardown reserve activated after signal mask", replace_once(client,
             '            COMMAND_DEADLINE = cleanup_deadline\n            CLEANUP_ACTIVE = True\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
             '            COMMAND_DEADLINE = cleanup_deadline\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n            CLEANUP_ACTIVE = True')),
@@ -4671,8 +5265,9 @@ def verify_supervisor_mutations(
             '            supervisor_mode = "fast-success"', '            supervisor_mode = ""')),
         ("nonce shortened", replace_once(client, 'nonce = secrets.token_hex(32)', 'nonce = secrets.token_hex(16)')),
         ("nonce generated before lock", replace_once(client,
-            '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n',
-            '        nonce = secrets.token_hex(32)\n        fcntl.flock(client_lock, fcntl.LOCK_EX)\n')),
+            '        lock_client(client_lock)\n',
+            '        nonce = secrets.token_hex(32)\n'
+            '        lock_client(client_lock)\n')),
         ("nonce description omitted", replace_once(client,
             '            f"--description={DESCRIPTION_PREFIX}{nonce}",\n', '')),
         ("nonce environment omitted", replace_once(client,
@@ -4734,7 +5329,9 @@ def verify_supervisor_mutations(
             '\n\ndef unit_properties(*names, context="show"):',
             '\n\ndef successful_terminal_state(state):\n    return True\n\n\ndef unit_properties(*names, context="show"):' )),
         ("journal not invocation scoped", client.replace('f"_SYSTEMD_INVOCATION_ID={invocation}"', '"--since=today"')),
-        ("successful cgroup unchecked", replace_once(client, '            if cgroup_pids(current.get("ControlGroup", "")):', '            if False:')),
+        ("successful cgroup unchecked", replace_once(client,
+            '            if cgroup_pids(current.get("ControlGroup", ""), "work"):',
+            '            if False:')),
         ("owned kill omitted", replace_once(client,
             '                retry_owned_command(invocation, nonce, service_command,\n                                    "kill", "kill", "--kill-whom=all", "--signal=KILL")',
             '                pass')),
@@ -4751,16 +5348,24 @@ def verify_supervisor_mutations(
         ("unload ownership revalidation omitted", client.replace(
             '        state = owned_state(invocation, nonce, service_command, context="unload")',
             '        state = unit_properties("LoadState")', 1)),
-        ("client lock released before launch", replace_once(client, '        publish_supervisor(repo, commit)\n', '        publish_supervisor(repo, commit)\n        os.close(client_lock)\n')),
+        ("client lock released before launch", replace_once(client,
+            '        publish_supervisor(repo, commit)\n',
+            '        publish_supervisor(repo, commit)\n        close_client_lock(client_lock)\n')),
         ("launch outside cleanup try", replace_once(
-            replace_once(client, '                launched = command(service_argv, check=False)', '                launched = launched'),
-            '        result = 1\n        try:', '        result = 1\n        launched = command(service_argv, check=False)\n        try:')),
+            replace_once(client, '                launched = command(service_argv, "launch", check=False)',
+                         '                launched = launched'),
+            '        result = 1\n        try:',
+            '        result = 1\n        launched = command(service_argv, "launch", check=False)\n        try:')),
         ("signals not blocked", client.replace('signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)', 'signal.pthread_sigmask(signal.SIG_UNBLOCK, CANCELLATION_SIGNALS)')),
         ("signal mask not restored", client.replace('signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)', 'signal.pthread_sigmask(signal.SIG_UNBLOCK, previous_mask)')),
         ("QUIT cancellation omitted", replace_once(client, 'signal.SIGHUP, signal.SIGQUIT}', 'signal.SIGHUP}')),
         ("immediate launch identity capture omitted", replace_once(client,
             '                    observed = launch_state(context="immediate")', '                    observed = {}')),
-        ("launch attempt marked too late", replace_once(client, '                launch_attempted = True\n                launched = command(service_argv, check=False)', '                launched = command(service_argv, check=False)\n                launch_attempted = True')),
+        ("launch attempt marked too late", replace_once(client,
+            '                launch_attempted = True\n'
+            '                launched = command(service_argv, "launch", check=False)',
+            '                launched = command(service_argv, "launch", check=False)\n'
+            '                launch_attempted = True')),
         ("launch recovery disabled", replace_once(client, '        launch_attempted = False', '        launch_attempted = None')),
         ("nonzero launch accepted", replace_once(client, '            if launched.returncode:', '            if False:')),
         ("missing launch InvocationID accepted", replace_once(client, '            if invocation is None:\n                fail(f"missing exact invocation identity: {sanitized_state(observed)}")', '            if False:\n                fail(f"missing exact invocation identity: {sanitized_state(observed)}")')),
@@ -4796,13 +5401,21 @@ def verify_supervisor_mutations(
             '            CLEANUP_ACTIVE = True\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
             '            CLEANUP_ACTIVE = True\n            previous_mask = set()')),
         ("cleanup interception moved after action", replace_once(client,
-            '    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])\n    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,\n                     timeout=ACTION_TIMEOUTS[arguments[0]])',
-            '    result = command(("/usr/bin/systemctl", *arguments, UNIT), check=False,\n                     timeout=ACTION_TIMEOUTS[arguments[0]])\n    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])')),
+            '    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])\n'
+            '    result = command(("/usr/bin/systemctl", *arguments, UNIT), "teardown", check=False,\n'
+            '                     timeout=ACTION_TIMEOUTS[arguments[0]])',
+            '    result = command(("/usr/bin/systemctl", *arguments, UNIT), "teardown", check=False,\n'
+            '                     timeout=ACTION_TIMEOUTS[arguments[0]])\n'
+            '    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])')),
         ("cleanup aggregation omitted", replace_once(client,
             '    if errors:\n        raise RuntimeError(\n            sanitized_diagnostic(\n                "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)) from None', '    pass')),
         ("B attempting marker after flock", replace_once(client,
-            '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.attempting")\n        fcntl.flock(client_lock, fcntl.LOCK_EX)',
-            '        fcntl.flock(client_lock, fcntl.LOCK_EX)\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.attempting")')),
+            '        if requested_mode == "client-terminal-race-b":\n'
+            '            durable_marker("client-terminal-race-b.attempting")\n'
+            '        lock_client(client_lock)',
+            '        lock_client(client_lock)\n'
+            '        if requested_mode == "client-terminal-race-b":\n'
+            '            durable_marker("client-terminal-race-b.attempting")')),
         ("B acquired marker before flock", replace_once(client,
             '        COMMAND_DEADLINE = work_deadline\n        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")',
             '        if requested_mode == "client-terminal-race-b":\n            durable_marker("client-terminal-race-b.acquired")\n        COMMAND_DEADLINE = work_deadline')),
@@ -5017,8 +5630,96 @@ def verify_supervisor_mutations(
             '            fail("duplicate key in structured command property")',
             '            fail(f"duplicate key in structured command property: {key}")')),
         ("containment top fallback unsanitized", replace_once(containment,
-            '        print("containment-test: " + bounded_sanitized_repr(error), file=sys.stderr)',
+            '        print("containment-test: " + top_level_diagnostic(error), file=sys.stderr)',
             '        print(f"containment-test: {error}", file=sys.stderr)')),
+        ("containment OS diagnostic uses raw error", replace_once(containment,
+            '    return EvidenceFailure(\n'
+            '        f"phase={phase} operation={operation} resource={resource_class} errno={number}")',
+            '    return EvidenceFailure(str(error))')),
+        ("containment diagnostic categories attacker controlled", replace_once(containment,
+            '    if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS\n'
+            '            or resource_class not in DIAGNOSTIC_RESOURCES):',
+            '    if False:')),
+        ("containment subprocess wrapper removed", replace_once(containment,
+            '    except OSError as error:\n'
+            '        raise evidence_failure(phase, "run", "process", error) from None',
+            '    except OSError:\n        raise')),
+        ("nonblocking contention swallowed by generic wrapper", replace_once(containment,
+            '        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)',
+            '        os_call(phase, "flock", resource_class, fcntl.flock, descriptor,\n'
+            '                fcntl.LOCK_EX | fcntl.LOCK_NB)')),
+        ("arbitrary OSError treated as lock contention", replace_once(containment,
+            '    except BlockingIOError as error:\n'
+            '        if error.errno == errno.EWOULDBLOCK:',
+            '    except OSError as error:\n'
+            '        if error.errno == errno.EWOULDBLOCK:')),
+        ("all BlockingIOError treated as lock contention", replace_once(containment,
+            '        if error.errno == errno.EWOULDBLOCK:\n            return False',
+            '        if True:\n            return False')),
+        ("containment generic errno-only fallback", replace_once(containment,
+            '        return str(evidence_failure("uncategorized", "unknown", "unknown", error))',
+            '        return f"errno={error.errno}"')),
+        ("containment blanket cgroup ENOENT acceptance", replace_once(containment,
+            '        except FileNotFoundError:\n            try:\n                rechecked = cgroup_stat(phase, root)',
+            '        except FileNotFoundError:\n            return []\n            try:\n                rechecked = cgroup_stat(phase, root)')),
+        ("containment cgroup retry bound weakened", replace_once(containment,
+            'CGROUP_SNAPSHOT_ATTEMPTS = 4', 'CGROUP_SNAPSHOT_ATTEMPTS = 1')),
+        ("containment cgroup root identity check removed", replace_once(containment,
+            '            if (after_root.st_dev, after_root.st_ino) != root_anchor:',
+            '            if False:')),
+        ("containment cross-attempt root anchor removed", replace_once(containment,
+            '            elif root_identity != root_anchor:',
+            '            elif False:')),
+        ("containment cgroup category rebound", replace_once(containment,
+            'DIAGNOSTIC_PHASES = (', 'DIAGNOSTIC_PHASES = ("attacker",')),
+        ("containment cgroup topology path omitted", replace_once(containment,
+            'canonical = tuple(sorted((relative, device, inode)',
+            'canonical = tuple(sorted((device, inode)')),
+        ("containment cgroup walk mislabeled", replace_once(containment,
+            'def cgroup_walk_error(phase, error):\n'
+            '    if isinstance(error, FileNotFoundError):\n        raise error\n'
+            '    raise evidence_failure(phase, "walk", "cgroup", error) from None',
+            'def cgroup_walk_error(phase, error):\n'
+            '    if isinstance(error, FileNotFoundError):\n        raise error\n'
+            '    raise evidence_failure(phase, "read", "cgroup", error) from None')),
+        ("containment cgroup procs inode recheck removed", replace_once(containment,
+            '                    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):',
+            '                    if False:')),
+        ("containment final directory identity recheck removed", replace_once(containment,
+            '                if (current.st_dev, current.st_ino) != (device, inode):',
+            '                if False:')),
+        ("containment final directory type recheck removed", replace_once(containment,
+            '                if not stat.S_ISDIR(current.st_mode):',
+            '                if False:')),
+        ("containment legitimate empty cgroup removal rejected", replace_once(containment,
+            '                if not residue_seen and previous_absent:',
+            '                if previous is None and previous_absent:')),
+        ("containment disappearance accepted after cgroup residue", replace_once(containment,
+            '                if not residue_seen and previous_absent:',
+            '                if previous_absent:')),
+        ("containment partial cgroup residue sticky update deleted", replace_once(containment,
+            '                    residue_seen = residue_seen or bool(parsed)',
+            '                    pass')),
+        ("containment partial cgroup residue sticky update delayed", replace_once(
+            replace_once(containment,
+                '                    residue_seen = residue_seen or bool(parsed)\n', ''),
+            '            snapshot = (root_identity, canonical, tuple(sorted(set(found))))',
+            '            snapshot = (root_identity, canonical, tuple(sorted(set(found))))\n'
+            '            residue_seen = residue_seen or bool(snapshot[2])')),
+        ("containment malformed cgroup pid accepted", replace_once(containment,
+            '        except ValueError:\n            fail("unit control group contained malformed process evidence")',
+            '        except ValueError:\n            return []')),
+        ("preflight marker phase omitted", replace_once(containment,
+            'wait_path("preflight", READY)', 'wait_path(READY)')),
+        ("stale marker phase mislabeled", replace_once(containment,
+            'wait_path("stale-attestation", stale_ready, timeout=30)',
+            'wait_path("preflight", stale_ready, timeout=30)')),
+        ("persistent arbitrary diagnostic retained", replace_once(containment,
+            '    return str(error) if isinstance(error, EvidenceFailure) else fallback',
+            '    return str(error)')),
+        ("stale cleanup marker phase flattened", replace_once(containment,
+            'release("stale-cleanup", stale_signal_name)',
+            'release("stale-attestation", stale_signal_name)')),
         ("active nonce replacement omitted", replace_once(containment,
             '    if active_nonce:\n        text = text.replace(active_nonce, "<redacted-nonce>")',
             '    if active_nonce:\n        pass')),
@@ -5043,17 +5744,17 @@ def verify_supervisor_mutations(
             '            parts.append("<redacted-hex64>")',
             '            parts.append(candidate)')),
         ("persistent action classifier rebound after fixture definition", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nPERSISTENT_ACTION_ERROR = ""\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nPERSISTENT_ACTION_ERROR = ""\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent diagnostic bound rebound", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nDIAGNOSTIC_TEXT_LIMIT = 999999\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nDIAGNOSTIC_TEXT_LIMIT = 999999\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent sanitizer builtin shadowed", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nstr = lambda value: value\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nstr = lambda value: value\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent failure sink rebound", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nfail = lambda message: None\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nfail = lambda message: None\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent failure sink decorated replacement", replace_once(containment,
             'def fail(message):\n    raise RuntimeError(message)',
             '@lambda function: (lambda message: None)\n'
@@ -5063,83 +5764,83 @@ def verify_supervisor_mutations(
             'if True:\n    @lambda function: (lambda message: None)\n'
             '    def fail(message):\n        raise RuntimeError(message)')),
         ("persistent classifier code replaced", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\npersistent_failure_classification.__code__ = '
             '(lambda stdout, stderr: {"success_in_stdout": False, '
             '"property_unknown": True, "action_unavailable": True}).__code__\n\n\n'
-            'def run(argv, **kwargs):')),
+            'def run(phase, argv, **kwargs):')),
         ("persistent constant reflected computed setattr", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\ntype(sys.modules[__name__]).__setattr__('
             'sys.modules[__name__], "PERSISTENT_" + "ACTION_ERROR", "")\n\n\n'
-            'def run(argv, **kwargs):')),
+            'def run(phase, argv, **kwargs):')),
         ("persistent classifier reflected globals mutation", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\npersistent_failure_classification.__getattribute__("__globals__")['
-            '"PERSISTENT_" + "ACTION_ERROR"] = ""\n\n\ndef run(argv, **kwargs):')),
+            '"PERSISTENT_" + "ACTION_ERROR"] = ""\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent coupled frame globals replacement", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\nframe_globals = sys._getframe().f_globals\n'
             'frame_globals["persistent_failure_" + "classification"] = '
             'lambda stdout, stderr: {"success_in_stdout": False, '
             '"property_unknown": True, "action_unavailable": True}\n'
             'frame_globals["assert_persistent_" + "failure_contract"] = lambda: None\n\n\n'
-            'def run(argv, **kwargs):')),
+            'def run(phase, argv, **kwargs):')),
         ("persistent coupled builtins exec replacement", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\n__builtins__.exec(\'globals()["persistent_failure_" + "classification"] = '
             'lambda stdout, stderr: {"success_in_stdout": False, "property_unknown": True, '
             '"action_unavailable": True}; globals()["assert_persistent_" + '
-            '"failure_contract"] = lambda: None\')\n\n\ndef run(argv, **kwargs):')),
+            '"failure_contract"] = lambda: None\')\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent imported fcntl function replaced", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nfcntl.flock = lambda *args: None\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nfcntl.flock = lambda *args: None\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent imported os function replaced", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nos.close = lambda descriptor: None\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nos.close = lambda descriptor: None\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent getattr builtins exec replacement", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\nimport builtins\ngetattr(builtins, "exec")(\'globals()["persistent_failure_" '
             '+ "classification"] = lambda stdout, stderr: {"success_in_stdout": False, '
-            '"property_unknown": True, "action_unavailable": True}\')\n\n\ndef run(argv, **kwargs):')),
+            '"property_unknown": True, "action_unavailable": True}\')\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent imported module alias write", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\nfilesystem = os\nfilesystem.close = lambda descriptor: None\n\n\n'
-            'def run(argv, **kwargs):')),
+            'def run(phase, argv, **kwargs):')),
         ("persistent exec callable alias", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\nexecute = exec\nexecute("fcntl.flock = lambda *args: None")\n\n\n'
-            'def run(argv, **kwargs):')),
+            'def run(phase, argv, **kwargs):')),
         ("persistent getattr callable alias namespace write", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\nread_attribute = getattr\nmodule_state = read_attribute(os, "__dict__")\n'
-            'module_state["close"] = lambda descriptor: None\n\n\ndef run(argv, **kwargs):')),
+            'module_state["close"] = lambda descriptor: None\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent extra runpy execution", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nrunpy.run_path("/tmp/unreviewed.py")\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nrunpy.run_path("/tmp/unreviewed.py")\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent nested builtins import execution", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\nif True:\n    import builtins as b\n    expose = b.vars\n'
             '    execute = expose(b)["exec"]\n'
-            '    execute("fcntl.flock = lambda *args: None")\n\n\ndef run(argv, **kwargs):')),
+            '    execute("fcntl.flock = lambda *args: None")\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent top-level generic runner execution", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\nrun(("/usr/bin/python3", "-c", '
             '\'open("/tmp/unreviewed", "w").write("executed")\'))\n\n\n'
-            'def run(argv, **kwargs):')),
+            'def run(phase, argv, **kwargs):')),
         ("persistent executable function default", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\ndef unreviewed(value=open("/tmp/unreviewed", "w")):\n'
-            '    return value\n\n\ndef run(argv, **kwargs):')),
+            '    return value\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent extra module constant", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nUNREVIEWED = "value"\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nUNREVIEWED = "value"\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent module mapping mutation", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nENV["PATH"] = "/tmp"\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nENV["PATH"] = "/tmp"\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent wait counter signature reordered", replace_once(containment,
-            'def wait_counter(path, expected, timeout=30):',
-            'def wait_counter(path, timeout, expected=30):')),
+            'def wait_counter(phase, path, expected, timeout=30):',
+            'def wait_counter(phase, path, timeout, expected=30):')),
         ("persistent ready constant changed", replace_once(containment,
             'READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"',
             'READY = "/tmp/unreviewed.ready"')),
@@ -5170,10 +5871,12 @@ def verify_supervisor_mutations(
             'cwd="/", env=ENV, text=True, **kwargs)',
             'cwd="/", env=environment, text=True, **kwargs)')),
         ("persistent recursive os callee cleanup suppression", replace_once(containment,
-            'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
+            'if (recovered.returncode\n            or path_exists("cleanup-intent", "cleanup-intent",\n'
+            '                           "/run/nmcp-ci/cleanup-intent.json")):',
             'if recovered.returncode or not (os.path.os.system("/bin/true") == 0):')),
         ("persistent walrus os callee cleanup suppression", replace_once(containment,
-            'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
+            'if (recovered.returncode\n            or path_exists("cleanup-intent", "cleanup-intent",\n'
+            '                           "/run/nmcp-ci/cleanup-intent.json")):',
             'if recovered.returncode or not '
             '((path_module := os.path).os.system("/bin/true") == 0):')),
         ("persistent recursive fcntl callee", replace_once(containment,
@@ -5204,7 +5907,8 @@ def verify_supervisor_mutations(
             'def main():\n', 'def main():\n    try:\n        raise RuntimeError("shadow")\n'
             '    except RuntimeError as all:\n        pass\n')),
         ("persistent relocated cleanup intent assertion", replace_once(containment,
-            '    if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
+            '    if (recovered.returncode\n            or path_exists("cleanup-intent", "cleanup-intent",\n'
+            '                           "/run/nmcp-ci/cleanup-intent.json")):\n'
             '        fail("retained-dependency recovery did not harden and clean")',
             '    if False or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
             '        pass\n'
@@ -5212,18 +5916,21 @@ def verify_supervisor_mutations(
             '    if recovered.returncode:\n'
             '        fail("retained-dependency recovery did not harden and clean")')),
         ("persistent padded cleanup intent assertion", replace_once(containment,
-            'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):',
+            'if (recovered.returncode\n            or path_exists("cleanup-intent", "cleanup-intent",\n'
+            '                           "/run/nmcp-ci/cleanup-intent.json")):',
             'if (recovered.returncode or '
             'os.path.exists("/run/nmcp-ci/cleanup-intent.json")) and True:')),
         ("persistent split cleanup intent assertion", replace_once(containment,
-            '    if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
+            '    if (recovered.returncode\n            or path_exists("cleanup-intent", "cleanup-intent",\n'
+            '                           "/run/nmcp-ci/cleanup-intent.json")):\n'
             '        fail("retained-dependency recovery did not harden and clean")',
             '    cleanup_intent_remains = '
             'os.path.exists("/run/nmcp-ci/cleanup-intent.json")\n'
             '    if recovered.returncode or cleanup_intent_remains:\n'
             '        fail("retained-dependency recovery did not harden and clean")')),
         ("persistent alternate cleanup intent branch", replace_once(containment,
-            '    if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):\n'
+            '    if (recovered.returncode\n            or path_exists("cleanup-intent", "cleanup-intent",\n'
+            '                           "/run/nmcp-ci/cleanup-intent.json")):\n'
             '        fail("retained-dependency recovery did not harden and clean")',
             '    if recovered.returncode:\n'
             '        fail("retained-dependency recovery did not harden and clean")\n'
@@ -5235,13 +5942,13 @@ def verify_supervisor_mutations(
             'if replaced_environment == f"NMCP_VERIFIER_NONCE={sentinel_nonce}":',
             'if replaced_environment != f"NMCP_VERIFIER_NONCE={sentinel_nonce}":')),
         ("persistent constant builtins setattr", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
+            '\n\ndef run(phase, argv, **kwargs):',
             '\n\nimport builtins\nbuiltins.setattr('
             'sys.modules[__name__], "PERSISTENT_" + "ACTION_ERROR", "")\n\n\n'
-            'def run(argv, **kwargs):')),
+            'def run(phase, argv, **kwargs):')),
         ("persistent wildcard import binder", replace_once(containment,
-            '\n\ndef run(argv, **kwargs):',
-            '\n\nfrom os import *\n\n\ndef run(argv, **kwargs):')),
+            '\n\ndef run(phase, argv, **kwargs):',
+            '\n\nfrom os import *\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent zero exit asserted before cleanup", replace_once(containment,
             '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
             '        cleanup_error = ""',
@@ -5263,9 +5970,21 @@ def verify_supervisor_mutations(
             '        if not classification["property_unknown"]:\n'
             '            fail("premature unrelated error")\n'
             '        cleanup_error = ""')),
+        ("persistent signed cleanup lock gate removed", replace_once(containment,
+            '    if state.get("LoadState") != "loaded" or not lock_held:\n        return False',
+            '    if state.get("LoadState") != "loaded":\n        return False')),
+        ("persistent signed cleanup lock gate inverted", replace_once(containment,
+            '    if state.get("LoadState") != "loaded" or not lock_held:\n        return False',
+            '    if state.get("LoadState") != "loaded" or lock_held:\n        return False')),
+        ("persistent lock handoff error treated as held", replace_once(containment,
+            '        except BaseException as error:\n'
+            '            lock_handoff_error = retained_diagnostic(error, "cleanup lock handoff failed")',
+            '        except BaseException as error:\n'
+            '            lock_held = True')),
         ("persistent signed external cleanup omitted", replace_once(containment,
-            '                cleanup_signed_launch(signature)',
-            '                pass')),
+            '            signed_cleanup_ran = cleanup_signed_launch_if_owned(\n'
+            '                lock_held, signature, after_exit, "persistent-cleanup", cleanup_signed_launch)',
+            '            signed_cleanup_ran = False')),
         ("persistent lock reuse asserted before cleanup", replace_once(containment,
             '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
             '        cleanup_error = ""',
@@ -5317,11 +6036,11 @@ def verify_supervisor_mutations(
             '    if any(successful_terminal_state(state) for state in rejected_terminal_states):',
             '    if False and any(successful_terminal_state(state) for state in rejected_terminal_states):')),
         ("containment show retries omitted", replace_once(containment,
-            'def show(*properties):\n'
+            'def show(phase, *properties):\n'
             '    requested = tuple(dict.fromkeys(("LoadState", *properties)))\n'
             '    errors = []\n'
             '    for attempt in range(4):',
-            'def show(*properties):\n'
+            'def show(phase, *properties):\n'
             '    requested = tuple(dict.fromkeys(("LoadState", *properties)))\n'
             '    errors = []\n'
             '    for attempt in range(1):')),
@@ -5333,23 +6052,25 @@ def verify_supervisor_mutations(
         ("stale loaded identity change accepted", replace_once(containment,
             '        if not stale_terminal_matches(\n'
             '                stale_after_client, stale_signature, stale_main_pid,\n'
-            '                cgroup_pids(stale_after_client.get("ControlGroup", ""))):',
+            '                cgroup_pids(stale_after_client.get("ControlGroup", ""), "stale-attestation")):',
             '        if False:')),
         ("stale live normalized identity omitted", replace_once(containment,
             '                or not launch_identity_matches(stale_observed, stale_signature)\n',
             '                or False\n')),
         ("stale loaded cleanup omitted", replace_once(containment,
-            '                cleanup_signed_launch_until(stale_signature, cleanup_deadline)',
+            '                cleanup_signed_launch_until(stale_signature, "stale-cleanup", cleanup_deadline)',
             '                pass')),
         ("stale cleanup shared deadline omitted", replace_once(containment,
-            '                cleanup_signed_launch_until(stale_signature, cleanup_deadline)',
-            '                cleanup_signed_launch(stale_signature)')),
+            '                cleanup_signed_launch_until(stale_signature, "stale-cleanup", cleanup_deadline)',
+            '                cleanup_signed_launch(stale_signature, "stale-cleanup")')),
         ("stale cleanup query deadline omitted", replace_once(containment,
-            '                partial = show_identity_until(cleanup_deadline, "ActiveState", "ControlGroup")',
+            '                partial = show_identity_until(\n'
+            '                    "stale-cleanup", cleanup_deadline, "ActiveState", "ControlGroup")',
             '                partial = show_identity("ActiveState", "ControlGroup")')),
         ("stale final post query deadline omitted", replace_once(containment,
-            '            stale_post_cleanup = show_until(cleanup_deadline, "LoadState", "ControlGroup")',
-            '            stale_post_cleanup = show("LoadState", "ControlGroup")')),
+            '            stale_post_cleanup = show_until(\n'
+            '                "stale-cleanup", cleanup_deadline, "LoadState", "ControlGroup")',
+            '            stale_post_cleanup = show("stale-cleanup", "LoadState", "ControlGroup")')),
         ("stale outer retry sleep unbudgeted", replace_once(containment,
             '            except Exception as error:\n'
             '                stale_state_error = bounded_sanitized_repr(error)\n'
@@ -5386,35 +6107,35 @@ def verify_supervisor_mutations(
             '                           stdout=subprocess.PIPE, stderr=subprocess.PIPE))\n'
             '    return structured_command_identity(*results)')),
         ("bounded signed cleanup identity omitted", replace_once(containment,
-            'def signed_launch_state_until(signature, deadline):\n'
-            '    state = show_identity_until(deadline, "ActiveState", "ControlGroup")\n'
+            'def signed_launch_state_until(signature, phase, deadline):\n'
+            '    state = show_identity_until(phase, deadline, "ActiveState", "ControlGroup")\n'
             '    if state.get("LoadState") == "not-found":\n'
             '        return state\n'
             '    if not launch_identity_matches(state, signature):',
-            'def signed_launch_state_until(signature, deadline):\n'
-            '    state = show_identity_until(deadline, "ActiveState", "ControlGroup")\n'
+            'def signed_launch_state_until(signature, phase, deadline):\n'
+            '    state = show_identity_until(phase, deadline, "ActiveState", "ControlGroup")\n'
             '    if state.get("LoadState") == "not-found":\n'
             '        return state\n'
             '    if False:')),
         ("stale stop starts without positive budget", replace_once(containment,
             '    timeout = bounded_cleanup_timeout(deadline - time.monotonic(), 20)\n'
-            '    stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,\n'
+            '    stopped = run(phase, ("/usr/bin/systemctl", "stop", UNIT), check=False,\n'
             '                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
             '    if stopped.returncode:\n'
             '        fail(f"bounded stale stop failed with status {stopped.returncode}")',
             '    timeout = 20\n'
-            '    stopped = run(("/usr/bin/systemctl", "stop", UNIT), check=False,\n'
+            '    stopped = run(phase, ("/usr/bin/systemctl", "stop", UNIT), check=False,\n'
             '                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)\n'
             '    if stopped.returncode:\n'
             '        fail(f"bounded stale stop failed with status {stopped.returncode}")')),
         ("stale active poll loses shared deadline", replace_once(containment,
-            '        state = signed_launch_state_until(signature, deadline)\n'
+            '        state = signed_launch_state_until(signature, phase, deadline)\n'
             '        if state["LoadState"] == "not-found":\n'
             '            return\n'
             '        if state.get("ActiveState") in ("failed", "inactive"):\n'
             '            break\n'
             '        delay = bounded_cleanup_timeout(deadline - time.monotonic(), 0.1)',
-            '        state = signed_launch_state(signature)\n'
+            '        state = signed_launch_state(signature, phase)\n'
             '        if state["LoadState"] == "not-found":\n'
             '            return\n'
             '        if state.get("ActiveState") in ("failed", "inactive"):\n'
@@ -5440,13 +6161,13 @@ def verify_supervisor_mutations(
             '    if reset.returncode:')),
         ("stale unload poll sleep unbudgeted", replace_once(containment,
             '    while True:\n'
-            '        state = signed_launch_state_until(signature, deadline)\n'
+            '        state = signed_launch_state_until(signature, phase, deadline)\n'
             '        if state["LoadState"] == "not-found":\n'
             '            return\n'
             '        delay = bounded_cleanup_timeout(deadline - time.monotonic(), 0.1)\n'
             '        time.sleep(delay)\n\n\ndef pid_exists',
             '    while True:\n'
-            '        state = signed_launch_state_until(signature, deadline)\n'
+            '        state = signed_launch_state_until(signature, phase, deadline)\n'
             '        if state["LoadState"] == "not-found":\n'
             '            return\n'
             '        time.sleep(0.1)\n\n\ndef pid_exists')),
@@ -5457,13 +6178,13 @@ def verify_supervisor_mutations(
             '    return min(remaining, cap)',
             '    return cap')),
         ("stale ready wait omitted", replace_once(containment,
-            '        wait_path(stale_ready, timeout=30)',
+            '        wait_path("stale-attestation", stale_ready, timeout=30)',
             '        stale_ready_seen = True')),
         ("stale release omitted before classification", replace_once(containment,
-            '        release(stale_signal_name)\n        stale_release_seen = True\n'
-            '        wait_path(stale_release_ack, timeout=30)',
+            '        release("stale-attestation", stale_signal_name)\n        stale_release_seen = True\n'
+            '        wait_path("stale-attestation", stale_release_ack, timeout=30)',
             '        stale_release_seen = True\n'
-            '        wait_path(stale_release_ack, timeout=30)')),
+            '        wait_path("stale-attestation", stale_release_ack, timeout=30)')),
         ("stale failure classified before release", replace_once(containment,
             '            if stale_observed.get("ActiveState") == "failed":\n                break',
             '            if stale_observed.get("ActiveState") in ("active", "failed"):\n'
@@ -5483,7 +6204,7 @@ def verify_supervisor_mutations(
             '            if False:\n'
             '                fail("released stale fixed-unit did not reach failed state: "')),
         ("stale cleanup finally disabled", replace_once(containment,
-            '    finally:\n        if not os.path.exists(stale_release):',
+            '    finally:\n        if not path_exists("stale-cleanup", "release", stale_release):',
             '    finally:\n        if False:')),
         ("stale mismatched identity cleanup allowed", replace_once(containment,
             '            if stale_signature is None or not launch_identity_matches(partial, stale_signature):',
@@ -5492,12 +6213,13 @@ def verify_supervisor_mutations(
             '             f"launch_stderr_present={bool(stale_launch_stderr)}; "',
             '             f"launch_stderr={stale_launch_stderr}; "')),
         ("stale signal paths not reset before launch", replace_once(containment,
-            '        reset_paths(stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",\n'
+            '        reset_paths("stale-setup", stale_helper, stale_helper_new, stale_ready, stale_ready + ".new",\n'
             '                    stale_release, stale_release_ack, stale_release_ack + ".new")\n'
             '        stale_helper_descriptor =',
             '        stale_helper_descriptor =')),
         ("stale helper atomic publication omitted", replace_once(containment,
-            '        os.replace(stale_helper_new, stale_helper)',
+            '        os_call("stale-setup", "replace", "helper", os.replace,\n'
+            '                stale_helper_new, stale_helper)',
             '        pass')),
         ("stale ready publication made non-atomic", replace_once(
             replace_once(containment,
@@ -5542,7 +6264,7 @@ def verify_supervisor_mutations(
             '        else:\n'
             '            reset_paths(stale_helper, stale_release)')),
         ("stale release acknowledgment wait omitted", replace_once(containment,
-            '        wait_path(stale_release_ack, timeout=30)',
+            '        wait_path("stale-attestation", stale_release_ack, timeout=30)',
             '        pass')),
         ("stale client stdout capture omitted", replace_once(containment,
             '        stale_rejected_stdout = rejected.stdout',
@@ -5574,21 +6296,23 @@ def verify_supervisor_mutations(
         ("fault unit residue accepted", replace_once(containment,
             '    if state.get("LoadState") != "not-found":', '    if False:')),
         ("fault cgroup residue accepted", replace_once(containment,
-            '    if cgroup_pids("/system.slice/" + UNIT):\n        fail(f"client fault left processes in the fixed unit cgroup: {mode}")',
+            '    if cgroup_pids("/system.slice/" + UNIT, phase):\n'
+            '        fail(f"client fault left processes in the fixed unit cgroup: {mode}")',
             '    if False:\n        pass')),
         ("fault lock reuse unchecked", replace_once(containment,
             '    assert_client_lock_reusable()\n\n\ndef fast_recovery', '    pass\n\n\ndef fast_recovery')),
         ("client lock reuse acquisition omitted", replace_once(containment,
-            '        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)\n    except BlockingIOError:\n        fail("client lock was not reusable after client exit")',
-            '        pass\n    except BlockingIOError:\n        fail("client lock was not reusable after client exit")')),
+            '        if not try_nonblocking_flock(descriptor, "transaction-lock", "lock"):\n'
+            '            fail("client lock was not reusable after client exit")',
+            '        pass')),
         ("fault fast recovery omitted", replace_once(containment,
-            '            if f"intercepted {boundary} command before attempt" not in faulted.stderr:\n                fail(f"property retry did not retain its initial real error: {mode}")\n        fast_recovery(client, repo, commit, go_binary, mode)',
+            '            if f"intercepted {boundary} command before attempt" not in faulted.stderr:\n                fail(f"property retry did not retain its initial real error: {mode}")\n        fast_recovery(client, repo, commit, go_binary, mode, "client-fault")',
             '            if f"intercepted {boundary} command before attempt" not in faulted.stderr:\n                fail(f"property retry did not retain its initial real error: {mode}")\n        pass')),
         ("cleanup fault boundary omitted", containment.replace(
             '("show", "kill", "stop", "wait", "reset", "unload")',
             '("show", "kill", "stop", "wait", "reset")', 1)),
         ("cleanup interception counter weakened", replace_once(containment,
-            '    if counter(intercepted) < minimum:', '    if False:')),
+            '    if counter(phase, intercepted) < minimum:', '    if False:')),
         ("persistent real action accepted", replace_once(containment,
             '    if persistent and attempts:', '    if False:')),
         ("transient real retry not required", replace_once(containment,
@@ -5642,12 +6366,12 @@ def verify_supervisor_mutations(
             '    return {"path": path, "argv": tuple(argv)}',
             '    return {"path": path, "argv": tuple(argv), "runtime": tuple(runtime)}')),
         ("raw ExecStart equality restored", replace_once(containment,
-            'def show_identity_until(deadline, *properties):\n'
-            '    state = show_until(deadline, *IDENTITY_PROPERTIES, *properties)\n'
+            'def show_identity_until(phase, deadline, *properties):\n'
+            '    state = show_until(phase, deadline, *IDENTITY_PROPERTIES, *properties)\n'
             '    if state.get("LoadState") == "loaded":\n'
-            '        state["Command"] = read_structured_command_until(deadline)',
-            'def show_identity_until(deadline, *properties):\n'
-            '    state = show_until(deadline, *IDENTITY_PROPERTIES, "ExecStart", *properties)\n'
+            '        state["Command"] = read_structured_command_until(phase, deadline)',
+            'def show_identity_until(phase, deadline, *properties):\n'
+            '    state = show_until(phase, deadline, *IDENTITY_PROPERTIES, "ExecStart", *properties)\n'
             '    if state.get("LoadState") == "loaded":\n'
             '        state["Command"] = state["ExecStart"]')),
         ("launch identity exact fields ignored", replace_once(containment,
@@ -5699,65 +6423,67 @@ def verify_supervisor_mutations(
         ("persistent property counterexample omitted", replace_once(containment,
             '        "fixed-property": ("KillMode", "process"),\n', '')),
         ("retained signature revalidation omitted", replace_once(containment,
-            'def signed_launch_state(signature):\n'
-            '    return signed_launch_state_until(signature, time.monotonic() + 10)',
-            'def signed_launch_state(signature):\n'
-            '    return show_until(time.monotonic() + 10, "ActiveState", "ControlGroup")')),
+            'def signed_launch_state(signature, phase):\n'
+            '    return signed_launch_state_until(signature, phase, time.monotonic() + 10)',
+            'def signed_launch_state(signature, phase):\n'
+            '    return show_until(phase, time.monotonic() + 10, "ActiveState", "ControlGroup")')),
         ("persistent cleanup unbounded", replace_once(containment,
-            'def cleanup_signed_launch(signature):\n    deadline = time.monotonic() + 20',
-            'def cleanup_signed_launch(signature):\n    deadline = float("inf")')),
+            'def cleanup_signed_launch(signature, phase):\n    deadline = time.monotonic() + 20',
+            'def cleanup_signed_launch(signature, phase):\n    deadline = float("inf")')),
         ("persistent owned cleanup dead", replace_once(containment,
-            '            cleanup_signed_launch(signature)',
-            '            if False:\n                cleanup_signed_launch(signature)')),
+            '    cleanup(signature, phase)',
+            '    if False:\n        cleanup(signature, phase)')),
         ("persistent stop prevalidation omitted", replace_once(containment,
-            '    state = signed_launch_state_until(signature, deadline)\n'
+            '    state = signed_launch_state_until(signature, phase, deadline)\n'
             '    if state["LoadState"] == "not-found":\n'
             '        return\n'
-            '    state = signed_launch_state_until(signature, deadline)',
-            '    state = signed_launch_state_until(signature, deadline)')),
+            '    state = signed_launch_state_until(signature, phase, deadline)',
+            '    state = signed_launch_state_until(signature, phase, deadline)')),
         ("persistent loaded poll revalidation omitted", replace_once(containment,
-            '        state = signed_launch_state_until(signature, deadline)\n'
+            '        state = signed_launch_state_until(signature, phase, deadline)\n'
             '        if state["LoadState"] == "not-found":\n'
             '            return\n'
             '        if state.get("ActiveState") in ("failed", "inactive"):\n'
             '            break\n'
             '        if time.monotonic() >= deadline:',
-            '        state = show_until(deadline, "ActiveState")\n'
+            '        state = show_until(phase, deadline, "ActiveState")\n'
             '        if state.get("ActiveState") in ("failed", "inactive"):\n'
             '            break\n'
             '        if time.monotonic() >= deadline:')),
         ("persistent reset prevalidation omitted", replace_once(containment,
             '    deadline = time.monotonic() + 30\n'
-            '    state = signed_launch_state_until(signature, deadline)\n'
+            '    state = signed_launch_state_until(signature, phase, deadline)\n'
             '    if state["LoadState"] == "not-found":\n'
             '        return',
             '    deadline = time.monotonic() + 30')),
         ("persistent unload poll revalidation omitted", replace_once(containment,
             '    while True:\n'
-            '        state = signed_launch_state_until(signature, deadline)\n'
+            '        state = signed_launch_state_until(signature, phase, deadline)\n'
             '        if state["LoadState"] == "not-found":\n'
             '            return\n'
             '        if time.monotonic() >= deadline:\n'
             '            fail("persistent-fault signed launch did not unload")',
             '    while True:\n'
-            '        state = show_until(deadline, "LoadState")\n'
+            '        state = show_until(phase, deadline, "LoadState")\n'
             '        if state["LoadState"] == "not-found":\n'
             '            return\n'
             '        if time.monotonic() >= deadline:\n'
             '            fail("persistent-fault signed launch did not unload")')),
         ("persistent handoff waits reordered", replace_once(containment,
-            '        wait_counter(intercepted, expected_interceptions)\n        wait_path(handoff_ready, timeout=30)',
-            '        wait_path(handoff_ready, timeout=30)\n        wait_counter(intercepted, expected_interceptions)')),
+            '        wait_counter("persistent-cleanup", intercepted, expected_interceptions)\n'
+            '        wait_path("persistent-cleanup", handoff_ready, timeout=30)',
+            '        wait_path("persistent-cleanup", handoff_ready, timeout=30)\n'
+            '        wait_counter("persistent-cleanup", intercepted, expected_interceptions)')),
         ("persistent handoff wait dead", replace_once(containment,
-            '        wait_path(handoff_ready, timeout=30)',
-            '        if False:\n            wait_path(handoff_ready, timeout=30)')),
+            '        wait_path("persistent-cleanup", handoff_ready, timeout=30)',
+            '        if False:\n            wait_path("persistent-cleanup", handoff_ready, timeout=30)')),
         ("persistent handoff released before attestation", replace_once(containment,
-            '        observed = show_identity_until(time.monotonic() + 10)',
-            '        release(mode + ".handoff")\n'
-            '        observed = show_identity_until(time.monotonic() + 10)')),
+            '        observed = show_identity_until("persistent-cleanup", time.monotonic() + 10)',
+            '        release("persistent-cleanup", mode + ".handoff")\n'
+            '        observed = show_identity_until("persistent-cleanup", time.monotonic() + 10)')),
         ("persistent handoff paths not reset", replace_once(containment,
-            '        reset_paths(intercepted, attempted, handoff_ready, handoff_release)',
-            '        reset_paths(intercepted, attempted)')),
+            '        reset_paths("persistent-cleanup", intercepted, attempted, handoff_ready, handoff_release)',
+            '        reset_paths("persistent-cleanup", intercepted, attempted)')),
         ("work budget boundary omitted", replace_once(containment,
             '    for budget_boundary in ("launch", "service", "journal"):',
             '    for budget_boundary in ("launch", "service",):')),
@@ -5765,23 +6491,25 @@ def verify_supervisor_mutations(
             '            ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, budget_mode),',
             '            ("/usr/bin/false",),')),
         ("work budget unit absence unchecked", replace_once(containment,
-            '        if show("LoadState", "ControlGroup").get("LoadState") != "not-found":',
+            '        if show("work-budget", "LoadState", "ControlGroup").get("LoadState") != "not-found":',
             '        if False:')),
         ("work budget cgroup unchecked", replace_once(containment,
-            '        if cgroup_pids("/system.slice/" + UNIT):\n            fail(f"work-budget teardown left cgroup processes: {budget_boundary}")',
+            '        if cgroup_pids("/system.slice/" + UNIT, "work-budget"):\n'
+            '            fail(f"work-budget teardown left cgroup processes: {budget_boundary}")',
             '        if False:\n            pass')),
         ("work budget client lock unchecked", replace_once(containment,
-            '        assert_client_lock_held()\n        release(budget_mode + "-unloaded")',
-            '        release(budget_mode + "-unloaded")')),
+            '        assert_client_lock_held()\n        release("work-budget", budget_mode + "-unloaded")',
+            '        release("work-budget", budget_mode + "-unloaded")')),
         ("work budget released before state proof", replace_once(containment,
-            '        if show("LoadState", "ControlGroup").get("LoadState") != "not-found":',
-            '        release(budget_mode + "-unloaded")\n        if show("LoadState", "ControlGroup").get("LoadState") != "not-found":')),
+            '        if show("work-budget", "LoadState", "ControlGroup").get("LoadState") != "not-found":',
+            '        release("work-budget", budget_mode + "-unloaded")\n'
+            '        if show("work-budget", "LoadState", "ControlGroup").get("LoadState") != "not-found":')),
         ("work budget failure accepted", replace_once(containment,
-            '        assert_client_failure(budget_result, budget_mode)', '        pass')),
+            '        assert_client_failure(budget_result, budget_mode, "work-budget")', '        pass')),
         ("work budget bound removed", replace_once(containment,
             '        if budget_elapsed < 0.7 or budget_elapsed > 20:', '        if False:')),
         ("work budget fast recovery omitted", replace_once(containment,
-            '        fast_recovery(client, repo, commit, go_binary, budget_mode)', '        pass')),
+            '        fast_recovery(client, repo, commit, go_binary, budget_mode, "work-budget")', '        pass')),
         ("old kill-only slow cleanup test", replace_once(containment,
             '                  for boundary in ("show", "kill", "stop")}',
             '                  for boundary in ("show", "kill")}')),
@@ -5789,11 +6517,11 @@ def verify_supervisor_mutations(
             'expected_slow_counts = {"show": (1, 1), "kill": (2, 0), "stop": (1, 1)}',
             'expected_slow_counts = {"show": (1, 1), "kill": (1, 0), "stop": (1, 1)}')),
         ("slow cleanup wait bound at cleanup budget", replace_once(containment,
-            '    wait_path(slow_unloaded, timeout=175)',
-            '    wait_path(slow_unloaded, timeout=170)')),
+            '    wait_path("slow-cleanup", slow_unloaded, timeout=175)',
+            '    wait_path("slow-cleanup", slow_unloaded, timeout=170)')),
         ("slow cleanup wait bound at cleanup reserve", replace_once(containment,
-            '    wait_path(slow_unloaded, timeout=175)',
-            '    wait_path(slow_unloaded, timeout=180)')),
+            '    wait_path("slow-cleanup", slow_unloaded, timeout=175)',
+            '    wait_path("slow-cleanup", slow_unloaded, timeout=180)')),
         ("slow cleanup elapsed bound at cleanup budget", replace_once(containment,
             '    if slow_elapsed < 25 or slow_elapsed > 175:',
             '    if slow_elapsed < 25 or slow_elapsed > 170:')),
@@ -5804,8 +6532,8 @@ def verify_supervisor_mutations(
             '            or "injected slow owned stop failure before action" not in slow_stderr):',
             '            or False):')),
         ("slow cleanup lock proof omitted", replace_once(containment,
-            '    assert_client_lock_held()\n    release(slow_mode + "-unloaded")',
-            '    release(slow_mode + "-unloaded")')),
+            '    assert_client_lock_held()\n    release("slow-cleanup", slow_mode + "-unloaded")',
+            '    release("slow-cleanup", slow_mode + "-unloaded")')),
         ("signal matrix signal omitted", replace_once(containment,
             '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
             '("hup", signal.SIGHUP)):' )),
@@ -5814,21 +6542,47 @@ def verify_supervisor_mutations(
             '("kill", "stop", "wait", "reset")', 2)),
         ("signal cancellation evidence omitted", replace_once(containment,
             '            if "cancelled by signal" not in cancelled_stderr:', '            if False:')),
-        ("client death omitted", replace_once(containment, 'os.kill(first.pid, signal.SIGKILL)', 'first.terminate()')),
-        ("supervisor SIGKILL softened", replace_once(containment, 'os.kill(main_pid, signal.SIGKILL)', 'os.kill(main_pid, signal.SIGTERM)')),
+        ("client death omitted", replace_once(containment,
+            'os_call("preflight", "kill", "process", os.kill, first.pid, signal.SIGKILL)',
+            'first.terminate()')),
+        ("client death wait phase flattened", replace_once(containment,
+            'process_wait("client-death", first, 30)',
+            'process_wait("preflight", first, 30)')),
+        ("supervisor SIGKILL softened", replace_once(containment,
+            'os_call("service-death", "kill", "process", os.kill, main_pid, signal.SIGKILL)',
+            'os_call("service-death", "kill", "process", os.kill, main_pid, signal.SIGTERM)')),
         ("nested cgroup evidence omitted", replace_once(containment, 'if not set(descendants) <= set(all_service_pids):', 'if False:')),
         ("overlap accepted", replace_once(containment, 'fail("second invocation overlapped the live orphaned client service")', 'pass')),
-        ("lock survival omitted", replace_once(containment, 'fail("live in-cgroup lock keeper released the transaction lock")', 'pass')),
+        ("lock survival omitted", replace_once(containment, 'fail("live matching in-cgroup lock keeper released the transaction lock")', 'pass')),
+        ("keeper live inode recheck omitted", replace_once(containment,
+            '        if (lock_transaction(lock)\n'
+            '                and process_has_inode(keeper_pid, expected, "service-death")):',
+            '        if lock_transaction(lock):')),
+        ("keeper liveness recheck omitted", replace_once(containment,
+            '    if not pid_exists(keeper_pid, "service-death"):\n        return',
+            '    if False:\n        return')),
+        ("post-teardown transaction lock acquisition omitted", replace_once(containment,
+            '        if not lock_transaction(lock):\n'
+            '            fail("transaction lock remained held after containment teardown")',
+            '        if False:\n'
+            '            fail("transaction lock remained held after containment teardown")')),
         ("terminal client B not blocked", replace_once(containment, 'fail("client B did not block behind terminal-state client A")', 'pass')),
-        ("terminal B acquired marker ignored", containment.replace(' or os.path.exists(acquired_b)', '', 1)),
-        ("terminal B started marker ignored", containment.replace(' or os.path.exists(started_b)', '', 1)),
+        ("terminal B acquired marker ignored", containment.replace(
+            ' or path_exists("terminal-race", "marker", acquired_b)', '', 1)),
+        ("terminal B started marker ignored", containment.replace(
+            ' or path_exists("terminal-race", "marker", started_b)', '', 1)),
         ("terminal unit replaced early", replace_once(containment, 'fail("client B replaced client A before A unloaded")', 'pass')),
-        ("terminal post-unload pause omitted", replace_once(containment, 'wait_path("/run/nmcp-ci/client-terminal-race-a-unloaded.ready", timeout=60)', 'time.sleep(0.1)')),
+        ("terminal post-unload pause omitted", replace_once(containment,
+            'wait_path("terminal-race", "/run/nmcp-ci/client-terminal-race-a-unloaded.ready", timeout=60)',
+            'time.sleep(0.1)')),
         ("terminal unload state unchecked", replace_once(containment, 'fail("client A reported teardown before the fixed name unloaded")', 'pass')),
         ("terminal B post-unload block unchecked", replace_once(containment, 'fail("client B acquired client.lock before A confirmed unload")', 'pass')),
-        ("terminal A lock released early", replace_once(containment, 'release("client-terminal-race-a-unloaded")', 'pass')),
+        ("terminal A lock released early", replace_once(containment,
+            'release("terminal-race", "client-terminal-race-a-unloaded")', 'pass')),
         ("terminal invocation reused", replace_once(containment, 'fail("client B did not launch a distinct post-unload invocation")', 'pass')),
-        ("terminal A completion not awaited", replace_once(containment, 'recovered_stdout, recovered_stderr = recovered.communicate(timeout=60)', 'recovered_stdout, recovered_stderr = "", ""')),
+        ("terminal A completion not awaited", replace_once(containment,
+            'recovered_stdout, recovered_stderr = process_communicate("terminal-race", recovered, 60)',
+            'recovered_stdout, recovered_stderr = "", ""')),
         ("reuse ownership loss accepted", replace_once(containment, 'fail("client did not fail safely after fixed-name ownership loss")', 'pass')),
         ("reuse sentinel touch accepted", replace_once(containment, 'fail("old client teardown touched the reused-name sentinel")', 'pass')),
         ("reuse sentinel nonce unchecked", replace_once(containment,
@@ -5844,7 +6598,10 @@ def verify_supervisor_mutations(
         ("cleanup failure evidence weakened", replace_once(containment,
             'CLEANUP_DATABASE_FAILURE not in retained.stderr\n            or CLEANUP_ROLES_FAILURE not in retained.stderr',
             'CLEANUP_DATABASE_FAILURE not in retained.stderr')),
-        ("retained recovery accepted", replace_once(containment, 'if recovered.returncode or os.path.exists("/run/nmcp-ci/cleanup-intent.json"):', 'if False:')),
+        ("retained recovery accepted", replace_once(containment,
+            'if (recovered.returncode\n            or path_exists("cleanup-intent", "cleanup-intent",\n'
+            '                           "/run/nmcp-ci/cleanup-intent.json")):',
+            'if False:')),
     ]
     runtime_valid_containment_mutations = {
         "persistent coupled builtins exec replacement",
@@ -6037,6 +6794,7 @@ def main() -> int:
         ROOT / "scripts" / "verify-ubuntu-migration-role-supervisor",
         ROOT / "scripts" / "verify-ubuntu-migration-role-client",
         ROOT / "scripts" / "verify-ubuntu-migration-role-containment",
+        ROOT / "scripts" / "verify-ubuntu-diagnostic-fixtures",
     ]
     for script in python_scripts:
         require(os.access(script, os.X_OK), f"{script.name} is not executable")
@@ -6132,6 +6890,23 @@ def main() -> int:
     supervisor = text(ROOT / "scripts" / "verify-ubuntu-migration-role-supervisor")
     client = text(ROOT / "scripts" / "verify-ubuntu-migration-role-client")
     containment = text(ROOT / "scripts" / "verify-ubuntu-migration-role-containment")
+    diagnostic_fixture_path = ROOT / "scripts" / "verify-ubuntu-diagnostic-fixtures"
+    diagnostic_fixture = text(diagnostic_fixture_path)
+    require(stat.S_IMODE(diagnostic_fixture_path.stat().st_mode) == 0o755,
+            "diagnostic fixture executable mode changed")
+    validate_diagnostic_fixture(diagnostic_fixture)
+    dead_fdopen_fixture = replace_once(
+        diagnostic_fixture,
+        "    actual_boundary_cases(client, containment)",
+        "    if False:\n        actual_boundary_cases(client, containment)")
+    expect_rejected(validate_diagnostic_fixture, dead_fdopen_fixture,
+                    "fdopen causal fixture call is dead", "source snapshot changed")
+    dead_lock_gate_fixture = replace_once(
+        diagnostic_fixture,
+        "    signed_cleanup_lock_cases(containment)",
+        "    if False:\n        signed_cleanup_lock_cases(containment)")
+    expect_rejected(validate_diagnostic_fixture, dead_lock_gate_fixture,
+                    "signed cleanup lock fixture call is dead", "source snapshot changed")
     role_mode = text(ROOT / "scripts" / "set-ubuntu-migration-role-mode")
     validate_runtime_helper(runtime_verifier_helper)
     validate_stage_verifier(stage_verifier)
@@ -6143,6 +6918,7 @@ def main() -> int:
         ROOT / "scripts" / "verify-ubuntu-migration-role-client",
         ROOT / "scripts" / "verify-ubuntu-migration-role-containment",
     )
+    run((str(diagnostic_fixture_path),))
     validate_fd_wrappers(migration_compatibility, role_mode)
     verify_supervisor_mutations(
         supervisor,

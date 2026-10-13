@@ -1,0 +1,637 @@
+#!/usr/bin/env python3
+"""Unprivileged causal fixtures for closed diagnostics and cgroup snapshots."""
+
+import errno
+import os
+import pathlib
+import runpy
+import stat
+import subprocess
+import types
+
+
+ROOT = pathlib.Path(__file__).resolve().parent
+CLIENT_PATH = ROOT / "verify-ubuntu-migration-role-client"
+CONTAINMENT_PATH = ROOT / "verify-ubuntu-migration-role-containment"
+SECRET = "nonce-0123456789abcdef" * 4
+HOSTILE_PATH = "/hostile/" + SECRET
+HOSTILE_ARGV = ("/hostile/program", "--secret=" + SECRET)
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def injected(number=errno.EACCES):
+    error = OSError(number, "hostile " + SECRET, HOSTILE_PATH)
+    error.filename2 = "second-" + SECRET
+    return error
+
+
+def assert_safe(error, expected):
+    rendered = str(error)
+    require(rendered == expected, f"wrong closed diagnostic: {rendered!r}")
+    require("\n" not in rendered and len(rendered) < 128, "diagnostic is multiline or unbounded")
+    require(SECRET not in rendered and HOSTILE_PATH not in rendered
+            and not any(argument in rendered for argument in HOSTILE_ARGV),
+            "diagnostic leaked injected state")
+
+
+def assert_raises(function, expected):
+    try:
+        function()
+    except RuntimeError as error:
+        assert_safe(error, expected)
+    else:
+        raise RuntimeError("injected boundary unexpectedly succeeded")
+
+
+def assert_fails_with(function, expected):
+    try:
+        function()
+    except RuntimeError as error:
+        require(str(error) == expected, f"wrong causal failure: {error!s}")
+    else:
+        raise RuntimeError("causal fixture unexpectedly succeeded")
+
+
+class FakeFile:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def fileno(self):
+        return 91
+
+    def read(self):
+        return self.payload
+
+    def close(self):
+        return None
+
+
+class FakeCounter(FakeFile):
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.close_calls = 0
+
+    def seek(self, _offset):
+        return 0
+
+    def truncate(self):
+        return 0
+
+    def write(self, value):
+        return len(value)
+
+    def flush(self):
+        return None
+
+    def close(self):
+        self.close_calls += 1
+        return None
+
+
+def directory(inode):
+    return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_dev=7, st_ino=inode)
+
+
+def regular(inode=20):
+    return types.SimpleNamespace(st_mode=stat.S_IFREG | 0o444, st_dev=7, st_ino=inode)
+
+
+def cgroup_case(namespace, kind):
+    function = namespace["cgroup_pids"]
+    globals_ = function.__globals__
+    module_os = globals_["os"]
+    original_open = globals_.get("open")
+    originals = module_os.lstat, module_os.walk, module_os.fstat
+    root_calls = 0
+    open_calls = 0
+    walk_calls = 0
+    read_calls = 0
+    child_calls = 0
+    fstat_calls = 0
+    phase = "prelaunch" if "prelaunch" in namespace["DIAGNOSTIC_PHASES"] else "preflight"
+
+    def fake_lstat(path):
+        nonlocal root_calls, child_calls
+        if path.endswith("/fixture"):
+            root_calls += 1
+            if kind == "initial-root-nondirectory" and root_calls == 1:
+                return regular(10)
+            if kind == "root-becomes-nondirectory" and root_calls == 3:
+                return regular(10)
+            if kind == "root-disappears" and root_calls > 1:
+                raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+            if kind == "same-attempt-root-reuse" and root_calls >= 3:
+                return directory(99)
+            if kind == "cross-attempt-root-reuse" and root_calls >= 5:
+                return directory(99)
+            if kind == "transient-root-residue" and root_calls in (5, 6):
+                raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+            if kind == "two-absent-root-observations" and root_calls in (5, 6, 7, 8):
+                raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+            if kind in ("empty-root-removal", "residue-root-removal") and root_calls >= 5:
+                raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+            if kind == "partial-residue-root-removal" and root_calls >= 3:
+                raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+            return directory(10)
+        if path.endswith("/child"):
+            child_calls += 1
+            if kind == "final-directory-recheck-mismatch" and child_calls == 3:
+                return directory(99)
+            if kind == "directory-becomes-nondirectory" and child_calls == 3:
+                return regular(11)
+            return directory(11)
+        if kind == "child-disappears" and path.endswith("/gone"):
+            raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+        if kind == "nondirectory-child" and path.endswith("/bad"):
+            return regular(31)
+        return directory(11)
+
+    def fake_walk(root, **kwargs):
+        nonlocal walk_calls
+        del kwargs
+        walk_calls += 1
+        if kind == "reordered-topology":
+            children = ((root + "/a", [], ["cgroup.procs"]),
+                        (root + "/b", [], ["cgroup.procs"]))
+            return iter(((root, ["a", "b"], []), *(children if walk_calls % 2 else reversed(children))))
+        if kind == "renamed-same-inode":
+            name = "a" if walk_calls == 1 else "b"
+            return iter(((root, [name], []), (root + "/" + name, [], ["cgroup.procs"])))
+        if kind == "child-disappears":
+            return iter(((root, ["gone"], []),))
+        if kind == "nondirectory-child":
+            return iter(((root, ["bad"], []),))
+        if kind in ("final-directory-recheck-mismatch", "directory-becomes-nondirectory"):
+            return iter(((root, ["child"], []),
+                         (root + "/child", [], ["cgroup.procs"])))
+        return iter(((root, [], ["cgroup.procs"]),))
+
+    def fake_open(_path, **_kwargs):
+        nonlocal open_calls, read_calls
+        open_calls += 1
+        if (kind in ("root-disappears", "file-disappears")
+                or kind == "cross-attempt-root-reuse" and open_calls == 1):
+            raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+        if kind == "transient-file-residue" and open_calls == 1:
+            raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+        if kind == "changing-pids":
+            read_calls += 1
+            return FakeFile("17\n" if read_calls == 1 else "23\n")
+        if kind == "malformed-pids":
+            return FakeFile("17 hostile\n")
+        return FakeFile("17 23\n" if kind in (
+            "residue", "transient-file-residue", "transient-root-residue",
+            "two-absent-root-observations", "residue-root-removal",
+            "partial-residue-root-removal") else "")
+
+    def fake_fstat(_descriptor):
+        nonlocal fstat_calls
+        fstat_calls += 1
+        if kind == "before-after-fstat-mismatch":
+            return regular(20 if fstat_calls % 2 else 21)
+        return regular()
+
+    module_os.lstat = fake_lstat
+    module_os.walk = fake_walk
+    module_os.fstat = fake_fstat
+    globals_["open"] = fake_open
+    try:
+        if kind == "root-disappears":
+            require(function("/fixture", phase) == [], "disappeared root was not valid empty")
+        elif kind == "empty-root-removal":
+            require(function("/fixture", phase) == [],
+                    "confirmed removal after an empty snapshot was not valid empty")
+            require(root_calls >= 8,
+                    "empty root removal was not confirmed by two absent observations")
+        elif kind == "residue-root-removal":
+            assert_raises(lambda: function("/fixture", phase),
+                          f"phase={phase} operation=walk resource=evidence errno=11")
+            require(open_calls == 1,
+                    "nonempty residue was not observed before permanent root removal")
+        elif kind == "partial-residue-root-removal":
+            assert_raises(lambda: function("/fixture", phase),
+                          f"phase={phase} operation=walk resource=evidence errno=11")
+            require(open_calls == 1 and root_calls >= 10,
+                    "partial PID evidence was not preserved through permanent root removal")
+        elif kind in ("residue", "transient-root-residue", "two-absent-root-observations"):
+            observed = function("/fixture", phase)
+            require(observed == [17, 23],
+                    f"nonempty cgroup residue was lost: {kind}:{phase}:{observed}:{root_calls}")
+        elif kind == "file-disappears":
+            assert_raises(lambda: function("/fixture", phase),
+                          f"phase={phase} operation=walk resource=evidence errno=11")
+            require(root_calls >= namespace["CGROUP_SNAPSHOT_ATTEMPTS"] * 2,
+                    "persistent file disappearance was not retried to the bound")
+        elif kind in ("cross-attempt-root-reuse", "same-attempt-root-reuse",
+                      "renamed-same-inode", "before-after-fstat-mismatch",
+                      "final-directory-recheck-mismatch"):
+            assert_raises(lambda: function("/fixture", phase),
+                          f"phase={phase} operation=stat resource=evidence errno=116")
+        elif kind == "initial-root-nondirectory":
+            assert_fails_with(lambda: function("/fixture", phase),
+                              "unit control group is not a directory")
+        elif kind == "root-becomes-nondirectory":
+            assert_fails_with(lambda: function("/fixture", phase),
+                              "unit control group changed type")
+        elif kind == "directory-becomes-nondirectory":
+            assert_fails_with(lambda: function("/fixture", phase),
+                              "unit control group traversal changed type")
+        elif kind == "malformed-pids":
+            assert_fails_with(lambda: function("/fixture", phase),
+                              "unit control group contained malformed process evidence")
+        elif kind in ("reordered-topology", "nondirectory-child"):
+            require(function("/fixture", phase) == [], f"{kind} did not stabilize safely")
+        elif kind == "transient-file-residue":
+            require(function("/fixture", phase) == [17, 23],
+                    "transient cgroup.procs disappearance lost stable residue")
+        elif kind == "changing-pids":
+            require(function("/fixture", phase) == [23], "changing PIDs did not stabilize")
+        elif kind == "child-disappears":
+            assert_raises(lambda: function("/fixture", phase),
+                          f"phase={phase} operation=walk resource=evidence errno=11")
+    finally:
+        module_os.lstat, module_os.walk, module_os.fstat = originals
+        if original_open is None:
+            del globals_["open"]
+        else:
+            globals_["open"] = original_open
+
+
+def diagnostic_cases(client, containment):
+    hostile = injected()
+    for operation in ("open", "read", "stat", "replace", "write", "fsync"):
+        assert_raises(
+            lambda operation=operation: client["os_call"](
+                "source-publication", operation, "helper",
+                lambda: (_ for _ in ()).throw(hostile)),
+            f"phase=source-publication operation={operation} resource=helper errno=13")
+    assert_safe(client["evidence_failure"](SECRET, SECRET, SECRET, hostile),
+                "phase=uncategorized operation=unknown resource=unknown errno=13")
+
+    original_run = subprocess.run
+    try:
+        subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected(errno.ENOENT))
+        assert_raises(lambda: client["command"](HOSTILE_ARGV, "launch"),
+                      "phase=launch operation=run resource=process errno=2")
+        assert_raises(lambda: containment["run"]("client-fault", HOSTILE_ARGV),
+                      "phase=client-fault operation=run resource=process errno=2")
+    finally:
+        subprocess.run = original_run
+
+    original_popen = subprocess.Popen
+    try:
+        subprocess.Popen = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected(errno.ENOEXEC))
+        assert_raises(lambda: containment["popen"]("client-fault", HOSTILE_ARGV),
+                      "phase=client-fault operation=popen resource=process errno=8")
+        assert_raises(lambda: client["bounded_journal_evidence"](SECRET),
+                      "phase=journal operation=popen resource=journal errno=8")
+    finally:
+        subprocess.Popen = original_popen
+
+    original_run_path = runpy.run_path
+    try:
+        runpy.run_path = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected(errno.EIO))
+        assert_raises(lambda: containment["assert_property_parser_contract"](HOSTILE_PATH),
+                      "phase=runpy operation=read resource=client errno=5")
+    finally:
+        runpy.run_path = original_run_path
+
+    assert_safe(client["top_level_diagnostic"](injected(errno.EIO)),
+                "phase=uncategorized operation=unknown resource=unknown errno=5")
+    assert_safe(containment["top_level_diagnostic"](injected(errno.EIO)),
+                "phase=uncategorized operation=unknown resource=unknown errno=5")
+
+    categorized = containment["evidence_failure"](
+        "persistent-cleanup", "read", "evidence", hostile)
+    require(containment["retained_diagnostic"](categorized, "capture failed") ==
+            "phase=persistent-cleanup operation=read resource=evidence errno=13",
+            "typed diagnostic was not retained")
+    require(containment["retained_diagnostic"](
+        RuntimeError("hostile " + SECRET), "capture failed") == "capture failed",
+        "arbitrary diagnostic detail was retained")
+def cgroup_boundary_cases(namespace):
+    function = namespace["cgroup_pids"]
+    globals_ = function.__globals__
+    module_os = globals_["os"]
+    original_open = globals_.get("open")
+    originals = module_os.lstat, module_os.walk, module_os.fstat
+    phase = "prelaunch" if "prelaunch" in namespace["DIAGNOSTIC_PHASES"] else "preflight"
+    hostile = injected()
+    try:
+        module_os.lstat = lambda *_args: (_ for _ in ()).throw(hostile)
+        assert_raises(lambda: namespace["cgroup_stat"](phase, "/fixture"),
+                      f"phase={phase} operation=stat resource=cgroup errno=13")
+
+        module_os.walk = lambda *_args, **_kwargs: (_ for _ in ()).throw(hostile)
+        assert_raises(lambda: list(namespace["cgroup_walk"](phase, "/fixture")),
+                      f"phase={phase} operation=walk resource=cgroup errno=13")
+        assert_raises(lambda: namespace["cgroup_walk_error"](phase, hostile),
+                      f"phase={phase} operation=walk resource=cgroup errno=13")
+
+        globals_["open"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(hostile)
+        assert_raises(lambda: namespace["cgroup_open"](phase, "/fixture/cgroup.procs"),
+                      f"phase={phase} operation=open resource=cgroup errno=13")
+
+        source = FakeFile("")
+        module_os.fstat = lambda *_args: (_ for _ in ()).throw(hostile)
+        assert_raises(lambda: namespace["cgroup_fstat"](phase, source),
+                      f"phase={phase} operation=stat resource=evidence errno=13")
+        source.read = lambda: (_ for _ in ()).throw(hostile)
+        assert_raises(lambda: namespace["cgroup_read"](phase, source),
+                      f"phase={phase} operation=read resource=evidence errno=13")
+        source.close = lambda: (_ for _ in ()).throw(hostile)
+        assert_raises(lambda: namespace["cgroup_close"](phase, source),
+                      f"phase={phase} operation=close resource=evidence errno=13")
+    finally:
+        module_os.lstat, module_os.walk, module_os.fstat = originals
+        if original_open is None:
+            del globals_["open"]
+        else:
+            globals_["open"] = original_open
+
+
+def explicit_marker_phase_cases(containment):
+    globals_ = containment["wait_path"].__globals__
+    module_os = globals_["os"]
+    original_stat = module_os.stat
+    original_open = module_os.open
+    wait_cases = (
+        ("preflight", "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"),
+        ("stale-attestation", "/run/nmcp-ci/stale-ready"),
+        ("client-fault", "/run/nmcp-ci/client-fault.ready"),
+        ("work-budget", "/run/nmcp-ci/client-work-budget-launch.ready"),
+        ("slow-cleanup", "/run/nmcp-ci/client-work-budget-slow-cleanup.ready"),
+        ("transient-cleanup", "/run/nmcp-ci/client-cleanup-fault-stop.blocked"),
+        ("persistent-cleanup", "/run/nmcp-ci/client-cleanup-persistent-stop.handoff.ready"),
+        ("signal-cleanup", "/run/nmcp-ci/client-signal-int-kill.ready"),
+        ("terminal-race", "/run/nmcp-ci/client-terminal-race-a.ready"),
+        ("name-reuse", "/run/nmcp-ci/client-reuse-pause.ready"),
+    )
+    release_cases = (
+        ("stale-attestation", "stale-release"),
+        ("stale-cleanup", "stale-release"),
+        ("client-fault", "client-fault"),
+        ("work-budget", "client-work-budget-launch-unloaded"),
+        ("slow-cleanup", "client-work-budget-slow-cleanup-unloaded"),
+        ("transient-cleanup", "client-cleanup-fault-stop"),
+        ("persistent-cleanup", "client-cleanup-persistent-stop.handoff"),
+        ("terminal-race", "client-terminal-race-a"),
+        ("name-reuse", "client-reuse-pause"),
+    )
+    try:
+        module_os.stat = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+        for phase, path in wait_cases:
+            assert_raises(lambda phase=phase, path=path: containment["wait_path"](phase, path),
+                          f"phase={phase} operation=stat resource=marker errno=13")
+        module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+        for phase, name in release_cases:
+            assert_raises(lambda phase=phase, name=name: containment["release"](phase, name),
+                          f"phase={phase} operation=open resource=release errno=13")
+    finally:
+        module_os.stat = original_stat
+        module_os.open = original_open
+
+
+def signed_cleanup_lock_cases(containment):
+    cleanup_if_owned = containment["cleanup_signed_launch_if_owned"]
+    signature = ("attested",)
+    calls = []
+
+    def cleanup(observed_signature, phase):
+        calls.append((observed_signature, phase))
+
+    require(not cleanup_if_owned(
+        False, signature, {"LoadState": "loaded"}, "persistent-cleanup", cleanup),
+        "contended cleanup lock was treated as owned")
+    require(not calls, "signed cleanup ran without the client lock")
+    require(not cleanup_if_owned(
+        True, signature, {"LoadState": "not-found"}, "persistent-cleanup", cleanup),
+        "absent signed launch was treated as cleanup work")
+    require(not cleanup_if_owned(
+        True, signature, {"EvidenceError": "passive capture failed"},
+        "persistent-cleanup", cleanup),
+        "unknown passive state was treated as a loaded signed launch")
+    assert_fails_with(lambda: cleanup_if_owned(
+        True, None, {"LoadState": "loaded"}, "persistent-cleanup", cleanup),
+        "loaded post-exit unit lacks an attested launch signature")
+    require(not calls, "signed cleanup ran without loaded, locked, attested state")
+    require(cleanup_if_owned(
+        True, signature, {"LoadState": "loaded"}, "persistent-cleanup", cleanup),
+        "owned signed cleanup did not run")
+    require(calls == [(signature, "persistent-cleanup")],
+            "signed cleanup callback did not run exactly once with owned identity")
+
+
+def actual_boundary_cases(client, containment):
+    client_globals = client["publish_supervisor"].__globals__
+    containment_globals = containment["release"].__globals__
+    module_os = client_globals["os"]
+
+    original_open = module_os.open
+    try:
+        module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+        assert_raises(lambda: client["durable_marker"]("fixture"),
+                      "phase=work operation=open resource=marker errno=13")
+        assert_raises(client["open_client_lock"],
+                      "phase=startup operation=open resource=lock errno=13")
+        assert_raises(lambda: containment["release"]("client-fault", "fixture"),
+                      "phase=client-fault operation=open resource=release errno=13")
+        assert_raises(containment["assert_client_lock_reusable"],
+                      "phase=transaction-lock operation=open resource=lock errno=13")
+        assert_raises(containment["open_transaction_lock"],
+                      "phase=transaction-lock operation=open resource=transaction errno=13")
+    finally:
+        module_os.open = original_open
+
+    original_builtin_open = containment_globals.get("open")
+    containment_globals["open"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+    try:
+        assert_raises(lambda: containment["counter"]("client-fault", HOSTILE_PATH),
+                      "phase=client-fault operation=open resource=counter errno=13")
+        containment_globals["open"] = lambda *_args, **_kwargs: (
+            _ for _ in ()).throw(injected(errno.ENOENT))
+        assert_raises(containment["load_cleanup_intent"],
+                      "phase=intent-window operation=open resource=cleanup-intent errno=2")
+        assert_raises(containment["run_root_entry"],
+                      "phase=intent-window operation=open resource=cleanup-intent errno=2")
+        assert_raises(lambda: containment["read_pid"](HOSTILE_PATH, "preflight"),
+                      "phase=preflight operation=open resource=pid errno=2")
+    finally:
+        if original_builtin_open is None:
+            del containment_globals["open"]
+        else:
+            containment_globals["open"] = original_builtin_open
+
+    original_unlink = module_os.unlink
+    try:
+        module_os.unlink = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+        assert_raises(lambda: containment["reset_paths"]("client-fault", HOSTILE_PATH),
+                      "phase=client-fault operation=unlink resource=marker errno=13")
+    finally:
+        module_os.unlink = original_unlink
+
+    original_fdopen = module_os.fdopen
+    original_fsync = module_os.fsync
+    original_close = module_os.close
+    try:
+        module_os.open = lambda *_args, **_kwargs: 90
+        raw_closes = []
+        module_os.close = lambda descriptor: raw_closes.append(descriptor)
+        module_os.fdopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+        assert_raises(lambda: client["record_counter"]("fixture"),
+                      "phase=work operation=fdopen resource=counter errno=13")
+        require(raw_closes == [90], "fdopen failure did not close its raw counter descriptor")
+
+        raw_closes.clear()
+        successful_counter = FakeCounter("0")
+        module_os.fdopen = lambda *_args, **_kwargs: successful_counter
+        module_os.fsync = lambda *_args, **_kwargs: None
+        client["record_counter"]("fixture")
+        require(not raw_closes and successful_counter.close_calls == 1,
+                "successful fdopen double-closed or failed to close transferred ownership")
+
+        module_os.fdopen = lambda *_args, **_kwargs: FakeCounter("0")
+        counter = FakeCounter("0")
+        counter.read = lambda: (_ for _ in ()).throw(injected())
+        module_os.fdopen = lambda *_args, **_kwargs: counter
+        module_os.fsync = lambda *_args, **_kwargs: None
+        assert_raises(lambda: client["record_counter"]("fixture"),
+                      "phase=work operation=read resource=evidence errno=13")
+
+        for method, operation in (("seek", "seek"), ("truncate", "truncate")):
+            counter = FakeCounter("0")
+            setattr(counter, method, lambda *_args: (_ for _ in ()).throw(injected()))
+            module_os.fdopen = lambda *_args, counter=counter, **_kwargs: counter
+            assert_raises(lambda: client["record_counter"]("fixture"),
+                          f"phase=work operation={operation} resource=evidence errno=13")
+    finally:
+        module_os.open = original_open
+        module_os.fdopen = original_fdopen
+        module_os.fsync = original_fsync
+        module_os.close = original_close
+
+    original_command = client_globals["command"]
+    original_unlink = module_os.unlink
+    try:
+        commit = "c" * 40
+        client_globals["command"] = lambda argv, *_args, **_kwargs: types.SimpleNamespace(
+            stdout=(commit + "\n" if "rev-parse" in argv else "fixture source"))
+        module_os.unlink = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH))
+        module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+        assert_raises(lambda: client["publish_supervisor"]("/repo", commit),
+                      "phase=source-publication operation=open resource=helper errno=13")
+    finally:
+        client_globals["command"] = original_command
+        module_os.unlink = original_unlink
+        module_os.open = original_open
+
+    original_flock = containment_globals["fcntl"].flock
+    original_close = module_os.close
+    try:
+        containment_globals["fcntl"].flock = lambda *_args: (
+            _ for _ in ()).throw(injected())
+        assert_raises(lambda: client["lock_client"](90),
+                      "phase=startup operation=flock resource=lock errno=13")
+        assert_raises(lambda: containment["lock_transaction"](90),
+                      "phase=transaction-lock operation=flock resource=transaction errno=13")
+
+        contention = BlockingIOError(errno.EWOULDBLOCK, "hostile " + SECRET, HOSTILE_PATH)
+        containment_globals["fcntl"].flock = lambda *_args: (
+            _ for _ in ()).throw(contention)
+        require(not containment["try_nonblocking_flock"](
+            90, "transaction-lock", "lock"),
+                "expected nonblocking contention was not returned explicitly")
+        require(not containment["lock_transaction"](90),
+                "transaction contention was not returned explicitly")
+        module_os.open = lambda *_args, **_kwargs: 90
+        module_os.close = lambda *_args: None
+        require(containment["assert_client_lock_held"]() is None,
+                "held client lock did not take the expected contention branch")
+        assert_raises(containment["assert_client_lock_reusable"],
+                      "client lock was not reusable after client exit")
+
+        arbitrary_eagain = OSError()
+        arbitrary_eagain.errno = errno.EAGAIN
+        arbitrary_eagain.filename = HOSTILE_PATH
+        containment_globals["fcntl"].flock = lambda *_args: (
+            _ for _ in ()).throw(arbitrary_eagain)
+        assert_raises(lambda: containment["try_nonblocking_flock"](
+            90, "transaction-lock", "lock"),
+            "phase=transaction-lock operation=flock resource=lock errno=11")
+        containment_globals["fcntl"].flock = lambda *_args: (
+            _ for _ in ()).throw(BlockingIOError(errno.EACCES, SECRET, HOSTILE_PATH))
+        assert_raises(lambda: containment["try_nonblocking_flock"](
+            90, "transaction-lock", "lock"),
+            "phase=transaction-lock operation=flock resource=lock errno=13")
+    finally:
+        containment_globals["fcntl"].flock = original_flock
+        module_os.open = original_open
+        module_os.close = original_close
+
+    keeper_globals = containment["assert_keeper_lock_coherent"].__globals__
+    keeper_originals = tuple(keeper_globals[name] for name in (
+        "pid_exists", "open_transaction_lock", "lock_transaction",
+        "process_has_inode", "close_transaction_lock"))
+    closed = []
+    try:
+        keeper_globals["pid_exists"] = lambda pid, phase: pid == 41 and phase == "service-death"
+        keeper_globals["open_transaction_lock"] = lambda: 90
+        keeper_globals["close_transaction_lock"] = lambda descriptor: closed.append(descriptor)
+        keeper_globals["process_has_inode"] = lambda *_args: True
+        keeper_globals["lock_transaction"] = lambda _descriptor: False
+        containment["assert_keeper_lock_coherent"](41, (7, 20))
+        require(closed == [90], "contended keeper lock was not closed")
+
+        closed.clear()
+        keeper_globals["lock_transaction"] = lambda _descriptor: True
+        keeper_globals["process_has_inode"] = lambda *_args: False
+        containment["assert_keeper_lock_coherent"](41, (7, 20))
+        require(closed == [90], "teardown-transition keeper lock was not released")
+
+        keeper_globals["process_has_inode"] = lambda *_args: True
+        assert_fails_with(lambda: containment["assert_keeper_lock_coherent"](41, (7, 20)),
+                          "live matching in-cgroup lock keeper released the transaction lock")
+    finally:
+        for name, value in zip((
+                "pid_exists", "open_transaction_lock", "lock_transaction",
+                "process_has_inode", "close_transaction_lock"), keeper_originals):
+            keeper_globals[name] = value
+
+
+def main():
+    client = runpy.run_path(str(CLIENT_PATH), run_name="diagnostic_client_fixture")
+    containment = runpy.run_path(str(CONTAINMENT_PATH), run_name="diagnostic_containment_fixture")
+    diagnostic_cases(client, containment)
+    explicit_marker_phase_cases(containment)
+    signed_cleanup_lock_cases(containment)
+    actual_boundary_cases(client, containment)
+    for namespace in (client, containment):
+        cgroup_boundary_cases(namespace)
+        for kind in ("root-disappears", "file-disappears", "residue",
+                     "cross-attempt-root-reuse", "same-attempt-root-reuse",
+                     "reordered-topology", "renamed-same-inode", "transient-file-residue",
+                     "changing-pids", "child-disappears", "nondirectory-child",
+                     "transient-root-residue", "two-absent-root-observations",
+                     "empty-root-removal", "residue-root-removal",
+                     "partial-residue-root-removal",
+                     "before-after-fstat-mismatch", "final-directory-recheck-mismatch",
+                     "initial-root-nondirectory", "root-becomes-nondirectory",
+                     "directory-becomes-nondirectory", "malformed-pids"):
+            cgroup_case(namespace, kind)
+    print("Ubuntu diagnostic fixtures passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
