@@ -1348,6 +1348,7 @@ def counter_atomic_cases(client, containment):
             original_fstat = module_os.fstat
             original_write = module_os.write
             original_close = module_os.close
+            original_unlink = module_os.unlink
             original_lseek = module_os.lseek
             original_ftruncate = module_os.ftruncate
             synthetic_block_anchors = set()
@@ -1682,6 +1683,116 @@ def counter_atomic_cases(client, containment):
                     and set(os.listdir(directory)) == entries_before_fstat_failure,
                     "post-create fstat failure leaked an artifact or changed the counter")
 
+            uncertain_opened = []
+            uncertain_closed = []
+            uncertain_created = set()
+            uncertain_unlinks = []
+            uncertain_fstat_failures = 0
+
+            def uncertain_open(target, flags, *args, **kwargs):
+                descriptor = original_open(target, flags, *args, **kwargs)
+                uncertain_opened.append((descriptor, str(target), flags))
+                if ".tmp." in str(target) and flags & os.O_EXCL:
+                    uncertain_created.add(descriptor)
+                return descriptor
+
+            def uncertain_fstat(descriptor):
+                nonlocal uncertain_fstat_failures
+                if descriptor in uncertain_created and uncertain_fstat_failures < 2:
+                    uncertain_fstat_failures += 1
+                    raise injected()
+                return original_fstat(descriptor)
+
+            def uncertain_close(descriptor):
+                original_close(descriptor)
+                uncertain_closed.append(descriptor)
+
+            def uncertain_unlink(target, *args, **kwargs):
+                uncertain_unlinks.append(str(target))
+                return original_unlink(target, *args, **kwargs)
+
+            entries_before_uncertainty = set(os.listdir(directory))
+            module_os.open = uncertain_open
+            module_os.fstat = uncertain_fstat
+            module_os.close = uncertain_close
+            module_os.unlink = uncertain_unlink
+            try:
+                assert_raises(lambda: client["record_counter"]("work", "count"),
+                              "phase=work operation=publish resource=counter category=io; "
+                              "cleanup=io|published-uncertain")
+            finally:
+                module_os.open = original_open
+                module_os.fstat = original_fstat
+                module_os.close = original_close
+                module_os.unlink = original_unlink
+            unresolved = set(os.listdir(directory)) - entries_before_uncertainty
+            require(uncertain_fstat_failures == 2 and pathlib.Path(path).read_bytes() == old,
+                    "bounded identity uncertainty changed the existing destination")
+            require(len(unresolved) == 1, "bounded identity uncertainty did not preserve one temp")
+            unresolved_name = next(iter(unresolved))
+            unresolved_token = unresolved_name.removeprefix("fixture.count.tmp.")
+            require(unresolved_name.startswith("fixture.count.tmp.")
+                    and len(unresolved_token) == 32
+                    and all(character in "0123456789abcdef" for character in unresolved_token)
+                    and not uncertain_unlinks,
+                    "bounded identity uncertainty unlinked a name without an identity")
+            require(sorted(descriptor for descriptor, _target, _flags in uncertain_opened)
+                    == sorted(uncertain_closed),
+                    "bounded identity uncertainty left an opened descriptor unclosed")
+            require(any(target == directory for _descriptor, target, _flags in uncertain_opened)
+                    and any(target == unresolved_name and flags & os.O_EXCL
+                            for _descriptor, target, flags in uncertain_opened),
+                    "bounded identity uncertainty did not track directory and temp descriptors")
+
+            recovery_opened = []
+            recovery_closed = []
+            recovery_replaces = []
+            recovery_unlinks = []
+
+            def recovery_open(target, flags, *args, **kwargs):
+                descriptor = original_open(target, flags, *args, **kwargs)
+                recovery_opened.append((descriptor, str(target), flags))
+                return descriptor
+
+            def recovery_close(descriptor):
+                original_close(descriptor)
+                recovery_closed.append(descriptor)
+
+            def recovery_replace(source, destination, *args, **kwargs):
+                recovery_replaces.append((str(source), str(destination)))
+                return original_replace(source, destination, *args, **kwargs)
+
+            def recovery_unlink(target, *args, **kwargs):
+                recovery_unlinks.append(str(target))
+                return original_unlink(target, *args, **kwargs)
+
+            module_os.open = recovery_open
+            module_os.close = recovery_close
+            module_os.replace = recovery_replace
+            module_os.unlink = recovery_unlink
+            try:
+                client["record_counter"]("work", "count")
+            finally:
+                module_os.open = original_open
+                module_os.close = original_close
+                module_os.replace = original_replace
+                module_os.unlink = original_unlink
+            quarantine_names = [destination for source, destination in recovery_replaces
+                                if source == unresolved_name
+                                and destination.startswith(unresolved_name + ".cleanup.")]
+            require(len(quarantine_names) == 1 and unresolved_name not in recovery_unlinks
+                    and recovery_unlinks.count(quarantine_names[0]) == 1,
+                    "later recovery did not quarantine and remove the exact stale temp")
+            require(not os.path.lexists(os.path.join(directory, unresolved_name))
+                    and containment["counter"]("persistent-cleanup", path)
+                        == int(old.decode("ascii").strip()) + 1,
+                    "later recovery did not safely publish the monotonic counter")
+            require(sorted(descriptor for descriptor, _target, _flags in recovery_opened)
+                    == sorted(recovery_closed)
+                    and any(target.startswith("/proc/self/fd/")
+                            for _descriptor, target, _flags in recovery_opened),
+                    "later recovery left a content, temp, or directory descriptor unclosed")
+
             def client_counter_read():
                 directory_descriptor = original_open(
                     directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -1893,6 +2004,7 @@ def counter_atomic_cases(client, containment):
         module_os.fstat = original_fstat if "original_fstat" in locals() else module_os.fstat
         module_os.open = original_open if "original_open" in locals() else module_os.open
         module_os.close = original_close if "original_close" in locals() else module_os.close
+        module_os.unlink = original_unlink if "original_unlink" in locals() else module_os.unlink
         module_os.lseek = original_lseek if "original_lseek" in locals() else module_os.lseek
         module_os.ftruncate = (original_ftruncate if "original_ftruncate" in locals()
                                else module_os.ftruncate)

@@ -296,6 +296,26 @@ def persistent_result_violation(returncode, classification, lock_handoff_error, 
     )
 
 
+def persistent_special_result_violation(returncode, stdout, stderr, evidence_case, boundary,
+                                        intercepted, attempted):
+    expected = {
+        "parse": ("kill", 2, "owned kill command remains unavailable: "),
+        "timeout": ("wait", 4, "unit properties remain unknown: "),
+    }
+    expected_boundary, expected_interceptions, cleanup_prefix = expected[evidence_case]
+    interception = f"intercepted {expected_boundary} command before attempt"
+    cleanup = cleanup_prefix + "; ".join(
+        interception for _attempt in range(expected_interceptions))
+    expected_stderr = (
+        "verification-client: injected client failure before cleanup boundary test; "
+        f"cleanup failed: {cleanup}\n")
+    return bool(
+        returncode != 1 or stdout != "" or stderr != expected_stderr
+        or boundary != expected_boundary
+        or intercepted != expected_interceptions or attempted != 0
+    )
+
+
 def stale_expected_rejection(state):
     safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup")
     safe = {name: state.get(name) for name in safe_names if name in state}
@@ -471,6 +491,41 @@ def assert_persistent_failure_contract():
     )
     if any(observed is not expected for observed, expected in scenarios):
         fail("persistent cleanup-first result classification changed")
+    primary = "verification-client: injected client failure before cleanup boundary test; cleanup failed: "
+    kill_interception = "intercepted kill command before attempt"
+    wait_interception = "intercepted wait command before attempt"
+    kill_stderr = (primary + "owned kill command remains unavailable: "
+                   + "; ".join((kill_interception,) * 2) + "\n")
+    wait_stderr = (primary + "unit properties remain unknown: "
+                   + "; ".join((wait_interception,) * 4) + "\n")
+    special_scenarios = (
+        (persistent_special_result_violation(1, "", kill_stderr, "parse", "kill", 2, 0), False),
+        (persistent_special_result_violation(
+            1, "", kill_stderr.replace("owned kill", "owned stop"),
+            "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(
+            1, SUCCESS + "\nextra", kill_stderr, "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(
+            1, "", "prefix" + kill_stderr, "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(
+            1, "", kill_stderr + "suffix", "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(
+            1, "", kill_stderr + "extra\n", "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(1, "", wait_stderr, "timeout", "wait", 4, 0), False),
+        (persistent_special_result_violation(
+            1, "", wait_stderr.replace("intercepted wait", "intercepted show"),
+            "timeout", "wait", 4, 0), True),
+        (persistent_special_result_violation(
+            1, "", kill_stderr, "timeout", "wait", 4, 0), True),
+        (persistent_special_result_violation(
+            1, "", wait_stderr + "extra", "timeout", "wait", 4, 0), True),
+        (persistent_special_result_violation(0, "", kill_stderr, "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(2, "", kill_stderr, "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(1, "", kill_stderr, "parse", "kill", 1, 0), True),
+        (persistent_special_result_violation(1, "", kill_stderr, "parse", "kill", 2, 1), True),
+    )
+    if any(observed is not expected for observed, expected in special_scenarios):
+        fail("special persistent client result classification changed")
 
 
 def run(phase, argv, **kwargs):
@@ -2058,21 +2113,22 @@ raise SystemExit(73)
                         "category=timeout"),
         }[wait_fault]
         lifecycle_violation = lifecycle_error != expected_lifecycle_error
+        observed_attempts = counter("persistent-cleanup", attempted)
         result_violation = persistent_result_violation(
             faulted.returncode, classification, lock_handoff_error, cleanup_error,
             lock_reuse_error, post_cleanup, post_cleanup_cgroup)
         if wait_fault != "normal":
-            expected_category = expected_lifecycle_error
             result_violation = bool(
-                faulted.returncode == 0 or classification["success_in_stdout"]
+                persistent_special_result_violation(
+                    faulted.returncode, faulted.stdout, faulted.stderr, wait_fault, boundary,
+                    observed_interceptions, observed_attempts)
                 or lock_handoff_error or cleanup_error or lock_reuse_error
-                or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup
-                or (wait_fault == "parse" and expected_category not in fault_stderr))
+                or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup)
         if lifecycle_violation or result_violation:
             diagnostics = persistent_failure_diagnostics(
                 mode, boundary, faulted, classification,
                 observed_interceptions,
-                counter("persistent-cleanup", attempted),
+                observed_attempts,
                 signature, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error,
                 "; ".join(item for item in (lifecycle_error, cleanup_error) if item),
                 lock_reuse_error, post_cleanup_cgroup)

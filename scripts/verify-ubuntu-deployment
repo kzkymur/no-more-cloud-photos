@@ -2514,6 +2514,15 @@ return result
                 < record_counter_source.find("quarantine_counter_temp(")
                 < record_counter_source.rfind("os.close(directory)")
                 < record_counter_source.find("aggregate_counter_failure(")
+            and 'cleanup_identity = temporary_identity' in record_counter_source
+            and 'cleanup_identity = counter_identity(\n                phase, os.fstat(temporary), "publish")' in record_counter_source
+            and ('elif temporary_created and not replaced:\n'
+                 '        cleanup_errors.append(counter_failure(phase, "publish", '
+                 '"published-uncertain"))') in record_counter_source
+            and ('if primary_error is not None:\n        if cleanup_errors:\n'
+                 '            raise aggregate_counter_failure(primary_error, cleanup_errors) '
+                 'from None\n        raise primary_error') in record_counter_source
+            and record_counter_source.count("os.close(directory)") == 1
             and "if not cleanup_errors and" not in record_counter_source
             and "truncate" not in record_counter_source
             and "O_TRUNC" not in record_counter_source,
@@ -2600,7 +2609,7 @@ return result
                 "len(token) != 32", "os.O_PATH | os.O_NOFOLLOW",
                 'f"/proc/self/fd/{descriptor}"', "os.O_RDONLY | os.O_NONBLOCK",
                 "opened_identity == content_identity == current_identity",
-                "quarantine_counter_temp(")),
+                "quarantine_counter_temp(", "for opened in (content, descriptor):")),
             "client counter parser, reader, identity, or stale-temp contract changed")
     lock_source = (ast.get_source_segment(source, named_function(tree, "lock_client")) or "")
     close_lock_source = (
@@ -2940,6 +2949,25 @@ def validate_containment(source: str, phase: str) -> None:
         or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup
     )
 ''', "containment persistent cleanup-first result predicate changed")
+    require_exact_function(tree, "persistent_special_result_violation", '''def persistent_special_result_violation(returncode, stdout, stderr, evidence_case, boundary,
+                                        intercepted, attempted):
+    expected = {
+        "parse": ("kill", 2, "owned kill command remains unavailable: "),
+        "timeout": ("wait", 4, "unit properties remain unknown: "),
+    }
+    expected_boundary, expected_interceptions, cleanup_prefix = expected[evidence_case]
+    interception = f"intercepted {expected_boundary} command before attempt"
+    cleanup = cleanup_prefix + "; ".join(
+        interception for _attempt in range(expected_interceptions))
+    expected_stderr = (
+        "verification-client: injected client failure before cleanup boundary test; "
+        f"cleanup failed: {cleanup}\\n")
+    return bool(
+        returncode != 1 or stdout != "" or stderr != expected_stderr
+        or boundary != expected_boundary
+        or intercepted != expected_interceptions or attempted != 0
+    )
+''', "containment special persistent client result predicate changed")
     require_exact_function(tree, "stale_expected_rejection", '''def stale_expected_rejection(state):
     safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup")
     safe = {name: state.get(name) for name in safe_names if name in state}
@@ -3102,6 +3130,41 @@ def validate_containment(source: str, phase: str) -> None:
     )
     if any(observed is not expected for observed, expected in scenarios):
         fail("persistent cleanup-first result classification changed")
+    primary = "verification-client: injected client failure before cleanup boundary test; cleanup failed: "
+    kill_interception = "intercepted kill command before attempt"
+    wait_interception = "intercepted wait command before attempt"
+    kill_stderr = (primary + "owned kill command remains unavailable: "
+                   + "; ".join((kill_interception,) * 2) + "\\n")
+    wait_stderr = (primary + "unit properties remain unknown: "
+                   + "; ".join((wait_interception,) * 4) + "\\n")
+    special_scenarios = (
+        (persistent_special_result_violation(1, "", kill_stderr, "parse", "kill", 2, 0), False),
+        (persistent_special_result_violation(
+            1, "", kill_stderr.replace("owned kill", "owned stop"),
+            "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(
+            1, SUCCESS + "\\nextra", kill_stderr, "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(
+            1, "", "prefix" + kill_stderr, "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(
+            1, "", kill_stderr + "suffix", "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(
+            1, "", kill_stderr + "extra\\n", "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(1, "", wait_stderr, "timeout", "wait", 4, 0), False),
+        (persistent_special_result_violation(
+            1, "", wait_stderr.replace("intercepted wait", "intercepted show"),
+            "timeout", "wait", 4, 0), True),
+        (persistent_special_result_violation(
+            1, "", kill_stderr, "timeout", "wait", 4, 0), True),
+        (persistent_special_result_violation(
+            1, "", wait_stderr + "extra", "timeout", "wait", 4, 0), True),
+        (persistent_special_result_violation(0, "", kill_stderr, "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(2, "", kill_stderr, "parse", "kill", 2, 0), True),
+        (persistent_special_result_violation(1, "", kill_stderr, "parse", "kill", 1, 0), True),
+        (persistent_special_result_violation(1, "", kill_stderr, "parse", "kill", 2, 1), True),
+    )
+    if any(observed is not expected for observed, expected in special_scenarios):
+        fail("special persistent client result classification changed")
 ''', "containment persistent diagnostic pure fixtures changed")
     counter_source = ast.get_source_segment(source, named_function(tree, "counter")) or ""
     counter_node = named_function(tree, "counter")
@@ -3143,6 +3206,7 @@ def validate_containment(source: str, phase: str) -> None:
         "STALE_REJECTION_PREFIX", "DIAGNOSTIC_TEXT_LIMIT", "COUNTER_MAX",
         "COUNTER_BYTE_LIMIT", "COUNTER_READ_ATTEMPTS", "COUNTER_CATEGORIES",
         "persistent_failure_classification", "bounded_sanitized_repr", "sanitized_state",
+        "persistent_result_violation", "persistent_special_result_violation",
         "persistent_failure_diagnostics", "assert_persistent_failure_contract",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
         "stale_failure_message",
@@ -3163,6 +3227,7 @@ def validate_containment(source: str, phase: str) -> None:
         "open_transaction_lock", "lock_transaction", "close_transaction_lock",
         "load_cleanup_intent", "top_level_diagnostic",
         "persistent_failure_classification", "persistent_result_violation",
+        "persistent_special_result_violation",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
         "stale_failure_message",
         "bounded_sanitized_repr", "sanitized_state", "persistent_failure_diagnostics",
@@ -3210,6 +3275,7 @@ def validate_containment(source: str, phase: str) -> None:
         ("load_cleanup_intent", ""),
         ("persistent_failure_classification", "stdout, stderr"),
         ("persistent_result_violation", "returncode, classification, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup, post_cleanup_cgroup"),
+        ("persistent_special_result_violation", "returncode, stdout, stderr, evidence_case, boundary, intercepted, attempted"),
         ("stale_expected_rejection", "state"),
         ("stale_client_classification", "attempted, returncode, stdout, stderr, expected_stderr"),
         ("diagnostic_bit", "value"),
@@ -3478,7 +3544,7 @@ COUNTER_CATEGORIES = (
     )
     expected_constant_loads = {
         "UNIT": 20, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
-        "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 7,
+        "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 8,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "STALE_REJECTION_PREFIX": 1, "DIAGNOSTIC_TEXT_LIMIT": 6,
         "PROGRAM": 2, "NONCE_VARIABLE": 2,
@@ -3694,6 +3760,7 @@ COUNTER_CATEGORIES = (
         "parse_counter", "parse_unit_properties", "parser",
         "persistent_failure_classification", "persistent_failure_diagnostics",
         "persistent_launch_signature", "persistent_result_violation",
+        "persistent_special_result_violation",
         "persistent_supervisor_mode", "pid_exists", "print", "process_communicate",
         "process_has_inode", "process_wait", "range", "read_pid",
         "read_structured_command_until", "release",
@@ -3710,7 +3777,7 @@ COUNTER_CATEGORIES = (
     reviewed_attribute_callee_roots = {
         "after_exit", "budgeted", "cancelled", "categories", "character", "descendants",
         "cleanup_errors", "dict", "environment", "errors", "expected_slow_counts", "fcntl", "first", "functools",
-        "digits", "found", "json", "kwargs", "line", "loaded", "matching", "mode", "mutations",
+        "digits", "found", "json", "kwargs", "kill_stderr", "line", "loaded", "matching", "mode", "mutations",
         "observed", "orphaned", "os", "parts", "post_cleanup", "post_cleanup_cgroup", "process",
         "property_boundaries",
         "partial", "recovered", "recovered_observed", "rendered", "replaced", "result", "runpy",
@@ -3720,7 +3787,7 @@ COUNTER_CATEGORIES = (
         "stderr",
         "stale_after_client", "stale_observed",
         "stale_post_cleanup", "stale_post_cleanup_cgroup", "stale_program",
-        "stopped", "reset", "subprocess", "text", "time", "value", "values", "waiting",
+        "stopped", "reset", "subprocess", "text", "time", "value", "values", "wait_stderr", "waiting",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -3768,6 +3835,26 @@ COUNTER_CATEGORIES = (
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        # CPython 3.12 exact full-stderr special persistent client-result contract.
+        ("fbcbc3afff2b7549623fe6e2a794d9b780d05dec913657a8c3c9ff1d52ee1da4",
+         "3dd71870892c0fa6d4c34e1b00c88c7d1b48fc7f2d8e4de37b901d6da4c6931a",
+         "521cc31ba6b4b924ded2e22c0653af461e789d5ab68b9e46d84487de96d5fd1b",
+         "de0875573891bb7a8cf97eeae76ac110c3306b30f442745741304b0d893943f5"),
+        # CPython 3.14 exact full-stderr special persistent client-result contract.
+        ("7760b71e4e5d0d63590c71317e46c199d1a1eeaf6ac9c3cca7a17e1d16cf0b81",
+         "e46e95981bbd5abe2ff0bb8df5ec257e8d6f3aa35854ba5ab1c9c93beeada768",
+         "947b8d04d8a5161011bdd5c086355208c06e2a949ebf36f9b5281f6804b02b94",
+         "d69448761165d3faa3a99aeadccdeb674d2665665cac345cf6283f479f65ed38"),
+        # CPython 3.12 exact special persistent client-result contract.
+        ("cb9633d357f91062a0990392e2b4e6996926a5ccea53e90aa4e3147788f62414",
+         "b7b1ea5d9b9967a94913b4ba616bd65e10b9eb6f6f291d035f5d70d647dadefb",
+         "521cc31ba6b4b924ded2e22c0653af461e789d5ab68b9e46d84487de96d5fd1b",
+         "8d2002046e6e95cd5be0056664c411f8adfcf00f6f787c0f9a59466f50c6edab"),
+        # CPython 3.14 exact special persistent client-result contract.
+        ("0ff3a7746394df1c2002a7c0807e14976135357c7b60ae7bcf10ec88d55f82c8",
+         "6d18303ef34ab8bbe48976c08f3ea79cd5bbf46211c1ff1751b9fcc5e682db4b",
+         "947b8d04d8a5161011bdd5c086355208c06e2a949ebf36f9b5281f6804b02b94",
+         "9472678b776b1c44c9762b933e3e09dd6638fcc4da822d4582edd75aeb88e47f"),
         # CPython 3.12 boundary-aware persistent handoff reachability.
         ("81f25df7a882989a44304e8f94c9411bc701c6a3860d4f6ac72b5e5190a24989",
          "f76efb245fec5b8bad1252deb0d3773f8f3c0345cd412364081ecf44fbd6262c",
@@ -3929,10 +4016,10 @@ COUNTER_CATEGORIES = (
     protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
     expected_call_root_stores = {
         "after_exit": 2, "budgeted": 1, "cancelled": 1, "categories": 1,
-        "character": 6, "cleanup_errors": 1, "digits": 1,
+        "character": 6, "cleanup": 1, "cleanup_errors": 1, "digits": 1,
         "descendants": 1, "environment": 1, "errors": 2, "expected_slow_counts": 1,
-        "first": 1, "found": 1, "identities": 1, "kept": 1, "line": 1,
-        "loaded": 1, "matching": 1, "mode": 7, "observed": 7,
+        "first": 1, "found": 1, "identities": 1, "kept": 1, "kill_stderr": 1, "line": 1,
+        "loaded": 1, "matching": 1, "mode": 7, "observed": 8,
         "mutations": 1, "orphaned": 1, "parser": 1, "partial": 1, "parts": 1,
         "path": 7, "payload": 3,
         "post_cleanup": 2, "post_cleanup_cgroup": 2,
@@ -3944,7 +4031,7 @@ COUNTER_CATEGORIES = (
         "stale_post_cleanup_cgroup": 2, "stale_program": 1,
         "state": 17, "stderr": 1, "stopped": 3, "successful_terminal_state": 1, "text": 8,
         "value": 16, "values": 3,
-        "waiting": 1,
+        "wait_stderr": 1, "waiting": 1,
     }
     actual_call_root_stores = {}
     call_root_store_contexts = []
@@ -3981,7 +4068,11 @@ COUNTER_CATEGORIES = (
                     "aa7b30ee4bb5a1c2512b0847e2e1952b992218475f740d4090209bb51ebe7033",
                     "31393fbaaf5747573d9c9b826ec9b80db1ac223c61cc9eab13bd8a70101f741e",
                     "5adfe655c44d2bf1bb1df5bbbabb2026cedab8e734759534b11fe497a49603f5",
-                    "e674706cb4da02afb3d09ec34e937989466766818cff54d3113810ce9fbd6580"}
+                     "e674706cb4da02afb3d09ec34e937989466766818cff54d3113810ce9fbd6580",
+                     "c4667a22b2f1545d746622be1221cede5b3fe51b7aed8510a766b0e746df2966",
+                     "17085a6cd2b2573ba60e1e09640adfc1c09767e406b912c840d9188706aa9aa4",
+                     "41835fcd4f6f5fc3865de2313a592848cd4127d124487645306c9e7b8b1b0844",
+                     "faaa3eb8fb287be835bef2025f7542d635ee05831b70b541375c953923bfe1fa"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -3999,9 +4090,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 511, "AugAssign": 2, "Break": 10, "ClassDef": 1, "Continue": 9,
-        "Delete": 1, "Expr": 317, "For": 48, "FunctionDef": 85, "If": 239,
-        "Import": 12, "Pass": 5, "Raise": 62, "Return": 90, "Try": 73, "While": 16,
+        "Assign": 522, "AugAssign": 2, "Break": 10, "ClassDef": 1, "Continue": 9,
+        "Delete": 1, "Expr": 318, "For": 48, "FunctionDef": 86, "If": 240,
+        "Import": 12, "Pass": 5, "Raise": 62, "Return": 91, "Try": 73, "While": 16,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -4055,7 +4146,11 @@ COUNTER_CATEGORIES = (
                      "8878c65e06d65c51f0271ce70658592af8e1f0b2a7c8ddc1e1777c9ed9807bdf",
                      "3d3bcdd78557518c1ac2e045b75d966e6107944f994439fc143ffbea0ca3a7b1",
                      "319c68e28ffedc235e6ac26c4624a87b47af898b48d98b71c9d9ba84b111149c",
-                     "64b4fcfa4637fe3966958d666429b9779cf3954519197b1a7d9d6262ace2563f"},
+                      "64b4fcfa4637fe3966958d666429b9779cf3954519197b1a7d9d6262ace2563f",
+                      "dad97dfe56ca8352752bfda112eb91a88125b2fc15da9697f017f3c67be3f764",
+                       "c580666bd20d06c213ff507fed7d64579e1f336d3e776b39bf2947255f4e0c12",
+                       "e040a2e7c2aca677648a8c119547ed52cfdb8852065e2080fb8e8e89bab72b71",
+                       "d01eb6de2ca328f17af90b8a8eedef26f6fae4da1de586e33dd747da32466b14"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -4699,10 +4794,14 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
         'recorded_cgroup = (observed.get("ControlGroup", "")',
         'observed_interceptions,', 'persistent cleanup retained a fixture artifact',
         'assert_client_lock_reusable()', 'persistent_result_violation(',
+        'observed_attempts = counter("persistent-cleanup", attempted)',
+        'persistent_special_result_violation(\n                    faulted.returncode, faulted.stdout, faulted.stderr, wait_fault, boundary,',
     )
     require(len(persistent_loops) == 1
             and all(fragment in persistent_source
-                    for fragment in persistent_cleanup_first_contract),
+                    for fragment in persistent_cleanup_first_contract)
+            and "expected_category" not in persistent_source
+            and "expected_lifecycle_error not in fault_stderr" not in persistent_source,
             "containment persistent fault handoff/exit/lock/owned cleanup sequence changed")
     loop_pairs = []
     for node in ast.walk(main_node):
@@ -5207,7 +5306,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "cde68e7c7a6ca5f159c1823b3de852b9209392df7d265070efe98930e32f23b6",
+            == "4eddab0b1bc3d52a3e7a0d3a16671ecc0cc1a388e8de8023b084eb47278b88cf",
             "diagnostic fixture source snapshot changed")
 
 
@@ -5733,6 +5832,45 @@ def verify_supervisor_mutations(
         ("client counter cleanup short-circuits", replace_once(client,
             '    if (directory is not None and temporary_name is not None and temporary_created',
             '    if not cleanup_errors and (directory is not None and temporary_name is not None and temporary_created')),
+        ("client counter uncertainty aggregation dropped", replace_once(client,
+            '    elif temporary_created and not replaced:\n'
+            '        cleanup_errors.append(counter_failure(phase, "publish", "published-uncertain"))',
+            '    elif temporary_created and not replaced:\n        pass')),
+        ("client counter uncertainty unsafe name unlink", replace_once(client,
+            '    elif temporary_created and not replaced:\n'
+            '        cleanup_errors.append(counter_failure(phase, "publish", "published-uncertain"))',
+            '    elif temporary_created and not replaced:\n'
+            '        os.unlink(temporary_name, dir_fd=directory)')),
+        ("client counter uncertainty loses primary", replace_once(client,
+            '    if primary_error is not None:\n'
+            '        if cleanup_errors:\n'
+            '            raise aggregate_counter_failure(primary_error, cleanup_errors) from None\n'
+            '        raise primary_error\n'
+            '    if cleanup_errors:\n'
+            '        raise aggregate_counter_failure(None, cleanup_errors) from None\n'
+            '    if not published:',
+            '    if primary_error is not None:\n'
+            '        if cleanup_errors:\n'
+            '            raise aggregate_counter_failure(None, cleanup_errors) from None\n'
+            '        raise primary_error\n'
+            '    if cleanup_errors:\n'
+            '        raise aggregate_counter_failure(None, cleanup_errors) from None\n'
+            '    if not published:')),
+        ("client counter uncertainty directory close omitted", replace_once(client,
+            '    if directory is not None:\n'
+            '        try:\n'
+            '            os.close(directory)\n'
+            '        except OSError:\n'
+            '            cleanup_errors.append(counter_failure(phase, "publish", "io"))',
+            '    if directory is not None:\n        pass')),
+        ("client stale temp content close omitted", replace_once(client,
+            '            for opened in (content, descriptor):',
+            '            for opened in (descriptor,):')),
+        ("client uncertain temp later recovery omitted", replace_once(client,
+            '            if opened_identity == content_identity == current_identity:\n'
+            '                quarantine_counter_temp(phase, directory, name, opened_identity)',
+            '            if opened_identity == content_identity == current_identity:\n'
+            '                pass')),
         ("client counter published too early", replace_once(client,
             '            os.fsync(temporary)\n'
             '            current = os.stat(temporary_name, dir_fd=directory, follow_symlinks=False)',
@@ -6699,6 +6837,31 @@ def verify_supervisor_mutations(
         ("persistent unrelated error broadly accepted", replace_once(containment,
             '        "property_unknown": PERSISTENT_PROPERTY_ERROR in stderr,',
             '        "property_unknown": bool(stderr),')),
+        ("special persistent arbitrary nonzero accepted", replace_once(containment,
+            '        returncode != 1 or stdout != "" or stderr != expected_stderr',
+            '        returncode == 0 or stdout != "" or stderr != expected_stderr')),
+        ("special persistent kill substituted with stop", replace_once(containment,
+            '        "parse": ("kill", 2, "owned kill command remains unavailable: "),',
+            '        "parse": ("stop", 2, "owned stop command remains unavailable: "),')),
+        ("special persistent stderr substring accepted", replace_once(containment,
+            '        returncode != 1 or stdout != "" or stderr != expected_stderr',
+            '        returncode != 1 or stdout != "" or expected_stderr not in stderr')),
+        ("special persistent stderr equality omitted", replace_once(containment,
+            '        returncode != 1 or stdout != "" or stderr != expected_stderr',
+            '        returncode != 1 or stdout != "" or False')),
+        ("special persistent stdout substring accepted", replace_once(containment,
+            '        returncode != 1 or stdout != "" or stderr != expected_stderr',
+            '        returncode != 1 or SUCCESS in stdout or stderr != expected_stderr')),
+        ("special persistent empty stderr accepted", replace_once(containment,
+            '            result_violation = bool(\n'
+            '                persistent_special_result_violation(\n'
+            '                    faulted.returncode, faulted.stdout, faulted.stderr, wait_fault, boundary,\n'
+            '                    observed_interceptions, observed_attempts)',
+            '            result_violation = bool(\n                False')),
+        ("special persistent wrong-process category requirement", replace_once(containment,
+            '                or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup)',
+            '                or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup\n'
+            '                or expected_lifecycle_error not in fault_stderr)')),
         ("persistent diagnostics become unbounded", replace_once(containment,
             'DIAGNOSTIC_TEXT_LIMIT = 512', 'DIAGNOSTIC_TEXT_LIMIT = 999999')),
         ("persistent diagnostics nonce redaction removed", replace_once(containment,
@@ -7534,9 +7697,9 @@ def verify_supervisor_mutations(
             '                            malformed, b"01\\n")',
             '                            malformed, b"1000000\\n")')),
         ("persistent invalid evidence reread for diagnostics", replace_once(containment,
-            '                observed_interceptions,\n                counter("persistent-cleanup", attempted),',
+            '                observed_interceptions,\n                observed_attempts,',
             '                counter("persistent-cleanup", intercepted),\n'
-            '                counter("persistent-cleanup", attempted),')),
+            '                observed_attempts,')),
         ("work budget boundary omitted", replace_once(containment,
             '    for budget_boundary in ("launch", "service", "journal"):',
             '    for budget_boundary in ("launch", "service",):')),
