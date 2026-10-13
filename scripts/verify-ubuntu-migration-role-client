@@ -597,10 +597,14 @@ def cgroup_pids(control_group, phase):
 
 
 def retain_control_group(state):
-    control_group = state.get("ControlGroup")
-    if state.get("LoadState") == "not-found" and not control_group:
+    if "ControlGroup" not in state:
+        fail("fixed unit observation omitted ControlGroup")
+    control_group = state["ControlGroup"]
+    if type(control_group) is not str:
+        fail("loaded fixed unit has an invalid control group path")
+    if control_group == "":
         return
-    if (type(control_group) is not str or not control_group.startswith("/")
+    if (not control_group.startswith("/")
             or control_group == "/" or os.path.normpath(control_group) != control_group):
         fail("loaded fixed unit has an invalid control group path")
     if control_group not in RECORDED_CGROUP:
@@ -706,9 +710,16 @@ def launch_matches(state, nonce, service_command):
 
 
 def launch_state(phase, *, context="show"):
-    return unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
-                           "Description", "Environment", "ExecStart", *SERVICE_PROPERTIES,
-                           context=context)
+    state = unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+                            "Description", "Environment", "ExecStart", *SERVICE_PROPERTIES,
+                            context=context)
+    terminal = (state.get("ActiveState"), state.get("SubState")) in (
+        ("active", "exited"), ("failed", "failed"),
+    )
+    if (state.get("LoadState") != "not-found" and state["ControlGroup"] == ""
+            and not terminal):
+        fail("loaded launch observation has no control group path")
+    return state
 
 
 def owned_state(phase, invocation, nonce, service_command, *properties, context="owned-state"):

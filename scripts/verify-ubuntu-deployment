@@ -787,7 +787,7 @@ def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
     # bypass this snapshot and must be rejected by the detailed inventories below.
     if enforce_snapshot:
         require(stable_source_digest(source)
-                == "edbdb66526b803a44ec6c0cb07ef7423ea33b078054ee7662ee0372add11220b",
+                == "11ddc8eb13418dbb8f4a01a2e61b5547ca1e0ba19ce4353f8ce4eeed33439d42",
                 "client reviewed stable UTF-8/LF source snapshot changed")
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     expected_imports = ast.parse('''import fcntl
@@ -887,17 +887,21 @@ import time
     require_exact_assignment(tree, "RECORDED_CGROUP", "RECORDED_CGROUP = []",
                              "client retained control-group state changed")
     require_exact_function(tree, "retain_control_group", '''def retain_control_group(state):
-    control_group = state.get("ControlGroup")
-    if state.get("LoadState") == "not-found" and not control_group:
+    if "ControlGroup" not in state:
+        fail("fixed unit observation omitted ControlGroup")
+    control_group = state["ControlGroup"]
+    if type(control_group) is not str:
+        fail("loaded fixed unit has an invalid control group path")
+    if control_group == "":
         return
-    if (type(control_group) is not str or not control_group.startswith("/")
+    if (not control_group.startswith("/")
             or control_group == "/" or os.path.normpath(control_group) != control_group):
         fail("loaded fixed unit has an invalid control group path")
     if control_group not in RECORDED_CGROUP:
         RECORDED_CGROUP.append(control_group)
     if len(RECORDED_CGROUP) > RECORDED_CGROUP_LIMIT:
         fail("too many fixed unit control group paths were observed")
-''', "client must append every valid nonempty control group across explicit absence")
+''', "client must distinguish a present exact empty control group from missing/invalid values")
     require_exact_function(tree, "fixed_cgroup_paths", '''def fixed_cgroup_paths():
     return tuple(dict.fromkeys((*RECORDED_CGROUP, CANONICAL_CGROUP)))
 ''', "client fixed cgroup paths must include retained and canonical paths exactly once")
@@ -1395,10 +1399,17 @@ import time
     require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
             "client must not infer absence from an empty or failed property query")
     require_exact_function(tree, "launch_state", '''def launch_state(phase, *, context="show"):
-    return unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
-                           "Description", "Environment", "ExecStart", *SERVICE_PROPERTIES,
-                           context=context)
-''', "client launch identity observation changed")
+    state = unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+                            "Description", "Environment", "ExecStart", *SERVICE_PROPERTIES,
+                            context=context)
+    terminal = (state.get("ActiveState"), state.get("SubState")) in (
+        ("active", "exited"), ("failed", "failed"),
+    )
+    if (state.get("LoadState") != "not-found" and state["ControlGroup"] == ""
+            and not terminal):
+        fail("loaded launch observation has no control group path")
+    return state
+''', "client launch capture may accept empty cgroups only for exact terminal state pairs")
     require_exact_function(tree, "owned_state", '''def owned_state(phase, invocation, nonce, service_command, *properties, context="owned-state"):
     state = unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState",
                             "ControlGroup", "Description", "Environment", "ExecStart",
@@ -2206,6 +2217,10 @@ finally:
         ast.dump(ast.parse('''state = unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState",
                          "ControlGroup", "Description", "Environment", "ExecStart",
                          *SERVICE_PROPERTIES, *properties, context=context)
+''').body[0]): 1,
+        ast.dump(ast.parse('''state = unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+                         "Description", "Environment", "ExecStart", *SERVICE_PROPERTIES,
+                         context=context)
 ''').body[0]): 1,
         ast.dump(ast.parse('''result = command(("/usr/bin/systemctl", *arguments, UNIT), "teardown", check=False,
                  timeout=ACTION_TIMEOUTS[arguments[0]])
@@ -4892,7 +4907,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "4503beaed9bf17b0811ee17716f59a659427ac4d869d521314d34fd35fde821b",
+            == "7773b25d76ddbe47132929deb8bc38de9b445d354287327d3221bd3dd757a300",
             "diagnostic fixture source snapshot changed")
 
 
@@ -5225,12 +5240,31 @@ def verify_supervisor_mutations(
         ("client empty loaded control group accepted", replace_once(client,
             '    if not control_group:\n        fail("unit control group path is missing")',
             '    if not control_group:\n        return []')),
-        ("client recorded cgroup cleared on not-found", replace_once(client,
-            '    control_group = state.get("ControlGroup")\n'
-            '    if state.get("LoadState") == "not-found" and not control_group:\n        return',
-            '    control_group = state.get("ControlGroup")\n'
-            '    if state.get("LoadState") == "not-found" and not control_group:\n'
-            '        RECORDED_CGROUP.clear()\n        return')),
+        ("client missing cgroup key guard omitted", replace_once(client,
+            '    if "ControlGroup" not in state:\n'
+            '        fail("fixed unit observation omitted ControlGroup")',
+            '    if False:\n        pass')),
+        ("client missing cgroup treated as empty", replace_once(client,
+            '    control_group = state["ControlGroup"]',
+            '    control_group = state.get("ControlGroup", "")')),
+        ("client exact empty cgroup invalidity restored", replace_once(client,
+            '    if control_group == "":\n        return',
+            '    if control_group == "":\n'
+            '        fail("loaded fixed unit has an invalid control group path")')),
+        ("client recorded cgroup cleared on empty", replace_once(client,
+            '    if control_group == "":\n        return',
+            '    if control_group == "":\n        RECORDED_CGROUP.clear()\n        return')),
+        ("client loaded non-string cgroup accepted", replace_once(client,
+            '    if type(control_group) is not str:\n'
+            '        fail("loaded fixed unit has an invalid control group path")',
+            '    if type(control_group) is not str:\n        return')),
+        ("client explicit null cgroup accepted", replace_once(client,
+            '    if type(control_group) is not str:',
+            '    if control_group is None:\n        return\n    if type(control_group) is not str:')),
+        ("client malformed nonempty cgroup accepted", replace_once(client,
+            '    if (not control_group.startswith("/")\n'
+            '            or control_group == "/" or os.path.normpath(control_group) != control_group):',
+            '    if False:')),
         ("client loaded cgroup not retained", replace_once(client,
             '        RECORDED_CGROUP.append(control_group)', '        pass')),
         ("client recorded cgroup overwritten", replace_once(client,
@@ -5657,15 +5691,15 @@ def verify_supervisor_mutations(
         ("required observed cgroup retention omitted", replace_once(client,
             '            if retain and "ControlGroup" in requested:',
             '            if False and "ControlGroup" in requested:')),
-        ("explicit absence empty cgroup treated as invalid", replace_once(client,
-            '    if state.get("LoadState") == "not-found" and not control_group:\n        return',
-            '    if state.get("LoadState") == "not-found" and control_group is None:\n        return')),
-        ("loaded empty cgroup rejected at wrong layer", replace_once(client,
-            '    if state.get("LoadState") == "not-found" and not control_group:',
-            '    if not control_group:')),
-        ("explicit absence nonempty cgroup validation weakened", replace_once(client,
-            '    if state.get("LoadState") == "not-found" and not control_group:',
-            '    if state.get("LoadState") == "not-found":')),
+        ("terminal launch empty cgroup rejected unconditionally", replace_once(client,
+            '    if (state.get("LoadState") != "not-found" and state["ControlGroup"] == ""\n'
+            '            and not terminal):',
+            '    if state.get("LoadState") != "not-found" and state["ControlGroup"] == "":')),
+        ("nonterminal launch empty cgroup accepted", replace_once(client,
+            '            and not terminal):', '            and False):')),
+        ("running launch empty cgroup accepted", replace_once(client,
+            '        ("active", "exited"), ("failed", "failed"),',
+            '        ("active", "exited"), ("active", "running"), ("failed", "failed"),')),
         ("terminal recovery uses fast supervisor", replace_once(client,
             '        supervisor_mode = ""\n    elif (requested_mode.startswith("client-cleanup-fault-")',
             '        supervisor_mode = "fast-success"\n    elif (requested_mode.startswith("client-cleanup-fault-")')),
@@ -5848,6 +5882,27 @@ def verify_supervisor_mutations(
         ("initial InvocationID nonce unchecked", replace_once(client,
             'if valid_invocation(candidate_invocation) and launch_matches(observed, nonce, exec_argv):',
             'if valid_invocation(candidate_invocation):')),
+        ("terminal immediate invocation left unset", replace_once(client,
+            '                if valid_invocation(candidate_invocation) and launch_matches(observed, nonce, exec_argv):\n'
+            '                    invocation = candidate_invocation',
+            '                if valid_invocation(candidate_invocation) and launch_matches(observed, nonce, exec_argv):\n'
+            '                    pass')),
+        ("terminal recovery invocation left unset", replace_once(client,
+            '                            invocation = candidate_invocation\n'
+            '                            teardown_owned(invocation, nonce, exec_argv)',
+            '                            teardown_owned(candidate_invocation, nonce, exec_argv)')),
+        ("terminal recovery teardown skipped", replace_once(client,
+            '                            invocation = candidate_invocation\n'
+            '                            teardown_owned(invocation, nonce, exec_argv)',
+            '                            invocation = candidate_invocation\n'
+            '                            pass')),
+        ("captured terminal teardown skipped", replace_once(client,
+            '                elif launch_attempted:\n'
+            '                    try:\n'
+            '                        teardown_owned(invocation, nonce, exec_argv)',
+            '                elif launch_attempted:\n'
+            '                    try:\n'
+            '                        pass')),
         ("teardown failure discarded", replace_once(client,
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException as error:\n                        cleanup_errors.append(error)',
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException:\n                        pass')),
@@ -7462,12 +7517,24 @@ def main() -> int:
         "    if False:\n        client_cgroup_lifecycle_cases(client)")
     expect_rejected(validate_diagnostic_fixture, dead_cgroup_lifecycle_fixture,
                     "client cgroup lifecycle fixture call is dead", "source snapshot changed")
+    dead_prelaunch_production_fixture = replace_once(
+        diagnostic_fixture,
+        "    client_prelaunch_production_path_case(client)",
+        "    if False:\n        client_prelaunch_production_path_case(client)")
+    expect_rejected(validate_diagnostic_fixture, dead_prelaunch_production_fixture,
+                    "client prelaunch production fixture call is dead", "source snapshot changed")
     dead_final_residue_fixture = replace_once(
         diagnostic_fixture,
         "    client_final_residue_diagnostic_cases(client)",
         "    if False:\n        client_final_residue_diagnostic_cases(client)")
     expect_rejected(validate_diagnostic_fixture, dead_final_residue_fixture,
                     "client final residue fixture call is dead", "source snapshot changed")
+    dead_terminal_empty_fixture = replace_once(
+        diagnostic_fixture,
+        "    client_terminal_empty_launch_routing_cases(client)",
+        "    if False:\n        client_terminal_empty_launch_routing_cases(client)")
+    expect_rejected(validate_diagnostic_fixture, dead_terminal_empty_fixture,
+                    "client terminal empty routing fixture call is dead", "source snapshot changed")
     dead_cgroup_observation_fixture = replace_once(
         diagnostic_fixture,
         "    client_cgroup_observation_cases(client)",

@@ -561,17 +561,23 @@ def client_cgroup_lifecycle_cases(client):
             "LoadState": "loaded", "ControlGroup": "/recorded-b", "InvocationID": "mismatch",
         })
         client["retain_control_group"]({"LoadState": "loaded", "ControlGroup": "/recorded-a"})
-        client["retain_control_group"]({"LoadState": "not-found"})
+        assert_fails_with(lambda: client["retain_control_group"]({"LoadState": "not-found"}),
+                          "fixed unit observation omitted ControlGroup")
+        assert_fails_with(lambda: client["retain_control_group"]({
+            "LoadState": "not-found", "ControlGroup": None,
+        }), "loaded fixed unit has an invalid control group path")
+        client["retain_control_group"]({"LoadState": "not-found", "ControlGroup": ""})
         client["retain_control_group"]({
             "LoadState": "not-found", "ControlGroup": "/recorded-not-found",
         })
+        client["retain_control_group"]({"LoadState": "loaded", "ControlGroup": ""})
         require(client["fixed_cgroup_paths"]() == (
                     "/recorded-a", "/recorded-b", "/recorded-not-found", canonical),
-                "later/mismatched/minimal states replaced retained control groups")
-        for invalid in (None, "", "relative", "/"):
-            state = {"LoadState": "loaded"}
-            if invalid is not None:
-                state["ControlGroup"] = invalid
+                "later/mismatched/minimal/empty states replaced retained control groups")
+        assert_fails_with(lambda: client["retain_control_group"]({"LoadState": "loaded"}),
+                          "fixed unit observation omitted ControlGroup")
+        for invalid in (None, 7, "relative", "/", "/a/../b"):
+            state = {"LoadState": "loaded", "ControlGroup": invalid}
             assert_fails_with(lambda state=state: client["retain_control_group"](state),
                               "loaded fixed unit has an invalid control group path")
         require(client["fixed_cgroup_paths"]() == (
@@ -628,7 +634,9 @@ def client_cgroup_lifecycle_cases(client):
                 "canonical and recorded control groups were not deduplicated")
 
         recorded[:] = ["/recorded-a", "/recorded-b"]
-        globals_["owned_state"] = lambda *_args, **_kwargs: {"LoadState": "not-found"}
+        globals_["owned_state"] = lambda *_args, **_kwargs: {
+            "LoadState": "not-found", "ControlGroup": "",
+        }
         calls.clear()
         client["teardown_owned"]("i" * 32, "n" * 64, ("/fixture",))
         require(calls == [("/recorded-a", "teardown"), ("/recorded-b", "teardown"),
@@ -713,6 +721,15 @@ def client_prelaunch_production_path_case(client):
         require(recorded == ["/prior"] and not scans,
                 "production prelaunch loaded read retained or scanned before LoadState rejection")
 
+        response = "LoadState=not-found\n"
+        minimal_absent = client["unit_properties"](
+            "prelaunch", "LoadState", context="prelaunch")
+        require(minimal_absent == {"LoadState": "not-found"},
+                "minimal explicit-absence parser contract changed without ControlGroup request")
+        assert_fails_with(lambda: client["unit_properties"](
+            "work", "LoadState", "ControlGroup"),
+            "unit properties remain unknown: fixed unit observation omitted ControlGroup")
+
         response = "LoadState=not-found\nControlGroup=/current-not-found\n"
         absent = client["unit_properties"](
             "prelaunch", "LoadState", "ControlGroup", context="prelaunch", retain=False)
@@ -727,6 +744,24 @@ def client_prelaunch_production_path_case(client):
         client["unit_properties"]("work", "LoadState", "ControlGroup")
         require(recorded[-1] == "/work-observed",
                 "non-prelaunch unit property observation lost required cgroup retention")
+
+        launch_properties = {
+            "LoadState": "loaded", "InvocationID": "i" * 32,
+            "ActiveState": "active", "SubState": "running", "ControlGroup": "",
+            "Description": "fixture", "Environment": "fixture", "ExecStart": "fixture",
+            **globals_["SERVICE_PROPERTIES"],
+        }
+        response = "".join(f"{name}={value}\n" for name, value in launch_properties.items())
+        assert_fails_with(lambda: client["launch_state"]("immediate", context="immediate"),
+                          "loaded launch observation has no control group path")
+        require(recorded == ["/prior", "/current-not-found", "/work-observed"],
+                "empty launch observation changed retained control groups")
+
+        launch_properties["ControlGroup"] = "/launch-observed"
+        response = "".join(f"{name}={value}\n" for name, value in launch_properties.items())
+        client["launch_state"]("recovery", context="recovery")
+        require(recorded[-1] == "/launch-observed",
+                "nonempty launch attestation did not retain its control group")
     finally:
         recorded[:] = originals[0]
         globals_["command"] = originals[1]
@@ -802,61 +837,134 @@ def client_final_residue_diagnostic_cases(client):
         globals_["cgroup_pids"] = original_cgroup_pids
 
 
-def client_terminal_teardown_reachability_case(client):
+def client_terminal_empty_launch_routing_cases(client):
     globals_ = client["teardown_owned"].__globals__
     recorded = globals_["RECORDED_CGROUP"]
     canonical = globals_["CANONICAL_CGROUP"]
     originals = (
-        list(recorded), globals_["owned_state"], globals_["cgroup_pids"],
-        globals_["retry_owned_command"], globals_["wait_unloaded"],
+        list(recorded), globals_["command"], globals_["command_path"],
+        globals_["cgroup_pids"], globals_["PROPERTY_RETRIES"],
     )
-    owned_calls = 0
-    actions = []
-    scans = []
+    nonce = "n" * 64
+    invocation = "a" * 32
+    service_command = ("/fixture",)
 
-    def fake_owned_state(*_args, **_kwargs):
-        nonlocal owned_calls
-        owned_calls += 1
-        if owned_calls <= 3:
-            return {
-                "LoadState": "loaded", "ActiveState": "failed", "SubState": "failed",
-                "ControlGroup": "/terminal-empty",
-            }
-        return {"LoadState": "not-found"}
-
-    def fake_cgroup_pids(control_group, phase):
-        scans.append((control_group, phase))
-        return []
-
-    def fake_retry(_invocation, _nonce, _service_command, name, action, *_arguments):
-        actions.append((name, action))
-        return True
-
-    original_wait_unloaded = globals_["wait_unloaded"]
-
-    def tracked_wait_unloaded(*args, **kwargs):
-        actions.append(("wait_unloaded", "entered"))
-        return original_wait_unloaded(*args, **kwargs)
+    def loaded_state(active, sub, *, result, code, status):
+        return {
+            "LoadState": "loaded", "InvocationID": invocation,
+            "ActiveState": active, "SubState": sub, "ControlGroup": "",
+            "Description": globals_["DESCRIPTION_PREFIX"] + nonce,
+            "Environment": globals_["NONCE_VARIABLE"] + "=" + nonce,
+            "ExecStart": "argv[]=/fixture ;",
+            **globals_["SERVICE_PROPERTIES"],
+            "Result": result, "ExecMainCode": code, "ExecMainStatus": status,
+        }
 
     try:
-        recorded[:] = ["/terminal-empty"]
-        globals_["owned_state"] = fake_owned_state
-        globals_["cgroup_pids"] = fake_cgroup_pids
-        globals_["retry_owned_command"] = fake_retry
-        globals_["wait_unloaded"] = tracked_wait_unloaded
-        client["teardown_owned"]("i" * 32, "n" * 64, ("/fixture",))
-        require(actions == [("reset", "reset-failed"), ("wait_unloaded", "entered")],
-                "loaded empty terminal teardown did not reach reset and unload wait")
-        require(scans == [
-            ("/terminal-empty", "teardown"), (canonical, "teardown"),
-            ("/terminal-empty", "unload"), (canonical, "unload"),
-        ], "loaded empty terminal teardown did not reach its final cgroup assertion")
+        globals_["command_path"] = lambda *_args, **_kwargs: None
+        globals_["PROPERTY_RETRIES"] = 1
+        terminal_cases = (
+            ("success", loaded_state(
+                "active", "exited", result="success", code="1", status="0"), True),
+            ("failure", loaded_state(
+                "failed", "failed", result="exit-code", code="1", status="73"), False),
+        )
+        for phase in ("immediate", "recovery"):
+            for outcome, terminal, successful in terminal_cases:
+                label = phase + "-" + outcome
+                prior = "/prior-" + outcome if phase == "immediate" else None
+                recorded[:] = [prior] if prior else []
+                scans = []
+                actions = []
+                unit_unloaded = False
+                settled = dict(terminal)
+                settled["ActiveState"] = "inactive"
+                settled["SubState"] = "dead"
+                states = [terminal]
+                if phase == "immediate":
+                    states.extend((terminal, terminal))
+                states.extend((terminal, terminal))
+                if successful:
+                    states.append(terminal)
+                states.extend((settled, settled, {
+                    "LoadState": "not-found", "ControlGroup": "",
+                }))
+
+                def fake_command(argv, *_args, **_kwargs):
+                    nonlocal unit_unloaded
+                    if len(argv) > 1 and argv[1] == "show":
+                        require(states, f"{label} issued an unexpected property read")
+                        state = states.pop(0)
+                        if state.get("LoadState") == "not-found":
+                            unit_unloaded = True
+                        requested = [argument.removeprefix("--property=")
+                                     for argument in argv if argument.startswith("--property=")]
+                        payload = "".join(f"{name}={state[name]}\n" for name in requested
+                                          if name in state)
+                        return subprocess.CompletedProcess(argv, 0, payload, "")
+                    actions.append(argv[1])
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+
+                def fake_cgroup_pids(control_group, scan_phase):
+                    if scan_phase == "final-close":
+                        require(unit_unloaded,
+                                f"{label} reached final resolution while its unit remained loaded")
+                    scans.append((control_group, scan_phase))
+                    return []
+
+                globals_["command"] = fake_command
+                globals_["cgroup_pids"] = fake_cgroup_pids
+                observed = client["launch_state"](phase, context=phase)
+                candidate_invocation = observed.get("InvocationID", "")
+                captured_invocation = None
+                if (client["valid_invocation"](candidate_invocation)
+                        and client["launch_matches"](observed, nonce, service_command)):
+                    captured_invocation = candidate_invocation
+                require(captured_invocation == invocation,
+                        f"{label} did not capture its exact terminal launch identity")
+
+                primary_error = RuntimeError("capture-original") if phase == "recovery" else None
+                if phase == "immediate":
+                    client["owned_state"](
+                        "ownership-read", captured_invocation, nonce, service_command)
+                    current = client["owned_state"](
+                        "work", captured_invocation, nonce, service_command,
+                        "Result", "ExecMainCode", "ExecMainStatus")
+                    observed_success = client["successful_terminal_state"](current)
+                    require(observed_success is successful,
+                            f"{label} empty-cgroup terminal decision changed")
+                    if observed_success:
+                        client["assert_fixed_cgroups_empty"]("work")
+                    else:
+                        primary_error = RuntimeError(
+                            f"verification invocation failed: {client['sanitized_state'](current)}; "
+                            "cleanup_database_failed=False; cleanup_roles_failed=False")
+                client["teardown_owned"](captured_invocation, nonce, service_command)
+                if primary_error is None:
+                    client["resolve_outcome"](None, [], nonce)
+                else:
+                    assert_fails_with(lambda: client["resolve_outcome"](
+                        primary_error, [], nonce), str(primary_error))
+                require(unit_unloaded and not states,
+                        f"{label} did not complete every routed property observation")
+                require(recorded == ([prior] if prior else []),
+                        f"{label} empty observation cleared or invented a retained control group")
+                expected_phases = (["work"] if phase == "immediate" and successful else []) + [
+                    "teardown", "unload", "final-close",
+                ]
+                expected_paths = ([prior] if prior else []) + [canonical]
+                require(scans == [(path, scan_phase) for scan_phase in expected_phases
+                                  for path in expected_paths],
+                        f"{label} lost sticky/canonical cleanup-driving scans")
+                expected_actions = (["stop"] if successful else []) + ["reset-failed"]
+                require(actions == expected_actions,
+                        f"{label} did not route through owned stop/reset-failed actions")
     finally:
         recorded[:] = originals[0]
-        globals_["owned_state"] = originals[1]
-        globals_["cgroup_pids"] = originals[2]
-        globals_["retry_owned_command"] = originals[3]
-        globals_["wait_unloaded"] = originals[4]
+        globals_["command"] = originals[1]
+        globals_["command_path"] = originals[2]
+        globals_["cgroup_pids"] = originals[3]
+        globals_["PROPERTY_RETRIES"] = originals[4]
 
 
 def client_cgroup_observation_cases(client):
@@ -927,8 +1035,11 @@ def client_cgroup_observation_cases(client):
                 nonlocal owned_calls
                 owned_calls += 1
                 if owned_calls <= 3:
-                    return {"LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead"}
-                return {"LoadState": "not-found"}
+                    return {
+                        "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
+                        "ControlGroup": "",
+                    }
+                return {"LoadState": "not-found", "ControlGroup": ""}
 
             def fake_retry_owned_command(_invocation, _nonce, _service_command,
                                          name, action, *_arguments):
@@ -1002,8 +1113,11 @@ def client_cgroup_diagnostic_dedup_cases(client):
         nonlocal owned_calls
         owned_calls += 1
         if owned_calls <= 2:
-            return {"LoadState": "loaded", "ActiveState": "active", "SubState": "exited"}
-        return {"LoadState": "not-found"}
+            return {
+                "LoadState": "loaded", "ActiveState": "active", "SubState": "exited",
+                "ControlGroup": "",
+            }
+        return {"LoadState": "not-found", "ControlGroup": ""}
 
     def cleanup_error(_invocation, _nonce, _service_command, name, action, *_arguments):
         require((name, action) == ("stop", "stop"),
@@ -1299,7 +1413,7 @@ def main():
     client_cgroup_lifecycle_cases(client)
     client_prelaunch_production_path_case(client)
     client_final_residue_diagnostic_cases(client)
-    client_terminal_teardown_reachability_case(client)
+    client_terminal_empty_launch_routing_cases(client)
     client_cgroup_observation_cases(client)
     client_cgroup_diagnostic_dedup_cases(client)
     client_phase_routing_cases(client)
