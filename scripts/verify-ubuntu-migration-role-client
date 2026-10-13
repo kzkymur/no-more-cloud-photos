@@ -216,6 +216,10 @@ def read_counter(phase, directory, counter_name):
     for _attempt in range(COUNTER_READ_ATTEMPTS):
         anchor = None
         descriptor = None
+        primary_error = None
+        cleanup_errors = []
+        retry = False
+        result = None
         try:
             anchor = os.open(counter_name, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
         except FileNotFoundError:
@@ -239,18 +243,30 @@ def read_counter(phase, directory, counter_name):
             try:
                 current = os.stat(counter_name, dir_fd=directory, follow_symlinks=False)
             except FileNotFoundError:
-                continue
+                retry = True
             except OSError:
                 raise counter_failure(phase, "read", "io") from None
-            if counter_identity(phase, current) == identity:
-                return value
+            if not retry and counter_identity(phase, current) == identity:
+                result = value
+        except BaseException as error:
+            primary_error = error
         finally:
             for opened in (descriptor, anchor):
                 if opened is not None:
                     try:
                         os.close(opened)
                     except OSError:
-                        raise counter_failure(phase, "read", "io") from None
+                        cleanup_errors.append(counter_failure(phase, "read", "io"))
+        if primary_error is not None:
+            if cleanup_errors:
+                raise aggregate_counter_failure(primary_error, cleanup_errors) from None
+            raise primary_error
+        if cleanup_errors:
+            raise aggregate_counter_failure(None, cleanup_errors) from None
+        if retry:
+            continue
+        if result is not None:
+            return result
     raise counter_failure(phase, "read", "rebound")
 
 
@@ -582,8 +598,10 @@ def record_counter(phase, name):
         raise counter_failure(phase, "publish", "unsafe-name")
     directory = None
     temporary = None
+    destination = None
     temporary_name = None
     temporary_identity = None
+    temporary_created = False
     replaced = False
     published = False
     primary_error = None
@@ -605,12 +623,16 @@ def record_counter(phase, name):
             temporary = os.open(temporary_name,
                                 os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                 0o600, dir_fd=directory)
+            temporary_created = True
             temporary_identity = counter_identity(
                 phase, os.fstat(temporary), "publish")
             written = 0
             while written < len(payload):
+                remaining = len(payload) - written
                 count = os.write(temporary, payload[written:])
-                if count <= 0:
+                if count <= 0 or count > remaining:
+                    raise counter_failure(phase, "publish", "short-write")
+                if count != remaining:
                     raise counter_failure(phase, "publish", "short-write")
                 written += count
             os.fsync(temporary)
@@ -621,11 +643,8 @@ def record_counter(phase, name):
                        src_dir_fd=directory, dst_dir_fd=directory)
             replaced = True
             destination = os.open(counter_name, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
-            try:
-                destination_identity = counter_identity(
-                    phase, os.fstat(destination), "publish")
-            finally:
-                os.close(destination)
+            destination_identity = counter_identity(
+                phase, os.fstat(destination), "publish")
             if destination_identity != temporary_identity:
                 raise counter_failure(phase, "publish", "published-uncertain")
             os.lseek(temporary, 0, os.SEEK_SET)
@@ -651,18 +670,28 @@ def record_counter(phase, name):
     except BaseException as error:
         primary_error = error
     cleanup_errors = []
-    if temporary is not None:
+    cleanup_identity = temporary_identity
+    if temporary_created and cleanup_identity is None and temporary is not None:
         try:
-            os.close(temporary)
-        except OSError:
-            cleanup_errors.append(counter_failure(phase, "publish", "io"))
-    if (directory is not None and temporary_name is not None and not replaced
-            and temporary_identity is not None):
-        try:
-            quarantine_counter_temp(
-                phase, directory, temporary_name, temporary_identity)
+            cleanup_identity = counter_identity(
+                phase, os.fstat(temporary), "publish")
         except BaseException as error:
             cleanup_errors.append(error)
+    for opened in (destination, temporary):
+        if opened is not None:
+            try:
+                os.close(opened)
+            except OSError:
+                cleanup_errors.append(counter_failure(phase, "publish", "io"))
+    if (directory is not None and temporary_name is not None and temporary_created
+            and not replaced and cleanup_identity is not None):
+        try:
+            quarantine_counter_temp(
+                phase, directory, temporary_name, cleanup_identity)
+        except BaseException as error:
+            cleanup_errors.append(error)
+    elif temporary_created and not replaced:
+        cleanup_errors.append(counter_failure(phase, "publish", "published-uncertain"))
     if directory is not None:
         try:
             os.close(directory)

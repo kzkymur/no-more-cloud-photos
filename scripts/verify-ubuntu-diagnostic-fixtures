@@ -1316,13 +1316,19 @@ def counter_atomic_cases(client, containment):
 
     try:
         client_globals["REQUESTED_MODE"] = "fixture"
-        client_globals["CLIENT_LOCK_HELD"] = True
         client_globals["counter_identity"] = fixture_client_identity
         client_globals["counter_directory_identity"] = fixture_directory_identity
         containment_globals["counter_identity"] = fixture_containment_identity
         with tempfile.TemporaryDirectory() as directory:
             client_globals["RUN"] = directory
             path = os.path.join(directory, "fixture.count")
+
+            client_globals["CLIENT_LOCK_HELD"] = False
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=lock-required")
+            require(not os.listdir(directory),
+                    "false client-lock state published a counter artifact")
+            client_globals["CLIENT_LOCK_HELD"] = True
 
             os.mkfifo(path, 0o600)
             assert_bounded_raises(
@@ -1341,6 +1347,9 @@ def counter_atomic_cases(client, containment):
             original_open = module_os.open
             original_fstat = module_os.fstat
             original_write = module_os.write
+            original_close = module_os.close
+            original_lseek = module_os.lseek
+            original_ftruncate = module_os.ftruncate
             synthetic_block_anchors = set()
 
             def synthetic_block_open(target, flags, *args, **kwargs):
@@ -1540,6 +1549,41 @@ def counter_atomic_cases(client, containment):
             pathlib.Path(path).write_bytes(b"4\n")
             os.chmod(path, 0o600)
 
+            content_rebound = False
+            publication_cleanup_closes = 0
+
+            def corrupt_published_content(descriptor, offset, whence):
+                nonlocal content_rebound
+                result = original_lseek(descriptor, offset, whence)
+                if not content_rebound:
+                    content_rebound = True
+                    original_ftruncate(descriptor, 0)
+                    original_write(descriptor, b"888\n")
+                    original_lseek(descriptor, 0, os.SEEK_SET)
+                return result
+
+            def fail_publication_cleanup_close(descriptor):
+                nonlocal publication_cleanup_closes
+                original_close(descriptor)
+                if content_rebound:
+                    publication_cleanup_closes += 1
+                    raise injected()
+
+            module_os.lseek = corrupt_published_content
+            module_os.close = fail_publication_cleanup_close
+            try:
+                assert_raises(lambda: client["record_counter"]("work", "count"),
+                              "phase=work operation=publish resource=counter "
+                              "category=published-uncertain; cleanup=io|io|io")
+            finally:
+                module_os.lseek = original_lseek
+                module_os.close = original_close
+            require(content_rebound and publication_cleanup_closes == 3
+                    and pathlib.Path(path).read_bytes() == b"888\n",
+                    "destination content check or independent outer closes did not execute")
+            pathlib.Path(path).write_bytes(b"4\n")
+            os.chmod(path, 0o600)
+
             stale = path + ".tmp." + "a" * 32
             pathlib.Path(stale).write_bytes(b"99\n")
             os.chmod(stale, 0o600)
@@ -1577,13 +1621,14 @@ def counter_atomic_cases(client, containment):
                     "cleanup deleted or accepted an entry rebound before quarantine")
             os.unlink(os.path.join(directory, preserved[0]))
 
-            old = pathlib.Path(path).read_bytes()
             original_write = module_os.write
             module_os.write = lambda descriptor, payload: original_write(descriptor, payload[:1])
-            client["record_counter"]("work", "count")
+            old = pathlib.Path(path).read_bytes()
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=short-write")
             module_os.write = original_write
-            require(containment["counter"]("persistent-cleanup", path) == 6,
-                    "short writes were not completed")
+            require(pathlib.Path(path).read_bytes() == old,
+                    "positive short write changed the published counter")
 
             def zero_write(_descriptor, _payload):
                 return 0
@@ -1596,6 +1641,13 @@ def counter_atomic_cases(client, containment):
             require(pathlib.Path(path).read_bytes() == old,
                     "zero-write failure changed the published counter")
 
+            module_os.write = lambda _descriptor, payload: len(payload) + 1
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=short-write")
+            module_os.write = original_write
+            require(pathlib.Path(path).read_bytes() == old,
+                    "out-of-range write count changed the published counter")
+
             module_os.write = lambda *_args: (_ for _ in ()).throw(injected())
             assert_raises(lambda: client["record_counter"]("work", "count"),
                           "phase=work operation=publish resource=counter category=io")
@@ -1603,11 +1655,81 @@ def counter_atomic_cases(client, containment):
             require(pathlib.Path(path).read_bytes() == old,
                     "write failure changed the published counter")
 
+            fstat_failed = False
+            created_descriptors = set()
+
+            def post_create_open(target, flags, *args, **kwargs):
+                descriptor = original_open(target, flags, *args, **kwargs)
+                if ".tmp." in str(target) and flags & os.O_EXCL:
+                    created_descriptors.add(descriptor)
+                return descriptor
+
+            def post_create_fstat(descriptor):
+                nonlocal fstat_failed
+                if descriptor in created_descriptors and not fstat_failed:
+                    fstat_failed = True
+                    raise injected()
+                return original_fstat(descriptor)
+
+            module_os.open = post_create_open
+            module_os.fstat = post_create_fstat
+            entries_before_fstat_failure = set(os.listdir(directory))
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=io")
+            module_os.open = original_open
+            module_os.fstat = original_fstat
+            require(fstat_failed and pathlib.Path(path).read_bytes() == old
+                    and set(os.listdir(directory)) == entries_before_fstat_failure,
+                    "post-create fstat failure leaked an artifact or changed the counter")
+
+            def client_counter_read():
+                directory_descriptor = original_open(
+                    directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    return client["read_counter"](
+                        "work", directory_descriptor, "fixture.count")
+                finally:
+                    module_os.close(directory_descriptor)
+
+            for namespace, invoke in (
+                    (client, client_counter_read),
+                    (containment, lambda: containment["counter"]("persistent-cleanup", path))):
+                pathlib.Path(path).write_bytes(b"01\n")
+                os.chmod(path, 0o600)
+                opened = []
+                closed = []
+
+                def tracking_open(target, flags, *args, **kwargs):
+                    descriptor = original_open(target, flags, *args, **kwargs)
+                    if target == path or target == "fixture.count" or str(target).startswith("/proc/self/fd/"):
+                        opened.append(descriptor)
+                    return descriptor
+
+                def failing_reader_close(descriptor):
+                    original_close(descriptor)
+                    if descriptor in opened:
+                        closed.append(descriptor)
+                        raise injected()
+
+                module_os.open = tracking_open
+                module_os.close = failing_reader_close
+                try:
+                    assert_raises(invoke,
+                                  ("phase=work" if namespace is client else
+                                   "phase=persistent-cleanup")
+                                  + " operation=parse resource=counter category=non-canonical; "
+                                    "cleanup=io|io")
+                finally:
+                    module_os.open = original_open
+                    module_os.close = original_close
+                require(len(set(closed)) == 2,
+                        "coherent reader did not attempt both content and anchor closes")
+            pathlib.Path(path).write_bytes(old)
+            os.chmod(path, 0o600)
+
             cleanup_started = False
             cleanup_closes = 0
             cleanup_renames = 0
-            original_close = module_os.close
-
             def primary_write_failure(*_args):
                 nonlocal cleanup_started
                 cleanup_started = True
@@ -1673,7 +1795,7 @@ def counter_atomic_cases(client, containment):
                           "phase=work operation=publish resource=counter "
                           "category=published-uncertain")
             module_os.fsync = original_fsync
-            require(fsync_calls == 2 and containment["counter"]("persistent-cleanup", path) == 7,
+            require(fsync_calls == 2 and containment["counter"]("persistent-cleanup", path) == 6,
                     "directory fsync failure destroyed published evidence")
 
             pathlib.Path(path).write_bytes(b"999999\n")
@@ -1771,6 +1893,9 @@ def counter_atomic_cases(client, containment):
         module_os.fstat = original_fstat if "original_fstat" in locals() else module_os.fstat
         module_os.open = original_open if "original_open" in locals() else module_os.open
         module_os.close = original_close if "original_close" in locals() else module_os.close
+        module_os.lseek = original_lseek if "original_lseek" in locals() else module_os.lseek
+        module_os.ftruncate = (original_ftruncate if "original_ftruncate" in locals()
+                               else module_os.ftruncate)
         client_globals["RUN"] = original_run
         client_globals["REQUESTED_MODE"] = original_mode
         client_globals["CLIENT_LOCK_HELD"] = original_lock_held
