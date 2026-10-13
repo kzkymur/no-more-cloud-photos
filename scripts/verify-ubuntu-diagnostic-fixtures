@@ -142,6 +142,10 @@ def cgroup_case(namespace, kind):
                 raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
             if kind == "partial-residue-root-removal" and root_calls >= 3:
                 raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+            if kind == "absent-live-recheck-absent" and root_calls in (5, 6, 7, 9, 10):
+                raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+            if kind == "complete-absent-complete" and root_calls in (5, 6):
+                raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
             return directory(10)
         if path.endswith("/child"):
             child_calls += 1
@@ -184,6 +188,8 @@ def cgroup_case(namespace, kind):
             raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
         if kind == "transient-file-residue" and open_calls == 1:
             raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
+        if kind == "complete-interrupted-complete" and open_calls == 2:
+            raise FileNotFoundError(errno.ENOENT, SECRET, HOSTILE_PATH)
         if kind == "changing-pids":
             read_calls += 1
             return FakeFile("17\n" if read_calls == 1 else "23\n")
@@ -223,7 +229,27 @@ def cgroup_case(namespace, kind):
                           f"phase={phase} operation=walk resource=evidence errno=11")
             require(open_calls == 1 and root_calls >= 10,
                     "partial PID evidence was not preserved through permanent root removal")
-        elif kind in ("residue", "transient-root-residue", "two-absent-root-observations"):
+        elif kind == "complete-interrupted-complete":
+            require(function("/fixture", phase) == [],
+                    "complete snapshot did not stabilize after an interrupted observation")
+            require(open_calls == 4,
+                    "interrupted observation was counted toward complete snapshot stability")
+        elif kind == "absent-live-recheck-absent":
+            assert_raises(lambda: function("/fixture", phase),
+                          f"phase={phase} operation=walk resource=evidence errno=11")
+            require(root_calls == 10,
+                    "live root recheck did not break consecutive absent observations")
+        elif kind == "complete-absent-complete":
+            require(function("/fixture", phase) == [],
+                    "complete snapshot did not stabilize after confirmed absence")
+            require(open_calls == 3 and root_calls == 14,
+                    "confirmed absence did not invalidate the prior complete snapshot")
+        elif kind == "two-absent-root-observations":
+            assert_raises(lambda: function("/fixture", phase),
+                          f"phase={phase} operation=walk resource=evidence errno=11")
+            require(open_calls == 2,
+                    "confirmed absence allowed prior residue snapshot reuse")
+        elif kind in ("residue", "transient-root-residue"):
             observed = function("/fixture", phase)
             require(observed == [17, 23],
                     f"nonempty cgroup residue was lost: {kind}:{phase}:{observed}:{root_calls}")
@@ -432,6 +458,272 @@ def signed_cleanup_lock_cases(containment):
             "signed cleanup callback did not run exactly once with owned identity")
 
 
+def client_cgroup_lifecycle_cases(client):
+    globals_ = client["retain_control_group"].__globals__
+    recorded = globals_["RECORDED_CGROUP"]
+    canonical = globals_["CANONICAL_CGROUP"]
+    original_recorded = list(recorded)
+    original_cgroup_pids = globals_["cgroup_pids"]
+    original_owned_state = globals_["owned_state"]
+    calls = []
+    residue = {}
+
+    def fake_cgroup_pids(control_group, phase):
+        calls.append((control_group, phase))
+        return list(residue.get(control_group, ()))
+
+    try:
+        recorded[:] = []
+        client["retain_control_group"]({"LoadState": "loaded", "ControlGroup": "/recorded-a"})
+        client["retain_control_group"]({
+            "LoadState": "loaded", "ControlGroup": "/recorded-b", "InvocationID": "mismatch",
+        })
+        client["retain_control_group"]({"LoadState": "loaded", "ControlGroup": "/recorded-a"})
+        client["retain_control_group"]({"LoadState": "not-found"})
+        require(client["fixed_cgroup_paths"]() == ("/recorded-a", "/recorded-b", canonical),
+                "later/mismatched/minimal states replaced retained control groups")
+        for invalid in (None, "", "relative", "/"):
+            state = {"LoadState": "loaded"}
+            if invalid is not None:
+                state["ControlGroup"] = invalid
+            assert_fails_with(lambda state=state: client["retain_control_group"](state),
+                              "loaded fixed unit has an invalid control group path")
+        require(client["fixed_cgroup_paths"]() == ("/recorded-a", "/recorded-b", canonical),
+                "invalid loaded state changed the retained control group")
+        recorded[:] = [f"/recorded-{index}" for index in range(globals_["RECORDED_CGROUP_LIMIT"])]
+        assert_fails_with(lambda: client["retain_control_group"]({
+            "LoadState": "loaded", "ControlGroup": "/overflow",
+        }), "too many fixed unit control group paths were observed")
+        require(recorded[-1] == "/overflow",
+                "retained control group bound omitted the overflow state")
+        recorded[:] = ["/recorded-a", "/recorded-b"]
+
+        globals_["cgroup_pids"] = fake_cgroup_pids
+        residue["/recorded-a"] = (41,)
+        assert_fails_with(lambda: client["assert_fixed_cgroups_empty"]("teardown"),
+                          "fixed-cgroup-residue=true")
+        require(calls == [("/recorded-a", "teardown"), ("/recorded-b", "teardown"),
+                          (canonical, "teardown")],
+                "recorded residue check skipped an earlier/later/canonical fixed cgroup")
+
+        calls.clear()
+        assert_fails_with(lambda: client["assert_prelaunch_absent"]({
+            "LoadState": "loaded", "ControlGroup": "/recorded-b",
+        }), "fixed-cgroup-residue=true")
+        require(calls == [("/recorded-a", "prelaunch"), ("/recorded-b", "prelaunch"),
+                          (canonical, "prelaunch")],
+                "prelaunch loaded-state rejection bypassed cgroup evidence")
+
+        calls.clear()
+        residue.clear()
+        residue[canonical] = (42,)
+        assert_fails_with(lambda: client["assert_fixed_cgroups_empty"]("prelaunch"),
+                          "fixed-cgroup-residue=true")
+        require(calls == [("/recorded-a", "prelaunch"), ("/recorded-b", "prelaunch"),
+                          (canonical, "prelaunch")],
+                "canonical residue check skipped retained control groups")
+
+        calls.clear()
+        residue.clear()
+        assert_fails_with(lambda: client["assert_prelaunch_absent"]({
+            "LoadState": "loaded", "ControlGroup": "/recorded-b",
+        }), "fixed verification unit is not explicitly absent: "
+            "{'LoadState': 'loaded', 'ControlGroup': '/recorded-b'}")
+        require(calls == [("/recorded-a", "prelaunch"), ("/recorded-b", "prelaunch"),
+                          (canonical, "prelaunch")],
+                "empty loaded prelaunch state was rejected before cgroup evidence")
+
+        calls.clear()
+        residue.clear()
+        recorded[:] = [canonical]
+        client["assert_fixed_cgroups_empty"]("final-close")
+        require(calls == [(canonical, "final-close")],
+                "canonical and recorded control groups were not deduplicated")
+
+        recorded[:] = ["/recorded-a", "/recorded-b"]
+        globals_["owned_state"] = lambda *_args, **_kwargs: {"LoadState": "not-found"}
+        calls.clear()
+        client["teardown_owned"]("i" * 32, "n" * 64, ("/fixture",))
+        require(calls == [("/recorded-a", "teardown"), ("/recorded-b", "teardown"),
+                          (canonical, "teardown")],
+                "cleanup accepted minimal not-found without both cgroup checks")
+        calls.clear()
+        client["wait_unloaded"]("i" * 32, "n" * 64, ("/fixture",))
+        require(calls == [("/recorded-a", "unload"), ("/recorded-b", "unload"),
+                          (canonical, "unload")],
+                "unload accepted minimal not-found without both cgroup checks")
+
+        calls.clear()
+        residue["/recorded-a"] = (43,)
+        assert_fails_with(lambda: client["teardown_owned"](
+            "i" * 32, "n" * 64, ("/fixture",)),
+            "fixed-cgroup-residue=true")
+
+        calls.clear()
+        assert_fails_with(lambda: client["resolve_outcome"](
+            RuntimeError("primary-original"), [], "n" * 64),
+            "fixed-cgroup-residue=true; primary-original")
+        require(calls == [("/recorded-a", "final-close"),
+                          ("/recorded-b", "final-close"), (canonical, "final-close")],
+                "primary error bypassed final cgroup evidence")
+
+        calls.clear()
+        assert_fails_with(lambda: client["resolve_outcome"](
+            None, [RuntimeError("cleanup-original")], "n" * 64),
+            "fixed-cgroup-residue=true; cleanup-original")
+        require(calls == [("/recorded-a", "final-close"),
+                          ("/recorded-b", "final-close"), (canonical, "final-close")],
+                "cleanup error bypassed final cgroup evidence")
+
+        calls.clear()
+        residue.clear()
+        assert_fails_with(lambda: client["resolve_outcome"](
+            RuntimeError("minimal-not-found-primary"), [], "n" * 64),
+            "minimal-not-found-primary")
+        require(calls == [("/recorded-a", "final-close"),
+                          ("/recorded-b", "final-close"), (canonical, "final-close")],
+                "minimal not-found primary path bypassed final cgroup evidence")
+    finally:
+        recorded[:] = original_recorded
+        globals_["cgroup_pids"] = original_cgroup_pids
+        globals_["owned_state"] = original_owned_state
+
+
+def client_final_residue_diagnostic_cases(client):
+    globals_ = client["retain_control_group"].__globals__
+    recorded = globals_["RECORDED_CGROUP"]
+    canonical = globals_["CANONICAL_CGROUP"]
+    original_recorded = list(recorded)
+    original_cgroup_pids = globals_["cgroup_pids"]
+    calls = []
+    residue_paths = set()
+
+    def fake_cgroup_pids(control_group, phase):
+        calls.append((control_group, phase))
+        return [987654] if control_group in residue_paths else []
+
+    try:
+        globals_["cgroup_pids"] = fake_cgroup_pids
+        recorded[:] = [f"/recorded-{index}" for index in range(globals_["RECORDED_CGROUP_LIMIT"])]
+        try:
+            client["retain_control_group"]({
+                "LoadState": "loaded", "ControlGroup": "/overflow",
+            })
+        except RuntimeError as error:
+            overflow_error = error
+        else:
+            raise RuntimeError("65th retained control group did not fail closed")
+        require(recorded[-1] == "/overflow", "65th control group was not retained before failure")
+        residue_paths.add("/overflow")
+        try:
+            client["resolve_outcome"](
+                overflow_error, [RuntimeError("cleanup-" + "c" * 512)], "n" * 64)
+        except RuntimeError as error:
+            diagnostic = str(error)
+        else:
+            raise RuntimeError("overflow residue did not fail final outcome resolution")
+        require(("/overflow", "final-close") in calls,
+                "final outcome did not inspect the retained overflow path")
+        require(diagnostic.startswith("fixed-cgroup-residue=true; ")
+                and "too many fixed unit control group paths were observed" in diagnostic,
+                "overflow residue did not precede and preserve the overflow error")
+        require(len(diagnostic) <= 512 and "/overflow" not in diagnostic
+                and "987654" not in diagnostic,
+                "overflow residue diagnostic leaked path/PID evidence or exceeded its bound")
+
+        calls.clear()
+        recorded[:] = ["/recorded-a", "/recorded-b"]
+        residue_paths.clear()
+        residue_paths.update(("/recorded-a", canonical))
+        try:
+            client["resolve_outcome"](
+                RuntimeError("p" * 512),
+                [RuntimeError("r" * 512), RuntimeError("c" * 512)], "n" * 64)
+        except RuntimeError as error:
+            diagnostic = str(error)
+        else:
+            raise RuntimeError("long prior errors hid final cgroup residue")
+        require(diagnostic.startswith("fixed-cgroup-residue=true; p") and len(diagnostic) <= 526,
+                "fixed residue indicator was truncated behind prior errors")
+        require("/recorded-a" not in diagnostic and "/recorded-b" not in diagnostic
+                and canonical not in diagnostic and "987654" not in diagnostic,
+                "fixed residue diagnostic exposed a retained path or PID")
+        require(calls == [("/recorded-a", "final-close"),
+                          ("/recorded-b", "final-close"), (canonical, "final-close")],
+                "long-error final residue check skipped retained/canonical paths")
+    finally:
+        recorded[:] = original_recorded
+        globals_["cgroup_pids"] = original_cgroup_pids
+
+
+def client_phase_routing_cases(client):
+    globals_ = client["unit_properties"].__globals__
+    module_os = globals_["os"]
+    original_run = subprocess.run
+    original_open = module_os.open
+    original_retries = globals_["PROPERTY_RETRIES"]
+    original_mode = globals_["REQUESTED_MODE"]
+    original_counter = globals_["record_counter"]
+    original_interceptions = dict(globals_["INTERCEPTIONS"])
+    original_boundaries = set(globals_["BOUNDARIES"])
+    property_cases = (
+        ("prelaunch", lambda: client["unit_properties"]("prelaunch", "LoadState")),
+        ("immediate", lambda: client["launch_state"]("immediate", context="immediate")),
+        ("recovery", lambda: client["launch_state"]("recovery", context="recovery")),
+        ("ownership-read", lambda: client["owned_state"](
+            "ownership-read", "i" * 32, "n" * 64, ("/fixture",))),
+        ("work", lambda: client["owned_state"](
+            "work", "i" * 32, "n" * 64, ("/fixture",))),
+        ("teardown", lambda: client["teardown_owned"](
+            "i" * 32, "n" * 64, ("/fixture",))),
+        ("unload", lambda: client["wait_unloaded"](
+            "i" * 32, "n" * 64, ("/fixture",))),
+    )
+    try:
+        globals_["PROPERTY_RETRIES"] = 1
+        subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+        for phase, call in property_cases:
+            assert_fails_with(call,
+                              f"unit properties remain unknown: phase={phase} "
+                              "operation=run resource=process errno=13")
+
+        module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
+        assert_raises(lambda: client["durable_marker"]("final-close", "fixture"),
+                      "phase=final-close operation=open resource=marker errno=13")
+
+        globals_["REQUESTED_MODE"] = "client-cleanup-persistent-unload"
+        globals_["INTERCEPTIONS"].clear()
+        assert_raises(lambda: client["command_path"]("unload", "unload"),
+                      "phase=unload operation=open resource=evidence errno=13")
+
+        globals_["record_counter"] = lambda _phase, _name: None
+        globals_["REQUESTED_MODE"] = "client-cleanup-persistent-show"
+        globals_["INTERCEPTIONS"].clear()
+        globals_["INTERCEPTIONS"]["show"] = 3
+        assert_raises(lambda: client["command_path"]("teardown", "show"),
+                      "phase=teardown operation=open resource=marker errno=13")
+
+        globals_["REQUESTED_MODE"] = "client-cleanup-fault-stop"
+        globals_["INTERCEPTIONS"].clear()
+        assert_raises(lambda: client["command_path"]("teardown", "stop"),
+                      "phase=teardown operation=open resource=marker errno=13")
+
+        globals_["REQUESTED_MODE"] = "client-signal-int-unload"
+        globals_["BOUNDARIES"].clear()
+        assert_raises(lambda: client["cleanup_boundary"]("unload"),
+                      "phase=unload operation=open resource=marker errno=13")
+    finally:
+        subprocess.run = original_run
+        module_os.open = original_open
+        globals_["PROPERTY_RETRIES"] = original_retries
+        globals_["REQUESTED_MODE"] = original_mode
+        globals_["record_counter"] = original_counter
+        globals_["INTERCEPTIONS"].clear()
+        globals_["INTERCEPTIONS"].update(original_interceptions)
+        globals_["BOUNDARIES"].clear()
+        globals_["BOUNDARIES"].update(original_boundaries)
+
+
 def actual_boundary_cases(client, containment):
     client_globals = client["publish_supervisor"].__globals__
     containment_globals = containment["release"].__globals__
@@ -440,7 +732,7 @@ def actual_boundary_cases(client, containment):
     original_open = module_os.open
     try:
         module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
-        assert_raises(lambda: client["durable_marker"]("fixture"),
+        assert_raises(lambda: client["durable_marker"]("work", "fixture"),
                       "phase=work operation=open resource=marker errno=13")
         assert_raises(client["open_client_lock"],
                       "phase=startup operation=open resource=lock errno=13")
@@ -488,7 +780,7 @@ def actual_boundary_cases(client, containment):
         raw_closes = []
         module_os.close = lambda descriptor: raw_closes.append(descriptor)
         module_os.fdopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
-        assert_raises(lambda: client["record_counter"]("fixture"),
+        assert_raises(lambda: client["record_counter"]("work", "fixture"),
                       "phase=work operation=fdopen resource=counter errno=13")
         require(raw_closes == [90], "fdopen failure did not close its raw counter descriptor")
 
@@ -496,7 +788,7 @@ def actual_boundary_cases(client, containment):
         successful_counter = FakeCounter("0")
         module_os.fdopen = lambda *_args, **_kwargs: successful_counter
         module_os.fsync = lambda *_args, **_kwargs: None
-        client["record_counter"]("fixture")
+        client["record_counter"]("work", "fixture")
         require(not raw_closes and successful_counter.close_calls == 1,
                 "successful fdopen double-closed or failed to close transferred ownership")
 
@@ -505,14 +797,14 @@ def actual_boundary_cases(client, containment):
         counter.read = lambda: (_ for _ in ()).throw(injected())
         module_os.fdopen = lambda *_args, **_kwargs: counter
         module_os.fsync = lambda *_args, **_kwargs: None
-        assert_raises(lambda: client["record_counter"]("fixture"),
+        assert_raises(lambda: client["record_counter"]("work", "fixture"),
                       "phase=work operation=read resource=evidence errno=13")
 
         for method, operation in (("seek", "seek"), ("truncate", "truncate")):
             counter = FakeCounter("0")
             setattr(counter, method, lambda *_args: (_ for _ in ()).throw(injected()))
             module_os.fdopen = lambda *_args, counter=counter, **_kwargs: counter
-            assert_raises(lambda: client["record_counter"]("fixture"),
+            assert_raises(lambda: client["record_counter"]("work", "fixture"),
                           f"phase=work operation={operation} resource=evidence errno=13")
     finally:
         module_os.open = original_open
@@ -615,6 +907,9 @@ def main():
     diagnostic_cases(client, containment)
     explicit_marker_phase_cases(containment)
     signed_cleanup_lock_cases(containment)
+    client_cgroup_lifecycle_cases(client)
+    client_final_residue_diagnostic_cases(client)
+    client_phase_routing_cases(client)
     actual_boundary_cases(client, containment)
     for namespace in (client, containment):
         cgroup_boundary_cases(namespace)
@@ -625,6 +920,8 @@ def main():
                      "transient-root-residue", "two-absent-root-observations",
                      "empty-root-removal", "residue-root-removal",
                      "partial-residue-root-removal",
+                     "complete-interrupted-complete", "absent-live-recheck-absent",
+                     "complete-absent-complete",
                      "before-after-fstat-mismatch", "final-directory-recheck-mismatch",
                      "initial-root-nondirectory", "root-becomes-nondirectory",
                      "directory-becomes-nondirectory", "malformed-pids"):

@@ -1110,6 +1110,7 @@ def cgroup_pids(control_group, phase):
             try:
                 rechecked = cgroup_stat(phase, root)
             except FileNotFoundError:
+                previous = None
                 if not residue_seen and previous_absent:
                     return []
                 previous_absent = True
@@ -1121,6 +1122,8 @@ def cgroup_pids(control_group, phase):
             if root_anchor is not None and (rechecked.st_dev, rechecked.st_ino) != root_anchor:
                 raise evidence_failure(
                     phase, "stat", "evidence", OSError(errno.ESTALE, "reused"))
+            previous = None
+            previous_absent = False
             continue
         except ValueError:
             fail("unit control group contained malformed process evidence")

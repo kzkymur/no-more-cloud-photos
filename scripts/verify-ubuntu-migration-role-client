@@ -16,6 +16,7 @@ import time
 
 
 UNIT = "nmcp-migration-role-verifier.service"
+CANONICAL_CGROUP = "/system.slice/nmcp-migration-role-verifier.service"
 RUN = "/run/nmcp-ci"
 PROGRAM = RUN + "/supervisor.py"
 PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -29,14 +30,16 @@ DESCRIPTION_PREFIX = "NMCP migration role verifier "
 SUCCESS = "Ubuntu migration role compatibility verification passed"
 CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
 CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
+CGROUP_RESIDUE_FAILURE = "fixed-cgroup-residue=true"
 JOURNAL_TIMEOUT = 5
 JOURNAL_BYTE_LIMIT = 256
 JOURNAL_LINE_LIMIT = 3
 JOURNAL_QUERY_LINE_LIMIT = 4
 CGROUP_SNAPSHOT_ATTEMPTS = 4
 DIAGNOSTIC_PHASES = (
-    "final-close", "journal", "launch", "ownership-read", "prelaunch", "source-publication",
-    "startup", "teardown", "transaction-lock", "uncategorized", "unload", "work",
+    "final-close", "immediate", "journal", "launch", "ownership-read", "prelaunch",
+    "recovery", "source-publication", "startup", "teardown", "transaction-lock",
+    "uncategorized", "unload", "work",
 )
 DIAGNOSTIC_OPERATIONS = (
     "chdir", "chmod", "close", "fdopen", "flock", "flush", "fsync", "kill", "mkdir", "open",
@@ -68,6 +71,8 @@ CLEANUP_ACTIVE = False
 RECOVERED_ERRORS = []
 INTERCEPTIONS = {}
 BOUNDARIES = set()
+RECORDED_CGROUP = []
+RECORDED_CGROUP_LIMIT = 64
 PROPERTY_RETRIES = 4
 PROPERTY_RETRY_BUDGET = 3.0
 TOTAL_BUDGET = 17 * 60
@@ -180,14 +185,14 @@ def cgroup_close(phase, source):
         raise evidence_failure(phase, "close", "evidence", error) from None
 
 
-def marker_exists(path):
+def marker_exists(phase, path):
     try:
         os.stat(path)
         return True
     except FileNotFoundError:
         return False
     except OSError as error:
-        raise evidence_failure("work", "stat", "marker", error) from None
+        raise evidence_failure(phase, "stat", "marker", error) from None
 
 
 def open_client_lock():
@@ -349,37 +354,37 @@ def bounded_journal_evidence(invocation):
     return parse_journal_evidence(bytes(payload))
 
 
-def record_counter(name):
+def record_counter(phase, name):
     path = f"{RUN}/{REQUESTED_MODE}.{name}"
     descriptor = None
     counter = None
     try:
-        descriptor = os_call("work", "open", "evidence", os.open, path,
+        descriptor = os_call(phase, "open", "evidence", os.open, path,
                              os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
-            counter = os_call("work", "fdopen", "counter", os.fdopen,
+            counter = os_call(phase, "fdopen", "counter", os.fdopen,
                               descriptor, "r+", encoding="ascii")
         except BaseException:
-            os_call("work", "close", "counter", os.close, descriptor)
+            os_call(phase, "close", "counter", os.close, descriptor)
             raise
         descriptor = None
-        value = os_call("work", "read", "evidence", counter.read).strip()
-        os_call("work", "seek", "evidence", counter.seek, 0)
-        os_call("work", "truncate", "evidence", counter.truncate)
-        os_call("work", "write", "evidence", counter.write,
+        value = os_call(phase, "read", "evidence", counter.read).strip()
+        os_call(phase, "seek", "evidence", counter.seek, 0)
+        os_call(phase, "truncate", "evidence", counter.truncate)
+        os_call(phase, "write", "evidence", counter.write,
                 str((int(value) if value else 0) + 1) + "\n")
-        os_call("work", "flush", "evidence", counter.flush)
-        os_call("work", "fsync", "evidence", os.fsync, counter.fileno())
+        os_call(phase, "flush", "evidence", counter.flush)
+        os_call(phase, "fsync", "evidence", os.fsync, counter.fileno())
     except OSError as error:
-        raise evidence_failure("work", "write", "evidence", error) from None
+        raise evidence_failure(phase, "write", "evidence", error) from None
     except ValueError:
         fail("command interception evidence was malformed")
     finally:
         if counter is not None:
-            os_call("work", "close", "evidence", counter.close)
+            os_call(phase, "close", "evidence", counter.close)
 
 
-def command_path(name):
+def command_path(phase, name):
     transient = REQUESTED_MODE == "client-cleanup-fault-" + name
     slow_cleanup = REQUESTED_MODE == "client-work-budget-slow-cleanup"
     persistent = REQUESTED_MODE == "client-cleanup-persistent-" + name
@@ -396,7 +401,7 @@ def command_path(name):
     if persistent or (slow_cleanup and count < slow_limit) or count == 0:
         interception = count + 1
         INTERCEPTIONS[name] = interception
-        record_counter(name + ".intercepted")
+        record_counter(phase, name + ".intercepted")
         if slow_cleanup:
             delay = (SLOW_PROPERTY_FAULT_SECONDS if name == "show"
                      else SLOW_ACTION_FAULT_SECONDS[name])
@@ -407,24 +412,24 @@ def command_path(name):
                 fail(f"absolute client cleanup deadline exhausted during slow {name} interception")
             fail(f"injected slow owned {name} failure before action")
         if REQUESTED_MODE == "client-cleanup-fault-stop":
-            durable_marker(REQUESTED_MODE + ".blocked")
+            durable_marker(phase, REQUESTED_MODE + ".blocked")
             release = f"{RUN}/{REQUESTED_MODE}.release"
             deadline = bounded_deadline(30)
-            while not marker_exists(release):
+            while not marker_exists(phase, release):
                 if time.monotonic() >= deadline:
                     fail("timed out awaiting release of intercepted stop command")
                 time.sleep(ACTION_RETRY_BACKOFF)
         required = 4 if name in ("show", "wait", "unload") else ACTION_ATTEMPTS
         if persistent and interception == required:
-            durable_marker(REQUESTED_MODE + ".handoff.ready")
+            durable_marker(phase, REQUESTED_MODE + ".handoff.ready")
             release = f"{RUN}/{REQUESTED_MODE}.handoff.release"
             deadline = bounded_deadline(30)
-            while not marker_exists(release):
+            while not marker_exists(phase, release):
                 if time.monotonic() >= deadline:
                     fail("timed out awaiting persistent-fault teardown handoff")
                 time.sleep(0.05)
         fail(f"intercepted {name} command before attempt")
-    record_counter(name + ".attempted")
+    record_counter(phase, name + ".attempted")
 
 
 def parse_unit_properties(result, requested):
@@ -458,21 +463,23 @@ def successful_terminal_state(state):
             and state.get("ActiveState") == "active" and state.get("SubState") == "exited")
 
 
-def unit_properties(*names, context="show"):
+def unit_properties(phase, *names, context="show"):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
     deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
     errors = []
     for attempt in range(PROPERTY_RETRIES):
         try:
-            command_path(context)
+            command_path(phase, context)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 fail("unit property lookup deadline exhausted")
             result = command(("/usr/bin/systemctl", "show", UNIT,
                               *(f"--property={name}" for name in requested)),
-                             "ownership-read", check=False,
+                              phase, check=False,
                              timeout=remaining)
             values = parse_unit_properties(result, requested)
+            if "ControlGroup" in requested:
+                retain_control_group(values)
             if errors:
                 RECOVERED_ERRORS.extend(errors)
             return values
@@ -487,7 +494,7 @@ def unit_properties(*names, context="show"):
 
 def cgroup_pids(control_group, phase):
     if not control_group:
-        return []
+        fail("unit control group path is missing")
     root = "/sys/fs/cgroup" + control_group
     previous = None
     root_anchor = None
@@ -562,6 +569,7 @@ def cgroup_pids(control_group, phase):
             try:
                 rechecked = cgroup_stat(phase, root)
             except FileNotFoundError:
+                previous = None
                 if not residue_seen and previous_absent:
                     return []
                 previous_absent = True
@@ -573,6 +581,8 @@ def cgroup_pids(control_group, phase):
             if root_anchor is not None and (rechecked.st_dev, rechecked.st_ino) != root_anchor:
                 raise evidence_failure(
                     phase, "stat", "evidence", OSError(errno.ESTALE, "reused"))
+            previous = None
+            previous_absent = False
             continue
         except ValueError:
             fail("unit control group contained malformed process evidence")
@@ -580,6 +590,67 @@ def cgroup_pids(control_group, phase):
             return list(snapshot[2])
         previous = snapshot
     raise evidence_failure(phase, "walk", "evidence", OSError(errno.EAGAIN, "unstable"))
+
+
+def retain_control_group(state):
+    if state.get("LoadState") == "not-found":
+        return
+    control_group = state.get("ControlGroup")
+    if (type(control_group) is not str or not control_group.startswith("/")
+            or control_group == "/" or os.path.normpath(control_group) != control_group):
+        fail("loaded fixed unit has an invalid control group path")
+    if control_group not in RECORDED_CGROUP:
+        RECORDED_CGROUP.append(control_group)
+    if len(RECORDED_CGROUP) > RECORDED_CGROUP_LIMIT:
+        fail("too many fixed unit control group paths were observed")
+
+
+def fixed_cgroup_paths():
+    return tuple(dict.fromkeys((*RECORDED_CGROUP, CANONICAL_CGROUP)))
+
+
+def fixed_cgroup_residue(phase):
+    residue = {}
+    for control_group in fixed_cgroup_paths():
+        pids = cgroup_pids(control_group, phase)
+        if pids:
+            residue[control_group] = pids
+    return residue
+
+
+def assert_fixed_cgroups_empty(phase):
+    residue = fixed_cgroup_residue(phase)
+    if residue:
+        fail(CGROUP_RESIDUE_FAILURE)
+
+
+def assert_prelaunch_absent(state):
+    retain_control_group(state)
+    assert_fixed_cgroups_empty("prelaunch")
+    if state.get("LoadState") != "not-found":
+        fail("fixed verification unit is not explicitly absent: "
+             f"{sanitized_state(state)}")
+
+
+def resolve_outcome(primary_error, cleanup_errors, nonce):
+    try:
+        assert_fixed_cgroups_empty("final-close")
+    except BaseException as final_error:
+        errors = [final_error]
+        if primary_error is not None:
+            errors.append(primary_error)
+        errors.extend(cleanup_errors)
+        detail = "; ".join(sanitized_diagnostic(error, nonce) for error in errors)
+        raise RuntimeError(sanitized_diagnostic(detail, nonce)) from None
+    if cleanup_errors:
+        detail = sanitized_diagnostic(
+            "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)
+        if primary_error is not None:
+            primary = sanitized_diagnostic(primary_error, nonce)
+            raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None
+        fail(f"cleanup failed: {detail}")
+    if primary_error is not None:
+        raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None
 
 
 def exec_start_argv(value):
@@ -604,14 +675,14 @@ def launch_matches(state, nonce, service_command):
     return all(state.get(name) == expected for name, expected in SERVICE_PROPERTIES.items())
 
 
-def launch_state(*, context="show"):
-    return unit_properties("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+def launch_state(phase, *, context="show"):
+    return unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
                            "Description", "Environment", "ExecStart", *SERVICE_PROPERTIES,
                            context=context)
 
 
-def owned_state(invocation, nonce, service_command, *properties, context="owned-state"):
-    state = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState",
+def owned_state(phase, invocation, nonce, service_command, *properties, context="owned-state"):
+    state = unit_properties(phase, "LoadState", "InvocationID", "ActiveState", "SubState",
                             "ControlGroup", "Description", "Environment", "ExecStart",
                             *SERVICE_PROPERTIES, *properties, context=context)
     if state.get("LoadState") == "not-found":
@@ -626,10 +697,10 @@ def owned_state(invocation, nonce, service_command, *properties, context="owned-
 
 
 def owned_command(invocation, nonce, service_command, *arguments):
-    state = owned_state(invocation, nonce, service_command)
+    state = owned_state("teardown", invocation, nonce, service_command)
     if state.get("LoadState") == "not-found":
         return False
-    command_path("reset" if arguments[0] == "reset-failed" else arguments[0])
+    command_path("teardown", "reset" if arguments[0] == "reset-failed" else arguments[0])
     result = command(("/usr/bin/systemctl", *arguments, UNIT), "teardown", check=False,
                      timeout=ACTION_TIMEOUTS[arguments[0]])
     if result.returncode:
@@ -637,28 +708,28 @@ def owned_command(invocation, nonce, service_command, *arguments):
     return True
 
 
-def durable_marker(name):
+def durable_marker(phase, name):
     path = f"{RUN}/{name}"
-    descriptor = os_call("work", "open", "marker", os.open, path,
+    descriptor = os_call(phase, "open", "marker", os.open, path,
                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        os_call("work", "write", "marker", os.write, descriptor, b"ready\n")
-        os_call("work", "fsync", "marker", os.fsync, descriptor)
+        os_call(phase, "write", "marker", os.write, descriptor, b"ready\n")
+        os_call(phase, "fsync", "marker", os.fsync, descriptor)
     finally:
-        os_call("work", "close", "marker", os.close, descriptor)
-    directory = os_call("work", "open", "directory", os.open, RUN,
+        os_call(phase, "close", "marker", os.close, descriptor)
+    directory = os_call(phase, "open", "directory", os.open, RUN,
                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        os_call("work", "fsync", "directory", os.fsync, directory)
+        os_call(phase, "fsync", "directory", os.fsync, directory)
     finally:
-        os_call("work", "close", "directory", os.close, directory)
+        os_call(phase, "close", "directory", os.close, directory)
 
 
 def exhaust_work_budget(boundary):
     global COMMAND_DEADLINE
     COMMAND_DEADLINE = min(COMMAND_DEADLINE,
                            time.monotonic() + WORK_BUDGET_FAULT_SECONDS)
-    durable_marker(f"client-work-budget-{boundary}.ready")
+    durable_marker("work", f"client-work-budget-{boundary}.ready")
     while time.monotonic() < COMMAND_DEADLINE:
         time.sleep(min(0.05, max(0, COMMAND_DEADLINE - time.monotonic())))
     fail(f"absolute client work budget exhausted at {boundary}")
@@ -669,7 +740,10 @@ def cleanup_boundary(name):
     if (name not in BOUNDARIES and REQUESTED_MODE.startswith(prefix)
             and REQUESTED_MODE.endswith("-" + name)):
         BOUNDARIES.add(name)
-        durable_marker(REQUESTED_MODE + ".ready")
+        if name == "unload":
+            durable_marker("unload", REQUESTED_MODE + ".ready")
+        else:
+            durable_marker("teardown", REQUESTED_MODE + ".ready")
         deadline = bounded_deadline(10)
         while not signal.sigpending() & CANCELLATION_SIGNALS:
             if time.monotonic() >= deadline:
@@ -699,8 +773,9 @@ def wait_unloaded(invocation, nonce, service_command, timeout=UNLOAD_TIMEOUT):
     deadline = bounded_deadline(timeout)
     while True:
         cleanup_boundary("unload")
-        state = owned_state(invocation, nonce, service_command, context="unload")
+        state = owned_state("unload", invocation, nonce, service_command, context="unload")
         if state.get("LoadState") == "not-found":
+            assert_fixed_cgroups_empty("unload")
             return
         if time.monotonic() >= deadline:
             if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:
@@ -712,22 +787,25 @@ def wait_unloaded(invocation, nonce, service_command, timeout=UNLOAD_TIMEOUT):
 def teardown_owned(invocation, nonce, service_command):
     """Remove only one attested invocation while the client lock is held."""
     errors = []
-    state = owned_state(invocation, nonce, service_command, "Result", "ExecMainCode", "ExecMainStatus",
+    state = owned_state("teardown", invocation, nonce, service_command,
+                        "Result", "ExecMainCode", "ExecMainStatus",
                         context="show")
     if state.get("LoadState") == "not-found":
+        assert_fixed_cgroups_empty("teardown")
         return
     kill_sent = False
     deadline = bounded_deadline(KILL_WAIT_TIMEOUT)
     while True:
         cleanup_boundary("wait")
         try:
-            state = owned_state(invocation, nonce, service_command, context="wait")
+            state = owned_state("teardown", invocation, nonce, service_command, context="wait")
         except BaseException as error:
             errors.append(error)
             break
         if state.get("LoadState") == "not-found":
+            assert_fixed_cgroups_empty("teardown")
             break
-        occupants = cgroup_pids(state.get("ControlGroup", ""), "teardown")
+        occupants = fixed_cgroup_residue("teardown")
         if occupants and not kill_sent:
             try:
                 retry_owned_command(invocation, nonce, service_command,
@@ -752,7 +830,7 @@ def teardown_owned(invocation, nonce, service_command):
         except BaseException as error:
             errors.append(error)
     try:
-        state = owned_state(invocation, nonce, service_command)
+        state = owned_state("teardown", invocation, nonce, service_command)
     except BaseException as error:
         errors.append(error)
         state = None
@@ -770,6 +848,11 @@ def teardown_owned(invocation, nonce, service_command):
             wait_unloaded(invocation, nonce, service_command)
         except BaseException as error:
             errors.append(error)
+    else:
+        try:
+            assert_fixed_cgroups_empty("teardown")
+        except BaseException as error:
+            errors.append(error)
     if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:
         errors.append(RuntimeError("absolute client cleanup deadline exhausted before owned unload"))
     if errors:
@@ -778,12 +861,12 @@ def teardown_owned(invocation, nonce, service_command):
                 "; ".join(sanitized_diagnostic(error, nonce) for error in errors), nonce)) from None
 
 
-def client_pause(name):
+def client_pause(phase, name):
     ready = f"{RUN}/{name}.ready"
     release = f"{RUN}/{name}.release"
-    durable_marker(name + ".ready")
+    durable_marker(phase, name + ".ready")
     deadline = bounded_deadline(60)
-    while not marker_exists(release):
+    while not marker_exists(phase, release):
         if time.monotonic() >= deadline:
             fail(f"timed out awaiting {release}")
         time.sleep(0.05)
@@ -866,13 +949,13 @@ def main():
     client_lock = open_client_lock()
     try:
         if requested_mode == "client-terminal-race-b":
-            durable_marker("client-terminal-race-b.attempting")
+            durable_marker("startup", "client-terminal-race-b.attempting")
         lock_client(client_lock)
         total_deadline = time.monotonic() + TOTAL_BUDGET
         work_deadline = total_deadline - CLEANUP_RESERVE
         COMMAND_DEADLINE = work_deadline
         if requested_mode == "client-terminal-race-b":
-            durable_marker("client-terminal-race-b.acquired")
+            durable_marker("startup", "client-terminal-race-b.acquired")
         if CANCELLED:
             fail(f"verification client cancelled by signal {CANCELLED[0]}")
         # A hostile root process can steal this nonce from systemd or /proc and
@@ -882,14 +965,10 @@ def main():
                            repo, commit, go_binary, nonce) + ((supervisor_mode,) if supervisor_mode else ())
         exec_argv = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "LANG=C",
                      "HOME=/root", f"{NONCE_VARIABLE}={nonce}", *supervisor_argv)
-        before = unit_properties("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup",
+        before = unit_properties("prelaunch", "LoadState", "InvocationID", "ActiveState",
+                                 "SubState", "ControlGroup",
                                  context="prelaunch")
-        if before.get("LoadState") != "not-found":
-            fail("fixed verification unit is not explicitly absent: "
-                 f"{sanitized_state(before)}")
-        occupants = cgroup_pids(before.get("ControlGroup", ""), "prelaunch")
-        if occupants:
-            fail(f"verification unit control group is not empty: {occupants}")
+        assert_prelaunch_absent(before)
         publish_supervisor(repo, commit)
         if CANCELLED:
             fail(f"verification client cancelled by signal {CANCELLED[0]}")
@@ -919,7 +998,7 @@ def main():
                     exhaust_work_budget("launch")
                 capture_error = None
                 try:
-                    observed = launch_state(context="immediate")
+                    observed = launch_state("immediate", context="immediate")
                 except BaseException as error:
                     capture_error = error
                     observed = {}
@@ -936,12 +1015,12 @@ def main():
             if capture_error is not None:
                 raise capture_error
             if requested_mode == "client-fault-missing-invocation":
-                client_pause("client-fault-missing-invocation")
+                client_pause("work", "client-fault-missing-invocation")
             if invocation is None:
                 fail(f"missing exact invocation identity: {sanitized_state(observed)}")
             if requested_mode == "client-fault-after-launch":
                 fail("injected client failure after launch")
-            owned_state(invocation, nonce, exec_argv)
+            owned_state("ownership-read", invocation, nonce, exec_argv)
             if requested_mode == "client-fault-after-invocation":
                 fail("injected client failure after invocation capture")
             if not launch_matches(observed, nonce, exec_argv):
@@ -959,11 +1038,11 @@ def main():
                 fail("injected client failure before cleanup boundary test")
             if requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
                 if requested_mode == "client-terminal-race-b":
-                    durable_marker("client-terminal-race-b.started")
-                client_pause(requested_mode)
+                    durable_marker("work", "client-terminal-race-b.started")
+                client_pause("work", requested_mode)
             deadline = bounded_deadline(16 * 60)
             while True:
-                current = owned_state(invocation, nonce, exec_argv,
+                current = owned_state("work", invocation, nonce, exec_argv,
                                       "Result", "ExecMainCode", "ExecMainStatus")
                 if ((current.get("ActiveState") == "active" and current.get("SubState") == "exited")
                         or current.get("ActiveState") == "failed"):
@@ -974,7 +1053,7 @@ def main():
                 if CANCELLED:
                     fail(f"verification client cancelled by signal {CANCELLED[0]}")
             if requested_mode == "client-terminal-race-a":
-                client_pause("client-terminal-race-a")
+                client_pause("work", "client-terminal-race-a")
             if cleanup_test:
                 fail("injected client failure at terminal cleanup boundary test")
             if requested_mode == "client-fault-at-terminal":
@@ -992,7 +1071,7 @@ def main():
                         if time.monotonic() >= category_deadline:
                             break
                         time.sleep(0.1)
-                        owned_state(invocation, nonce, exec_argv)
+                        owned_state("work", invocation, nonce, exec_argv)
                         journal_evidence = bounded_journal_evidence(invocation)
                 fail(f"verification invocation failed: {sanitized_state(current)}; "
                      f"cleanup_database_failed={journal_evidence[1]}; "
@@ -1002,10 +1081,9 @@ def main():
                 if time.monotonic() >= deadline:
                     fail("exact invocation journal lacks one final success marker")
                 time.sleep(0.1)
-                owned_state(invocation, nonce, exec_argv)
+                owned_state("work", invocation, nonce, exec_argv)
                 journal_evidence = bounded_journal_evidence(invocation)
-            if cgroup_pids(current.get("ControlGroup", ""), "work"):
-                fail("successful invocation left control-group processes")
+            assert_fixed_cgroups_empty("work")
             result = 0
         except BaseException as error:
             primary_error = error
@@ -1019,10 +1097,10 @@ def main():
             try:
                 if launch_attempted and invocation is None:
                     try:
-                        discovered = launch_state(context="recovery")
+                        discovered = launch_state("recovery", context="recovery")
                         candidate_invocation = discovered.get("InvocationID", "")
                         if discovered.get("LoadState") == "not-found":
-                            pass
+                            assert_fixed_cgroups_empty("teardown")
                         elif (valid_invocation(candidate_invocation)
                               and launch_matches(discovered, nonce, exec_argv)):
                             invocation = candidate_invocation
@@ -1042,7 +1120,10 @@ def main():
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 CLEANUP_ACTIVE = False
             if requested_mode in WORK_BUDGET_MODES:
-                client_pause(requested_mode + "-unloaded")
+                try:
+                    client_pause("unload", requested_mode + "-unloaded")
+                except BaseException as error:
+                    cleanup_errors.append(error)
             COMMAND_DEADLINE = work_deadline
             if CANCELLED:
                 cancellation = RuntimeError(f"verification client cancelled by signal {CANCELLED[0]}")
@@ -1052,17 +1133,9 @@ def main():
                     cleanup_errors.append(cancellation)
             if RECOVERED_ERRORS:
                 cleanup_errors.extend(RECOVERED_ERRORS)
-        if cleanup_errors:
-            detail = sanitized_diagnostic(
-                "; ".join(sanitized_diagnostic(error, nonce) for error in cleanup_errors), nonce)
-            if primary_error is not None:
-                primary = sanitized_diagnostic(primary_error, nonce)
-                raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None
-            fail(f"cleanup failed: {detail}")
-        if primary_error is not None:
-            raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None
+        resolve_outcome(primary_error, cleanup_errors, nonce)
         if requested_mode == "client-terminal-race-a":
-            client_pause("client-terminal-race-a-unloaded")
+            client_pause("unload", "client-terminal-race-a-unloaded")
     finally:
         close_client_lock(client_lock)
     print(SUCCESS, flush=True)
