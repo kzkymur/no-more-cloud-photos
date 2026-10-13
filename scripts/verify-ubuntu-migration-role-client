@@ -50,6 +50,15 @@ DIAGNOSTIC_RESOURCES = (
     "cgroup", "counter", "directory", "evidence", "helper", "journal", "lock", "marker",
     "process", "runtime-root", "unknown",
 )
+COUNTER_MAX = 999999
+COUNTER_BYTE_LIMIT = 7
+COUNTER_READ_ATTEMPTS = 4
+COUNTER_CATEGORIES = (
+    "empty", "io", "lock-required", "non-ascii", "non-canonical", "overflow", "oversize",
+    "published-uncertain", "rebound", "short-write", "unsafe-mode", "unsafe-name",
+    "unsafe-owner", "unsafe-type",
+)
+CLIENT_LOCK_HELD = False
 SERVICE_PROPERTIES = {
     "Type": "exec", "KillMode": "control-group", "SendSIGKILL": "yes",
     "TimeoutStopUSec": "15s", "RuntimeMaxUSec": "15min", "Delegate": "no",
@@ -123,6 +132,208 @@ def os_call(phase, operation, resource_class, function, *args, **kwargs):
         return function(*args, **kwargs)
     except OSError as error:
         raise evidence_failure(phase, operation, resource_class, error) from None
+
+
+def counter_failure(phase, operation, category):
+    if (phase not in DIAGNOSTIC_PHASES or operation not in ("parse", "publish", "read")
+            or category not in COUNTER_CATEGORIES):
+        phase, operation, category = "uncategorized", "read", "io"
+    return EvidenceFailure(
+        f"phase={phase} operation={operation} resource=counter category={category}")
+
+
+def parse_counter(phase, payload):
+    if len(payload) > COUNTER_BYTE_LIMIT:
+        raise counter_failure(phase, "parse", "oversize")
+    if not payload:
+        raise counter_failure(phase, "parse", "empty")
+    try:
+        value = payload.decode("ascii")
+    except UnicodeDecodeError:
+        raise counter_failure(phase, "parse", "non-ascii") from None
+    digits = value[:-1]
+    if (not value.endswith("\n") or not digits
+            or (digits != "0" and (digits[0] == "0" or not digits.isdecimal()))
+            or (digits == "0" and len(digits) != 1)):
+        raise counter_failure(phase, "parse", "non-canonical")
+    number = int(digits)
+    if number > COUNTER_MAX:
+        raise counter_failure(phase, "parse", "overflow")
+    return number
+
+
+def counter_identity(phase, metadata, operation="read"):
+    if not stat.S_ISREG(metadata.st_mode):
+        raise counter_failure(phase, operation, "unsafe-type")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise counter_failure(phase, operation, "unsafe-mode")
+    if metadata.st_uid != 0 or metadata.st_gid != 0:
+        raise counter_failure(phase, operation, "unsafe-owner")
+    return metadata.st_dev, metadata.st_ino
+
+
+def counter_directory_identity(phase, metadata):
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise counter_failure(phase, "publish", "unsafe-type")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise counter_failure(phase, "publish", "unsafe-mode")
+    if metadata.st_uid != 0 or metadata.st_gid != 0:
+        raise counter_failure(phase, "publish", "unsafe-owner")
+    return metadata.st_dev, metadata.st_ino
+
+
+def aggregate_counter_failure(primary_error, cleanup_errors):
+    categories = []
+    for error in cleanup_errors:
+        rendered = str(error)
+        category = rendered.rsplit("category=", 1)[-1]
+        categories.append(category if category in COUNTER_CATEGORIES else "io")
+    prefix = str(primary_error) if primary_error is not None else "counter cleanup failed"
+    return EvidenceFailure(prefix + "; cleanup=" + "|".join(categories))
+
+
+def read_counter_descriptor(phase, descriptor, expected_identity):
+    payload = bytearray()
+    while len(payload) <= COUNTER_BYTE_LIMIT:
+        try:
+            chunk = os.read(descriptor, COUNTER_BYTE_LIMIT + 1 - len(payload))
+        except OSError:
+            raise counter_failure(phase, "read", "io") from None
+        if not chunk:
+            break
+        payload.extend(chunk)
+    try:
+        after = os.fstat(descriptor)
+    except OSError:
+        raise counter_failure(phase, "read", "io") from None
+    if counter_identity(phase, after) != expected_identity:
+        raise counter_failure(phase, "read", "rebound")
+    return parse_counter(phase, bytes(payload))
+
+
+def read_counter(phase, directory, counter_name):
+    observed = False
+    for _attempt in range(COUNTER_READ_ATTEMPTS):
+        anchor = None
+        descriptor = None
+        try:
+            anchor = os.open(counter_name, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+        except FileNotFoundError:
+            if not observed and _attempt == 0:
+                return 0
+            raise counter_failure(phase, "read", "rebound") from None
+        except OSError:
+            raise counter_failure(phase, "read", "io") from None
+        observed = True
+        try:
+            try:
+                identity = counter_identity(phase, os.fstat(anchor))
+                descriptor = os.open(
+                    f"/proc/self/fd/{anchor}", os.O_RDONLY | os.O_NONBLOCK)
+                descriptor_identity = counter_identity(phase, os.fstat(descriptor))
+            except OSError:
+                raise counter_failure(phase, "read", "io") from None
+            if descriptor_identity != identity:
+                raise counter_failure(phase, "read", "rebound")
+            value = read_counter_descriptor(phase, descriptor, identity)
+            try:
+                current = os.stat(counter_name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise counter_failure(phase, "read", "io") from None
+            if counter_identity(phase, current) == identity:
+                return value
+        finally:
+            for opened in (descriptor, anchor):
+                if opened is not None:
+                    try:
+                        os.close(opened)
+                    except OSError:
+                        raise counter_failure(phase, "read", "io") from None
+    raise counter_failure(phase, "read", "rebound")
+
+
+def quarantine_counter_temp(phase, directory, name, expected_identity):
+    quarantine = name + ".cleanup." + secrets.token_hex(16)
+    try:
+        os.replace(name, quarantine, src_dir_fd=directory, dst_dir_fd=directory)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise counter_failure(phase, "publish", "io") from None
+    anchor = None
+    try:
+        try:
+            anchor = os.open(quarantine, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+            quarantined_identity = counter_identity(
+                phase, os.fstat(anchor), "publish")
+            current_identity = counter_identity(
+                phase, os.stat(quarantine, dir_fd=directory, follow_symlinks=False),
+                "publish")
+        except OSError:
+            raise counter_failure(phase, "publish", "io") from None
+        if quarantined_identity != expected_identity or current_identity != expected_identity:
+            raise counter_failure(phase, "publish", "rebound")
+        try:
+            os.unlink(quarantine, dir_fd=directory)
+        except OSError:
+            raise counter_failure(phase, "publish", "io") from None
+    finally:
+        if anchor is not None:
+            try:
+                os.close(anchor)
+            except OSError:
+                raise counter_failure(phase, "publish", "io") from None
+
+
+def cleanup_counter_temps(phase, directory, counter_name):
+    prefix = counter_name + ".tmp."
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        raise counter_failure(phase, "publish", "io") from None
+    for name in names:
+        token = name[len(prefix):] if name.startswith(prefix) else ""
+        if len(token) != 32 or any(character not in "0123456789abcdef" for character in token):
+            continue
+        descriptor = None
+        content = None
+        try:
+            descriptor = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        try:
+            try:
+                opened = os.fstat(descriptor)
+                opened_identity = counter_identity(phase, opened, "publish")
+                content = os.open(
+                    f"/proc/self/fd/{descriptor}", os.O_RDONLY | os.O_NONBLOCK)
+                content_identity = counter_identity(
+                    phase, os.fstat(content), "publish")
+                current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except OSError:
+                continue
+            except EvidenceFailure:
+                continue
+            try:
+                current_identity = counter_identity(phase, current, "publish")
+            except EvidenceFailure:
+                continue
+            if opened_identity == content_identity == current_identity:
+                quarantine_counter_temp(phase, directory, name, opened_identity)
+        finally:
+            close_failed = False
+            for opened in (content, descriptor):
+                if opened is not None:
+                    try:
+                        os.close(opened)
+                    except OSError:
+                        close_failed = True
+            if close_failed:
+                raise counter_failure(phase, "publish", "io") from None
 
 
 def raise_walk_error(error):
@@ -205,11 +416,15 @@ def open_client_lock():
 
 
 def lock_client(descriptor):
+    global CLIENT_LOCK_HELD
     os_call("startup", "flock", "lock", fcntl.flock,
             descriptor, fcntl.LOCK_EX)
+    CLIENT_LOCK_HELD = True
 
 
 def close_client_lock(descriptor):
+    global CLIENT_LOCK_HELD
+    CLIENT_LOCK_HELD = False
     os_call("final-close", "close", "lock", os.close, descriptor)
 
 
@@ -359,33 +574,108 @@ def bounded_journal_evidence(invocation):
 
 
 def record_counter(phase, name):
-    path = f"{RUN}/{REQUESTED_MODE}.{name}"
-    descriptor = None
-    counter = None
+    if not CLIENT_LOCK_HELD:
+        raise counter_failure(phase, "publish", "lock-required")
+    counter_name = f"{REQUESTED_MODE}.{name}"
+    if (not counter_name or counter_name in (".", "..") or "/" in counter_name
+            or "\x00" in counter_name):
+        raise counter_failure(phase, "publish", "unsafe-name")
+    directory = None
+    temporary = None
+    temporary_name = None
+    temporary_identity = None
+    replaced = False
+    published = False
+    primary_error = None
     try:
-        descriptor = os_call(phase, "open", "evidence", os.open, path,
-                             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
-            counter = os_call(phase, "fdopen", "counter", os.fdopen,
-                              descriptor, "r+", encoding="ascii")
-        except BaseException:
-            os_call(phase, "close", "counter", os.close, descriptor)
+            directory = os.open(RUN, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            counter_directory_identity(phase, os.fstat(directory))
+            cleanup_counter_temps(phase, directory, counter_name)
+        except EvidenceFailure:
             raise
-        descriptor = None
-        value = os_call(phase, "read", "evidence", counter.read).strip()
-        os_call(phase, "seek", "evidence", counter.seek, 0)
-        os_call(phase, "truncate", "evidence", counter.truncate)
-        os_call(phase, "write", "evidence", counter.write,
-                str((int(value) if value else 0) + 1) + "\n")
-        os_call(phase, "flush", "evidence", counter.flush)
-        os_call(phase, "fsync", "evidence", os.fsync, counter.fileno())
-    except OSError as error:
-        raise evidence_failure(phase, "write", "evidence", error) from None
-    except ValueError:
-        fail("command interception evidence was malformed")
-    finally:
-        if counter is not None:
-            os_call(phase, "close", "evidence", counter.close)
+        except OSError:
+            raise counter_failure(phase, "read", "io") from None
+        value = read_counter(phase, directory, counter_name)
+        if value >= COUNTER_MAX:
+            raise counter_failure(phase, "parse", "overflow")
+        payload = f"{value + 1}\n".encode("ascii")
+        temporary_name = counter_name + ".tmp." + secrets.token_hex(16)
+        try:
+            temporary = os.open(temporary_name,
+                                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600, dir_fd=directory)
+            temporary_identity = counter_identity(
+                phase, os.fstat(temporary), "publish")
+            written = 0
+            while written < len(payload):
+                count = os.write(temporary, payload[written:])
+                if count <= 0:
+                    raise counter_failure(phase, "publish", "short-write")
+                written += count
+            os.fsync(temporary)
+            current = os.stat(temporary_name, dir_fd=directory, follow_symlinks=False)
+            if counter_identity(phase, current, "publish") != temporary_identity:
+                raise counter_failure(phase, "publish", "rebound")
+            os.replace(temporary_name, counter_name,
+                       src_dir_fd=directory, dst_dir_fd=directory)
+            replaced = True
+            destination = os.open(counter_name, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                destination_identity = counter_identity(
+                    phase, os.fstat(destination), "publish")
+            finally:
+                os.close(destination)
+            if destination_identity != temporary_identity:
+                raise counter_failure(phase, "publish", "published-uncertain")
+            os.lseek(temporary, 0, os.SEEK_SET)
+            observed = bytearray()
+            while len(observed) <= len(payload):
+                chunk = os.read(temporary, len(payload) + 1 - len(observed))
+                if not chunk:
+                    break
+                observed.extend(chunk)
+            if (bytes(observed) != payload
+                    or counter_identity(phase, os.fstat(temporary), "publish")
+                        != temporary_identity):
+                raise counter_failure(phase, "publish", "published-uncertain")
+            try:
+                os.fsync(directory)
+            except OSError:
+                raise counter_failure(phase, "publish", "published-uncertain") from None
+            published = True
+        except EvidenceFailure:
+            raise
+        except OSError:
+            raise counter_failure(phase, "publish", "io") from None
+    except BaseException as error:
+        primary_error = error
+    cleanup_errors = []
+    if temporary is not None:
+        try:
+            os.close(temporary)
+        except OSError:
+            cleanup_errors.append(counter_failure(phase, "publish", "io"))
+    if (directory is not None and temporary_name is not None and not replaced
+            and temporary_identity is not None):
+        try:
+            quarantine_counter_temp(
+                phase, directory, temporary_name, temporary_identity)
+        except BaseException as error:
+            cleanup_errors.append(error)
+    if directory is not None:
+        try:
+            os.close(directory)
+        except OSError:
+            cleanup_errors.append(counter_failure(phase, "publish", "io"))
+    if primary_error is not None:
+        if cleanup_errors:
+            raise aggregate_counter_failure(primary_error, cleanup_errors) from None
+        raise primary_error
+    if cleanup_errors:
+        raise aggregate_counter_failure(None, cleanup_errors) from None
+    if not published:
+        raise counter_failure(phase, "publish", "published-uncertain")
 
 
 def command_path(phase, name):

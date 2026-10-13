@@ -7,6 +7,8 @@ import pathlib
 import runpy
 import stat
 import subprocess
+import tempfile
+import threading
 import types
 
 
@@ -1165,6 +1167,7 @@ def client_phase_routing_cases(client):
     original_open = module_os.open
     original_retries = globals_["PROPERTY_RETRIES"]
     original_mode = globals_["REQUESTED_MODE"]
+    original_lock_held = globals_["CLIENT_LOCK_HELD"]
     original_counter = globals_["record_counter"]
     original_interceptions = dict(globals_["INTERCEPTIONS"])
     original_boundaries = set(globals_["BOUNDARIES"])
@@ -1183,6 +1186,7 @@ def client_phase_routing_cases(client):
     )
     try:
         globals_["PROPERTY_RETRIES"] = 1
+        globals_["CLIENT_LOCK_HELD"] = True
         subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
         for phase, call in property_cases:
             assert_fails_with(call,
@@ -1196,7 +1200,7 @@ def client_phase_routing_cases(client):
         globals_["REQUESTED_MODE"] = "client-cleanup-persistent-unload"
         globals_["INTERCEPTIONS"].clear()
         assert_raises(lambda: client["command_path"]("unload", "unload"),
-                      "phase=unload operation=open resource=evidence errno=13")
+                      "phase=unload operation=read resource=counter category=io")
 
         globals_["record_counter"] = lambda _phase, _name: None
         globals_["REQUESTED_MODE"] = "client-cleanup-persistent-show"
@@ -1219,11 +1223,560 @@ def client_phase_routing_cases(client):
         module_os.open = original_open
         globals_["PROPERTY_RETRIES"] = original_retries
         globals_["REQUESTED_MODE"] = original_mode
+        globals_["CLIENT_LOCK_HELD"] = original_lock_held
         globals_["record_counter"] = original_counter
         globals_["INTERCEPTIONS"].clear()
         globals_["INTERCEPTIONS"].update(original_interceptions)
         globals_["BOUNDARIES"].clear()
         globals_["BOUNDARIES"].update(original_boundaries)
+
+
+def counter_atomic_cases(client, containment):
+    client_globals = client["record_counter"].__globals__
+    containment_globals = containment["counter"].__globals__
+    module_os = client_globals["os"]
+    original_run = client_globals["RUN"]
+    original_mode = client_globals["REQUESTED_MODE"]
+    original_lock_held = client_globals["CLIENT_LOCK_HELD"]
+    original_client_identity = client_globals["counter_identity"]
+    original_directory_identity = client_globals["counter_directory_identity"]
+    original_containment_identity = containment_globals["counter_identity"]
+
+    def fixture_client_identity(phase, metadata, operation="read"):
+        if not stat.S_ISREG(metadata.st_mode):
+            raise client["counter_failure"](phase, operation, "unsafe-type")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise client["counter_failure"](phase, operation, "unsafe-mode")
+        return metadata.st_dev, metadata.st_ino
+
+    def fixture_containment_identity(phase, metadata):
+        if not stat.S_ISREG(metadata.st_mode):
+            raise containment["counter_failure"](phase, "read", "unsafe-type")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise containment["counter_failure"](phase, "read", "unsafe-mode")
+        return metadata.st_dev, metadata.st_ino
+
+    def fixture_directory_identity(phase, metadata):
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise client["counter_failure"](phase, "publish", "unsafe-type")
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise client["counter_failure"](phase, "publish", "unsafe-mode")
+        return metadata.st_dev, metadata.st_ino
+
+    def bounded_call(function):
+        result = []
+        failure = []
+
+        def invoke():
+            try:
+                result.append(function())
+            except BaseException as error:
+                failure.append(error)
+
+        worker = threading.Thread(target=invoke, daemon=True)
+        worker.start()
+        worker.join(2)
+        require(not worker.is_alive(), "hostile counter open did not complete boundedly")
+        return result, failure
+
+    def assert_bounded_raises(function, expected):
+        result, failure = bounded_call(function)
+        require(not result and len(failure) == 1 and expected in str(failure[0]),
+                f"expected bounded counter failure containing {expected!r}, got {failure!r}")
+
+    parser_cases = (
+        (b"", "empty"), (b"1", "non-canonical"), (b"01\n", "non-canonical"),
+        (b"+1\n", "non-canonical"), (b"-1\n", "non-canonical"),
+        (b" 1\n", "non-canonical"), (b"1 \n", "non-canonical"),
+        (b"1\n2\n", "non-canonical"), (b"\xff\n", "non-ascii"),
+        (b"1000000\n", "oversize"),
+    )
+    for namespace in (client, containment):
+        phases = (("work",) if namespace is client else
+                  ("slow-cleanup", "transient-cleanup", "persistent-cleanup"))
+        for payload, category in parser_cases:
+            for phase in phases:
+                assert_raises(
+                    lambda namespace=namespace, payload=payload, phase=phase:
+                        namespace["parse_counter"](phase, payload),
+                    f"phase={phase} operation=parse resource=counter category={category}")
+
+    unsafe = types.SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o600, st_uid=1, st_gid=0, st_dev=1, st_ino=2)
+    assert_raises(lambda: original_client_identity("work", unsafe),
+                  "phase=work operation=read resource=counter category=unsafe-owner")
+    assert_raises(lambda: original_containment_identity("persistent-cleanup", unsafe),
+                  "phase=persistent-cleanup operation=read resource=counter category=unsafe-owner")
+    synthetic_block = types.SimpleNamespace(
+        st_mode=stat.S_IFBLK | 0o600, st_uid=0, st_gid=0, st_dev=1, st_ino=3)
+    assert_raises(lambda: original_client_identity("work", synthetic_block),
+                  "phase=work operation=read resource=counter category=unsafe-type")
+    assert_raises(lambda: original_containment_identity("persistent-cleanup", synthetic_block),
+                  "phase=persistent-cleanup operation=read resource=counter category=unsafe-type")
+
+    try:
+        client_globals["REQUESTED_MODE"] = "fixture"
+        client_globals["CLIENT_LOCK_HELD"] = True
+        client_globals["counter_identity"] = fixture_client_identity
+        client_globals["counter_directory_identity"] = fixture_directory_identity
+        containment_globals["counter_identity"] = fixture_containment_identity
+        with tempfile.TemporaryDirectory() as directory:
+            client_globals["RUN"] = directory
+            path = os.path.join(directory, "fixture.count")
+
+            os.mkfifo(path, 0o600)
+            assert_bounded_raises(
+                lambda: containment["counter"]("persistent-cleanup", path),
+                "category=unsafe-type")
+            assert_bounded_raises(
+                lambda: client["record_counter"]("work", "count"),
+                "category=unsafe-type")
+            os.unlink(path)
+
+            assert_bounded_raises(
+                lambda: containment["counter"]("persistent-cleanup", "/dev/null"),
+                "category=unsafe-type")
+            pathlib.Path(path).write_bytes(b"0\n")
+            os.chmod(path, 0o600)
+            original_open = module_os.open
+            original_fstat = module_os.fstat
+            original_write = module_os.write
+            synthetic_block_anchors = set()
+
+            def synthetic_block_open(target, flags, *args, **kwargs):
+                if target == "fixture.count" and flags == (os.O_PATH | os.O_NOFOLLOW):
+                    descriptor = original_open(target, flags, *args, **kwargs)
+                    synthetic_block_anchors.add(descriptor)
+                    return descriptor
+                return original_open(target, flags, *args, **kwargs)
+
+            def synthetic_block_fstat(descriptor):
+                metadata = original_fstat(descriptor)
+                if descriptor in synthetic_block_anchors:
+                    synthetic_block_anchors.remove(descriptor)
+                    return types.SimpleNamespace(
+                        st_mode=stat.S_IFBLK | 0o600, st_uid=metadata.st_uid,
+                        st_gid=metadata.st_gid, st_dev=metadata.st_dev, st_ino=metadata.st_ino)
+                return metadata
+
+            module_os.open = synthetic_block_open
+            module_os.fstat = synthetic_block_fstat
+            assert_bounded_raises(
+                lambda: client["record_counter"]("work", "count"),
+                "category=unsafe-type")
+            module_os.open = original_open
+            module_os.fstat = original_fstat
+            require(pathlib.Path(path).read_bytes() == b"0\n",
+                    "device-anchor rejection changed the published counter")
+
+            pathlib.Path(path).write_bytes(b"3\n")
+            os.chmod(path, 0o600)
+            original_read = module_os.read
+            disappear_once = True
+
+            def disappear_during_read(descriptor, size):
+                nonlocal disappear_once
+                payload = original_read(descriptor, size)
+                if payload and disappear_once:
+                    disappear_once = False
+                    os.unlink(path)
+                return payload
+
+            module_os.read = disappear_during_read
+            assert_raises(lambda: containment["counter"]("persistent-cleanup", path),
+                          "phase=persistent-cleanup operation=read resource=counter "
+                          "category=rebound")
+            module_os.read = original_read
+
+            pathlib.Path(path).write_bytes(b"4\n")
+            os.chmod(path, 0o600)
+            disappear_once = True
+            module_os.read = disappear_during_read
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=read resource=counter category=rebound")
+            module_os.read = original_read
+            require(not os.path.exists(path),
+                    "producer reset a counter that disappeared after observation")
+
+            pathlib.Path(path).write_bytes(b"0\n")
+            os.chmod(path, 0o600)
+            fifo_stale = path + ".tmp." + "c" * 32
+            os.mkfifo(fifo_stale, 0o600)
+            stale_result, stale_failure = bounded_call(
+                lambda: client["record_counter"]("work", "count"))
+            require(stale_result == [None] and not stale_failure,
+                    f"stale FIFO cleanup failed: {stale_failure!r}")
+            require(stat.S_ISFIFO(os.lstat(fifo_stale).st_mode)
+                    and containment["counter"]("persistent-cleanup", path) == 1,
+                    "stale FIFO cleanup blocked, removed the FIFO, or skipped publication")
+            os.unlink(fifo_stale)
+
+            block_stale = path + ".tmp." + "e" * 32
+            pathlib.Path(block_stale).write_bytes(b"synthetic block\n")
+            os.chmod(block_stale, 0o600)
+            block_anchors = set()
+
+            def stale_block_open(target, flags, *args, **kwargs):
+                descriptor = original_open(target, flags, *args, **kwargs)
+                if target == os.path.basename(block_stale) and flags == (os.O_PATH | os.O_NOFOLLOW):
+                    block_anchors.add(descriptor)
+                return descriptor
+
+            def stale_block_fstat(descriptor):
+                metadata = original_fstat(descriptor)
+                if descriptor in block_anchors:
+                    block_anchors.remove(descriptor)
+                    return types.SimpleNamespace(
+                        st_mode=stat.S_IFBLK | 0o600, st_uid=metadata.st_uid,
+                        st_gid=metadata.st_gid, st_dev=metadata.st_dev, st_ino=metadata.st_ino)
+                return metadata
+
+            module_os.open = stale_block_open
+            module_os.fstat = stale_block_fstat
+            block_result, block_failure = bounded_call(
+                lambda: client["record_counter"]("work", "count"))
+            module_os.open = original_open
+            module_os.fstat = original_fstat
+            require(block_result == [None] and not block_failure and os.path.exists(block_stale),
+                    "stale synthetic block entry blocked, was deleted, or prevented publication")
+            os.unlink(block_stale)
+            pathlib.Path(path).write_bytes(b"0\n")
+            os.chmod(path, 0o600)
+
+            before_replace = threading.Event()
+            permit_replace = threading.Event()
+            original_replace = module_os.replace
+
+            def barrier_replace(*args, **kwargs):
+                before_replace.set()
+                require(permit_replace.wait(5), "counter publication barrier timed out")
+                return original_replace(*args, **kwargs)
+
+            module_os.replace = barrier_replace
+            failure = []
+
+            def publish_at_barrier():
+                try:
+                    client["record_counter"]("work", "count")
+                except BaseException as error:
+                    failure.append(error)
+
+            publisher = threading.Thread(
+                target=publish_at_barrier, daemon=True)
+            publisher.start()
+            require(before_replace.wait(5), "counter publisher did not reach replace barrier")
+            require(containment["counter"]("persistent-cleanup", path) == 0,
+                    "pre-replace reader did not retain the old counter")
+            permit_replace.set()
+            publisher.join(5)
+            require(not publisher.is_alive() and not failure,
+                    "counter publisher did not finish after replace barrier")
+            module_os.replace = original_replace
+            require(containment["counter"]("persistent-cleanup", path) == 1,
+                    "post-replace reader did not observe the new counter")
+            for expected in (2, 3, 4):
+                client["record_counter"]("work", "count")
+                require(containment["counter"]("persistent-cleanup", path) == expected,
+                        "repeated counter publication was not monotonic")
+
+            def replace_during_read(replacement):
+                replaced = False
+
+                def racing_read(descriptor, size):
+                    nonlocal replaced
+                    payload = original_read(descriptor, size)
+                    if payload and not replaced:
+                        replaced = True
+                        os.replace(replacement, path)
+                    return payload
+
+                return racing_read
+
+            pathlib.Path(path).write_bytes(b"10\n")
+            replacement = path + ".race"
+            pathlib.Path(replacement).write_bytes(b"11\n")
+            os.chmod(path, 0o600)
+            os.chmod(replacement, 0o600)
+            module_os.read = replace_during_read(replacement)
+            raced_value = containment["counter"]("persistent-cleanup", path)
+            module_os.read = original_read
+            require(raced_value in (10, 11) and raced_value == 11,
+                    "reader rejected or returned the incoherent pre-replace snapshot")
+
+            pathlib.Path(path).write_bytes(b"20\n")
+            pathlib.Path(replacement).write_bytes(b"21\n")
+            os.chmod(path, 0o600)
+            os.chmod(replacement, 0o600)
+            module_os.read = replace_during_read(replacement)
+            client["record_counter"]("work", "count")
+            module_os.read = original_read
+            require(containment["counter"]("persistent-cleanup", path) == 22,
+                    "producer did not retry a counter replaced during its old-value read")
+            pathlib.Path(path).write_bytes(b"4\n")
+            os.chmod(path, 0o600)
+
+            original_replace_for_rebind = module_os.replace
+
+            def rebind_publish_source(source, destination, *args, **kwargs):
+                if ".tmp." in source and ".cleanup." not in destination:
+                    source_directory = kwargs["src_dir_fd"]
+                    os.unlink(source, dir_fd=source_directory)
+                    hostile_descriptor = original_open(
+                        source, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600, dir_fd=source_directory)
+                    try:
+                        original_write(hostile_descriptor, b"777\n")
+                    finally:
+                        module_os.close(hostile_descriptor)
+                return original_replace_for_rebind(source, destination, *args, **kwargs)
+
+            module_os.replace = rebind_publish_source
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter "
+                          "category=published-uncertain")
+            module_os.replace = original_replace_for_rebind
+            require(pathlib.Path(path).read_bytes() == b"777\n",
+                    "source-name rebound was reported successful or hidden")
+            pathlib.Path(path).write_bytes(b"4\n")
+            os.chmod(path, 0o600)
+
+            stale = path + ".tmp." + "a" * 32
+            pathlib.Path(stale).write_bytes(b"99\n")
+            os.chmod(stale, 0o600)
+            hostile = path + ".tmp." + "b" * 32
+            os.symlink(path, hostile)
+            client["record_counter"]("work", "count")
+            require(not os.path.lexists(stale) and os.path.islink(hostile),
+                    "stale cleanup removed an unsafe path or retained its owned regular temp")
+
+            rebound_stale = path + ".tmp." + "d" * 32
+            pathlib.Path(rebound_stale).write_bytes(b"55\n")
+            os.chmod(rebound_stale, 0o600)
+
+            def rebind_cleanup_source(source, destination, *args, **kwargs):
+                if source.endswith("d" * 32) and ".cleanup." in destination:
+                    source_directory = kwargs["src_dir_fd"]
+                    os.unlink(source, dir_fd=source_directory)
+                    hostile_descriptor = original_open(
+                        source, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600, dir_fd=source_directory)
+                    try:
+                        original_write(hostile_descriptor, b"888\n")
+                    finally:
+                        module_os.close(hostile_descriptor)
+                return original_replace_for_rebind(source, destination, *args, **kwargs)
+
+            module_os.replace = rebind_cleanup_source
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=rebound")
+            module_os.replace = original_replace_for_rebind
+            preserved = [entry for entry in os.listdir(directory)
+                         if entry.startswith(os.path.basename(rebound_stale) + ".cleanup.")]
+            require(len(preserved) == 1
+                    and pathlib.Path(directory, preserved[0]).read_bytes() == b"888\n",
+                    "cleanup deleted or accepted an entry rebound before quarantine")
+            os.unlink(os.path.join(directory, preserved[0]))
+
+            old = pathlib.Path(path).read_bytes()
+            original_write = module_os.write
+            module_os.write = lambda descriptor, payload: original_write(descriptor, payload[:1])
+            client["record_counter"]("work", "count")
+            module_os.write = original_write
+            require(containment["counter"]("persistent-cleanup", path) == 6,
+                    "short writes were not completed")
+
+            def zero_write(_descriptor, _payload):
+                return 0
+
+            old = pathlib.Path(path).read_bytes()
+            module_os.write = zero_write
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=short-write")
+            module_os.write = original_write
+            require(pathlib.Path(path).read_bytes() == old,
+                    "zero-write failure changed the published counter")
+
+            module_os.write = lambda *_args: (_ for _ in ()).throw(injected())
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=io")
+            module_os.write = original_write
+            require(pathlib.Path(path).read_bytes() == old,
+                    "write failure changed the published counter")
+
+            cleanup_started = False
+            cleanup_closes = 0
+            cleanup_renames = 0
+            original_close = module_os.close
+
+            def primary_write_failure(*_args):
+                nonlocal cleanup_started
+                cleanup_started = True
+                raise injected()
+
+            def failing_cleanup_close(descriptor):
+                nonlocal cleanup_closes
+                original_close(descriptor)
+                if cleanup_started:
+                    cleanup_closes += 1
+                    raise injected()
+
+            def failing_cleanup_rename(*_args, **_kwargs):
+                nonlocal cleanup_renames
+                cleanup_renames += 1
+                raise injected()
+
+            module_os.write = primary_write_failure
+            module_os.close = failing_cleanup_close
+            module_os.replace = failing_cleanup_rename
+            try:
+                assert_raises(lambda: client["record_counter"]("work", "count"),
+                              "phase=work operation=publish resource=counter category=io; cleanup="
+                              "io|io|io")
+            finally:
+                module_os.write = original_write
+                module_os.close = original_close
+                module_os.replace = original_replace_for_rebind
+            require(cleanup_closes == 2 and cleanup_renames == 1,
+                    "cleanup failure skipped a later independent cleanup action")
+
+            original_fsync = module_os.fsync
+            module_os.fsync = lambda _descriptor: (_ for _ in ()).throw(injected())
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=io")
+            module_os.fsync = original_fsync
+            require(pathlib.Path(path).read_bytes() == old,
+                    "temporary fsync failure changed the published counter")
+
+            def fail_publish_replace(source, destination, *args, **kwargs):
+                if ".cleanup." not in destination:
+                    raise injected()
+                return original_replace(source, destination, *args, **kwargs)
+
+            module_os.replace = fail_publish_replace
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter category=io")
+            module_os.replace = original_replace
+            require(pathlib.Path(path).read_bytes() == old,
+                    "replace failure changed the published counter")
+
+            fsync_calls = 0
+
+            def fail_directory_fsync(descriptor):
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if stat.S_ISDIR(module_os.fstat(descriptor).st_mode):
+                    raise injected()
+                return original_fsync(descriptor)
+
+            module_os.fsync = fail_directory_fsync
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=publish resource=counter "
+                          "category=published-uncertain")
+            module_os.fsync = original_fsync
+            require(fsync_calls == 2 and containment["counter"]("persistent-cleanup", path) == 7,
+                    "directory fsync failure destroyed published evidence")
+
+            pathlib.Path(path).write_bytes(b"999999\n")
+            os.chmod(path, 0o600)
+            assert_raises(lambda: client["record_counter"]("work", "count"),
+                          "phase=work operation=parse resource=counter category=overflow")
+            require(pathlib.Path(path).read_bytes() == b"999999\n",
+                    "counter overflow changed the published bound")
+
+            pathlib.Path(path).write_bytes(b"1\n")
+            os.chmod(path, 0o644)
+            assert_raises(lambda: containment["counter"]("persistent-cleanup", path),
+                          "phase=persistent-cleanup operation=read resource=counter "
+                          "category=unsafe-mode")
+            os.chmod(path, 0o600)
+            original_stat = module_os.stat
+
+            rebound_stats = 0
+
+            def rebound_stat(target, *args, **kwargs):
+                nonlocal rebound_stats
+                metadata = original_stat(target, *args, **kwargs)
+                if target == path:
+                    rebound_stats += 1
+                    return types.SimpleNamespace(
+                        st_mode=metadata.st_mode, st_uid=metadata.st_uid, st_gid=metadata.st_gid,
+                        st_dev=metadata.st_dev, st_ino=metadata.st_ino + rebound_stats)
+                return metadata
+
+            module_os.stat = rebound_stat
+            assert_raises(lambda: containment["counter"]("persistent-cleanup", path),
+                          "phase=persistent-cleanup operation=read resource=counter "
+                          "category=rebound")
+            module_os.stat = original_stat
+            require(rebound_stats == containment_globals["COUNTER_READ_ATTEMPTS"],
+                    "counter rebound retries were not strictly bounded")
+
+            pathlib.Path(path).write_bytes(b"30\n")
+            pathlib.Path(replacement).write_bytes(b"31\n")
+            os.chmod(path, 0o600)
+            os.chmod(replacement, 0o600)
+
+            def symlink_during_read(descriptor, size):
+                payload = original_read(descriptor, size)
+                if os.path.isfile(replacement):
+                    os.unlink(path)
+                    os.symlink(replacement, path)
+                return payload
+
+            module_os.read = symlink_during_read
+            assert_raises(lambda: containment["counter"]("persistent-cleanup", path),
+                          "phase=persistent-cleanup operation=read resource=counter "
+                          "category=unsafe-type")
+            module_os.read = original_read
+            os.unlink(path)
+            pathlib.Path(path).write_bytes(b"40\n")
+            os.chmod(path, 0o600)
+
+            rebound_to_fifo = True
+
+            def fifo_during_read(descriptor, size):
+                nonlocal rebound_to_fifo
+                payload = original_read(descriptor, size)
+                if rebound_to_fifo:
+                    rebound_to_fifo = False
+                    os.unlink(path)
+                    os.mkfifo(path, 0o600)
+                return payload
+
+            module_os.read = fifo_during_read
+            assert_bounded_raises(
+                lambda: containment["counter"]("persistent-cleanup", path),
+                "category=unsafe-type")
+            module_os.read = original_read
+
+            os.unlink(path)
+            require(containment["counter"]("persistent-cleanup", path) == 0,
+                    "missing counter did not read as zero")
+            os.mkdir(path, 0o700)
+            assert_raises(lambda: containment["counter"]("persistent-cleanup", path),
+                          "phase=persistent-cleanup operation=read resource=counter "
+                          "category=unsafe-type")
+            os.rmdir(path)
+            os.symlink(hostile, path)
+            assert_raises(lambda: containment["counter"]("persistent-cleanup", path),
+                          "phase=persistent-cleanup operation=read resource=counter "
+                          "category=unsafe-type")
+            os.unlink(path)
+    finally:
+        module_os.replace = original_replace if "original_replace" in locals() else module_os.replace
+        module_os.write = original_write if "original_write" in locals() else module_os.write
+        module_os.fsync = original_fsync if "original_fsync" in locals() else module_os.fsync
+        module_os.read = original_read if "original_read" in locals() else module_os.read
+        module_os.stat = original_stat if "original_stat" in locals() else module_os.stat
+        module_os.fstat = original_fstat if "original_fstat" in locals() else module_os.fstat
+        module_os.open = original_open if "original_open" in locals() else module_os.open
+        module_os.close = original_close if "original_close" in locals() else module_os.close
+        client_globals["RUN"] = original_run
+        client_globals["REQUESTED_MODE"] = original_mode
+        client_globals["CLIENT_LOCK_HELD"] = original_lock_held
+        client_globals["counter_identity"] = original_client_identity
+        client_globals["counter_directory_identity"] = original_directory_identity
+        containment_globals["counter_identity"] = original_containment_identity
 
 
 def actual_boundary_cases(client, containment):
@@ -1250,8 +1803,10 @@ def actual_boundary_cases(client, containment):
     original_builtin_open = containment_globals.get("open")
     containment_globals["open"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
     try:
+        module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
         assert_raises(lambda: containment["counter"]("client-fault", HOSTILE_PATH),
-                      "phase=client-fault operation=open resource=counter errno=13")
+                      "phase=client-fault operation=read resource=counter category=io")
+        module_os.open = original_open
         containment_globals["open"] = lambda *_args, **_kwargs: (
             _ for _ in ()).throw(injected(errno.ENOENT))
         assert_raises(containment["load_cleanup_intent"],
@@ -1274,45 +1829,7 @@ def actual_boundary_cases(client, containment):
     finally:
         module_os.unlink = original_unlink
 
-    original_fdopen = module_os.fdopen
-    original_fsync = module_os.fsync
-    original_close = module_os.close
-    try:
-        module_os.open = lambda *_args, **_kwargs: 90
-        raw_closes = []
-        module_os.close = lambda descriptor: raw_closes.append(descriptor)
-        module_os.fdopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
-        assert_raises(lambda: client["record_counter"]("work", "fixture"),
-                      "phase=work operation=fdopen resource=counter errno=13")
-        require(raw_closes == [90], "fdopen failure did not close its raw counter descriptor")
-
-        raw_closes.clear()
-        successful_counter = FakeCounter("0")
-        module_os.fdopen = lambda *_args, **_kwargs: successful_counter
-        module_os.fsync = lambda *_args, **_kwargs: None
-        client["record_counter"]("work", "fixture")
-        require(not raw_closes and successful_counter.close_calls == 1,
-                "successful fdopen double-closed or failed to close transferred ownership")
-
-        module_os.fdopen = lambda *_args, **_kwargs: FakeCounter("0")
-        counter = FakeCounter("0")
-        counter.read = lambda: (_ for _ in ()).throw(injected())
-        module_os.fdopen = lambda *_args, **_kwargs: counter
-        module_os.fsync = lambda *_args, **_kwargs: None
-        assert_raises(lambda: client["record_counter"]("work", "fixture"),
-                      "phase=work operation=read resource=evidence errno=13")
-
-        for method, operation in (("seek", "seek"), ("truncate", "truncate")):
-            counter = FakeCounter("0")
-            setattr(counter, method, lambda *_args: (_ for _ in ()).throw(injected()))
-            module_os.fdopen = lambda *_args, counter=counter, **_kwargs: counter
-            assert_raises(lambda: client["record_counter"]("work", "fixture"),
-                          f"phase=work operation={operation} resource=evidence errno=13")
-    finally:
-        module_os.open = original_open
-        module_os.fdopen = original_fdopen
-        module_os.fsync = original_fsync
-        module_os.close = original_close
+    module_os.open = original_open
 
     original_command = client_globals["command"]
     original_unlink = module_os.unlink
@@ -1417,6 +1934,7 @@ def main():
     client_cgroup_observation_cases(client)
     client_cgroup_diagnostic_dedup_cases(client)
     client_phase_routing_cases(client)
+    counter_atomic_cases(client, containment)
     actual_boundary_cases(client, containment)
     for namespace in (client, containment):
         cgroup_boundary_cases(namespace)
