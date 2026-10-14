@@ -22,6 +22,20 @@ READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
 SUCCESS = "Ubuntu migration role compatibility verification passed"
+RESULT_PREFIX = "NMCP_CLIENT_RESULT_V1:"
+RESULT_BYTE_LIMIT = 8192
+RESULT_EVENT_LIMIT = 99
+CLIENT_STDERR_BYTE_LIMIT = 9216
+RESULT_PRIMARY_CATEGORIES = (
+    "none", "cleanup-test", "cancelled", "verification", "unexpected",
+)
+RESULT_BOUNDARIES = ("none", "show", "kill", "stop", "wait", "reset", "unload", "final")
+RESULT_CLEANUP_CATEGORIES = (
+    "property-recovered", "kill-recovered", "stop-recovered", "reset-recovered",
+    "property-unavailable", "kill-unavailable", "stop-unavailable", "reset-unavailable",
+    "wait-timeout", "unload-timeout", "cgroup-residue", "cgroup-observation", "deadline",
+    "cancelled", "unexpected",
+)
 PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"
 PERSISTENT_ACTION_ERROR = " command remains unavailable:"
 STALE_REJECTION_PREFIX = "verification-client: fixed verification unit is not explicitly absent: "
@@ -69,6 +83,17 @@ def fail(message):
 
 class EvidenceFailure(RuntimeError):
     pass
+
+
+class PersistentCgroupFinalityFailure(RuntimeError):
+    def __init__(self, result, errors, recorded_scanned, canonical_scanned):
+        super().__init__("; ".join(
+            retained_diagnostic(error, f"{name} cgroup scan failed")
+            for name, error in errors))
+        self.result = result
+        self.errors = tuple(errors)
+        self.recorded_scanned = recorded_scanned
+        self.canonical_scanned = canonical_scanned
 
 
 def evidence_failure(phase, operation, resource_class, error):
@@ -316,6 +341,249 @@ def persistent_special_result_violation(returncode, stdout, stderr, evidence_cas
     )
 
 
+def parse_client_result(payload):
+    try:
+        encoded = payload.encode("ascii") if type(payload) is str else b""
+    except UnicodeEncodeError:
+        encoded = b""
+    if not encoded or len(encoded) > RESULT_BYTE_LIMIT:
+        fail("client result schema was absent or oversized")
+    if "\n" in payload or "\r" in payload or payload != payload.strip():
+        fail("client result schema was not one canonical line")
+    prefix, separator, body = payload.partition(":")
+    if not separator or prefix + ":" != RESULT_PREFIX:
+        fail("client result schema prefix changed")
+    fields = body.split(";")
+    expected_names = (
+        "primary", "events", "return", "stdout", "success",
+    )
+    if len(fields) != len(expected_names):
+        fail("client result schema field count changed")
+    values = {}
+    for field, expected_name in zip(fields, expected_names):
+        name, field_separator, value = field.partition("=")
+        if not field_separator or name != expected_name or not value or name in values:
+            fail("client result schema fields were missing, duplicated, or reordered")
+        values[name] = value
+    if values["primary"] not in RESULT_PRIMARY_CATEGORIES:
+        fail("client result schema primary category was unknown")
+    if values["events"] == "-":
+        events = ()
+    else:
+        raw_events = values["events"].split(",")
+        if len(raw_events) > RESULT_EVENT_LIMIT:
+            fail("client result schema event trace exceeded its bound")
+        parsed_events = []
+        for raw_event in raw_events:
+            parts = raw_event.split(".")
+            if len(parts) != 5:
+                fail("client result schema event was malformed")
+            boundary, category, *raw_counts = parts
+            if (boundary not in RESULT_BOUNDARIES
+                    or category not in RESULT_CLEANUP_CATEGORIES
+                    or boundary == "none" and category != "unexpected"):
+                fail("client result schema event category or boundary was unknown")
+            counts = []
+            for value in raw_counts:
+                if (not value.isascii() or not value.isdecimal()
+                        or (value != "0" and value.startswith("0"))):
+                    fail("client result schema event count was malformed")
+                count = int(value)
+                if count > COUNTER_MAX:
+                    fail("client result schema event count exceeded its bound")
+                counts.append(count)
+            parsed_events.append((boundary, category, *counts))
+        events = tuple(parsed_events)
+        canonical = tuple(sorted(events, key=lambda event: (
+            RESULT_BOUNDARIES.index(event[0]), RESULT_CLEANUP_CATEGORIES.index(event[1]),
+            event[2], event[3], event[4])))
+        if len(set(events)) != len(events) or events != canonical:
+            fail("client result schema events were duplicate or noncanonically ordered")
+    flags = {}
+    for name in ("return", "stdout", "success"):
+        if values[name] not in ("0", "1"):
+            fail("client result schema flag was malformed")
+        flags[name] = int(values[name])
+    return {
+        "primary": values["primary"], "events": events, **flags,
+    }
+
+
+def client_stderr_evidence(stderr):
+    try:
+        encoded = stderr.encode("ascii")
+    except (AttributeError, UnicodeEncodeError):
+        encoded = b""
+    lines = stderr.splitlines(keepends=True) if type(stderr) is str else []
+    leading_whitespace = bool(stderr and stderr[0].isspace())
+    trailing_whitespace = bool(stderr and not stderr.endswith("\n") and stderr[-1].isspace())
+    shape = bool(
+        encoded and len(encoded) <= CLIENT_STDERR_BYTE_LIMIT and len(lines) == 2
+        and all(line.endswith("\n") for line in lines)
+        and lines[0].startswith(RESULT_PREFIX)
+        and lines[1].startswith("verification-client: ")
+        and RESULT_PREFIX not in lines[1]
+        and not leading_whitespace and not trailing_whitespace
+    )
+    parsed = None
+    if shape:
+        try:
+            parsed = parse_client_result(lines[0][:-1])
+        except RuntimeError:
+            shape = False
+    return parsed, {
+        "shape": shape, "line_count": len(lines), "byte_count": len(encoded),
+        "byte_bounded": bool(encoded and len(encoded) <= CLIENT_STDERR_BYTE_LIMIT),
+        "leading_whitespace": leading_whitespace,
+        "trailing_whitespace": trailing_whitespace,
+    }
+
+
+def expected_persistent_result(case, boundary):
+    if case not in ("normal", "parse", "timeout"):
+        fail("persistent evidence case was not explicitly labeled")
+    categories = {
+        "show": (("show", "property-unavailable"),),
+        "kill": (("kill", "kill-unavailable"),),
+        "stop": (("stop", "stop-unavailable"), ("unload", "unload-timeout")),
+        "wait": (("wait", "property-unavailable"),),
+        "reset": (("reset", "reset-unavailable"), ("unload", "unload-timeout")),
+        "unload": (("unload", "property-unavailable"),),
+    }[boundary]
+    events = tuple(
+        (event_boundary, category,
+         (3 if boundary in ("show", "wait", "unload") else 1)
+         if event_boundary == boundary else 0,
+         (4 if boundary in ("show", "wait", "unload") else 2)
+         if event_boundary == boundary else 0, 0)
+        for event_boundary, category in categories)
+    return {
+        "primary": "cleanup-test", "events": events,
+        "return": 1, "stdout": 0, "success": 0,
+    }
+
+
+def retain_persistent_cgroup(recorded, state):
+    control_group = state.get("ControlGroup")
+    if control_group is None:
+        if state.get("LoadState") == "loaded":
+            fail("loaded persistent state omitted its requested control group")
+        control_group = ""
+    if type(control_group) is not str:
+        fail("persistent state returned an invalid control group")
+    if control_group:
+        if recorded and control_group != recorded:
+            fail("persistent control group changed after attestation")
+        return control_group, "attested"
+    if recorded:
+        return recorded, "attested"
+    fail("persistent containment omitted its attested control group")
+
+
+def persistent_cgroup_finality(recorded, category, reader):
+    if category != "attested":
+        fail("persistent recorded control group lacked a closed category")
+    if not recorded:
+        fail("persistent finality lacked an attested control group")
+    result = {"recorded": [], "canonical": []}
+    errors = []
+    recorded_scanned = False
+    canonical_scanned = False
+    for name, path in (("recorded", recorded), ("canonical", "/system.slice/" + UNIT)):
+        if name == "recorded":
+            recorded_scanned = True
+        else:
+            canonical_scanned = True
+        try:
+            result[name] = reader(path)
+        except BaseException as error:
+            errors.append((name, error))
+    if errors:
+        raise PersistentCgroupFinalityFailure(
+            result, errors, recorded_scanned, canonical_scanned)
+    return result, recorded_scanned, canonical_scanned
+
+
+def evaluate_persistent_result(case, expected_case, lifecycle_category, expected_lifecycle,
+                               parsed, stderr_shape, expected_result, returncode, stdout,
+                               intercepted, attempted, lock_handoff_error, cleanup_error,
+                               cleanup_categories, lock_reuse_error,
+                               expected_signed_cleanup_required, signed_cleanup_required,
+                               signed_cleanup_ran, release_ok, reap_ok, unit_absent,
+                               recorded_category, recorded_required, recorded_path_present,
+                               recorded_scanned, canonical_scanned, recorded_empty, canonical_empty,
+                               artifacts_absent):
+    schema = parsed or {}
+    predicates = {
+        "case_exact": case == expected_case,
+        "lifecycle_category": lifecycle_category == expected_lifecycle,
+        "lifecycle_match": lifecycle_category == expected_lifecycle,
+        "schema_shape": stderr_shape["shape"],
+        "schema_exact": parsed == expected_result,
+        "primary_exact": schema.get("primary") == expected_result["primary"],
+        "events_exact": schema.get("events") == expected_result["events"],
+        "return_match": returncode == expected_result["return"] == schema.get("return"),
+        "stdout_match": stdout == "" and schema.get("stdout") == expected_result["stdout"],
+        "success_match": SUCCESS not in stdout and schema.get("success") == expected_result["success"],
+        "intercept_match": (intercepted == sum(event[3] for event in expected_result["events"])
+                            == sum(event[3] for event in schema.get("events", ()))),
+        "attempt_match": (attempted == sum(event[4] for event in expected_result["events"])
+                          == sum(event[4] for event in schema.get("events", ()))),
+        "retry_match": (sum(event[2] for event in schema.get("events", ()))
+                        == sum(event[2] for event in expected_result["events"])),
+        "lock_handoff_ok": not lock_handoff_error,
+        "cleanup_error_empty": not cleanup_error,
+        "cleanup_categories": cleanup_categories == (),
+        "lock_reuse": not lock_reuse_error,
+        "signed_cleanup_required": signed_cleanup_required == expected_signed_cleanup_required,
+        "signed_cleanup_ran": signed_cleanup_ran == signed_cleanup_required,
+        "release": release_ok,
+        "reap": reap_ok,
+        "unit_absent": unit_absent,
+        "recorded_category": recorded_category == "attested",
+        "recorded_required": recorded_required and recorded_path_present,
+        "recorded_scan": recorded_scanned,
+        "canonical_scan": canonical_scanned,
+        "recorded_empty": recorded_empty,
+        "canonical_empty": canonical_empty,
+        "artifacts_absent": artifacts_absent,
+    }
+    return predicates
+
+
+def persistent_scalar_diagnostic(case, lifecycle_category, predicates, stderr_shape):
+    lifecycle = lifecycle_category if lifecycle_category in (
+        "none", "non-canonical", "timeout", "unexpected") else "unexpected"
+    bits = {name: diagnostic_bit(value) for name, value in predicates.items()}
+    byte_class = ("bounded" if stderr_shape["byte_bounded"] else
+                  "empty" if stderr_shape["byte_count"] == 0 else "over")
+    message = (
+        f"persistent-result:case={case};life_cat={lifecycle};"
+        f"case_exact={bits['case_exact']};life_match={bits['lifecycle_match']};"
+        f"schema_shape={bits['schema_shape']};schema_exact={bits['schema_exact']};"
+        f"primary_exact={bits['primary_exact']};events_exact={bits['events_exact']};"
+        f"ret={bits['return_match']};"
+        f"out={bits['stdout_match']};success={bits['success_match']};"
+        f"retry={bits['retry_match']};intercept={bits['intercept_match']};"
+        f"attempt={bits['attempt_match']};handoff={bits['lock_handoff_ok']};"
+        f"cleanup_empty={bits['cleanup_error_empty']};cleanup_cats={bits['cleanup_categories']};"
+        f"reuse={bits['lock_reuse']};signed_req={bits['signed_cleanup_required']};"
+        f"signed_ran={bits['signed_cleanup_ran']};release={bits['release']};"
+        f"reap={bits['reap']};absent={bits['unit_absent']};"
+        f"recorded_cat={bits['recorded_category']};"
+        f"recorded_req={bits['recorded_required']};recorded_scan={bits['recorded_scan']};"
+        f"canonical_scan={bits['canonical_scan']};"
+        f"recorded_empty={bits['recorded_empty']};canonical_empty={bits['canonical_empty']};"
+        f"artifacts_absent={bits['artifacts_absent']};se_lines={stderr_shape['line_count']};"
+        f"se_bytes={byte_class};se_lws={diagnostic_bit(stderr_shape['leading_whitespace'])};"
+        f"se_tws={diagnostic_bit(stderr_shape['trailing_whitespace'])};"
+        f"se_events={bits['events_exact']}"
+    )
+    if len(("containment-test: " + repr(message) + "\n").encode("ascii")) > 512:
+        fail("persistent scalar diagnostic exceeded its complete outer bound")
+    return message
+
+
 def stale_expected_rejection(state):
     safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup")
     safe = {name: state.get(name) for name in safe_names if name in state}
@@ -458,6 +726,169 @@ def persistent_failure_diagnostics(mode, boundary, faulted, classification, inte
         f"post_cleanup_cgroup={bounded_sanitized_repr(post_cleanup_cgroup)}"
     )
     return bounded_sanitized_repr(detail)
+
+
+def assert_machine_result_contract():
+    expected = expected_persistent_result("parse", "kill")
+    line = (RESULT_PREFIX + "primary=cleanup-test;events=kill.kill-unavailable.1.2.0;"
+            "return=1;stdout=0;success=0")
+    stderr = line + "\nverification-client: " + "x" * 700 + "\n"
+    parsed, shape = client_stderr_evidence(stderr)
+    if parsed != expected or not shape["shape"]:
+        fail("canonical persistent client result schema was rejected")
+    mixed = parse_client_result(
+        RESULT_PREFIX + "primary=cleanup-test;events="
+        "show.property-recovered.1.1.1,show.property-unavailable.3.4.1,"
+        "stop.stop-unavailable.1.2.0,"
+        "unload.unload-timeout.0.0.0,final.cgroup-residue.0.0.0,"
+        "final.cgroup-observation.0.0.0,final.unexpected.0.0.0;"
+        "return=1;stdout=0;success=0")
+    if mixed["events"] != (
+            ("show", "property-recovered", 1, 1, 1),
+            ("show", "property-unavailable", 3, 4, 1),
+            ("stop", "stop-unavailable", 1, 2, 0),
+            ("unload", "unload-timeout", 0, 0, 0),
+            ("final", "cgroup-residue", 0, 0, 0),
+            ("final", "cgroup-observation", 0, 0, 0),
+            ("final", "unexpected", 0, 0, 0)):
+        fail("mixed recovered, final residue, and unknown cleanup ordering changed")
+    malformed = (
+        line.replace("primary=cleanup-test", "primary=unknown"),
+        line.replace("kill.kill-unavailable", "unknown.kill-unavailable"),
+        line.replace("kill.kill-unavailable", "kill.unexpected-category"),
+        line.replace("kill.kill-unavailable.1.2.0", "kill.kill-unavailable.1.2.0,kill.kill-unavailable.1.2.0"),
+        line.replace("events=kill.kill-unavailable.1.2.0", "events=unload.unload-timeout.0.0.0,kill.kill-unavailable.1.2.0"),
+        line.replace(".1.2.0", ".01.2.0"),
+        line.replace(".1.2.0", ".1.-1.0"),
+        line.replace(".1.2.0", ".1.2.1000000"),
+        line.replace(";events=kill.kill-unavailable.1.2.0", ""),
+        line.replace(";return=1", ";extra=0;return=1"),
+        line.replace("primary=cleanup-test;events=", "events=kill.kill-unavailable.1.2.0;primary=cleanup-test;events="),
+        line + " ", " " + line, line + "\n", line + "\nextra",
+    )
+    for mutation in malformed:
+        try:
+            parse_client_result(mutation)
+        except RuntimeError:
+            continue
+        fail("client result parser accepted a malformed schema mutation")
+    for mutated_stderr in (
+            line + "\n", "verification-client: human only\n",
+            line + "\nverification-client: human\nextra\n",
+            " " + line + "\nverification-client: human\n",
+            line + "\nverification-client: human"):
+        _parsed, mutated_shape = client_stderr_evidence(mutated_stderr)
+        if mutated_shape["shape"]:
+            fail("client stderr extractor accepted missing, bypassed, padded, or extra schema data")
+
+    facts = {
+        "case": "parse", "expected_case": "parse",
+        "lifecycle_category": "non-canonical", "expected_lifecycle": "non-canonical",
+        "parsed": parsed, "stderr_shape": shape, "expected_result": expected,
+        "returncode": 1, "stdout": "", "intercepted": 2, "attempted": 0,
+        "lock_handoff_error": "", "cleanup_error": "", "cleanup_categories": (),
+        "lock_reuse_error": "", "expected_signed_cleanup_required": True,
+        "signed_cleanup_required": True, "signed_cleanup_ran": True,
+        "release_ok": True, "reap_ok": True, "unit_absent": True,
+        "recorded_category": "attested", "recorded_required": True,
+        "recorded_path_present": True, "recorded_scanned": True, "canonical_scanned": True,
+        "recorded_empty": True, "canonical_empty": True, "artifacts_absent": True,
+    }
+    predicates = evaluate_persistent_result(**facts)
+    if not all(predicates.values()):
+        fail("valid persistent result failed an independent contract predicate")
+    mutations = {
+        "case_exact": ("case", "normal"),
+        "lifecycle_match": ("lifecycle_category", "timeout"),
+        "schema_shape": ("stderr_shape", {**shape, "shape": False}),
+        "schema_exact": ("parsed", {**parsed, "events": (("kill", "kill-unavailable", 0, 2, 0),)}),
+        "return_match": ("returncode", 0), "stdout_match": ("stdout", "extra"),
+        "intercept_match": ("intercepted", 1), "attempt_match": ("attempted", 1),
+        "lock_handoff_ok": ("lock_handoff_error", "failed"),
+        "cleanup_error_empty": ("cleanup_error", "failed"),
+        "cleanup_categories": ("cleanup_categories", ("unexpected",)),
+        "lock_reuse": ("lock_reuse_error", "failed"),
+        "signed_cleanup_required": ("signed_cleanup_required", False),
+        "signed_cleanup_ran": ("signed_cleanup_ran", False),
+        "release": ("release_ok", False), "reap": ("reap_ok", False),
+        "unit_absent": ("unit_absent", False),
+        "recorded_category": ("recorded_category", "unexpected"),
+        "recorded_required": ("recorded_path_present", False),
+        "recorded_scan": ("recorded_scanned", False),
+        "canonical_scan": ("canonical_scanned", False),
+        "recorded_empty": ("recorded_empty", False),
+        "canonical_empty": ("canonical_empty", False),
+        "artifacts_absent": ("artifacts_absent", False),
+    }
+    for expected_false, (name, value) in mutations.items():
+        changed = {**facts, name: value}
+        observed = evaluate_persistent_result(**changed)
+        if observed.get(expected_false) is not False or all(observed.values()):
+            fail(f"persistent evaluator lost hidden conjunct: {expected_false}")
+    message = persistent_scalar_diagnostic(
+        "parse", "non-canonical", {name: False for name in predicates},
+        {**shape, "line_count": 999999, "byte_count": 999999, "byte_bounded": False})
+    emitted = "containment-test: " + bounded_sanitized_repr(RuntimeError(message)) + "\n"
+    if len(emitted.encode("ascii")) > 512 or "<truncated>" in emitted or "x" * 64 in emitted:
+        fail("persistent scalar diagnostic was truncated, unbounded, or retained bulky data")
+
+
+def assert_persistent_cgroup_routing_contract():
+    calls = []
+    reader = lambda path: calls.append(path) or []
+    recorded, category = retain_persistent_cgroup(
+        "", {"LoadState": "loaded", "ControlGroup": "/recorded"})
+    recorded, category = retain_persistent_cgroup(
+        recorded, {"LoadState": "not-found"})
+    result, recorded_scanned, canonical_scanned = persistent_cgroup_finality(
+        recorded, category, reader)
+    if (recorded != "/recorded" or category != "attested"
+            or not recorded_scanned or not canonical_scanned
+            or result != {"recorded": [], "canonical": []}
+            or calls != ["/recorded", "/system.slice/" + UNIT]):
+        fail("live persistent control group was not retained and independently scanned")
+    for label, outcomes in (
+            ("recorded-error-canonical-residue", ("error", [41])),
+            ("recorded-error-canonical-empty", ("error", [])),
+            ("recorded-residue-canonical-error", ([42], "error")),
+            ("recorded-empty-canonical-error", ([], "error")),
+            ("both-error", ("error", "error"))):
+        calls.clear()
+        failing_reader = lambda path: calls.append(path) or (
+            {}["error"] if outcomes[len(calls) - 1] == "error"
+            else outcomes[len(calls) - 1])
+        try:
+            persistent_cgroup_finality(recorded, category, failing_reader)
+        except PersistentCgroupFinalityFailure as error:
+            expected_result = {
+                "recorded": [] if outcomes[0] == "error" else outcomes[0],
+                "canonical": [] if outcomes[1] == "error" else outcomes[1],
+            }
+            if (calls != ["/recorded", "/system.slice/" + UNIT]
+                    or error.result != expected_result
+                    or not error.recorded_scanned or not error.canonical_scanned
+                    or tuple(name for name, _error in error.errors) != tuple(
+                        name for name, outcome in zip(("recorded", "canonical"), outcomes)
+                        if outcome == "error")):
+                fail(f"persistent final scan did not preserve independent evidence: {label}")
+        else:
+            fail(f"persistent final scan failure unexpectedly succeeded: {label}")
+    for state in (
+            {"LoadState": "loaded", "ControlGroup": ""},
+            {"LoadState": "loaded", "ControlGroup": "/replacement"}):
+        try:
+            retain_persistent_cgroup("/recorded", state)
+        except RuntimeError:
+            if state["ControlGroup"] == "":
+                fail("later empty terminal control group discarded its retained path")
+            continue
+        if state["ControlGroup"]:
+            fail("persistent control group replacement was accepted")
+    try:
+        retain_persistent_cgroup("", {"LoadState": "loaded", "ControlGroup": ""})
+    except RuntimeError:
+        return
+    fail("persistent containment accepted an empty initial control group")
 
 
 def assert_persistent_failure_contract():
@@ -655,6 +1086,94 @@ def wait_path(phase, path, timeout=900):
         time.sleep(0.1)
 
 
+def validated_payload_marker(phase, path, expected_payload, resource_class="marker"):
+    root = "/run/nmcp-ci"
+    if (os.path.dirname(path) != root or os.path.basename(path) in ("", ".", "..")
+            or not isinstance(expected_payload, bytes) or not expected_payload):
+        fail("launch barrier marker path or payload was unsafe")
+    directory = os_call(phase, "open", "directory", os.open, root,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    try:
+        try:
+            descriptor = os.open(os.path.basename(path),
+                                 os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise evidence_failure(phase, "open", resource_class, error) from None
+        before = os_call(phase, "stat", resource_class, os.fstat, descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
+            fail("launch barrier marker has unsafe identity")
+        payload = os_call(
+            phase, "read", resource_class, os.read, descriptor, len(expected_payload) + 1)
+        after = os_call(phase, "stat", resource_class, os.fstat, descriptor)
+        current = os_call(phase, "stat", resource_class, os.stat, os.path.basename(path),
+                          dir_fd=directory, follow_symlinks=False)
+        identity = (before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+                    before.st_gid, before.st_nlink, before.st_size)
+        if (identity != (after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+                         after.st_gid, after.st_nlink, after.st_size)
+                or identity != (current.st_dev, current.st_ino, current.st_mode, current.st_uid,
+                                 current.st_gid, current.st_nlink, current.st_size)
+                or before.st_size != len(expected_payload)
+                or payload != expected_payload):
+            fail("launch barrier marker was malformed or replaced")
+        return True
+    finally:
+        if descriptor is not None:
+            os_call(phase, "close", resource_class, os.close, descriptor)
+        os_call(phase, "close", "directory", os.close, directory)
+
+
+def validated_marker(phase, path, nonce):
+    return validated_payload_marker(phase, path, (nonce + "\n").encode("ascii"))
+
+
+def persistent_launch_barriers(phase):
+    names = os_call(phase, "listdir", "directory", os.listdir, "/run/nmcp-ci")
+    prefix = "launch-"
+    suffix = ".required"
+    return tuple(sorted(
+        barrier_name for barrier_name in names
+        if barrier_name.startswith(prefix) and barrier_name.endswith(suffix)
+        and len(barrier_name) == len(prefix) + 64 + len(suffix)
+        and all(character in "0123456789abcdef"
+                for character in barrier_name[len(prefix):-len(suffix)])))
+
+
+def wait_persistent_launch_required(phase, baseline, timeout=10):
+    deadline = time.monotonic() + timeout
+    while True:
+        candidates = tuple(
+            name for name in persistent_launch_barriers(phase) if name not in baseline)
+        if len(candidates) > 1:
+            fail("multiple persistent launch barrier declarations appeared")
+        if candidates:
+            return candidates[0][len("launch-"):-len(".required")]
+        if time.monotonic() >= deadline:
+            fail("timed out awaiting persistent launch barrier declaration")
+        time.sleep(0.05)
+
+
+def persistent_launch_paths(nonce):
+    if (type(nonce) is not str or len(nonce) != 64
+            or any(character not in "0123456789abcdef" for character in nonce)):
+        fail("persistent launch nonce was not canonical")
+    base = "/run/nmcp-ci/launch-" + nonce
+    return base + ".required", base + ".ready", base + ".release"
+
+
+def wait_validated_marker(phase, path, nonce, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not validated_marker(phase, path, nonce):
+        if time.monotonic() >= deadline:
+            fail("timed out awaiting validated launch barrier readiness")
+        time.sleep(0.05)
+
+
 def reset_signal_paths(phase, name):
     for suffix in ("ready", "release"):
         try:
@@ -758,20 +1277,54 @@ def wait_counter(phase, path, expected, timeout=30):
 
 
 def release(phase, name):
-    path = f"/run/nmcp-ci/{name}.release"
-    descriptor = os_call(phase, "open", "release", os.open, path,
-                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        os_call(phase, "write", "release", os.write, descriptor, b"release\n")
-        os_call(phase, "fsync", "release", os.fsync, descriptor)
-    finally:
-        os_call(phase, "close", "release", os.close, descriptor)
-    directory = os_call(phase, "open", "directory", os.open, "/run/nmcp-ci",
+    root = "/run/nmcp-ci"
+    path = f"{root}/{name}.release"
+    nonce = name[len("launch-"):] if name.startswith("launch-") else ""
+    payload = ((nonce + "\n").encode("ascii")
+               if len(nonce) == 64 and all(character in "0123456789abcdef" for character in nonce)
+               else b"release\n")
+    directory = os_call(phase, "open", "directory", os.open, root,
                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
     try:
+        try:
+            descriptor = os.open(name + ".release",
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory)
+        except FileExistsError:
+            os_call(phase, "close", "directory", os.close, directory)
+            directory = None
+            if not validated_payload_marker(phase, path, payload, "release"):
+                fail("existing release disappeared during validation")
+            return
+        except OSError as error:
+            raise evidence_failure(phase, "open", "release", error) from None
+        written = 0
+        while written < len(payload):
+            count = os_call(phase, "write", "release", os.write,
+                            descriptor, payload[written:])
+            if count <= 0 or count > len(payload) - written:
+                fail("short write while publishing release")
+            written += count
+        os_call(phase, "chmod", "release", os.fchmod, descriptor, 0o600)
+        os_call(phase, "fsync", "release", os.fsync, descriptor)
+        opened = os_call(phase, "stat", "release", os.fstat, descriptor)
+        current = os_call(phase, "stat", "release", os.stat, name + ".release",
+                          dir_fd=directory, follow_symlinks=False)
+        identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                                  value.st_gid, value.st_nlink, value.st_size)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or opened.st_gid != 0
+                or opened.st_nlink != 1 or stat.S_IMODE(opened.st_mode) != 0o600
+                or identity(opened) != identity(current) or opened.st_size != len(payload)):
+            fail("published release had unsafe identity")
         os_call(phase, "fsync", "directory", os.fsync, directory)
     finally:
-        os_call(phase, "close", "directory", os.close, directory)
+        if descriptor is not None:
+            os_call(phase, "close", "release", os.close, descriptor)
+        if directory is not None:
+            os_call(phase, "close", "directory", os.close, directory)
+    if not validated_payload_marker(phase, path, payload, "release"):
+        fail("published release disappeared before validation")
 
 
 def wait_unit_absent(phase, timeout=30):
@@ -803,6 +1356,16 @@ def assert_client_lock_held():
         os_call("transaction-lock", "close", "lock", os.close, descriptor)
 
 
+def assert_transaction_lock_held():
+    descriptor = open_transaction_lock()
+    try:
+        if not lock_transaction(descriptor):
+            return
+        fail("supervisor released its transaction lock before launch attestation")
+    finally:
+        close_transaction_lock(descriptor)
+
+
 def assert_client_failure(result, mode, phase):
     if result.returncode == 0 or SUCCESS in result.stdout:
         fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
@@ -814,6 +1377,15 @@ def assert_client_failure(result, mode, phase):
     if cgroup_pids("/system.slice/" + UNIT, phase):
         fail(f"client fault left processes in the fixed unit cgroup: {mode}")
     assert_client_lock_reusable()
+
+
+def assert_cancelled_result(result, mode):
+    assert_client_failure(result, mode, "signal-cleanup")
+    parsed, shape = client_stderr_evidence(result.stderr)
+    if (not shape["shape"] or parsed is None or parsed["primary"] != "cancelled"
+            or parsed["return"] != 1 or parsed["stdout"] != 0
+            or parsed["success"] != 0):
+        fail(f"client signal result did not report one machine primary cancellation: {mode}")
 
 
 def fast_recovery(client, repo, commit, go_binary, context, phase):
@@ -1442,6 +2014,8 @@ def main():
     client, repo, commit, go_binary = sys.argv[1:]
     assert_property_parser_contract(client)
     assert_persistent_failure_contract()
+    assert_machine_result_contract()
+    assert_persistent_cgroup_routing_contract()
     assert_cleanup_deadline_contract()
     assert_launch_identity_contract()
 
@@ -1645,12 +2219,11 @@ raise SystemExit(73)
     except Exception as error:
         stale_failure = error
     finally:
-        if not path_exists("stale-cleanup", "release", stale_release):
-            try:
-                release("stale-cleanup", stale_signal_name)
-                stale_release_seen = True
-            except Exception as error:
-                stale_release_error = bounded_sanitized_repr(error)
+        try:
+            release("stale-cleanup", stale_signal_name)
+            stale_release_seen = True
+        except Exception as error:
+            stale_release_error = bounded_sanitized_repr(error)
         if (path_exists("stale-cleanup", "marker", stale_ready)
                 and not path_exists("stale-cleanup", "marker", stale_release_ack)):
             release_deadline = time.monotonic() + 5
@@ -1929,12 +2502,14 @@ raise SystemExit(73)
         for boundary in ("show", "kill", "stop", "wait", "reset", "unload")) + (
             ("kill", "parse"), ("wait", "timeout"),
         )
-    for boundary, wait_fault in persistent_cases:
+    for boundary, evidence_case in persistent_cases:
+        case_label = evidence_case
         mode = "client-cleanup-persistent-" + boundary
         intercepted, attempted = fault_paths(mode, boundary)
         handoff_ready = f"/run/nmcp-ci/{mode}.handoff.ready"
         handoff_release = f"/run/nmcp-ci/{mode}.handoff.release"
         reset_paths("persistent-cleanup", intercepted, attempted, handoff_ready, handoff_release)
+        launch_barrier_baseline = persistent_launch_barriers("persistent-cleanup")
         process = popen("persistent-cleanup",
             ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
             cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1943,31 +2518,65 @@ raise SystemExit(73)
         lifecycle_error = ""
         observed = {"EvidenceError": "pre-handoff state unavailable"}
         signature = None
+        recorded_cgroup = ""
+        recorded_cgroup_category = "unobserved"
         observed_interceptions = None
         fault_stdout = ""
         fault_stderr = ""
+        release_ok = False
+        reap_ok = False
+        requires_live = persistent_supervisor_mode(mode) == "fast-hold"
+        launch_required = ""
+        launch_ready = ""
+        launch_release = ""
+        nonce = ""
         try:
+            nonce = wait_persistent_launch_required(
+                "persistent-cleanup", launch_barrier_baseline, timeout=10)
+            launch_required, launch_ready, launch_release = persistent_launch_paths(nonce)
+            if not validated_marker("persistent-cleanup", launch_required, nonce):
+                fail("persistent launch barrier declaration disappeared")
+            wait_validated_marker("persistent-cleanup", launch_ready, nonce, timeout=10)
+            early_observed = show_identity_until(
+                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")
+            if early_observed.get("LoadState") != "loaded":
+                fail("persistent launch barrier did not retain a loaded service")
+            if early_observed.get("Environment") != f"{NONCE_VARIABLE}={nonce}":
+                fail("validated launch barrier did not match loaded immutable unit identity")
+            signature = persistent_launch_signature(
+                early_observed, repo, commit, go_binary, mode)
+            assert_launch_signature_counterexamples(
+                early_observed, repo, commit, go_binary, mode)
+            recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(
+                recorded_cgroup, early_observed)
+            if not cgroup_pids(recorded_cgroup, "persistent-cleanup"):
+                fail("persistent launch barrier had no live service cgroup process")
+            assert_transaction_lock_held()
+            assert_client_lock_held()
+            release("persistent-cleanup", "launch-" + nonce)
             wait_counter("persistent-cleanup", intercepted, expected_interceptions, timeout=30)
             observed_interceptions = counter("persistent-cleanup", intercepted)
             if observed_interceptions != expected_interceptions:
                 fail("persistent interception count changed before handoff")
             wait_path("persistent-cleanup", handoff_ready, timeout=30)
-            observed = show_identity_until("persistent-cleanup", time.monotonic() + 10)
+            observed = show_identity_until(
+                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")
             if observed["LoadState"] == "not-found":
                 fail("persistent client exited before its attested handoff")
-            signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)
-            assert_launch_signature_counterexamples(observed, repo, commit, go_binary, mode)
-            requires_live = persistent_supervisor_mode(mode) == "fast-hold"
-            if wait_fault != "normal" and not requires_live:
+            if not launch_identity_matches(observed, signature):
+                fail("persistent launch identity changed before boundary handoff")
+            recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(
+                recorded_cgroup, observed)
+            if evidence_case != "normal" and not requires_live:
                 fail("injected persistent evidence case did not use fast-hold")
-            handoff_pids = cgroup_pids(
-                observed.get("ControlGroup", ""), "persistent-cleanup")
+            handoff_pids = (cgroup_pids(recorded_cgroup, "persistent-cleanup")
+                            if recorded_cgroup else [])
             if requires_live and not handoff_pids:
                 fail("fast-hold persistent handoff had no live service cgroup process")
             if not requires_live and handoff_pids:
                 fail("terminal persistent handoff retained live service cgroup processes")
             assert_client_lock_held()
-            if wait_fault == "parse":
+            if evidence_case == "parse":
                 malformed = os_call("persistent-cleanup", "open", "counter", os.open, intercepted,
                                     os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
                 try:
@@ -1977,14 +2586,22 @@ raise SystemExit(73)
                 finally:
                     os_call("persistent-cleanup", "close", "counter", os.close, malformed)
                 counter("persistent-cleanup", intercepted)
-            elif wait_fault == "timeout":
+            elif evidence_case == "timeout":
                 wait_counter("persistent-cleanup", intercepted, COUNTER_MAX, timeout=0)
         except BaseException as error:
             lifecycle_error = retained_diagnostic(error, "persistent handoff observation failed")
         finally:
             try:
-                if not path_exists("persistent-cleanup", "release", handoff_release):
-                    release("persistent-cleanup", mode + ".handoff")
+                if launch_release:
+                    release("persistent-cleanup", "launch-" + nonce)
+            except BaseException as error:
+                lifecycle_error = "; ".join(item for item in (
+                    lifecycle_error, retained_diagnostic(error, "persistent launch release failed"))
+                    if item)
+            try:
+                release("persistent-cleanup", mode + ".handoff")
+                release_ok = validated_payload_marker(
+                    "persistent-cleanup", handoff_release, b"release\n", "release")
             except BaseException as error:
                 lifecycle_error = "; ".join(item for item in (
                     lifecycle_error, retained_diagnostic(error, "persistent handoff release failed"))
@@ -1992,6 +2609,7 @@ raise SystemExit(73)
             try:
                 fault_stdout, fault_stderr = process_communicate(
                     "persistent-cleanup", process, 60)
+                reap_ok = process.poll() is not None
             except BaseException as error:
                 lifecycle_error = "; ".join(item for item in (
                     lifecycle_error, retained_diagnostic(error, "persistent client wait failed"))
@@ -2001,6 +2619,7 @@ raise SystemExit(73)
                         os_call("persistent-cleanup", "kill", "process", process.terminate)
                         fault_stdout, fault_stderr = process_communicate(
                             "persistent-cleanup", process, 30)
+                        reap_ok = process.poll() is not None
                     except BaseException as terminate_error:
                         lifecycle_error = "; ".join(item for item in (
                             lifecycle_error,
@@ -2010,6 +2629,7 @@ raise SystemExit(73)
                             try:
                                 os_call("persistent-cleanup", "kill", "process", process.kill)
                                 process_wait("persistent-cleanup", process, 10)
+                                reap_ok = process.poll() is not None
                             except BaseException as kill_error:
                                 lifecycle_error = "; ".join(item for item in (
                                     lifecycle_error,
@@ -2017,23 +2637,27 @@ raise SystemExit(73)
                                                         "persistent client reap failed")) if item)
         faulted = subprocess.CompletedProcess(process.args, process.returncode,
                                                fault_stdout, fault_stderr)
-        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)
         cleanup_error = ""
         if signature is None:
             try:
                 recovered_observed = show_identity_until(
-                    "persistent-cleanup", time.monotonic() + 10)
+                    "persistent-cleanup", time.monotonic() + 10, "ControlGroup")
                 if recovered_observed.get("LoadState") != "not-found":
                     signature = persistent_launch_signature(
                         recovered_observed, repo, commit, go_binary, mode)
                     observed = recovered_observed
+                recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(
+                    recorded_cgroup, recovered_observed)
             except BaseException as error:
                 cleanup_error = "; ".join(item for item in (
                     cleanup_error,
                     retained_diagnostic(error, "post-handoff ownership recovery failed")) if item)
         try:
-            after_exit = (show("persistent-cleanup", "LoadState") if signature is None
+            after_exit = (show("persistent-cleanup", "LoadState", "ControlGroup")
+                          if signature is None
                           else signed_launch_state(signature, "persistent-cleanup"))
+            recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(
+                recorded_cgroup, after_exit)
         except BaseException as error:
             after_exit = {"EvidenceError": "post-exit state capture failed"}
             cleanup_error = retained_diagnostic(error, "post-exit state capture failed")
@@ -2060,6 +2684,8 @@ raise SystemExit(73)
         try:
             post_cleanup = show_identity_until("persistent-cleanup", time.monotonic() + 10,
                                                "ActiveState", "ControlGroup")
+            recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(
+                recorded_cgroup, post_cleanup)
         except BaseException as error:
             post_cleanup = {"EvidenceError": "post-cleanup state capture failed"}
             cleanup_error = "; ".join(
@@ -2067,20 +2693,26 @@ raise SystemExit(73)
                     cleanup_error, retained_diagnostic(error, "post-cleanup state capture failed"))
                 if item)
         try:
-            post_cleanup_cgroup = []
-            recorded_cgroup = (observed.get("ControlGroup", "")
-                               or (after_exit.get("ControlGroup", "")
-                                   if type(after_exit) is dict else ""))
-            for control_group in tuple(dict.fromkeys(
-                    (recorded_cgroup, "/system.slice/" + UNIT))):
-                if control_group:
-                    post_cleanup_cgroup.extend(cgroup_pids(
-                        control_group, "persistent-cleanup"))
-        except BaseException as error:
-            post_cleanup_cgroup = ["cgroup evidence capture failed"]
+            post_cleanup_cgroup, recorded_cgroup_scanned, canonical_cgroup_scanned = persistent_cgroup_finality(
+                recorded_cgroup, recorded_cgroup_category,
+                lambda control_group: cgroup_pids(control_group, "persistent-cleanup"))
+        except PersistentCgroupFinalityFailure as error:
+            post_cleanup_cgroup = error.result
+            recorded_cgroup_scanned = error.recorded_scanned
+            canonical_cgroup_scanned = error.canonical_scanned
             cleanup_error = "; ".join(
                 item for item in (
                     cleanup_error, retained_diagnostic(error, "cgroup evidence capture failed"))
+                if item)
+        except BaseException as error:
+            post_cleanup_cgroup = {
+                "recorded": ["capture-failed"], "canonical": ["capture-failed"],
+            }
+            recorded_cgroup_scanned = False
+            canonical_cgroup_scanned = False
+            cleanup_error = "; ".join(
+                item for item in (
+                    cleanup_error, retained_diagnostic(error, "cgroup evidence setup failed"))
                 if item)
         finally:
             if cleanup_lock is not None:
@@ -2105,44 +2737,68 @@ raise SystemExit(73)
             assert_client_lock_reusable()
         except BaseException as error:
             lock_reuse_error = retained_diagnostic(error, "client lock reuse check failed")
-        expected_lifecycle_error = {
-            "normal": "",
-            "parse": ("phase=persistent-cleanup operation=parse resource=counter "
-                      "category=non-canonical"),
-            "timeout": ("phase=persistent-cleanup operation=read resource=counter "
-                        "category=timeout"),
-        }[wait_fault]
-        lifecycle_violation = lifecycle_error != expected_lifecycle_error
         observed_attempts = counter("persistent-cleanup", attempted)
-        result_violation = persistent_result_violation(
-            faulted.returncode, classification, lock_handoff_error, cleanup_error,
-            lock_reuse_error, post_cleanup, post_cleanup_cgroup)
-        if wait_fault != "normal":
-            result_violation = bool(
-                persistent_special_result_violation(
-                    faulted.returncode, faulted.stdout, faulted.stderr, wait_fault, boundary,
-                    observed_interceptions, observed_attempts)
-                or lock_handoff_error or cleanup_error or lock_reuse_error
-                or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup)
-        if lifecycle_violation or result_violation:
-            diagnostics = persistent_failure_diagnostics(
-                mode, boundary, faulted, classification,
-                observed_interceptions,
-                observed_attempts,
-                signature, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error,
-                "; ".join(item for item in (lifecycle_error, cleanup_error) if item),
-                lock_reuse_error, post_cleanup_cgroup)
-            fail("persistent command result violated failure contract: " + diagnostics)
-        if wait_fault != "parse":
-            assert_interception(mode, boundary, "persistent-cleanup", persistent=True)
-        reset_paths("persistent-cleanup", intercepted, attempted, handoff_ready, handoff_release)
-        if any(path_exists("persistent-cleanup", "marker", path) for path in (
-                intercepted, attempted, handoff_ready, handoff_release)):
-            fail("persistent cleanup retained a fixture artifact")
+        expected_lifecycle = {
+            "normal": "none", "parse": "non-canonical", "timeout": "timeout",
+        }[case_label]
+        lifecycle_category = {
+            "": "none",
+            "phase=persistent-cleanup operation=parse resource=counter category=non-canonical":
+                "non-canonical",
+            "phase=persistent-cleanup operation=read resource=counter category=timeout": "timeout",
+        }.get(lifecycle_error, "unexpected")
+        parsed_result, stderr_shape = client_stderr_evidence(faulted.stderr)
+        expected_result = expected_persistent_result(case_label, boundary)
+        signed_cleanup_required = after_exit.get("LoadState") == "loaded"
+        expected_signed_cleanup_required = boundary in ("show", "stop", "reset")
+        unit_absent = post_cleanup.get("LoadState") == "not-found"
+        recorded_empty = not post_cleanup_cgroup["recorded"]
+        canonical_empty = not post_cleanup_cgroup["canonical"]
+        cleanup_categories = () if not cleanup_error else ("unexpected",)
+        artifacts_absent = False
+        try:
+            reset_paths("persistent-cleanup", intercepted, attempted,
+                        handoff_ready, handoff_release, launch_required, launch_ready, launch_release)
+            artifacts_absent = not any(
+                path_exists("persistent-cleanup", "marker", path)
+                for path in (intercepted, attempted, handoff_ready, handoff_release,
+                             launch_required, launch_ready, launch_release))
+        except BaseException as error:
+            cleanup_error = "; ".join(item for item in (
+                cleanup_error, retained_diagnostic(error, "fixture artifact cleanup failed")) if item)
+            cleanup_categories = ("unexpected",)
+        predicates = evaluate_persistent_result(
+            case_label, evidence_case, lifecycle_category, expected_lifecycle,
+            parsed_result, stderr_shape, expected_result, faulted.returncode, faulted.stdout,
+            observed_interceptions, observed_attempts, lock_handoff_error, cleanup_error,
+            cleanup_categories, lock_reuse_error, expected_signed_cleanup_required,
+            signed_cleanup_required, signed_cleanup_ran, release_ok, reap_ok, unit_absent,
+            recorded_cgroup_category, True, bool(recorded_cgroup),
+            recorded_cgroup_scanned, canonical_cgroup_scanned,
+            recorded_empty, canonical_empty, artifacts_absent)
+        if not all(predicates.values()):
+            fail(persistent_scalar_diagnostic(
+                case_label, lifecycle_category, predicates, stderr_shape))
         fast_recovery(client, repo, commit, go_binary, mode, "persistent-cleanup")
 
     for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),
                                 ("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):
+        for lifecycle in ("startup", "work"):
+            mode = f"client-signal-{signal_name}-{lifecycle}"
+            marker = f"/run/nmcp-ci/{mode}.ready"
+            reset_paths("signal-cleanup", marker)
+            cancelled = popen("signal-cleanup",
+                ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary, mode),
+                cwd="/", env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            wait_path("signal-cleanup", marker, timeout=30)
+            os_call("signal-cleanup", "kill", "process", os.kill, cancelled.pid, signum)
+            cancelled_stdout, cancelled_stderr = process_communicate(
+                "signal-cleanup", cancelled, 30)
+            result = subprocess.CompletedProcess(cancelled.args, cancelled.returncode,
+                                                 cancelled_stdout, cancelled_stderr)
+            assert_cancelled_result(result, mode)
+            fast_recovery(client, repo, commit, go_binary, mode, "signal-cleanup")
         for boundary in ("kill", "stop", "wait", "reset", "unload"):
             mode = f"client-signal-{signal_name}-{boundary}"
             marker = f"/run/nmcp-ci/{mode}.ready"
@@ -2157,9 +2813,7 @@ raise SystemExit(73)
                 "signal-cleanup", cancelled, 30)
             result = subprocess.CompletedProcess(cancelled.args, cancelled.returncode,
                                                  cancelled_stdout, cancelled_stderr)
-            assert_client_failure(result, mode, "signal-cleanup")
-            if "cancelled by signal" not in cancelled_stderr:
-                fail(f"client did not report latched cancellation after teardown: {mode}")
+            assert_cancelled_result(result, mode)
             fast_recovery(client, repo, commit, go_binary, mode, "signal-cleanup")
 
     prior = None

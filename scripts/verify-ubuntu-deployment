@@ -492,6 +492,46 @@ def validate_supervisor(source: str) -> None:
     return subprocess.run(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo, *args), cwd="/", env=clean_env(),
                           check=True, stdout=stdout or subprocess.PIPE).stdout
 ''', "supervisor git must use command-scoped safe.directory")
+    require_exact_function(tree, "validate_launch_marker", '''def validate_launch_marker(path, nonce, suffix, absent_ok=False):
+    root = "/run/nmcp-ci"
+    expected_path = root + "/launch-" + nonce + suffix
+    if path != expected_path:
+        die("persistent launch protocol path does not match its nonce")
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    try:
+        try:
+            descriptor = os.open(os.path.basename(path),
+                                 os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            if absent_ok:
+                return False
+            raise
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
+            die("unsafe persistent launch protocol marker")
+        payload = os.read(descriptor, len(nonce) + 2)
+        after = os.fstat(descriptor)
+        current = os.stat(os.path.basename(path), dir_fd=directory, follow_symlinks=False)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )
+        expected_payload = (nonce + "\\n").encode("ascii")
+        if (identity(before) != identity(after) or identity(before) != identity(current)
+                or before.st_size != len(expected_payload) or payload != expected_payload):
+            die("persistent launch protocol marker was malformed or replaced")
+        return True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory)
+''', "supervisor persistent launch marker validation changed")
+    require_exact_function(tree, "validate_launch_required", '''def validate_launch_required(path, nonce):
+    validate_launch_marker(path, nonce, ".required")
+''', "supervisor required marker validation routing changed")
     require_exact_function(tree, "archive_tree", '''def archive_tree(repo, commit, destination):
     resolved = git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}").decode().strip()
     if resolved != commit:
@@ -705,8 +745,26 @@ def validate_supervisor(source: str) -> None:
         'signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)',
     )
     require(all(fragment in source for fragment in intent_contract)
-            and source.count('fsync_directory("/run/nmcp-ci")') == 2,
+            and source.count('fsync_directory("/run/nmcp-ci")') == 3,
             "supervisor durable intent/bounded cleanup contract changed")
+    launch_barrier_contract = (
+        'if launch_required is not None:',
+        'validate_launch_required(launch_required, nonce)',
+        'launch_barrier = "/run/nmcp-ci/launch-" + nonce',
+        'ready_fd = os.open(launch_barrier + ".ready",',
+        'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)',
+        'write_all(ready_fd, (nonce + "\\n").encode("ascii"))',
+        'while not validate_launch_marker(',
+        'launch_barrier + ".release", nonce, ".release", absent_ok=True):',
+        'die("timed out awaiting live launch attestation")',
+        'except BaseException as launch_error:',
+        'if "lock_keeper" in locals():',
+        'os.killpg(lock_keeper.pid, signal.SIGKILL)',
+        'f"{launch_error}; launch cleanup failed: "',
+    )
+    require(all(fragment in source for fragment in launch_barrier_contract)
+            and source.count('launch_barrier = "/run/nmcp-ci/launch-" + nonce') == 1,
+            "supervisor live launch barrier contract changed")
     cleanup_contract = (
         'cleanup_errors = []',
         'CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"',
@@ -767,13 +825,16 @@ def validate_supervisor(source: str) -> None:
             and 'if fast_success:\n            print("Ubuntu migration role compatibility verification passed", flush=True)' in source,
             "supervisor fast and full success markers changed")
     nonce_contract = (
-        'if os.geteuid() != 0 or len(sys.argv) not in (5, 6):',
-        'die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO NONCE [FAULT_POINT]")',
+        'if os.geteuid() != 0 or len(sys.argv) not in (5, 6, 7):',
+        'optional = list(sys.argv[5:])',
+        'if optional and optional[-1].startswith("--persistent-launch-required="):',
+        'launch_required = optional.pop().partition("=")[2]',
+        'if len(optional) > 1:',
         'nonce = sys.argv[4]',
         'if (len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce)',
         'or os.environ.get("NMCP_VERIFIER_NONCE") != nonce):',
         'die("supervisor launch nonce does not match its environment")',
-        'FAULT_MODE = sys.argv[5] if len(sys.argv) == 6 else ""',
+        'FAULT_MODE = optional[0] if optional else ""',
     )
     require(all(source.count(fragment) == 1 for fragment in nonce_contract),
             "supervisor nonce argv/environment validation changed")
@@ -787,7 +848,7 @@ def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
     # bypass this snapshot and must be rejected by the detailed inventories below.
     if enforce_snapshot:
         require(stable_source_digest(source)
-                == "1c6981a962a8c1feb5419501f61e4887461d5b9214c1bfba6f3a9854f9828cce",
+                == "cc619ec242842e11f4d541e0c1ae691a66fd16665ad27048fb564e6b6d9767c4",
                 "client reviewed stable UTF-8/LF source snapshot changed")
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     expected_imports = ast.parse('''import fcntl
@@ -815,6 +876,218 @@ import time
     require(len(evidence_classes) == 1
             and ast.dump(evidence_classes[0]) == ast.dump(expected_evidence_class),
             "client categorized evidence failure type changed")
+    cancellation_classes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CancellationFailure"
+    ]
+    expected_cancellation_class = ast.parse('''class CancellationFailure(PrimaryFailure):
+    def __init__(self, signum):
+        super().__init__("cancelled", f"verification client cancelled by signal {signum}")
+''').body[0]
+    require(len(cancellation_classes) == 1
+            and ast.dump(cancellation_classes[0]) == ast.dump(expected_cancellation_class),
+            "client typed cancellation failure changed")
+    cleanup_classes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CleanupFailure"
+    ]
+    expected_cleanup_class = ast.parse('''class CleanupFailure(RuntimeError):
+    def __init__(self, message, constituents=()):
+        super().__init__(message)
+        self.constituents = tuple(constituents)
+''').body[0]
+    require(len(cleanup_classes) == 1
+            and ast.dump(cleanup_classes[0]) == ast.dump(expected_cleanup_class),
+            "client cleanup failure constituent retention changed")
+    cgroup_classes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CgroupFailure"
+    ]
+    expected_cgroup_class = ast.parse('''class CgroupFailure(CleanupFailure):
+    def __init__(self, message, residue_error, observation_errors):
+        self.residue_error = residue_error
+        self.observation_errors = tuple(observation_errors)
+        super().__init__(message, tuple(
+            error for error in (residue_error, *self.observation_errors) if error is not None))
+''').body[0]
+    require(len(cgroup_classes) == 1
+            and ast.dump(cgroup_classes[0]) == ast.dump(expected_cgroup_class),
+            "client structured cgroup failure identity changed")
+    require_exact_assignment(tree, "RESULT_PREFIX", 'RESULT_PREFIX = "NMCP_CLIENT_RESULT_V1:"',
+                             "client result prefix changed")
+    require_exact_assignment(tree, "RESULT_BYTE_LIMIT", "RESULT_BYTE_LIMIT = 8192",
+                              "client result bound changed")
+    require_exact_assignment(tree, "RESULT_EVENT_LIMIT", "RESULT_EVENT_LIMIT = 99",
+                             "client result event bound changed")
+    require_exact_assignment(tree, "PRIMARY_CATEGORIES", '''PRIMARY_CATEGORIES = (
+    "none", "cleanup-test", "cancelled", "verification", "unexpected",
+)
+''', "client primary result categories changed")
+    require_exact_assignment(tree, "CLEANUP_BOUNDARIES", '''CLEANUP_BOUNDARIES = (
+    "none", "show", "kill", "stop", "wait", "reset", "unload", "final")
+''', "client cleanup result boundaries changed")
+    require_exact_assignment(tree, "CLEANUP_CATEGORIES", '''CLEANUP_CATEGORIES = (
+    "property-recovered", "kill-recovered", "stop-recovered", "reset-recovered",
+    "property-unavailable", "kill-unavailable", "stop-unavailable", "reset-unavailable",
+    "wait-timeout", "unload-timeout", "cgroup-residue", "cgroup-observation", "deadline",
+    "cancelled", "unexpected",
+)
+''', "client cleanup result categories changed")
+    require_exact_function(tree, "cleanup_result", '''def cleanup_result(category, boundary, errors=()):
+    if boundary not in CLEANUP_BOUNDARIES:
+        boundary = "none"
+    if category not in CLEANUP_CATEGORIES or (boundary == "none" and category != "unexpected"):
+        category = "unexpected"
+    snapshot = (RETRIES.get(boundary, 0), INTERCEPTIONS.get(boundary, 0),
+                ATTEMPTS.get(boundary, 0))
+    RESULT_EVENTS.add((boundary, category, *snapshot))
+    if len(RESULT_EVENTS) > RESULT_EVENT_LIMIT:
+        RESULT_EVENTS.add((
+            "final", "unexpected", RETRIES.get("final", 0),
+            INTERCEPTIONS.get("final", 0), ATTEMPTS.get("final", 0)))
+    RESULT_MAPPED_CLEANUP_ERRORS.update(id(error) for error in errors)
+''', "client cleanup result aggregation changed")
+    require_exact_function(tree, "cleanup_fail", '''def cleanup_fail(category, boundary, message):
+    error = CleanupFailure(message)
+    cleanup_result(category, boundary, (error,))
+    raise error
+''', "client categorized cleanup failure mapping changed")
+    require_exact_function(tree, "cleanup_error_mapped", '''def cleanup_error_mapped(error):
+    if isinstance(error, CleanupFailure) and error.constituents:
+        return all(cleanup_error_mapped(constituent) for constituent in error.constituents)
+    return id(error) in RESULT_MAPPED_CLEANUP_ERRORS
+''', "client per-error cleanup mapping changed")
+    require_exact_function(tree, "record_cgroup_failure", '''def record_cgroup_failure(error, boundary):
+    if not isinstance(error, CgroupFailure):
+        cleanup_result("unexpected", boundary, (error,))
+        return
+    if error.residue_error is not None:
+        cleanup_result("cgroup-residue", boundary, (error.residue_error,))
+    if error.observation_errors:
+        cleanup_result("cgroup-observation", boundary, error.observation_errors)
+''', "client cgroup result classification must preserve every constituent identity")
+    require_exact_function(tree, "aggregate_cleanup_failure", '''def aggregate_cleanup_failure(errors, nonce):
+    diagnostics = []
+    for error in errors:
+        append_unique_diagnostic(diagnostics, sanitized_diagnostic(error, nonce))
+    return CleanupFailure(
+        sanitized_diagnostic("; ".join(diagnostics), nonce), tuple(errors))
+''', "client aggregate cleanup failure must retain every constituent identity")
+    require_exact_function(tree, "cleanup_retry", '''def cleanup_retry(boundary):
+    if boundary not in CLEANUP_BOUNDARIES:
+        boundary = "none"
+    RETRIES[boundary] = RETRIES.get(boundary, 0) + 1
+''', "client cleanup retry aggregation changed")
+    require('''            wait_error = CleanupFailure(
+                f"owned unit did not terminate its control group: {sanitized_state(state)}")
+            cleanup_result("cgroup-residue" if occupants else "wait-timeout",
+                           "wait", (wait_error,))
+            errors.append(wait_error)''' in source,
+            "client wait deadline must record classified immutable causal evidence")
+    require_exact_function(tree, "property_result_boundary", '''def property_result_boundary(context):
+    return {
+        "show": "show", "prelaunch": "show", "immediate": "show",
+        "recovery": "show", "owned-state": "show", "wait": "wait", "unload": "unload",
+    }.get(context)
+''', "client property result context routing changed")
+    require_exact_function(tree, "property_command_path", '''def property_command_path(phase, context, result_boundary):
+    before_interceptions = INTERCEPTIONS.get(context, 0)
+    before_attempts = ATTEMPTS.get(context, 0)
+    try:
+        command_path(phase, context)
+    finally:
+        if context != result_boundary:
+            INTERCEPTIONS[result_boundary] = (
+                INTERCEPTIONS.get(result_boundary, 0)
+                + INTERCEPTIONS.get(context, 0) - before_interceptions)
+            ATTEMPTS[result_boundary] = (
+                ATTEMPTS.get(result_boundary, 0) + ATTEMPTS.get(context, 0) - before_attempts)
+''', "client property result counters changed")
+    require_exact_function(tree, "primary_result_category", '''def primary_result_category(error):
+    if error is None:
+        return "none"
+    return error.category if isinstance(error, PrimaryFailure) else "unexpected"
+''', "client primary result derivation changed")
+    require_exact_function(tree, "cancellation_exception", '''def cancellation_exception():
+    return CancellationFailure(CANCELLED[0]) if CANCELLED else None
+''', "client cancellation detection must create a typed primary failure")
+    require_exact_function(tree, "terminal_cancellation_exception", '''def terminal_cancellation_exception():
+    pending = signal.sigpending() & CANCELLATION_SIGNALS
+    cancellation = cancellation_exception()
+    return cancellation or (CancellationFailure(min(pending)) if pending else None)
+''', "client terminal cancellation must recheck both pending signals and the latch")
+    require_exact_function(tree, "check_cancelled", '''def check_cancelled():
+    error = cancellation_exception()
+    if error is not None:
+        raise error
+''', "client cancellation checks must raise the typed primary failure directly")
+    require_exact_function(tree, "primary_exception", '''def primary_exception(error, boundary):
+    if isinstance(error, CgroupFailure):
+        record_cgroup_failure(error, boundary)
+    if isinstance(error, CancellationFailure):
+        return error
+    cancellation = cancellation_exception()
+    if cancellation is not None:
+        return cancellation
+    if isinstance(error, PrimaryFailure):
+        return error
+    return (PrimaryFailure("verification", str(error))
+            if isinstance(error, RuntimeError) else error)
+''', "client primary exception conversion must retain structured cgroup evidence")
+    require_exact_function(tree, "render_client_result", '''def render_client_result(primary_error):
+    primary = primary_result_category(primary_error)
+    ordered = tuple(sorted(RESULT_EVENTS, key=lambda event: (
+        CLEANUP_BOUNDARIES.index(event[0]), CLEANUP_CATEGORIES.index(event[1]),
+        event[2], event[3], event[4])))
+    if len(ordered) > RESULT_EVENT_LIMIT:
+        overflow = tuple(event for event in ordered
+                         if event[:2] == ("final", "unexpected"))[-1]
+        ordered = ordered[:RESULT_EVENT_LIMIT - 1] + (overflow,)
+    events = ",".join(
+        f"{boundary}.{category}.{retries}.{interceptions}.{attempts}"
+        for boundary, category, retries, interceptions, attempts in ordered) or "-"
+    line = (
+        f"{RESULT_PREFIX}primary={primary};events={events};"
+        "return=1;stdout=0;success=0"
+    )
+    try:
+        encoded = line.encode("ascii")
+    except UnicodeEncodeError:
+        raise RuntimeError("client result schema was not ASCII") from None
+    if len(encoded) > RESULT_BYTE_LIMIT or "\\n" in line or "\\r" in line:
+        raise RuntimeError("client result schema exceeded its canonical bound")
+    return line
+''', "client result rendering derivation or bound changed")
+    require_exact_function(tree, "result_failure", '''def result_failure(primary_error, human):
+    raise ClientResultFailure(render_client_result(primary_error), human) from None
+''', "client result failure rendering changed")
+    require_exact_function(tree, "emit_terminal_result", '''def emit_terminal_result(primary_error, cleanup_errors, nonce, result):
+    signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
+    failure = None
+    try:
+        resolve_outcome(primary_error, cleanup_errors, nonce)
+    except ClientResultFailure as error:
+        failure = error
+    if failure is None:
+        descriptor = 1
+        payload = (SUCCESS + "\\n").encode("ascii")
+        status = result
+    else:
+        descriptor = 2
+        payload = (failure.machine + "\\nverification-client: "
+                   + top_level_diagnostic(failure) + "\\n").encode("ascii")
+        status = 1
+    cancellation = terminal_cancellation_exception()
+    if cancellation is not None:
+        failure = ClientResultFailure(
+            render_client_result(cancellation), sanitized_diagnostic(cancellation, nonce))
+        descriptor = 2
+        payload = (failure.machine + "\\nverification-client: "
+                   + top_level_diagnostic(failure) + "\\n").encode("ascii")
+        status = 1
+    os.write(descriptor, payload)
+    return status
+''', "client terminal result must remain one signal-masked low-level emission")
     require(literal_assignment(tree, "CGROUP_SNAPSHOT_ATTEMPTS") == 4
             and literal_assignment(tree, "RECORDED_CGROUP_LIMIT") == 64
             and literal_assignment(tree, "CANONICAL_CGROUP")
@@ -830,7 +1103,7 @@ import time
                 "unknown", "unlink", "wait", "walk", "write")
             and literal_assignment(tree, "DIAGNOSTIC_RESOURCES") == (
                 "cgroup", "counter", "directory", "evidence", "helper", "journal", "lock", "marker",
-                "process", "runtime-root", "unknown"),
+                "process", "release", "runtime-root", "unknown"),
             "client closed diagnostic/cgroup constants changed")
     require_exact_function(tree, "evidence_failure", '''def evidence_failure(phase, operation, resource_class, error):
     if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS
@@ -926,7 +1199,8 @@ import time
             pids = cgroup_pids(control_group, phase)
         except BaseException as error:
             diagnostic = cgroup_observation_error(phase, error)
-            append_unique_diagnostic(errors, str(diagnostic))
+            if str(diagnostic) not in tuple(map(str, errors)):
+                errors.append(diagnostic)
             continue
         if pids:
             residue[control_group] = pids
@@ -934,9 +1208,11 @@ import time
 ''', "client must exhaustively retain residue and deduplicated observation failures")
     require_exact_function(tree, "assert_fixed_cgroups_empty", '''def assert_fixed_cgroups_empty(phase):
     residue, errors = fixed_cgroup_residue(phase)
-    failures = ([CGROUP_RESIDUE_FAILURE] if residue else []) + list(errors)
+    residue_error = CleanupFailure(CGROUP_RESIDUE_FAILURE) if residue else None
+    failures = ([str(residue_error)] if residue_error is not None else []) + list(map(str, errors))
     if failures:
-        fail(sanitized_diagnostic("; ".join(failures), None))
+        raise CgroupFailure(
+            sanitized_diagnostic("; ".join(failures), None), residue_error, errors)
 ''', "client must prioritize residue and bound safe exhaustive cgroup observation failures")
     require_exact_function(tree, "assert_prelaunch_absent", '''def assert_prelaunch_absent(state):
     if state.get("LoadState") != "not-found":
@@ -946,33 +1222,47 @@ import time
     assert_fixed_cgroups_empty("prelaunch")
 ''', "client prelaunch must reject loaded state before explicit-absence cgroup evidence")
     require_exact_function(tree, "resolve_outcome", '''def resolve_outcome(primary_error, cleanup_errors, nonce):
+    primary_error = cancellation_exception() or primary_error
+    if isinstance(primary_error, CgroupFailure):
+        record_cgroup_failure(primary_error, "final")
+    primary_error = cancellation_exception() or primary_error
+    final_error = None
     try:
         assert_fixed_cgroups_empty("final-close")
-    except BaseException as final_error:
+    except BaseException as error:
+        final_error = error
+        record_cgroup_failure(final_error, "final")
+    primary_error = cancellation_exception() or primary_error
+    for error in cleanup_errors:
+        if not cleanup_error_mapped(error):
+            if isinstance(error, CgroupFailure):
+                record_cgroup_failure(error, "final")
+            else:
+                cleanup_result("unexpected", "final", (error,))
+        primary_error = cancellation_exception() or primary_error
+    if final_error is not None or cleanup_errors:
         errors = []
-        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))
-        if primary_error is not None:
-            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))
-        for error in cleanup_errors:
-            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
-        detail = "; ".join(errors)
-        raise RuntimeError(sanitized_diagnostic(detail, nonce)) from None
-    if cleanup_errors:
-        errors = []
+        if final_error is not None:
+            append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))
+            if primary_error is not None:
+                append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))
         for error in cleanup_errors:
             append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
         detail = sanitized_diagnostic("; ".join(errors), nonce)
+        primary_error = cancellation_exception() or primary_error
+        if final_error is not None:
+            result_failure(primary_error, detail)
         if primary_error is not None:
             primary = sanitized_diagnostic(primary_error, nonce)
-            raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None
-        fail(f"cleanup failed: {detail}")
+            result_failure(primary_error, f"{primary}; cleanup failed: {detail}")
+        result_failure(None, f"cleanup failed: {detail}")
     if primary_error is not None:
-        raise RuntimeError(sanitized_diagnostic(primary_error, nonce)) from None
-''', "client final cgroup evidence must precede and aggregate every primary/cleanup outcome")
+        result_failure(primary_error, sanitized_diagnostic(primary_error, nonce))
+''', "client must classify complete final/cleanup evidence before one result emission")
     phase_argument_index = {"cgroup_pids": 1}
     phase_call_names = {
         "assert_fixed_cgroups_empty", "cgroup_pids", "client_pause", "command_path",
-        "durable_marker", "fixed_cgroup_residue", "launch_state", "marker_exists",
+        "durable_marker", "fixed_cgroup_residue", "launch_state", "validated_marker",
         "owned_state", "record_counter", "unit_properties",
     }
     observed_phase_calls = {}
@@ -1003,15 +1293,18 @@ import time
         ("command_path", "<forwarded>"): 1,
         ("command_path", "teardown"): 1,
         ("durable_marker", "<forwarded>"): 3,
-        ("durable_marker", "startup"): 2,
+        ("durable_marker", "final-close"): 1,
+        ("durable_marker", "launch"): 1,
+        ("durable_marker", "startup"): 3,
         ("durable_marker", "teardown"): 1,
         ("durable_marker", "unload"): 1,
-        ("durable_marker", "work"): 2,
+        ("durable_marker", "work"): 3,
         ("fixed_cgroup_residue", "<forwarded>"): 1,
         ("fixed_cgroup_residue", "teardown"): 1,
         ("launch_state", "immediate"): 1,
         ("launch_state", "recovery"): 1,
-        ("marker_exists", "<forwarded>"): 3,
+        ("validated_marker", "<forwarded>"): 5,
+        ("validated_marker", "final-close"): 1,
         ("owned_state", "ownership-read"): 1,
         ("owned_state", "teardown"): 4,
         ("owned_state", "unload"): 1,
@@ -1026,8 +1319,8 @@ import time
     try:
         raise SystemExit(main())
     except Exception as error:
-        print("verification-client: " + top_level_diagnostic(error), file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(emit_terminal_result(
+            primary_exception(error, "final"), [], None, 1))
 ''').body[0]
     guards = [node for node in tree.body if isinstance(node, ast.If)]
     require(len(guards) == 2 and ast.dump(guards[-1]) == ast.dump(expected_guard),
@@ -1166,21 +1459,12 @@ import time
         os_call("journal", "close", "journal", process.stdout.close)
     return parse_journal_evidence(bytes(payload))
 ''', "client journal acquisition must be byte/line/time bounded and status-only")
-    early_print_calls = [
-        node for node in ast.walk(tree) if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name) and node.func.id == "print"
-    ]
-    early_expected_stdout = ast.parse("print(SUCCESS, flush=True)").body[0].value
-    early_expected_stderr = ast.parse(
-        "print('verification-client: ' + top_level_diagnostic(error), file=sys.stderr)"
-    ).body[0].value
-    require(len(early_print_calls) == 2
-            and sorted(ast.dump(node) for node in early_print_calls)
-                == sorted((ast.dump(early_expected_stdout), ast.dump(early_expected_stderr)))
+    require(not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "print" for node in ast.walk(tree))
             and not any(isinstance(node, ast.Attribute)
                         and isinstance(node.value, ast.Name) and node.value.id == "sys"
-                        and node.attr == "stdout" for node in ast.walk(tree)),
-            "client output sinks must retain only canonical success and sanitized stderr")
+                        and node.attr in {"stdout", "stderr"} for node in ast.walk(tree)),
+            "client output sinks must not use buffered Python streams")
     retained_category_contract = '''                if requested_mode == "retained-cleanup-dependency":
                     category_deadline = bounded_deadline(5)
                     while not (journal_evidence[1] and journal_evidence[2]):
@@ -1370,11 +1654,14 @@ import time
 ''', "client terminal success must use the exact raw typed systemd state contract")
     require_exact_function(tree, "unit_properties", '''def unit_properties(phase, *names, context="show", retain=True):
     requested = tuple(dict.fromkeys(("LoadState", *names)))
+    result_boundary = property_result_boundary(context)
+    if result_boundary is None:
+        fail("unit property result context is not allowlisted")
     deadline = bounded_deadline(PROPERTY_RETRY_BUDGET)
     errors = []
     for attempt in range(PROPERTY_RETRIES):
         try:
-            command_path(phase, context)
+            property_command_path(phase, context, result_boundary)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 fail("unit property lookup deadline exhausted")
@@ -1386,15 +1673,18 @@ import time
             if retain and "ControlGroup" in requested:
                 retain_control_group(values)
             if errors:
+                cleanup_result("property-recovered", result_boundary, errors)
                 RECOVERED_ERRORS.extend(errors)
             return values
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             errors.append(error)
             if attempt + 1 >= PROPERTY_RETRIES or time.monotonic() >= deadline:
                 break
+            cleanup_retry(result_boundary)
             time.sleep(min(0.05 * (2 ** attempt), max(0, deadline - time.monotonic())))
     detail = "; ".join(sanitized_diagnostic(error, None) for error in errors)
-    fail("unit properties remain unknown: " + sanitized_diagnostic(detail, None))
+    cleanup_fail("property-unavailable", result_boundary,
+                 "unit properties remain unknown: " + sanitized_diagnostic(detail, None))
 ''', "client property reads must retain cgroups by default with one explicit prelaunch exception")
     require("if not values" not in source and "return {\"LoadState\": \"not-found\"" not in source,
             "client must not infer absence from an empty or failed property query")
@@ -1435,21 +1725,86 @@ import time
         fail(f"owned unit {arguments[0]} command failed with status {result.returncode}")
     return True
 ''', "client must revalidate exact ownership immediately before name-based commands")
-    require_exact_function(tree, "durable_marker", '''def durable_marker(phase, name):
-    path = f"{RUN}/{name}"
-    descriptor = os_call(phase, "open", "marker", os.open, path,
-                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
-        os_call(phase, "write", "marker", os.write, descriptor, b"ready\\n")
-        os_call(phase, "fsync", "marker", os.fsync, descriptor)
-    finally:
-        os_call(phase, "close", "marker", os.close, descriptor)
+    require_exact_function(tree, "marker_identity", '''def marker_identity(metadata, resource_class="marker"):
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0
+            or metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600):
+        fail(f"unsafe {resource_class} identity")
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+            metadata.st_gid, metadata.st_nlink, metadata.st_size)
+''', "client marker identity validation changed")
+    require_exact_function(tree, "validated_marker", '''def validated_marker(phase, path, expected_payload, resource_class="marker"):
+    if (os.path.dirname(path) != RUN or os.path.basename(path) in ("", ".", "..")
+            or not isinstance(expected_payload, bytes) or not expected_payload):
+        fail(f"unsafe {resource_class} path or payload")
     directory = os_call(phase, "open", "directory", os.open, RUN,
                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
     try:
+        try:
+            descriptor = os.open(os.path.basename(path),
+                                 os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise evidence_failure(phase, "open", resource_class, error) from None
+        before = os_call(phase, "stat", resource_class, os.fstat, descriptor)
+        identity = marker_identity(before, resource_class)
+        payload = os_call(phase, "read", resource_class, os.read, descriptor,
+                          len(expected_payload) + 1)
+        after = os_call(phase, "stat", resource_class, os.fstat, descriptor)
+        current = os_call(phase, "stat", resource_class, os.stat,
+                          os.path.basename(path), dir_fd=directory, follow_symlinks=False)
+        if (marker_identity(after, resource_class) != identity
+                or marker_identity(current, resource_class) != identity
+                or before.st_size != len(expected_payload) or payload != expected_payload):
+            fail(f"{resource_class} was malformed or replaced")
+        return True
+    finally:
+        if descriptor is not None:
+            os_call(phase, "close", resource_class, os.close, descriptor)
+        os_call(phase, "close", "directory", os.close, directory)
+''', "client anchored exact marker validation changed")
+    require_exact_function(tree, "durable_marker", '''def durable_marker(phase, name, payload=b"ready\\n"):
+    path = f"{RUN}/{name}"
+    if "/" in name or name in ("", ".", ".."):
+        fail("unsafe marker name")
+    directory = os_call(phase, "open", "directory", os.open, RUN,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    try:
+        try:
+            descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory)
+        except FileExistsError:
+            os_call(phase, "close", "directory", os.close, directory)
+            directory = None
+            if not validated_marker(phase, path, payload):
+                fail("existing marker disappeared during validation")
+            return
+        except OSError as error:
+            raise evidence_failure(phase, "open", "marker", error) from None
+        written = 0
+        while written < len(payload):
+            count = os_call(phase, "write", "marker", os.write, descriptor, payload[written:])
+            if count <= 0 or count > len(payload) - written:
+                fail("short write while publishing marker")
+            written += count
+        os_call(phase, "chmod", "marker", os.fchmod, descriptor, 0o600)
+        os_call(phase, "fsync", "marker", os.fsync, descriptor)
+        opened = os_call(phase, "stat", "marker", os.fstat, descriptor)
+        current = os_call(phase, "stat", "marker", os.stat, name,
+                          dir_fd=directory, follow_symlinks=False)
+        if marker_identity(opened) != marker_identity(current):
+            fail("marker was replaced while published")
         os_call(phase, "fsync", "directory", os.fsync, directory)
     finally:
-        os_call(phase, "close", "directory", os.close, directory)
+        if descriptor is not None:
+            os_call(phase, "close", "marker", os.close, descriptor)
+        if directory is not None:
+            os_call(phase, "close", "directory", os.close, directory)
+    if not validated_marker(phase, path, payload):
+        fail("published marker disappeared before validation")
 ''', "client attempting/acquired markers must be durably fsynced")
     require_exact_function(tree, "exhaust_work_budget", '''def exhaust_work_budget(boundary):
     global COMMAND_DEADLINE
@@ -1475,7 +1830,10 @@ import time
         'os_call("source-publication", "fsync", "directory", os.fsync, directory)',
         'nonce = secrets.token_hex(32)',
         'supervisor_argv = ("/usr/bin/python3", "-I", "-S", PROGRAM,',
-        'repo, commit, go_binary, nonce) + ((supervisor_mode,) if supervisor_mode else ())',
+        'repo, commit, go_binary, nonce) + (',
+        '((supervisor_mode,) if supervisor_mode else ())',
+        '"--persistent-launch-required="',
+        'if launch_barrier_required else ()',
         'exec_argv = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C", "LANG=C",',
         '"HOME=/root", f"{NONCE_VARIABLE}={nonce}", *supervisor_argv)',
         '"/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec"',
@@ -1498,7 +1856,7 @@ import time
         'cleanup_database_failed={journal_evidence[1]}',
         'cleanup_roles_failed={journal_evidence[2]}',
         'while not journal_evidence[0]:',
-        'print(SUCCESS, flush=True)',
+        'return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
         'teardown_owned(invocation, nonce, exec_argv)',
         'assert_fixed_cgroups_empty("work")',
         'for signum in CANCELLATION_SIGNALS:',
@@ -1515,10 +1873,13 @@ import time
         'CLEANUP_ACTIVE = True',
         'CLEANUP_ACTIVE = False',
         'discovered = launch_state("recovery", context="recovery")',
-        'except BaseException as error:\n            primary_error = error',
+        'except BaseException as error:\n'
+        '            primary_error = primary_exception(error, "final")',
         'f"{sanitized_state(discovered)}"',
         'cleanup_errors.append(error)',
-        'raise RuntimeError(f"{primary}; cleanup failed: {detail}") from None',
+        'result_failure(primary_error, f"{primary}; cleanup failed: {detail}")',
+        'signal.sigpending() & CANCELLATION_SIGNALS',
+        'os.write(descriptor, payload)',
         'client_pause("unload", "client-terminal-race-a-unloaded")',
         'Hostile root is explicitly outside this verifier\'s threat model.',
     )
@@ -1534,10 +1895,6 @@ import time
         node for node in ast.walk(tree) if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name) and node.func.id == "print"
     ]
-    expected_stdout = ast.parse("print(SUCCESS, flush=True)").body[0].value
-    expected_stderr = ast.parse(
-        "print('verification-client: ' + top_level_diagnostic(error), file=sys.stderr)"
-    ).body[0].value
     sys_output_attributes = [
         node for node in ast.walk(tree) if isinstance(node, ast.Attribute)
         and isinstance(node.value, ast.Name) and node.value.id == "sys"
@@ -1570,6 +1927,7 @@ import time
         and node.func.value.id == "os" and node.func.attr == "write"
     ]
     expected_os_writes = [
+        ast.parse("os.write(descriptor, payload)", mode="eval").body,
         ast.parse("os.write(temporary, payload[written:])", mode="eval").body,
     ]
     builtin_open_calls = [
@@ -1585,6 +1943,7 @@ import time
         and node.func.value.id == "os" and node.func.attr == "fdopen"
     ]
     expected_os_sink_references = [
+        ast.parse("os.write", mode="eval").body,
         ast.parse("os.write", mode="eval").body,
         ast.parse("os.write", mode="eval").body,
         ast.parse("os.write", mode="eval").body,
@@ -1644,11 +2003,7 @@ import time
                            "copy_file_range", "system", "popen", "stdout", "stderr"}
              or node.attr.startswith("exec") or node.attr.startswith("spawn"))
     ]
-    require(len(print_calls) == 2
-            and any(ast.dump(node) == ast.dump(expected_stdout) for node in print_calls)
-            and any(ast.dump(node) == ast.dump(expected_stderr) for node in print_calls)
-            and len(sys_output_attributes) == 1
-            and sys_output_attributes[0].attr == "stderr"
+    require(not print_calls and not sys_output_attributes
             and not numeric_output_sinks and not special_output_opens
             and [ast.dump(node) for node in os_write_calls]
                 == [ast.dump(node) for node in expected_os_writes]
@@ -1657,9 +2012,9 @@ import time
             and not fdopen_calls
             and [ast.dump(node) for node in subprocess_calls]
                 == [ast.dump(node) for node in expected_subprocess_calls]
-            and sorted(sys_attributes) == sorted(["argv"] * 6 + ["stderr"])
+            and sorted(sys_attributes) == sorted(["argv"] * 6)
             and not forbidden_os_output_calls
-            and print_loads == [node.func for node in print_calls]
+            and not print_loads
             and open_loads == [builtin_open_calls[0].func]
             and sorted(ast.dump(node) for node in os_sink_references)
                 == sorted(ast.dump(node) for node in expected_os_sink_references)
@@ -1682,7 +2037,7 @@ elif (requested_mode.startswith("client-cleanup-fault-")
       or requested_mode.startswith("client-cleanup-persistent-")
       or requested_mode.startswith("client-signal-")):
     boundary = requested_mode.rsplit("-", 1)[1]
-    if boundary in ("kill", "wait"):
+    if boundary in ("kill", "wait", "work"):
         supervisor_mode = "fast-hold"
     elif boundary == "stop":
         supervisor_mode = "fast-success"
@@ -1706,7 +2061,20 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
     lock_try = parents.get(lock_calls[0])
     while lock_try is not None and not isinstance(lock_try, ast.Try):
         lock_try = parents.get(lock_try)
-    expected_close = ast.parse("close_client_lock(client_lock)").body[0]
+    expected_close = ast.parse('''try:
+    if (launch_barrier_required and nonce is not None
+            and not validated_marker("final-close", f"{RUN}/launch-{nonce}.release",
+                                     (nonce + "\\n").encode("ascii"), "release")):
+        durable_marker("final-close", f"launch-{nonce}.release",
+                       (nonce + "\\n").encode("ascii"))
+except BaseException as error:
+    cleanup_errors.append(error)
+finally:
+    try:
+        close_client_lock(client_lock)
+    except BaseException as error:
+        cleanup_errors.append(error)
+''').body[0]
     require(isinstance(lock_try, ast.Try) and len(lock_try.finalbody) == 1
             and ast.dump(lock_try.finalbody[0]) == ast.dump(expected_close),
             "client.lock must encompass the complete transaction through owned unload")
@@ -1727,7 +2095,6 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
         "journal_evidence = bounded_journal_evidence(invocation)",
         'assert_fixed_cgroups_empty("work")',
         "teardown_owned(invocation, nonce, exec_argv)",
-        'resolve_outcome(primary_error, cleanup_errors, nonce)',
         'client_pause("unload", "client-terminal-race-a-unloaded")',
         "close_client_lock(client_lock)",
     )
@@ -1735,6 +2102,13 @@ elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
     require(all(position >= 0 for position in positions)
             and positions == sorted(positions),
             "client.lock lifecycle ordering no longer covers reap through confirmed unload")
+    require(source.count("\n        resolve_outcome(primary_error, cleanup_errors, nonce)\n") == 1
+            and source.count(
+                "return emit_terminal_result(primary_error, cleanup_errors, nonce, result)") == 1
+            and source.index(
+                "return emit_terminal_result(primary_error, cleanup_errors, nonce, result)")
+            > source.index("close_client_lock(client_lock)"),
+            "client outcome must enter its terminal critical section after acquired-resource cleanup")
     require(lock_source.count('durable_marker("work", "client-terminal-race-b.started")') == 1
             and lock_source.index('durable_marker("work", "client-terminal-race-b.started")')
             > lock_source.index('launched = command(service_argv, "launch", check=False)'),
@@ -1861,7 +2235,7 @@ if invocation is None:
     expected_handler = ast.parse('''try:
     pass
 except BaseException as error:
-    primary_error = error
+    primary_error = primary_exception(error, "final")
 ''').body[0].handlers[0]
     expected_finally = ast.parse('''try:
     pass
@@ -1901,12 +2275,9 @@ finally:
         except BaseException as error:
             cleanup_errors.append(error)
     COMMAND_DEADLINE = work_deadline
-    if CANCELLED:
-        cancellation = RuntimeError(f"verification client cancelled by signal {CANCELLED[0]}")
-        if primary_error is None:
-            primary_error = cancellation
-        elif str(cancellation) not in str(primary_error):
-            cleanup_errors.append(cancellation)
+    cancellation = cancellation_exception()
+    if cancellation is not None:
+        primary_error = cancellation
     if RECOVERED_ERRORS:
         cleanup_errors.extend(RECOVERED_ERRORS)
 ''').body[0].finalbody
@@ -2095,14 +2466,14 @@ finally:
     protected_constants = budget_constants | security_constants
     expected_protected_load_counts = {
         "ACTION_ATTEMPTS": 6, "ACTION_RETRY_BACKOFF": 3, "ACTION_TIMEOUTS": 3,
-        "CANCELLATION_SIGNALS": 4, "CLEANUP_BUDGET": 2, "CLEANUP_ENVELOPE": 1,
+        "CANCELLATION_SIGNALS": 6, "CLEANUP_BUDGET": 2, "CLEANUP_ENVELOPE": 1,
         "CLEANUP_DATABASE_FAILURE": 3, "CLEANUP_ROLES_FAILURE": 3,
         "CLEANUP_MARGIN": 1, "CLEANUP_RESERVE": 2, "CLIENT_FAULTS": 1,
         "DESCRIPTION_PREFIX": 2, "ENVIRONMENT": 2, "JOURNAL_BYTE_LIMIT": 3,
         "JOURNAL_LINE_LIMIT": 1, "JOURNAL_QUERY_LINE_LIMIT": 1,
         "JOURNAL_TIMEOUT": 1, "KILL_WAIT_TIMEOUT": 2,
         "NONCE_VARIABLE": 3, "PATH": 1, "PROGRAM": 3, "PROPERTY_RETRIES": 2,
-        "PROPERTY_RETRY_BUDGET": 2, "RUN": 13, "SERVICE_PROPERTIES": 3,
+        "PROPERTY_RETRY_BUDGET": 2, "RUN": 17, "SERVICE_PROPERTIES": 3,
         "SLOW_ACTION_FAULT_SECONDS": 1, "SLOW_PROPERTY_FAULT_SECONDS": 1,
         "SUCCESS": 5, "TOTAL_BUDGET": 2, "UNIT": 3, "UNLOAD_TIMEOUT": 2,
         "WORK_BUDGET_FAULT_SECONDS": 1, "WORK_BUDGET_MODES": 2,
@@ -2229,6 +2600,9 @@ finally:
         ast.dump(ast.parse(
             "previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)"
         ).body[0]): 2,
+        ast.dump(ast.parse(
+            "pending = signal.sigpending() & CANCELLATION_SIGNALS"
+        ).body[0]): 1,
         ast.dump(ast.parse('''process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
                            stderr=subprocess.DEVNULL)
 ''').body[0]): 1,
@@ -2361,20 +2735,19 @@ finally:
         observed_exhaust_guards[ast.dump(guard.test)] = call.args[0].value
     require(len(exhaust_calls) == 4 and observed_exhaust_guards == expected_exhaust_guards,
             "client may accelerate work exhaustion only at the four reviewed boundaries")
-    expected_outcome = ast.parse('''resolve_outcome(primary_error, cleanup_errors, nonce)
-if requested_mode == "client-terminal-race-a":
+    expected_outcome = ast.parse('''if requested_mode == "client-terminal-race-a":
     client_pause("unload", "client-terminal-race-a-unloaded")
 ''').body
     require([ast.dump(node) for node in lock_try.body[launch_index + 1:]]
             == [ast.dump(node) for node in expected_outcome],
-            "client must immediately resolve primary/cleanup errors after the inner finally")
-    expected_post_lock = ast.parse('''print(SUCCESS, flush=True)
-return result
+            "client must complete post-unload synchronization before outer cleanup")
+    expected_post_lock = ast.parse('''return emit_terminal_result(
+    primary_error, cleanup_errors, nonce, result)
 ''').body
     lock_index = main_node.body.index(lock_try)
     require([ast.dump(node) for node in main_node.body[lock_index + 1:]]
             == [ast.dump(node) for node in expected_post_lock],
-            "client must emit success only after client.lock closes successfully")
+            "client must enter terminal emission only after client.lock cleanup")
 
     invocation_assignments = [
         node for node in ast.walk(main_node)
@@ -2427,7 +2800,7 @@ return result
         'context="show"', 'deadline = bounded_deadline(KILL_WAIT_TIMEOUT)',
         'cleanup_boundary("wait")', 'context="wait"',
         'occupants, observation_errors = fixed_cgroup_residue("teardown")',
-        'for diagnostic in observation_errors:\n            append_unique_diagnostic(errors, diagnostic)',
+        'cleanup_result("cgroup-observation", "wait", observation_errors)',
         'if occupants and not kill_sent:',
         'retry_owned_command(invocation, nonce, service_command,\n                                    "kill", "kill", "--kill-whom=all", "--signal=KILL")',
         'retry_owned_command(invocation, nonce, service_command, "stop", "stop")',
@@ -2435,11 +2808,12 @@ return result
         'wait_unloaded(invocation, nonce, service_command)',
     )
     require(all(teardown.count(fragment) == 1 for fragment in teardown_contract)
-            and teardown.count("append_unique_diagnostic(") == 11
+            and teardown.count("aggregate_cleanup_failure(errors, nonce)") == 2
             and teardown.count('assert_fixed_cgroups_empty("teardown")') == 3
-            and teardown.count('"; ".join(errors)') == 2
-            and "errors.append(" not in teardown and "errors.extend(" not in teardown,
-            "client teardown must retry pre-action failures and aggregate kill/stop/wait/reset/unload errors")
+            and teardown.count("errors.append(") == 10
+            and teardown.count("errors.extend(") == 1
+            and "errors.append(sanitized_diagnostic" not in teardown,
+            "client teardown must retain each kill/stop/wait/reset/unload constituent")
     require('if not occupants:\n                break' in teardown
             and 'if not occupants:\n                return' not in teardown,
             "client loaded empty terminal teardown must continue through reset and unload")
@@ -2450,7 +2824,8 @@ return result
             and 'cleanup_boundary("unload")' in wait_source
             and "timeout=UNLOAD_TIMEOUT" in wait_source
             and "deadline = bounded_deadline(timeout)" in wait_source
-            and 'fail("absolute client cleanup deadline exhausted while awaiting owned unload")' in wait_source,
+            and 'cleanup_fail("deadline", "unload",' in wait_source
+            and 'cleanup_fail("unload-timeout", "unload",' in wait_source,
             "client unload polling/fault boundary ownership contract changed")
 
     record_counter_source = ast.get_source_segment(
@@ -2779,12 +3154,15 @@ def validate_containment(source: str, phase: str) -> None:
         "pid_exists": 1, "read_pid": 1, "process_has_inode": 2,
         "wait_path": 0, "release": 0, "reset_signal_paths": 0, "reset_paths": 0,
         "counter": 0, "wait_counter": 0, "assert_interception": 2,
+        "validated_marker": 0, "persistent_launch_barriers": 0,
+        "wait_persistent_launch_required": 0, "wait_validated_marker": 0,
     }
     forwarding_regions = {
         "show", "assert_client_failure", "fast_recovery", "cleanup_fixture_invocation",
         "cleanup_signed_launch",
         "show_until", "read_structured_command_until", "cleanup_signed_launch_until",
-        "wait_counter", "assert_interception",
+        "wait_counter", "assert_interception", "validated_marker",
+        "persistent_launch_barriers", "wait_persistent_launch_required", "wait_validated_marker",
     }
     main_phase_inventory = {}
     for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
@@ -2809,13 +3187,13 @@ def validate_containment(source: str, phase: str) -> None:
         ("pid_exists", "preflight"): 1, ("pid_exists", "service-death"): 1,
         ("popen", "client-fault"): 1, ("popen", "name-reuse"): 1,
         ("popen", "persistent-cleanup"): 1, ("popen", "preflight"): 1,
-        ("popen", "signal-cleanup"): 1, ("popen", "slow-cleanup"): 1,
+        ("popen", "signal-cleanup"): 2, ("popen", "slow-cleanup"): 1,
         ("popen", "terminal-race"): 2, ("popen", "transient-cleanup"): 1,
         ("popen", "work-budget"): 1,
         ("process_communicate", "client-fault"): 1,
         ("process_communicate", "name-reuse"): 1,
         ("process_communicate", "persistent-cleanup"): 2,
-        ("process_communicate", "signal-cleanup"): 1,
+        ("process_communicate", "signal-cleanup"): 2,
         ("process_communicate", "slow-cleanup"): 1,
         ("process_communicate", "terminal-race"): 2,
         ("process_communicate", "transient-cleanup"): 1,
@@ -2828,18 +3206,17 @@ def validate_containment(source: str, phase: str) -> None:
         ("run", "retained-cleanup"): 2, ("run", "service-death"): 1,
         ("run", "stale-attestation"): 1, ("run", "stale-setup"): 1,
         ("run", "transient-cleanup"): 1,
-        ("assert_interception", "persistent-cleanup"): 1,
         ("assert_interception", "transient-cleanup"): 2,
         ("counter", "persistent-cleanup"): 3, ("counter", "slow-cleanup"): 2,
         ("counter", "transient-cleanup"): 1,
         ("release", "client-fault"): 1, ("release", "name-reuse"): 1,
-        ("release", "persistent-cleanup"): 1, ("release", "slow-cleanup"): 1,
+        ("release", "persistent-cleanup"): 3, ("release", "slow-cleanup"): 1,
         ("release", "stale-attestation"): 1, ("release", "stale-cleanup"): 1,
         ("release", "terminal-race"): 3, ("release", "transient-cleanup"): 1,
         ("release", "work-budget"): 1,
         ("reset_paths", "client-fault"): 1, ("reset_paths", "name-reuse"): 1,
         ("reset_paths", "persistent-cleanup"): 3,
-        ("reset_paths", "signal-cleanup"): 2, ("reset_paths", "slow-cleanup"): 2,
+        ("reset_paths", "signal-cleanup"): 3, ("reset_paths", "slow-cleanup"): 2,
         ("reset_paths", "stale-cleanup"): 1, ("reset_paths", "stale-setup"): 1,
         ("reset_paths", "terminal-race"): 2,
         ("reset_paths", "transient-cleanup"): 4, ("reset_paths", "work-budget"): 2,
@@ -2847,9 +3224,13 @@ def validate_containment(source: str, phase: str) -> None:
         ("reset_signal_paths", "name-reuse"): 1,
         ("reset_signal_paths", "terminal-race"): 1,
         ("wait_counter", "persistent-cleanup"): 2,
+        ("persistent_launch_barriers", "persistent-cleanup"): 1,
+        ("wait_persistent_launch_required", "persistent-cleanup"): 1,
+        ("validated_marker", "persistent-cleanup"): 1,
+        ("wait_validated_marker", "persistent-cleanup"): 1,
         ("wait_path", "client-fault"): 1, ("wait_path", "name-reuse"): 1,
         ("wait_path", "persistent-cleanup"): 1, ("wait_path", "preflight"): 1,
-        ("wait_path", "signal-cleanup"): 1, ("wait_path", "slow-cleanup"): 2,
+        ("wait_path", "signal-cleanup"): 2, ("wait_path", "slow-cleanup"): 2,
         ("wait_path", "stale-attestation"): 2, ("wait_path", "terminal-race"): 6,
         ("wait_path", "transient-cleanup"): 1, ("wait_path", "work-budget"): 2,
     }, "containment process lifecycle phase inventory changed")
@@ -3208,6 +3589,11 @@ def validate_containment(source: str, phase: str) -> None:
         "persistent_failure_classification", "bounded_sanitized_repr", "sanitized_state",
         "persistent_result_violation", "persistent_special_result_violation",
         "persistent_failure_diagnostics", "assert_persistent_failure_contract",
+        "parse_client_result", "client_stderr_evidence", "expected_persistent_result",
+        "retain_persistent_cgroup", "persistent_cgroup_finality",
+        "PersistentCgroupFinalityFailure",
+        "evaluate_persistent_result", "persistent_scalar_diagnostic",
+        "assert_machine_result_contract", "assert_persistent_cgroup_routing_contract",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
         "stale_failure_message",
         "len", "str", "repr", "sorted", "bool", "any", "next",
@@ -3228,13 +3614,20 @@ def validate_containment(source: str, phase: str) -> None:
         "load_cleanup_intent", "top_level_diagnostic",
         "persistent_failure_classification", "persistent_result_violation",
         "persistent_special_result_violation",
+        "parse_client_result", "client_stderr_evidence", "expected_persistent_result",
+        "retain_persistent_cgroup", "persistent_cgroup_finality",
+        "evaluate_persistent_result", "persistent_scalar_diagnostic",
+        "assert_machine_result_contract", "assert_persistent_cgroup_routing_contract",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
         "stale_failure_message",
         "bounded_sanitized_repr", "sanitized_state", "persistent_failure_diagnostics",
         "assert_persistent_failure_contract", "run", "parse_unit_properties", "show",
         "assert_property_parser_contract", "wait_path", "reset_signal_paths", "reset_paths",
+        "validated_payload_marker", "validated_marker", "persistent_launch_barriers", "wait_persistent_launch_required",
+        "persistent_launch_paths", "wait_validated_marker",
         "counter", "wait_counter", "release", "wait_unit_absent",
-        "assert_client_lock_reusable", "assert_client_lock_held", "assert_client_failure",
+        "assert_client_lock_reusable", "assert_client_lock_held", "assert_transaction_lock_held",
+        "assert_client_failure", "assert_cancelled_result",
         "fast_recovery", "fault_paths", "assert_interception", "cleanup_fixture_invocation",
         "unique_json_object", "parse_structured_command", "structured_command_identity",
         "launch_identity_signature",
@@ -3276,6 +3669,13 @@ def validate_containment(source: str, phase: str) -> None:
         ("persistent_failure_classification", "stdout, stderr"),
         ("persistent_result_violation", "returncode, classification, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup, post_cleanup_cgroup"),
         ("persistent_special_result_violation", "returncode, stdout, stderr, evidence_case, boundary, intercepted, attempted"),
+        ("parse_client_result", "payload"),
+        ("client_stderr_evidence", "stderr"),
+        ("expected_persistent_result", "case, boundary"),
+        ("retain_persistent_cgroup", "recorded, state"),
+        ("persistent_cgroup_finality", "recorded, category, reader"),
+        ("evaluate_persistent_result", "case, expected_case, lifecycle_category, expected_lifecycle, parsed, stderr_shape, expected_result, returncode, stdout, intercepted, attempted, lock_handoff_error, cleanup_error, cleanup_categories, lock_reuse_error, expected_signed_cleanup_required, signed_cleanup_required, signed_cleanup_ran, release_ok, reap_ok, unit_absent, recorded_category, recorded_required, recorded_path_present, recorded_scanned, canonical_scanned, recorded_empty, canonical_empty, artifacts_absent"),
+        ("persistent_scalar_diagnostic", "case, lifecycle_category, predicates, stderr_shape"),
         ("stale_expected_rejection", "state"),
         ("stale_client_classification", "attempted, returncode, stdout, stderr, expected_stderr"),
         ("diagnostic_bit", "value"),
@@ -3283,17 +3683,27 @@ def validate_containment(source: str, phase: str) -> None:
         ("bounded_sanitized_repr", "value, active_nonce=None"),
         ("top_level_diagnostic", "error"), ("sanitized_state", "state"),
         ("persistent_failure_diagnostics", "mode, boundary, faulted, classification, intercepted, attempted, observed, after_exit, signed_cleanup_ran, post_cleanup, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup_cgroup"),
+        ("assert_machine_result_contract", ""),
+        ("assert_persistent_cgroup_routing_contract", ""),
         ("assert_persistent_failure_contract", ""), ("run", "phase, argv, **kwargs"),
         ("parse_unit_properties", "result, requested"), ("show", "phase, *properties"),
         ("assert_property_parser_contract", "client"),
         ("wait_path", "phase, path, timeout=900"),
+        ("validated_payload_marker", "phase, path, expected_payload, resource_class='marker'"),
+        ("validated_marker", "phase, path, nonce"),
+        ("persistent_launch_barriers", "phase"),
+        ("wait_persistent_launch_required", "phase, baseline, timeout=10"),
+        ("persistent_launch_paths", "nonce"),
+        ("wait_validated_marker", "phase, path, nonce, timeout=10"),
         ("reset_signal_paths", "phase, name"), ("reset_paths", "phase, *paths"),
         ("counter", "phase, path"),
         ("wait_counter", "phase, path, expected, timeout=30"),
         ("release", "phase, name"),
         ("wait_unit_absent", "phase, timeout=30"), ("assert_client_lock_reusable", ""),
         ("assert_client_lock_held", ""),
+        ("assert_transaction_lock_held", ""),
         ("assert_client_failure", "result, mode, phase"),
+        ("assert_cancelled_result", "result, mode"),
         ("fast_recovery", "client, repo, commit, go_binary, context, phase"),
         ("fault_paths", "mode, boundary"),
         ("assert_interception", "mode, boundary, phase, *, persistent=False"),
@@ -3335,16 +3745,32 @@ def validate_containment(source: str, phase: str) -> None:
     }
     expected_function_defaults = {
         "cgroup_stat": [ast.dump(ast.Constant(value="cgroup"))],
+        "validated_payload_marker": [ast.dump(ast.Constant(value="marker"))],
         "wait_path": [ast.dump(ast.Constant(value=900))],
+        "wait_persistent_launch_required": [ast.dump(ast.Constant(value=10))],
+        "wait_validated_marker": [ast.dump(ast.Constant(value=10))],
         "wait_counter": [ast.dump(ast.Constant(value=30))],
         "wait_unit_absent": [ast.dump(ast.Constant(value=30))],
         "assert_interception": [ast.dump(ast.Constant(value=False))],
         "bounded_sanitized_repr": [ast.dump(ast.Constant(value=None))],
     }
     evidence_classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
-    expected_evidence_class = ast.parse('''class EvidenceFailure(RuntimeError):
+    evidence_class_methods = {
+        node for evidence_class in evidence_classes for node in evidence_class.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    expected_evidence_classes = ast.parse('''class EvidenceFailure(RuntimeError):
     pass
-''').body[0]
+class PersistentCgroupFinalityFailure(RuntimeError):
+    def __init__(self, result, errors, recorded_scanned, canonical_scanned):
+        super().__init__("; ".join(
+            retained_diagnostic(error, f"{name} cgroup scan failed")
+            for name, error in errors))
+        self.result = result
+        self.errors = tuple(errors)
+        self.recorded_scanned = recorded_scanned
+        self.canonical_scanned = canonical_scanned
+''').body
     protected_persistent_bindings.update(node.name for node in reviewed_persistent_functions)
     require(actual_containment_functions == expected_containment_functions
             and actual_function_signatures == expected_function_signatures
@@ -3357,9 +3783,9 @@ def validate_containment(source: str, phase: str) -> None:
                         for node in reviewed_persistent_functions)
             and not any(node.decorator_list for node in reviewed_persistent_functions)
             and {node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
-                == reviewed_persistent_functions
-            and len(evidence_classes) == 1
-            and ast.dump(evidence_classes[0]) == ast.dump(expected_evidence_class)
+                == reviewed_persistent_functions | evidence_class_methods
+            and len(evidence_classes) == 2
+            and tuple(map(ast.dump, evidence_classes)) == tuple(map(ast.dump, expected_evidence_classes))
             and not any(isinstance(node, ast.AsyncFunctionDef) for node in ast.walk(tree))
             and {node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
                 == set(evidence_classes),
@@ -3414,6 +3840,8 @@ try_nonblocking_flock(cleanup_lock, "persistent-cleanup", "lock")
     expected_module_assignments = {
         "UNIT", "CLEANUP_DATABASE_FAILURE", "CLEANUP_ROLES_FAILURE",
         "READY", "PID_FILES", "ENV", "SUCCESS", "PERSISTENT_PROPERTY_ERROR",
+        "RESULT_PREFIX", "RESULT_BYTE_LIMIT", "RESULT_EVENT_LIMIT", "CLIENT_STDERR_BYTE_LIMIT",
+        "RESULT_PRIMARY_CATEGORIES", "RESULT_BOUNDARIES", "RESULT_CLEANUP_CATEGORIES",
         "PERSISTENT_ACTION_ERROR", "STALE_REJECTION_PREFIX", "DIAGNOSTIC_TEXT_LIMIT",
         "PROGRAM", "NONCE_VARIABLE",
         "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "IDENTITY_PROPERTIES",
@@ -3432,6 +3860,20 @@ READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
 SUCCESS = "Ubuntu migration role compatibility verification passed"
+RESULT_PREFIX = "NMCP_CLIENT_RESULT_V1:"
+RESULT_BYTE_LIMIT = 8192
+RESULT_EVENT_LIMIT = 99
+CLIENT_STDERR_BYTE_LIMIT = 9216
+RESULT_PRIMARY_CATEGORIES = (
+    "none", "cleanup-test", "cancelled", "verification", "unexpected",
+)
+RESULT_BOUNDARIES = ("none", "show", "kill", "stop", "wait", "reset", "unload", "final")
+RESULT_CLEANUP_CATEGORIES = (
+    "property-recovered", "kill-recovered", "stop-recovered", "reset-recovered",
+    "property-unavailable", "kill-unavailable", "stop-unavailable", "reset-unavailable",
+    "wait-timeout", "unload-timeout", "cgroup-residue", "cgroup-observation", "deadline",
+    "cancelled", "unexpected",
+)
 PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"
 PERSISTENT_ACTION_ERROR = " command remains unavailable:"
 STALE_REJECTION_PREFIX = "verification-client: fixed verification unit is not explicitly absent: "
@@ -3543,15 +3985,19 @@ COUNTER_CATEGORIES = (
         and node.targets[0] not in reviewed_persistent_assignments
     )
     expected_constant_loads = {
-        "UNIT": 20, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
-        "READY": 2, "PID_FILES": 1, "ENV": 11, "SUCCESS": 8,
+        "UNIT": 22, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
+        "READY": 2, "PID_FILES": 1, "ENV": 12, "SUCCESS": 9,
+        "RESULT_PREFIX": 5, "RESULT_BYTE_LIMIT": 1, "RESULT_EVENT_LIMIT": 1,
+        "CLIENT_STDERR_BYTE_LIMIT": 2,
+        "RESULT_PRIMARY_CATEGORIES": 1, "RESULT_BOUNDARIES": 2,
+        "RESULT_CLEANUP_CATEGORIES": 2,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "STALE_REJECTION_PREFIX": 1, "DIAGNOSTIC_TEXT_LIMIT": 6,
-        "PROGRAM": 2, "NONCE_VARIABLE": 2,
+        "PROGRAM": 2, "NONCE_VARIABLE": 3,
         "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 6, "IDENTITY_PROPERTIES": 1,
         "SYSTEMD_UNIT_OBJECT": 1, "CGROUP_SNAPSHOT_ATTEMPTS": 1,
         "DIAGNOSTIC_PHASES": 2, "DIAGNOSTIC_OPERATIONS": 1,
-        "DIAGNOSTIC_RESOURCES": 1, "COUNTER_MAX": 2, "COUNTER_BYTE_LIMIT": 3,
+        "DIAGNOSTIC_RESOURCES": 1, "COUNTER_MAX": 3, "COUNTER_BYTE_LIMIT": 3,
         "COUNTER_READ_ATTEMPTS": 1, "COUNTER_CATEGORIES": 2,
     }
     actual_constant_loads = {name: 0 for name in expected_module_assignments}
@@ -3566,7 +4012,7 @@ COUNTER_CATEGORIES = (
     }
     expected_mutable_constant_contexts = {
         "ENV": {
-            ast.dump(ast.parse('call(env=ENV)', mode="eval").body.keywords[0]): 11,
+            ast.dump(ast.parse('call(env=ENV)', mode="eval").body.keywords[0]): 12,
         },
         "SERVICE_PROPERTIES": {
             ast.dump(ast.parse('(*SERVICE_PROPERTIES,)', mode="eval").body.elts[0]): 3,
@@ -3618,9 +4064,9 @@ COUNTER_CATEGORIES = (
             "containment imports exceed the reviewed modules")
     protected_persistent_bindings.update(reviewed_imports)
     expected_module_loads = {
-        "errno": 10, "fcntl": 5, "functools": 1, "json": 6, "os": 88,
+        "errno": 10, "fcntl": 5, "functools": 1, "json": 6, "os": 112,
         "runpy": 1, "secrets": 2,
-        "signal": 6, "stat": 8, "subprocess": 95, "sys": 3, "time": 67,
+        "signal": 6, "stat": 12, "subprocess": 98, "sys": 3, "time": 74,
     }
     actual_module_loads = {name: 0 for name in reviewed_imports}
     for node in ast.walk(tree):
@@ -3634,25 +4080,25 @@ COUNTER_CATEGORIES = (
         ("fcntl", "flock"): 2, ("functools", "partial"): 1,
         ("json", "dumps"): 4, ("json", "load"): 1,
         ("json", "loads"): 1, ("os", "O_CREAT"): 2,
-        ("os", "O_DIRECTORY"): 2, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 10,
-        ("os", "O_NONBLOCK"): 1, ("os", "O_PATH"): 1,
-        ("os", "O_RDONLY"): 3, ("os", "O_RDWR"): 4, ("os", "O_TRUNC"): 1,
+        ("os", "O_DIRECTORY"): 3, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 12,
+        ("os", "O_NONBLOCK"): 2, ("os", "O_PATH"): 1,
+        ("os", "O_RDONLY"): 5, ("os", "O_RDWR"): 4, ("os", "O_TRUNC"): 1,
         ("os", "O_WRONLY"): 3,
-        ("os", "close"): 10, ("os", "fchmod"): 1, ("os", "fstat"): 4, ("os", "fsync"): 5,
+        ("os", "close"): 13, ("os", "fchmod"): 2, ("os", "fstat"): 7, ("os", "fsync"): 5,
         ("os", "geteuid"): 1,
-        ("os", "kill"): 4, ("os", "listdir"): 1, ("os", "lstat"): 3,
-        ("os", "open"): 11, ("os", "path"): 7, ("os", "read"): 1,
-        ("os", "replace"): 1, ("os", "stat"): 4,
+        ("os", "kill"): 5, ("os", "listdir"): 2, ("os", "lstat"): 3,
+        ("os", "open"): 13, ("os", "path"): 11, ("os", "read"): 2,
+        ("os", "replace"): 1, ("os", "stat"): 6,
         ("os", "unlink"): 2, ("os", "walk"): 1, ("os", "write"): 3,
         ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2,
-        ("stat", "S_IMODE"): 1, ("stat", "S_ISDIR"): 6, ("stat", "S_ISREG"): 1,
+        ("stat", "S_IMODE"): 3, ("stat", "S_ISDIR"): 6, ("stat", "S_ISREG"): 3,
         ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 2,
         ("signal", "SIGQUIT"): 1, ("signal", "SIGTERM"): 1,
-        ("subprocess", "CalledProcessError"): 1, ("subprocess", "CompletedProcess"): 21,
-        ("subprocess", "PIPE"): 68, ("subprocess", "TimeoutExpired"): 1,
+        ("subprocess", "CalledProcessError"): 1, ("subprocess", "CompletedProcess"): 22,
+        ("subprocess", "PIPE"): 70, ("subprocess", "TimeoutExpired"): 1,
         ("subprocess", "Popen"): 1, ("subprocess", "SubprocessError"): 2,
         ("subprocess", "run"): 1, ("sys", "argv"): 2, ("sys", "stderr"): 1,
-        ("time", "monotonic"): 49, ("time", "sleep"): 18,
+        ("time", "monotonic"): 54, ("time", "sleep"): 20,
     }
     expected_recursive_module_attributes = {
         "errno.EAGAIN": 1, "errno.EIO": 2, "errno.ESTALE": 6,
@@ -3661,24 +4107,24 @@ COUNTER_CATEGORIES = (
         "fcntl.flock": 2, "functools.partial": 1,
         "json.dumps": 4, "json.load": 1, "json.loads": 1,
         "os.O_CREAT": 2,
-        "os.O_DIRECTORY": 2, "os.O_EXCL": 2, "os.O_NOFOLLOW": 10,
-        "os.O_NONBLOCK": 1, "os.O_PATH": 1,
-        "os.O_RDONLY": 3, "os.O_RDWR": 4, "os.O_TRUNC": 1, "os.O_WRONLY": 3,
-        "os.close": 10, "os.fchmod": 1, "os.fstat": 4, "os.fsync": 5, "os.geteuid": 1,
-        "os.kill": 4, "os.listdir": 1, "os.lstat": 3, "os.open": 11, "os.path": 7,
-        "os.path.abspath": 1, "os.path.dirname": 1,
+        "os.O_DIRECTORY": 3, "os.O_EXCL": 2, "os.O_NOFOLLOW": 12,
+        "os.O_NONBLOCK": 2, "os.O_PATH": 1,
+        "os.O_RDONLY": 5, "os.O_RDWR": 4, "os.O_TRUNC": 1, "os.O_WRONLY": 3,
+        "os.close": 13, "os.fchmod": 2, "os.fstat": 7, "os.fsync": 5, "os.geteuid": 1,
+        "os.kill": 5, "os.listdir": 2, "os.lstat": 3, "os.open": 13, "os.path": 11,
+        "os.path.abspath": 1, "os.path.basename": 3, "os.path.dirname": 2,
         "os.path.join": 4, "os.path.relpath": 1,
-        "os.read": 1, "os.replace": 1, "os.stat": 4, "os.unlink": 2,
+        "os.read": 2, "os.replace": 1, "os.stat": 6, "os.unlink": 2,
         "os.walk": 1, "os.write": 3,
-        "runpy.run_path": 1, "secrets.token_hex": 2, "stat.S_IMODE": 1,
-        "stat.S_ISDIR": 6, "stat.S_ISREG": 1,
+        "runpy.run_path": 1, "secrets.token_hex": 2, "stat.S_IMODE": 3,
+        "stat.S_ISDIR": 6, "stat.S_ISREG": 3,
         "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 2,
         "signal.SIGQUIT": 1, "signal.SIGTERM": 1,
-        "subprocess.CalledProcessError": 1, "subprocess.CompletedProcess": 21,
-        "subprocess.PIPE": 68, "subprocess.TimeoutExpired": 1,
+        "subprocess.CalledProcessError": 1, "subprocess.CompletedProcess": 22,
+        "subprocess.PIPE": 70, "subprocess.TimeoutExpired": 1,
         "subprocess.Popen": 1, "subprocess.SubprocessError": 2,
         "subprocess.run": 1, "sys.argv": 2, "sys.stderr": 1,
-        "time.monotonic": 49, "time.sleep": 18,
+        "time.monotonic": 54, "time.sleep": 20,
     }
 
     def rooted_attribute_chain(node):
@@ -3739,55 +4185,62 @@ COUNTER_CATEGORIES = (
                 if isinstance(child, ast.AST):
                     child_relations[id(child)] = (parent, field)
     reviewed_name_callees = {
-        "EvidenceFailure", "OSError", "RuntimeError", "SystemExit", "all", "any", "assert_client_failure",
+        "EvidenceFailure", "PersistentCgroupFinalityFailure", "OSError", "RuntimeError", "SystemExit", "UnicodeEncodeError", "all", "any", "assert_cancelled_result", "assert_client_failure",
         "assert_client_lock_held", "assert_client_lock_reusable", "assert_interception",
+        "assert_transaction_lock_held",
         "assert_cleanup_deadline_contract", "assert_launch_identity_contract",
         "assert_launch_signature_counterexamples",
-        "assert_keeper_lock_coherent", "assert_persistent_failure_contract",
+        "assert_keeper_lock_coherent", "assert_machine_result_contract",
+        "assert_persistent_cgroup_routing_contract", "assert_persistent_failure_contract",
         "assert_property_parser_contract", "assert_replaced_or_absent", "bool", "bytearray",
         "bytes",
         "bounded_cleanup_timeout", "bounded_sanitized_repr", "cgroup_close", "cgroup_fstat",
         "cgroup_open", "cgroup_pids", "cgroup_read", "cgroup_stat", "cgroup_walk",
-        "cleanup", "cleanup_fixture_invocation", "cleanup_signed_launch",
+        "client_stderr_evidence", "cleanup", "cleanup_fixture_invocation", "cleanup_signed_launch",
         "cleanup_signed_launch_if_owned", "cleanup_signed_launch_until",
         "close_transaction_lock",
         "aggregate_counter_failure", "counter", "counter_failure", "counter_identity", "dict", "evidence_failure",
         "fail", "function",
-        "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
+        "evaluate_persistent_result", "expected_persistent_result", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
         "launch_identity_matches", "launch_identity_signature", "list", "load_cleanup_intent",
         "lock_transaction", "map", "next", "observable_identity", "open",
         "open_transaction_lock", "os_call", "parse_structured_command", "path_exists", "popen",
-        "parse_counter", "parse_unit_properties", "parser",
+        "parse_client_result", "parse_counter", "parse_unit_properties", "parser",
         "persistent_failure_classification", "persistent_failure_diagnostics",
-        "persistent_launch_signature", "persistent_result_violation",
-        "persistent_special_result_violation",
+        "persistent_cgroup_finality", "persistent_launch_barriers", "persistent_launch_paths",
+        "persistent_launch_signature",
+        "persistent_result_violation", "wait_persistent_launch_required",
+        "persistent_scalar_diagnostic", "persistent_special_result_violation",
         "persistent_supervisor_mode", "pid_exists", "print", "process_communicate",
         "process_has_inode", "process_wait", "range", "read_pid",
-        "read_structured_command_until", "release",
-        "repr", "reset_paths", "reset_signal_paths", "retained_diagnostic", "run", "run_root_entry",
-        "sanitized_state", "set", "show", "show_identity_until", "show_until",
+        "read_structured_command_until", "reader", "release", "retain_persistent_cgroup",
+        "identity", "repr", "reset_paths", "reset_signal_paths", "retained_diagnostic", "run", "run_root_entry",
+        "sanitized_state", "set", "show", "show_identity_until", "show_until", "sum",
         "signed_launch_state", "signed_launch_state_until",
-        "sorted", "stale_terminal_matches", "str", "structured_command_fixture_result",
+        "sorted", "stale_terminal_matches", "str", "structured_command_fixture_result", "super",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
         "stale_failure_message",
         "structured_command_identity", "successful_terminal_state", "tuple", "type",
-        "top_level_diagnostic", "try_nonblocking_flock", "unique_json_object", "wait_counter",
-        "wait_path", "wait_unit_absent",
+        "top_level_diagnostic", "try_nonblocking_flock", "unique_json_object",
+        "validated_marker", "validated_payload_marker",
+        "wait_counter", "wait_path", "wait_unit_absent", "wait_validated_marker", "zip",
     }
     reviewed_attribute_callee_roots = {
-        "after_exit", "budgeted", "cancelled", "categories", "character", "descendants",
-        "cleanup_errors", "dict", "environment", "errors", "expected_slow_counts", "fcntl", "first", "functools",
-        "digits", "found", "json", "kwargs", "kill_stderr", "line", "loaded", "matching", "mode", "mutations",
-        "observed", "orphaned", "os", "parts", "post_cleanup", "post_cleanup_cgroup", "process",
-        "property_boundaries",
+        "after_exit", "body", "budgeted", "calls", "cancelled", "categories", "character",
+        "counts", "descendants",
+        "cleanup_errors", "dict", "early_observed", "environment", "errors", "expected_slow_counts", "fcntl", "first", "functools",
+        "digits", "emitted", "field", "found", "json", "kwargs", "kill_stderr", "line", "loaded", "matching", "mode", "mutations",
+        "barrier_name", "name", "observed", "orphaned", "os", "parts", "post_cleanup", "post_cleanup_cgroup", "process",
+        "parsed_events", "predicates", "property_boundaries", "raw_event",
         "partial", "recovered", "recovered_observed", "rendered", "replaced", "result", "runpy",
-        "secrets", "sentinel_state",
+        "schema", "secrets", "sentinel_state",
         "identities", "kept", "path", "payload", "results", "signature", "slow", "slow_paths",
         "slow_state", "source", "stat", "state",
         "stderr",
         "stale_after_client", "stale_observed",
         "stale_post_cleanup", "stale_post_cleanup_cgroup", "stale_program",
-        "stopped", "reset", "subprocess", "text", "time", "value", "values", "wait_stderr", "waiting",
+        "stopped", "reset", "RESULT_BOUNDARIES", "RESULT_CLEANUP_CATEGORIES",
+        "subprocess", "text", "time", "value", "values", "wait_stderr", "waiting",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -3835,6 +4288,19 @@ COUNTER_CATEGORIES = (
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        ("13f8080e846eeba82c28c5be7a34d9d1bee5b30af561e73de6917cf9d4fe1671",
+         "fb087a013ee70dcaa947c7f761b39f71e64f19fd2f863f57ecc7f56db329ebf5",
+         "521cc31ba6b4b924ded2e22c0653af461e789d5ab68b9e46d84487de96d5fd1b",
+         "84a7906fa5850734c47aff97fd3448f9f073ad414599a36911a7a6c91302be42"),
+        ("55131a8bdccbea4783cf8dc557aa565b91cfa0a60bea19d5d8fcfdbfe1c759b5",
+         "fee24b44cedc805db86e6c0b1b4451125e5f62111998418b3097d86fe0402846",
+         "947b8d04d8a5161011bdd5c086355208c06e2a949ebf36f9b5281f6804b02b94",
+         "4f5fb80c0e2d57e7c0331bbbf1f302689427e907e58f042f270f5570e3749297"),
+        # CPython 3.14 closed machine-result schema and independent predicates.
+        ("80f86da1fcf16db4d94e371e382fcb785a34081fd16d2417359f80e3d2f0e40e",
+         "dac871eb7d73cd5826180dd8ae1e25ccbec08ecaa3c97068662f24dccd95b0fc",
+         "947b8d04d8a5161011bdd5c086355208c06e2a949ebf36f9b5281f6804b02b94",
+         "c170c99595480296eb76d97d71c7139a12c64f8deb52d140e1ef8668942908d7"),
         # CPython 3.12 exact full-stderr special persistent client-result contract.
         ("fbcbc3afff2b7549623fe6e2a794d9b780d05dec913657a8c3c9ff1d52ee1da4",
          "3dd71870892c0fa6d4c34e1b00c88c7d1b48fc7f2d8e4de37b901d6da4c6931a",
@@ -4010,28 +4476,111 @@ COUNTER_CATEGORIES = (
          "998ad0381b9003eb93bab41950efb56ec98af4e4b89f92d2753f9d29a228f321",
          "9f5ce0e5abac6c9a487a72793625ed3efe967f11b82d8dd35efa0e3dc14a9afa",
          "4079f6946f084c5477d3d2bcd8497d5ae29b5b8d36a66c0fd2911ccd7b6aa955"),
+        ("4ec3e4b6e6f552bdb2692a4524a751d508ac430f396ca33fedea190bcd0a3089",
+         "cb840ece53047fbb93d524e5da9b97983923512fab117711a0474f5064972c67",
+         "521cc31ba6b4b924ded2e22c0653af461e789d5ab68b9e46d84487de96d5fd1b",
+         "f21466cfa702377e554fbc92eec4f89a84712a1a09ffc0f51081d283d20e58fe"),
+        ("15eccebcb38e592164122da066fc234351acac884bd73e8f89889cec514813e8",
+         "3bd5024698514bc976b2c1ebc9cc2f186034653ff86da99e5afdf6783f50f6a2",
+         "947b8d04d8a5161011bdd5c086355208c06e2a949ebf36f9b5281f6804b02b94",
+         "0ec900c00fd6f9545e7d6647e4e5d713f1655df57ec944200a8cde55f0011fc7"),
+        ("0b9b004b5e8ece5dbf9fdef29af272c7d82cf938e3c76d40f0966acd1feb757d",
+         "62aa694dc628896f58a8f318649e0c6c6323cf46f2e82ce67ee89dea7d0a65f6",
+         "947b8d04d8a5161011bdd5c086355208c06e2a949ebf36f9b5281f6804b02b94",
+         "72bfa50015481347ffb5c5fd484566d7fd03fd8c484d6bddf4d8a890807519f5"),
+        ("89db2b0d0593604c0136052c5957a48ace28fec71d0aab3249654ab829bc0d74",
+         "c1fd0e91300b1bc1f8774a3effb10f0f8a5677586ab9a1cea830a2bf0c298dc6",
+         "521cc31ba6b4b924ded2e22c0653af461e789d5ab68b9e46d84487de96d5fd1b",
+         "07e3e0d99a210a853b6283146da7fd9a6fc4470cfe92b903f329f073bb9ebaf4"),
+        # CPython 3.14 mixed cleanup-result ordering fixture.
+        ("ade09baaf0cbb8216ab484d63e3be0ba904acf974f18a6daf81f2bf88fd5340f",
+         "3c28a42d766e0c0670976df33069ccbd73aeeda494aee53273b5850a8516721d",
+         "947b8d04d8a5161011bdd5c086355208c06e2a949ebf36f9b5281f6804b02b94",
+         "60ddeb1e525b2c0999e8b0225f9b86127d8e505ea056d3fb17fffa2a97007027"),
+        # CPython 3.12 mixed cleanup-result ordering fixture.
+        ("14bd3aa1f20ac1d1e404869d95acbadb2a129a83781aef73715d589180e53331",
+         "9d347cc8c344abf90232d102947190250c9f8870119f80415776782ad612f3a0",
+         "521cc31ba6b4b924ded2e22c0653af461e789d5ab68b9e46d84487de96d5fd1b",
+         "3f0163ab54453abbcfd32619e77ee41d8ef31433595edce31fb09a345195406e"),
+        # CPython 3.14 independent final scans, structured cgroup evidence, ready-first launch.
+        ("1e8638db3626312e7a5cd94a7212aeaad2b4b89de1679a4efa9e01120c050afa",
+         "fbbb4016f8f57c32698c36d322a8bf7565513155df8e11d095dad2537d221a12",
+         "4466f7c72b0410d1ce17f1c3890777ce72f701477517825bf720486f70be0d27",
+         "680235c280ea1fbf124784cfa29152cdd0d486a7a4c66171b93613d0046207a2"),
+        # CPython 3.12 independent final scans, structured cgroup evidence, ready-first launch.
+        ("9d5f88516ea51c8a27457f9f032da5253e5157fb41b142a288964cef5e1ead0c",
+         "2e616f5695156cd1d367b40147e11ca6ffe06389e9ad9a1e15dedab053d3cf8a",
+          "0978854132429f21505d197d70ae7720a1cf6b57aa896345bc653b34b2896854",
+          "01f1b28459b740cd5cbd55550a8bde2665b4de7b61822e226d7c9ad8230565f8"),
+        # CPython 3.14 multi-boundary event trace and release-safe launch discovery.
+        ("e4bcb221a67059926a7c791cf693046ccb389deab2e8aed68de62ca302612b68",
+         "edd31d40e5bf285f6465f6d4bf83e3b82c3ac9d69c4223eb9453200a9ca1f5d0",
+         "4466f7c72b0410d1ce17f1c3890777ce72f701477517825bf720486f70be0d27",
+         "58ed01f25207532ad3d66e174c2ea173544e789a0abab1d9b20074af798a6a7e"),
+        # CPython 3.12 multi-boundary event trace and release-safe launch discovery.
+        ("1fa47e822ef2e0cf4f0e59d64ad6efd97cf5c280bf4583f052ee16eb59bab37e",
+         "1543f1db4cd23f4415f933ddc2af23caaf6e6214ec68b1481332f54474c3bf3f",
+         "0978854132429f21505d197d70ae7720a1cf6b57aa896345bc653b34b2896854",
+         "232861dcec9965e91a4619d5c83d5339e5495f158930fc5c74f3d1c40cd3f12a"),
+        # CPython 3.14 immutable causal snapshots and nonce-bound launch markers.
+        ("1968e47dc522f9a2bfbabc43a7806ff08e11b7b4eff22f48ca2c94ed62e9a6e9",
+         "d9599146f65ba65bea460cf1fb02078248457339b8604c47282635f316754789",
+         "4466f7c72b0410d1ce17f1c3890777ce72f701477517825bf720486f70be0d27",
+         "2800cd4165f2cf8b209d11782b1aa60e05fb176841258102797ccf68f0e19d56"),
+        # CPython 3.12 immutable causal snapshots and nonce-bound launch markers.
+        ("ae653ef5bb3e03a832bbedc77aff7a13e92f89a41eafc325c0b225b089cd4459",
+         "7765fee28d059849100797a39ca34da6acfb09b5ca8b089a5717172fe6982492",
+          "0978854132429f21505d197d70ae7720a1cf6b57aa896345bc653b34b2896854",
+          "1c081d757a4f1cfcfa6d140b5f19ba834136693b8f9c1c15a3da423d77f5e28b"),
+        # CPython 3.14 anchored release validation and wait-deadline evidence.
+        ("9ca41b940ef4b24233b0d7941d0cb71aa5c6514b20c3ea45497ab80345a7e736",
+         "3c6e3b265bafa98c4cdfd6b1e8d67db896869575bdcb95c5c91c10f4fb958f3b",
+         "bf18a86c3394b6fb0bb127763719d344d16dffb8e2f72d8c286bcfdfa42a588e",
+         "d57934f8ab944984a985edfb54830e00ce922dab6c3df9c4221a156cef72a034"),
+        # CPython 3.12 anchored release validation and wait-deadline evidence.
+        ("ea01254577ed679e7ca8f2b29952f7c625691693082a2d4c2e7d6d0613a5946e",
+         "edf35111fee4cae923f32061ad8db0ef4878456a6c6d6665dfa0cced0cf973c2",
+          "8271a0ed0695a249c79df50079e623c37685fe4999a59e70e9b1c8749929171d",
+          "341eef747a89403ffc5505698c1b865d26659e88768873fd9b707c4a426e49cf"),
+        # CPython 3.14 typed cancellation and direct lifecycle signal fixtures.
+        ("e68b701265a555396e5313f6530704248a809dec78d58fb071464193bbba14e8",
+         "83904faa8ad4624b4d65e12babbdc4d028f2647a7ce84a61c6f78ebd6ac7baa7",
+         "e11a509b8a1a5344b558c11b2f7f7903ada3c83aa6335500e6c924da3b2f5b07",
+         "d3dda00d05d238c7c53e03180e8e9d5436220b688c1b18c7a7e1cd3fdb1fdd32"),
+        # CPython 3.12 typed cancellation and direct lifecycle signal fixtures.
+        ("fc9880202564acbaca301097938202469fa40d18eefa075977e728d9d0a94160",
+         "72ecbfd763a929e7fbf51c4957af3d1e00b17d43821b6fefcc49ea7ac39ac808",
+         "52db6fe7d050a322c1ae51dd7261ee33ca2da7f07dcecff1350d2e811602fbe0",
+         "b740fc173f46e0ea5921992a276657fb16382a7ec279dfd2b1b367312efe40fa"),
     }
     require(observed_call_fingerprints in reviewed_call_fingerprints,
             "containment call targets, arguments, or use-site contexts changed")
     protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
     expected_call_root_stores = {
-        "after_exit": 2, "budgeted": 1, "cancelled": 1, "categories": 1,
-        "character": 6, "cleanup": 1, "cleanup_errors": 1, "digits": 1,
-        "descendants": 1, "environment": 1, "errors": 2, "expected_slow_counts": 1,
-        "first": 1, "found": 1, "identities": 1, "kept": 1, "kill_stderr": 1, "line": 1,
-        "loaded": 1, "matching": 1, "mode": 7, "observed": 8,
-        "mutations": 1, "orphaned": 1, "parser": 1, "partial": 1, "parts": 1,
-        "path": 7, "payload": 3,
-        "post_cleanup": 2, "post_cleanup_cgroup": 2,
-        "process": 3, "property_boundaries": 1, "recovered": 3, "replaced": 1,
-        "recovered_observed": 1, "rendered": 3, "reset": 1, "result": 7, "results": 1,
+        "after_exit": 2, "body": 1, "budgeted": 1, "calls": 1, "cancelled": 2, "categories": 2,
+        "barrier_name": 1, "character": 9, "cleanup": 1, "cleanup_errors": 1, "digits": 1,
+        "descendants": 1, "environment": 1, "errors": 3, "expected_slow_counts": 1,
+        "early_observed": 1,
+        "emitted": 1, "field": 1, "first": 1, "found": 1, "identities": 1,
+        "identity": 3, "kept": 1, "kill_stderr": 1, "line": 3,
+        "loaded": 1, "matching": 1, "mode": 8, "observed": 9,
+        "mutations": 2, "name": 23, "orphaned": 1, "parser": 1, "partial": 1, "parts": 2,
+        "path": 8, "payload": 5,
+        "post_cleanup": 2, "post_cleanup_cgroup": 3,
+        "counts": 1, "parsed_events": 1, "predicates": 3, "process": 3,
+        "property_boundaries": 1, "raw_event": 1, "recovered": 3,
+        "replaced": 1,
+        "reader": 1, "recovered_observed": 1, "rendered": 3, "reset": 1,
+        "result": 10, "results": 1,
         "sentinel_state": 1, "signature": 5, "slow": 1,
         "slow_paths": 1, "slow_state": 1, "source": 3, "stale_after_client": 2,
         "stale_observed": 3, "stale_post_cleanup": 3,
         "stale_post_cleanup_cgroup": 2, "stale_program": 1,
-        "state": 17, "stderr": 1, "stopped": 3, "successful_terminal_state": 1, "text": 8,
-        "value": 16, "values": 3,
+        "schema": 1, "state": 18, "stderr": 2, "stopped": 3,
+        "successful_terminal_state": 1, "text": 8,
+        "value": 20, "values": 4,
         "wait_stderr": 1, "waiting": 1,
+        "RESULT_BOUNDARIES": 1, "RESULT_CLEANUP_CATEGORIES": 1,
     }
     actual_call_root_stores = {}
     call_root_store_contexts = []
@@ -4044,7 +4593,9 @@ COUNTER_CATEGORIES = (
                                              type(parent).__name__, field, ast.dump(parent)))
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
-                in {"049ae2817fbd2bacf89f1efb7a0a2749adbc82cfe6793b46ab69269b11a297fd",
+                in {"7a49f2d7c648b844bd9e0f205b03abe341254e7d730364222f4fcb9538474c9d",
+                    "38c38f3be3504753058245186dc262c7de4b64117aad095dc8bf7b291822b5e1",
+                    "049ae2817fbd2bacf89f1efb7a0a2749adbc82cfe6793b46ab69269b11a297fd",
                     "1d70ddd3c38447ac648f6f32336183ca2c74814a97eed812c239236c07666512",
                     "bc61618b71906f8fd37a750859fbe21bb1d44c49c0565e1a60254fbf21b6a906",
                     "35c269712dfb27277c12293fb43526b3c119084a519f2a8433e568530f0e07af",
@@ -4062,6 +4613,10 @@ COUNTER_CATEGORIES = (
                     "d3e165d6739578d5914ab1fc17e4a3122c7b69fba82b2496bf0c905d12103399",
                     "736c9b5a8e87836eb660f8102fe944f814adc5adbae303dbc014dfedd5678a25",
                     "95414aa17f539723cba5d48ffbefa65592d669ec867dcfaa77899dde7508a869",
+                    "64e63a2c0020ce2d13d3eff733a985f2c98480f7188c572f25963a76ab5581a3",
+                    "e3ea0798fa55ce460f4b936ef72997c3d5ad35d5bbfa323c595fe229bdd92555",
+                    "1224454279ad6e1fcdc7d802186f19151b90ac11c5dfed9a038510c33e9f767a",
+                    "140cffdcdb626d3c5ce14fc68237e0c7359ca7b9363066221d313f8021148740",
                     "ed10b7120c2bc595e9b4f73c486d646f4bb2c6678489e8679bf00d23dbde5ab1",
                     "53c119c1c4cbaf56920df306779652455ddedbe4e6a8e7411b408a539bea08db",
                     "1ed77c82b56c90e952f9443498af925ac61378cd7a94a7447fe70cc7a941be3b",
@@ -4072,7 +4627,20 @@ COUNTER_CATEGORIES = (
                      "c4667a22b2f1545d746622be1221cede5b3fe51b7aed8510a766b0e746df2966",
                      "17085a6cd2b2573ba60e1e09640adfc1c09767e406b912c840d9188706aa9aa4",
                      "41835fcd4f6f5fc3865de2313a592848cd4127d124487645306c9e7b8b1b0844",
-                     "faaa3eb8fb287be835bef2025f7542d635ee05831b70b541375c953923bfe1fa"}
+                      "faaa3eb8fb287be835bef2025f7542d635ee05831b70b541375c953923bfe1fa",
+                       "016806f4d87a61f78e64f8f75e7f0af980324525fb5b841f64ddd41151945e28",
+                       "7e8f0f074c8cd0b78b5a656e117ade34935b73508f8e8232ae14d3e29124438f",
+                       "5a3c7303bea9ca9d623190f7ad64c4d959d0f513266aec414ed2d5071ba76e77",
+                       "7c79a3a73407b9abaa21f6ea102e7a03f7cfaf34a7bc3b4f3a74cdc72ded3657",
+                       "e1aef0534026523162585d7d6e750af2bfd760d58af7c6c9a55efa2a74fd16cb",
+                       "8b847b865a8c69d267e23a46c7edb284c6659221107fa9e389cf25adefd486b5",
+                        "fa85a26dd273235a158f33bada8a507890fc5ed652147db326c52bd2551bb186",
+                        "17f4e237d2ede927a2e4c1263414870eb631dfbb205c5aaa64ea7833bb83a2d1",
+                        "67ed86b2e153a370468ba7754821f2ce7a3d8bb8498c59fc9c13dbaefeadc3ec",
+                        "d72fc199850f4762a559b567f993f01f054da7e68b1d110a4ba2c600df230f8c",
+                         "48d2a1f1d48b5f0eb5dd74aef6463e9f007f4db2212f232c185c64b8599b0a21",
+                         "b5e491cc5deae20c6608be730f2d5122ee53d0fec91aacaef1daf62d64931c10",
+                         "3eb17733448b2be2ddd3e01caa09045921602fcf56beed5243215d70db5282ea"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -4090,9 +4658,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 522, "AugAssign": 2, "Break": 10, "ClassDef": 1, "Continue": 9,
-        "Delete": 1, "Expr": 318, "For": 48, "FunctionDef": 86, "If": 240,
-        "Import": 12, "Pass": 5, "Raise": 62, "Return": 91, "Try": 73, "While": 16,
+        "Assign": 669, "AugAssign": 3, "Break": 10, "ClassDef": 2, "Continue": 11,
+        "Delete": 1, "Expr": 394, "For": 58, "FunctionDef": 104, "If": 293,
+        "Import": 12, "Pass": 5, "Raise": 65, "Return": 108, "Try": 86, "While": 19,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -4106,7 +4674,10 @@ COUNTER_CATEGORIES = (
     # The recursive semantic call/module/binding inventories above remain independently required.
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
-                in {"ecdfb0d359bbc5e7303581bd3ca141f7b30f92a5f94f4c6b47476c8dfc4f1906",
+                in {"8ffb3f843bd3aa975bff2bdf254685ec319ef03402d2601cd661cb31f6e6d8a4",
+                    "b8afbd0765718bd176b6568194cb1f3707a2d60e880a6b5323807428484e2acf",
+                    "f13e69e31bc10519fe8b74adc34f2a0bb83bef8c324168cfee93b2443c1c177d",
+                    "ecdfb0d359bbc5e7303581bd3ca141f7b30f92a5f94f4c6b47476c8dfc4f1906",
                     "a7fe96a3e61f3d0d70dbe247af72bf013b84cedb91fdcb66d4b341ffddeac501",
                     "bfa28bcf72c0c64baf28e8d4589369616c71137bfde2816ebfa3962fc00032c0",
                     "2742ee89e9a4759eceeadd8be6e103fea0d8e36a0e9dcc8fc5eb70c5389a7ada",
@@ -4150,13 +4721,42 @@ COUNTER_CATEGORIES = (
                       "dad97dfe56ca8352752bfda112eb91a88125b2fc15da9697f017f3c67be3f764",
                        "c580666bd20d06c213ff507fed7d64579e1f336d3e776b39bf2947255f4e0c12",
                        "e040a2e7c2aca677648a8c119547ed52cfdb8852065e2080fb8e8e89bab72b71",
-                       "d01eb6de2ca328f17af90b8a8eedef26f6fae4da1de586e33dd747da32466b14"},
+                       "d01eb6de2ca328f17af90b8a8eedef26f6fae4da1de586e33dd747da32466b14",
+                       "8e5a50e688100252184614c178cc0b819dcdc2faa6c35d1eacd3254de0ca37b3",
+                       "73ce24db5acec434c2fbd359b0355d0815d07442b9048ea2bc1e6a50da4a2b52",
+                       "54c9693a1c419f24854f682004e547186fed4e7db79428c45777e346e4e517d2",
+                       "af1ca3fcea7dca8282811a279f26040fe71629130596e40e5036d4308f366503",
+                       "2f8a5c5b1e71e0c72b3b9643e0789fa602ed1cb97e6d46413481090a1fad4976",
+                       "847619888a5caa99d8275fd78f78db3e914aedd947d77d312939f6f4395b2ab1",
+                       "56a32bec749480f4f3a687cd58965e6de70245794b413507fdd9c06c94ac8414",
+                       "24d15bb7f9af9bd5d40e294ce78b9a31492af2269a98dd4352e5d13eedd34d10",
+                       "a95f815de24a73eca008570806c2bd095c8a62238af998c2e49511292a3d60f5",
+                        "9a7ea5c537fcaa4f42b383518f0f3f743537be76977b21abbca45caf55350c84",
+                        "8d99a4b999aff986c5564ad7fc671bf48a4c51bf7a57debff6b61a18b29465fb",
+                         "2a62313279dca4412793b4c1ea0491e244d9bea4082ca39c674fb64eeae79fd2",
+                         "9726e9f71685f02f2ea71a329849fb2852f7d4e3139f6d27ec87cd1ab4714910",
+                         "57c686759af04c34d578effd7bf972ae6baa83a36aa681ec254257e67ee67dc9",
+                         "e1b4ddc3409bc33673f52267fa6435cbf68c9b96852edd60bd8a7c1da43f948c",
+                         "1a3ba2d51dd64c7d98c622d1f19c9614c25e47f571632abfd3890b4a6baf700a",
+                         "b93d892af09453a3e660d409f7328e35a17af2a482bf28873c5d0247d7422572",
+                         "d40b6c8fb7ea93d15df409918d535d73a99c5497675775a43809042926a65057",
+                         "ce56a75e61d9a148a5261faab42674d620aa063bd914e34e30b2cfd1e5ed8fe6",
+                         "21fbbd0107cd38a1daaa410cf89c1f6ac4001652fb46633d9af352ee2c41745d"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
         'kwargs.setdefault("timeout", 18 * 60)', mode="eval").body)
+    reviewed_fixture_calls_clear = ast.dump(ast.parse('calls.clear()', mode="eval").body)
     reviewed_json_loads = ast.dump(ast.parse(
         'json.loads(result.stdout, object_pairs_hook=unique_json_object)', mode="eval").body)
+    reviewed_evidence_attribute_stores = {
+        node for evidence_class in evidence_classes for node in ast.walk(evidence_class)
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)
+    }
+    reviewed_evidence_attributes = {
+        node for evidence_class in evidence_classes for node in ast.walk(evidence_class)
+        if isinstance(node, ast.Attribute)
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.NamedExpr):
             persistent_binding_violations.append(node)
@@ -4172,10 +4772,12 @@ COUNTER_CATEGORIES = (
               and protected_persistent_bindings.intersection(node.names)):
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Attribute) and node.attr in protected_persistent_bindings
-              and isinstance(node.ctx, (ast.Store, ast.Del))):
+              and isinstance(node.ctx, (ast.Store, ast.Del))
+              and node not in reviewed_evidence_attribute_stores):
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Attribute)
-              and isinstance(node.ctx, (ast.Store, ast.Del))):
+              and isinstance(node.ctx, (ast.Store, ast.Del))
+              and node not in reviewed_evidence_attribute_stores):
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del))
               and any(isinstance(child, ast.Name)
@@ -4183,8 +4785,8 @@ COUNTER_CATEGORIES = (
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
               and node.func.attr in {"update", "setdefault", "pop", "popitem", "clear",
-                                     "__setitem__", "__delitem__"}
-              and ast.dump(node) != reviewed_kwargs_setdefault):
+                                      "__setitem__", "__delitem__"}
+              and ast.dump(node) not in {reviewed_kwargs_setdefault, reviewed_fixture_calls_clear}):
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
               and node.value.id in protected_persistent_bindings
@@ -4192,7 +4794,7 @@ COUNTER_CATEGORIES = (
             persistent_binding_violations.append(node)
         elif (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
               and node.name in protected_persistent_bindings
-              and node not in reviewed_persistent_functions):
+              and node not in reviewed_persistent_functions | set(evidence_classes)):
             persistent_binding_violations.append(node)
         elif isinstance(node, ast.arg) and node.arg in protected_persistent_bindings:
             persistent_binding_violations.append(node)
@@ -4227,7 +4829,8 @@ COUNTER_CATEGORIES = (
                                 "__globals__", "__closure__", "__setattr__", "__delattr__",
                                 "setattr", "delattr", "getattr", "modules", "builtins",
                                 "_getframe", "f_globals", "f_locals", "gi_frame", "cr_frame",
-                                "tb_frame", "exec", "eval", "compile", "__import__"})):
+                                "tb_frame", "exec", "eval", "compile", "__import__"})
+              and node not in reviewed_evidence_attributes):
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.ImportFrom)
               and (node.module or "").split(".", 1)[0] in {"__main__", "builtins", "importlib"}):
@@ -4265,6 +4868,14 @@ COUNTER_CATEGORIES = (
         fail(f"client fault left processes in the fixed unit cgroup: {mode}")
     assert_client_lock_reusable()
 ''', "containment causal client failure residue/lock assertions changed")
+    require_exact_function(tree, "assert_cancelled_result", '''def assert_cancelled_result(result, mode):
+    assert_client_failure(result, mode, "signal-cleanup")
+    parsed, shape = client_stderr_evidence(result.stderr)
+    if (not shape["shape"] or parsed is None or parsed["primary"] != "cancelled"
+            or parsed["return"] != 1 or parsed["stdout"] != 0
+            or parsed["success"] != 0):
+        fail(f"client signal result did not report one machine primary cancellation: {mode}")
+''', "containment signal checks must require one canonical machine cancellation result")
     require_exact_function(tree, "fast_recovery", '''def fast_recovery(client, repo, commit, go_binary, context, phase):
     recovered = run(phase, ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                      "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -4425,18 +5036,35 @@ COUNTER_CATEGORIES = (
         'for boundary in ("show", "kill", "stop", "wait", "reset", "unload"):',
         'f"intercepted {boundary} command before attempt" not in faulted.stderr',
         'mode = "client-cleanup-persistent-" + boundary',
-        'signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)',
-        'assert_launch_signature_counterexamples(observed, repo, commit, go_binary, mode)',
-        'show("persistent-cleanup", "LoadState") if signature is None',
+        'signature = persistent_launch_signature(\n                early_observed, repo, commit, go_binary, mode)',
+        'assert_launch_signature_counterexamples(\n                early_observed, repo, commit, go_binary, mode)',
+        'launch_barrier_baseline = persistent_launch_barriers("persistent-cleanup")',
+        'nonce = wait_persistent_launch_required(\n'
+        '                "persistent-cleanup", launch_barrier_baseline, timeout=10)',
+        'wait_validated_marker("persistent-cleanup", launch_ready, nonce, timeout=10)',
+        'if early_observed.get("LoadState") != "loaded":',
+        'if early_observed.get("Environment") != f"{NONCE_VARIABLE}={nonce}":',
+        'assert_transaction_lock_held()',
+        'release("persistent-cleanup", "launch-" + nonce)',
+        'if launch_release:\n'
+        '                    release("persistent-cleanup", "launch-" + nonce)',
+        'release_ok = validated_payload_marker(\n'
+        '                    "persistent-cleanup", handoff_release, b"release\\n", "release")',
+        'if not launch_identity_matches(observed, signature):',
+        'show("persistent-cleanup", "LoadState", "ControlGroup")\n'
+        '                          if signature is None',
         'signed_launch_state(signature, "persistent-cleanup")',
         'cleanup_signed_launch_if_owned(\n                lock_held, signature, after_exit, "persistent-cleanup", cleanup_signed_launch)',
         'PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"',
         'PERSISTENT_ACTION_ERROR = " command remains unavailable:"',
         'DIAGNOSTIC_TEXT_LIMIT = 512',
         'assert_persistent_failure_contract()',
+        'assert_machine_result_contract()',
+        'assert_persistent_cgroup_routing_contract()',
         'assert_cleanup_deadline_contract()',
         'assert_launch_identity_contract()',
-        'observed = show_identity_until("persistent-cleanup", time.monotonic() + 10)',
+        'observed = show_identity_until(\n'
+        '                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")',
         'show_identity_until(phase, deadline, "ActiveState", "ControlGroup")',
         'structured_command_identity(*results)',
         'launch_identity_matches(state, signature)',
@@ -4448,13 +5076,21 @@ COUNTER_CATEGORIES = (
         '"stale-cleanup", cleanup_deadline, "ActiveState", "ControlGroup")',
         'stale_action_error = stale_action_error or bounded_sanitized_repr(error)',
         'and stale_identity_error is None and stale_action_error is None',
-        'classification = persistent_failure_classification(faulted.stdout, faulted.stderr)',
-        'persistent_failure_diagnostics(',
+        'parsed_result, stderr_shape = client_stderr_evidence(faulted.stderr)',
+        'expected_result = expected_persistent_result(case_label, boundary)',
+        'predicates = evaluate_persistent_result(',
+        'if not all(predicates.values()):',
+        'persistent_scalar_diagnostic(',
+        'post_cleanup_cgroup, recorded_cgroup_scanned, canonical_cgroup_scanned = persistent_cgroup_finality(',
+        'recorded_cgroup_category, True, bool(recorded_cgroup),',
+        'recorded_empty = not post_cleanup_cgroup["recorded"]',
+        'canonical_empty = not post_cleanup_cgroup["canonical"]',
         'for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),',
         '("hup", signal.SIGHUP), ("quit", signal.SIGQUIT)):',
+        'for lifecycle in ("startup", "work"):',
         'mode = f"client-signal-{signal_name}-{boundary}"',
         'os_call("signal-cleanup", "kill", "process", os.kill, cancelled.pid, signum)',
-        '"cancelled by signal" not in cancelled_stderr',
+        'assert_cancelled_result(result, mode)',
         'if result.returncode == 0 or SUCCESS in result.stdout:',
         'state.get("LoadState") != "not-found"',
         'cgroup_pids("/system.slice/" + UNIT, phase)',
@@ -4648,7 +5284,9 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
                     "096540731117a03c72bef00ab0ba0a4ad3668e9f27e631637468b1f8f8872658",
                      "f621abbcb669f1170e20ecda304ea37810013d467abdbeee123c5766c6a1295b",
                      "f373dac7efd8e4c82403c9b1fd0c9bd8bd6e3129c77514bda5948e008941999e",
-                     "20c79e55ce002919f44642434a25b8e1eb9e20242cc36feb10b31b4478e8a7fc"},
+                     "20c79e55ce002919f44642434a25b8e1eb9e20242cc36feb10b31b4478e8a7fc",
+                     "ed953f486022b3e0e0075c8ff3548ac7bd39825c2749578f27bf2755afe3b425",
+                     "f0f75e2264dc66be2bbbea5884142d36580fd976878e6c44edd3b57aa4a83353"},
             "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
 
     persistent_loops = []
@@ -4771,35 +5409,58 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
     persistent_source = (ast.get_source_segment(source, persistent_loops[0])
                          if len(persistent_loops) == 1 else "") or ""
     persistent_cleanup_first_contract = (
+        'for boundary, evidence_case in persistent_cases:',
+        'case_label = evidence_case',
         'lifecycle_error = ""',
+        'launch_barrier_baseline = persistent_launch_barriers("persistent-cleanup")',
+        'nonce = wait_persistent_launch_required(',
+        'wait_validated_marker("persistent-cleanup", launch_ready, nonce, timeout=10)',
+        'early_observed = show_identity_until(',
+        'persistent launch barrier did not retain a loaded service',
+        'validated launch barrier did not match loaded immutable unit identity',
+        'signature = persistent_launch_signature(\n                early_observed, repo, commit, go_binary, mode)',
+        'persistent launch barrier had no live service cgroup process',
+        'assert_transaction_lock_held()',
+        'release("persistent-cleanup", "launch-" + nonce)',
         'wait_counter("persistent-cleanup", intercepted, expected_interceptions, timeout=30)',
         'observed_interceptions = counter("persistent-cleanup", intercepted)',
         'wait_path("persistent-cleanup", handoff_ready, timeout=30)',
         'fail("persistent client exited before its attested handoff")',
-        'signature = persistent_launch_signature(observed, repo, commit, go_binary, mode)',
+        'if not launch_identity_matches(observed, signature):',
         'requires_live = persistent_supervisor_mode(mode) == "fast-hold"',
-        'if wait_fault != "normal" and not requires_live:',
-        'handoff_pids = cgroup_pids(',
+        'if evidence_case != "normal" and not requires_live:',
+        'handoff_pids = (cgroup_pids(recorded_cgroup, "persistent-cleanup")',
         'if requires_live and not handoff_pids:',
         'if not requires_live and handoff_pids:',
         'assert_client_lock_held()', 'malformed, b"01\\n"',
         'wait_counter("persistent-cleanup", intercepted, COUNTER_MAX, timeout=0)',
         'except BaseException as error:\n            lifecycle_error = retained_diagnostic(',
-        'finally:\n            try:\n                if not path_exists(',
+        'if launch_release:\n                    release("persistent-cleanup", "launch-" + nonce)',
+        'retained_diagnostic(error, "persistent launch release failed")',
         'release("persistent-cleanup", mode + ".handoff")',
         'process_communicate(\n                    "persistent-cleanup", process, 60)',
         'process.terminate', 'process.kill', 'process_wait("persistent-cleanup", process, 10)',
         'if signature is None:', 'post-handoff ownership recovery failed',
-        'cleanup_signed_launch_if_owned(', 'post_cleanup_cgroup.extend(cgroup_pids(',
-        'recorded_cgroup = (observed.get("ControlGroup", "")',
-        'observed_interceptions,', 'persistent cleanup retained a fixture artifact',
-        'assert_client_lock_reusable()', 'persistent_result_violation(',
+        'cleanup_signed_launch_if_owned(',
+        'recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(',
+        'post_cleanup_cgroup, recorded_cgroup_scanned, canonical_cgroup_scanned = persistent_cgroup_finality(',
+        'lambda control_group: cgroup_pids(control_group, "persistent-cleanup")',
+        'observed_interceptions,', 'artifacts_absent = not any(',
+        'assert_client_lock_reusable()', 'client_stderr_evidence(faulted.stderr)',
+        'expected_persistent_result(case_label, boundary)',
+        'evaluate_persistent_result(', 'if not all(predicates.values()):',
+        'persistent_scalar_diagnostic(',
         'observed_attempts = counter("persistent-cleanup", attempted)',
-        'persistent_special_result_violation(\n                    faulted.returncode, faulted.stdout, faulted.stderr, wait_fault, boundary,',
+        'release_ok = validated_payload_marker(',
+        'reap_ok = process.poll() is not None',
     )
     require(len(persistent_loops) == 1
             and all(fragment in persistent_source
                     for fragment in persistent_cleanup_first_contract)
+            and persistent_source.index('wait_validated_marker("persistent-cleanup", launch_ready, nonce')
+                < persistent_source.index('early_observed = show_identity_until(')
+                < persistent_source.index('if early_observed.get("LoadState") != "loaded":')
+                < persistent_source.index('signature = persistent_launch_signature(')
             and "expected_category" not in persistent_source
             and "expected_lifecycle_error not in fault_stderr" not in persistent_source,
             "containment persistent fault handoff/exit/lock/owned cleanup sequence changed")
@@ -4812,6 +5473,8 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
         '("show", "kill", "stop", "wait", "reset", "unload")', mode="eval").body)
     expected_signal_boundaries = ast.dump(ast.parse(
         '("kill", "stop", "wait", "reset", "unload")', mode="eval").body)
+    expected_signal_lifecycles = ast.dump(ast.parse(
+        '("startup", "work")', mode="eval").body)
     expected_persistent_cases = ast.dump(ast.parse("persistent_cases", mode="eval").body)
     expected_signals = ast.dump(ast.parse(
         '(("int", signal.SIGINT), ("term", signal.SIGTERM), ("hup", signal.SIGHUP), ("quit", signal.SIGQUIT))',
@@ -4820,14 +5483,16 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
             and loop_pairs.count(expected_boundaries) == 2
             and loop_pairs.count(expected_persistent_cases) == 1
             and loop_pairs.count(expected_signal_boundaries) == 2
+            and loop_pairs.count(expected_signal_lifecycles) == 1
             and loop_pairs.count(expected_signals) == 1,
             "containment causal matrix must execute nine client faults and transient/persistent cleanup hooks")
     call_names = [
         node.func.id for node in ast.walk(main_node)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     ]
-    require(call_names.count("assert_client_failure") == 5
-            and call_names.count("fast_recovery") == 6,
+    require(call_names.count("assert_client_failure") == 4
+            and call_names.count("assert_cancelled_result") == 2
+            and call_names.count("fast_recovery") == 7,
             "containment causal fault families must each assert failure and fast recovery")
     race_fragments = (
         'go_binary, "client-terminal-race-a"),',
@@ -5306,7 +5971,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "4eddab0b1bc3d52a3e7a0d3a16671ecc0cc1a388e8de8023b084eb47278b88cf",
+            == "428fb04c043001406146c627026247ff90bf3ac3fffac36a21a9698572546518",
             "diagnostic fixture source snapshot changed")
 
 
@@ -5378,6 +6043,33 @@ def verify_supervisor_mutations(
         ("run_phase changed descriptors", replace_once(supervisor, "process = subprocess.Popen(argv, cwd=\"/\", env=env, pass_fds=pass_fds,", "process = subprocess.Popen(argv, cwd=\"/\", env=env, pass_fds=(),"), "run_phase process/session/wait"),
         ("run_phase invocation environment", replace_once(supervisor, "                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))", "                          env=clean_env(), pass_fds=(phase_fd, *phase_inputs.values()))"), "run_phase invocation"),
         ("run_phase invocation descriptors", replace_once(supervisor, "                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))", "                          env=phase_env, pass_fds=(phase_fd,))"), "run_phase invocation"),
+        ("launch barrier cleanup omitted", replace_once(
+            supervisor, '        if "lock_keeper" in locals():\n',
+            '        if False:\n'),
+         "live launch barrier contract"),
+        ("launch marker treated as optional existence hint", replace_once(
+            supervisor, '        if launch_required is not None:\n'
+            '            validate_launch_required(launch_required, nonce)',
+            '        if launch_required is not None and os.path.exists(launch_required):\n'
+            '            pass'),
+         "live launch barrier contract"),
+        ("launch marker nonce path binding omitted", replace_once(
+            supervisor, '    if path != expected_path:', '    if False:'),
+         "persistent launch marker validation"),
+        ("launch marker symlink protection omitted", replace_once(
+            supervisor, 'os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW',
+            'os.O_RDONLY | os.O_NONBLOCK'),
+         "persistent launch marker validation"),
+        ("launch marker content binding omitted", replace_once(
+            supervisor, '                or before.st_size != len(expected_payload) or payload != expected_payload):',
+            '                or False):'),
+         "persistent launch marker validation"),
+        ("release marker reduced to existence", replace_once(
+            supervisor,
+            '            while not validate_launch_marker(\n'
+            '                    launch_barrier + ".release", nonce, ".release", absent_ok=True):',
+            '            while not os.path.exists(launch_barrier + ".release"):'),
+         "live launch barrier contract"),
         ("duplicate run_phase execution", replace_once(supervisor, '                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))', '                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))\n                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))'), "run_phase invocation"),
         ("lock metadata gap", replace_once(supervisor, "or lock_stat.st_gid != 0 or lock_stat.st_nlink != 1", "or lock_stat.st_gid != 0"), "lock/snapshot/traversal/signal cleanup"),
         ("non-atomic snapshot", replace_once(supervisor, "        os.rename(snapshot_build, snapshot)", "        shutil.copytree(snapshot_build, snapshot)"), "lock/snapshot/traversal/signal cleanup"),
@@ -5478,58 +6170,75 @@ def verify_supervisor_mutations(
             '                     f"cleanup_roles_failed={journal_evidence[2]}")',
             '                     "cleanup_roles_failed=False")')),
         ("raw journal written to stdout", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    sys.stdout.write(journal_evidence)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    sys.stdout.write(journal_evidence)\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw journal written to numeric stdout", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    os.write(1, journal_evidence.encode("ascii"))\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    os.write(1, journal_evidence.encode("ascii"))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr written to computed stdout", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    os.write(1 + 0, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    os.write(1 + 0, launched.stderr.encode())\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr written through descriptor alias", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    output_fd = 2\n    os.write(output_fd, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    output_fd = 2\n    os.write(output_fd, launched.stderr.encode())\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("subprocess stderr written to numeric stderr", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    os.write(2, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    os.write(2, launched.stderr.encode())\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv written to special stderr path", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    open("/dev/stderr", "w").write(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    open("/dev/stderr", "w").write(repr(service_argv))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv written to keyword stderr path", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    open(file="/dev/stderr", mode="w").write(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    open(file="/dev/stderr", mode="w").write(repr(service_argv))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by inherited subprocess", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    subprocess.run(("/bin/echo", repr(service_argv)))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    subprocess.run(("/bin/echo", repr(service_argv)))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by aliased print", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    emit = print\n    emit(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    emit = print\n    emit(repr(service_argv))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr emitted by aliased os write", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    emit = os.write\n    emit(2, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    emit = os.write\n    emit(2, launched.stderr.encode())\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by aliased open", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    emit = open\n    emit("/dev/stderr", "w").write(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    emit = open\n    emit("/dev/stderr", "w").write(repr(service_argv))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by aliased subprocess", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    runner = subprocess.run\n    runner(("/bin/echo", repr(service_argv)))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    runner = subprocess.run\n    runner(("/bin/echo", repr(service_argv)))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by os spawn", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    os.spawnv(os.P_WAIT, "/bin/echo", ("echo", repr(service_argv)))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    os.spawnv(os.P_WAIT, "/bin/echo", ("echo", repr(service_argv)))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr emitted through os path module", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    os.path.os.write(2, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    os.path.os.write(2, launched.stderr.encode())\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv spawned through os path module", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    os.path.os.spawnv(os.P_WAIT, "/bin/echo", ("echo", repr(service_argv)))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    os.path.os.spawnv(os.P_WAIT, "/bin/echo", ("echo", repr(service_argv)))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr emitted through subprocess os", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    subprocess.os.write(2, launched.stderr.encode())\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    subprocess.os.write(2, launched.stderr.encode())\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted through subprocess sys", replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
-            '    subprocess.sys.stdout.write(repr(service_argv))\n    print(SUCCESS, flush=True)\n    return result')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    subprocess.sys.stdout.write(repr(service_argv))\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("success emitted before cleanup", replace_once(replace_once(client,
-            '    print(SUCCESS, flush=True)\n    return result',
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
             '    return result'),
             '            result = 0\n        except BaseException as error:',
             '            print(SUCCESS, flush=True)\n            result = 0\n        except BaseException as error:')),
@@ -5558,14 +6267,15 @@ def verify_supervisor_mutations(
             '                                f"{sanitized_state(discovered)}"))',
             '                                f"{discovered}"))')),
         ("cleanup exposes exception strings", replace_once(client,
-            '        errors = []\n'
             '        for error in cleanup_errors:\n'
             '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
             '        detail = sanitized_diagnostic("; ".join(errors), nonce)',
+            '        for error in cleanup_errors:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
             '        detail = "; ".join(map(str, cleanup_errors))')),
-        ("client top fallback unsanitized", replace_once(client,
-            '        print("verification-client: " + top_level_diagnostic(error), file=sys.stderr)',
-            '        print(f"verification-client: {error}", file=sys.stderr)')),
+        ("client top fallback unsanitized", client.replace(
+            '                   + top_level_diagnostic(failure) + "\\n").encode("ascii")',
+            '                   + str(failure) + "\\n").encode("ascii")')),
         ("client OS diagnostic uses raw error", replace_once(client,
             '    return EvidenceFailure(\n        f"phase={phase} operation={operation} resource={resource_class} errno={number}")',
             '    return RuntimeError(str(error))')),
@@ -5700,11 +6410,16 @@ def verify_supervisor_mutations(
             '    return tuple(dict.fromkeys((*RECORDED_CGROUP, CANONICAL_CGROUP)))',
             '    return tuple(dict.fromkeys((*RECORDED_CGROUP[-1:], CANONICAL_CGROUP)))')),
         ("client cgroup observation raises early", replace_once(client,
-            '            append_unique_diagnostic(errors, str(diagnostic))\n            continue',
+            '            if str(diagnostic) not in tuple(map(str, errors)):\n'
+            '                errors.append(diagnostic)\n'
+            '            continue',
             '            raise diagnostic')),
         ("client cgroup observation returns early", replace_once(client,
-            '            append_unique_diagnostic(errors, str(diagnostic))\n            continue',
-            '            append_unique_diagnostic(errors, str(diagnostic))\n'
+            '            if str(diagnostic) not in tuple(map(str, errors)):\n'
+            '                errors.append(diagnostic)\n'
+            '            continue',
+            '            if str(diagnostic) not in tuple(map(str, errors)):\n'
+            '                errors.append(diagnostic)\n'
             '            return residue, tuple(errors)')),
         ("client cgroup scan short-circuits after residue", replace_once(client,
             '        if pids:\n            residue[control_group] = pids',
@@ -5722,8 +6437,20 @@ def verify_supervisor_mutations(
             '    return evidence_failure(phase, "unknown", "cgroup", OSError(errno.EIO, "observation failed"))',
             '    return RuntimeError(str(error))')),
         ("client cgroup observation outranks residue", replace_once(client,
-            '    failures = ([CGROUP_RESIDUE_FAILURE] if residue else []) + list(errors)',
-            '    failures = list(errors) + ([CGROUP_RESIDUE_FAILURE] if residue else [])')),
+            '    failures = ([str(residue_error)] if residue_error is not None else []) + list(map(str, errors))',
+            '    failures = list(map(str, errors)) + ([str(residue_error)] if residue_error is not None else [])')),
+        ("client cgroup aggregate identity flattened", replace_once(client,
+            '        raise CgroupFailure(\n'
+            '            sanitized_diagnostic("; ".join(failures), None), residue_error, errors)',
+            '        fail(sanitized_diagnostic("; ".join(failures), None))')),
+        ("client simultaneous cgroup evidence made exclusive", replace_once(client,
+            '    if error.observation_errors:\n'
+            '        cleanup_result("cgroup-observation", boundary, error.observation_errors)',
+            '    elif error.observation_errors:\n'
+            '        cleanup_result("cgroup-observation", boundary, error.observation_errors)')),
+        ("client unmapped cgroup failure mislabeled", replace_once(client,
+            '        cleanup_result("unexpected", boundary, (error,))',
+            '        cleanup_result("cgroup-observation", boundary, (error,))')),
         ("client cgroup observation prevents known-residue kill", replace_once(client,
             '        if occupants and not kill_sent:',
             '        if occupants and not observation_errors and not kill_sent:')),
@@ -5735,10 +6462,12 @@ def verify_supervisor_mutations(
             '    if not diagnostics:\n        diagnostics.append(diagnostic)')),
         ("client final cgroup diagnostic raw append", replace_once(client,
             '        except BaseException as error:\n'
-            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
+            '            record_cgroup_failure(error, "unload")\n'
+            '            errors.append(error)\n'
             '    if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:',
             '        except BaseException as error:\n'
-            '            errors.append(error)\n'
+            '            cleanup_result("cgroup-observation", "unload", (error,))\n'
+            '            errors.append(sanitized_diagnostic(error, nonce))\n'
             '    if COMMAND_DEADLINE is not None and time.monotonic() >= COMMAND_DEADLINE:')),
         ("client counter metadata anchor omitted", replace_once(client,
             'anchor = os.open(counter_name, os.O_PATH | os.O_NOFOLLOW, dir_fd=directory)',
@@ -6178,8 +6907,8 @@ def verify_supervisor_mutations(
             '            COMMAND_DEADLINE = cleanup_deadline\n            CLEANUP_ACTIVE = True\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
             '            COMMAND_DEADLINE = cleanup_deadline\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n            CLEANUP_ACTIVE = True')),
         ("work deadline not restored after teardown", replace_once(client,
-            '            COMMAND_DEADLINE = work_deadline\n            if CANCELLED:',
-            '            COMMAND_DEADLINE = total_deadline\n            if CANCELLED:')),
+            '            COMMAND_DEADLINE = work_deadline\n            cancellation = cancellation_exception()',
+            '            COMMAND_DEADLINE = total_deadline\n            cancellation = cancellation_exception()')),
         ("subprocess ignores absolute budget", replace_once(client,
             '        timeout = min(timeout, remaining)', '        timeout = timeout')),
         ("prelaunch loaded unit accepted", replace_once(client,
@@ -6300,50 +7029,145 @@ def verify_supervisor_mutations(
         ("successful cgroup unchecked", replace_once(client,
             '            assert_fixed_cgroups_empty("work")',
             '            pass')),
+        ("client machine result emission bypassed", replace_once(client,
+            '    os.write(descriptor, payload)',
+            '    pass')),
+        ("terminal emission mask removed", replace_once(client,
+            '    signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n'
+            '    failure = None',
+            '    failure = None')),
+        ("terminal pending cancellation check removed", replace_once(client,
+            '    pending = signal.sigpending() & CANCELLATION_SIGNALS',
+            '    pending = set()')),
+        ("terminal latch recheck removed", replace_once(client,
+            '    cancellation = cancellation_exception()\n'
+            '    return cancellation or (CancellationFailure(min(pending)) if pending else None)',
+            '    return CancellationFailure(min(pending)) if pending else None')),
+        ("terminal cancellation replacement removed", replace_once(client,
+            '    if cancellation is not None:\n'
+            '        failure = ClientResultFailure(\n'
+            '            render_client_result(cancellation), sanitized_diagnostic(cancellation, nonce))',
+            '    if cancellation is not None:\n        pass')),
+        ("terminal low-level write duplicated", replace_once(client,
+            '    os.write(descriptor, payload)\n    return status',
+            '    os.write(descriptor, payload)\n    os.write(descriptor, payload)\n    return status')),
+        ("terminal output uses buffered print", replace_once(client,
+            '    os.write(descriptor, payload)',
+            '    print(payload.decode("ascii"), end="")')),
+        ("terminal mask unblocked before write", replace_once(client,
+            '    os.write(descriptor, payload)',
+            '    signal.pthread_sigmask(signal.SIG_UNBLOCK, CANCELLATION_SIGNALS)\n'
+            '    os.write(descriptor, payload)')),
+        ("client result return hardcoded zero", replace_once(client,
+            '        "return=1;stdout=0;success=0"',
+            '        "return=0;stdout=0;success=0"')),
+        ("client result byte bound removed", replace_once(client,
+            '    if len(encoded) > RESULT_BYTE_LIMIT or "\\n" in line or "\\r" in line:',
+            '    if "\\n" in line or "\\r" in line:')),
+        ("client result category substituted unknown", replace_once(client,
+            '    "wait-timeout", "unload-timeout", "cgroup-residue", "cgroup-observation", "deadline",',
+            '    "wait-timeout", "unload-timeout", "cgroup-residue", "unknown-cleanup", "deadline",')),
+        ("release payload binding omitted", replace_once(client,
+            '                or marker_identity(current, resource_class) != identity\n'
+            '                or before.st_size != len(expected_payload) or payload != expected_payload):',
+            '                or marker_identity(current, resource_class) != identity\n'
+            '                or False):')),
+        ("release partial write completion omitted", replace_once(client,
+            '        written = 0\n'
+            '        while written < len(payload):\n'
+            '            count = os_call(phase, "write", "marker", os.write, descriptor, payload[written:])\n'
+            '            if count <= 0 or count > len(payload) - written:\n'
+            '                fail("short write while publishing marker")\n'
+            '            written += count',
+            '        os_call(phase, "write", "marker", os.write, descriptor, payload)')),
+        ("wait deadline causal classification omitted", replace_once(client,
+            '            cleanup_result("cgroup-residue" if occupants else "wait-timeout",\n'
+            '                           "wait", (wait_error,))',
+            '            pass')),
+        ("client result primary relabeled", replace_once(client,
+            '    return error.category if isinstance(error, PrimaryFailure) else "unexpected"',
+            '    return "verification"')),
+        ("cancellation detection downgraded to RuntimeError", replace_once(client,
+            '    return CancellationFailure(CANCELLED[0]) if CANCELLED else None',
+            '    return RuntimeError(f"verification client cancelled by signal {CANCELLED[0]}") if CANCELLED else None')),
+        ("cancellation wrapped as verification", replace_once(client,
+            '    if cancellation is not None:\n        return cancellation\n    if isinstance(error, PrimaryFailure):',
+            '    if cancellation is not None:\n        return PrimaryFailure("verification", str(cancellation))\n    if isinstance(error, PrimaryFailure):')),
+        ("client result boundary hardcoded", replace_once(client,
+            '        CLEANUP_BOUNDARIES.index(event[0]), CLEANUP_CATEGORIES.index(event[1]),',
+            '        CLEANUP_BOUNDARIES.index("show"), CLEANUP_CATEGORIES.index(event[1]),')),
+        ("client result counters looked up at render time", replace_once(client,
+            '        f"{boundary}.{category}.{retries}.{interceptions}.{attempts}"',
+            '        f"{boundary}.{category}.{RETRIES.get(boundary, 0)}."'
+            'f"{INTERCEPTIONS.get(boundary, 0)}.{ATTEMPTS.get(boundary, 0)}"')),
+        ("client primary cgroup evidence recording omitted", replace_once(client,
+            '    if isinstance(error, CgroupFailure):\n'
+            '        record_cgroup_failure(error, boundary)',
+            '    if isinstance(error, CgroupFailure):\n        pass')),
+        ("client recovered property recording cleanup-only", replace_once(client,
+            '                cleanup_result("property-recovered", result_boundary, errors)',
+            '                if CLEANUP_ACTIVE:\n'
+            '                    cleanup_result("property-recovered", result_boundary, errors)')),
+        ("client recovered cleanup error identities omitted", replace_once(client,
+            '                cleanup_result("property-recovered", result_boundary, errors)',
+            '                cleanup_result("property-recovered", result_boundary)')),
+        ("client mixed unknown cleanup detection omitted", replace_once(client,
+            '        if not cleanup_error_mapped(error):',
+            '        if False and not cleanup_error_mapped(error):')),
+        ("client mixed unknown hidden by final cgroup residue", replace_once(client,
+            '        if not cleanup_error_mapped(error):',
+            '        if final_error is None and not cleanup_error_mapped(error):')),
+        ("client aggregate launders unknown constituent", replace_once(client,
+            '    if isinstance(error, CleanupFailure) and error.constituents:\n'
+            '        return all(cleanup_error_mapped(constituent) for constituent in error.constituents)',
+            '    if isinstance(error, CleanupFailure) and error.constituents:\n'
+            '        return True')),
+        ("client owned-state property route omitted", replace_once(client,
+            '        "recovery": "show", "owned-state": "show", "wait": "wait", "unload": "unload",',
+            '        "recovery": "show", "wait": "wait", "unload": "unload",')),
         ("final-close fixed cgroups unchecked", replace_once(client,
             '        assert_fixed_cgroups_empty("final-close")',
             '        pass')),
+        ("post-final-scan cancellation check omitted", replace_once(client,
+            '    primary_error = cancellation_exception() or primary_error\n'
+            '    for error in cleanup_errors:',
+            '    for error in cleanup_errors:')),
         ("final cgroup evidence error discarded", replace_once(client,
-            'def resolve_outcome(primary_error, cleanup_errors, nonce):\n'
-            '    try:\n        assert_fixed_cgroups_empty("final-close")\n'
-            '    except BaseException as final_error:\n        errors = []\n'
-            '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))\n'
-            '        if primary_error is not None:\n'
-            '            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))\n'
-            '        for error in cleanup_errors:\n'
-            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
-            '        detail = "; ".join(errors)\n'
-            '        raise RuntimeError(sanitized_diagnostic(detail, nonce)) from None',
-            'def resolve_outcome(primary_error, cleanup_errors, nonce):\n'
-            '    try:\n        assert_fixed_cgroups_empty("final-close")\n'
-            '    except BaseException:\n        pass')),
+            '        if final_error is not None:\n            result_failure(primary_error, detail)',
+            '        if final_error is not None:\n            return')),
+        ("final cgroup result emitted before cleanup classification", replace_once(client,
+            '    for error in cleanup_errors:\n        if not cleanup_error_mapped(error):',
+            '    if final_error is not None:\n'
+            '        result_failure(primary_error, sanitized_diagnostic(final_error, nonce))\n'
+            '    for error in cleanup_errors:\n        if not cleanup_error_mapped(error):')),
         ("final cgroup evidence omitted from aggregate", replace_once(client,
             '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))',
             '        pass')),
         ("final cgroup evidence appended after prior errors", replace_once(client,
-            '        errors = []\n'
-            '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))\n'
-            '        if primary_error is not None:\n'
-            '            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))\n'
+            '        if final_error is not None:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))\n'
+            '            if primary_error is not None:\n'
+            '                append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))\n'
             '        for error in cleanup_errors:\n'
             '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))',
-            '        errors = []\n'
             '        if primary_error is not None:\n'
             '            append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))\n'
             '        for error in cleanup_errors:\n'
             '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
-            '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))')),
+            '        if final_error is not None:\n'
+            '            append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))')),
         ("final cgroup residue exposes paths and PIDs", replace_once(client,
-            '        fail(sanitized_diagnostic("; ".join(failures), None))',
+            '        raise CgroupFailure(\n'
+            '            sanitized_diagnostic("; ".join(failures), None), residue_error, errors)',
             '        fail(f"fixed unit control groups are not empty: {residue}")')),
         ("primary error raised before final cgroup evidence", replace_once(client,
-            'def resolve_outcome(primary_error, cleanup_errors, nonce):\n    try:',
-            'def resolve_outcome(primary_error, cleanup_errors, nonce):\n'
-            '    if primary_error is not None:\n        raise primary_error\n    try:')),
+            '    final_error = None\n    try:',
+            '    if primary_error is not None:\n        raise primary_error\n'
+            '    final_error = None\n    try:')),
         ("cleanup error raised before final cgroup evidence", replace_once(client,
-            'def resolve_outcome(primary_error, cleanup_errors, nonce):\n    try:',
-            'def resolve_outcome(primary_error, cleanup_errors, nonce):\n'
-            '    if cleanup_errors:\n        raise cleanup_errors[0]\n    try:')),
+            '    final_error = None\n    try:',
+            '    if cleanup_errors:\n        raise cleanup_errors[0]\n'
+            '    final_error = None\n    try:')),
         ("owned kill omitted", replace_once(client,
             '                retry_owned_command(invocation, nonce, service_command,\n                                    "kill", "kill", "--kill-whom=all", "--signal=KILL")',
             '                pass')),
@@ -6355,10 +7179,17 @@ def verify_supervisor_mutations(
             '            if not occupants:\n                break',
             '            if not occupants:\n                return')),
         ("teardown early not-found cgroups unchecked", replace_once(client,
-            '    if state.get("LoadState") == "not-found":\n        assert_fixed_cgroups_empty("teardown")\n        return\n    kill_sent = False',
+            '    if state.get("LoadState") == "not-found":\n'
+            '        try:\n            assert_fixed_cgroups_empty("teardown")\n'
+            '        except BaseException as error:\n            record_cgroup_failure(error, "show")\n            raise\n'
+            '        return\n    kill_sent = False',
             '    if state.get("LoadState") == "not-found":\n        return\n    kill_sent = False')),
         ("unload not-found cgroups unchecked", replace_once(client,
-            '        if state.get("LoadState") == "not-found":\n            assert_fixed_cgroups_empty("unload")\n            return',
+            '        if state.get("LoadState") == "not-found":\n'
+            '            try:\n                assert_fixed_cgroups_empty("unload")\n'
+            '            except BaseException as error:\n'
+            '                record_cgroup_failure(error, "unload")\n                raise\n'
+            '            return',
             '        if state.get("LoadState") == "not-found":\n            return')),
         ("ownership mismatch accepted", replace_once(client, '    if state.get("InvocationID") != invocation:', '    if state.get("InvocationID") == invocation:')),
         ("launch ownership accepted", replace_once(client,
@@ -6372,11 +7203,20 @@ def verify_supervisor_mutations(
         ("client lock released before launch", replace_once(client,
             '        publish_supervisor(repo, commit)\n',
             '        publish_supervisor(repo, commit)\n        close_client_lock(client_lock)\n')),
+        ("persistent client launch barrier declaration omitted", replace_once(client,
+            '        if requested_mode.startswith("client-cleanup-persistent-"):\n'
+            '            launch_barrier_required = True\n'
+            '            durable_marker("launch", launch_barrier + ".required",\n'
+            '                           (nonce + "\\n").encode("ascii"))',
+            '        if False:\n            pass')),
+        ("persistent client launch protocol argument omitted", replace_once(client,
+            '                                  if launch_barrier_required else ()))',
+            '                                  if False else ()))')),
         ("launch outside cleanup try", replace_once(
             replace_once(client, '                launched = command(service_argv, "launch", check=False)',
-                         '                launched = launched'),
-            '        result = 1\n        try:',
-            '        result = 1\n        launched = command(service_argv, "launch", check=False)\n        try:')),
+                          '                launched = launched'),
+            '        invocation = None\n        try:',
+            '        invocation = None\n        launched = command(service_argv, "launch", check=False)\n        try:')),
         ("signals not blocked", client.replace('signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)', 'signal.pthread_sigmask(signal.SIG_UNBLOCK, CANCELLATION_SIGNALS)')),
         ("signal mask not restored", client.replace('signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)', 'signal.pthread_sigmask(signal.SIG_UNBLOCK, previous_mask)')),
         ("QUIT cancellation omitted", replace_once(client, 'signal.SIGHUP, signal.SIGQUIT}', 'signal.SIGHUP}')),
@@ -6428,14 +7268,8 @@ def verify_supervisor_mutations(
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException as error:\n                        cleanup_errors.append(error)',
             '                        teardown_owned(invocation, nonce, exec_argv)\n                    except BaseException:\n                        pass')),
         ("teardown aggregation bypassed", replace_once(client,
-            '    if cleanup_errors:\n        errors = []\n'
-            '        for error in cleanup_errors:\n'
-            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
-            '        detail = sanitized_diagnostic("; ".join(errors), nonce)',
-            '    if False:\n        errors = []\n'
-            '        for error in cleanup_errors:\n'
-            '            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))\n'
-            '        detail = sanitized_diagnostic("; ".join(errors), nonce)')),
+            '    if final_error is not None or cleanup_errors:\n        errors = []',
+            '    if final_error is not None:\n        errors = []')),
         ("recovered property errors discarded", replace_once(client,
             '            if RECOVERED_ERRORS:\n                cleanup_errors.extend(RECOVERED_ERRORS)',
             '            if RECOVERED_ERRORS:\n                pass')),
@@ -6451,9 +7285,9 @@ def verify_supervisor_mutations(
             '            acted = owned_command(invocation, nonce, service_command, action, *arguments)',
             '            acted = owned_command("", nonce, service_command, action, *arguments)')),
         ("raising statement between finally and resolution", replace_once(client,
-            '        resolve_outcome(primary_error, cleanup_errors, nonce)',
-            '        unit_properties("work", "LoadState")\n'
-            '        resolve_outcome(primary_error, cleanup_errors, nonce)')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            '    unit_properties("work", "LoadState")\n'
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("signal cancellation bypasses cleanup", replace_once(client, '    CANCELLED.append(signum)', '    os._exit(128 + signum)')),
         ("teardown signal block omitted", replace_once(client,
             '            CLEANUP_ACTIVE = True\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
@@ -6466,7 +7300,8 @@ def verify_supervisor_mutations(
             '                     timeout=ACTION_TIMEOUTS[arguments[0]])\n'
             '    command_path("teardown", "reset" if arguments[0] == "reset-failed" else arguments[0])')),
         ("cleanup aggregation omitted", replace_once(client,
-            '    if errors:\n        raise RuntimeError(\n            sanitized_diagnostic(\n                "; ".join(errors), nonce)) from None', '    pass')),
+            '    if state is None:\n        raise aggregate_cleanup_failure(errors, nonce) from None',
+            '    if state is None:\n        pass')),
         ("B attempting marker after flock", replace_once(client,
             '        if requested_mode == "client-terminal-race-b":\n'
             '            durable_marker("startup", "client-terminal-race-b.attempting")\n'
@@ -6535,7 +7370,7 @@ def verify_supervisor_mutations(
         "nonce argv spawned through os path module": "client output sinks",
         "raw stderr emitted through subprocess os": "client output sinks",
         "nonce argv emitted through subprocess sys": "client output sinks",
-        "success emitted before cleanup": "emit success only after client.lock",
+        "success emitted before cleanup": "client output sinks",
     }
     callable_binding_mutations = [
         ("reviewer reproduced terminal helper widening", replace_once(client,
@@ -6672,6 +7507,20 @@ def verify_supervisor_mutations(
         expect_rejected(lambda candidate: validate_client(candidate, enforce_snapshot=False),
                         mutation, label, journal_mutation_categories.get(label, "client"))
     containment_mutations = [
+        ("containment prepublished release skips validation", replace_once(containment,
+            '        except FileExistsError:\n'
+            '            os_call(phase, "close", "directory", os.close, directory)\n'
+            '            directory = None\n'
+            '            if not validated_payload_marker(phase, path, payload, "release"):\n'
+            '                fail("existing release disappeared during validation")\n'
+            '            return',
+            '        except FileExistsError:\n'
+            '            return')),
+        ("containment release nofollow omitted", replace_once(containment,
+            '            descriptor = os.open(name + ".release",\n'
+            '                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,',
+            '            descriptor = os.open(name + ".release",\n'
+            '                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,')),
         ("containment counter metadata anchor omitted", replace_once(containment,
             'anchor = os.open(path, os.O_PATH | os.O_NOFOLLOW)',
             'anchor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)')),
@@ -6853,15 +7702,32 @@ def verify_supervisor_mutations(
             '        returncode != 1 or stdout != "" or stderr != expected_stderr',
             '        returncode != 1 or SUCCESS in stdout or stderr != expected_stderr')),
         ("special persistent empty stderr accepted", replace_once(containment,
-            '            result_violation = bool(\n'
-            '                persistent_special_result_violation(\n'
-            '                    faulted.returncode, faulted.stdout, faulted.stderr, wait_fault, boundary,\n'
-            '                    observed_interceptions, observed_attempts)',
-            '            result_violation = bool(\n                False')),
+            '        "schema_shape": stderr_shape["shape"],',
+            '        "schema_shape": True,')),
         ("special persistent wrong-process category requirement", replace_once(containment,
-            '                or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup)',
-            '                or post_cleanup.get("LoadState") != "not-found" or post_cleanup_cgroup\n'
-            '                or expected_lifecycle_error not in fault_stderr)')),
+            '        "events_exact": schema.get("events") == expected_result["events"],',
+            '        "events_exact": True,')),
+        ("machine schema field order relaxed", replace_once(containment,
+            '        if not field_separator or name != expected_name or not value or name in values:',
+            '        if not field_separator or not value or name in values:')),
+        ("machine schema duplicate categories accepted", replace_once(containment,
+            '        if len(set(events)) != len(events) or events != canonical:',
+            '        if False or events != canonical:')),
+        ("machine schema reordered categories accepted", replace_once(containment,
+            '        if len(set(events)) != len(events) or events != canonical:',
+            '        if len(set(events)) != len(events) or False:')),
+        ("machine schema malformed retry accepted", replace_once(containment,
+            '                or (value != "0" and value.startswith("0"))):',
+            '                or False):')),
+        ("machine schema boundary ignored", replace_once(containment,
+            '        "events_exact": schema.get("events") == expected_result["events"],',
+            '        "events_exact": True,')),
+        ("machine stderr extra line accepted", replace_once(containment,
+            '        encoded and len(encoded) <= CLIENT_STDERR_BYTE_LIMIT and len(lines) == 2',
+            '        encoded and len(encoded) <= CLIENT_STDERR_BYTE_LIMIT and len(lines) >= 2')),
+        ("machine schema case inferred", replace_once(containment,
+            '        "case_exact": case == expected_case,',
+            '        "case_exact": True,')),
         ("persistent diagnostics become unbounded", replace_once(containment,
             'DIAGNOSTIC_TEXT_LIMIT = 512', 'DIAGNOSTIC_TEXT_LIMIT = 999999')),
         ("persistent diagnostics nonce redaction removed", replace_once(containment,
@@ -7074,24 +7940,24 @@ def verify_supervisor_mutations(
             '\n\ndef run(phase, argv, **kwargs):',
             '\n\nfrom os import *\n\n\ndef run(phase, argv, **kwargs):')),
         ("persistent zero exit asserted before cleanup", replace_once(containment,
-            '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
+            '                                               fault_stdout, fault_stderr)\n'
             '        cleanup_error = ""',
-            '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
+            '                                               fault_stdout, fault_stderr)\n'
             '        if faulted.returncode == 0:\n'
             '            fail("premature zero exit")\n'
             '        cleanup_error = ""')),
         ("persistent success marker asserted before cleanup", replace_once(containment,
-            '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
+            '                                               fault_stdout, fault_stderr)\n'
             '        cleanup_error = ""',
-            '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
-            '        if classification["success_in_stdout"]:\n'
+            '                                               fault_stdout, fault_stderr)\n'
+            '        if SUCCESS in faulted.stdout:\n'
             '            fail("premature success marker")\n'
             '        cleanup_error = ""')),
         ("persistent unrelated error asserted before cleanup", replace_once(containment,
-            '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
+            '                                               fault_stdout, fault_stderr)\n'
             '        cleanup_error = ""',
-            '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
-            '        if not classification["property_unknown"]:\n'
+            '                                               fault_stdout, fault_stderr)\n'
+            '        if PERSISTENT_PROPERTY_ERROR not in faulted.stderr:\n'
             '            fail("premature unrelated error")\n'
             '        cleanup_error = ""')),
         ("persistent signed cleanup lock gate removed", replace_once(containment,
@@ -7110,9 +7976,9 @@ def verify_supervisor_mutations(
             '                lock_held, signature, after_exit, "persistent-cleanup", cleanup_signed_launch)',
             '            signed_cleanup_ran = False')),
         ("persistent lock reuse asserted before cleanup", replace_once(containment,
-            '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
+            '                                               fault_stdout, fault_stderr)\n'
             '        cleanup_error = ""',
-            '        classification = persistent_failure_classification(faulted.stdout, faulted.stderr)\n'
+            '                                               fault_stdout, fault_stderr)\n'
             '        assert_client_lock_reusable()\n'
             '        cleanup_error = ""')),
         ("containment nonzero show treated as absent", replace_once(containment,
@@ -7329,8 +8195,9 @@ def verify_supervisor_mutations(
             '            if False:\n'
             '                fail("released stale fixed-unit did not reach failed state: "')),
         ("stale cleanup finally disabled", replace_once(containment,
-            '    finally:\n        if not path_exists("stale-cleanup", "release", stale_release):',
-            '    finally:\n        if False:')),
+            '            release("stale-cleanup", stale_signal_name)\n'
+            '            stale_release_seen = True',
+            '            stale_release_seen = True')),
         ("stale mismatched identity cleanup allowed", replace_once(containment,
             '            if stale_signature is None or not launch_identity_matches(partial, stale_signature):',
             '            if False:')),
@@ -7474,7 +8341,8 @@ def verify_supervisor_mutations(
             '        fail(f"client fault left processes in the fixed unit cgroup: {mode}")',
             '    if False:\n        pass')),
         ("fault lock reuse unchecked", replace_once(containment,
-            '    assert_client_lock_reusable()\n\n\ndef fast_recovery', '    pass\n\n\ndef fast_recovery')),
+            '    assert_client_lock_reusable()\n\n\ndef assert_cancelled_result',
+            '    pass\n\n\ndef assert_cancelled_result')),
         ("client lock reuse acquisition omitted", replace_once(containment,
             '        if not try_nonblocking_flock(descriptor, "transaction-lock", "lock"):\n'
             '            fail("client lock was not reusable after client exit")',
@@ -7645,6 +8513,29 @@ def verify_supervisor_mutations(
             '            return\n'
             '        if time.monotonic() >= deadline:\n'
             '            fail("persistent-fault signed launch did not unload")')),
+        ("persistent launch barrier wait omitted", replace_once(containment,
+            '            wait_validated_marker("persistent-cleanup", launch_ready, nonce, timeout=10)',
+            '            pass')),
+        ("persistent unit queried before ready", replace_once(containment,
+            '            wait_validated_marker("persistent-cleanup", launch_ready, nonce, timeout=10)\n'
+            '            early_observed = show_identity_until(\n'
+            '                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")',
+            '            early_observed = show_identity_until(\n'
+            '                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")\n'
+            '            wait_validated_marker("persistent-cleanup", launch_ready, nonce, timeout=10)')),
+        ("persistent not-found accepted after ready", replace_once(containment,
+            '            if early_observed.get("LoadState") != "loaded":\n'
+            '                fail("persistent launch barrier did not retain a loaded service")',
+            '            if False:\n'
+            '                fail("persistent launch barrier did not retain a loaded service")')),
+        ("persistent launch release omitted on failure", replace_once(containment,
+            '                if launch_release:',
+            '                if False:')),
+        ("persistent launch transaction lock unchecked", replace_once(containment,
+            '            assert_transaction_lock_held()', '            pass')),
+        ("persistent later invocation change accepted", replace_once(containment,
+            '            if not launch_identity_matches(observed, signature):',
+            '            if False:')),
         ("persistent handoff waits reordered", replace_once(containment,
             '            wait_counter("persistent-cleanup", intercepted, expected_interceptions, timeout=30)\n'
             '            observed_interceptions = counter("persistent-cleanup", intercepted)\n'
@@ -7660,17 +8551,79 @@ def verify_supervisor_mutations(
             '            wait_path("persistent-cleanup", handoff_ready, timeout=30)',
             '            if False:\n                wait_path("persistent-cleanup", handoff_ready, timeout=30)')),
         ("persistent handoff released before attestation", replace_once(containment,
-            '            observed = show_identity_until("persistent-cleanup", time.monotonic() + 10)',
+            '            observed = show_identity_until(\n'
+            '                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")',
             '            release("persistent-cleanup", mode + ".handoff")\n'
-            '            observed = show_identity_until("persistent-cleanup", time.monotonic() + 10)')),
+            '            observed = show_identity_until(\n'
+            '                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")')),
+        ("persistent handoff control group request omitted", replace_once(containment,
+            '            observed = show_identity_until(\n'
+            '                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")',
+            '            observed = show_identity_until(\n'
+            '                "persistent-cleanup", time.monotonic() + 10)')),
+        ("persistent recorded control group dropped", replace_once(containment,
+            '            recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(\n'
+            '                recorded_cgroup, early_observed)',
+            '            recorded_cgroup, recorded_cgroup_category = "", "unobserved"')),
+        ("persistent empty control group scanned", replace_once(containment,
+            '            handoff_pids = (cgroup_pids(recorded_cgroup, "persistent-cleanup")',
+            '            handoff_pids = (cgroup_pids("", "persistent-cleanup")')),
+        ("persistent recorded final scan skipped", replace_once(containment,
+            '    for name, path in (("recorded", recorded), ("canonical", "/system.slice/" + UNIT)):',
+            '    for name, path in (("canonical", "/system.slice/" + UNIT),):')),
+        ("persistent canonical final scan skipped", replace_once(containment,
+            '    for name, path in (("recorded", recorded), ("canonical", "/system.slice/" + UNIT)):',
+            '    for name, path in (("recorded", recorded),):')),
+        ("persistent final scan stops after reader error", replace_once(containment,
+            '        except BaseException as error:\n'
+            '            errors.append((name, error))',
+            '        except BaseException:\n'
+            '            raise')),
+        ("persistent recovered control group request omitted", replace_once(containment,
+            '                    "persistent-cleanup", time.monotonic() + 10, "ControlGroup")',
+            '                    "persistent-cleanup", time.monotonic() + 10)')),
+        ("persistent after-exit control group request omitted", replace_once(containment,
+            '            after_exit = (show("persistent-cleanup", "LoadState", "ControlGroup")',
+            '            after_exit = (show("persistent-cleanup", "LoadState")')),
+        ("persistent recorded path lost after exit", replace_once(containment,
+            '            recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(\n'
+            '                recorded_cgroup, after_exit)',
+            '            recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(\n'
+            '                "", after_exit)')),
+        ("persistent post-cleanup control group request omitted", replace_once(containment,
+            '            post_cleanup = show_identity_until("persistent-cleanup", time.monotonic() + 10,\n'
+            '                                               "ActiveState", "ControlGroup")',
+            '            post_cleanup = show_identity_until("persistent-cleanup", time.monotonic() + 10,\n'
+            '                                               "ActiveState")')),
         ("persistent handoff paths not reset", replace_once(containment,
-            '        reset_paths("persistent-cleanup", intercepted, attempted, handoff_ready, handoff_release)\n'
-            '        process = popen("persistent-cleanup",',
-            '        reset_paths("persistent-cleanup", intercepted, attempted)\n'
-            '        process = popen("persistent-cleanup",')),
+            '        reset_paths("persistent-cleanup", intercepted, attempted, handoff_ready, handoff_release)',
+            '        reset_paths("persistent-cleanup", intercepted, attempted)')),
         ("persistent special cases restored invalid terminal pair", replace_once(containment,
             '            ("kill", "parse"), ("wait", "timeout"),',
             '            ("show", "parse"), ("stop", "timeout"),')),
+        ("persistent normal and parse labels swapped", replace_once(containment,
+            '        case_label = evidence_case',
+            '        case_label = "normal" if evidence_case == "parse" else '
+            '"parse" if evidence_case == "normal" else evidence_case')),
+        ("persistent stop unload timeout omitted", replace_once(containment,
+            '        "stop": (("stop", "stop-unavailable"), ("unload", "unload-timeout")),',
+            '        "stop": (("stop", "stop-unavailable"),),')),
+        ("persistent show and unload categories swapped", replace_once(containment,
+            '        "show": (("show", "property-unavailable"),),\n'
+            '        "kill": (("kill", "kill-unavailable"),),',
+            '        "show": (("show", "unload-timeout"),),\n'
+            '        "kill": (("kill", "kill-unavailable"),),')),
+        ("persistent reset and unload categories swapped", replace_once(containment,
+            '        "reset": (("reset", "reset-unavailable"), ("unload", "unload-timeout")),\n'
+            '        "unload": (("unload", "property-unavailable"),),',
+            '        "reset": (("reset", "property-unavailable"),),\n'
+            '        "unload": (("unload", "reset-unavailable"), ("unload", "unload-timeout")),')),
+        ("persistent signed cleanup globally required", replace_once(containment,
+            '        expected_signed_cleanup_required = boundary in ("show", "stop", "reset")',
+            '        expected_signed_cleanup_required = True')),
+        ("persistent signed cleanup kill substituted", replace_once(containment,
+            '        expected_signed_cleanup_required = boundary in ("show", "stop", "reset")',
+            '        expected_signed_cleanup_required = boundary in ("show", "kill", "reset")')),
         ("persistent parse boundary loses fast-hold", replace_once(containment,
             '    if boundary in ("kill", "wait"):\n        return "fast-hold"',
             '    if boundary == "wait":\n        return "fast-hold"')),
@@ -7679,11 +8632,11 @@ def verify_supervisor_mutations(
             '                fail("persistent client exited before its attested handoff")',
             '            if False:\n                pass')),
         ("persistent no-launch reachability accepted", replace_once(containment,
-            '            if requires_live and not handoff_pids:\n'
-            '                fail("fast-hold persistent handoff had no live service cgroup process")',
+            '            if not cgroup_pids(recorded_cgroup, "persistent-cleanup"):\n'
+            '                fail("persistent launch barrier had no live service cgroup process")',
             '            if False:\n                pass')),
         ("persistent special fast-hold requirement omitted", replace_once(containment,
-            '            if wait_fault != "normal" and not requires_live:\n'
+            '            if evidence_case != "normal" and not requires_live:\n'
             '                fail("injected persistent evidence case did not use fast-hold")',
             '            if False:\n                pass')),
         ("persistent terminal boundary liveness accepted", replace_once(containment,
@@ -7691,15 +8644,15 @@ def verify_supervisor_mutations(
             '                fail("terminal persistent handoff retained live service cgroup processes")',
             '            if False:\n                pass')),
         ("persistent held client lock unchecked", replace_once(containment,
-            '            assert_client_lock_held()\n            if wait_fault == "parse":',
-            '            if wait_fault == "parse":')),
+            '            assert_client_lock_held()\n            if evidence_case == "parse":',
+            '            if evidence_case == "parse":')),
         ("persistent parse payload category swapped", replace_once(containment,
             '                            malformed, b"01\\n")',
             '                            malformed, b"1000000\\n")')),
         ("persistent invalid evidence reread for diagnostics", replace_once(containment,
-            '                observed_interceptions,\n                observed_attempts,',
-            '                counter("persistent-cleanup", intercepted),\n'
-            '                observed_attempts,')),
+            '            observed_interceptions, observed_attempts, lock_handoff_error, cleanup_error,',
+            '            counter("persistent-cleanup", intercepted), observed_attempts, '
+            'lock_handoff_error, cleanup_error,')),
         ("work budget boundary omitted", replace_once(containment,
             '    for budget_boundary in ("launch", "service", "journal"):',
             '    for budget_boundary in ("launch", "service",):')),
@@ -7756,8 +8709,12 @@ def verify_supervisor_mutations(
         ("signal matrix boundary omitted", containment.replace(
             '("kill", "stop", "wait", "reset", "unload")',
             '("kill", "stop", "wait", "reset")', 2)),
-        ("signal cancellation evidence omitted", replace_once(containment,
-            '            if "cancelled by signal" not in cancelled_stderr:', '            if False:')),
+        ("signal cancellation reduced to text-only", replace_once(containment,
+            '    parsed, shape = client_stderr_evidence(result.stderr)\n'
+            '    if (not shape["shape"] or parsed is None or parsed["primary"] != "cancelled"\n'
+            '            or parsed["return"] != 1 or parsed["stdout"] != 0\n'
+            '            or parsed["success"] != 0):',
+            '    if "cancelled by signal" not in result.stderr:')),
         ("client death omitted", replace_once(containment,
             'os_call("preflight", "kill", "process", os.kill, first.pid, signal.SIGKILL)',
             'first.terminate()')),

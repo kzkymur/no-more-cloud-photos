@@ -424,10 +424,142 @@ def explicit_marker_phase_cases(containment):
         module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
         for phase, name in release_cases:
             assert_raises(lambda phase=phase, name=name: containment["release"](phase, name),
-                          f"phase={phase} operation=open resource=release errno=13")
+                          f"phase={phase} operation=open resource=directory errno=13")
     finally:
         module_os.stat = original_stat
         module_os.open = original_open
+
+
+def persistent_launch_release_cases(containment):
+    globals_ = containment["wait_persistent_launch_required"].__globals__
+    original_barriers = globals_["persistent_launch_barriers"]
+    nonce = "0123456789abcdef" * 4
+    name = "launch-" + nonce + ".required"
+    try:
+        globals_["persistent_launch_barriers"] = lambda _phase: (name,)
+        discovered = containment["wait_persistent_launch_required"](
+            "persistent-cleanup", (), timeout=0)
+        required, ready, release = containment["persistent_launch_paths"](discovered)
+        require(discovered == nonce
+                and required == "/run/nmcp-ci/" + name
+                and ready == f"/run/nmcp-ci/launch-{nonce}.ready"
+                and release == f"/run/nmcp-ci/launch-{nonce}.release",
+                "validated nonce filename did not independently derive every launch path")
+        for invalid in ("", nonce.upper(), nonce + "0", "g" * 64, None):
+            assert_fails_with(
+                lambda invalid=invalid: containment["persistent_launch_paths"](invalid),
+                "persistent launch nonce was not canonical")
+    finally:
+        globals_["persistent_launch_barriers"] = original_barriers
+
+
+def release_marker_security_cases(client, containment):
+    client_globals = client["durable_marker"].__globals__
+    original_run = client_globals["RUN"]
+    module_os = client_globals["os"]
+    originals = module_os.fstat, module_os.stat, module_os.write
+
+    def root_owned(metadata, *, inode=None):
+        values = list(metadata)
+        values[1] = metadata.st_ino if inode is None else inode
+        values[4] = 0
+        values[5] = 0
+        return os.stat_result(values)
+
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            os.chmod(root, 0o700)
+            client_globals["RUN"] = root
+            real_fstat, real_stat, real_write = originals
+            module_os.fstat = lambda descriptor: root_owned(real_fstat(descriptor))
+            module_os.stat = lambda *args, **kwargs: root_owned(real_stat(*args, **kwargs))
+            nonce = "0123456789abcdef" * 4
+            payload = (nonce + "\n").encode("ascii")
+
+            client["durable_marker"]("final-close", "launch-" + nonce + ".release", payload)
+            path = root + "/launch-" + nonce + ".release"
+            require(client["validated_marker"]("final-close", path, payload, "release"),
+                    "fresh nonce release marker did not validate")
+            client["durable_marker"]("final-close", "launch-" + nonce + ".release", payload)
+
+            malformed = root + "/malformed.release"
+            pathlib.Path(malformed).write_bytes(b"release\n")
+            os.chmod(malformed, 0o600)
+            assert_fails_with(
+                lambda: client["validated_marker"](
+                    "final-close", malformed, payload, "release"),
+                "release was malformed or replaced")
+
+            target = root + "/target"
+            pathlib.Path(target).write_bytes(payload)
+            os.chmod(target, 0o600)
+            symlink = root + "/symlink.release"
+            os.symlink(target, symlink)
+            try:
+                client["validated_marker"]("final-close", symlink, payload, "release")
+            except RuntimeError as error:
+                require("resource=release" in str(error),
+                        "symlink release did not fail with closed release evidence")
+            else:
+                raise RuntimeError("symlink release unexpectedly validated")
+
+            rebound = root + "/rebound.release"
+            pathlib.Path(rebound).write_bytes(payload)
+            os.chmod(rebound, 0o600)
+            def rebound_stat(*args, **kwargs):
+                observed = real_stat(*args, **kwargs)
+                if args and args[0] == "rebound.release" and kwargs.get("dir_fd") is not None:
+                    return root_owned(observed, inode=observed.st_ino + 1)
+                return root_owned(observed)
+            module_os.stat = rebound_stat
+            assert_fails_with(lambda: client["validated_marker"](
+                "final-close", rebound, payload, "release"),
+                "release was malformed or replaced")
+            module_os.stat = lambda *args, **kwargs: root_owned(real_stat(*args, **kwargs))
+
+            partial = []
+            def partial_write(descriptor, remaining):
+                count = max(1, len(remaining) // 2) if not partial else len(remaining)
+                partial.append(count)
+                return real_write(descriptor, remaining[:count])
+            module_os.write = partial_write
+            client["durable_marker"]("final-close", "partial.release", payload)
+            require(len(partial) == 2 and client["validated_marker"](
+                        "final-close", root + "/partial.release", payload, "release"),
+                    "partial release write was not completed and validated")
+
+            module_os.write = lambda _descriptor, _payload: 0
+            assert_fails_with(lambda: client["durable_marker"](
+                "final-close", "short.release", payload),
+                "short write while publishing marker")
+            module_os.write = real_write
+
+        containment_globals = containment["release"].__globals__
+        containment_os = containment_globals["os"]
+        containment_originals = (containment_os.open, containment_os.close,
+                                 containment_globals["validated_payload_marker"])
+        calls = []
+        try:
+            def existing_open(path, flags, *args, **kwargs):
+                if path == "/run/nmcp-ci":
+                    return 91
+                raise FileExistsError(errno.EEXIST, "exists")
+            containment_os.open = existing_open
+            containment_os.close = lambda descriptor: calls.append(("close", descriptor))
+            containment_globals["validated_payload_marker"] = (
+                lambda phase, path, expected, resource: calls.append(
+                    (phase, path, expected, resource)) or True)
+            containment["release"]("persistent-cleanup", "launch-" + nonce)
+            require(calls[-1] == (
+                        "persistent-cleanup", "/run/nmcp-ci/launch-" + nonce + ".release",
+                        payload, "release"),
+                    "prepublished containment release was not nonce-validated")
+        finally:
+            containment_os.open, containment_os.close = containment_originals[:2]
+            containment_globals["validated_payload_marker"] = containment_originals[2]
+    finally:
+        client_globals["RUN"] = original_run
+        module_os.fstat, module_os.stat, module_os.write = originals
 
 
 def signed_cleanup_lock_cases(containment):
@@ -1195,7 +1327,7 @@ def client_phase_routing_cases(client):
 
         module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
         assert_raises(lambda: client["durable_marker"]("final-close", "fixture"),
-                      "phase=final-close operation=open resource=marker errno=13")
+                      "phase=final-close operation=open resource=directory errno=13")
 
         globals_["REQUESTED_MODE"] = "client-cleanup-persistent-unload"
         globals_["INTERCEPTIONS"].clear()
@@ -1207,17 +1339,17 @@ def client_phase_routing_cases(client):
         globals_["INTERCEPTIONS"].clear()
         globals_["INTERCEPTIONS"]["show"] = 3
         assert_raises(lambda: client["command_path"]("teardown", "show"),
-                      "phase=teardown operation=open resource=marker errno=13")
+                      "phase=teardown operation=open resource=directory errno=13")
 
         globals_["REQUESTED_MODE"] = "client-cleanup-fault-stop"
         globals_["INTERCEPTIONS"].clear()
         assert_raises(lambda: client["command_path"]("teardown", "stop"),
-                      "phase=teardown operation=open resource=marker errno=13")
+                      "phase=teardown operation=open resource=directory errno=13")
 
         globals_["REQUESTED_MODE"] = "client-signal-int-unload"
         globals_["BOUNDARIES"].clear()
         assert_raises(lambda: client["cleanup_boundary"]("unload"),
-                      "phase=unload operation=open resource=marker errno=13")
+                      "phase=unload operation=open resource=directory errno=13")
     finally:
         subprocess.run = original_run
         module_os.open = original_open
@@ -2025,11 +2157,11 @@ def actual_boundary_cases(client, containment):
     try:
         module_os.open = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
         assert_raises(lambda: client["durable_marker"]("work", "fixture"),
-                      "phase=work operation=open resource=marker errno=13")
+                      "phase=work operation=open resource=directory errno=13")
         assert_raises(client["open_client_lock"],
                       "phase=startup operation=open resource=lock errno=13")
         assert_raises(lambda: containment["release"]("client-fault", "fixture"),
-                      "phase=client-fault operation=open resource=release errno=13")
+                      "phase=client-fault operation=open resource=directory errno=13")
         assert_raises(containment["assert_client_lock_reusable"],
                       "phase=transaction-lock operation=open resource=lock errno=13")
         assert_raises(containment["open_transaction_lock"],
@@ -2157,11 +2289,555 @@ def actual_boundary_cases(client, containment):
             keeper_globals[name] = value
 
 
+def client_cleanup_result_cases(client, containment):
+    globals_ = client["resolve_outcome"].__globals__
+    mutable_names = (
+        "CLEANUP_ACTIVE", "REQUESTED_MODE", "COMMAND_DEADLINE",
+    )
+    originals = {name: globals_[name] for name in mutable_names}
+    call_originals = {name: globals_[name] for name in (
+        "assert_fixed_cgroups_empty", "command", "command_path", "durable_marker",
+        "validated_marker", "record_counter", "owned_state",
+    )}
+    sleep_original = globals_["time"].sleep
+
+    def reset(mode):
+        globals_["CLEANUP_ACTIVE"] = True
+        globals_["REQUESTED_MODE"] = mode
+        globals_["COMMAND_DEADLINE"] = None
+        for name in ("RESULT_EVENTS", "RESULT_MAPPED_CLEANUP_ERRORS",
+                     "RETRIES", "INTERCEPTIONS", "ATTEMPTS"):
+            globals_[name].clear()
+        globals_["RECOVERED_ERRORS"].clear()
+
+    def schema(primary, cleanup):
+        try:
+            client["resolve_outcome"](primary, cleanup, "n" * 64)
+        except globals_["ClientResultFailure"] as error:
+            parsed = containment["parse_client_result"](error.machine)
+            require(str(error), "client result failure lost its human diagnostic")
+            return parsed
+        raise RuntimeError("failing client outcome omitted its machine result")
+
+    def require_failure(function, prefix):
+        try:
+            function()
+        except RuntimeError as error:
+            require(str(error).startswith(prefix), f"wrong causal failure: {error!s}")
+            return error
+        raise RuntimeError("expected causal cleanup failure was not raised")
+
+    primary = client["PrimaryFailure"]("cleanup-test", "fixture primary")
+    globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
+    globals_["durable_marker"] = lambda *_args: None
+    globals_["validated_marker"] = lambda *_args: True
+    globals_["record_counter"] = lambda *_args: None
+    globals_["time"].sleep = lambda _delay: None
+    try:
+        reset("")
+        client["interrupted"](client["signal"].SIGTERM, None)
+        try:
+            client["check_cancelled"]()
+        except client["CancellationFailure"] as cancellation:
+            require(cancellation.category == "cancelled"
+                    and client["primary_exception"](cancellation, "final") is cancellation,
+                    "typed cancellation was not preserved as the primary exception")
+        else:
+            raise RuntimeError("direct signal fixture did not raise typed cancellation")
+        wrapped = client["primary_exception"](RuntimeError("later verification"), "final")
+        require(isinstance(wrapped, client["CancellationFailure"])
+                and wrapped.category == "cancelled",
+                "latched cancellation was wrapped as verification")
+        globals_["CANCELLED"].clear()
+
+        for signum in sorted(globals_["CANCELLATION_SIGNALS"]):
+            reset("")
+            scans = []
+            def cancel_during_final_scan(phase, injected=signum):
+                scans.append(phase)
+                client["interrupted"](injected, None)
+            globals_["assert_fixed_cgroups_empty"] = cancel_during_final_scan
+            parsed = schema(None, [])
+            require(scans == ["final-close"] and parsed["primary"] == "cancelled",
+                    f"final scan signal did not yield one primary cancellation: {signum}")
+            globals_["CANCELLED"].clear()
+        globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
+
+        globals_["command"] = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ("systemctl", "show"), 0, "LoadState=not-found\n", "")
+
+        reset("")
+        globals_["RESULT_EVENTS"].update(
+            (boundary, category, globals_["COUNTER_MAX"],
+             globals_["COUNTER_MAX"], globals_["COUNTER_MAX"])
+            for boundary in globals_["CLEANUP_BOUNDARIES"]
+            for category in globals_["CLEANUP_CATEGORIES"]
+            if boundary != "none" or category == "unexpected")
+        for boundary in globals_["CLEANUP_BOUNDARIES"]:
+            globals_["RETRIES"][boundary] = globals_["COUNTER_MAX"]
+            globals_["INTERCEPTIONS"][boundary] = globals_["COUNTER_MAX"]
+            globals_["ATTEMPTS"][boundary] = globals_["COUNTER_MAX"]
+        try:
+            client["result_failure"](
+                client["PrimaryFailure"]("verification", "maximum aggregation"),
+                "maximum aggregation")
+        except globals_["ClientResultFailure"] as error:
+            maximum = error.machine
+        else:
+            raise RuntimeError("maximum legitimate client result was not emitted")
+        maximum_parsed = containment["parse_client_result"](maximum)
+        require(len(maximum_parsed["events"]) == globals_["RESULT_EVENT_LIMIT"]
+                and all(event[2:] == (globals_["COUNTER_MAX"],) * 3
+                        for event in maximum_parsed["events"])
+                and len(maximum.encode("ascii")) <= globals_["RESULT_BYTE_LIMIT"],
+                "maximum legitimate client result did not render and parse within its bound")
+
+        for mode, context in (
+                ("client-property-fault-immediate", "immediate"),
+                ("client-property-fault-recovery", "recovery"),
+                ("client-property-fault-owned", "owned-state")):
+            reset(mode)
+            globals_["CLEANUP_ACTIVE"] = False
+            globals_["command_path"] = call_originals["command_path"]
+            client["unit_properties"]("teardown", "LoadState", context=context)
+            parsed = schema(primary, list(globals_["RECOVERED_ERRORS"]))
+            require(parsed["events"] == (("show", "property-recovered", 1, 1, 1),),
+                    f"{context} recovered property evidence was not causally preserved")
+
+        reset("client-cleanup-fault-show")
+        globals_["command_path"] = call_originals["command_path"]
+        client["unit_properties"]("teardown", "LoadState", context="show")
+        parsed = schema(primary, list(globals_["RECOVERED_ERRORS"]))
+        require(parsed["events"] == (("show", "property-recovered", 1, 1, 1),),
+                "recovered property retry produced the wrong causal result")
+
+        reset("")
+        globals_["RETRIES"]["show"] = 1
+        globals_["INTERCEPTIONS"]["show"] = 1
+        globals_["ATTEMPTS"]["show"] = 1
+        client["cleanup_result"]("property-recovered", "show")
+        globals_["RETRIES"]["show"] = 3
+        globals_["INTERCEPTIONS"]["show"] = 4
+        client["cleanup_result"]("property-unavailable", "show")
+        parsed = schema(primary, [])
+        require(parsed["events"] == (
+                    ("show", "property-recovered", 1, 1, 1),
+                    ("show", "property-unavailable", 3, 4, 1)),
+                "same-boundary recovered and unavailable events lost causal snapshots")
+
+        reset("client-cleanup-fault-show")
+        globals_["command_path"] = call_originals["command_path"]
+        client["unit_properties"]("teardown", "LoadState", context="show")
+        parsed = schema(primary, [*globals_["RECOVERED_ERRORS"],
+                                  RuntimeError("uncategorized cleanup failure")])
+        require(parsed["events"] == (
+                    ("show", "property-recovered", 1, 1, 1),
+                    ("final", "unexpected", 0, 0, 0)),
+                "mixed mapped and unmapped cleanup errors omitted unexpected")
+
+        reset("client-cleanup-fault-show")
+        globals_["command_path"] = call_originals["command_path"]
+        client["unit_properties"]("teardown", "LoadState", context="show")
+        residue_error = globals_["CleanupFailure"]("fixed-cgroup-residue=true")
+        observation_error = globals_["EvidenceFailure"](
+            "phase=final-close operation=walk resource=evidence errno=13")
+        final_cgroup_error = globals_["CgroupFailure"](
+            "fixed-cgroup-residue=true; phase=final-close operation=walk "
+            "resource=evidence errno=13", residue_error, (observation_error,))
+        globals_["assert_fixed_cgroups_empty"] = lambda _phase: (
+            _ for _ in ()).throw(final_cgroup_error)
+        parsed = schema(primary, [*globals_["RECOVERED_ERRORS"],
+                                  RuntimeError("uncategorized cleanup failure")])
+        require(parsed["events"] == (
+                    ("show", "property-recovered", 1, 1, 1),
+                    ("final", "cgroup-residue", 0, 0, 0),
+                    ("final", "cgroup-observation", 0, 0, 0),
+                    ("final", "unexpected", 0, 0, 0)),
+                "mixed recovered, final cgroup evidence, and unknown cleanup lost identity")
+        globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
+
+        reset("client-cleanup-persistent-show")
+        property_error = require_failure(
+            lambda: client["unit_properties"]("teardown", "LoadState", context="show"),
+            "unit properties remain unknown")
+        parsed = schema(primary, [property_error])
+        require(parsed["events"] == (("show", "property-unavailable", 3, 4, 0),),
+                "unavailable property path produced the wrong causal result")
+
+        globals_["owned_state"] = lambda *_args, **_kwargs: {"LoadState": "loaded"}
+
+        reset("client-cleanup-fault-stop")
+        stop_calls = []
+        def stop_path(_phase, name):
+            stop_calls.append(name)
+            if len(stop_calls) == 1:
+                globals_["INTERCEPTIONS"][name] = 1
+                raise RuntimeError("intercepted stop command before attempt")
+            globals_["ATTEMPTS"][name] = 1
+        globals_["command_path"] = stop_path
+        client["retry_owned_command"](
+            "i" * 32, "n" * 64, ("/fixture",), "stop", "stop")
+        parsed = schema(primary, list(globals_["RECOVERED_ERRORS"]))
+        require(parsed["events"] == (("stop", "stop-recovered", 1, 1, 1),),
+                "recovered stop path produced the wrong causal result")
+
+        reset("client-cleanup-persistent-reset")
+        def reset_path(_phase, name):
+            globals_["INTERCEPTIONS"][name] = globals_["INTERCEPTIONS"].get(name, 0) + 1
+            raise RuntimeError("intercepted reset command before attempt")
+        globals_["command_path"] = reset_path
+        reset_error = require_failure(lambda: client["retry_owned_command"](
+            "i" * 32, "n" * 64, ("/fixture",), "reset", "reset-failed"),
+            "owned reset command remains unavailable")
+        parsed = schema(primary, [reset_error])
+        require(parsed["events"] == (("reset", "reset-unavailable", 1, 2, 0),),
+                "unavailable reset path produced the wrong causal result")
+
+        reset("client-cleanup-persistent-reset")
+        globals_["command_path"] = reset_path
+        mapped_error = require_failure(lambda: client["retry_owned_command"](
+            "i" * 32, "n" * 64, ("/fixture",), "reset", "reset-failed"),
+            "owned reset command remains unavailable")
+        aggregate = client["aggregate_cleanup_failure"](
+            [mapped_error, RuntimeError("unknown aggregate constituent")], "n" * 64)
+        parsed = schema(primary, [aggregate])
+        require(parsed["events"] == (
+                    ("reset", "reset-unavailable", 1, 2, 0),
+                    ("final", "unexpected", 0, 0, 0)),
+                "teardown aggregate laundered an unmapped constituent")
+
+        reset("")
+        unload_error = require_failure(lambda: client["wait_unloaded"](
+            "i" * 32, "n" * 64, ("/fixture",), timeout=0),
+            "fixed unit did not unload")
+        parsed = schema(primary, [unload_error])
+        require(parsed["events"] == (("unload", "unload-timeout", 0, 0, 0),),
+                "unload timeout produced the wrong causal result")
+
+        reset("")
+        residue_error = globals_["CleanupFailure"]("fixed-cgroup-residue=true")
+        globals_["assert_fixed_cgroups_empty"] = lambda _phase: (
+            _ for _ in ()).throw(globals_["CgroupFailure"](
+                "fixed-cgroup-residue=true", residue_error, ()))
+        parsed = schema(primary, [])
+        require(parsed["events"] == (("final", "cgroup-residue", 0, 0, 0),),
+                "final cgroup residue produced the wrong causal result")
+
+        reset("")
+        residue_error = globals_["CleanupFailure"]("fixed-cgroup-residue=true")
+        observation_error = globals_["EvidenceFailure"](
+            "phase=work operation=walk resource=evidence errno=13")
+        primary_cgroup_error = globals_["CgroupFailure"](
+            "fixed-cgroup-residue=true; phase=work operation=walk resource=evidence errno=13",
+            residue_error, (observation_error,))
+        globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
+        wrapped = client["primary_exception"](primary_cgroup_error, "final")
+        parsed = schema(wrapped, [])
+        require(parsed["primary"] == "verification" and parsed["events"] == (
+                    ("final", "cgroup-residue", 0, 0, 0),
+                    ("final", "cgroup-observation", 0, 0, 0)),
+                "primary cgroup wrapping discarded structured constituent evidence")
+
+        reset("")
+        residue_error = globals_["CleanupFailure"]("fixed-cgroup-residue=true")
+        observation_error = globals_["EvidenceFailure"](
+            "phase=unload operation=walk resource=evidence errno=13")
+        unload_cgroup_error = globals_["CgroupFailure"](
+            "fixed-cgroup-residue=true; phase=unload operation=walk resource=evidence errno=13",
+            residue_error, (observation_error,))
+        globals_["assert_fixed_cgroups_empty"] = lambda _phase: (
+            _ for _ in ()).throw(unload_cgroup_error)
+        globals_["owned_state"] = lambda *_args, **_kwargs: {"LoadState": "not-found"}
+        unload_error = require_failure(lambda: client["wait_unloaded"](
+            "i" * 32, "n" * 64, ("/fixture",)), "fixed-cgroup-residue=true")
+        globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
+        parsed = schema(primary, [unload_error])
+        require(parsed["events"] == (
+                    ("unload", "cgroup-residue", 0, 0, 0),
+                    ("unload", "cgroup-observation", 0, 0, 0)),
+                "unload cgroup failure collapsed residue or observation evidence")
+    finally:
+        for name, value in originals.items():
+            globals_[name] = value
+        for name, value in call_originals.items():
+            globals_[name] = value
+        globals_["time"].sleep = sleep_original
+        for name in ("RESULT_EVENTS", "RESULT_MAPPED_CLEANUP_ERRORS",
+                     "RETRIES", "INTERCEPTIONS", "ATTEMPTS"):
+            globals_[name].clear()
+        globals_["RECOVERED_ERRORS"].clear()
+        globals_["CANCELLED"].clear()
+
+
+def client_teardown_transition_cases(client, containment):
+    globals_ = client["teardown_owned"].__globals__
+    call_names = (
+        "assert_fixed_cgroups_empty", "bounded_deadline", "command", "durable_marker",
+        "fixed_cgroup_residue", "owned_state", "record_counter", "validated_marker",
+        "retry_owned_command",
+    )
+    originals = {name: globals_[name] for name in call_names}
+    mutable_names = ("CLEANUP_ACTIVE", "COMMAND_DEADLINE", "REQUESTED_MODE")
+    mutable_originals = {name: globals_[name] for name in mutable_names}
+    sleep_original = globals_["time"].sleep
+    recorded = globals_["RECORDED_CGROUP"]
+    recorded_original = list(recorded)
+    invocation = "i" * 32
+    nonce = "n" * 64
+    service_command = ("/fixture",)
+    expected = {
+        "show": (("property-unavailable",), True, 3, 4),
+        "kill": (("kill-unavailable",), False, 1, 2),
+        "stop": (("stop-unavailable", "unload-timeout"), True, 1, 2),
+        "wait": (("property-unavailable",), False, 3, 4),
+        "reset": (("reset-unavailable", "unload-timeout"), True, 1, 2),
+        "unload": (("property-unavailable",), False, 3, 4),
+    }
+
+    def reset(boundary):
+        globals_["CLEANUP_ACTIVE"] = True
+        globals_["COMMAND_DEADLINE"] = None
+        globals_["REQUESTED_MODE"] = "client-cleanup-persistent-" + boundary
+        for name in ("RESULT_EVENTS", "RESULT_MAPPED_CLEANUP_ERRORS",
+                     "RETRIES", "INTERCEPTIONS", "ATTEMPTS"):
+            globals_[name].clear()
+        globals_["RECOVERED_ERRORS"].clear()
+        recorded.clear()
+
+    globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
+    globals_["durable_marker"] = lambda *_args: None
+    globals_["validated_marker"] = lambda *_args: True
+    globals_["record_counter"] = lambda *_args: None
+    globals_["time"].sleep = lambda _delay: None
+    try:
+        for boundary, (categories, expected_loaded, retries, interceptions) in expected.items():
+            reset(boundary)
+            state = {
+                "loaded": True,
+                "active": "active" if boundary in ("kill", "wait", "stop") else "failed",
+                "sub": "exited" if boundary == "stop" else
+                       "running" if boundary in ("kill", "wait") else "failed",
+                "occupants": boundary in ("kill", "wait"),
+            }
+
+            def fake_fixed_cgroup_residue(_phase):
+                return ({"/fixture-cgroup": (41,)} if state["occupants"] else {}, ())
+
+            def fake_command(argv, _phase, **_kwargs):
+                action = argv[1]
+                if action == "show":
+                    requested = [item.split("=", 1)[1] for item in argv if item.startswith("--property=")]
+                    if not state["loaded"]:
+                        payload = "".join(
+                            f"{name}={'not-found' if name == 'LoadState' else ''}\n"
+                            for name in requested)
+                    else:
+                        values = {
+                            "LoadState": "loaded", "InvocationID": invocation,
+                            "ActiveState": state["active"], "SubState": state["sub"],
+                            "ControlGroup": "/fixture-cgroup",
+                            "Description": globals_["DESCRIPTION_PREFIX"] + nonce,
+                            "Environment": f"{globals_['NONCE_VARIABLE']}={nonce}",
+                            "ExecStart": "{ path=/fixture ; argv[]=/fixture ; }",
+                            "Result": "success" if state["sub"] == "exited" else "exit-code",
+                            "ExecMainCode": "1", "ExecMainStatus": "0",
+                            **globals_["SERVICE_PROPERTIES"],
+                        }
+                        payload = "".join(f"{name}={values[name]}\n" for name in requested)
+                    return subprocess.CompletedProcess(argv, 0, payload, "")
+                if action == "kill":
+                    state.update(active="failed", sub="failed", occupants=False)
+                elif action == "stop":
+                    state.update(active="inactive", sub="dead", occupants=False)
+                elif action == "reset-failed" and state["active"] != "active":
+                    state.update(loaded=False, active="inactive", sub="dead", occupants=False)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            globals_["fixed_cgroup_residue"] = fake_fixed_cgroup_residue
+            globals_["command"] = fake_command
+            globals_["bounded_deadline"] = lambda timeout: (
+                globals_["time"].monotonic()
+                if timeout in (globals_["KILL_WAIT_TIMEOUT"], globals_["UNLOAD_TIMEOUT"])
+                else globals_["time"].monotonic() + 100)
+            try:
+                client["teardown_owned"](invocation, nonce, service_command)
+            except RuntimeError as teardown_error:
+                captured_error = teardown_error
+            else:
+                raise RuntimeError(f"persistent {boundary} teardown unexpectedly succeeded")
+
+            after_exit_loaded = state["loaded"]
+            signed_cleanup_ran = containment["cleanup_signed_launch_if_owned"](
+                True, {"fixture": boundary},
+                {"LoadState": "loaded" if after_exit_loaded else "not-found"},
+                "persistent-cleanup",
+                lambda _signature, _phase: state.update(
+                    loaded=False, active="inactive", sub="dead", occupants=False))
+            try:
+                    client["resolve_outcome"](
+                        client["PrimaryFailure"]("cleanup-test", "fixture primary"),
+                    [captured_error], nonce)
+            except globals_["ClientResultFailure"] as error:
+                parsed = containment["parse_client_result"](error.machine)
+            else:
+                raise RuntimeError(f"persistent {boundary} result schema was not emitted")
+            expected_events = tuple(
+                (event_boundary, category,
+                 retries if event_boundary == boundary else 0,
+                 interceptions if event_boundary == boundary else 0, 0)
+                for event_boundary, category in (
+                    ((boundary, categories[0]),)
+                    + ((("unload", categories[1]),) if len(categories) == 2 else ())))
+            require(parsed["events"] == expected_events,
+                    f"persistent {boundary} teardown produced the wrong machine result: "
+                    f"{parsed}; error={captured_error}")
+            require(after_exit_loaded == expected_loaded
+                    and signed_cleanup_ran == expected_loaded and not state["loaded"],
+                    f"persistent {boundary} external cleanup transition was incorrect")
+
+        reset("")
+        globals_["RETRIES"]["wait"] = 2
+        globals_["INTERCEPTIONS"]["wait"] = 3
+        globals_["ATTEMPTS"]["wait"] = 4
+        state = {"loaded": True}
+        globals_["owned_state"] = lambda *_args, **_kwargs: (
+            {"LoadState": "loaded", "ActiveState": "active", "SubState": "running"}
+            if state["loaded"] else {"LoadState": "not-found"})
+        globals_["fixed_cgroup_residue"] = lambda _phase: ({"/fixture": (41,)}, ())
+        def deadline_action(_invocation, _nonce, _command, boundary, *_args):
+            if boundary == "stop":
+                state["loaded"] = False
+            return True
+        globals_["retry_owned_command"] = deadline_action
+        globals_["bounded_deadline"] = lambda _timeout: globals_["time"].monotonic()
+        captured_error = None
+        try:
+            client["teardown_owned"](invocation, nonce, service_command)
+        except RuntimeError as error:
+            captured_error = error
+            require("owned unit did not terminate its control group" in str(error),
+                    "wait deadline returned the wrong causal failure")
+        else:
+            raise RuntimeError("wait deadline teardown unexpectedly succeeded")
+        parsed = None
+        try:
+            client["resolve_outcome"](
+                client["PrimaryFailure"]("cleanup-test", "fixture primary"),
+                [captured_error], nonce)
+        except globals_["ClientResultFailure"] as error:
+            parsed = containment["parse_client_result"](error.machine)
+        require(parsed is not None and parsed["events"] == (
+                    ("wait", "cgroup-residue", 2, 3, 4),),
+                "actual wait deadline lost its immutable causal residue snapshot")
+    finally:
+        for name, value in originals.items():
+            globals_[name] = value
+        for name, value in mutable_originals.items():
+            globals_[name] = value
+        globals_["time"].sleep = sleep_original
+        recorded[:] = recorded_original
+        for name in ("RESULT_EVENTS", "RESULT_MAPPED_CLEANUP_ERRORS",
+                     "RETRIES", "INTERCEPTIONS", "ATTEMPTS"):
+            globals_[name].clear()
+        globals_["RECOVERED_ERRORS"].clear()
+
+
+def client_terminal_emission_cases(client, containment):
+    globals_ = client["emit_terminal_result"].__globals__
+    original_assert = globals_["assert_fixed_cgroups_empty"]
+    original_render = globals_["render_client_result"]
+    original_mask = globals_["signal"].pthread_sigmask
+    original_pending = globals_["signal"].sigpending
+    original_write = globals_["os"].write
+    writes = []
+    masks = []
+
+    def reset():
+        writes.clear()
+        masks.clear()
+        globals_["CANCELLED"].clear()
+        globals_["RESULT_EVENTS"].clear()
+        globals_["RESULT_MAPPED_CLEANUP_ERRORS"].clear()
+        globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
+        globals_["render_client_result"] = original_render
+        globals_["signal"].sigpending = lambda: set()
+
+    def fake_mask(operation, signals):
+        masks.append((operation, signals))
+        return set()
+
+    def fake_write(descriptor, payload):
+        writes.append((descriptor, payload))
+        return len(payload)
+
+    globals_["signal"].pthread_sigmask = fake_mask
+    globals_["os"].write = fake_write
+    try:
+        reset()
+        status = client["emit_terminal_result"](None, [], "n" * 64, 0)
+        require(status == 0 and writes == [(1, (globals_["SUCCESS"] + "\n").encode("ascii"))],
+                "successful terminal result was not one low-level stdout write")
+        require(masks == [(globals_["signal"].SIG_BLOCK, globals_["CANCELLATION_SIGNALS"])],
+                "successful terminal result did not enter one non-restored signal mask")
+
+        reset()
+        render_calls = 0
+        def cancel_during_render(primary_error):
+            nonlocal render_calls
+            render_calls += 1
+            if render_calls == 1:
+                client["interrupted"](globals_["signal"].SIGTERM, None)
+            return original_render(primary_error)
+        globals_["render_client_result"] = cancel_during_render
+        status = client["emit_terminal_result"](
+            client["PrimaryFailure"]("verification", "fixture failure"), [], "n" * 64, 1)
+        parsed = containment["parse_client_result"](
+            writes[0][1].splitlines()[0].decode("ascii"))
+        require(status == 1 and len(writes) == 1 and writes[0][0] == 2
+                and parsed["primary"] == "cancelled" and render_calls == 2,
+                "cancellation during result rendering was not reclassified and emitted once")
+        require(writes[0][1].count(b"NMCP_CLIENT_RESULT_V1:") == 1
+                and writes[0][1].count(b"verification-client: ") == 1,
+                "failing terminal result was buffered or duplicated")
+
+        reset()
+        def cancel_at_pending_check():
+            client["interrupted"](globals_["signal"].SIGHUP, None)
+            return set()
+        globals_["signal"].sigpending = cancel_at_pending_check
+        status = client["emit_terminal_result"](None, [], "n" * 64, 0)
+        parsed = containment["parse_client_result"](
+            writes[0][1].splitlines()[0].decode("ascii"))
+        require(status == 1 and len(writes) == 1 and writes[0][0] == 2
+                and parsed["primary"] == "cancelled",
+                "cancellation immediately before the pending check emitted success")
+
+        reset()
+        globals_["signal"].sigpending = lambda: {globals_["signal"].SIGQUIT}
+        status = client["emit_terminal_result"](None, [], "n" * 64, 0)
+        parsed = containment["parse_client_result"](
+            writes[0][1].splitlines()[0].decode("ascii"))
+        require(status == 1 and len(writes) == 1 and parsed["primary"] == "cancelled",
+                "kernel-pending handled signal did not replace successful output")
+    finally:
+        globals_["assert_fixed_cgroups_empty"] = original_assert
+        globals_["render_client_result"] = original_render
+        globals_["signal"].pthread_sigmask = original_mask
+        globals_["signal"].sigpending = original_pending
+        globals_["os"].write = original_write
+        globals_["CANCELLED"].clear()
+        globals_["RESULT_EVENTS"].clear()
+        globals_["RESULT_MAPPED_CLEANUP_ERRORS"].clear()
+
+
 def main():
     client = runpy.run_path(str(CLIENT_PATH), run_name="diagnostic_client_fixture")
     containment = runpy.run_path(str(CONTAINMENT_PATH), run_name="diagnostic_containment_fixture")
+    containment["assert_persistent_cgroup_routing_contract"]()
     diagnostic_cases(client, containment)
     explicit_marker_phase_cases(containment)
+    persistent_launch_release_cases(containment)
+    release_marker_security_cases(client, containment)
     signed_cleanup_lock_cases(containment)
     stale_diagnostic_cases(containment)
     client_cgroup_lifecycle_cases(client)
@@ -2173,6 +2849,9 @@ def main():
     client_phase_routing_cases(client)
     counter_atomic_cases(client, containment)
     actual_boundary_cases(client, containment)
+    client_cleanup_result_cases(client, containment)
+    client_terminal_emission_cases(client, containment)
+    client_teardown_transition_cases(client, containment)
     for namespace in (client, containment):
         cgroup_boundary_cases(namespace)
         for kind in ("root-disappears", "file-disappears", "residue",

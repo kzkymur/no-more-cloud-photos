@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 CURRENT_ASSETS = {
     "supervisor": ("scripts/verify-ubuntu-migration-role-supervisor", "trusted root supervisor", 0o500),
@@ -258,6 +259,48 @@ def fsync_directory(path):
         os.close(descriptor)
 
 
+def validate_launch_marker(path, nonce, suffix, absent_ok=False):
+    root = "/run/nmcp-ci"
+    expected_path = root + "/launch-" + nonce + suffix
+    if path != expected_path:
+        die("persistent launch protocol path does not match its nonce")
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    try:
+        try:
+            descriptor = os.open(os.path.basename(path),
+                                 os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            if absent_ok:
+                return False
+            raise
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
+            die("unsafe persistent launch protocol marker")
+        payload = os.read(descriptor, len(nonce) + 2)
+        after = os.fstat(descriptor)
+        current = os.stat(os.path.basename(path), dir_fd=directory, follow_symlinks=False)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )
+        expected_payload = (nonce + "\n").encode("ascii")
+        if (identity(before) != identity(after) or identity(before) != identity(current)
+                or before.st_size != len(expected_payload) or payload != expected_payload):
+            die("persistent launch protocol marker was malformed or replaced")
+        return True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory)
+
+
+def validate_launch_required(path, nonce):
+    validate_launch_marker(path, nonce, ".required")
+
+
 def metadata(value):
     return {"dev": value.st_dev, "ino": value.st_ino, "uid": value.st_uid,
             "gid": value.st_gid, "mode": stat.S_IMODE(value.st_mode)}
@@ -421,8 +464,9 @@ def open_verified(root_fd, manifest, name):
 
 def main():
     global FAULT_MODE
-    if os.geteuid() != 0 or len(sys.argv) not in (5, 6):
-        die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO NONCE [FAULT_POINT]")
+    if os.geteuid() != 0 or len(sys.argv) not in (5, 6, 7):
+        die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO NONCE "
+            "[FAULT_POINT] [--persistent-launch-required=PATH]")
     os.chdir("/")
     os.umask(0o077)
     signal.signal(signal.SIGINT, interrupted)
@@ -431,7 +475,13 @@ def main():
     if (len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce)
             or os.environ.get("NMCP_VERIFIER_NONCE") != nonce):
         die("supervisor launch nonce does not match its environment")
-    FAULT_MODE = sys.argv[5] if len(sys.argv) == 6 else ""
+    optional = list(sys.argv[5:])
+    launch_required = None
+    if optional and optional[-1].startswith("--persistent-launch-required="):
+        launch_required = optional.pop().partition("=")[2]
+    if len(optional) > 1:
+        die("supervisor received an invalid optional argument sequence")
+    FAULT_MODE = optional[0] if optional else ""
     repo, current_commit, go_binary = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
     if current_commit != git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip():
         die("checkout HEAD is not the requested candidate commit")
@@ -452,19 +502,67 @@ def main():
     create_owned_top(run_root, 0o700, intents,
                      {"current-source", "v18-source", "nmcp-admin-current.build",
                       "nmcp-admin-v18.build", "snapshot", "snapshot.build"}, "run-root")
-    lock_keeper = subprocess.Popen(
-        ("/bin/sh", "-c", "trap '' TERM INT HUP QUIT; while :; do /usr/bin/sleep 300; done"),
-        cwd="/", env=clean_env(), pass_fds=(lock_fd,), start_new_session=True,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    keeper_pid_fd = os.open(LOCK_KEEPER_PID_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
-        write_all(keeper_pid_fd, f"{lock_keeper.pid}\n".encode("ascii"))
-        os.fchmod(keeper_pid_fd, 0o600)
-        os.fsync(keeper_pid_fd)
-    finally:
-        os.close(keeper_pid_fd)
-    fsync_directory(os.path.dirname(LOCK_KEEPER_PID_PATH))
+        lock_keeper = subprocess.Popen(
+            ("/bin/sh", "-c", "trap '' TERM INT HUP QUIT; while :; do /usr/bin/sleep 300; done"),
+            cwd="/", env=clean_env(), pass_fds=(lock_fd,), start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        keeper_pid_fd = os.open(LOCK_KEEPER_PID_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            write_all(keeper_pid_fd, f"{lock_keeper.pid}\n".encode("ascii"))
+            os.fchmod(keeper_pid_fd, 0o600)
+            os.fsync(keeper_pid_fd)
+        finally:
+            os.close(keeper_pid_fd)
+        fsync_directory(os.path.dirname(LOCK_KEEPER_PID_PATH))
+        if launch_required is not None:
+            validate_launch_required(launch_required, nonce)
+            launch_barrier = "/run/nmcp-ci/launch-" + nonce
+            ready_fd = os.open(launch_barrier + ".ready",
+                               os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                write_all(ready_fd, (nonce + "\n").encode("ascii"))
+                os.fsync(ready_fd)
+            finally:
+                os.close(ready_fd)
+            fsync_directory("/run/nmcp-ci")
+            deadline = time.monotonic() + 30
+            while not validate_launch_marker(
+                    launch_barrier + ".release", nonce, ".release", absent_ok=True):
+                if time.monotonic() >= deadline:
+                    die("timed out awaiting live launch attestation")
+                time.sleep(0.05)
+    except BaseException as launch_error:
+        cleanup_errors = []
+        try:
+            recover_intents()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if "lock_keeper" in locals():
+            try:
+                os.killpg(lock_keeper.pid, signal.SIGKILL)
+                lock_keeper.wait()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                cleanup_errors.append(error)
+        try:
+            os.unlink(LOCK_KEEPER_PID_PATH)
+            fsync_directory(os.path.dirname(LOCK_KEEPER_PID_PATH))
+        except FileNotFoundError:
+            pass
+        except BaseException as error:
+            cleanup_errors.append(error)
+        try:
+            os.close(lock_fd)
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            raise RuntimeError(
+                f"{launch_error}; launch cleanup failed: "
+                + "; ".join(map(str, cleanup_errors))) from launch_error
+        raise
     run_identity = (os.lstat(run_root).st_dev, os.lstat(run_root).st_ino)
     owned = []
     trace = []
@@ -694,7 +792,6 @@ def main():
                 )
                 if probe.returncode == 0 and probe.stdout.strip() == "1":
                     break
-                import time
                 time.sleep(0.05)
             else:
                 die("retained cleanup connection did not become observable")
