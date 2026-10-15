@@ -32,11 +32,16 @@ class Failure(Exception):
 
 pending_signal = 0
 curl_child = None
+cleanup_signal_depth = 0
 
 
 def signal_handler(signum, _frame):
     global pending_signal
-    pending_signal = signum
+    # Preserve the first deferred cleanup signal.  The failure that entered
+    # cleanup remains primary; later signals must not interrupt namespace
+    # finality or replace an already recorded primary signal.
+    if not pending_signal or not cleanup_signal_depth:
+        pending_signal = signum
     if curl_child is not None and curl_child.poll() is None:
         try:
             os.killpg(curl_child.pid, signum)
@@ -49,7 +54,7 @@ for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
 
 
 def checkpoint():
-    if pending_signal:
+    if pending_signal and not cleanup_signal_depth:
         raise Failure(128 + pending_signal)
 
 
@@ -411,15 +416,22 @@ def run_curl(url, output_fd):
 
 
 def cleanup_owned_target(chain, descriptor, url):
-    global pending_signal
+    global cleanup_signal_depth, pending_signal
     saved_signal = pending_signal
     pending_signal = 0
+    cleanup_signal_depth += 1
     try:
         quarantine_unlink(chain, chain.name, descriptor, "owned", url, validate_parent=False)
     except Exception:
         pass
     finally:
-        pending_signal = saved_signal
+        late_signal = pending_signal
+        cleanup_signal_depth -= 1
+        # Explicit status policy: the primary failure/signal that caused
+        # cleanup wins.  If it was not a signal, retain the first late signal
+        # only as deferred state; it cannot abort cleanup or override the
+        # already propagating primary exception.
+        pending_signal = saved_signal or late_signal
 
 
 def probe_parent(parent):

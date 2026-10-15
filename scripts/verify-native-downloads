@@ -18,6 +18,95 @@ if sys.flags.optimize:
 repo = pathlib.Path(__file__).resolve().parent.parent
 downloader = repo / "internal/nativevalidation/download-verified"
 
+fetch_tools = {"aria2c", "aria2p", "curl", "fetch", "ftp", "http", "https", "lftp", "wget", "wget2", "xh"}
+fetch_pattern = re.compile(
+    r"(?<![A-Za-z0-9_.-])(" + "|".join(sorted(map(re.escape, fetch_tools), key=len, reverse=True)) + r")(?![A-Za-z0-9_.:-])"
+)
+shell_command_prefixes = {"do", "elif", "else", "if", "then", "until", "while"}
+assignment = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+allowed_fetch_declaration = (
+    "for", "command", "in", "autoconf", "automake", "cmake", "ctest", "curl", "git", "go", "ldd",
+    "make", "meson", "nasm", "ninja", "pkg-config", "prlimit", "python3", "sha256sum", "stat", "tar",
+    "timeout", "xz",
+)
+
+
+def shell_basename(token):
+    return os.path.basename(token).strip("$(){}")
+
+
+def shell_segments(line):
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    segment = []
+    for token in lexer:
+        if token in {";", "&&", "||", "|", "|&", "&"}:
+            if segment:
+                yield segment
+                segment = []
+        else:
+            segment.append(token)
+    if segment:
+        yield segment
+
+
+def assert_no_fetch_bypass(relative, text):
+    logical = text.replace("\\\n", " ")
+    for line_number, line in enumerate(logical.splitlines(), 1):
+        for segment in shell_segments(line):
+            first = shell_basename(segment[0])
+            if relative == "scripts/prepare-native-validation" and tuple(segment) == allowed_fetch_declaration:
+                continue
+            index = 0
+            if first in shell_command_prefixes:
+                index += 1
+            while index < len(segment) and assignment.match(segment[index]):
+                index += 1
+            used = set(fetch_pattern.findall(" ".join(segment)))
+            if index == len(segment):
+                assert not used, f"{relative}:{line_number}: bypasses shared downloader with {sorted(used)!r}"
+                continue
+            executable = shell_basename(segment[index])
+            if executable == "git" and used == {"fetch"}:
+                used = set()
+            assert not used, f"{relative}:{line_number}: bypasses shared downloader with {sorted(used)!r}"
+
+
+fetch_mutations = (
+    "curl https://invalid.example",
+    "/usr/bin/curl https://invalid.example",
+    "command -- curl https://invalid.example",
+    "env curl https://invalid.example",
+    "env TOKEN=value /usr/bin/wget https://invalid.example",
+    "TOKEN=value curl https://invalid.example",
+    "timeout 1m wget https://invalid.example",
+    "nice -n 1 aria2c https://invalid.example",
+    "sudo -n -- /usr/bin/fetch https://invalid.example",
+    "busybox wget https://invalid.example",
+    "true && command env TOKEN=value /usr/bin/curl https://invalid.example",
+    "time /usr/bin/curl https://invalid.example",
+    "true |& /usr/bin/curl https://invalid.example",
+    "timeout --signal TERM 1m curl https://invalid.example",
+    "nice --adjustment=1 aria2c https://invalid.example",
+    "wget2 https://invalid.example",
+    "if /usr/bin/curl https://invalid.example; then true; fi",
+    "then wget2 https://invalid.example",
+    "while busybox wget https://invalid.example; do true; done",
+    "case x in x) /usr/bin/curl https://invalid.example ;; esac",
+    "function pull { wget2 https://invalid.example; }; pull",
+    "for item in $(curl https://invalid.example); do true; done",
+    "artifact=$(curl https://invalid.example)",
+    'artifact="$(/usr/bin/wget2 https://invalid.example)"',
+)
+for mutation in fetch_mutations:
+    try:
+        assert_no_fetch_bypass("causal-fetch-mutation", mutation)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"fetch mutation was accepted: {mutation}")
+
 consumer_tuples = {
     "scripts/prepare-native-validation": [
         ("$tools/exiftool-13.36.tar.gz", "https://github.com/exiftool/exiftool/archive/refs/tags/13.36.tar.gz", "f70ecbcdccc18268d4d3c290faf8cf73b1cf128e3e7f8671e24d6604cae4dc73"),
@@ -47,12 +136,12 @@ for relative, expected in consumer_tuples.items():
     text = (repo / relative).read_text()
     assert "download() {" not in text, f"{relative}: retains private downloader"
     assert "download_verified=$repo/internal/nativevalidation/download-verified" in text, f"{relative}: downloader binding changed"
+    assert_no_fetch_bypass(relative, text)
     logical = text.replace("\\\n", " ")
     actual = []
     probe_count = 0
     for line_number, line in enumerate(logical.splitlines(), 1):
         tokens = shlex.split(line, comments=True, posix=True)
-        assert not tokens or tokens[0] != "curl", f"{relative}:{line_number}: bypasses shared downloader"
         if tokens and tokens[0] == "$download_verified":
             if tokens[1:] == ["--probe-parent", "$cache_parent"]:
                 assert relative == "scripts/prepare-native-validation", f"{relative}:{line_number}: unexpected capability probe"
@@ -592,6 +681,7 @@ esac
         entry = quarantine / "entry"
         entry.rename(owned_identity_held)
         entry.write_text("foreign after owned identity\n")
+        _process.send_signal(signal.SIGHUP)
     status, _, _ = barrier_sequence_case(
         owned_identity_target,
         ("after-publish", "after-owned-quarantine-identity-before-unlink"),
@@ -610,6 +700,7 @@ esac
         entry = quarantine / "entry"
         entry.rename(owned_finally_held)
         entry.write_text("foreign after owned finally identity\n")
+        _process.send_signal(signal.SIGINT)
     status, _, _ = barrier_sequence_case(
         owned_finally_target,
         ("after-publish", "after-owned-finally-identity-before-unlink"),
@@ -619,6 +710,36 @@ esac
     assert not lexists(owned_finally_target)
     assert owned_finally_held.read_bytes() == source.read_bytes()
     consume_retained_quarantine(races, expected_bytes=b"foreign after owned finally identity\n")
+    assert_no_internal_residue(races)
+
+    late_primary_target = races / "late-signal-primary-cleanup.tar.xz"
+    def corrupt_after_final_hash(_process, _barriers):
+        late_primary_target.write_bytes(b"primary checksum failure\n")
+    def signal_during_primary_cleanup(process, _barriers):
+        process.send_signal(signal.SIGTERM)
+    status, _, _ = barrier_sequence_case(
+        late_primary_target,
+        ("after-final-hash", "after-owned-quarantine-identity-before-unlink"),
+        (corrupt_after_final_hash, signal_during_primary_cleanup),
+    )
+    assert status == 1
+    assert not lexists(late_primary_target)
+    consume_retained_quarantine(races, expected_bytes=b"primary checksum failure\n")
+    assert_no_internal_residue(races)
+
+    late_finally_target = races / "late-signal-finally-cleanup.tar.xz"
+    def corrupt_before_finally_cleanup(_process, _barriers):
+        late_finally_target.write_bytes(b"primary state failure\n")
+    def signal_during_finally_cleanup(process, _barriers):
+        process.send_signal(signal.SIGHUP)
+    status, _, _ = barrier_sequence_case(
+        late_finally_target,
+        ("after-final-hash", "after-owned-finally-identity-before-unlink"),
+        (corrupt_before_finally_cleanup, signal_during_finally_cleanup),
+    )
+    assert status == 1
+    assert not lexists(late_finally_target)
+    consume_retained_quarantine(races, expected_bytes=b"primary state failure\n")
     assert_no_internal_residue(races)
 
     assert entries(outside) == ["sentinel"]
