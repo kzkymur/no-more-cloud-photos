@@ -33,14 +33,15 @@ class Failure(Exception):
 pending_signal = 0
 curl_child = None
 cleanup_signal_depth = 0
+handled_signals = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
 
 
 def signal_handler(signum, _frame):
     global pending_signal
-    # Preserve the first deferred cleanup signal.  The failure that entered
-    # cleanup remains primary; later signals must not interrupt namespace
-    # finality or replace an already recorded primary signal.
-    if not pending_signal or not cleanup_signal_depth:
+    # Preserve the first signal.  A failure that entered cleanup remains
+    # primary; later signals must not interrupt namespace finality or replace
+    # an already recorded primary signal.
+    if not pending_signal:
         pending_signal = signum
     if curl_child is not None and curl_child.poll() is None:
         try:
@@ -49,7 +50,7 @@ def signal_handler(signum, _frame):
             pass
 
 
-for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+for handled_signal in handled_signals:
     signal.signal(handled_signal, signal_handler)
 
 
@@ -328,10 +329,39 @@ def quarantine_unlink(chain, name, expected_fd, purpose, url, validate_parent=Tr
             os.close(quarantine_fd)
 
 
+def quarantine_with_deferred_signals(chain, descriptor, purpose, url, validate_parent):
+    global cleanup_signal_depth
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+    try:
+        cleanup_signal_depth += 1
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    try:
+        return quarantine_unlink(
+            chain,
+            chain.name,
+            descriptor,
+            purpose,
+            url,
+            validate_parent=validate_parent,
+        )
+    finally:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+        try:
+            cleanup_signal_depth -= 1
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 def remove_invalid(chain, descriptor, url):
-    quarantine_unlink(chain, chain.name, descriptor, "invalid", url)
+    quarantine_with_deferred_signals(chain, descriptor, "invalid", url, validate_parent=True)
     if entry_metadata(chain.directory_fd, chain.name) is not None:
         raise Failure(1, "invalid cache target was replaced")
+    # The quarantine operation and all of its descriptor finalizers completed.
+    # A first signal deferred during successful invalid cleanup surfaces only
+    # after canonical/quarantine finality; a primary cleanup failure wins by
+    # propagating before this checkpoint.
+    checkpoint()
 
 
 def inspect_warm(chain, expected_digest, url):
@@ -416,22 +446,10 @@ def run_curl(url, output_fd):
 
 
 def cleanup_owned_target(chain, descriptor, url):
-    global cleanup_signal_depth, pending_signal
-    saved_signal = pending_signal
-    pending_signal = 0
-    cleanup_signal_depth += 1
     try:
-        quarantine_unlink(chain, chain.name, descriptor, "owned", url, validate_parent=False)
+        quarantine_with_deferred_signals(chain, descriptor, "owned", url, validate_parent=False)
     except Exception:
         pass
-    finally:
-        late_signal = pending_signal
-        cleanup_signal_depth -= 1
-        # Explicit status policy: the primary failure/signal that caused
-        # cleanup wins.  If it was not a signal, retain the first late signal
-        # only as deferred state; it cannot abort cleanup or override the
-        # already propagating primary exception.
-        pending_signal = saved_signal or late_signal
 
 
 def probe_parent(parent):

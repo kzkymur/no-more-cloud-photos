@@ -18,7 +18,7 @@ if sys.flags.optimize:
 repo = pathlib.Path(__file__).resolve().parent.parent
 downloader = repo / "internal/nativevalidation/download-verified"
 
-fetch_tools = {"aria2c", "aria2p", "curl", "fetch", "ftp", "http", "https", "lftp", "wget", "wget2", "xh"}
+fetch_tools = {"aria2c", "aria2p", "curl", "fetch", "ftp", "http", "httpie", "https", "lftp", "wget", "wget2", "xh"}
 fetch_pattern = re.compile(
     r"(?<![A-Za-z0-9_.-])(" + "|".join(sorted(map(re.escape, fetch_tools), key=len, reverse=True)) + r")(?![A-Za-z0-9_.:-])"
 )
@@ -28,6 +28,10 @@ allowed_fetch_declaration = (
     "for", "command", "in", "autoconf", "automake", "cmake", "ctest", "curl", "git", "go", "ldd",
     "make", "meson", "nasm", "ninja", "pkg-config", "prlimit", "python3", "sha256sum", "stat", "tar",
     "timeout", "xz",
+)
+allowed_git_fetch = (
+    "git", "-C", "$work/source/aom", "fetch", "--quiet", "--depth=1", "origin",
+    "615b5f541e4434aebd993036bc97ebc1a77ebc25",
 )
 
 
@@ -52,7 +56,7 @@ def shell_segments(line):
 
 
 def assert_no_fetch_bypass(relative, text):
-    logical = text.replace("\\\n", " ")
+    logical = text.replace("\\\n", "")
     for line_number, line in enumerate(logical.splitlines(), 1):
         for segment in shell_segments(line):
             first = shell_basename(segment[0])
@@ -69,8 +73,20 @@ def assert_no_fetch_bypass(relative, text):
                 continue
             executable = shell_basename(segment[index])
             if executable == "git" and used == {"fetch"}:
-                used = set()
+                if relative == "internal/stillprocessor/helper/build-pinned-toolchain.sh" and tuple(segment) == allowed_git_fetch:
+                    used = set()
             assert not used, f"{relative}:{line_number}: bypasses shared downloader with {sorted(used)!r}"
+
+
+def assert_no_direct_downloader(relative, text):
+    binding = "download_verified=$repo/internal/nativevalidation/download-verified"
+    logical = text.replace("\\\n", "")
+    for line_number, line in enumerate(logical.splitlines(), 1):
+        if line.strip() == binding:
+            continue
+        for segment in shell_segments(line):
+            direct = [token for token in segment if shell_basename(token) == "download-verified"]
+            assert not direct, f"{relative}:{line_number}: direct or concatenated downloader invocation"
 
 
 fetch_mutations = (
@@ -98,6 +114,9 @@ fetch_mutations = (
     "for item in $(curl https://invalid.example); do true; done",
     "artifact=$(curl https://invalid.example)",
     'artifact="$(/usr/bin/wget2 https://invalid.example)"',
+    "cu\\\nrl https://invalid.example",
+    "/usr/bin/wg\\\net https://invalid.example",
+    "httpie https://invalid.example",
 )
 for mutation in fetch_mutations:
     try:
@@ -106,6 +125,26 @@ for mutation in fetch_mutations:
         pass
     else:
         raise AssertionError(f"fetch mutation was accepted: {mutation}")
+
+git_fetch_mutation = "git -C $work/source/aom fetch --quiet --depth=1 origin deadbeef"
+try:
+    assert_no_fetch_bypass("internal/stillprocessor/helper/build-pinned-toolchain.sh", git_fetch_mutation)
+except AssertionError:
+    pass
+else:
+    raise AssertionError("non-pinned git fetch mutation was accepted")
+
+downloader_mutations = (
+    '"$repo/internal/nativevalidation/download"-verified "$target" "$url" "$digest"',
+    '"$repo/internal/nativevalidation"/download-verified "$target" "$url" "$digest"',
+)
+for mutation in downloader_mutations:
+    try:
+        assert_no_direct_downloader("causal-downloader-mutation", mutation)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"direct downloader mutation was accepted: {mutation}")
 
 consumer_tuples = {
     "scripts/prepare-native-validation": [
@@ -137,7 +176,8 @@ for relative, expected in consumer_tuples.items():
     assert "download() {" not in text, f"{relative}: retains private downloader"
     assert "download_verified=$repo/internal/nativevalidation/download-verified" in text, f"{relative}: downloader binding changed"
     assert_no_fetch_bypass(relative, text)
-    logical = text.replace("\\\n", " ")
+    assert_no_direct_downloader(relative, text)
+    logical = text.replace("\\\n", "")
     actual = []
     probe_count = 0
     for line_number, line in enumerate(logical.splitlines(), 1):
@@ -641,6 +681,8 @@ esac
         entry = quarantine / "entry"
         entry.rename(invalid_identity_held)
         entry.write_text("foreign after invalid identity\n")
+        _process.send_signal(signal.SIGTERM)
+        _process.send_signal(signal.SIGHUP)
     status, _, _ = barrier_case(
         invalid_identity_target,
         "after-invalid-quarantine-identity-before-unlink",
@@ -660,13 +702,15 @@ esac
         entry = quarantine / "entry"
         entry.rename(invalid_finally_held)
         entry.write_text("foreign after invalid finally identity\n")
+        _process.send_signal(signal.SIGHUP)
+        _process.send_signal(signal.SIGINT)
     status, _, stderr = barrier_case(
         invalid_finally_target,
         "after-invalid-finally-identity-before-unlink",
         replace_after_invalid_finally_identity,
     )
-    assert status == 0, stderr
-    assert invalid_finally_target.read_bytes() == source.read_bytes()
+    assert status == 129, stderr
+    assert not lexists(invalid_finally_target)
     assert invalid_finally_held.read_bytes() == b"invalid finally boundary\n"
     consume_retained_quarantine(races, expected_bytes=b"foreign after invalid finally identity\n")
     assert_no_internal_residue(races)
