@@ -171,8 +171,28 @@ consumer_tuples = {
         ("$work/downloads/ffmpeg-9.0.2.tar.xz", "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz", "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"),
     ],
 }
+
+# These four scripts are the complete tracked downloader-consumer inventory.
+# Tuple parsing explains the contract; a canonical source digest additionally
+# rejects shell-equivalent variable/path constructions that a partial parser
+# cannot safely prove equivalent to one of the 15 blessed calls.
+consumer_source_sha256 = {
+    "scripts/prepare-native-validation": "8fce746de4602d9ccc97812918e332e116281510e6266b09cea6a4ac941f89e8",
+    "internal/stillprocessor/helper/build-pinned-toolchain.sh": "cd1d57ccb03a836240a159a43c78c3cc50fa53107e7fd5e8a5fac667f5dc2bbd",
+    "internal/animationprocessor/helper/build-pinned-codecs.sh": "b0cbaf149af53f5e3b1fd96e0f07c0411ff079f644523346e271815c1b106dbf",
+    "internal/videoprocessor/helper/build-pinned-toolchain.sh": "5ac5ed7f03d177dc583d138b3f8dfae748cedbf20986a071b967b71501c802e5",
+}
+assert set(consumer_source_sha256) == set(consumer_tuples), "canonical consumer inventory differs from tuple inventory"
+
+
+def assert_canonical_consumer(relative, text):
+    actual = hashlib.sha256(text.encode()).hexdigest()
+    assert actual == consumer_source_sha256[relative], f"{relative}: canonical consumer source changed"
+
+
 for relative, expected in consumer_tuples.items():
     text = (repo / relative).read_text()
+    assert_canonical_consumer(relative, text)
     assert "download() {" not in text, f"{relative}: retains private downloader"
     assert "download_verified=$repo/internal/nativevalidation/download-verified" in text, f"{relative}: downloader binding changed"
     assert_no_fetch_bypass(relative, text)
@@ -198,6 +218,18 @@ for relative, expected in consumer_tuples.items():
     expected_identifier_count = 1 + len(actual) + probe_count
     assert len(re.findall(r"\bdownload_verified\b", text)) == expected_identifier_count, f"{relative}: downloader identifier alias or hidden invocation"
 
+constructed_downloader_mutation = '''
+suffix=-verified
+"$repo/internal/nativevalidation/download$suffix" "$tools/extra.tar.gz" https://invalid.example/extra.tar.gz aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+'''
+mutated_prepare = (repo / "scripts/prepare-native-validation").read_text() + constructed_downloader_mutation
+try:
+    assert_canonical_consumer("scripts/prepare-native-validation", mutated_prepare)
+except AssertionError:
+    pass
+else:
+    raise AssertionError("constructed downloader invocation was accepted in an actual consumer")
+
 prepare_text = (repo / "scripts/prepare-native-validation").read_text()
 expected_cache_parent_probe = '''cache_parents=(
   "$tools"
@@ -214,17 +246,67 @@ tracked = subprocess.run(
     check=True,
     stdout=subprocess.PIPE,
 ).stdout.decode().split("\0")
+snapshot_exclusions = {"internal/nativevalidation/download-verified", "scripts/verify-native-downloads"}
+canonical_repository_sha256 = "a58628cd8026e9b34366d1e93992aca85f01e81e7556e75ae119d5eeb2c264c8"
+
+
+def repository_source_digest(contents):
+    digest = hashlib.sha256()
+    for relative in sorted(contents):
+        if relative in snapshot_exclusions:
+            continue
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(contents[relative])
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+tracked_contents = {relative: (repo / relative).read_bytes() for relative in filter(None, tracked)}
+assert repository_source_digest(tracked_contents) == canonical_repository_sha256, "canonical tracked source snapshot changed"
+
+split_constructed_consumer = b'''#!/usr/bin/env bash
+suffix=-verified
+helper=download
+"$repo/internal/nativevalidation/$helper$suffix" "$target" "$url" "$digest"
+'''
+mutated_contents = dict(tracked_contents)
+mutated_contents["scripts/new-split-constructed-consumer"] = split_constructed_consumer
+assert repository_source_digest(mutated_contents) != canonical_repository_sha256, "new tracked constructed consumer escaped repository snapshot"
+
 literal_reference_allowlist = set(consumer_tuples) | {"scripts/verify-native-downloads", ".github/workflows/ci.yml"}
 variable_reference_allowlist = set(consumer_tuples) | {"scripts/verify-native-downloads"}
+
+
+def assert_tracked_consumer_inventory(relative, text):
+    if "internal/nativevalidation/download" in text:
+        assert relative in literal_reference_allowlist, f"unvalidated downloader consumer/reference: {relative}"
+    if "download_verified" in text:
+        assert relative in variable_reference_allowlist, f"unvalidated downloader variable consumer: {relative}"
+
+
+discovered_literal_references = set()
+discovered_variable_references = set()
 for relative in filter(None, tracked):
     try:
         text = (repo / relative).read_text()
     except UnicodeDecodeError:
         continue
-    if "internal/nativevalidation/download-verified" in text:
-        assert relative in literal_reference_allowlist, f"unvalidated downloader consumer/reference: {relative}"
-    if "$download_verified" in text:
-        assert relative in variable_reference_allowlist, f"unvalidated downloader variable consumer: {relative}"
+    assert_tracked_consumer_inventory(relative, text)
+    if "internal/nativevalidation/download" in text:
+        discovered_literal_references.add(relative)
+    if "download_verified" in text:
+        discovered_variable_references.add(relative)
+
+assert discovered_literal_references == literal_reference_allowlist, "tracked downloader reference inventory changed"
+assert discovered_variable_references == variable_reference_allowlist, "tracked downloader variable inventory changed"
+
+try:
+    assert_tracked_consumer_inventory("scripts/new-constructed-consumer", constructed_downloader_mutation)
+except AssertionError:
+    pass
+else:
+    raise AssertionError("new tracked constructed downloader consumer was accepted")
 
 
 def lexists(path):
