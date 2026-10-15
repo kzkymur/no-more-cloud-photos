@@ -59,6 +59,26 @@ capabilities, and writes `.native-work/validation.env`. Run
 `scripts/prepare-native-validation COMMAND [ARG ...]` to execute another command
 with that environment, or source the generated file after preparation.
 
+The native download cache contract is Ubuntu 26.04 on Linux filesystems that
+support `O_TMPFILE`, `linkat(AT_EMPTY_PATH)`, and
+`renameat2(RENAME_NOREPLACE)`, with procfs mounted and numeric `mnt_id` fields
+available from `/proc/self/fdinfo`. Native preparation preflights those exact
+operations inside every real cache parent (`.tools`, the shared download
+directory, and the still, animation, and video download directories); a probe
+under `/tmp` is not accepted as evidence for the checkout filesystem. A missing
+kernel, filesystem, libc, or procfs capability fails before any network request
+and reports the operation and cache-parent path. Each probe retains one small
+mode-`0600` `.download-verified.capability-retained.*` marker in each cache
+parent. This deliberately trades bounded-per-run residue for an honest
+successful publication and rename test without an unsafe check-then-delete
+cleanup; the markers may be removed manually after validation is no longer
+running. Invalid cached entries are
+moved to a private `.download-verified.quarantine.*` directory before a verified
+replacement is published. Linux has no conditional unlink-by-descriptor, so a
+quarantined inode is retained rather than risking deletion of a same-UID
+namespace replacement; operators may inspect and remove retained quarantine
+directories after validation is no longer running.
+
 Compose uses checkout-hashed project, volume, and ownership labels. Its verify
 command guarantees cleanup, while Docker's image/build cache is retained.
 PostgreSQL inputs are never exposed directly from the checkout: the entrypoint

@@ -2,29 +2,100 @@
 import hashlib
 import os
 import pathlib
+import re
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
+
+if sys.flags.optimize:
+    raise SystemExit("verify-native-downloads requires Python assertions; do not use -O or PYTHONOPTIMIZE")
 
 repo = pathlib.Path(__file__).resolve().parent.parent
 downloader = repo / "internal/nativevalidation/download-verified"
 
-consumers = {
-    "scripts/prepare-native-validation": (6, ("exiftool-13.36.tar.gz", "ffmpeg-6.0.1-amd64-static.tar.xz", "canon-a410.dng")),
-    "internal/stillprocessor/helper/build-pinned-toolchain.sh": (4, ("lcms2-2.14.tar.gz", "LibRaw-0.22.2.tar.gz", "libheif-1.23.5.tar.gz", "vips-8.18.7.tar.xz")),
-    "internal/animationprocessor/helper/build-pinned-codecs.sh": (2, ("libwebp-1.6.0.tar.gz", "giflib-5.2.2.tar.gz")),
-    "internal/videoprocessor/helper/build-pinned-toolchain.sh": (3, ("zimg-3.0.6.tar.gz", "SVT-AV1-v4.2.0.tar.gz", "ffmpeg-9.0.2.tar.xz")),
+consumer_tuples = {
+    "scripts/prepare-native-validation": [
+        ("$tools/exiftool-13.36.tar.gz", "https://github.com/exiftool/exiftool/archive/refs/tags/13.36.tar.gz", "f70ecbcdccc18268d4d3c290faf8cf73b1cf128e3e7f8671e24d6604cae4dc73"),
+        ("$tools/ffmpeg-6.0.1-amd64-static.tar.xz", "https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz", "28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5"),
+        ("$downloads/sRGB2014.icc", "https://registry.color.org/rgb-registry/profiles/sRGB2014.icc", "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"),
+        ("$downloads/static-gallery-4.webp", "https://www.gstatic.com/webp/gallery/4.webp", "0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9"),
+        ("$downloads/orientation-6.jpg", "https://raw.githubusercontent.com/recurser/exif-orientation-examples/219294e144531b0c01247913cb58b6f5531b5081/Landscape_6.jpg", "9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124"),
+        ("$downloads/canon-a410.dng", "https://raw.pixls.us/data/Canon/Canon%20PowerShot%20A410/CANON_A410_CHDK_CRW_0741.DNG", "f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38"),
+    ],
+    "internal/stillprocessor/helper/build-pinned-toolchain.sh": [
+        ("$work/downloads/lcms2-2.14.tar.gz", "https://github.com/mm2/Little-CMS/releases/download/lcms2.14/lcms2-2.14.tar.gz", "28474ea6f6591c4d4cee972123587001a4e6e353412a41b3e9e82219818d5740"),
+        ("$work/downloads/LibRaw-0.22.2.tar.gz", "https://www.libraw.org/data/LibRaw-0.22.2.tar.gz", "de86b035655accff8d4010f1a221fdf50d353cb7b1422ba26f14a0db92612cfa"),
+        ("$work/downloads/libheif-1.23.5.tar.gz", "https://github.com/strukturag/libheif/releases/download/v1.23.5/libheif-1.23.5.tar.gz", "fd9036064c4432f0550d15072ddf34956a248279ee9aeaff0fba3fa0f77d8f1a"),
+        ("$work/downloads/vips-8.18.7.tar.xz", "https://github.com/libvips/libvips/releases/download/v8.18.7/vips-8.18.7.tar.xz", "5baaead3b0bb20ffdb9e9ff09aa9fda08620923df77b63b436654cb5e0b3bf94"),
+    ],
+    "internal/animationprocessor/helper/build-pinned-codecs.sh": [
+        ("$work/downloads/libwebp-1.6.0.tar.gz", "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz", "e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564"),
+        ("$work/downloads/giflib-5.2.2.tar.gz", "https://sourceforge.net/projects/giflib/files/giflib-5.2.2.tar.gz/download", "be7ffbd057cadebe2aa144542fd90c6838c6a083b5e8a9048b8ee3b66b29d5fb"),
+    ],
+    "internal/videoprocessor/helper/build-pinned-toolchain.sh": [
+        ("$work/downloads/zimg-3.0.6.tar.gz", "https://github.com/sekrit-twc/zimg/archive/refs/tags/release-3.0.6.tar.gz", "be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577"),
+        ("$work/downloads/SVT-AV1-v4.2.0.tar.gz", "https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v4.2.0/SVT-AV1-v4.2.0.tar.gz", "c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740"),
+        ("$work/downloads/ffmpeg-9.0.2.tar.xz", "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz", "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"),
+    ],
 }
-for relative, (count, names) in consumers.items():
+for relative, expected in consumer_tuples.items():
     text = (repo / relative).read_text()
-    assert "curl --" not in text, f"{relative}: bypasses shared downloader"
     assert "download() {" not in text, f"{relative}: retains private downloader"
-    assert text.count('"$download_verified"') == count, f"{relative}: incomplete shared-downloader coverage"
-    for name in names:
-        assert name in text, f"{relative}: missing pinned input {name}"
+    assert "download_verified=$repo/internal/nativevalidation/download-verified" in text, f"{relative}: downloader binding changed"
+    logical = text.replace("\\\n", " ")
+    actual = []
+    probe_count = 0
+    for line_number, line in enumerate(logical.splitlines(), 1):
+        tokens = shlex.split(line, comments=True, posix=True)
+        assert not tokens or tokens[0] != "curl", f"{relative}:{line_number}: bypasses shared downloader"
+        if tokens and tokens[0] == "$download_verified":
+            if tokens[1:] == ["--probe-parent", "$cache_parent"]:
+                assert relative == "scripts/prepare-native-validation", f"{relative}:{line_number}: unexpected capability probe"
+                probe_count += 1
+                continue
+            assert len(tokens) == 4, f"{relative}:{line_number}: downloader requires exact target/URL/digest arguments"
+            actual.append(tuple(tokens[1:]))
+    assert actual == expected, f"{relative}: exact target/URL/digest tuples changed\nexpected={expected!r}\nactual={actual!r}"
+    expected_probes = 1 if relative == "scripts/prepare-native-validation" else 0
+    assert probe_count == expected_probes, f"{relative}: capability probe invocation changed"
+    assert logical.count("$download_verified") == len(actual) + probe_count, f"{relative}: unparsed downloader invocation or alias"
+    assert text.count("internal/nativevalidation/download-verified") == 1, f"{relative}: direct or aliased downloader reference"
+    assert text.count("download-verified") == 1, f"{relative}: split-path or direct downloader reference"
+    expected_identifier_count = 1 + len(actual) + probe_count
+    assert len(re.findall(r"\bdownload_verified\b", text)) == expected_identifier_count, f"{relative}: downloader identifier alias or hidden invocation"
+
+prepare_text = (repo / "scripts/prepare-native-validation").read_text()
+expected_cache_parent_probe = '''cache_parents=(
+  "$tools"
+  "$downloads"
+  "$state/still/downloads"
+  "$state/animation/downloads"
+  "$state/video/downloads"
+)'''
+assert expected_cache_parent_probe in prepare_text, "native capability probe must cover every real cache parent"
+
+tracked = subprocess.run(
+    ["git", "ls-files", "-z"],
+    cwd=repo,
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().split("\0")
+literal_reference_allowlist = set(consumer_tuples) | {"scripts/verify-native-downloads", ".github/workflows/ci.yml"}
+variable_reference_allowlist = set(consumer_tuples) | {"scripts/verify-native-downloads"}
+for relative in filter(None, tracked):
+    try:
+        text = (repo / relative).read_text()
+    except UnicodeDecodeError:
+        continue
+    if "internal/nativevalidation/download-verified" in text:
+        assert relative in literal_reference_allowlist, f"unvalidated downloader consumer/reference: {relative}"
+    if "$download_verified" in text:
+        assert relative in variable_reference_allowlist, f"unvalidated downloader variable consumer: {relative}"
 
 
 def lexists(path):
@@ -37,6 +108,30 @@ def entries(path):
 
 def assert_no_internal_residue(directory):
     assert not any(name.startswith(".download-verified.") for name in entries(directory)), entries(directory)
+
+
+def consume_retained_quarantine(directory, *, expected_bytes=None, expected_type=stat.S_IFREG, symlink_target=None):
+    quarantines = [item for item in pathlib.Path(directory).iterdir() if item.name.startswith(".download-verified.quarantine.")]
+    assert len(quarantines) == 1, [item.name for item in quarantines]
+    quarantine = quarantines[0]
+    assert stat.S_IMODE(quarantine.stat().st_mode) == 0o700
+    entry = quarantine / "entry"
+    metadata = entry.lstat()
+    assert stat.S_IFMT(metadata.st_mode) == expected_type
+    if expected_bytes is not None:
+        if not metadata.st_mode & stat.S_IRUSR:
+            entry.chmod(0o600)
+        assert entry.read_bytes() == expected_bytes
+    if symlink_target is not None:
+        assert entry.is_symlink() and os.readlink(entry) == os.fspath(symlink_target)
+    shutil.rmtree(quarantine)
+
+
+def consume_empty_quarantine(directory):
+    quarantines = [item for item in pathlib.Path(directory).iterdir() if item.name.startswith(".download-verified.quarantine.")]
+    assert len(quarantines) == 1, [item.name for item in quarantines]
+    assert entries(quarantines[0]) == []
+    shutil.rmtree(quarantines[0])
 
 
 def wait_for(path, process):
@@ -133,7 +228,56 @@ esac
         stdout, stderr = process.communicate(timeout=15)
         return process.returncode, stdout, stderr
 
+    def barrier_sequence_case(target, events, mutations, mode="success"):
+        assert len(events) == len(mutations)
+        barrier_root = pathlib.Path(tempfile.mkdtemp(prefix="barrier-sequence-", dir=work))
+        run_env = base_env.copy()
+        run_env.update(
+            {
+                "FAKE_CURL_MODE": mode,
+                "NMCP_DOWNLOAD_TEST_BARRIER_DIR": str(barrier_root),
+                "NMCP_DOWNLOAD_TEST_BARRIER": ",".join(events),
+            }
+        )
+        process = subprocess.Popen(
+            [str(downloader), str(target), "fixture://native", digest],
+            env=run_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for event, mutate in zip(events, mutations):
+            ready = barrier_root / f"{event}.ready"
+            wait_for(ready, process)
+            mutate(process, barrier_root)
+            (barrier_root / f"{event}.release").touch()
+        stdout, stderr = process.communicate(timeout=15)
+        return process.returncode, stdout, stderr
+
     cache = work / "cache"
+    cache.mkdir()
+    capability = subprocess.run(
+        [str(downloader), "--probe-parent", str(cache)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert capability.returncode == 0, capability.stderr
+    capability_entries = entries(cache)
+    assert len(capability_entries) == 1
+    assert capability_entries[0].startswith(".download-verified.capability-retained.")
+    marker = cache / capability_entries[0]
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+    assert marker.read_bytes() == b"no-more-cloud-photos native cache capability\n"
+    unsupported = subprocess.run(
+        [str(downloader), "--probe-parent", "/proc"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert unsupported.returncode == 1
+    assert "cache parent lacks O_TMPFILE support at /proc:" in unsupported.stderr, unsupported.stderr
+
     warm_targets = (
         cache / ".tools/exiftool-13.36.tar.gz",
         cache / ".native-work/downloads/sRGB2014.icc",
@@ -147,6 +291,7 @@ esac
         result = invoke(target)
         assert result.returncode == 0, result.stderr
         assert target.read_bytes() == source.read_bytes()
+        consume_retained_quarantine(target.parent, expected_bytes=b"corrupt warm cache\n")
         assert_no_internal_residue(target.parent)
     initial_downloads = len(curl_log.read_text().splitlines())
     assert initial_downloads == len(warm_targets)
@@ -178,12 +323,14 @@ esac
     result = invoke(fifo_target)
     assert result.returncode == 0, result.stderr
     assert stat.S_ISREG(fifo_target.stat().st_mode) and fifo_target.read_bytes() == source.read_bytes()
+    consume_retained_quarantine(shapes, expected_type=stat.S_IFIFO)
     symlink_target = shapes / "symlink.tar.xz"
     symlink_target.symlink_to(outside, target_is_directory=True)
     result = invoke(symlink_target)
     assert result.returncode == 0, result.stderr
     assert not symlink_target.is_symlink() and symlink_target.read_bytes() == source.read_bytes()
     assert entries(outside) == ["sentinel"]
+    consume_retained_quarantine(shapes, expected_type=stat.S_IFLNK, symlink_target=outside)
     assert_no_internal_residue(shapes)
 
     unreadable_target = shapes / "unreadable.tar.xz"
@@ -192,6 +339,7 @@ esac
     result = invoke(unreadable_target)
     assert result.returncode == 0, result.stderr
     assert unreadable_target.read_bytes() == source.read_bytes()
+    consume_retained_quarantine(shapes, expected_bytes=b"unreadable corrupt cache\n")
 
     initial_parent = cache / "initial-parent-link"
     initial_parent.symlink_to(outside, target_is_directory=True)
@@ -208,6 +356,54 @@ esac
     status, _, stderr = barrier_case(no_named_temp, "temp-opened", assert_unnamed)
     assert status == 0, stderr
     assert no_named_temp.read_bytes() == source.read_bytes()
+
+    def install_collision(target, shape):
+        if shape == "directory":
+            target.mkdir()
+            (target / "sentinel").write_text("collision directory\n")
+        elif shape == "symlink":
+            target.symlink_to(outside, target_is_directory=True)
+        else:
+            target.write_text("collision regular\n")
+
+    def assert_collision(target, shape):
+        if shape == "directory":
+            assert target.is_dir() and entries(target) == ["sentinel"]
+        elif shape == "symlink":
+            assert target.is_symlink() and os.readlink(target) == os.fspath(outside)
+        else:
+            assert target.read_text() == "collision regular\n"
+
+    for shape in ("directory", "symlink", "regular"):
+        target = races / f"linkat-collision-{shape}"
+        before = len(curl_log.read_text().splitlines())
+        def collide_after_precheck(_process, _barriers, target=target, shape=shape):
+            install_collision(target, shape)
+        status, _, _ = barrier_case(target, "after-publish-absence-check", collide_after_precheck)
+        assert status == 1
+        assert len(curl_log.read_text().splitlines()) == before + 1
+        assert_collision(target, shape)
+        assert entries(outside) == ["sentinel"]
+        assert_no_internal_residue(races)
+
+    for event in ("warm-lstat-before-opath-open", "warm-readable-open-before-identity"):
+        for shape in ("directory", "symlink", "regular"):
+            target = races / f"{event}-{shape}"
+            held = races / f"{event}-{shape}-held"
+            target.write_bytes(source.read_bytes())
+            original = target.stat().st_dev, target.stat().st_ino
+            before = len(curl_log.read_text().splitlines())
+            def replace_warm_boundary(_process, _barriers, target=target, held=held, shape=shape):
+                target.rename(held)
+                install_collision(target, shape)
+            status, _, _ = barrier_case(target, event, replace_warm_boundary)
+            assert status == (73 if event == "warm-lstat-before-opath-open" and shape == "directory" else 1)
+            assert (held.stat().st_dev, held.stat().st_ino) == original
+            assert held.read_bytes() == source.read_bytes()
+            assert_collision(target, shape)
+            assert len(curl_log.read_text().splitlines()) == before
+            assert entries(outside) == ["sentinel"]
+            assert_no_internal_residue(races)
 
     for event in ("temp-downloaded", "temp-hashed", "before-publish"):
         target = races / f"appeared-{event}.tar.xz"
@@ -247,6 +443,7 @@ esac
         assert status == 1
         assert target.read_bytes() == source.read_bytes()
         assert held.read_bytes() == source.read_bytes()
+        consume_empty_quarantine(races)
         assert_no_internal_residue(races)
 
     aba_target = races / "final-aba.tar.xz"
@@ -257,6 +454,7 @@ esac
     status, _, _ = barrier_case(aba_target, "after-final-binding-1", rename_away_and_back)
     assert status == 1
     assert not lexists(aba_target)
+    consume_retained_quarantine(races, expected_bytes=source.read_bytes())
     assert_no_internal_residue(races)
 
     same_inode_mutation = races / "same-inode-after-final-hash.tar.xz"
@@ -265,6 +463,7 @@ esac
     status, _, _ = barrier_case(same_inode_mutation, "after-final-hash", mutate_published_inode)
     assert status == 1
     assert not lexists(same_inode_mutation)
+    consume_retained_quarantine(races, expected_bytes=b"mutated after final hash\n")
     assert_no_internal_residue(races)
 
     signal_target = races / "signal-after-publish.tar.xz"
@@ -273,6 +472,7 @@ esac
     status, _, _ = barrier_case(signal_target, "after-publish", interrupt_after_publish)
     assert status == 143
     assert not lexists(signal_target)
+    consume_retained_quarantine(races, expected_bytes=source.read_bytes())
     assert_no_internal_residue(races)
 
     rebound_root = cache / "rebound"
@@ -311,6 +511,7 @@ esac
     status, _, _ = barrier_case(published_rebound_target, "after-publish", rebind_after_publish)
     assert status == 1
     assert entries(outside) == ["sentinel"]
+    consume_retained_quarantine(published_rebound_held, expected_bytes=source.read_bytes())
     assert entries(published_rebound_held) == []
     rebound_parent.unlink()
     published_rebound_held.rename(rebound_parent)
@@ -325,6 +526,7 @@ esac
     assert status == 1
     assert invalid_target.read_text() == "foreign target\n"
     assert invalid_held.read_text() == "invalid\n"
+    consume_empty_quarantine(races)
     assert_no_internal_residue(races)
 
     quarantined_target = races / "after-quarantine.tar.xz"
@@ -339,6 +541,84 @@ esac
     assert status == 1
     assert quarantined_target.read_text() == "foreign quarantine\n"
     assert quarantined_held.read_text() == "invalid\n"
+    consume_empty_quarantine(races)
+    assert_no_internal_residue(races)
+
+    invalid_identity_target = races / "invalid-identity-boundary.tar.xz"
+    invalid_identity_target.write_bytes(b"invalid identity boundary\n")
+    invalid_identity_held = races / "invalid-identity-held"
+    def replace_after_invalid_identity(_process, _barriers):
+        quarantine = next(item for item in races.iterdir() if item.name.startswith(".download-verified.quarantine."))
+        entry = quarantine / "entry"
+        entry.rename(invalid_identity_held)
+        entry.write_text("foreign after invalid identity\n")
+    status, _, _ = barrier_case(
+        invalid_identity_target,
+        "after-invalid-quarantine-identity-before-unlink",
+        replace_after_invalid_identity,
+    )
+    assert status == 1
+    assert invalid_identity_target.read_text() == "foreign after invalid identity\n"
+    assert invalid_identity_held.read_bytes() == b"invalid identity boundary\n"
+    consume_empty_quarantine(races)
+    assert_no_internal_residue(races)
+
+    invalid_finally_target = races / "invalid-finally-boundary.tar.xz"
+    invalid_finally_target.write_bytes(b"invalid finally boundary\n")
+    invalid_finally_held = races / "invalid-finally-held"
+    def replace_after_invalid_finally_identity(_process, _barriers):
+        quarantine = next(item for item in races.iterdir() if item.name.startswith(".download-verified.quarantine."))
+        entry = quarantine / "entry"
+        entry.rename(invalid_finally_held)
+        entry.write_text("foreign after invalid finally identity\n")
+    status, _, stderr = barrier_case(
+        invalid_finally_target,
+        "after-invalid-finally-identity-before-unlink",
+        replace_after_invalid_finally_identity,
+    )
+    assert status == 0, stderr
+    assert invalid_finally_target.read_bytes() == source.read_bytes()
+    assert invalid_finally_held.read_bytes() == b"invalid finally boundary\n"
+    consume_retained_quarantine(races, expected_bytes=b"foreign after invalid finally identity\n")
+    assert_no_internal_residue(races)
+
+    def interrupt_published(process, _barriers):
+        process.send_signal(signal.SIGTERM)
+
+    owned_identity_target = races / "owned-identity-boundary.tar.xz"
+    owned_identity_held = races / "owned-identity-held"
+    def replace_after_owned_identity(_process, _barriers):
+        quarantine = next(item for item in races.iterdir() if item.name.startswith(".download-verified.quarantine."))
+        entry = quarantine / "entry"
+        entry.rename(owned_identity_held)
+        entry.write_text("foreign after owned identity\n")
+    status, _, _ = barrier_sequence_case(
+        owned_identity_target,
+        ("after-publish", "after-owned-quarantine-identity-before-unlink"),
+        (interrupt_published, replace_after_owned_identity),
+    )
+    assert status == 143
+    assert owned_identity_target.read_text() == "foreign after owned identity\n"
+    assert owned_identity_held.read_bytes() == source.read_bytes()
+    consume_empty_quarantine(races)
+    assert_no_internal_residue(races)
+
+    owned_finally_target = races / "owned-finally-boundary.tar.xz"
+    owned_finally_held = races / "owned-finally-held"
+    def replace_after_owned_finally_identity(_process, _barriers):
+        quarantine = next(item for item in races.iterdir() if item.name.startswith(".download-verified.quarantine."))
+        entry = quarantine / "entry"
+        entry.rename(owned_finally_held)
+        entry.write_text("foreign after owned finally identity\n")
+    status, _, _ = barrier_sequence_case(
+        owned_finally_target,
+        ("after-publish", "after-owned-finally-identity-before-unlink"),
+        (interrupt_published, replace_after_owned_finally_identity),
+    )
+    assert status == 143
+    assert not lexists(owned_finally_target)
+    assert owned_finally_held.read_bytes() == source.read_bytes()
+    consume_retained_quarantine(races, expected_bytes=b"foreign after owned finally identity\n")
     assert_no_internal_residue(races)
 
     assert entries(outside) == ["sentinel"]

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import ctypes
+import errno
 import hashlib
 import os
 import secrets
@@ -14,8 +15,12 @@ O_TMPFILE = getattr(os, "O_TMPFILE", 0o20000000)
 AT_EMPTY_PATH = 0x1000
 RENAME_NOREPLACE = 1
 libc = ctypes.CDLL(None, use_errno=True)
-libc.linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-libc.renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+linkat_call = getattr(libc, "linkat", None)
+renameat2_call = getattr(libc, "renameat2", None)
+if linkat_call is not None:
+    linkat_call.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+if renameat2_call is not None:
+    renameat2_call.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
 
 
 class Failure(Exception):
@@ -70,7 +75,9 @@ def same_inode(metadata, descriptor):
 
 
 def rename_noreplace(source_fd, source, destination_fd, destination):
-    result = libc.renameat2(
+    if renameat2_call is None:
+        raise OSError(errno.ENOSYS, "libc renameat2 is unavailable", source, destination)
+    result = renameat2_call(
         source_fd,
         os.fsencode(source),
         destination_fd,
@@ -83,7 +90,9 @@ def rename_noreplace(source_fd, source, destination_fd, destination):
 
 
 def publish_unnamed(descriptor, directory_fd, name):
-    result = libc.linkat(
+    if linkat_call is None:
+        raise OSError(errno.ENOSYS, "libc linkat is unavailable", name)
+    result = linkat_call(
         descriptor,
         ctypes.c_char_p(b""),
         directory_fd,
@@ -186,7 +195,8 @@ class ParentChain:
 def barrier(name, url):
     root = os.environ.get("NMCP_DOWNLOAD_TEST_BARRIER_DIR")
     selected = os.environ.get("NMCP_DOWNLOAD_TEST_BARRIER")
-    if not root or selected != name or not url.startswith("fixture://"):
+    selected_names = selected.split(",") if selected else []
+    if not root or name not in selected_names or not url.startswith("fixture://"):
         checkpoint()
         return
     ready = os.path.join(root, name + ".ready")
@@ -265,52 +275,51 @@ def quarantine_unlink(chain, name, expected_fd, purpose, url, validate_parent=Tr
     except FileNotFoundError:
         if quarantine_fd is not None:
             os.close(quarantine_fd)
-        try:
-            os.rmdir(quarantine, dir_fd=chain.directory_fd)
-        except OSError:
-            pass
         return False
     except Exception:
         if quarantine_fd is not None:
             os.close(quarantine_fd)
-        try:
-            os.rmdir(quarantine, dir_fd=chain.directory_fd)
-        except OSError:
-            pass
         raise
     try:
         barrier(f"after-{purpose}-quarantine", url)
-        quarantined = entry_metadata(quarantine_fd, "entry")
-        if quarantined is None:
+        try:
+            quarantined_fd = open_entry(quarantine_fd, "entry")
+        except FileNotFoundError:
             raise Failure(1, "quarantined entry disappeared")
-        if not same_inode(quarantined, expected_fd):
-            if restore_foreign(quarantine_fd, "entry", chain.directory_fd, name):
-                renamed = False
-            raise Failure(1, "foreign entry reached quarantine")
-        if validate_parent:
-            chain.validate()
-        os.unlink("entry", dir_fd=quarantine_fd)
-        renamed = False
-        if validate_parent:
-            chain.validate()
-        return True
+        try:
+            if descriptor_identity(quarantined_fd) != descriptor_identity(expected_fd):
+                if restore_foreign(quarantine_fd, "entry", chain.directory_fd, name):
+                    renamed = False
+                raise Failure(1, "foreign entry reached quarantine")
+            barrier(f"after-{purpose}-quarantine-identity-before-unlink", url)
+            if validate_parent:
+                chain.validate()
+            # Linux has no conditional unlink-by-descriptor operation.  Once an
+            # entry has been separately authorized, deleting its pathname would
+            # permit a same-UID namespace replacement to be deleted instead.
+            # Retain the authorized inode in the private quarantine rather than
+            # perform that unsafe check-then-unlink sequence.
+            return True
+        finally:
+            os.close(quarantined_fd)
     finally:
         if renamed:
-            quarantined = entry_metadata(quarantine_fd, "entry")
-            if quarantined is not None:
-                if same_inode(quarantined, expected_fd):
-                    try:
-                        os.unlink("entry", dir_fd=quarantine_fd)
-                    except OSError:
-                        pass
-                else:
-                    restore_foreign(quarantine_fd, "entry", chain.directory_fd, name)
-        if quarantine_fd is not None:
             try:
-                if bound_to(chain.directory_fd, quarantine, quarantine_fd):
-                    os.rmdir(quarantine, dir_fd=chain.directory_fd)
-            except OSError:
-                pass
+                current_fd = open_entry(quarantine_fd, "entry")
+            except FileNotFoundError:
+                current_fd = None
+            if current_fd is not None:
+                try:
+                    expected = descriptor_identity(current_fd) == descriptor_identity(expected_fd)
+                    barrier(f"after-{purpose}-finally-identity-before-unlink", url)
+                    if not expected:
+                        if restore_foreign(quarantine_fd, "entry", chain.directory_fd, name):
+                            renamed = False
+                finally:
+                    os.close(current_fd)
+            # Never pathname-unlink an entry after a separable identity check.
+            # On any uncertainty the quarantine is intentionally retained.
+        if quarantine_fd is not None:
             os.close(quarantine_fd)
 
 
@@ -324,6 +333,7 @@ def inspect_warm(chain, expected_digest, url):
     initial = entry_metadata(chain.directory_fd, chain.name)
     if initial is None:
         return False
+    barrier("warm-lstat-before-opath-open", url)
     descriptor = open_entry(chain.directory_fd, chain.name)
     try:
         opened = os.fstat(descriptor)
@@ -342,6 +352,7 @@ def inspect_warm(chain, expected_digest, url):
                     os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
                     dir_fd=chain.directory_fd,
                 )
+                barrier("warm-readable-open-before-identity", url)
             except OSError:
                 remove_invalid(chain, descriptor, url)
                 return False
@@ -411,6 +422,63 @@ def cleanup_owned_target(chain, descriptor, url):
         pending_signal = saved_signal
 
 
+def probe_parent(parent):
+    if not parent.startswith("/") or parent != os.path.normpath(parent):
+        raise Failure(2, "capability probe parent must be a normalized absolute path")
+    if not os.path.isdir(parent):
+        raise Failure(1, f"cache parent capability probe requires an existing directory: {parent}")
+    try:
+        chain = ParentChain(os.path.join(parent, ".download-verified-capability-target"))
+    except (Failure, OSError) as error:
+        detail = error.message if isinstance(error, Failure) else error.strerror
+        raise Failure(1, f"cache parent lacks descriptor/mount identity support at {parent}: {detail}") from error
+    token = f"{os.getpid()}.{secrets.token_hex(12)}"
+    source_name = f".download-verified.capability-source.{token}"
+    retained_name = f".download-verified.capability-retained.{token}"
+    content = b"no-more-cloud-photos native cache capability\n"
+    temporaries = []
+    try:
+        chain.validate()
+        try:
+            descriptor = os.open(".", O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600, dir_fd=chain.directory_fd)
+        except OSError as error:
+            raise Failure(1, f"cache parent lacks O_TMPFILE support at {parent}: {error.strerror}") from error
+        temporaries.append(descriptor)
+        os.write(descriptor, content)
+        try:
+            publish_unnamed(descriptor, chain.directory_fd, source_name)
+        except OSError as error:
+            raise Failure(1, f"cache parent lacks linkat(AT_EMPTY_PATH) support at {parent}: {error.strerror}") from error
+        if not bound_to(chain.directory_fd, source_name, descriptor):
+            raise Failure(1, f"cache parent linkat publication identity changed at {parent}/{source_name}")
+        try:
+            rename_noreplace(chain.directory_fd, source_name, chain.directory_fd, retained_name)
+        except OSError as error:
+            raise Failure(1, f"cache parent lacks renameat2(RENAME_NOREPLACE) support at {parent}: {error.strerror}") from error
+        if not bound_to(chain.directory_fd, retained_name, descriptor):
+            raise Failure(1, f"cache parent renameat2 identity changed at {parent}/{retained_name}")
+        try:
+            collision_fd = os.open(".", O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600, dir_fd=chain.directory_fd)
+        except OSError as error:
+            raise Failure(1, f"cache parent repeated O_TMPFILE check failed at {parent}: {error.strerror}") from error
+        temporaries.append(collision_fd)
+        try:
+            publish_unnamed(collision_fd, chain.directory_fd, retained_name)
+        except OSError as error:
+            if error.errno != errno.EEXIST:
+                raise Failure(1, f"cache parent linkat collision check failed at {parent}: {error.strerror}") from error
+        else:
+            raise Failure(1, f"cache parent linkat overwrote an existing entry at {parent}")
+        chain.validate()
+    finally:
+        for descriptor in temporaries:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        chain.close()
+
+
 def download(target, url, expected_digest):
     chain = ParentChain(target)
     temporary_fd = None
@@ -442,6 +510,7 @@ def download(target, url, expected_digest):
         chain.validate()
         if entry_metadata(chain.directory_fd, chain.name) is not None:
             raise Failure(1, "cache target appeared before publication")
+        barrier("after-publish-absence-check", url)
         publish_unnamed(temporary_fd, chain.directory_fd, chain.name)
         published = True
         published_state = descriptor_state(os.fstat(temporary_fd))
@@ -472,6 +541,9 @@ def download(target, url, expected_digest):
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--probe-parent":
+        probe_parent(sys.argv[2])
+        return
     if len(sys.argv) != 4 or not sys.argv[1].startswith("/"):
         raise Failure(2, f"usage: {sys.argv[0]} ABSOLUTE_TARGET URL SHA256")
     target, url, expected_digest = sys.argv[1:]

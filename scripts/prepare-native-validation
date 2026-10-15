@@ -23,8 +23,18 @@ for command in autoconf automake cmake ctest curl git go ldd make meson nasm nin
   need "$command"
 done
 
-mkdir -p "$tools" "$downloads" "$build" "$fixtures"
+cache_parents=(
+  "$tools"
+  "$downloads"
+  "$state/still/downloads"
+  "$state/animation/downloads"
+  "$state/video/downloads"
+)
+mkdir -p "$build" "$fixtures" "${cache_parents[@]}"
 rm -f -- "$env_file"
+for cache_parent in "${cache_parents[@]}"; do
+  "$download_verified" --probe-parent "$cache_parent"
+done
 scripts/verify-native-downloads
 
 "$download_verified" "$tools/exiftool-13.36.tar.gz" \
