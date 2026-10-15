@@ -27,8 +27,22 @@ rm -f -- "$env_file"
 
 download() {
   local target=$1 url=$2 digest=$3
+  if [[ -e $target ]] && ! printf '%s  %s\n' "$digest" "$target" | sha256sum --check >/dev/null 2>&1; then
+    rm -f -- "$target"
+  fi
   if [[ ! -f $target ]]; then
-    curl --fail --location --silent --show-error "$url" --output "$target"
+    local temporary
+    temporary=$(mktemp "$target.download.XXXXXXXX")
+    if ! curl --fail --location --silent --show-error --retry 2 --retry-all-errors \
+      --connect-timeout 30 --max-time 300 "$url" --output "$temporary"; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    if ! printf '%s  %s\n' "$digest" "$temporary" | sha256sum --check; then
+      rm -f -- "$temporary"
+      return 1
+    fi
+    mv -f -- "$temporary" "$target"
   fi
   printf '%s  %s\n' "$digest" "$target" | sha256sum --check
 }
