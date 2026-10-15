@@ -498,8 +498,8 @@ def validate_supervisor(source: str) -> None:
     if path != expected_path:
         die("persistent launch protocol path does not match its nonce")
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    descriptor = None
-    try:
+    with CleanupScope() as cleanup:
+        cleanup.defer("launch-marker-directory-close", os.close, directory)
         try:
             descriptor = os.open(os.path.basename(path),
                                  os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
@@ -508,6 +508,7 @@ def validate_supervisor(source: str) -> None:
             if absent_ok:
                 return False
             raise
+        cleanup.defer("launch-marker-close", os.close, descriptor)
         before = os.fstat(descriptor)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
                 or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
@@ -524,10 +525,6 @@ def validate_supervisor(source: str) -> None:
                 or before.st_size != len(expected_payload) or payload != expected_payload):
             die("persistent launch protocol marker was malformed or replaced")
         return True
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        os.close(directory)
 ''', "supervisor persistent launch marker validation changed")
     require_exact_function(tree, "validate_launch_required", '''def validate_launch_required(path, nonce):
     validate_launch_marker(path, nonce, ".required")
@@ -585,7 +582,8 @@ def validate_supervisor(source: str) -> None:
     for name, (expected_mode, object_id) in expected_files.items():
         path = os.path.join(destination, name)
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
+        with CleanupScope() as cleanup:
+            cleanup.defer("archive-member-close", os.close, descriptor)
             metadata = os.fstat(descriptor)
             if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
                     or stat.S_IMODE(metadata.st_mode) != expected_mode):
@@ -604,27 +602,122 @@ def validate_supervisor(source: str) -> None:
             )
             if identity(after) != identity(metadata):
                 die(f"archive member changed while verified: {name}")
-        finally:
-            os.close(descriptor)
         blob = git(repo, "cat-file", "blob", object_id)
         if extracted != blob:
             die(f"archive member differs from reviewed Git blob: {name}")
     return tree
 ''', "supervisor archive_tree blob binding/nofollow/metadata contract changed")
-    require_exact_function(tree, "run_phase", '''def run_phase(argv, *, env, pass_fds):
-    global ACTIVE_PHASE
-    process = subprocess.Popen(argv, cwd="/", env=env, pass_fds=pass_fds,
-                               start_new_session=True)
-    ACTIVE_PHASE = process
+    require_exact_assignment(tree, "OWNED_PHASE_GROUP", "OWNED_PHASE_GROUP = None",
+                              "supervisor owned phase process-group state changed")
+    require_exact_assignment(
+        tree, "CLEANUP_TRANSITION_ERRORS", "CLEANUP_TRANSITION_ERRORS = None",
+        "supervisor cleanup transition latch state changed")
+    require_exact_assignment(tree, "SIGNAL_ERRORS", "SIGNAL_ERRORS = []",
+                             "supervisor signal evidence latch changed")
+    require_exact_assignment(tree, "BODY_ACTIVE", "BODY_ACTIVE = False",
+                             "supervisor body activity latch changed")
+    require_exact_assignment(
+        tree, "HANDLED_TERMINATION_SIGNALS",
+        "HANDLED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)",
+        "supervisor handled termination signal set changed")
+    require_exact_function(tree, "interrupted", '''def interrupted(signum, _frame):
+    error = RuntimeError(f"supervisor interrupted by signal {signum}")
+    SIGNAL_ERRORS.append(("cleanup-transition-signal", error))
+    if BODY_ACTIVE:
+        raise error
+''', "supervisor signal handler must always latch and raise only in the active body")
+    require_exact_function(tree, "run_supervisor_body", '''def run_supervisor_body(resources):
+    global BODY_ACTIVE
     try:
+        BODY_ACTIVE = True
+        return supervisor_body(resources)
+    finally:
+        BODY_ACTIVE = False
+''', "supervisor body wrapper must finalize activity before propagating return or failure")
+    require_exact_function(tree, "run_phase", '''def run_phase(argv, *, env, pass_fds):
+    global ACTIVE_PHASE, OWNED_PHASE_GROUP
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)
+    with CleanupScope() as launch_cleanup:
+        launch_cleanup.defer("phase-signal-mask-restore", signal.pthread_sigmask,
+                             signal.SIG_SETMASK, old_mask)
+        process = subprocess.Popen(argv, cwd="/", env=env, pass_fds=pass_fds,
+                                   start_new_session=True)
+        group = provisional_process_group(process)
+        OWNED_PHASE_GROUP = group
+        ACTIVE_PHASE = process
+        validate_owned_process_group(group)
+    with CleanupScope() as cleanup:
+        cleanup.defer("phase-process-state", clear_active_phase, process)
         status = process.wait()
         if status:
             raise subprocess.CalledProcessError(status, argv)
-    finally:
-        if process.poll() is not None:
-            ACTIVE_PHASE = None
+        if process_group_exists(group["pgid"]):
+            die("phase leader exited while its process group remained live")
+        OWNED_PHASE_GROUP = None
 ''', "supervisor run_phase process/session/wait contract changed")
-    main_node = named_function(tree, "main")
+    require_exact_function(tree, "clear_active_phase", '''def clear_active_phase(process):
+    global ACTIVE_PHASE
+    if process.poll() is not None:
+        ACTIVE_PHASE = None
+''', "supervisor run_phase state restoration changed")
+    require_exact_function(tree, "provisional_process_group", '''def provisional_process_group(process):
+    return {"process": process, "pgid": process.pid}
+''', "supervisor provisional process-group ownership changed")
+    require_exact_function(tree, "validate_owned_process_group", '''def validate_owned_process_group(group):
+    process = group["process"]
+    pgid = group["pgid"]
+    if (type(pgid) is not int or pgid <= 0 or pgid == os.getpgrp()
+            or process.pid != pgid):
+        die("unsafe owned process-group identity")
+    if os.getpgid(pgid) != pgid:
+        die("launched process did not establish its owned session group")
+''', "supervisor owned process-group validation changed")
+    require_exact_function(tree, "launch_lock_keeper", '''def launch_lock_keeper(resources, lock_fd):
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)
+    with CleanupScope() as cleanup:
+        cleanup.defer("keeper-signal-mask-restore", signal.pthread_sigmask,
+                      signal.SIG_SETMASK, old_mask)
+        process = subprocess.Popen(
+            ("/bin/sh", "-c", "trap '' TERM INT HUP QUIT; while :; do /usr/bin/sleep 300; done"),
+            cwd="/", env=clean_env(), pass_fds=(lock_fd,), start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        group = provisional_process_group(process)
+        resources["lock_keeper_group"] = group
+        resources["lock_keeper"] = process
+        validate_owned_process_group(group)
+    return process
+''', "supervisor lock-keeper atomic ownership publication changed")
+    require_exact_function(tree, "launch_retained_process", '''def launch_retained_process(resources):
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)
+    with CleanupScope() as cleanup:
+        cleanup.defer("retained-signal-mask-restore", signal.pthread_sigmask,
+                      signal.SIG_SETMASK, old_mask)
+        process = subprocess.Popen(
+            ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
+             "--dbname=nmcp", "--command", "SELECT pg_sleep(300)"),
+            cwd="/", env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        group = provisional_process_group(process)
+        resources["retained_group"] = group
+        resources["retained_process"] = process
+        validate_owned_process_group(group)
+    return process
+''', "supervisor retained-process atomic ownership publication changed")
+    require_exact_function(tree, "process_group_exists", '''def process_group_exists(pgid):
+    if type(pgid) is not int or pgid <= 0 or pgid == os.getpgrp():
+        die("unsafe process-group probe identity")
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+''', "supervisor bounded process-group existence probe changed")
+    main_node = named_function(tree, "supervisor_body")
+    cleanup_node = named_function(tree, "cleanup_supervisor")
     loops = [
         node for node in ast.walk(main_node)
         if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
@@ -642,7 +735,7 @@ def validate_supervisor(source: str) -> None:
     require(len(phase_calls) == 1 and ast.dump(phase_calls[0]) == ast.dump(expected_phase_call),
             "supervisor run_phase invocation changed")
     loop_source = ast.get_source_segment(source, loops[0]) or ""
-    for fragment in (
+    phase_descriptor_fragments = (
         'trace.append(f"phase-start:{phase}")',
         'trace.append(f"phase-success:{phase}")',
         'trace.append(f"boundary-start:{phase}")',
@@ -660,16 +753,26 @@ def validate_supervisor(source: str) -> None:
         'phase_env[variable] = f"/proc/self/fd/{installed_fd}"',
         'run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase)',
         'env=phase_env, pass_fds=(phase_fd, *phase_inputs.values())',
-        'phase_env.pop(variable, None)',
+        'cleanup.defer("phase-close", os.close, phase_fd)',
+        'cleanup.defer("phase-input-close", os.close, installed_fd)',
+        'cleanup.defer("phase-env-remove", phase_env.pop, variable, None)',
         'staged_helper = open_verified(snapshot_fd, manifest, "runtime-helper")',
         'staged_sql = open_verified(snapshot_fd, manifest, "verify-runtime-roles.sql")',
         'installed_helper = os.open(installs["runtime-helper"], os.O_RDONLY | os.O_NOFOLLOW)',
         'installed_sql = os.open(installs["verify-runtime-roles.sql"], os.O_RDONLY | os.O_NOFOLLOW)',
         '("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{installed_helper}", str(installed_sql))',
         'pass_fds=(installed_helper, installed_sql, staged_helper, staged_sql)',
+        'cleanup.defer("boundary-staged-close", os.close, staged_helper)',
+        'cleanup.defer("boundary-staged-close", os.close, staged_sql)',
+        'cleanup.defer("boundary-installed-close", os.close, installed_helper)',
+        'cleanup.defer("boundary-installed-close", os.close, installed_sql)',
         'trace.append(f"boundary-success:{phase}")',
-    ):
-        require(loop_source.count(fragment) == 1, "supervisor phase descriptor/trace contract changed")
+    )
+    missing_phase_fragments = tuple(
+        fragment for fragment in phase_descriptor_fragments
+        if loop_source.count(fragment) != 1)
+    require(not missing_phase_fragments,
+            f"supervisor phase descriptor/trace contract changed: {missing_phase_fragments!r}")
     trace_events = re.findall(r'trace\.append\(f"([a-z-]+):\{phase\}"\)', loop_source)
     require(trace_events == ["phase-start", "phase-success", "boundary-start", "boundary-success"],
             "supervisor phase and boundary trace order changed")
@@ -697,14 +800,18 @@ def validate_supervisor(source: str) -> None:
         '            os.chmod(path, 0o755)',
         'fsync_directory(snapshot_build)\n        os.rename(snapshot_build, snapshot)\n'
         '        fsync_directory(run_root)\n        snapshot_fd = os.open(snapshot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)',
-        'if ACTIVE_PHASE is not None and ACTIVE_PHASE.poll() is None:',
-        'os.killpg(ACTIVE_PHASE.pid, signal.SIGTERM)',
-        'os.killpg(ACTIVE_PHASE.pid, signal.SIGKILL)',
+        'active_dead = terminate_process_group(',
+        'OWNED_PHASE_GROUP, "active-phase", 5, cleanup_errors)',
+        'retained_dead = terminate_process_group(',
+        'resources["retained_group"], "retained-process", 1, cleanup_errors)',
         'pass_fds=(lock_fd,), start_new_session=True',
+        'for signum in HANDLED_TERMINATION_SIGNALS:\n        signal.signal(signum, interrupted)',
         'recover_intents()\n    intents = []',
     )
     require(all(source.count(fragment) == 1 for fragment in hardening_fragments),
             "supervisor lock/snapshot/traversal/signal cleanup contract changed")
+    require(source.count("signal.signal(") == 1,
+            "supervisor installed signal handlers must be exactly the atomically masked set")
     manifest_fragments = (
         'records.append({"name": name, "purpose": purpose, "provenance_commit": current_commit,',
         '"provenance_tree": current_tree, "type": "regular", "uid": 0, "gid": 0,',
@@ -741,12 +848,19 @@ def validate_supervisor(source: str) -> None:
         'os.mkdir(name, mode, dir_fd=parent_fd)',
         'os.fsync(parent_fd)\n        fault(f"{fault_name or path}:after-mkdir")',
         'top_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)',
-        'entry["identity"] = metadata(top)\n            durable_intents(entries)',
-        'signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)',
+        'entry["identity"] = metadata(top)\n        durable_intents(entries)',
+        'cleanup.defer("signal-mask-restore", signal.pthread_sigmask,\n'
+        '                      signal.SIG_SETMASK, old_mask)',
+        'cleanup.defer("owned-parent-close", os.close, parent_fd)',
+        'cleanup.defer("umask-restore", os.umask, previous_umask)',
+        'cleanup.defer("owned-top-close", os.close, top_fd)',
     )
-    require(all(fragment in source for fragment in intent_contract)
+    missing_intent_fragments = tuple(
+        fragment for fragment in intent_contract if fragment not in source)
+    require(not missing_intent_fragments
             and source.count('fsync_directory("/run/nmcp-ci")') == 3,
-            "supervisor durable intent/bounded cleanup contract changed")
+            f"supervisor durable intent/bounded cleanup contract changed: "
+            f"{missing_intent_fragments!r}")
     launch_barrier_contract = (
         'if launch_required is not None:',
         'validate_launch_required(launch_required, nonce)',
@@ -757,49 +871,59 @@ def validate_supervisor(source: str) -> None:
         'while not validate_launch_marker(',
         'launch_barrier + ".release", nonce, ".release", absent_ok=True):',
         'die("timed out awaiting live launch attestation")',
-        'except BaseException as launch_error:',
-        'if "lock_keeper" in locals():',
-        'os.killpg(lock_keeper.pid, signal.SIGKILL)',
-        'f"{launch_error}; launch cleanup failed: "',
+        'resources["lock_fd"] = lock_fd',
+        'resources["lock_held"] = True',
+        'lock_keeper = launch_lock_keeper(resources, lock_fd)',
+        'resources["keeper_marker"] = True',
+        'resources["intents_acquired"] = True',
     )
     require(all(fragment in source for fragment in launch_barrier_contract)
             and source.count('launch_barrier = "/run/nmcp-ci/launch-" + nonce') == 1,
             "supervisor live launch barrier contract changed")
     cleanup_contract = (
         'cleanup_errors = []',
+        'class SupervisorCleanupFailure(RuntimeError):',
+        'f"{category}: {error}" for category, error in self.cleanup_errors',
         'CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"',
         'CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"',
         '("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp"))',
         '("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc"',
         'result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,',
         'if result.returncode:',
-        'marker = (CLEANUP_DATABASE_FAILURE if label == "drop database"',
+        'marker = CLEANUP_DATABASE_FAILURE if label == "drop database" else CLEANUP_ROLES_FAILURE',
         'print(marker, file=sys.stderr, flush=True)',
-        'cleanup_errors.append(RuntimeError(',
-        'cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))',
-        'if cleanup_errors:\n            raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))',
-        'if retained_process is not None:\n        die("retained cleanup dependency unexpectedly permitted cleanup")',
+        'cleanup_errors.append((label + "-report", error))',
+        'cleanup_errors.append((label + "-report", report_error))',
+        'cleanup_errors.append((label, RuntimeError(',
+        'cleanup_errors.append((label, RuntimeError(f"{label} could not run: {error}")))',
+        'if resources["keeper_marker"] and resources["lock_held"]:',
+        'if resources["intents_acquired"] and resources["lock_held"]:',
+        'supervisor_cleanup_errors = cleanup_supervisor(resources)',
+        'item for item in CLEANUP_TRANSITION_ERRORS if item[1] is not primary_error',
+        'raise SupervisorCleanupFailure(primary_error, cleanup_errors) from primary_error',
+        'raise primary_error',
+        'raise SupervisorCleanupFailure(None, cleanup_errors) from cleanup_errors[0][1]',
         'print("Ubuntu migration role compatibility verification passed", flush=True)',
     )
     require(all(fragment in source for fragment in cleanup_contract),
             "supervisor independent cleanup/result aggregation contract changed")
     cleanup_assignments = [
-        node for node in ast.walk(main_node)
+        node for node in ast.walk(cleanup_node)
         if isinstance(node, ast.Assign) and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "cleanup_commands"
     ]
-    expected_cleanup_assignment = ast.parse('''cleanup_commands = () if FAULT_MODE in ("fast-success", "fast-fail", "fast-hold") else (
+    expected_cleanup_assignment = ast.parse('''cleanup_commands = (
     ("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp")),
     ("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
                     "--dbname=postgres", "--set=ON_ERROR_STOP=1", "--command",
                     "DROP ROLE IF EXISTS nmcp_graph_probe,nmcp_graph_bridge,nmcp_api,nmcp_worker,nmcp_migrator,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner")),
-)
+) if resources["database_cleanup"] else ()
 ''').body[0]
     require(len(cleanup_assignments) == 1
             and ast.dump(cleanup_assignments[0]) == ast.dump(expected_cleanup_assignment),
             "supervisor only exact fast modes may skip the fixed database cleanup commands")
     cleanup_loops = [
-        node for node in ast.walk(main_node)
+        node for node in ast.walk(cleanup_node)
         if isinstance(node, ast.For)
         and ast.dump(node.target) == ast.dump(
             ast.parse("for label, arguments in cleanup_commands:\n    pass").body[0].target)
@@ -812,8 +936,10 @@ def validate_supervisor(source: str) -> None:
         'result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,': 1,
         'if result.returncode:': 1,
         'print(marker, file=sys.stderr, flush=True)': 2,
-        'cleanup_errors.append(RuntimeError(': 2,
-        'cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))': 1,
+        'cleanup_errors.append((label, RuntimeError(': 2,
+        'cleanup_errors.append((label, RuntimeError(f"{label} could not run: {error}")))': 1,
+        'cleanup_errors.append((label + "-report", error))': 1,
+        'cleanup_errors.append((label + "-report", report_error))': 1,
     }
     require(all(cleanup_loop_source.count(fragment) == count
                 for fragment, count in checked_cleanup_fragments.items()),
@@ -821,9 +947,46 @@ def validate_supervisor(source: str) -> None:
     require(source.index('print("Ubuntu migration role compatibility verification passed", flush=True)')
             > source.index('if cleanup_errors:'),
             "supervisor success marker must follow successful cleanup")
-    require(source.count('print("Ubuntu migration role compatibility verification passed", flush=True)') == 2
-            and 'if fast_success:\n            print("Ubuntu migration role compatibility verification passed", flush=True)' in source,
-            "supervisor fast and full success markers changed")
+    require(source.count('print("Ubuntu migration role compatibility verification passed", flush=True)') == 1,
+            "supervisor success marker must follow the one outer cleanup decision")
+    outer_main = named_function(tree, "main")
+    resource_initialization = ast.parse('''resources = {
+    "lock_fd": None, "lock_keeper": None, "lock_keeper_group": None,
+    "snapshot_fd": None, "retained_process": None, "retained_group": None,
+    "lock_held": False, "intents_acquired": False,
+    "keeper_marker": False, "database_cleanup": False,
+}
+''').body[0]
+    require(ast.dump(outer_main.body[2]) == ast.dump(resource_initialization)
+            and source.count("supervisor_cleanup_errors = cleanup_supervisor(resources)") == 1
+            and source.count("result = run_supervisor_body(resources)") == 1,
+            "supervisor resources must be initialized before one outer acquisition/cleanup system")
+    cleanup_transition = ast.parse('''try:
+    try:
+        result = run_supervisor_body(resources)
+    except BaseException as error:
+        primary_error = error
+finally:
+    CLEANUP_TRANSITION_ERRORS = SIGNAL_ERRORS
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)
+    except BaseException as error:
+        CLEANUP_TRANSITION_ERRORS.append(("cleanup-transition-mask", error))
+    supervisor_cleanup_errors = cleanup_supervisor(resources)
+    cleanup_errors = (*(
+        item for item in CLEANUP_TRANSITION_ERRORS if item[1] is not primary_error
+    ), *supervisor_cleanup_errors)
+''').body[0]
+    require(len(outer_main.body) > 4
+            and isinstance(outer_main.body[0], ast.Global)
+            and outer_main.body[0].names == ["CLEANUP_TRANSITION_ERRORS"]
+            and ast.dump(outer_main.body[1]) == ast.dump(
+                ast.parse("SIGNAL_ERRORS.clear()").body[0])
+            and ast.dump(outer_main.body[5]) == ast.dump(cleanup_transition)
+            and not any(
+                isinstance(node, ast.Attribute) and node.attr == "SIG_SETMASK"
+                for node in ast.walk(outer_main)),
+            "supervisor cleanup transition must latch, evidence, and non-restoringly mask every handled signal")
     nonce_contract = (
         'if os.geteuid() != 0 or len(sys.argv) not in (5, 6, 7):',
         'optional = list(sys.argv[5:])',
@@ -838,6 +1001,214 @@ def validate_supervisor(source: str) -> None:
     )
     require(all(source.count(fragment) == 1 for fragment in nonce_contract),
             "supervisor nonce argv/environment validation changed")
+    require(source.count('resources["database_cleanup"] = True') == 1
+            and source.index('resources["database_cleanup"] = True')
+                < source.index('run(("/usr/bin/systemctl", "start", "postgresql"))')
+            and source.index('resources["database_cleanup"] = True')
+                > source.index('fsync_directory("/var/lib/nmcp/deployment")'),
+            "supervisor database cleanup eligibility must begin immediately before PostgreSQL startup")
+    acquisition_order = (
+        'fcntl.flock(lock_fd, fcntl.LOCK_EX)',
+        'resources["lock_held"] = True',
+        'resources["intents_acquired"] = True',
+        'recover_intents()\n    intents = []',
+    )
+    acquisition_positions = tuple(source.find(fragment) for fragment in acquisition_order)
+    keeper_order = (
+        'lock_keeper = launch_lock_keeper(resources, lock_fd)',
+        'keeper_pid_fd = os.open(LOCK_KEEPER_PID_PATH,',
+        'resources["keeper_marker"] = True',
+    )
+    keeper_positions = tuple(source.find(fragment) for fragment in keeper_order)
+    require(all(position >= 0 for position in (*acquisition_positions, *keeper_positions))
+            and acquisition_positions == tuple(sorted(acquisition_positions))
+            and keeper_positions == tuple(sorted(keeper_positions)),
+            "supervisor cleanup eligibility flags must follow actual resource acquisition")
+    cleanup_source = ast.get_source_segment(source, cleanup_node) or ""
+    require_exact_function(tree, "terminate_process_group", '''def terminate_process_group(group, category, timeout, cleanup_errors):
+    if group is None:
+        return True
+    process = group["process"]
+    pgid = group["pgid"]
+    try:
+        live = process_group_exists(pgid)
+    except BaseException as error:
+        cleanup_errors.append((category + "-probe", error))
+        live = None
+    if live is False:
+        try:
+            process.poll()
+        except BaseException as error:
+            cleanup_errors.append((category + "-reap", error))
+        return True
+    if live is True:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            live = False
+        except BaseException as error:
+            cleanup_errors.append((category + "-kill", error))
+    timing_failed = False
+    try:
+        deadline = time.monotonic() + timeout
+    except BaseException as error:
+        cleanup_errors.append((category + "-wait-timing", error))
+        timing_failed = True
+        deadline = None
+    while live is True and deadline is not None:
+        try:
+            expired = time.monotonic() >= deadline
+        except BaseException as error:
+            cleanup_errors.append((category + "-wait-timing", error))
+            timing_failed = True
+            break
+        if expired:
+            break
+        try:
+            process.poll()
+        except BaseException as error:
+            cleanup_errors.append((category + "-reap", error))
+        try:
+            live = process_group_exists(pgid)
+        except BaseException as error:
+            cleanup_errors.append((category + "-probe", error))
+            live = None
+            break
+        if live:
+            try:
+                time.sleep(0.05)
+            except BaseException as error:
+                cleanup_errors.append((category + "-wait-timing", error))
+                timing_failed = True
+                break
+    if live is True:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            live = False
+        except BaseException as error:
+            cleanup_errors.append((category + "-force-kill", error))
+        try:
+            deadline = time.monotonic() + timeout
+        except BaseException as error:
+            cleanup_errors.append((category + "-force-wait-timing", error))
+            timing_failed = True
+            deadline = None
+        while live is True and deadline is not None:
+            try:
+                expired = time.monotonic() >= deadline
+            except BaseException as error:
+                cleanup_errors.append((category + "-force-wait-timing", error))
+                timing_failed = True
+                break
+            if expired:
+                break
+            try:
+                process.poll()
+            except BaseException as error:
+                cleanup_errors.append((category + "-reap", error))
+            try:
+                live = process_group_exists(pgid)
+            except BaseException as error:
+                cleanup_errors.append((category + "-probe", error))
+                live = None
+                break
+            if live:
+                try:
+                    time.sleep(0.05)
+                except BaseException as error:
+                    cleanup_errors.append((category + "-force-wait-timing", error))
+                    timing_failed = True
+                    break
+    if live is False and not timing_failed:
+        try:
+            process.poll()
+        except BaseException as error:
+            cleanup_errors.append((category + "-reap", error))
+        return True
+    cleanup_errors.append((category + "-containment-retained", RuntimeError(
+        "process-group absence was not confirmed; transaction containment retained")))
+    return False
+''', "supervisor bounded process-group termination and quarantine categorization changed")
+    quarantine_fragments = (
+        'active_dead = terminate_process_group(',
+        'retained_dead = terminate_process_group(',
+        'if not (active_dead and retained_dead):\n        return tuple(cleanup_errors)',
+        'keeper_dead = terminate_process_group(',
+        'if not keeper_dead:\n        return tuple(cleanup_errors)',
+        '("snapshot-close", error)', '("lock-keeper-marker-unlink", error)',
+        '("lock-keeper-marker-fsync", error)', '("intent-recovery", error)',
+        '("lock-close", error)',
+    )
+    require(all(cleanup_source.count(fragment) == 1 for fragment in quarantine_fragments)
+            and cleanup_source.index('if not (active_dead and retained_dead):')
+                < cleanup_source.index('cleanup_commands = (')
+            and cleanup_source.index('if not keeper_dead:')
+                < cleanup_source.index('os.unlink(LOCK_KEEPER_PID_PATH)')
+                < cleanup_source.index('recover_intents()')
+                < cleanup_source.index('os.close(lock_fd)'),
+            "supervisor unconfirmed process death must retain transaction containment")
+    aggregate_nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SupervisorCleanupFailure"
+    ]
+    cleanup_scope_nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CleanupScope"
+    ]
+    expected_cleanup_scope = ast.parse('''class CleanupScope:
+    def __init__(self):
+        self.actions = []
+
+    def __enter__(self):
+        return self
+
+    def defer(self, category, function, *args, **kwargs):
+        self.actions.append((category, function, args, kwargs))
+
+    def __exit__(self, _kind, primary_error, _traceback):
+        cleanup_errors = []
+        for category, function, args, kwargs in reversed(self.actions):
+            try:
+                function(*args, **kwargs)
+            except BaseException as error:
+                cleanup_errors.append((category, error))
+        if cleanup_errors:
+            cause = primary_error if primary_error is not None else cleanup_errors[0][1]
+            raise SupervisorCleanupFailure(primary_error, cleanup_errors) from cause
+        return False
+''').body[0]
+    require(len(cleanup_scope_nodes) == 1
+            and ast.dump(cleanup_scope_nodes[0]) == ast.dump(expected_cleanup_scope),
+            "supervisor local cleanup aggregation/reverse-attempt contract changed")
+    reviewed_cleanup_snapshots = {
+        "aggregate": {
+            "af0fa3d57246e7d1e79221535e4cd9fccaceedc3847163cdfe3dda51522c7400",
+            "b7483f09de9a25b49deeb15941a85111348f691b68fd6ce2a2d01c7c94db61b3",
+        },
+        "cleanup": {
+            "ea695de06933ca4eaad86e0f9ac24b74031e69ef91097831ba0238e9f778e5c5",
+            "30c35a13b47fc0e337182a59c829e325435294555a4c0dfb5807d5b16c92719d",
+        },
+        "main": {
+            "243c3080c02e9282062841ade8bc0a36a188b048273cf7de0e2f3000825f06d4",
+            "648470db4069a6f0829d3fd9f7a4c52dab55b5a031169e94cfaaf9c109029c20",
+            "a62a3fa765cb467b4366e29448b955b40f120d38b31c48a6141145d681676690",
+            "cb0f208dd559e4847f6187fd0f0814fc83d4d98abd4d44dffdb3c6e0623c7a5a",
+        },
+    }
+    observed_cleanup_snapshots = {
+        "aggregate": hashlib.sha256(ast.dump(
+            aggregate_nodes[0], include_attributes=False).encode()).hexdigest()
+        if len(aggregate_nodes) == 1 else "",
+        "cleanup": hashlib.sha256(ast.dump(
+            cleanup_node, include_attributes=False).encode()).hexdigest(),
+        "main": hashlib.sha256(ast.dump(
+            outer_main, include_attributes=False).encode()).hexdigest(),
+    }
+    require(all(observed_cleanup_snapshots[name] in fingerprints
+                for name, fingerprints in reviewed_cleanup_snapshots.items()),
+            "supervisor reviewed cleanup control-flow snapshot changed")
 
 
 def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
@@ -848,7 +1219,7 @@ def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
     # bypass this snapshot and must be rejected by the detailed inventories below.
     if enforce_snapshot:
         require(stable_source_digest(source)
-                == "cc619ec242842e11f4d541e0c1ae691a66fd16665ad27048fb564e6b6d9767c4",
+                == "1b2c38a6622d6d67eeae32b0b902980b0835cff422d61291729aed76f9536b29",
                 "client reviewed stable UTF-8/LF source snapshot changed")
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     expected_imports = ast.parse('''import fcntl
@@ -915,9 +1286,9 @@ import time
             "client structured cgroup failure identity changed")
     require_exact_assignment(tree, "RESULT_PREFIX", 'RESULT_PREFIX = "NMCP_CLIENT_RESULT_V1:"',
                              "client result prefix changed")
-    require_exact_assignment(tree, "RESULT_BYTE_LIMIT", "RESULT_BYTE_LIMIT = 8192",
-                              "client result bound changed")
-    require_exact_assignment(tree, "RESULT_EVENT_LIMIT", "RESULT_EVENT_LIMIT = 99",
+    require_exact_assignment(tree, "RESULT_BYTE_LIMIT", "RESULT_BYTE_LIMIT = select.PIPE_BUF",
+                               "client result bound changed")
+    require_exact_assignment(tree, "RESULT_EVENT_LIMIT", "RESULT_EVENT_LIMIT = 48",
                              "client result event bound changed")
     require_exact_assignment(tree, "PRIMARY_CATEGORIES", '''PRIMARY_CATEGORIES = (
     "none", "cleanup-test", "cancelled", "verification", "unexpected",
@@ -934,17 +1305,17 @@ import time
 )
 ''', "client cleanup result categories changed")
     require_exact_function(tree, "cleanup_result", '''def cleanup_result(category, boundary, errors=()):
+    global RESULT_EVENTS_COMPLETE
     if boundary not in CLEANUP_BOUNDARIES:
         boundary = "none"
     if category not in CLEANUP_CATEGORIES or (boundary == "none" and category != "unexpected"):
         category = "unexpected"
-    snapshot = (RETRIES.get(boundary, 0), INTERCEPTIONS.get(boundary, 0),
-                ATTEMPTS.get(boundary, 0))
-    RESULT_EVENTS.add((boundary, category, *snapshot))
-    if len(RESULT_EVENTS) > RESULT_EVENT_LIMIT:
-        RESULT_EVENTS.add((
-            "final", "unexpected", RETRIES.get("final", 0),
-            INTERCEPTIONS.get("final", 0), ATTEMPTS.get("final", 0)))
+    if len(RESULT_EVENTS) < RESULT_EVENT_LIMIT:
+        snapshot = (RETRIES.get(boundary, 0), INTERCEPTIONS.get(boundary, 0),
+                    ATTEMPTS.get(boundary, 0))
+        RESULT_EVENTS.append((len(RESULT_EVENTS), boundary, category, *snapshot))
+    else:
+        RESULT_EVENTS_COMPLETE = False
     RESULT_MAPPED_CLEANUP_ERRORS.update(id(error) for error in errors)
 ''', "client cleanup result aggregation changed")
     require_exact_function(tree, "cleanup_fail", '''def cleanup_fail(category, boundary, message):
@@ -1026,68 +1397,112 @@ import time
         record_cgroup_failure(error, boundary)
     if isinstance(error, CancellationFailure):
         return error
-    cancellation = cancellation_exception()
-    if cancellation is not None:
-        return cancellation
     if isinstance(error, PrimaryFailure):
         return error
     return (PrimaryFailure("verification", str(error))
             if isinstance(error, RuntimeError) else error)
 ''', "client primary exception conversion must retain structured cgroup evidence")
-    require_exact_function(tree, "render_client_result", '''def render_client_result(primary_error):
-    primary = primary_result_category(primary_error)
-    ordered = tuple(sorted(RESULT_EVENTS, key=lambda event: (
-        CLEANUP_BOUNDARIES.index(event[0]), CLEANUP_CATEGORIES.index(event[1]),
-        event[2], event[3], event[4])))
-    if len(ordered) > RESULT_EVENT_LIMIT:
-        overflow = tuple(event for event in ordered
-                         if event[:2] == ("final", "unexpected"))[-1]
-        ordered = ordered[:RESULT_EVENT_LIMIT - 1] + (overflow,)
-    events = ",".join(
-        f"{boundary}.{category}.{retries}.{interceptions}.{attempts}"
-        for boundary, category, retries, interceptions, attempts in ordered) or "-"
-    line = (
-        f"{RESULT_PREFIX}primary={primary};events={events};"
-        "return=1;stdout=0;success=0"
+    require_exact_function(tree, "preserve_primary", '''def preserve_primary(primary_error, error, boundary):
+    candidate = primary_exception(error, boundary)
+    if primary_error is None:
+        return candidate
+    cleanup_result("cancelled" if isinstance(candidate, CancellationFailure) else "unexpected",
+                   boundary, (candidate,))
+    return primary_error
+''', "client first primary, including cancellation, must remain authoritative")
+    render_source = ast.get_source_segment(source, named_function(tree, "render_client_result")) or ""
+    render_contract = (
+        "def render_client_result(primary_error, final_evidence):",
+        'f"{ordinal}.{boundary}.{category}.{retries}.{interceptions}.{attempts}"',
+        "for ordinal, boundary, category, retries, interceptions, attempts in RESULT_EVENTS",
+        "events_complete={int(RESULT_EVENTS_COMPLETE)}",
+        "final_scanned={int(scanned)}",
+        "final_observed={int(observed)}",
+        "final_empty={int(empty)}",
+        "return=1;stdout=0;success=0",
+        "len(encoded) > RESULT_BYTE_LIMIT",
     )
-    try:
-        encoded = line.encode("ascii")
-    except UnicodeEncodeError:
-        raise RuntimeError("client result schema was not ASCII") from None
-    if len(encoded) > RESULT_BYTE_LIMIT or "\\n" in line or "\\r" in line:
-        raise RuntimeError("client result schema exceeded its canonical bound")
-    return line
-''', "client result rendering derivation or bound changed")
-    require_exact_function(tree, "result_failure", '''def result_failure(primary_error, human):
-    raise ClientResultFailure(render_client_result(primary_error), human) from None
+    require(all(render_source.count(fragment) == 1 for fragment in render_contract)
+            and "sorted(" not in render_source and "set(" not in render_source,
+            "client append-only result rendering derivation or bound changed")
+    require_exact_function(tree, "result_failure", '''def result_failure(primary_error, human, final_evidence):
+    raise ClientResultFailure(render_client_result(primary_error, final_evidence), human) from None
 ''', "client result failure rendering changed")
-    require_exact_function(tree, "emit_terminal_result", '''def emit_terminal_result(primary_error, cleanup_errors, nonce, result):
-    signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
-    failure = None
-    try:
-        resolve_outcome(primary_error, cleanup_errors, nonce)
-    except ClientResultFailure as error:
-        failure = error
-    if failure is None:
-        descriptor = 1
-        payload = (SUCCESS + "\\n").encode("ascii")
-        status = result
-    else:
-        descriptor = 2
-        payload = (failure.machine + "\\nverification-client: "
-                   + top_level_diagnostic(failure) + "\\n").encode("ascii")
-        status = 1
-    cancellation = terminal_cancellation_exception()
-    if cancellation is not None:
-        failure = ClientResultFailure(
-            render_client_result(cancellation), sanitized_diagnostic(cancellation, nonce))
-        descriptor = 2
-        payload = (failure.machine + "\\nverification-client: "
-                   + top_level_diagnostic(failure) + "\\n").encode("ascii")
-        status = 1
-    os.write(descriptor, payload)
-    return status
-''', "client terminal result must remain one signal-masked low-level emission")
+    require_exact_function(tree, "resolve_outcome", '''def resolve_outcome(primary_error, cleanup_errors, nonce, final_evidence):
+    if (type(final_evidence) is not tuple or len(final_evidence) != 4
+            or any(type(bit) is not bool for bit in final_evidence[:3])
+            or final_evidence[2] and not (final_evidence[0] and final_evidence[1])
+            or (final_evidence[:3] != (True, True, True))
+                != (final_evidence[3] is not None)):
+        fail("final cgroup evidence was not immutable and complete")
+    if isinstance(primary_error, CgroupFailure):
+        record_cgroup_failure(primary_error, "final")
+    final_error = final_evidence[3]
+    if final_error is not None:
+        record_cgroup_failure(final_error, "final")
+    for error in cleanup_errors:
+        if not cleanup_error_mapped(error):
+            if isinstance(error, CgroupFailure):
+                record_cgroup_failure(error, "final")
+            else:
+                cleanup_result("unexpected", "final", (error,))
+    if not RESULT_EVENTS_COMPLETE:
+        cleanup_errors = [*cleanup_errors, RuntimeError("cleanup event evidence overflowed")]
+    if final_error is not None or cleanup_errors:
+        errors = []
+        if final_error is not None:
+            append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))
+            if primary_error is not None:
+                append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))
+        for error in cleanup_errors:
+            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
+        detail = sanitized_diagnostic("; ".join(errors), nonce)
+        if final_error is not None:
+            result_failure(primary_error, detail, final_evidence)
+        if primary_error is not None:
+            primary = sanitized_diagnostic(primary_error, nonce)
+            result_failure(primary_error, f"{primary}; cleanup failed: {detail}", final_evidence)
+        result_failure(None, f"cleanup failed: {detail}", final_evidence)
+    if primary_error is not None:
+        result_failure(primary_error, sanitized_diagnostic(primary_error, nonce), final_evidence)
+''', "client final evidence and result aggregation changed")
+    require_exact_function(tree, "cleanup_error_mapped", '''def cleanup_error_mapped(error):
+    if isinstance(error, CleanupFailure) and error.constituents:
+        return all(cleanup_error_mapped(constituent) for constituent in error.constituents)
+    return id(error) in RESULT_MAPPED_CLEANUP_ERRORS
+''', "client aggregate cleanup evidence mapping changed")
+    require_exact_function(tree, "write_terminal_payload", '''def write_terminal_payload(descriptor, payload):
+    if type(payload) is not bytes or not payload or len(payload) > select.PIPE_BUF:
+        raise TerminalEmissionFailure("terminal result payload exceeded PIPE_BUF")
+    while True:
+        try:
+            written = os.write(descriptor, payload)
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise TerminalEmissionFailure("terminal result write failed") from error
+        if written != len(payload):
+            raise TerminalEmissionFailure("terminal result write was not exact")
+        return
+''', "client terminal write retry/exactness contract changed")
+    emit_node = named_function(tree, "emit_terminal_result")
+    emit_source = ast.get_source_segment(source, emit_node) or ""
+    expected_terminal_mask = ast.parse(
+        "signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)").body[0]
+    emit_contract = (
+        "def emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence):",
+        "signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)",
+        "cancellation = terminal_cancellation_exception()",
+        "if primary_error is None:",
+        'cleanup_result("cancelled", "final", (cancellation,))',
+        "resolve_outcome(primary_error, cleanup_errors, nonce, final_evidence)",
+        "top_level_diagnostic(failure)",
+        "write_terminal_payload(descriptor, payload)",
+    )
+    require(all(emit_source.count(fragment) == 1 for fragment in emit_contract)
+            and "os.write" not in emit_source
+            and ast.dump(emit_node.body[0]) == ast.dump(expected_terminal_mask),
+            "client terminal result must have one cancellation decision and one frozen emission")
     require(literal_assignment(tree, "CGROUP_SNAPSHOT_ATTEMPTS") == 4
             and literal_assignment(tree, "RECORDED_CGROUP_LIMIT") == 64
             and literal_assignment(tree, "CANONICAL_CGROUP")
@@ -1214,6 +1629,16 @@ import time
         raise CgroupFailure(
             sanitized_diagnostic("; ".join(failures), None), residue_error, errors)
 ''', "client must prioritize residue and bound safe exhaustive cgroup observation failures")
+    require_exact_function(tree, "capture_final_cgroup_evidence", '''def capture_final_cgroup_evidence():
+    if not CLIENT_LOCK_HELD:
+        fail("final cgroup evidence requires client.lock")
+    residue, errors = fixed_cgroup_residue("final-close")
+    residue_error = CleanupFailure(CGROUP_RESIDUE_FAILURE) if residue else None
+    failures = ([str(residue_error)] if residue_error is not None else []) + list(map(str, errors))
+    failure = (CgroupFailure(sanitized_diagnostic("; ".join(failures), None),
+                             residue_error, errors) if failures else None)
+    return (True, not errors, not residue and not errors, failure)
+''', "client final empty evidence requires a complete error-free observation")
     require_exact_function(tree, "assert_prelaunch_absent", '''def assert_prelaunch_absent(state):
     if state.get("LoadState") != "not-found":
         fail("fixed verification unit is not explicitly absent: "
@@ -1221,44 +1646,20 @@ import time
     retain_control_group(state)
     assert_fixed_cgroups_empty("prelaunch")
 ''', "client prelaunch must reject loaded state before explicit-absence cgroup evidence")
-    require_exact_function(tree, "resolve_outcome", '''def resolve_outcome(primary_error, cleanup_errors, nonce):
-    primary_error = cancellation_exception() or primary_error
-    if isinstance(primary_error, CgroupFailure):
-        record_cgroup_failure(primary_error, "final")
-    primary_error = cancellation_exception() or primary_error
-    final_error = None
-    try:
-        assert_fixed_cgroups_empty("final-close")
-    except BaseException as error:
-        final_error = error
-        record_cgroup_failure(final_error, "final")
-    primary_error = cancellation_exception() or primary_error
-    for error in cleanup_errors:
-        if not cleanup_error_mapped(error):
-            if isinstance(error, CgroupFailure):
-                record_cgroup_failure(error, "final")
-            else:
-                cleanup_result("unexpected", "final", (error,))
-        primary_error = cancellation_exception() or primary_error
-    if final_error is not None or cleanup_errors:
-        errors = []
-        if final_error is not None:
-            append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))
-            if primary_error is not None:
-                append_unique_diagnostic(errors, sanitized_diagnostic(primary_error, nonce))
-        for error in cleanup_errors:
-            append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
-        detail = sanitized_diagnostic("; ".join(errors), nonce)
-        primary_error = cancellation_exception() or primary_error
-        if final_error is not None:
-            result_failure(primary_error, detail)
-        if primary_error is not None:
-            primary = sanitized_diagnostic(primary_error, nonce)
-            result_failure(primary_error, f"{primary}; cleanup failed: {detail}")
-        result_failure(None, f"cleanup failed: {detail}")
-    if primary_error is not None:
-        result_failure(primary_error, sanitized_diagnostic(primary_error, nonce))
-''', "client must classify complete final/cleanup evidence before one result emission")
+    resolve_source = ast.get_source_segment(source, named_function(tree, "resolve_outcome")) or ""
+    resolve_contract = (
+        "def resolve_outcome(primary_error, cleanup_errors, nonce, final_evidence):",
+        "type(final_evidence) is not tuple",
+        "final_error = final_evidence[3]",
+        "if not RESULT_EVENTS_COMPLETE:",
+        'RuntimeError("cleanup event evidence overflowed")',
+        "result_failure(primary_error, detail, final_evidence)",
+        'result_failure(None, f"cleanup failed: {detail}", final_evidence)',
+    )
+    require(all(resolve_source.count(fragment) == 1 for fragment in resolve_contract)
+            and "assert_fixed_cgroups_empty" not in resolve_source
+            and "cancellation_exception" not in resolve_source,
+            "client must consume immutable final evidence without rescanning or replacing primary")
     phase_argument_index = {"cgroup_pids": 1}
     phase_call_names = {
         "assert_fixed_cgroups_empty", "cgroup_pids", "client_pause", "command_path",
@@ -1282,7 +1683,6 @@ import time
         key = (call.func.id, phase)
         observed_phase_calls[key] = observed_phase_calls.get(key, 0) + 1
     expected_phase_calls = {
-        ("assert_fixed_cgroups_empty", "final-close"): 1,
         ("assert_fixed_cgroups_empty", "prelaunch"): 1,
         ("assert_fixed_cgroups_empty", "teardown"): 4,
         ("assert_fixed_cgroups_empty", "unload"): 1,
@@ -1300,6 +1700,7 @@ import time
         ("durable_marker", "unload"): 1,
         ("durable_marker", "work"): 3,
         ("fixed_cgroup_residue", "<forwarded>"): 1,
+        ("fixed_cgroup_residue", "final-close"): 1,
         ("fixed_cgroup_residue", "teardown"): 1,
         ("launch_state", "immediate"): 1,
         ("launch_state", "recovery"): 1,
@@ -1316,15 +1717,11 @@ import time
     require(observed_phase_calls == expected_phase_calls,
             "client lifecycle diagnostic phase routing changed")
     expected_guard = ast.parse('''if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as error:
-        raise SystemExit(emit_terminal_result(
-            primary_exception(error, "final"), [], None, 1))
+    raise SystemExit(main())
 ''').body[0]
     guards = [node for node in tree.body if isinstance(node, ast.If)]
     require(len(guards) == 2 and ast.dump(guards[-1]) == ast.dump(expected_guard),
-            "client top-level diagnostic sink must remain bounded and sanitized")
+            "client top level must not duplicate terminal emission")
     require(literal_assignment(tree, "UNIT") == "nmcp-migration-role-verifier.service",
             "client fixed transient service unit name changed")
     require_exact_assignment(tree, "RUN", 'RUN = "/run/nmcp-ci"',
@@ -1856,7 +2253,7 @@ import time
         'cleanup_database_failed={journal_evidence[1]}',
         'cleanup_roles_failed={journal_evidence[2]}',
         'while not journal_evidence[0]:',
-        'return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+        'return emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence)',
         'teardown_owned(invocation, nonce, exec_argv)',
         'assert_fixed_cgroups_empty("work")',
         'for signum in CANCELLATION_SIGNALS:',
@@ -1874,10 +2271,10 @@ import time
         'CLEANUP_ACTIVE = False',
         'discovered = launch_state("recovery", context="recovery")',
         'except BaseException as error:\n'
-        '            primary_error = primary_exception(error, "final")',
+        '            primary_error = preserve_primary(primary_error, error, "final")',
         'f"{sanitized_state(discovered)}"',
         'cleanup_errors.append(error)',
-        'result_failure(primary_error, f"{primary}; cleanup failed: {detail}")',
+        'result_failure(primary_error, f"{primary}; cleanup failed: {detail}", final_evidence)',
         'signal.sigpending() & CANCELLATION_SIGNALS',
         'os.write(descriptor, payload)',
         'client_pause("unload", "client-terminal-race-a-unloaded")',
@@ -2071,9 +2468,14 @@ except BaseException as error:
     cleanup_errors.append(error)
 finally:
     try:
-        close_client_lock(client_lock)
+        final_evidence = capture_final_cgroup_evidence()
     except BaseException as error:
         cleanup_errors.append(error)
+    finally:
+        try:
+            close_client_lock(client_lock)
+        except BaseException as error:
+            cleanup_errors.append(error)
 ''').body[0]
     require(isinstance(lock_try, ast.Try) and len(lock_try.finalbody) == 1
             and ast.dump(lock_try.finalbody[0]) == ast.dump(expected_close),
@@ -2096,19 +2498,21 @@ finally:
         'assert_fixed_cgroups_empty("work")',
         "teardown_owned(invocation, nonce, exec_argv)",
         'client_pause("unload", "client-terminal-race-a-unloaded")',
+        "final_evidence = capture_final_cgroup_evidence()",
         "close_client_lock(client_lock)",
     )
     positions = [lock_source.find(fragment) for fragment in ordered_lock_fragments]
     require(all(position >= 0 for position in positions)
             and positions == sorted(positions),
             "client.lock lifecycle ordering no longer covers reap through confirmed unload")
-    require(source.count("\n        resolve_outcome(primary_error, cleanup_errors, nonce)\n") == 1
+    require(source.count(
+                "resolve_outcome(primary_error, cleanup_errors, nonce, final_evidence)") == 2
             and source.count(
-                "return emit_terminal_result(primary_error, cleanup_errors, nonce, result)") == 1
+                "return emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence)") == 1
             and source.index(
-                "return emit_terminal_result(primary_error, cleanup_errors, nonce, result)")
+                "return emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence)")
             > source.index("close_client_lock(client_lock)"),
-            "client outcome must enter its terminal critical section after acquired-resource cleanup")
+            "client immutable outcome must be emitted only after lock-held final capture and cleanup")
     require(lock_source.count('durable_marker("work", "client-terminal-race-b.started")') == 1
             and lock_source.index('durable_marker("work", "client-terminal-race-b.started")')
             > lock_source.index('launched = command(service_argv, "launch", check=False)'),
@@ -2235,7 +2639,7 @@ if invocation is None:
     expected_handler = ast.parse('''try:
     pass
 except BaseException as error:
-    primary_error = primary_exception(error, "final")
+    primary_error = preserve_primary(primary_error, error, "final")
 ''').body[0].handlers[0]
     expected_finally = ast.parse('''try:
     pass
@@ -2277,7 +2681,11 @@ finally:
     COMMAND_DEADLINE = work_deadline
     cancellation = cancellation_exception()
     if cancellation is not None:
-        primary_error = cancellation
+        if primary_error is None:
+            primary_error = cancellation
+        else:
+            cleanup_result("cancelled", "final", (cancellation,))
+            cleanup_errors.append(cancellation)
     if RECOVERED_ERRORS:
         cleanup_errors.extend(RECOVERED_ERRORS)
 ''').body[0].finalbody
@@ -2742,7 +3150,7 @@ finally:
             == [ast.dump(node) for node in expected_outcome],
             "client must complete post-unload synchronization before outer cleanup")
     expected_post_lock = ast.parse('''return emit_terminal_result(
-    primary_error, cleanup_errors, nonce, result)
+    primary_error, cleanup_errors, nonce, result, final_evidence)
 ''').body
     lock_index = main_node.body.index(lock_try)
     require([ast.dump(node) for node in main_node.body[lock_index + 1:]]
@@ -3041,6 +3449,13 @@ finally:
 
 def validate_containment(source: str, phase: str) -> None:
     tree = ast.parse(source, filename="verify-ubuntu-migration-role-containment")
+    result_parser_source = ast.get_source_segment(
+        source, named_function(tree, "parse_client_result")) or ""
+    require(result_parser_source.count(
+                'if flags["final_empty"] and not (flags["final_scanned"] and flags["final_observed"]):') == 1
+            and result_parser_source.count(
+                'fail("client result schema final evidence was contradictory")') == 1,
+            "containment client result parser must reject contradictory final evidence")
     require_exact_function(tree, "retained_diagnostic", '''def retained_diagnostic(error, fallback):
     return str(error) if isinstance(error, EvidenceFailure) else fallback
 ''', "containment aggregation may retain only typed categorized diagnostics")
@@ -3989,8 +4404,8 @@ COUNTER_CATEGORIES = (
         "READY": 2, "PID_FILES": 1, "ENV": 12, "SUCCESS": 9,
         "RESULT_PREFIX": 5, "RESULT_BYTE_LIMIT": 1, "RESULT_EVENT_LIMIT": 1,
         "CLIENT_STDERR_BYTE_LIMIT": 2,
-        "RESULT_PRIMARY_CATEGORIES": 1, "RESULT_BOUNDARIES": 2,
-        "RESULT_CLEANUP_CATEGORIES": 2,
+        "RESULT_PRIMARY_CATEGORIES": 1, "RESULT_BOUNDARIES": 1,
+        "RESULT_CLEANUP_CATEGORIES": 1,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "STALE_REJECTION_PREFIX": 1, "DIAGNOSTIC_TEXT_LIMIT": 6,
         "PROGRAM": 2, "NONCE_VARIABLE": 3,
@@ -4201,7 +4616,7 @@ COUNTER_CATEGORIES = (
         "close_transaction_lock",
         "aggregate_counter_failure", "counter", "counter_failure", "counter_identity", "dict", "evidence_failure",
         "fail", "function",
-        "evaluate_persistent_result", "expected_persistent_result", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
+        "enumerate", "evaluate_persistent_result", "expected_persistent_result", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
         "launch_identity_matches", "launch_identity_signature", "list", "load_cleanup_intent",
         "lock_transaction", "map", "next", "observable_identity", "open",
         "open_transaction_lock", "os_call", "parse_structured_command", "path_exists", "popen",
@@ -4288,6 +4703,21 @@ COUNTER_CATEGORIES = (
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        # CPython 3.14 contradictory final-evidence rejection.
+        ("baac808ed0863905a85ef6e2919d7107337fb9121a2f12dc70ac9a1607ce07d5",
+         "7e76563f12e29b31b0240d14e17cb89e1efe9835bef6adf23da666b57b635bec",
+         "e11a509b8a1a5344b558c11b2f7f7903ada3c83aa6335500e6c924da3b2f5b07",
+         "de1fe74d891e9131ad2344dddabf4d28e1e55bc5fa7bc384b5667eca7ef7abfe"),
+        # CPython 3.12 contradictory final-evidence rejection.
+        ("2498d2c8c1d73b8827d0c2df958ab698ccbe9db4cbe43c90a4e64e4698a68ef6",
+         "575cb8a52e264b6387d0a9f548efa2a90eeac370600edc180a5ac78d9f77e46c",
+         "52db6fe7d050a322c1ae51dd7261ee33ca2da7f07dcecff1350d2e811602fbe0",
+         "6b43c950012d3c6726cfb0f9cfb1d474feaf37b206699931e281194f9709c08d"),
+        # CPython 3.14 nonce-bound argv and ordinal client-result contract.
+        ("3aad0058aba96a07752539daa9b287594ff8764167d98d62e8b3cff8f8599075",
+         "40c83f824ff62415f1ab9816179a43d7508618c4c1b3934fdaf5afa1c14cf801",
+         "e11a509b8a1a5344b558c11b2f7f7903ada3c83aa6335500e6c924da3b2f5b07",
+         "dda8c524727f6de8ddd18090276a28f82d49853aa26e67877da6a9810c8bbbe8"),
         ("13f8080e846eeba82c28c5be7a34d9d1bee5b30af561e73de6917cf9d4fe1671",
          "fb087a013ee70dcaa947c7f761b39f71e64f19fd2f863f57ecc7f56db329ebf5",
          "521cc31ba6b4b924ded2e22c0653af461e789d5ab68b9e46d84487de96d5fd1b",
@@ -4595,6 +5025,7 @@ COUNTER_CATEGORIES = (
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
                 in {"7a49f2d7c648b844bd9e0f205b03abe341254e7d730364222f4fcb9538474c9d",
                     "38c38f3be3504753058245186dc262c7de4b64117aad095dc8bf7b291822b5e1",
+                    "8bd4c83f02b7baaabbdf92ce66cbd0d3c9a9cedd68653682f2fe996d83a1a576",
                     "049ae2817fbd2bacf89f1efb7a0a2749adbc82cfe6793b46ab69269b11a297fd",
                     "1d70ddd3c38447ac648f6f32336183ca2c74814a97eed812c239236c07666512",
                     "bc61618b71906f8fd37a750859fbe21bb1d44c49c0565e1a60254fbf21b6a906",
@@ -4640,7 +5071,8 @@ COUNTER_CATEGORIES = (
                         "d72fc199850f4762a559b567f993f01f054da7e68b1d110a4ba2c600df230f8c",
                          "48d2a1f1d48b5f0eb5dd74aef6463e9f007f4db2212f232c185c64b8599b0a21",
                          "b5e491cc5deae20c6608be730f2d5122ee53d0fec91aacaef1daf62d64931c10",
-                         "3eb17733448b2be2ddd3e01caa09045921602fcf56beed5243215d70db5282ea"}
+                         "3eb17733448b2be2ddd3e01caa09045921602fcf56beed5243215d70db5282ea",
+                         "e31276abe1e0508ac96477c4599477c2cb3ba4013c0f1968ff4da1c067398a5b"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -4658,8 +5090,8 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 669, "AugAssign": 3, "Break": 10, "ClassDef": 2, "Continue": 11,
-        "Delete": 1, "Expr": 394, "For": 58, "FunctionDef": 104, "If": 293,
+        "Assign": 673, "AugAssign": 4, "Break": 10, "ClassDef": 2, "Continue": 11,
+        "Delete": 1, "Expr": 396, "For": 59, "FunctionDef": 104, "If": 296,
         "Import": 12, "Pass": 5, "Raise": 65, "Return": 108, "Try": 86, "While": 19,
     }
     actual_statement_inventory = {}
@@ -4741,7 +5173,10 @@ COUNTER_CATEGORIES = (
                          "b93d892af09453a3e660d409f7328e35a17af2a482bf28873c5d0247d7422572",
                          "d40b6c8fb7ea93d15df409918d535d73a99c5497675775a43809042926a65057",
                          "ce56a75e61d9a148a5261faab42674d620aa063bd914e34e30b2cfd1e5ed8fe6",
-                         "21fbbd0107cd38a1daaa410cf89c1f6ac4001652fb46633d9af352ee2c41745d"},
+                          "21fbbd0107cd38a1daaa410cf89c1f6ac4001652fb46633d9af352ee2c41745d",
+                          "10cff3bf959ecb4997e6d39a6035b8a906fe4b21da1c6e020b3113d1cdd68436",
+                          "b4411eb49334757c6d18df04b3f8781fb0aeab31a8e09ab4007b595fd2463af6",
+                          "b0bac21bf3291be909d81a1507e4696d14a372000a7831ae0dfc27545ae30abf"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -4940,7 +5375,8 @@ COUNTER_CATEGORIES = (
              f"{sanitized_state(state)}")
     supervisor_argv = ("/usr/bin/python3", "-I", "-S", PROGRAM,
                        os.path.abspath(os.path.join("/", repo)), commit, go_binary, nonce,
-                       persistent_supervisor_mode(mode))
+                       persistent_supervisor_mode(mode),
+                       "--persistent-launch-required=/run/nmcp-ci/launch-" + nonce + ".required")
     expected_argv = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
                      "LC_ALL=C", "LANG=C", "HOME=/root", prefix + nonce,
                      *supervisor_argv)
@@ -4954,24 +5390,18 @@ COUNTER_CATEGORIES = (
              f"{sanitized_state(state)}")
     return signature
 ''', "containment persistent full launch signature parser changed")
-    require_exact_function(tree, "assert_launch_signature_counterexamples", '''def assert_launch_signature_counterexamples(state, repo, commit, go_binary, mode):
-    mutations = {
-        "description": ("Description", "wrong verifier description"),
-        "environment": ("Environment", f"{NONCE_VARIABLE}={'0' * 64}"),
-        "exec-start": ("Command", {"path": "/usr/bin/env",
-                                     "argv": tuple("/bin/false" if item == PROGRAM else item
-                                                   for item in state["Command"]["argv"])}),
-        "fixed-property": ("KillMode", "process"),
-    }
-    for label, (property_name, replacement) in mutations.items():
-        changed = dict(state)
-        changed[property_name] = replacement
-        try:
-            persistent_launch_signature(changed, repo, commit, go_binary, mode)
-        except RuntimeError:
-            continue
-        fail(f"persistent launch signature accepted mismatched {label}")
-''', "containment live launch-signature counterexamples changed")
+    counterexample_source = ast.get_source_segment(
+        source, named_function(tree, "assert_launch_signature_counterexamples")) or ""
+    counterexample_contract = (
+        'required = "--persistent-launch-required=/run/nmcp-ci/launch-"',
+        'if marker_index != len(argv) - 1:',
+        '"required-marker-omitted"', '"required-marker-wrong"',
+        '"required-marker-reordered"',
+        'persistent_launch_signature(changed, repo, commit, go_binary, mode)',
+    )
+    require(all(counterexample_source.count(fragment) == 1
+                for fragment in counterexample_contract),
+            "containment live launch signature must reject marker omission, change, and reorder")
     require_exact_function(tree, "signed_launch_state", '''def signed_launch_state(signature, phase):
     return signed_launch_state_until(signature, phase, time.monotonic() + 10)
 ''', "containment persistent loaded polls must revalidate the retained full signature")
@@ -5971,7 +6401,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "428fb04c043001406146c627026247ff90bf3ac3fffac36a21a9698572546518",
+            == "d899f01bc1b900c50dd16a2dfe25f06f81d4c3887bd32e24f5aa9aaf49db8db2",
             "diagnostic fixture source snapshot changed")
 
 
@@ -6024,6 +6454,8 @@ def verify_supervisor_mutations(
     migration_wrapper: str,
     role_mode: str,
 ) -> None:
+    terminal_return = (
+        '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence)')
     supervisor_mutations = [
         ("inventory omission", replace_once(supervisor, '    "nmcp.sysusers": ("infra/ubuntu/sysusers.d/nmcp.conf", "nmcp system user declaration", 0o400),\n', ""), "asset inventory"),
         ("inventory extra", replace_once(supervisor, "CURRENT_ASSETS = {\n", 'CURRENT_ASSETS = {\n    "extra": ("extra", "extra", 0o400),\n'), "asset inventory"),
@@ -6035,17 +6467,168 @@ def verify_supervisor_mutations(
         ("git safe.directory omission", replace_once(supervisor, '("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo, *args)', '("/usr/bin/git", "-C", repo, *args)'), "command-scoped safe.directory"),
         ("archive blob comparison omission", replace_once(supervisor, '        if extracted != blob:\n            die(f"archive member differs from reviewed Git blob: {name}")\n', ""), "archive_tree blob binding"),
         ("archive blob comparison replacement", replace_once(supervisor, "        if extracted != blob:", "        if len(extracted) != len(blob):"), "archive_tree blob binding"),
-        ("run_phase immediate return", replace_once(supervisor, "    global ACTIVE_PHASE\n    process = subprocess.Popen", "    global ACTIVE_PHASE\n    return\n    process = subprocess.Popen"), "run_phase process/session/wait"),
+        ("run_phase immediate return", replace_once(supervisor, "    global ACTIVE_PHASE, OWNED_PHASE_GROUP\n    old_mask = signal.pthread_sigmask", "    global ACTIVE_PHASE, OWNED_PHASE_GROUP\n    return\n    old_mask = signal.pthread_sigmask"), "run_phase process/session/wait"),
         ("run_phase no-op", replace_once(supervisor, "        status = process.wait()", "        status = 0"), "run_phase process/session/wait"),
-        ("run_phase signal global omission", replace_once(supervisor, "    global ACTIVE_PHASE", "    global UNUSED_PHASE"), "run_phase process/session/wait"),
+        ("run_phase signal global omission", replace_once(supervisor,
+            "def run_phase(argv, *, env, pass_fds):\n    global ACTIVE_PHASE, OWNED_PHASE_GROUP",
+            "def run_phase(argv, *, env, pass_fds):\n    global UNUSED_PHASE"),
+            "run_phase process/session/wait"),
         ("run_phase session disabled", replace_once(supervisor, "                               start_new_session=True)", "                               start_new_session=False)"), "run_phase process/session/wait"),
         ("run_phase changed environment", replace_once(supervisor, "process = subprocess.Popen(argv, cwd=\"/\", env=env, pass_fds=pass_fds,", "process = subprocess.Popen(argv, cwd=\"/\", env=clean_env(), pass_fds=pass_fds,"), "run_phase process/session/wait"),
         ("run_phase changed descriptors", replace_once(supervisor, "process = subprocess.Popen(argv, cwd=\"/\", env=env, pass_fds=pass_fds,", "process = subprocess.Popen(argv, cwd=\"/\", env=env, pass_fds=(),"), "run_phase process/session/wait"),
+        ("phase masks only after Popen", replace_once(supervisor,
+            '    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)\n'
+            '    with CleanupScope() as launch_cleanup:\n'
+            '        launch_cleanup.defer("phase-signal-mask-restore", signal.pthread_sigmask,\n'
+            '                             signal.SIG_SETMASK, old_mask)\n'
+            '        process = subprocess.Popen(argv, cwd="/", env=env, pass_fds=pass_fds,\n'
+            '                                   start_new_session=True)',
+            '    with CleanupScope() as launch_cleanup:\n'
+            '        process = subprocess.Popen(argv, cwd="/", env=env, pass_fds=pass_fds,\n'
+            '                                   start_new_session=True)\n'
+            '        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)\n'
+            '        launch_cleanup.defer("phase-signal-mask-restore", signal.pthread_sigmask,\n'
+            '                             signal.SIG_SETMASK, old_mask)'),
+         "run_phase process/session/wait"),
+        ("phase validates before provisional publication", replace_once(supervisor,
+            '        OWNED_PHASE_GROUP = group\n        ACTIVE_PHASE = process\n'
+            '        validate_owned_process_group(group)',
+            '        validate_owned_process_group(group)\n'
+            '        OWNED_PHASE_GROUP = group\n        ACTIVE_PHASE = process'),
+         "run_phase process/session/wait"),
+        ("keeper masks only after Popen", replace_once(supervisor,
+            'def launch_lock_keeper(resources, lock_fd):\n'
+            '    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)\n'
+            '    with CleanupScope() as cleanup:\n'
+            '        cleanup.defer("keeper-signal-mask-restore", signal.pthread_sigmask,\n'
+            '                      signal.SIG_SETMASK, old_mask)\n'
+            '        process = subprocess.Popen(\n'
+            '            ("/bin/sh", "-c", "trap \'\' TERM INT HUP QUIT; while :; do /usr/bin/sleep 300; done"),\n'
+            '            cwd="/", env=clean_env(), pass_fds=(lock_fd,), start_new_session=True,\n'
+            '            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n'
+            '        )',
+            'def launch_lock_keeper(resources, lock_fd):\n'
+            '    with CleanupScope() as cleanup:\n'
+            '        process = subprocess.Popen(\n'
+            '            ("/bin/sh", "-c", "trap \'\' TERM INT HUP QUIT; while :; do /usr/bin/sleep 300; done"),\n'
+            '            cwd="/", env=clean_env(), pass_fds=(lock_fd,), start_new_session=True,\n'
+            '            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n'
+            '        )\n'
+            '        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)\n'
+            '        cleanup.defer("keeper-signal-mask-restore", signal.pthread_sigmask,\n'
+            '                      signal.SIG_SETMASK, old_mask)'),
+         "lock-keeper atomic ownership publication"),
+        ("keeper validates before provisional publication", replace_once(supervisor,
+            '        resources["lock_keeper_group"] = group\n'
+            '        resources["lock_keeper"] = process\n'
+            '        validate_owned_process_group(group)',
+            '        validate_owned_process_group(group)\n'
+            '        resources["lock_keeper_group"] = group\n'
+            '        resources["lock_keeper"] = process'),
+         "lock-keeper atomic ownership publication"),
+        ("retained masks only after Popen", replace_once(supervisor,
+            'def launch_retained_process(resources):\n'
+            '    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)\n'
+            '    with CleanupScope() as cleanup:\n'
+            '        cleanup.defer("retained-signal-mask-restore", signal.pthread_sigmask,\n'
+            '                      signal.SIG_SETMASK, old_mask)\n'
+            '        process = subprocess.Popen(\n'
+            '            ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",\n'
+            '             "--dbname=nmcp", "--command", "SELECT pg_sleep(300)"),\n'
+            '            cwd="/", env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n'
+            '            start_new_session=True,\n'
+            '        )',
+            'def launch_retained_process(resources):\n'
+            '    with CleanupScope() as cleanup:\n'
+            '        process = subprocess.Popen(\n'
+            '            ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",\n'
+            '             "--dbname=nmcp", "--command", "SELECT pg_sleep(300)"),\n'
+            '            cwd="/", env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n'
+            '            start_new_session=True,\n'
+            '        )\n'
+            '        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)\n'
+            '        cleanup.defer("retained-signal-mask-restore", signal.pthread_sigmask,\n'
+            '                      signal.SIG_SETMASK, old_mask)'),
+         "retained-process atomic ownership publication"),
+        ("retained validates before provisional publication", replace_once(supervisor,
+            '        resources["retained_group"] = group\n'
+            '        resources["retained_process"] = process\n'
+            '        validate_owned_process_group(group)',
+            '        validate_owned_process_group(group)\n'
+            '        resources["retained_group"] = group\n'
+            '        resources["retained_process"] = process'),
+         "retained-process atomic ownership publication"),
+        ("extra installed unmasked signal handler", replace_once(supervisor,
+            '    for signum in HANDLED_TERMINATION_SIGNALS:\n'
+            '        signal.signal(signum, interrupted)',
+            '    for signum in HANDLED_TERMINATION_SIGNALS:\n'
+            '        signal.signal(signum, interrupted)\n'
+            '    signal.signal(signal.SIGHUP, interrupted)'),
+         "installed signal handlers"),
+        ("signal evidence latch omitted", replace_once(supervisor,
+            '    SIGNAL_ERRORS.append(("cleanup-transition-signal", error))',
+            '    pass'),
+         "signal handler"),
+        ("body signal conditional raise omitted", replace_once(supervisor,
+            '    if BODY_ACTIVE:\n        raise error',
+            '    if BODY_ACTIVE:\n        pass'),
+         "signal handler"),
+        ("post-body signal raises", replace_once(supervisor,
+            '    if BODY_ACTIVE:\n        raise error',
+            '    raise error'),
+         "signal handler"),
+        ("body wrapper finalization omitted", replace_once(supervisor,
+            '    finally:\n        BODY_ACTIVE = False\n\n\ndef clean_env',
+            '    finally:\n        pass\n\n\ndef clean_env'),
+         "body wrapper"),
+        ("body wrapper clears before return", replace_once(supervisor,
+            '        return supervisor_body(resources)\n    finally:\n        BODY_ACTIVE = False',
+            '        BODY_ACTIVE = False\n        return supervisor_body(resources)\n    finally:\n        pass'),
+         "body wrapper"),
+        ("cleanup transition latch removed", replace_once(supervisor,
+            '        CLEANUP_TRANSITION_ERRORS = SIGNAL_ERRORS\n        try:\n'
+            '            signal.pthread_sigmask',
+            '        try:\n            signal.pthread_sigmask'),
+         "cleanup transition"),
+        ("cleanup termination mask removed", replace_once(supervisor,
+            '            signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)\n',
+            '            pass\n'),
+         "cleanup transition"),
+        ("cleanup termination mask installed late", replace_once(supervisor,
+            '        CLEANUP_TRANSITION_ERRORS = SIGNAL_ERRORS\n'
+            '        try:\n'
+            '            signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)',
+            '        try:\n'
+            '            signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)\n'
+            '            CLEANUP_TRANSITION_ERRORS = SIGNAL_ERRORS'),
+         "cleanup transition"),
+        ("cleanup mask failure discarded", replace_once(supervisor,
+            '        except BaseException as error:\n'
+            '            CLEANUP_TRANSITION_ERRORS.append(("cleanup-transition-mask", error))',
+            '        except BaseException:\n            pass'),
+         "cleanup transition"),
+        ("cleanup transition evidence discarded", replace_once(supervisor,
+            '        cleanup_errors = (*(\n'
+            '            item for item in CLEANUP_TRANSITION_ERRORS if item[1] is not primary_error\n'
+            '        ), *supervisor_cleanup_errors)',
+            '        cleanup_errors = supervisor_cleanup_errors'),
+         "independent cleanup/result aggregation"),
+        ("cleanup termination mask restored", replace_once(supervisor,
+            '        supervisor_cleanup_errors = cleanup_supervisor(resources)\n'
+            '        cleanup_errors = (*(\n'
+            '            item for item in CLEANUP_TRANSITION_ERRORS if item[1] is not primary_error\n'
+            '        ), *supervisor_cleanup_errors)',
+            '        supervisor_cleanup_errors = cleanup_supervisor(resources)\n'
+            '        signal.pthread_sigmask(signal.SIG_SETMASK, set())\n'
+            '        cleanup_errors = (*(\n'
+            '            item for item in CLEANUP_TRANSITION_ERRORS if item[1] is not primary_error\n'
+            '        ), *supervisor_cleanup_errors)'),
+         "cleanup transition"),
         ("run_phase invocation environment", replace_once(supervisor, "                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))", "                          env=clean_env(), pass_fds=(phase_fd, *phase_inputs.values()))"), "run_phase invocation"),
         ("run_phase invocation descriptors", replace_once(supervisor, "                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))", "                          env=phase_env, pass_fds=(phase_fd,))"), "run_phase invocation"),
         ("launch barrier cleanup omitted", replace_once(
-            supervisor, '        if "lock_keeper" in locals():\n',
-            '        if False:\n'),
+            supervisor, '        lock_keeper = launch_lock_keeper(resources, lock_fd)\n',
+            ''),
          "live launch barrier contract"),
         ("launch marker treated as optional existence hint", replace_once(
             supervisor, '        if launch_required is not None:\n'
@@ -6073,7 +6656,21 @@ def verify_supervisor_mutations(
         ("duplicate run_phase execution", replace_once(supervisor, '                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))', '                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))\n                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),\n                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))'), "run_phase invocation"),
         ("lock metadata gap", replace_once(supervisor, "or lock_stat.st_gid != 0 or lock_stat.st_nlink != 1", "or lock_stat.st_gid != 0"), "lock/snapshot/traversal/signal cleanup"),
         ("non-atomic snapshot", replace_once(supervisor, "        os.rename(snapshot_build, snapshot)", "        shutil.copytree(snapshot_build, snapshot)"), "lock/snapshot/traversal/signal cleanup"),
-        ("outer SIGKILL wrong target", replace_once(supervisor, "os.killpg(ACTIVE_PHASE.pid, signal.SIGKILL)", "os.kill(ACTIVE_PHASE.pid, signal.SIGKILL)"), "lock/snapshot/traversal/signal cleanup"),
+        ("owned phase group not retained", replace_once(supervisor,
+            "        OWNED_PHASE_GROUP = group\n", ""), "run_phase process/session/wait"),
+        ("phase success group probe omitted", replace_once(supervisor,
+            '        if process_group_exists(group["pgid"]):\n'
+            '            die("phase leader exited while its process group remained live")\n', ""),
+            "run_phase process/session/wait"),
+        ("group probe reduced to leader PID", replace_once(supervisor,
+            "        os.killpg(pgid, 0)", "        os.kill(pgid, 0)"),
+            "process-group existence probe"),
+        ("outer SIGTERM wrong target", replace_once(supervisor,
+            "            os.killpg(pgid, signal.SIGTERM)",
+            "            os.kill(pgid, signal.SIGTERM)"), "process-group termination"),
+        ("outer SIGKILL wrong target", replace_once(supervisor,
+            "            os.killpg(pgid, signal.SIGKILL)",
+            "            os.kill(pgid, signal.SIGKILL)"), "process-group termination"),
         ("helper verification gap", replace_once(supervisor, 'staged_helper = open_verified(snapshot_fd, manifest, "runtime-helper")', 'staged_helper = os.open(installs["runtime-helper"], os.O_RDONLY)'), "descriptor/trace"),
         ("SQL verification gap", replace_once(supervisor, 'staged_sql = open_verified(snapshot_fd, manifest, "verify-runtime-roles.sql")', 'staged_sql = os.open(installs["verify-runtime-roles.sql"], os.O_RDONLY)'), "descriptor/trace"),
         ("path helper execution", replace_once(supervisor, 'f"/proc/self/fd/{installed_helper}"', 'installs["runtime-helper"]'), "descriptor/trace"),
@@ -6094,33 +6691,133 @@ def verify_supervisor_mutations(
         ("cleanup target identity omitted", replace_once(supervisor, 'if expected is not None and metadata(top) != expected:', 'if False:'), "durable intent"),
         ("intent journal not directory fsynced", replace_once(supervisor, 'os.replace(temporary, INTENT_PATH)\n    fsync_directory("/run/nmcp-ci")', 'os.replace(temporary, INTENT_PATH)'), "durable intent"),
         ("dropdb status unchecked", replace_once(supervisor,
-            '                if result.returncode:\n                    print(marker, file=sys.stderr, flush=True)\n                    cleanup_errors.append(RuntimeError(',
-            '                if False:\n                    print(marker, file=sys.stderr, flush=True)\n                    cleanup_errors.append(RuntimeError('), "cleanup"),
+            '            if result.returncode:\n                cleanup_errors.append((label, RuntimeError(',
+            '            if False:\n                cleanup_errors.append((label, RuntimeError('), "cleanup"),
         ("cleanup result marker omitted", replace_once(supervisor,
-            '                    print(marker, file=sys.stderr, flush=True)\n                    cleanup_errors.append(RuntimeError(',
-            '                    cleanup_errors.append(RuntimeError('), "cleanup"),
-        ("cleanup exceptions discarded", replace_once(supervisor, 'cleanup_errors.append(RuntimeError(f"{label} could not run: {error}"))', 'pass'), "cleanup"),
-        ("cleanup aggregation omitted", replace_once(supervisor, '        if cleanup_errors:\n            raise RuntimeError("cleanup failed: " + "; ".join(map(str, cleanup_errors)))', '        pass'), "independent cleanup"),
-        ("dropdb cleanup omitted", replace_once(supervisor, '            ("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp")),\n', ''), "cleanup"),
-        ("role cleanup omitted", replace_once(supervisor, '            ("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",\n', '            ("other cleanup", ("/bin/true",\n'), "cleanup"),
-        ("fast hold runs database cleanup", replace_once(supervisor,
-            '("fast-success", "fast-fail", "fast-hold")',
-            '("fast-success", "fast-fail")'), "exact fast modes"),
-        ("normal mode skips database cleanup", replace_once(supervisor,
-            '("fast-success", "fast-fail", "fast-hold")',
-            '("fast-success", "fast-fail", "fast-hold", "retained-cleanup-dependency")'), "exact fast modes"),
-        ("prefix modes skip database cleanup", replace_once(supervisor,
-            'FAULT_MODE in ("fast-success", "fast-fail", "fast-hold")',
-            'FAULT_MODE.startswith("fast-")'), "exact fast modes"),
+            '                try:\n                    print(marker, file=sys.stderr, flush=True)\n'
+            '                except BaseException as error:\n'
+            '                    cleanup_errors.append((label + "-report", error))',
+            '                pass'), "cleanup"),
+        ("cleanup result marker failure uncaptured", replace_once(supervisor,
+            '                except BaseException as error:\n'
+            '                    cleanup_errors.append((label + "-report", error))',
+            '                except BaseException:\n                    pass'), "cleanup"),
+        ("cleanup exceptions discarded", replace_once(supervisor,
+            'cleanup_errors.append((label, RuntimeError(f"{label} could not run: {error}")))',
+            'pass'), "cleanup"),
+        ("cleanup aggregation omitted", replace_once(supervisor,
+            '        supervisor_cleanup_errors = cleanup_supervisor(resources)\n',
+            '        supervisor_cleanup_errors = ()\n'), "independent cleanup/result aggregation"),
+        ("dropdb cleanup omitted", replace_once(supervisor,
+            '        ("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp")),\n', ''), "cleanup"),
+        ("role cleanup omitted", replace_once(supervisor,
+            '        ("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",\n',
+            '        ("other cleanup", ("/bin/true",\n'), "cleanup"),
+        ("database cleanup eligible at lock acquisition", replace_once(supervisor,
+            '    resources["intents_acquired"] = True\n    recover_intents()',
+            '    resources["intents_acquired"] = True\n'
+            '    resources["database_cleanup"] = True\n    recover_intents()'),
+         "database cleanup eligibility"),
+        ("database cleanup eligibility omitted", replace_once(supervisor,
+            '        resources["database_cleanup"] = True\n', ''),
+         "database cleanup eligibility"),
+        ("cleanup selection bypassed", replace_once(supervisor,
+            ') if resources["database_cleanup"] else ()', ') if False else ()'),
+            "exact fast modes"),
         ("selected cleanup commands bypassed", replace_once(supervisor,
-            '        for label, arguments in cleanup_commands:',
-            '        for label, arguments in ():'), "selected cleanup command tuple"),
+            '    for label, arguments in cleanup_commands:',
+            '    for label, arguments in ():'), "selected cleanup command tuple"),
         ("normal success omitted", replace_once(supervisor,
-            '    if retained_process is not None:\n        die("retained cleanup dependency unexpectedly permitted cleanup")\n    print("Ubuntu migration role compatibility verification passed", flush=True)',
-            '    if retained_process is not None:\n        die("retained cleanup dependency unexpectedly permitted cleanup")'), "success marker"),
-        ("fast success omitted", replace_once(supervisor,
-            '        if fast_success:\n            print("Ubuntu migration role compatibility verification passed", flush=True)',
-            '        if fast_success:\n            pass'), "success marker"),
+            '    print("Ubuntu migration role compatibility verification passed", flush=True)\n',
+            ''), "independent cleanup/result aggregation"),
+        ("primary masked by cleanup", replace_once(supervisor,
+            '        raise primary_error\n',
+            '        raise RuntimeError("cleanup failed")\n'), "independent cleanup/result aggregation"),
+        ("primary cause discarded", replace_once(supervisor,
+            'raise SupervisorCleanupFailure(primary_error, cleanup_errors) from primary_error',
+            'raise SupervisorCleanupFailure(primary_error, cleanup_errors) from None'),
+            "independent cleanup/result aggregation"),
+        ("cleanup categories flattened", replace_once(supervisor,
+            'f"{category}: {error}" for category, error in self.cleanup_errors',
+            'str(error) for _category, error in self.cleanup_errors'),
+            "independent cleanup/result aggregation"),
+        ("aggregate primary moved after cleanup", replace_once(supervisor,
+            'message = f"{primary_error}; cleanup failed: {details}"',
+            'message = f"cleanup failed: {details}; {primary_error}"'),
+            "reviewed cleanup control-flow snapshot"),
+        ("unconfirmed active or retained process bypasses quarantine", replace_once(supervisor,
+            '    if not (active_dead and retained_dead):\n        return tuple(cleanup_errors)',
+            '    if False:\n        return tuple(cleanup_errors)'), "retain transaction containment"),
+        ("unconfirmed keeper bypasses quarantine", replace_once(supervisor,
+            '    if not keeper_dead:\n        return tuple(cleanup_errors)',
+            '    if False:\n        return tuple(cleanup_errors)'), "retain transaction containment"),
+        ("unconfirmed process reported dead", replace_once(supervisor,
+            '    cleanup_errors.append((category + "-containment-retained", RuntimeError(\n'
+            '        "process-group absence was not confirmed; transaction containment retained")))\n'
+            '    return False',
+             '    return True'), "process-group termination"),
+        ("cleanup wait monotonic unguarded", replace_once(supervisor,
+            '    try:\n'
+            '        deadline = time.monotonic() + timeout\n'
+            '    except BaseException as error:\n'
+            '        cleanup_errors.append((category + "-wait-timing", error))\n'
+            '        timing_failed = True\n'
+            '        deadline = None',
+            '    deadline = time.monotonic() + timeout'),
+         "process-group termination"),
+        ("cleanup wait sleep unguarded", replace_once(supervisor,
+            '            try:\n'
+            '                time.sleep(0.05)\n'
+            '            except BaseException as error:\n'
+            '                cleanup_errors.append((category + "-wait-timing", error))\n'
+            '                timing_failed = True\n'
+            '                break',
+            '            time.sleep(0.05)'),
+         "process-group termination"),
+        ("lock ownership flag omitted", replace_once(supervisor,
+            '    resources["lock_held"] = True\n', ''), "live launch barrier contract"),
+        ("intent authority flag omitted", replace_once(supervisor,
+            '    resources["intents_acquired"] = True\n', ''), "live launch barrier contract"),
+        ("keeper marker ownership flag omitted", replace_once(supervisor,
+            '        resources["keeper_marker"] = True\n', ''), "live launch barrier contract"),
+        ("unsafe unconditional intent recovery", replace_once(supervisor,
+            '    if resources["intents_acquired"] and resources["lock_held"]:\n',
+            '    if True:\n'), "independent cleanup/result aggregation"),
+        ("unsafe unconditional marker cleanup", replace_once(supervisor,
+            '    if resources["keeper_marker"] and resources["lock_held"]:\n',
+            '    if True:\n'), "independent cleanup/result aggregation"),
+        ("group absence accepted from reaped leader", replace_once(supervisor,
+            '    if live is False:\n        try:\n            process.poll()\n'
+            '        except BaseException as error:\n'
+            '            cleanup_errors.append((category + "-reap", error))\n'
+            '        return True\n    if live is True:',
+            '    if process.poll() is not None:\n        try:\n            process.poll()\n'
+            '        except BaseException as error:\n'
+            '            cleanup_errors.append((category + "-reap", error))\n'
+            '        return True\n    if live is True:'),
+         "process-group termination"),
+        ("marker unlink category collapsed", replace_once(supervisor,
+            '("lock-keeper-marker-unlink", error)',
+            '("lock-keeper-marker-fsync", error)'),
+            "retain transaction containment"),
+        ("resource initialized after acquisition", replace_once(supervisor,
+            '    resources = {\n        "lock_fd": None, "lock_keeper": None, "lock_keeper_group": None,',
+            '    resources = {\n        "lock_fd": os.open("/dev/null", os.O_RDONLY), "lock_keeper": None, "lock_keeper_group": None,'),
+            "initialized before"),
+        ("marker directory close registration omitted", replace_once(supervisor,
+            '        cleanup.defer("launch-marker-directory-close", os.close, directory)\n', ''),
+            "persistent launch marker validation"),
+        ("local cleanup stops after first failure", replace_once(supervisor,
+            '        for category, function, args, kwargs in reversed(self.actions):',
+            '        for category, function, args, kwargs in reversed(self.actions[:1]):'),
+            "local cleanup aggregation"),
+        ("create-owned signal restoration omitted", replace_once(supervisor,
+            '        cleanup.defer("signal-mask-restore", signal.pthread_sigmask,\n'
+            '                      signal.SIG_SETMASK, old_mask)\n', ''),
+            "durable intent"),
+        ("phase input close registration omitted", replace_once(supervisor,
+            '                    cleanup.defer("phase-input-close", os.close, installed_fd)\n', ''),
+            "descriptor/trace"),
         ("supervisor nonce length weakened", replace_once(supervisor, 'len(nonce) != 64', 'len(nonce) != 32'), "nonce argv/environment"),
         ("supervisor nonce environment omitted", replace_once(supervisor,
             '            or os.environ.get("NMCP_VERIFIER_NONCE") != nonce):', '            or False):'), "nonce argv/environment"),
@@ -6170,75 +6867,75 @@ def verify_supervisor_mutations(
             '                     f"cleanup_roles_failed={journal_evidence[2]}")',
             '                     "cleanup_roles_failed=False")')),
         ("raw journal written to stdout", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    sys.stdout.write(journal_evidence)\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw journal written to numeric stdout", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    os.write(1, journal_evidence.encode("ascii"))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr written to computed stdout", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    os.write(1 + 0, launched.stderr.encode())\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr written through descriptor alias", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    output_fd = 2\n    os.write(output_fd, launched.stderr.encode())\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("subprocess stderr written to numeric stderr", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    os.write(2, launched.stderr.encode())\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv written to special stderr path", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    open("/dev/stderr", "w").write(repr(service_argv))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv written to keyword stderr path", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    open(file="/dev/stderr", mode="w").write(repr(service_argv))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by inherited subprocess", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    subprocess.run(("/bin/echo", repr(service_argv)))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by aliased print", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    emit = print\n    emit(repr(service_argv))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr emitted by aliased os write", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    emit = os.write\n    emit(2, launched.stderr.encode())\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by aliased open", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    emit = open\n    emit("/dev/stderr", "w").write(repr(service_argv))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by aliased subprocess", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    runner = subprocess.run\n    runner(("/bin/echo", repr(service_argv)))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted by os spawn", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    os.spawnv(os.P_WAIT, "/bin/echo", ("echo", repr(service_argv)))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr emitted through os path module", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    os.path.os.write(2, launched.stderr.encode())\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv spawned through os path module", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    os.path.os.spawnv(os.P_WAIT, "/bin/echo", ("echo", repr(service_argv)))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("raw stderr emitted through subprocess os", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    subprocess.os.write(2, launched.stderr.encode())\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("nonce argv emitted through subprocess sys", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    subprocess.sys.stdout.write(repr(service_argv))\n'
             '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
         ("success emitted before cleanup", replace_once(replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    return result'),
             '            result = 0\n        except BaseException as error:',
             '            print(SUCCESS, flush=True)\n            result = 0\n        except BaseException as error:')),
@@ -6437,7 +7134,13 @@ def verify_supervisor_mutations(
             '    return evidence_failure(phase, "unknown", "cgroup", OSError(errno.EIO, "observation failed"))',
             '    return RuntimeError(str(error))')),
         ("client cgroup observation outranks residue", replace_once(client,
+            'def assert_fixed_cgroups_empty(phase):\n'
+            '    residue, errors = fixed_cgroup_residue(phase)\n'
+            '    residue_error = CleanupFailure(CGROUP_RESIDUE_FAILURE) if residue else None\n'
             '    failures = ([str(residue_error)] if residue_error is not None else []) + list(map(str, errors))',
+            'def assert_fixed_cgroups_empty(phase):\n'
+            '    residue, errors = fixed_cgroup_residue(phase)\n'
+            '    residue_error = CleanupFailure(CGROUP_RESIDUE_FAILURE) if residue else None\n'
             '    failures = list(map(str, errors)) + ([str(residue_error)] if residue_error is not None else [])')),
         ("client cgroup aggregate identity flattened", replace_once(client,
             '        raise CgroupFailure(\n'
@@ -6533,13 +7236,14 @@ def verify_supervisor_mutations(
         ("client counter directory trust omitted", replace_once(client,
             '            counter_directory_identity(phase, os.fstat(directory))', '            pass')),
         ("client counter lock requirement omitted", replace_once(client,
-            '    if not CLIENT_LOCK_HELD:', '    if False:')),
+            'def record_counter(phase, name):\n    if not CLIENT_LOCK_HELD:',
+            'def record_counter(phase, name):\n    if False:')),
         ("client counter lock comment camouflage", replace_once(client,
-            '    if not CLIENT_LOCK_HELD:',
-            '    if False:  # if not CLIENT_LOCK_HELD:')),
+            'def record_counter(phase, name):\n    if not CLIENT_LOCK_HELD:',
+            'def record_counter(phase, name):\n    if False:  # if not CLIENT_LOCK_HELD:')),
         ("client counter lock alternate expression", replace_once(client,
-            '    if not CLIENT_LOCK_HELD:',
-            '    if 1 == 0:  # if not CLIENT_LOCK_HELD:')),
+            'def record_counter(phase, name):\n    if not CLIENT_LOCK_HELD:',
+            'def record_counter(phase, name):\n    if 1 == 0:  # if not CLIENT_LOCK_HELD:')),
         ("client counter nonpositive write guard disabled", replace_once(client,
             '                if count <= 0 or count > remaining:',
             '                if False:  # count <= 0 or count > remaining')),
@@ -7030,12 +7734,18 @@ def verify_supervisor_mutations(
             '            assert_fixed_cgroups_empty("work")',
             '            pass')),
         ("client machine result emission bypassed", replace_once(client,
-            '    os.write(descriptor, payload)',
+            '    write_terminal_payload(descriptor, payload)',
             '    pass')),
         ("terminal emission mask removed", replace_once(client,
             '    signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n'
-            '    failure = None',
-            '    failure = None')),
+            '    cancellation = terminal_cancellation_exception()',
+            '    cancellation = terminal_cancellation_exception()')),
+        ("terminal emission mask moved before write", replace_once(
+            replace_once(client,
+                '    signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n', ''),
+            '    write_terminal_payload(descriptor, payload)',
+            '    signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)\n'
+            '    write_terminal_payload(descriptor, payload)')),
         ("terminal pending cancellation check removed", replace_once(client,
             '    pending = signal.sigpending() & CANCELLATION_SIGNALS',
             '    pending = set()')),
@@ -7045,19 +7755,23 @@ def verify_supervisor_mutations(
             '    return CancellationFailure(min(pending)) if pending else None')),
         ("terminal cancellation replacement removed", replace_once(client,
             '    if cancellation is not None:\n'
-            '        failure = ClientResultFailure(\n'
-            '            render_client_result(cancellation), sanitized_diagnostic(cancellation, nonce))',
+            '        if primary_error is None:\n'
+            '            primary_error = cancellation\n'
+            '        else:\n'
+            '            cleanup_result("cancelled", "final", (cancellation,))\n'
+            '            cleanup_errors = [*cleanup_errors, cancellation]',
             '    if cancellation is not None:\n        pass')),
         ("terminal low-level write duplicated", replace_once(client,
-            '    os.write(descriptor, payload)\n    return status',
-            '    os.write(descriptor, payload)\n    os.write(descriptor, payload)\n    return status')),
+            '    write_terminal_payload(descriptor, payload)\n    return status',
+            '    write_terminal_payload(descriptor, payload)\n'
+            '    write_terminal_payload(descriptor, payload)\n    return status')),
         ("terminal output uses buffered print", replace_once(client,
-            '    os.write(descriptor, payload)',
+            '    write_terminal_payload(descriptor, payload)',
             '    print(payload.decode("ascii"), end="")')),
         ("terminal mask unblocked before write", replace_once(client,
-            '    os.write(descriptor, payload)',
+            '    write_terminal_payload(descriptor, payload)',
             '    signal.pthread_sigmask(signal.SIG_UNBLOCK, CANCELLATION_SIGNALS)\n'
-            '    os.write(descriptor, payload)')),
+            '    write_terminal_payload(descriptor, payload)')),
         ("client result return hardcoded zero", replace_once(client,
             '        "return=1;stdout=0;success=0"',
             '        "return=0;stdout=0;success=0"')),
@@ -7091,14 +7805,20 @@ def verify_supervisor_mutations(
             '    return CancellationFailure(CANCELLED[0]) if CANCELLED else None',
             '    return RuntimeError(f"verification client cancelled by signal {CANCELLED[0]}") if CANCELLED else None')),
         ("cancellation wrapped as verification", replace_once(client,
-            '    if cancellation is not None:\n        return cancellation\n    if isinstance(error, PrimaryFailure):',
-            '    if cancellation is not None:\n        return PrimaryFailure("verification", str(cancellation))\n    if isinstance(error, PrimaryFailure):')),
+            '    if isinstance(error, CancellationFailure):\n        return error',
+            '    if isinstance(error, CancellationFailure):\n'
+            '        return PrimaryFailure("verification", str(error))')),
+        ("first cancellation primary replaced by later verification", replace_once(client,
+            '    if primary_error is None:\n        return candidate\n'
+            '    cleanup_result("cancelled" if isinstance(candidate, CancellationFailure) else "unexpected",',
+            '    if primary_error is not None:\n        return candidate\n'
+            '    cleanup_result("cancelled" if isinstance(candidate, CancellationFailure) else "unexpected",')),
         ("client result boundary hardcoded", replace_once(client,
-            '        CLEANUP_BOUNDARIES.index(event[0]), CLEANUP_CATEGORIES.index(event[1]),',
-            '        CLEANUP_BOUNDARIES.index("show"), CLEANUP_CATEGORIES.index(event[1]),')),
+            '        f"{ordinal}.{boundary}.{category}.{retries}.{interceptions}.{attempts}"',
+            '        f"{ordinal}.show.{category}.{retries}.{interceptions}.{attempts}"')),
         ("client result counters looked up at render time", replace_once(client,
-            '        f"{boundary}.{category}.{retries}.{interceptions}.{attempts}"',
-            '        f"{boundary}.{category}.{RETRIES.get(boundary, 0)}."'
+            '        f"{ordinal}.{boundary}.{category}.{retries}.{interceptions}.{attempts}"',
+            '        f"{ordinal}.{boundary}.{category}.{RETRIES.get(boundary, 0)}."'
             'f"{INTERCEPTIONS.get(boundary, 0)}.{ATTEMPTS.get(boundary, 0)}"')),
         ("client primary cgroup evidence recording omitted", replace_once(client,
             '    if isinstance(error, CgroupFailure):\n'
@@ -7126,19 +7846,29 @@ def verify_supervisor_mutations(
             '        "recovery": "show", "owned-state": "show", "wait": "wait", "unload": "unload",',
             '        "recovery": "show", "wait": "wait", "unload": "unload",')),
         ("final-close fixed cgroups unchecked", replace_once(client,
-            '        assert_fixed_cgroups_empty("final-close")',
-            '        pass')),
+            '    residue, errors = fixed_cgroup_residue("final-close")',
+            '    residue, errors = {}, ()')),
+        ("final observation failure claims empty", replace_once(client,
+            '    return (True, not errors, not residue and not errors, failure)',
+            '    return (True, not errors, not residue, failure)')),
+        ("false final evidence accepted without error", replace_once(client,
+            '            or (final_evidence[:3] != (True, True, True))\n'
+            '                != (final_evidence[3] is not None)):',
+            '            or False):')),
+        ("final error accepted with clean evidence", replace_once(client,
+            '                != (final_evidence[3] is not None)):',
+            '                and (final_evidence[3] is not None)):')),
         ("post-final-scan cancellation check omitted", replace_once(client,
-            '    primary_error = cancellation_exception() or primary_error\n'
-            '    for error in cleanup_errors:',
-            '    for error in cleanup_errors:')),
+            '            cancellation = cancellation_exception()',
+            '            cancellation = None')),
         ("final cgroup evidence error discarded", replace_once(client,
-            '        if final_error is not None:\n            result_failure(primary_error, detail)',
+            '        if final_error is not None:\n'
+            '            result_failure(primary_error, detail, final_evidence)',
             '        if final_error is not None:\n            return')),
         ("final cgroup result emitted before cleanup classification", replace_once(client,
             '    for error in cleanup_errors:\n        if not cleanup_error_mapped(error):',
             '    if final_error is not None:\n'
-            '        result_failure(primary_error, sanitized_diagnostic(final_error, nonce))\n'
+            '        result_failure(primary_error, sanitized_diagnostic(final_error, nonce), final_evidence)\n'
             '    for error in cleanup_errors:\n        if not cleanup_error_mapped(error):')),
         ("final cgroup evidence omitted from aggregate", replace_once(client,
             '        append_unique_diagnostic(errors, sanitized_diagnostic(final_error, nonce))',
@@ -7161,13 +7891,13 @@ def verify_supervisor_mutations(
             '            sanitized_diagnostic("; ".join(failures), None), residue_error, errors)',
             '        fail(f"fixed unit control groups are not empty: {residue}")')),
         ("primary error raised before final cgroup evidence", replace_once(client,
-            '    final_error = None\n    try:',
+            '    final_error = final_evidence[3]',
             '    if primary_error is not None:\n        raise primary_error\n'
-            '    final_error = None\n    try:')),
+            '    final_error = final_evidence[3]')),
         ("cleanup error raised before final cgroup evidence", replace_once(client,
-            '    final_error = None\n    try:',
+            '    final_error = final_evidence[3]',
             '    if cleanup_errors:\n        raise cleanup_errors[0]\n'
-            '    final_error = None\n    try:')),
+            '    final_error = final_evidence[3]')),
         ("owned kill omitted", replace_once(client,
             '                retry_owned_command(invocation, nonce, service_command,\n                                    "kill", "kill", "--kill-whom=all", "--signal=KILL")',
             '                pass')),
@@ -7285,9 +8015,9 @@ def verify_supervisor_mutations(
             '            acted = owned_command(invocation, nonce, service_command, action, *arguments)',
             '            acted = owned_command("", nonce, service_command, action, *arguments)')),
         ("raising statement between finally and resolution", replace_once(client,
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)',
+            terminal_return,
             '    unit_properties("work", "LoadState")\n'
-            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)')),
+            '    return emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence)')),
         ("signal cancellation bypasses cleanup", replace_once(client, '    CANCELLED.append(signum)', '    os._exit(128 + signum)')),
         ("teardown signal block omitted", replace_once(client,
             '            CLEANUP_ACTIVE = True\n            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)',
@@ -7354,22 +8084,22 @@ def verify_supervisor_mutations(
         "retained cleanup category polling omitted": "lifecycle diagnostic phase routing",
         "retained cleanup roles category omitted": "retained cleanup category evidence",
         "raw journal written to stdout": "client output sinks",
-        "raw journal written to numeric stdout": "client output sinks",
-        "raw stderr written to computed stdout": "client output sinks",
-        "raw stderr written through descriptor alias": "client output sinks",
-        "subprocess stderr written to numeric stderr": "client output sinks",
-        "nonce argv written to special stderr path": "client output sinks",
-        "nonce argv written to keyword stderr path": "client output sinks",
-        "nonce argv emitted by inherited subprocess": "client output sinks",
-        "nonce argv emitted by aliased print": "client output sinks",
-        "raw stderr emitted by aliased os write": "client output sinks",
-        "nonce argv emitted by aliased open": "client output sinks",
-        "nonce argv emitted by aliased subprocess": "client output sinks",
-        "nonce argv emitted by os spawn": "client output sinks",
-        "raw stderr emitted through os path module": "client output sinks",
-        "nonce argv spawned through os path module": "client output sinks",
-        "raw stderr emitted through subprocess os": "client output sinks",
-        "nonce argv emitted through subprocess sys": "client output sinks",
+        "raw journal written to numeric stdout": "fixed transient service/attestation/owned cleanup",
+        "raw stderr written to computed stdout": "fixed transient service/attestation/owned cleanup",
+        "raw stderr written through descriptor alias": "fixed transient service/attestation/owned cleanup",
+        "subprocess stderr written to numeric stderr": "fixed transient service/attestation/owned cleanup",
+        "nonce argv written to special stderr path": "fixed transient service/attestation/owned cleanup",
+        "nonce argv written to keyword stderr path": "fixed transient service/attestation/owned cleanup",
+        "nonce argv emitted by inherited subprocess": "fixed transient service/attestation/owned cleanup",
+        "nonce argv emitted by aliased print": "fixed transient service/attestation/owned cleanup",
+        "raw stderr emitted by aliased os write": "fixed transient service/attestation/owned cleanup",
+        "nonce argv emitted by aliased open": "fixed transient service/attestation/owned cleanup",
+        "nonce argv emitted by aliased subprocess": "fixed transient service/attestation/owned cleanup",
+        "nonce argv emitted by os spawn": "fixed transient service/attestation/owned cleanup",
+        "raw stderr emitted through os path module": "fixed transient service/attestation/owned cleanup",
+        "nonce argv spawned through os path module": "fixed transient service/attestation/owned cleanup",
+        "raw stderr emitted through subprocess os": "fixed transient service/attestation/owned cleanup",
+        "nonce argv emitted through subprocess sys": "fixed transient service/attestation/owned cleanup",
         "success emitted before cleanup": "client output sinks",
     }
     callable_binding_mutations = [
@@ -7507,6 +8237,9 @@ def verify_supervisor_mutations(
         expect_rejected(lambda candidate: validate_client(candidate, enforce_snapshot=False),
                         mutation, label, journal_mutation_categories.get(label, "client"))
     containment_mutations = [
+        ("containment contradictory final evidence accepted", replace_once(containment,
+            '    if flags["final_empty"] and not (flags["final_scanned"] and flags["final_observed"]):\n'
+            '        fail("client result schema final evidence was contradictory")\n', '')),
         ("containment prepublished release skips validation", replace_once(containment,
             '        except FileExistsError:\n'
             '            os_call(phase, "close", "directory", os.close, directory)\n'
@@ -7711,11 +8444,11 @@ def verify_supervisor_mutations(
             '        if not field_separator or name != expected_name or not value or name in values:',
             '        if not field_separator or not value or name in values:')),
         ("machine schema duplicate categories accepted", replace_once(containment,
-            '        if len(set(events)) != len(events) or events != canonical:',
-            '        if False or events != canonical:')),
+            '            if counts[0] != expected_ordinal:',
+            '            if False:')),
         ("machine schema reordered categories accepted", replace_once(containment,
-            '        if len(set(events)) != len(events) or events != canonical:',
-            '        if len(set(events)) != len(events) or False:')),
+            '            if counts[0] != expected_ordinal:',
+            '            if counts[0] < 0:')),
         ("machine schema malformed retry accepted", replace_once(containment,
             '                or (value != "0" and value.startswith("0"))):',
             '                or False):')),
@@ -8461,9 +9194,8 @@ def verify_supervisor_mutations(
         ("persistent environment counterexample omitted", replace_once(containment,
             '        "environment": ("Environment", f"{NONCE_VARIABLE}={\'0\' * 64}"),\n', '')),
         ("persistent argv counterexample omitted", replace_once(containment,
-            '        "exec-start": ("Command", {"path": "/usr/bin/env",\n'
-            '                                     "argv": tuple("/bin/false" if item == PROGRAM else item\n'
-            '                                                   for item in state["Command"]["argv"])}),\n', '')),
+            '        "exec-start": ("Command", {"path": "/usr/bin/env",',
+            '        "exec-start-omitted": ("Command", {"path": "/usr/bin/env",')),
         ("persistent property counterexample omitted", replace_once(containment,
             '        "fixed-property": ("KillMode", "process"),\n', '')),
         ("retained signature revalidation omitted", replace_once(containment,
@@ -9122,6 +9854,18 @@ def main() -> int:
         "    if False:\n        client_phase_routing_cases(client)")
     expect_rejected(validate_diagnostic_fixture, dead_phase_routing_fixture,
                     "client phase routing fixture call is dead", "source snapshot changed")
+    dead_supervisor_cleanup_fixture = replace_once(
+        diagnostic_fixture,
+        "    supervisor_cleanup_cases(supervisor)",
+        "    if False:\n        supervisor_cleanup_cases(supervisor)")
+    expect_rejected(validate_diagnostic_fixture, dead_supervisor_cleanup_fixture,
+                    "supervisor cleanup causal fixture call is dead", "source snapshot changed")
+    dead_atomic_launch_fixture = replace_once(
+        diagnostic_fixture,
+        "    supervisor_atomic_launch_cases(supervisor)",
+        "    if False:\n        supervisor_atomic_launch_cases(supervisor)")
+    expect_rejected(validate_diagnostic_fixture, dead_atomic_launch_fixture,
+                    "supervisor atomic launch fixture call is dead", "source snapshot changed")
     role_mode = text(ROOT / "scripts" / "set-ubuntu-migration-role-mode")
     validate_runtime_helper(runtime_verifier_helper)
     validate_stage_verifier(stage_verifier)

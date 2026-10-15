@@ -2,6 +2,7 @@
 """Unprivileged causal fixtures for closed diagnostics and cgroup snapshots."""
 
 import errno
+import fcntl
 import os
 import pathlib
 import runpy
@@ -15,6 +16,7 @@ import types
 ROOT = pathlib.Path(__file__).resolve().parent
 CLIENT_PATH = ROOT / "verify-ubuntu-migration-role-client"
 CONTAINMENT_PATH = ROOT / "verify-ubuntu-migration-role-containment"
+SUPERVISOR_PATH = ROOT / "verify-ubuntu-migration-role-supervisor"
 SECRET = "nonce-0123456789abcdef" * 4
 HOSTILE_PATH = "/hostile/" + SECRET
 HOSTILE_ARGV = ("/hostile/program", "--secret=" + SECRET)
@@ -56,6 +58,16 @@ def assert_fails_with(function, expected):
         require(str(error) == expected, f"wrong causal failure: {error!s}")
     else:
         raise RuntimeError("causal fixture unexpectedly succeeded")
+
+
+def capture_final(client):
+    globals_ = client["capture_final_cgroup_evidence"].__globals__
+    held = globals_["CLIENT_LOCK_HELD"]
+    globals_["CLIENT_LOCK_HELD"] = True
+    try:
+        return client["capture_final_cgroup_evidence"]()
+    finally:
+        globals_["CLIENT_LOCK_HELD"] = held
 
 
 class FakeFile:
@@ -789,16 +801,18 @@ def client_cgroup_lifecycle_cases(client):
             "fixed-cgroup-residue=true")
 
         calls.clear()
+        final_evidence = capture_final(client)
         assert_fails_with(lambda: client["resolve_outcome"](
-            RuntimeError("primary-original"), [], "n" * 64),
+            RuntimeError("primary-original"), [], "n" * 64, final_evidence),
             "fixed-cgroup-residue=true; primary-original")
         require(calls == [("/recorded-a", "final-close"),
                           ("/recorded-b", "final-close"), (canonical, "final-close")],
                 "primary error bypassed final cgroup evidence")
 
         calls.clear()
+        final_evidence = capture_final(client)
         assert_fails_with(lambda: client["resolve_outcome"](
-            None, [RuntimeError("cleanup-original")], "n" * 64),
+            None, [RuntimeError("cleanup-original")], "n" * 64, final_evidence),
             "fixed-cgroup-residue=true; cleanup-original")
         require(calls == [("/recorded-a", "final-close"),
                           ("/recorded-b", "final-close"), (canonical, "final-close")],
@@ -806,8 +820,9 @@ def client_cgroup_lifecycle_cases(client):
 
         calls.clear()
         residue.clear()
+        final_evidence = capture_final(client)
         assert_fails_with(lambda: client["resolve_outcome"](
-            RuntimeError("minimal-not-found-primary"), [], "n" * 64),
+            RuntimeError("minimal-not-found-primary"), [], "n" * 64, final_evidence),
             "minimal-not-found-primary")
         require(calls == [("/recorded-a", "final-close"),
                           ("/recorded-b", "final-close"), (canonical, "final-close")],
@@ -930,9 +945,11 @@ def client_final_residue_diagnostic_cases(client):
             raise RuntimeError("65th retained control group did not fail closed")
         require(recorded[-1] == "/overflow", "65th control group was not retained before failure")
         residue_paths.add("/overflow")
+        final_evidence = capture_final(client)
         try:
             client["resolve_outcome"](
-                overflow_error, [RuntimeError("cleanup-" + "c" * 512)], "n" * 64)
+                overflow_error, [RuntimeError("cleanup-" + "c" * 512)], "n" * 64,
+                final_evidence)
         except RuntimeError as error:
             diagnostic = str(error)
         else:
@@ -950,10 +967,12 @@ def client_final_residue_diagnostic_cases(client):
         recorded[:] = ["/recorded-a", "/recorded-b"]
         residue_paths.clear()
         residue_paths.update(("/recorded-a", canonical))
+        final_evidence = capture_final(client)
         try:
             client["resolve_outcome"](
                 RuntimeError("p" * 512),
-                [RuntimeError("r" * 512), RuntimeError("c" * 512)], "n" * 64)
+                [RuntimeError("r" * 512), RuntimeError("c" * 512)], "n" * 64,
+                final_evidence)
         except RuntimeError as error:
             diagnostic = str(error)
         else:
@@ -1074,11 +1093,12 @@ def client_terminal_empty_launch_routing_cases(client):
                             f"verification invocation failed: {client['sanitized_state'](current)}; "
                             "cleanup_database_failed=False; cleanup_roles_failed=False")
                 client["teardown_owned"](captured_invocation, nonce, service_command)
+                final_evidence = capture_final(client)
                 if primary_error is None:
-                    client["resolve_outcome"](None, [], nonce)
+                    client["resolve_outcome"](None, [], nonce, final_evidence)
                 else:
                     assert_fails_with(lambda: client["resolve_outcome"](
-                        primary_error, [], nonce), str(primary_error))
+                        primary_error, [], nonce, final_evidence), str(primary_error))
                 require(unit_unloaded and not states,
                         f"{label} did not complete every routed property observation")
                 require(recorded == ([prior] if prior else []),
@@ -1146,8 +1166,10 @@ def client_cgroup_observation_cases(client):
                     f"{label} did not exhaustively inspect later/canonical paths")
 
             calls.clear()
+            final_evidence = capture_final(client)
             try:
-                client["resolve_outcome"](RuntimeError("primary-original"), [], "n" * 64)
+                client["resolve_outcome"](
+                    RuntimeError("primary-original"), [], "n" * 64, final_evidence)
             except RuntimeError as error:
                 diagnostic = str(error)
             else:
@@ -2305,6 +2327,7 @@ def client_cleanup_result_cases(client, containment):
         globals_["CLEANUP_ACTIVE"] = True
         globals_["REQUESTED_MODE"] = mode
         globals_["COMMAND_DEADLINE"] = None
+        globals_["RESULT_EVENTS_COMPLETE"] = True
         for name in ("RESULT_EVENTS", "RESULT_MAPPED_CLEANUP_ERRORS",
                      "RETRIES", "INTERCEPTIONS", "ATTEMPTS"):
             globals_[name].clear()
@@ -2312,9 +2335,21 @@ def client_cleanup_result_cases(client, containment):
 
     def schema(primary, cleanup):
         try:
-            client["resolve_outcome"](primary, cleanup, "n" * 64)
+            globals_["assert_fixed_cgroups_empty"]("final-close")
+            final_evidence = (True, True, True, None)
+        except BaseException as final_error:
+            observed = not (isinstance(final_error, globals_["CgroupFailure"])
+                            and final_error.observation_errors)
+            final_evidence = (True, observed, False, final_error)
+        try:
+            client["resolve_outcome"](primary, cleanup, "n" * 64,
+                                      final_evidence)
         except globals_["ClientResultFailure"] as error:
             parsed = containment["parse_client_result"](error.machine)
+            require([event[0] for event in parsed["events"]]
+                    == list(range(len(parsed["events"]))),
+                    "client result event ordinals were not contiguous")
+            parsed["events"] = tuple(event[1:] for event in parsed["events"])
             require(str(error), "client result failure lost its human diagnostic")
             return parsed
         raise RuntimeError("failing client outcome omitted its machine result")
@@ -2345,34 +2380,75 @@ def client_cleanup_result_cases(client, containment):
         else:
             raise RuntimeError("direct signal fixture did not raise typed cancellation")
         wrapped = client["primary_exception"](RuntimeError("later verification"), "final")
-        require(isinstance(wrapped, client["CancellationFailure"])
-                and wrapped.category == "cancelled",
-                "latched cancellation was wrapped as verification")
+        require(isinstance(wrapped, client["PrimaryFailure"])
+                and wrapped.category == "verification",
+                "later cancellation replaced the first verification primary")
         globals_["CANCELLED"].clear()
 
         for signum in sorted(globals_["CANCELLATION_SIGNALS"]):
             reset("")
-            scans = []
-            def cancel_during_final_scan(phase, injected=signum):
-                scans.append(phase)
-                client["interrupted"](injected, None)
-            globals_["assert_fixed_cgroups_empty"] = cancel_during_final_scan
-            parsed = schema(None, [])
-            require(scans == ["final-close"] and parsed["primary"] == "cancelled",
-                    f"final scan signal did not yield one primary cancellation: {signum}")
+            cancellation = client["CancellationFailure"](signum)
+            preserved = client["preserve_primary"](primary, cancellation, "final")
+            parsed = schema(preserved, [cancellation])
+            require(preserved is primary and parsed["primary"] == "cleanup-test"
+                    and parsed["events"] == (("final", "cancelled", 0, 0, 0),),
+                    f"later cancellation replaced the first primary: {signum}")
             globals_["CANCELLED"].clear()
+        reset("")
+        cancellation = client["CancellationFailure"](globals_["signal"].SIGTERM)
+        preserved = client["preserve_primary"](
+            cancellation, RuntimeError("later verification"), "final")
+        parsed = schema(preserved, [])
+        require(preserved is cancellation and parsed["primary"] == "cancelled"
+                and parsed["events"] == (("final", "unexpected", 0, 0, 0),),
+                "later verification replaced the first cancellation primary")
+
+        reset("")
+        observation_error = globals_["EvidenceFailure"](
+            "phase=final-close operation=walk resource=evidence errno=13")
+        original_residue = globals_["fixed_cgroup_residue"]
+        original_lock_held = globals_["CLIENT_LOCK_HELD"]
+        globals_["fixed_cgroup_residue"] = lambda _phase: ({}, (observation_error,))
+        globals_["CLIENT_LOCK_HELD"] = True
+        try:
+            final_evidence = client["capture_final_cgroup_evidence"]()
+        finally:
+            globals_["fixed_cgroup_residue"] = original_residue
+            globals_["CLIENT_LOCK_HELD"] = original_lock_held
+        require(final_evidence[:3] == (True, False, False)
+                and isinstance(final_evidence[3], globals_["CgroupFailure"]),
+                "final observation failure claimed an empty cgroup")
+        residue_error = globals_["CleanupFailure"]("fixed-cgroup-residue=true")
+        valid_residue = globals_["CgroupFailure"](
+            "fixed-cgroup-residue=true", residue_error, ())
+        valid_observation = globals_["CgroupFailure"](
+            str(observation_error), None, (observation_error,))
+        for valid in ((True, True, False, valid_residue),
+                      (True, False, False, valid_observation),
+                      (False, False, False, valid_observation)):
+            try:
+                client["resolve_outcome"](None, [], "n" * 64, valid)
+            except globals_["ClientResultFailure"]:
+                pass
+            else:
+                raise RuntimeError("non-clean final evidence unexpectedly resolved successfully")
+        for contradictory in (
+                (False, True, True, None), (True, False, True, None),
+                (True, True, False, None), (False, False, False, None),
+                (True, True, True, valid_residue)):
+            assert_fails_with(lambda contradictory=contradictory: client["resolve_outcome"](
+                None, [], "n" * 64, contradictory),
+                "final cgroup evidence was not immutable and complete")
         globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
 
         globals_["command"] = lambda *_args, **_kwargs: subprocess.CompletedProcess(
             ("systemctl", "show"), 0, "LoadState=not-found\n", "")
 
         reset("")
-        globals_["RESULT_EVENTS"].update(
-            (boundary, category, globals_["COUNTER_MAX"],
-             globals_["COUNTER_MAX"], globals_["COUNTER_MAX"])
-            for boundary in globals_["CLEANUP_BOUNDARIES"]
-            for category in globals_["CLEANUP_CATEGORIES"]
-            if boundary != "none" or category == "unexpected")
+        for boundary in globals_["CLEANUP_BOUNDARIES"]:
+            for category in globals_["CLEANUP_CATEGORIES"]:
+                if boundary != "none" or category == "unexpected":
+                    client["cleanup_result"](category, boundary)
         for boundary in globals_["CLEANUP_BOUNDARIES"]:
             globals_["RETRIES"][boundary] = globals_["COUNTER_MAX"]
             globals_["INTERCEPTIONS"][boundary] = globals_["COUNTER_MAX"]
@@ -2380,14 +2456,17 @@ def client_cleanup_result_cases(client, containment):
         try:
             client["result_failure"](
                 client["PrimaryFailure"]("verification", "maximum aggregation"),
-                "maximum aggregation")
+                "maximum aggregation", (True, True, True, None))
         except globals_["ClientResultFailure"] as error:
             maximum = error.machine
         else:
             raise RuntimeError("maximum legitimate client result was not emitted")
         maximum_parsed = containment["parse_client_result"](maximum)
         require(len(maximum_parsed["events"]) == globals_["RESULT_EVENT_LIMIT"]
-                and all(event[2:] == (globals_["COUNTER_MAX"],) * 3
+                and [event[0] for event in maximum_parsed["events"]]
+                    == list(range(globals_["RESULT_EVENT_LIMIT"]))
+                and maximum_parsed["events_complete"] == 0
+                and all(event[3:] == (0, 0, 0)
                         for event in maximum_parsed["events"])
                 and len(maximum.encode("ascii")) <= globals_["RESULT_BYTE_LIMIT"],
                 "maximum legitimate client result did not render and parse within its bound")
@@ -2598,6 +2677,7 @@ def client_teardown_transition_cases(client, containment):
         globals_["CLEANUP_ACTIVE"] = True
         globals_["COMMAND_DEADLINE"] = None
         globals_["REQUESTED_MODE"] = "client-cleanup-persistent-" + boundary
+        globals_["RESULT_EVENTS_COMPLETE"] = True
         for name in ("RESULT_EVENTS", "RESULT_MAPPED_CLEANUP_ERRORS",
                      "RETRIES", "INTERCEPTIONS", "ATTEMPTS"):
             globals_[name].clear()
@@ -2676,16 +2756,16 @@ def client_teardown_transition_cases(client, containment):
             try:
                     client["resolve_outcome"](
                         client["PrimaryFailure"]("cleanup-test", "fixture primary"),
-                    [captured_error], nonce)
+                        [captured_error], nonce, (True, True, True, None))
             except globals_["ClientResultFailure"] as error:
                 parsed = containment["parse_client_result"](error.machine)
             else:
                 raise RuntimeError(f"persistent {boundary} result schema was not emitted")
             expected_events = tuple(
-                (event_boundary, category,
+                (ordinal, event_boundary, category,
                  retries if event_boundary == boundary else 0,
                  interceptions if event_boundary == boundary else 0, 0)
-                for event_boundary, category in (
+                for ordinal, (event_boundary, category) in enumerate(
                     ((boundary, categories[0]),)
                     + ((("unload", categories[1]),) if len(categories) == 2 else ())))
             require(parsed["events"] == expected_events,
@@ -2723,11 +2803,11 @@ def client_teardown_transition_cases(client, containment):
         try:
             client["resolve_outcome"](
                 client["PrimaryFailure"]("cleanup-test", "fixture primary"),
-                [captured_error], nonce)
+                [captured_error], nonce, (True, True, True, None))
         except globals_["ClientResultFailure"] as error:
             parsed = containment["parse_client_result"](error.machine)
         require(parsed is not None and parsed["events"] == (
-                    ("wait", "cgroup-residue", 2, 3, 4),),
+                    (0, "wait", "cgroup-residue", 2, 3, 4),),
                 "actual wait deadline lost its immutable causal residue snapshot")
     finally:
         for name, value in originals.items():
@@ -2744,7 +2824,6 @@ def client_teardown_transition_cases(client, containment):
 
 def client_terminal_emission_cases(client, containment):
     globals_ = client["emit_terminal_result"].__globals__
-    original_assert = globals_["assert_fixed_cgroups_empty"]
     original_render = globals_["render_client_result"]
     original_mask = globals_["signal"].pthread_sigmask
     original_pending = globals_["signal"].sigpending
@@ -2757,8 +2836,8 @@ def client_terminal_emission_cases(client, containment):
         masks.clear()
         globals_["CANCELLED"].clear()
         globals_["RESULT_EVENTS"].clear()
+        globals_["RESULT_EVENTS_COMPLETE"] = True
         globals_["RESULT_MAPPED_CLEANUP_ERRORS"].clear()
-        globals_["assert_fixed_cgroups_empty"] = lambda _phase: None
         globals_["render_client_result"] = original_render
         globals_["signal"].sigpending = lambda: set()
 
@@ -2774,28 +2853,43 @@ def client_terminal_emission_cases(client, containment):
     globals_["os"].write = fake_write
     try:
         reset()
-        status = client["emit_terminal_result"](None, [], "n" * 64, 0)
+        evidence = (True, True, True, None)
+        status = client["emit_terminal_result"](None, [], "n" * 64, 0, evidence)
         require(status == 0 and writes == [(1, (globals_["SUCCESS"] + "\n").encode("ascii"))],
                 "successful terminal result was not one low-level stdout write")
         require(masks == [(globals_["signal"].SIG_BLOCK, globals_["CANCELLATION_SIGNALS"])],
                 "successful terminal result did not enter one non-restored signal mask")
 
         reset()
-        render_calls = 0
-        def cancel_during_render(primary_error):
-            nonlocal render_calls
-            render_calls += 1
-            if render_calls == 1:
-                client["interrupted"](globals_["signal"].SIGTERM, None)
-            return original_render(primary_error)
-        globals_["render_client_result"] = cancel_during_render
-        status = client["emit_terminal_result"](
-            client["PrimaryFailure"]("verification", "fixture failure"), [], "n" * 64, 1)
+        def cancelling_mask(operation, signals):
+            masks.append((operation, signals))
+            client["interrupted"](globals_["signal"].SIGTERM, None)
+            return set()
+        globals_["signal"].pthread_sigmask = cancelling_mask
+        status = client["emit_terminal_result"](None, [], "n" * 64, 0, evidence)
         parsed = containment["parse_client_result"](
             writes[0][1].splitlines()[0].decode("ascii"))
         require(status == 1 and len(writes) == 1 and writes[0][0] == 2
-                and parsed["primary"] == "cancelled" and render_calls == 2,
-                "cancellation during result rendering was not reclassified and emitted once")
+                and parsed["primary"] == "cancelled",
+                "cancellation latched by terminal masking emitted stale success")
+        globals_["signal"].pthread_sigmask = fake_mask
+
+        reset()
+        render_calls = 0
+        def cancel_during_render(primary_error, final_evidence):
+            nonlocal render_calls
+            render_calls += 1
+            client["interrupted"](globals_["signal"].SIGTERM, None)
+            return original_render(primary_error, final_evidence)
+        globals_["render_client_result"] = cancel_during_render
+        status = client["emit_terminal_result"](
+            client["PrimaryFailure"]("verification", "fixture failure"), [], "n" * 64, 1,
+            evidence)
+        parsed = containment["parse_client_result"](
+            writes[0][1].splitlines()[0].decode("ascii"))
+        require(status == 1 and len(writes) == 1 and writes[0][0] == 2
+                and parsed["primary"] == "verification" and render_calls == 1,
+                "post-decision cancellation replaced the frozen primary result")
         require(writes[0][1].count(b"NMCP_CLIENT_RESULT_V1:") == 1
                 and writes[0][1].count(b"verification-client: ") == 1,
                 "failing terminal result was buffered or duplicated")
@@ -2805,7 +2899,7 @@ def client_terminal_emission_cases(client, containment):
             client["interrupted"](globals_["signal"].SIGHUP, None)
             return set()
         globals_["signal"].sigpending = cancel_at_pending_check
-        status = client["emit_terminal_result"](None, [], "n" * 64, 0)
+        status = client["emit_terminal_result"](None, [], "n" * 64, 0, evidence)
         parsed = containment["parse_client_result"](
             writes[0][1].splitlines()[0].decode("ascii"))
         require(status == 1 and len(writes) == 1 and writes[0][0] == 2
@@ -2814,13 +2908,44 @@ def client_terminal_emission_cases(client, containment):
 
         reset()
         globals_["signal"].sigpending = lambda: {globals_["signal"].SIGQUIT}
-        status = client["emit_terminal_result"](None, [], "n" * 64, 0)
+        status = client["emit_terminal_result"](None, [], "n" * 64, 0, evidence)
         parsed = containment["parse_client_result"](
             writes[0][1].splitlines()[0].decode("ascii"))
         require(status == 1 and len(writes) == 1 and parsed["primary"] == "cancelled",
-                "kernel-pending handled signal did not replace successful output")
+                 "kernel-pending handled signal did not replace successful output")
+
+        reset()
+        attempts = []
+        def interrupted_once(descriptor, payload):
+            attempts.append((descriptor, payload))
+            if len(attempts) == 1:
+                raise InterruptedError()
+            return len(payload)
+        globals_["os"].write = interrupted_once
+        status = client["emit_terminal_result"](None, [], "n" * 64, 0, evidence)
+        require(status == 0 and len(attempts) == 2 and attempts[0][1] is attempts[1][1]
+                and len(attempts[0][1]) <= globals_["select"].PIPE_BUF,
+                "EINTR did not retry the same frozen PIPE_BUF-bounded payload")
+
+        for label, failing_write in (
+                ("short", lambda _descriptor, payload: len(payload) - 1),
+                ("zero", lambda _descriptor, _payload: 0),
+                ("error", lambda _descriptor, _payload: (_ for _ in ()).throw(OSError(errno.EIO,
+                                                                                       "failed")))):
+            reset()
+            calls = []
+            def fail_once(descriptor, payload, function=failing_write):
+                calls.append((descriptor, payload))
+                return function(descriptor, payload)
+            globals_["os"].write = fail_once
+            try:
+                client["emit_terminal_result"](None, [], "n" * 64, 0, evidence)
+            except globals_["TerminalEmissionFailure"]:
+                pass
+            else:
+                raise RuntimeError(f"{label} terminal write unexpectedly succeeded")
+            require(len(calls) == 1, f"{label} terminal write attempted a second emission")
     finally:
-        globals_["assert_fixed_cgroups_empty"] = original_assert
         globals_["render_client_result"] = original_render
         globals_["signal"].pthread_sigmask = original_mask
         globals_["signal"].sigpending = original_pending
@@ -2830,9 +2955,758 @@ def client_terminal_emission_cases(client, containment):
         globals_["RESULT_MAPPED_CLEANUP_ERRORS"].clear()
 
 
+def supervisor_process_group_case(supervisor):
+    child = '''import os, signal
+pid = os.fork()
+if pid:
+    os._exit(0)
+signal.pause()
+'''
+    globals_ = supervisor["run_phase"].__globals__
+    original_owned = globals_["OWNED_PHASE_GROUP"]
+    with tempfile.TemporaryDirectory() as root:
+        lock_fd = os.open(root + "/transaction.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        contender_fd = None
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            assert_fails_with(lambda: supervisor["run_phase"](
+                ("/usr/bin/python3", "-I", "-S", "-c", child),
+                env=supervisor["clean_env"](), pass_fds=(lock_fd,)),
+                "phase leader exited while its process group remained live")
+            group = globals_["OWNED_PHASE_GROUP"]
+            require(globals_["ACTIVE_PHASE"] is None and group is not None
+                    and supervisor["process_group_exists"](group["pgid"]),
+                    "reaped phase leader erased live process-group ownership evidence")
+            os.close(lock_fd)
+            lock_fd = None
+            contender_fd = os.open(root + "/transaction.lock", os.O_RDWR)
+            try:
+                fcntl.flock(contender_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise RuntimeError("live background phase group did not retain its lock")
+            cleanup_errors = []
+            terminated = supervisor["terminate_process_group"](
+                group, "causal-background-group", 1, cleanup_errors)
+            require(terminated and not cleanup_errors
+                    and not supervisor["process_group_exists"](group["pgid"]),
+                    "live background phase group was not terminated to finality")
+            fcntl.flock(contender_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            group = globals_["OWNED_PHASE_GROUP"]
+            if group is not None:
+                try:
+                    os.killpg(group["pgid"], supervisor["signal"].SIGKILL)
+                except ProcessLookupError:
+                    pass
+            globals_["OWNED_PHASE_GROUP"] = original_owned
+            if contender_fd is not None:
+                os.close(contender_fd)
+            if lock_fd is not None:
+                os.close(lock_fd)
+
+
+def supervisor_atomic_launch_cases(supervisor):
+    globals_ = supervisor["run_phase"].__globals__
+    originals = (
+        globals_["subprocess"].Popen, globals_["os"].getpgid,
+        globals_["os"].killpg, globals_["os"].close,
+        globals_["signal"].pthread_sigmask, globals_["recover_intents"],
+        globals_["OWNED_PHASE_GROUP"], globals_["ACTIVE_PHASE"],
+        globals_["BODY_ACTIVE"], tuple(globals_["SIGNAL_ERRORS"]),
+    )
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            del timeout
+            return 0
+
+    def empty_resources(lock_fd):
+        return {
+            "lock_fd": lock_fd, "lock_keeper": None, "lock_keeper_group": None,
+            "snapshot_fd": None, "retained_process": None, "retained_group": None,
+            "lock_held": True, "intents_acquired": True,
+            "keeper_marker": False, "database_cleanup": False,
+        }
+
+    try:
+        globals_["BODY_ACTIVE"] = True
+        for label, pid in (("phase", 501), ("keeper", 502), ("retained", 503)):
+            state = {"blocked": False, "pending": False, "killed": False, "closed": False}
+            resources = empty_resources(600 + pid)
+            process = Process(pid)
+            globals_["OWNED_PHASE_GROUP"] = None
+            globals_["ACTIVE_PHASE"] = None
+            globals_["subprocess"].Popen = lambda *_args, **_kwargs: process
+
+            def fake_getpgid(observed_pid, case=label):
+                require(state["blocked"] and observed_pid == pid,
+                        f"{case} validation ran outside the termination mask")
+                if case == "phase":
+                    group = globals_["OWNED_PHASE_GROUP"]
+                    registered = globals_["ACTIVE_PHASE"] is process
+                else:
+                    group_key = "lock_keeper_group" if case == "keeper" else "retained_group"
+                    process_key = "lock_keeper" if case == "keeper" else "retained_process"
+                    group = resources[group_key]
+                    registered = resources[process_key] is process
+                require(group == {"process": process, "pgid": pid} and registered,
+                        f"{case} validation preceded provisional ownership publication")
+                state["pending"] = True
+                return observed_pid
+
+            def fake_mask(how, mask, case=label):
+                require(mask == (globals_["HANDLED_TERMINATION_SIGNALS"]
+                                 if how == globals_["signal"].SIG_BLOCK
+                                 else {globals_["signal"].SIGUSR1}),
+                        f"{case} launch used the wrong termination mask")
+                if how == globals_["signal"].SIG_BLOCK:
+                    state["blocked"] = True
+                    return {globals_["signal"].SIGUSR1}
+                require(state["blocked"] and state["pending"],
+                        f"{case} restored its mask before validation completed")
+                state["blocked"] = False
+                globals_["interrupted"](globals_["signal"].SIGTERM, None)
+
+            def fake_killpg(observed_pid, signum):
+                require(observed_pid == pid, f"{label} cleanup targeted the wrong group")
+                if signum == 0:
+                    if state["killed"]:
+                        raise ProcessLookupError()
+                    return
+                state["killed"] = True
+
+            def fake_close(descriptor):
+                require(descriptor == resources["lock_fd"] and state["killed"],
+                        f"{label} lock closed before its provisional group was killed")
+                state["closed"] = True
+
+            globals_["os"].getpgid = fake_getpgid
+            globals_["signal"].pthread_sigmask = fake_mask
+            globals_["os"].killpg = fake_killpg
+            globals_["os"].close = fake_close
+            globals_["recover_intents"] = lambda: None
+            try:
+                if label == "phase":
+                    supervisor["run_phase"](("/fixture",), env={}, pass_fds=())
+                elif label == "keeper":
+                    supervisor["launch_lock_keeper"](resources, resources["lock_fd"])
+                else:
+                    supervisor["launch_retained_process"](resources)
+            except globals_["SupervisorCleanupFailure"] as error:
+                require(error.primary_error is None
+                        and tuple(category for category, _item in error.cleanup_errors) == (
+                            label + "-signal-mask-restore",),
+                        f"{label} pending termination was not delivered after publication")
+            else:
+                raise RuntimeError(f"{label} pending termination unexpectedly disappeared")
+
+            cleanup_errors = supervisor["cleanup_supervisor"](resources)
+            require(cleanup_errors == () and state["killed"] and state["closed"],
+                    f"{label} provisional group was not contained before lock release")
+    finally:
+        globals_["subprocess"].Popen = originals[0]
+        globals_["os"].getpgid = originals[1]
+        globals_["os"].killpg = originals[2]
+        globals_["os"].close = originals[3]
+        globals_["signal"].pthread_sigmask = originals[4]
+        globals_["recover_intents"] = originals[5]
+        globals_["OWNED_PHASE_GROUP"] = originals[6]
+        globals_["ACTIVE_PHASE"] = originals[7]
+        globals_["BODY_ACTIVE"] = originals[8]
+        globals_["SIGNAL_ERRORS"][:] = originals[9]
+
+
+def supervisor_cleanup_cases(supervisor):
+    globals_ = supervisor["cleanup_supervisor"].__globals__
+    original_body = globals_["supervisor_body"]
+    original_run_body = globals_["run_supervisor_body"]
+    original_cleanup = globals_["cleanup_supervisor"]
+    original_transition_errors = globals_["CLEANUP_TRANSITION_ERRORS"]
+    original_signal_errors = tuple(globals_["SIGNAL_ERRORS"])
+    original_body_active = globals_["BODY_ACTIVE"]
+    original_active = globals_["ACTIVE_PHASE"]
+    original_owned_phase = globals_["OWNED_PHASE_GROUP"]
+    original_recover = globals_["recover_intents"]
+    original_fsync = globals_["fsync_directory"]
+    original_run = globals_["subprocess"].run
+    original_open = globals_["os"].open
+    original_close = globals_["os"].close
+    original_fstat = globals_["os"].fstat
+    original_read = globals_["os"].read
+    original_stat = globals_["os"].stat
+    original_unlink = globals_["os"].unlink
+    original_killpg = globals_["os"].killpg
+    original_stderr = globals_["sys"].stderr
+    original_argv = globals_["sys"].argv
+    original_environ = globals_["os"].environ
+    original_geteuid = globals_["os"].geteuid
+    original_chdir = globals_["os"].chdir
+    original_umask = globals_["os"].umask
+    original_signal = globals_["signal"].signal
+    original_pthread_sigmask = globals_["signal"].pthread_sigmask
+    original_monotonic = globals_["time"].monotonic
+    original_sleep = globals_["time"].sleep
+    original_makedirs = globals_["os"].makedirs
+    original_lstat = globals_["os"].lstat
+    original_flock = globals_["fcntl"].flock
+    original_git = globals_["git"]
+
+    def resources(**updates):
+        values = {
+            "lock_fd": None, "lock_keeper": None, "lock_keeper_group": None,
+            "snapshot_fd": None, "retained_process": None, "retained_group": None,
+            "lock_held": False, "intents_acquired": False,
+            "keeper_marker": False, "database_cleanup": False,
+        }
+        values.update(updates)
+        return values
+
+    class Process:
+        def __init__(self, pid, calls, wait_errors=(), status=None):
+            self.pid = pid
+            self.calls = calls
+            self.wait_errors = list(wait_errors)
+            self.status = status
+
+        def poll(self):
+            self.calls.append(("poll", self.pid))
+            return self.status
+
+        def wait(self, timeout=None):
+            self.calls.append(("wait", self.pid, timeout))
+            if self.wait_errors:
+                raise self.wait_errors.pop(0)
+            self.status = 0
+            return 0
+
+    try:
+        unsafe = []
+        primary = RuntimeError("early-primary")
+        globals_["supervisor_body"] = lambda _resources: (_ for _ in ()).throw(primary)
+        globals_["recover_intents"] = lambda: unsafe.append("recover")
+        globals_["fsync_directory"] = lambda _path: unsafe.append("fsync")
+        globals_["subprocess"].run = lambda *_args, **_kwargs: unsafe.append("database")
+        globals_["os"].unlink = lambda _path: unsafe.append("unlink")
+        try:
+            supervisor["main"]()
+        except RuntimeError as error:
+            require(error is primary and error.__cause__ is None,
+                    "early supervisor failure did not preserve its original exception")
+        else:
+            raise RuntimeError("early supervisor failure unexpectedly succeeded")
+        require(unsafe == [], "pre-lock failure attempted unsafe name or database cleanup")
+
+        nonce = "a" * 64
+        early_resources = resources()
+        directory_stat = types.SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700, st_uid=0, st_gid=0)
+        lock_stat = types.SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600, st_uid=0, st_gid=0, st_nlink=1)
+        globals_["sys"].argv = ["supervisor", "/repo", "commit", "/go", nonce]
+        globals_["os"].environ = {"NMCP_VERIFIER_NONCE": nonce}
+        globals_["os"].geteuid = lambda: 0
+        globals_["os"].chdir = lambda _path: None
+        globals_["os"].umask = lambda _mask: 0o022
+        globals_["signal"].signal = lambda *_args: None
+        globals_["git"] = lambda *_args, **_kwargs: b"commit\n"
+        globals_["os"].makedirs = lambda *_args, **_kwargs: None
+        globals_["os"].lstat = lambda _path: directory_stat
+        globals_["os"].open = lambda *_args, **_kwargs: 44
+        globals_["os"].fstat = lambda _descriptor: lock_stat
+        globals_["fcntl"].flock = lambda *_args: None
+        early_failure = RuntimeError("early normal setup failed")
+        globals_["recover_intents"] = lambda: (_ for _ in ()).throw(early_failure)
+        try:
+            supervisor["supervisor_body"](early_resources)
+        except RuntimeError as error:
+            require(error is early_failure, "early normal-mode failure lost its cause")
+        else:
+            raise RuntimeError("early normal-mode setup failure unexpectedly succeeded")
+        require(early_resources["lock_held"] and early_resources["intents_acquired"]
+                and not early_resources["database_cleanup"],
+                "database cleanup became eligible before PostgreSQL startup")
+
+        globals_["sys"].argv = original_argv
+        globals_["os"].environ = original_environ
+        globals_["os"].geteuid = original_geteuid
+        globals_["os"].chdir = original_chdir
+        globals_["os"].umask = original_umask
+        globals_["signal"].signal = original_signal
+        globals_["git"] = original_git
+        globals_["os"].makedirs = original_makedirs
+        globals_["os"].lstat = original_lstat
+        globals_["os"].open = original_open
+        globals_["os"].fstat = original_fstat
+        globals_["fcntl"].flock = original_flock
+
+        partial = []
+        globals_["recover_intents"] = lambda: partial.append("recover")
+        globals_["os"].close = lambda descriptor: partial.append(("close", descriptor))
+        cleanup = supervisor["cleanup_supervisor"](resources(
+            lock_fd=41, lock_held=True, intents_acquired=True))
+        require(cleanup == () and partial == ["recover", ("close", 41)],
+                "partially acquired supervisor resources were not cleaned to finality")
+
+        cleanup_calls = []
+        globals_["cleanup_supervisor"] = lambda _resources: cleanup_calls.append("cleanup") or ()
+        globals_["signal"].pthread_sigmask = lambda *_args: set()
+        def interrupted_body(_resources):
+            globals_["interrupted"](globals_["signal"].SIGTERM, None)
+        globals_["supervisor_body"] = interrupted_body
+        try:
+            supervisor["main"]()
+        except RuntimeError as error:
+            require(str(error) == "supervisor interrupted by signal 15"
+                    and cleanup_calls == ["cleanup"] and not globals_["BODY_ACTIVE"],
+                    "body signal did not interrupt normally and finalize before cleanup")
+        else:
+            raise RuntimeError("body signal unexpectedly succeeded")
+
+        cleanup_calls.clear()
+        globals_["supervisor_body"] = lambda _resources: 0
+        def signal_after_body_finally(resources):
+            result = original_run_body(resources)
+            require(not globals_["BODY_ACTIVE"],
+                    "body wrapper returned before clearing its active latch")
+            globals_["interrupted"](globals_["signal"].SIGTERM, None)
+            return result
+        globals_["run_supervisor_body"] = signal_after_body_finally
+        try:
+            supervisor["main"]()
+        except globals_["SupervisorCleanupFailure"] as error:
+            require(error.primary_error is None and cleanup_calls == ["cleanup"]
+                    and tuple(category for category, _item in error.cleanup_errors) == (
+                        "cleanup-transition-signal",),
+                    "signal after body wrapper finalization skipped cleanup or became primary")
+        else:
+            raise RuntimeError("post-body signal unexpectedly succeeded")
+
+        cleanup_calls.clear()
+        propagation_primary = RuntimeError("body-propagation-primary")
+        globals_["supervisor_body"] = lambda _resources: (
+            _ for _ in ()).throw(propagation_primary)
+        def signal_during_propagation(resources):
+            try:
+                return original_run_body(resources)
+            except BaseException:
+                require(not globals_["BODY_ACTIVE"],
+                        "body wrapper propagated before clearing its active latch")
+                globals_["interrupted"](globals_["signal"].SIGINT, None)
+                raise
+        globals_["run_supervisor_body"] = signal_during_propagation
+        try:
+            supervisor["main"]()
+        except globals_["SupervisorCleanupFailure"] as error:
+            require(error.primary_error is propagation_primary
+                    and error.__cause__ is propagation_primary
+                    and cleanup_calls == ["cleanup"]
+                    and tuple(category for category, _item in error.cleanup_errors) == (
+                        "cleanup-transition-signal",),
+                    "propagation signal replaced the primary or skipped cleanup")
+        else:
+            raise RuntimeError("propagation signal unexpectedly succeeded")
+
+        globals_["run_supervisor_body"] = original_run_body
+
+        primary = RuntimeError("primary-before-cleanup-transition")
+        globals_["supervisor_body"] = lambda _resources: (_ for _ in ()).throw(primary)
+        cleanup_calls = []
+        globals_["cleanup_supervisor"] = lambda _resources: cleanup_calls.append("cleanup") or ()
+
+        def signal_inside_mask(operation, signals):
+            require(operation == globals_["signal"].SIG_BLOCK
+                    and signals == globals_["HANDLED_TERMINATION_SIGNALS"],
+                    "cleanup transition used the wrong signal mask")
+            globals_["interrupted"](globals_["signal"].SIGTERM, None)
+            return set()
+
+        globals_["signal"].pthread_sigmask = signal_inside_mask
+        try:
+            supervisor["main"]()
+        except globals_["SupervisorCleanupFailure"] as error:
+            require(error.primary_error is primary and error.__cause__ is primary
+                    and cleanup_calls == ["cleanup"]
+                    and tuple(category for category, _item in error.cleanup_errors)
+                    == ("cleanup-transition-signal",)
+                    and "signal 15" in str(error.cleanup_errors[0][1]),
+                    "signal inside cleanup mask aborted cleanup or masked its primary")
+        else:
+            raise RuntimeError("signal-inside-mask cleanup transition unexpectedly succeeded")
+
+        mask_error = OSError(errno.EIO, "cleanup mask failed")
+        cleanup_calls.clear()
+        def failing_cleanup_mask(_operation, _signals):
+            raise mask_error
+        globals_["signal"].pthread_sigmask = failing_cleanup_mask
+        try:
+            supervisor["main"]()
+        except globals_["SupervisorCleanupFailure"] as error:
+            require(error.primary_error is primary and error.__cause__ is primary
+                    and cleanup_calls == ["cleanup"]
+                    and error.cleanup_errors == (("cleanup-transition-mask", mask_error),),
+                    "cleanup mask failure aborted cleanup or replaced its primary")
+        else:
+            raise RuntimeError("failing cleanup mask transition unexpectedly succeeded")
+
+        globals_["cleanup_supervisor"] = original_cleanup
+
+        calls = []
+        masks = []
+        blocked = False
+        injected = False
+        killed = set()
+        active = Process(91, calls)
+        retained = Process(92, calls)
+        primary = RuntimeError("primary-before-cleanup-signal")
+
+        def signal_wait_body(acquired):
+            globals_["OWNED_PHASE_GROUP"] = {"process": active, "pgid": 91}
+            acquired.update(resources(
+                snapshot_fd=93, retained_process=retained,
+                retained_group={"process": retained, "pgid": 92}))
+            raise primary
+
+        def cleanup_mask(operation, signals):
+            nonlocal blocked
+            masks.append((operation, signals))
+            require(operation == globals_["signal"].SIG_BLOCK
+                    and signals == globals_["HANDLED_TERMINATION_SIGNALS"],
+                    "cleanup transition used or restored the wrong signal mask")
+            blocked = True
+            return set()
+
+        def cleanup_killpg(pid, signum):
+            calls.append(("kill", pid, signum))
+            if signum == 0:
+                if pid in killed:
+                    raise ProcessLookupError()
+                return
+            if signum == globals_["signal"].SIGKILL or pid == 92:
+                killed.add(pid)
+
+        clock = 0.0
+        def cleanup_monotonic():
+            nonlocal clock
+            clock += 0.25
+            return clock
+
+        def cleanup_sleep(_seconds):
+            nonlocal injected
+            require(blocked, "cleanup wait ran before termination signals were blocked")
+            if not injected:
+                injected = True
+                globals_["interrupted"](globals_["signal"].SIGTERM, None)
+
+        globals_["supervisor_body"] = signal_wait_body
+        globals_["signal"].pthread_sigmask = cleanup_mask
+        globals_["os"].killpg = cleanup_killpg
+        globals_["os"].close = lambda descriptor: calls.append(("close", descriptor))
+        globals_["time"].monotonic = cleanup_monotonic
+        globals_["time"].sleep = cleanup_sleep
+        try:
+            supervisor["main"]()
+        except globals_["SupervisorCleanupFailure"] as error:
+            categories = tuple(category for category, _item in error.cleanup_errors)
+            require(error.primary_error is primary and error.__cause__ is primary
+                    and str(error).startswith("primary-before-cleanup-signal; cleanup failed: ")
+                    and categories == ("cleanup-transition-signal",)
+                    and masks == [(globals_["signal"].SIG_BLOCK,
+                                   globals_["HANDLED_TERMINATION_SIGNALS"])]
+                    and blocked and injected
+                    and ("kill", 91, globals_["signal"].SIGKILL) in calls
+                    and ("kill", 92, globals_["signal"].SIGTERM) in calls
+                    and ("close", 93) in calls,
+                    "cleanup-wait signal masked the primary or aborted later safe handling")
+        else:
+            raise RuntimeError("cleanup-wait signal injection unexpectedly succeeded")
+
+        globals_["supervisor_body"] = lambda _resources: (_ for _ in ()).throw(primary)
+        globals_["signal"].pthread_sigmask = original_pthread_sigmask
+        globals_["time"].monotonic = original_monotonic
+        globals_["time"].sleep = original_sleep
+
+        calls = []
+        active = Process(101, calls, status=0)
+        keeper = Process(102, calls)
+        globals_["ACTIVE_PHASE"] = None
+        globals_["OWNED_PHASE_GROUP"] = {"process": active, "pgid": 101}
+        def unknown_group(pid, signum):
+            calls.append(("kill", pid, signum))
+            if signum == 0:
+                raise OSError(errno.EIO, "group probe failed")
+        globals_["os"].killpg = unknown_group
+        globals_["os"].unlink = lambda path: calls.append(("unlink", path))
+        globals_["fsync_directory"] = lambda path: calls.append(("fsync", path))
+        globals_["os"].close = lambda descriptor: calls.append(("close", descriptor))
+        globals_["subprocess"].run = lambda *_args, **_kwargs: calls.append(("database",))
+        globals_["recover_intents"] = lambda: calls.append(("recover",))
+        cleanup = supervisor["cleanup_supervisor"](resources(
+            lock_fd=43, lock_keeper=keeper,
+            lock_keeper_group={"process": keeper, "pgid": 102}, snapshot_fd=42,
+            lock_held=True, intents_acquired=True, keeper_marker=True,
+            database_cleanup=True))
+        categories = tuple(category for category, _error in cleanup)
+        require(categories == (
+                    "active-phase-probe", "active-phase-containment-retained")
+                and ("kill", 101, 0) in calls
+                and not any(call == ("kill", 101, globals_["signal"].SIGTERM)
+                            or call == ("kill", 101, globals_["signal"].SIGKILL)
+                            for call in calls)
+                and ("close", 42) in calls
+                and not any(call[0] in ("database", "unlink", "fsync", "recover")
+                            or call == ("close", 43)
+                            or call[:2] == ("kill", 102) for call in calls),
+                "unconfirmed active process group dismantled transaction quarantine")
+
+        calls = []
+        active = Process(101, calls)
+        keeper = Process(102, calls)
+        retained = Process(103, calls)
+        globals_["ACTIVE_PHASE"] = None
+        globals_["OWNED_PHASE_GROUP"] = {"process": active, "pgid": 101}
+        signalled = set()
+
+        def killpg(pid, signum):
+            calls.append(("kill", pid, signum))
+            if signum == 0:
+                if pid in signalled:
+                    raise ProcessLookupError()
+                return
+            signalled.add(pid)
+            if pid in (101, 103):
+                raise OSError(errno.EIO, f"kill {pid} failed")
+
+        def close(descriptor):
+            calls.append(("close", descriptor))
+            if descriptor == 42:
+                raise OSError(errno.EIO, "snapshot close failed")
+
+        def run_cleanup(arguments, **_kwargs):
+            calls.append(("database", arguments[4]))
+            if arguments[4] == "/usr/bin/dropdb":
+                return types.SimpleNamespace(returncode=1, stdout="drop out", stderr="drop err")
+            raise OSError(errno.EIO, "role cleanup failed")
+
+        globals_["os"].killpg = killpg
+        globals_["os"].unlink = lambda path: (
+            calls.append(("unlink", path)),
+            (_ for _ in ()).throw(OSError(errno.EIO, "unlink failed")),
+        )[-1]
+        globals_["fsync_directory"] = lambda path: (
+            calls.append(("fsync", path)),
+            (_ for _ in ()).throw(OSError(errno.EIO, "fsync failed")),
+        )[-1]
+        globals_["os"].close = close
+        globals_["subprocess"].run = run_cleanup
+        globals_["recover_intents"] = lambda: (
+            calls.append(("recover",)),
+            (_ for _ in ()).throw(OSError(errno.EIO, "recovery failed")),
+        )[-1]
+        class BrokenStderr:
+            def write(self, _value):
+                raise OSError(errno.EIO, "stderr write failed")
+
+            def flush(self):
+                raise OSError(errno.EIO, "stderr flush failed")
+        globals_["sys"].stderr = BrokenStderr()
+        cleanup = supervisor["cleanup_supervisor"](resources(
+            lock_fd=43, lock_keeper=keeper,
+            lock_keeper_group={"process": keeper, "pgid": 102}, snapshot_fd=42,
+            retained_process=retained,
+            retained_group={"process": retained, "pgid": 103},
+            lock_held=True, intents_acquired=True,
+            keeper_marker=True, database_cleanup=True))
+        categories = tuple(category for category, _error in cleanup)
+        require(categories == (
+            "active-phase-kill", "retained-process-kill",
+            "snapshot-close", "drop database", "drop database-report", "drop roles",
+            "drop roles-report", "lock-keeper-marker-unlink",
+            "lock-keeper-marker-fsync", "intent-recovery"),
+            f"supervisor cleanup categories or order changed: {categories!r}")
+        require(("kill", 102, globals_["signal"].SIGTERM) in calls
+                and ("kill", 101, globals_["signal"].SIGTERM) in calls
+                and ("unlink", globals_["LOCK_KEEPER_PID_PATH"]) in calls
+                and ("fsync", "/run/nmcp-ci") in calls
+                and ("kill", 103, globals_["signal"].SIGTERM) in calls
+                and ("close", 42) in calls and ("database", "/usr/bin/dropdb") in calls
+                and ("database", "/usr/bin/psql") in calls and ("recover",) in calls
+                and ("close", 43) in calls,
+                f"one supervisor cleanup failure blocked a later eligible operation: {calls!r}")
+        globals_["sys"].stderr = original_stderr
+
+        primary = RuntimeError("create-owned-primary")
+        local_calls = []
+        original_durable = globals_["durable_intents"]
+        original_fault = globals_["fault"]
+        original_lexists = globals_["os"].path.lexists
+        original_mkdir = globals_["os"].mkdir
+        original_fsync_call = globals_["os"].fsync
+        original_mask = globals_["signal"].pthread_sigmask
+        descriptors = iter((71, 72))
+        owned_stat = types.SimpleNamespace(
+            st_dev=1, st_ino=2, st_mode=stat.S_IFDIR | 0o700,
+            st_uid=0, st_gid=0)
+        try:
+            globals_["os"].open = lambda *_args, **_kwargs: next(descriptors)
+            globals_["os"].fstat = lambda _descriptor: owned_stat
+            globals_["os"].path.lexists = lambda _path: False
+            globals_["os"].mkdir = lambda *_args, **_kwargs: None
+            globals_["os"].fsync = lambda _descriptor: None
+            globals_["durable_intents"] = lambda _entries: None
+            globals_["fault"] = lambda point: (_ for _ in ()).throw(primary) if point.endswith(
+                ":after-register") else None
+            def causal_close(descriptor):
+                local_calls.append(("close", descriptor))
+                raise OSError(errno.EIO, f"close {descriptor}")
+            def causal_umask(mask):
+                local_calls.append(("umask", mask))
+                if mask == 0o077:
+                    raise OSError(errno.EIO, "umask restore")
+                return 0o077
+            def causal_mask(how, mask):
+                local_calls.append(("mask", how, mask))
+                if how == globals_["signal"].SIG_SETMASK:
+                    raise OSError(errno.EIO, "mask restore")
+                return {globals_["signal"].SIGUSR1}
+            globals_["os"].close = causal_close
+            globals_["os"].umask = causal_umask
+            globals_["signal"].pthread_sigmask = causal_mask
+            try:
+                supervisor["create_owned_top"](
+                    "/fixture/owned", 0o700, [], set(), "fixture")
+            except globals_["SupervisorCleanupFailure"] as error:
+                require(error.primary_error is primary and error.__cause__ is primary
+                        and tuple(category for category, _item in error.cleanup_errors) == (
+                            "owned-top-close", "umask-restore", "owned-parent-close",
+                            "signal-mask-restore")
+                        and local_calls[-4:] == [
+                            ("close", 72), ("umask", 0o077), ("close", 71),
+                            ("mask", globals_["signal"].SIG_SETMASK,
+                             {globals_["signal"].SIGUSR1})],
+                        "create_owned_top cleanup masked its primary or skipped restoration")
+            else:
+                raise RuntimeError("create_owned_top causal cleanup unexpectedly succeeded")
+        finally:
+            globals_["durable_intents"] = original_durable
+            globals_["fault"] = original_fault
+            globals_["os"].path.lexists = original_lexists
+            globals_["os"].mkdir = original_mkdir
+            globals_["os"].fsync = original_fsync_call
+            globals_["signal"].pthread_sigmask = original_mask
+
+        phase_primary = RuntimeError("phase-primary")
+        phase_calls = []
+        try:
+            with supervisor["CleanupScope"]() as cleanup_scope:
+                for descriptor in (81, 82, 83):
+                    cleanup_scope.defer("phase-input-close", lambda value: (
+                        phase_calls.append(value),
+                        (_ for _ in ()).throw(OSError(errno.EIO, f"close {value}")),
+                    )[-1], descriptor)
+                raise phase_primary
+        except globals_["SupervisorCleanupFailure"] as error:
+            require(error.primary_error is phase_primary and error.__cause__ is phase_primary
+                    and phase_calls == [83, 82, 81]
+                    and len(error.cleanup_errors) == 3,
+                    "phase-style descriptor cleanup skipped a close or replaced the primary")
+        else:
+            raise RuntimeError("phase-style descriptor cleanup unexpectedly succeeded")
+
+        aggregate_primary = RuntimeError("primary-first")
+        aggregate_cleanup = (
+            ("snapshot-close", RuntimeError("snapshot-detail")),
+            ("lock-close", RuntimeError("lock-detail")),
+        )
+        globals_["supervisor_body"] = lambda _resources: (
+            _ for _ in ()).throw(aggregate_primary)
+        globals_["cleanup_supervisor"] = lambda _resources: aggregate_cleanup
+        try:
+            supervisor["main"]()
+        except globals_["SupervisorCleanupFailure"] as error:
+            require(str(error) == ("primary-first; cleanup failed: "
+                                   "snapshot-close: snapshot-detail; lock-close: lock-detail")
+                    and error.primary_error is aggregate_primary
+                    and error.cleanup_errors == aggregate_cleanup
+                    and error.__cause__ is aggregate_primary,
+                    "supervisor aggregate did not expose primary-first cleanup detail and cause")
+        else:
+            raise RuntimeError("supervisor aggregate failure unexpectedly succeeded")
+
+        nonce = "a" * 64
+        marker_stat = types.SimpleNamespace(
+            st_dev=1, st_ino=2, st_mode=stat.S_IFREG | 0o600, st_uid=0, st_gid=0,
+            st_nlink=1, st_size=65, st_mtime_ns=3, st_ctime_ns=4)
+        descriptors = iter((10, 11))
+        closed = []
+        globals_["os"].open = lambda *_args, **_kwargs: next(descriptors)
+        globals_["os"].fstat = lambda _descriptor: marker_stat
+        globals_["os"].read = lambda _descriptor, _size: (nonce + "\n").encode("ascii")
+        globals_["os"].stat = lambda *_args, **_kwargs: marker_stat
+        def fail_close(descriptor):
+            closed.append(descriptor)
+            raise OSError(errno.EIO, f"close {descriptor} failed")
+        globals_["os"].close = fail_close
+        try:
+            supervisor["validate_launch_marker"](
+                "/run/nmcp-ci/launch-" + nonce + ".release", nonce, ".release")
+        except globals_["SupervisorCleanupFailure"] as error:
+            require(closed == [11, 10]
+                    and error.primary_error is None
+                    and tuple(category for category, _item in error.cleanup_errors) == (
+                        "launch-marker-close", "launch-marker-directory-close"),
+                    "launch marker validation did not independently close both descriptors")
+        else:
+            raise RuntimeError("injected launch marker close failures unexpectedly succeeded")
+    finally:
+        globals_["supervisor_body"] = original_body
+        globals_["run_supervisor_body"] = original_run_body
+        globals_["cleanup_supervisor"] = original_cleanup
+        globals_["CLEANUP_TRANSITION_ERRORS"] = original_transition_errors
+        globals_["SIGNAL_ERRORS"][:] = original_signal_errors
+        globals_["BODY_ACTIVE"] = original_body_active
+        globals_["ACTIVE_PHASE"] = original_active
+        globals_["OWNED_PHASE_GROUP"] = original_owned_phase
+        globals_["recover_intents"] = original_recover
+        globals_["fsync_directory"] = original_fsync
+        globals_["subprocess"].run = original_run
+        globals_["os"].open = original_open
+        globals_["os"].close = original_close
+        globals_["os"].fstat = original_fstat
+        globals_["os"].read = original_read
+        globals_["os"].stat = original_stat
+        globals_["os"].unlink = original_unlink
+        globals_["os"].killpg = original_killpg
+        globals_["sys"].stderr = original_stderr
+        globals_["sys"].argv = original_argv
+        globals_["os"].environ = original_environ
+        globals_["os"].geteuid = original_geteuid
+        globals_["os"].chdir = original_chdir
+        globals_["os"].umask = original_umask
+        globals_["signal"].signal = original_signal
+        globals_["signal"].pthread_sigmask = original_pthread_sigmask
+        globals_["time"].monotonic = original_monotonic
+        globals_["time"].sleep = original_sleep
+        globals_["os"].makedirs = original_makedirs
+        globals_["os"].lstat = original_lstat
+        globals_["fcntl"].flock = original_flock
+        globals_["git"] = original_git
+
+
 def main():
     client = runpy.run_path(str(CLIENT_PATH), run_name="diagnostic_client_fixture")
     containment = runpy.run_path(str(CONTAINMENT_PATH), run_name="diagnostic_containment_fixture")
+    supervisor = runpy.run_path(str(SUPERVISOR_PATH), run_name="diagnostic_supervisor_fixture")
+    supervisor_process_group_case(supervisor)
+    supervisor_atomic_launch_cases(supervisor)
+    supervisor_cleanup_cases(supervisor)
     containment["assert_persistent_cgroup_routing_contract"]()
     diagnostic_cases(client, containment)
     explicit_marker_phase_cases(containment)

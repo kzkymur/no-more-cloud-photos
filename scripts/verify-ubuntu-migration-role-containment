@@ -355,7 +355,8 @@ def parse_client_result(payload):
         fail("client result schema prefix changed")
     fields = body.split(";")
     expected_names = (
-        "primary", "events", "return", "stdout", "success",
+        "primary", "events", "events_complete", "final_scanned", "final_observed",
+        "final_empty", "return", "stdout", "success",
     )
     if len(fields) != len(expected_names):
         fail("client result schema field count changed")
@@ -374,17 +375,17 @@ def parse_client_result(payload):
         if len(raw_events) > RESULT_EVENT_LIMIT:
             fail("client result schema event trace exceeded its bound")
         parsed_events = []
-        for raw_event in raw_events:
+        for expected_ordinal, raw_event in enumerate(raw_events):
             parts = raw_event.split(".")
-            if len(parts) != 5:
+            if len(parts) != 6:
                 fail("client result schema event was malformed")
-            boundary, category, *raw_counts = parts
+            raw_ordinal, boundary, category, *raw_counts = parts
             if (boundary not in RESULT_BOUNDARIES
                     or category not in RESULT_CLEANUP_CATEGORIES
                     or boundary == "none" and category != "unexpected"):
                 fail("client result schema event category or boundary was unknown")
             counts = []
-            for value in raw_counts:
+            for value in (raw_ordinal, *raw_counts):
                 if (not value.isascii() or not value.isdecimal()
                         or (value != "0" and value.startswith("0"))):
                     fail("client result schema event count was malformed")
@@ -392,18 +393,18 @@ def parse_client_result(payload):
                 if count > COUNTER_MAX:
                     fail("client result schema event count exceeded its bound")
                 counts.append(count)
-            parsed_events.append((boundary, category, *counts))
+            if counts[0] != expected_ordinal:
+                fail("client result schema event ordinals were not contiguous")
+            parsed_events.append((expected_ordinal, boundary, category, *counts[1:]))
         events = tuple(parsed_events)
-        canonical = tuple(sorted(events, key=lambda event: (
-            RESULT_BOUNDARIES.index(event[0]), RESULT_CLEANUP_CATEGORIES.index(event[1]),
-            event[2], event[3], event[4])))
-        if len(set(events)) != len(events) or events != canonical:
-            fail("client result schema events were duplicate or noncanonically ordered")
     flags = {}
-    for name in ("return", "stdout", "success"):
+    for name in ("events_complete", "final_scanned", "final_observed", "final_empty",
+                 "return", "stdout", "success"):
         if values[name] not in ("0", "1"):
             fail("client result schema flag was malformed")
         flags[name] = int(values[name])
+    if flags["final_empty"] and not (flags["final_scanned"] and flags["final_observed"]):
+        fail("client result schema final evidence was contradictory")
     return {
         "primary": values["primary"], "events": events, **flags,
     }
@@ -451,14 +452,15 @@ def expected_persistent_result(case, boundary):
         "unload": (("unload", "property-unavailable"),),
     }[boundary]
     events = tuple(
-        (event_boundary, category,
-         (3 if boundary in ("show", "wait", "unload") else 1)
-         if event_boundary == boundary else 0,
-         (4 if boundary in ("show", "wait", "unload") else 2)
-         if event_boundary == boundary else 0, 0)
-        for event_boundary, category in categories)
+         (ordinal, event_boundary, category,
+          (3 if boundary in ("show", "wait", "unload") else 1)
+          if event_boundary == boundary else 0,
+          (4 if boundary in ("show", "wait", "unload") else 2)
+          if event_boundary == boundary else 0, 0)
+        for ordinal, (event_boundary, category) in enumerate(categories))
     return {
         "primary": "cleanup-test", "events": events,
+        "events_complete": 1, "final_scanned": 1, "final_observed": 1, "final_empty": 1,
         "return": 1, "stdout": 0, "success": 0,
     }
 
@@ -525,12 +527,16 @@ def evaluate_persistent_result(case, expected_case, lifecycle_category, expected
         "return_match": returncode == expected_result["return"] == schema.get("return"),
         "stdout_match": stdout == "" and schema.get("stdout") == expected_result["stdout"],
         "success_match": SUCCESS not in stdout and schema.get("success") == expected_result["success"],
-        "intercept_match": (intercepted == sum(event[3] for event in expected_result["events"])
-                            == sum(event[3] for event in schema.get("events", ()))),
-        "attempt_match": (attempted == sum(event[4] for event in expected_result["events"])
-                          == sum(event[4] for event in schema.get("events", ()))),
-        "retry_match": (sum(event[2] for event in schema.get("events", ()))
-                        == sum(event[2] for event in expected_result["events"])),
+        "events_complete": schema.get("events_complete") == 1,
+        "final_scanned": schema.get("final_scanned") == 1,
+        "final_observed": schema.get("final_observed") == 1,
+        "final_empty": schema.get("final_empty") == 1,
+        "intercept_match": (intercepted == sum(event[4] for event in expected_result["events"])
+                            == sum(event[4] for event in schema.get("events", ()))),
+        "attempt_match": (attempted == sum(event[5] for event in expected_result["events"])
+                          == sum(event[5] for event in schema.get("events", ()))),
+        "retry_match": (sum(event[3] for event in schema.get("events", ()))
+                        == sum(event[3] for event in expected_result["events"])),
         "lock_handoff_ok": not lock_handoff_error,
         "cleanup_error_empty": not cleanup_error,
         "cleanup_categories": cleanup_categories == (),
@@ -562,6 +568,8 @@ def persistent_scalar_diagnostic(case, lifecycle_category, predicates, stderr_sh
         f"case_exact={bits['case_exact']};life_match={bits['lifecycle_match']};"
         f"schema_shape={bits['schema_shape']};schema_exact={bits['schema_exact']};"
         f"primary_exact={bits['primary_exact']};events_exact={bits['events_exact']};"
+        f"events_complete={bits['events_complete']};final_scanned={bits['final_scanned']};"
+        f"final_observed={bits['final_observed']};final_empty={bits['final_empty']};"
         f"ret={bits['return_match']};"
         f"out={bits['stdout_match']};success={bits['success_match']};"
         f"retry={bits['retry_match']};intercept={bits['intercept_match']};"
@@ -730,7 +738,8 @@ def persistent_failure_diagnostics(mode, boundary, faulted, classification, inte
 
 def assert_machine_result_contract():
     expected = expected_persistent_result("parse", "kill")
-    line = (RESULT_PREFIX + "primary=cleanup-test;events=kill.kill-unavailable.1.2.0;"
+    line = (RESULT_PREFIX + "primary=cleanup-test;events=0.kill.kill-unavailable.1.2.0;"
+            "events_complete=1;final_scanned=1;final_observed=1;final_empty=1;"
             "return=1;stdout=0;success=0")
     stderr = line + "\nverification-client: " + "x" * 700 + "\n"
     parsed, shape = client_stderr_evidence(stderr)
@@ -738,32 +747,36 @@ def assert_machine_result_contract():
         fail("canonical persistent client result schema was rejected")
     mixed = parse_client_result(
         RESULT_PREFIX + "primary=cleanup-test;events="
-        "show.property-recovered.1.1.1,show.property-unavailable.3.4.1,"
-        "stop.stop-unavailable.1.2.0,"
-        "unload.unload-timeout.0.0.0,final.cgroup-residue.0.0.0,"
-        "final.cgroup-observation.0.0.0,final.unexpected.0.0.0;"
+        "0.show.property-recovered.1.1.1,1.show.property-unavailable.3.4.1,"
+        "2.stop.stop-unavailable.1.2.0,"
+        "3.unload.unload-timeout.0.0.0,4.final.cgroup-residue.0.0.0,"
+        "5.final.cgroup-observation.0.0.0,6.final.unexpected.0.0.0;"
+        "events_complete=1;final_scanned=1;final_observed=1;final_empty=0;"
         "return=1;stdout=0;success=0")
     if mixed["events"] != (
-            ("show", "property-recovered", 1, 1, 1),
-            ("show", "property-unavailable", 3, 4, 1),
-            ("stop", "stop-unavailable", 1, 2, 0),
-            ("unload", "unload-timeout", 0, 0, 0),
-            ("final", "cgroup-residue", 0, 0, 0),
-            ("final", "cgroup-observation", 0, 0, 0),
-            ("final", "unexpected", 0, 0, 0)):
+            (0, "show", "property-recovered", 1, 1, 1),
+            (1, "show", "property-unavailable", 3, 4, 1),
+            (2, "stop", "stop-unavailable", 1, 2, 0),
+            (3, "unload", "unload-timeout", 0, 0, 0),
+            (4, "final", "cgroup-residue", 0, 0, 0),
+            (5, "final", "cgroup-observation", 0, 0, 0),
+            (6, "final", "unexpected", 0, 0, 0)):
         fail("mixed recovered, final residue, and unknown cleanup ordering changed")
     malformed = (
         line.replace("primary=cleanup-test", "primary=unknown"),
         line.replace("kill.kill-unavailable", "unknown.kill-unavailable"),
         line.replace("kill.kill-unavailable", "kill.unexpected-category"),
-        line.replace("kill.kill-unavailable.1.2.0", "kill.kill-unavailable.1.2.0,kill.kill-unavailable.1.2.0"),
-        line.replace("events=kill.kill-unavailable.1.2.0", "events=unload.unload-timeout.0.0.0,kill.kill-unavailable.1.2.0"),
+        line.replace("0.kill.kill-unavailable.1.2.0", "0.kill.kill-unavailable.1.2.0,0.kill.kill-unavailable.1.2.0"),
+        line.replace("events=0.kill.kill-unavailable.1.2.0", "events=1.kill.kill-unavailable.1.2.0"),
         line.replace(".1.2.0", ".01.2.0"),
         line.replace(".1.2.0", ".1.-1.0"),
         line.replace(".1.2.0", ".1.2.1000000"),
-        line.replace(";events=kill.kill-unavailable.1.2.0", ""),
+        line.replace(";events=0.kill.kill-unavailable.1.2.0", ""),
         line.replace(";return=1", ";extra=0;return=1"),
-        line.replace("primary=cleanup-test;events=", "events=kill.kill-unavailable.1.2.0;primary=cleanup-test;events="),
+        line.replace("primary=cleanup-test;events=", "events=0.kill.kill-unavailable.1.2.0;primary=cleanup-test;events="),
+        line.replace("events_complete=1", "events_complete=2"),
+        line.replace("final_scanned=1", "final_scanned=0"),
+        line.replace("final_observed=1", "final_observed=0"),
         line + " ", " " + line, line + "\n", line + "\nextra",
     )
     for mutation in malformed:
@@ -801,7 +814,11 @@ def assert_machine_result_contract():
         "case_exact": ("case", "normal"),
         "lifecycle_match": ("lifecycle_category", "timeout"),
         "schema_shape": ("stderr_shape", {**shape, "shape": False}),
-        "schema_exact": ("parsed", {**parsed, "events": (("kill", "kill-unavailable", 0, 2, 0),)}),
+        "schema_exact": ("parsed", {**parsed, "events": ((0, "kill", "kill-unavailable", 0, 2, 0),)}),
+        "events_complete": ("parsed", {**parsed, "events_complete": 0}),
+        "final_scanned": ("parsed", {**parsed, "final_scanned": 0}),
+        "final_observed": ("parsed", {**parsed, "final_observed": 0}),
+        "final_empty": ("parsed", {**parsed, "final_empty": 0}),
         "return_match": ("returncode", 0), "stdout_match": ("stdout", "extra"),
         "intercept_match": ("intercepted", 1), "attempt_match": ("attempted", 1),
         "lock_handoff_ok": ("lock_handoff_error", "failed"),
@@ -1643,7 +1660,8 @@ def persistent_launch_signature(state, repo, commit, go_binary, mode):
              f"{sanitized_state(state)}")
     supervisor_argv = ("/usr/bin/python3", "-I", "-S", PROGRAM,
                        os.path.abspath(os.path.join("/", repo)), commit, go_binary, nonce,
-                       persistent_supervisor_mode(mode))
+                       persistent_supervisor_mode(mode),
+                       "--persistent-launch-required=/run/nmcp-ci/launch-" + nonce + ".required")
     expected_argv = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
                      "LC_ALL=C", "LANG=C", "HOME=/root", prefix + nonce,
                      *supervisor_argv)
@@ -1659,12 +1677,29 @@ def persistent_launch_signature(state, repo, commit, go_binary, mode):
 
 
 def assert_launch_signature_counterexamples(state, repo, commit, go_binary, mode):
+    argv = state["Command"]["argv"]
+    required = "--persistent-launch-required=/run/nmcp-ci/launch-"
+    marker_index = -1
+    index = 0
+    for argument in argv:
+        if argument[:len(required)] == required:
+            marker_index = index
+        index += 1
+    if marker_index != len(argv) - 1:
+        fail("persistent launch required marker was not the final argument")
     mutations = {
         "description": ("Description", "wrong verifier description"),
         "environment": ("Environment", f"{NONCE_VARIABLE}={'0' * 64}"),
         "exec-start": ("Command", {"path": "/usr/bin/env",
-                                     "argv": tuple("/bin/false" if item == PROGRAM else item
-                                                   for item in state["Command"]["argv"])}),
+                                      "argv": tuple("/bin/false" if item == PROGRAM else item
+                                                    for item in argv)}),
+        "required-marker-omitted": ("Command", {"path": "/usr/bin/env",
+                                                   "argv": argv[:-1]}),
+        "required-marker-wrong": ("Command", {"path": "/usr/bin/env",
+                                                 "argv": (*argv[:-1], required + "0" * 64
+                                                          + ".required")}),
+        "required-marker-reordered": ("Command", {"path": "/usr/bin/env",
+                                                     "argv": (*argv[:-2], argv[-1], argv[-2])}),
         "fixed-property": ("KillMode", "process"),
     }
     for label, (property_name, replacement) in mutations.items():

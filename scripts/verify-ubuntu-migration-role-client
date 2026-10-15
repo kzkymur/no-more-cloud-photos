@@ -29,8 +29,8 @@ NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
 DESCRIPTION_PREFIX = "NMCP migration role verifier "
 SUCCESS = "Ubuntu migration role compatibility verification passed"
 RESULT_PREFIX = "NMCP_CLIENT_RESULT_V1:"
-RESULT_BYTE_LIMIT = 8192
-RESULT_EVENT_LIMIT = 99
+RESULT_BYTE_LIMIT = select.PIPE_BUF
+RESULT_EVENT_LIMIT = 48
 PRIMARY_CATEGORIES = (
     "none", "cleanup-test", "cancelled", "verification", "unexpected",
 )
@@ -95,7 +95,8 @@ INTERCEPTIONS = {}
 ATTEMPTS = {}
 RETRIES = {}
 BOUNDARIES = set()
-RESULT_EVENTS = set()
+RESULT_EVENTS = []
+RESULT_EVENTS_COMPLETE = True
 RESULT_MAPPED_CLEANUP_ERRORS = set()
 RECORDED_CGROUP = []
 RECORDED_CGROUP_LIMIT = 64
@@ -164,6 +165,10 @@ class ClientResultFailure(RuntimeError):
         self.machine = machine
 
 
+class TerminalEmissionFailure(BaseException):
+    pass
+
+
 def fail(message):
     raise RuntimeError(message)
 
@@ -173,17 +178,17 @@ def primary_fail(category, message):
 
 
 def cleanup_result(category, boundary, errors=()):
+    global RESULT_EVENTS_COMPLETE
     if boundary not in CLEANUP_BOUNDARIES:
         boundary = "none"
     if category not in CLEANUP_CATEGORIES or (boundary == "none" and category != "unexpected"):
         category = "unexpected"
-    snapshot = (RETRIES.get(boundary, 0), INTERCEPTIONS.get(boundary, 0),
-                ATTEMPTS.get(boundary, 0))
-    RESULT_EVENTS.add((boundary, category, *snapshot))
-    if len(RESULT_EVENTS) > RESULT_EVENT_LIMIT:
-        RESULT_EVENTS.add((
-            "final", "unexpected", RETRIES.get("final", 0),
-            INTERCEPTIONS.get("final", 0), ATTEMPTS.get("final", 0)))
+    if len(RESULT_EVENTS) < RESULT_EVENT_LIMIT:
+        snapshot = (RETRIES.get(boundary, 0), INTERCEPTIONS.get(boundary, 0),
+                    ATTEMPTS.get(boundary, 0))
+        RESULT_EVENTS.append((len(RESULT_EVENTS), boundary, category, *snapshot))
+    else:
+        RESULT_EVENTS_COMPLETE = False
     RESULT_MAPPED_CLEANUP_ERRORS.update(id(error) for error in errors)
 
 
@@ -271,29 +276,31 @@ def primary_exception(error, boundary):
         record_cgroup_failure(error, boundary)
     if isinstance(error, CancellationFailure):
         return error
-    cancellation = cancellation_exception()
-    if cancellation is not None:
-        return cancellation
     if isinstance(error, PrimaryFailure):
         return error
     return (PrimaryFailure("verification", str(error))
             if isinstance(error, RuntimeError) else error)
 
 
-def render_client_result(primary_error):
+def preserve_primary(primary_error, error, boundary):
+    candidate = primary_exception(error, boundary)
+    if primary_error is None:
+        return candidate
+    cleanup_result("cancelled" if isinstance(candidate, CancellationFailure) else "unexpected",
+                   boundary, (candidate,))
+    return primary_error
+
+
+def render_client_result(primary_error, final_evidence):
     primary = primary_result_category(primary_error)
-    ordered = tuple(sorted(RESULT_EVENTS, key=lambda event: (
-        CLEANUP_BOUNDARIES.index(event[0]), CLEANUP_CATEGORIES.index(event[1]),
-        event[2], event[3], event[4])))
-    if len(ordered) > RESULT_EVENT_LIMIT:
-        overflow = tuple(event for event in ordered
-                         if event[:2] == ("final", "unexpected"))[-1]
-        ordered = ordered[:RESULT_EVENT_LIMIT - 1] + (overflow,)
+    scanned, observed, empty, _final_error = final_evidence
     events = ",".join(
-        f"{boundary}.{category}.{retries}.{interceptions}.{attempts}"
-        for boundary, category, retries, interceptions, attempts in ordered) or "-"
+        f"{ordinal}.{boundary}.{category}.{retries}.{interceptions}.{attempts}"
+        for ordinal, boundary, category, retries, interceptions, attempts in RESULT_EVENTS) or "-"
     line = (
         f"{RESULT_PREFIX}primary={primary};events={events};"
+        f"events_complete={int(RESULT_EVENTS_COMPLETE)};final_scanned={int(scanned)};"
+        f"final_observed={int(observed)};final_empty={int(empty)};"
         "return=1;stdout=0;success=0"
     )
     try:
@@ -305,15 +312,37 @@ def render_client_result(primary_error):
     return line
 
 
-def result_failure(primary_error, human):
-    raise ClientResultFailure(render_client_result(primary_error), human) from None
+def result_failure(primary_error, human, final_evidence):
+    raise ClientResultFailure(render_client_result(primary_error, final_evidence), human) from None
 
 
-def emit_terminal_result(primary_error, cleanup_errors, nonce, result):
+def write_terminal_payload(descriptor, payload):
+    if type(payload) is not bytes or not payload or len(payload) > select.PIPE_BUF:
+        raise TerminalEmissionFailure("terminal result payload exceeded PIPE_BUF")
+    while True:
+        try:
+            written = os.write(descriptor, payload)
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise TerminalEmissionFailure("terminal result write failed") from error
+        if written != len(payload):
+            raise TerminalEmissionFailure("terminal result write was not exact")
+        return
+
+
+def emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence):
     signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
+    cancellation = terminal_cancellation_exception()
+    if cancellation is not None:
+        if primary_error is None:
+            primary_error = cancellation
+        else:
+            cleanup_result("cancelled", "final", (cancellation,))
+            cleanup_errors = [*cleanup_errors, cancellation]
     failure = None
     try:
-        resolve_outcome(primary_error, cleanup_errors, nonce)
+        resolve_outcome(primary_error, cleanup_errors, nonce, final_evidence)
     except ClientResultFailure as error:
         failure = error
     if failure is None:
@@ -325,17 +354,9 @@ def emit_terminal_result(primary_error, cleanup_errors, nonce, result):
         payload = (failure.machine + "\nverification-client: "
                    + top_level_diagnostic(failure) + "\n").encode("ascii")
         status = 1
-    cancellation = terminal_cancellation_exception()
-    if cancellation is not None:
-        failure = ClientResultFailure(
-            render_client_result(cancellation), sanitized_diagnostic(cancellation, nonce))
-        descriptor = 2
-        payload = (failure.machine + "\nverification-client: "
-                   + top_level_diagnostic(failure) + "\n").encode("ascii")
-        status = 1
-    # This write is the terminal-result linearization point. Signals already
-    # latched or pending above win; later signals cannot change committed output.
-    os.write(descriptor, payload)
+    # The cancellation decision above is the linearization point. The immutable
+    # payload is then emitted atomically; only EINTR may retry the same bytes.
+    write_terminal_payload(descriptor, payload)
     return status
 
 
@@ -1236,6 +1257,23 @@ def assert_fixed_cgroups_empty(phase):
             sanitized_diagnostic("; ".join(failures), None), residue_error, errors)
 
 
+def uncaptured_final_cgroup_evidence():
+    error = cgroup_observation_error(
+        "final-close", RuntimeError("final cgroup evidence was not captured"))
+    return (False, False, False, CgroupFailure(str(error), None, (error,)))
+
+
+def capture_final_cgroup_evidence():
+    if not CLIENT_LOCK_HELD:
+        fail("final cgroup evidence requires client.lock")
+    residue, errors = fixed_cgroup_residue("final-close")
+    residue_error = CleanupFailure(CGROUP_RESIDUE_FAILURE) if residue else None
+    failures = ([str(residue_error)] if residue_error is not None else []) + list(map(str, errors))
+    failure = (CgroupFailure(sanitized_diagnostic("; ".join(failures), None),
+                             residue_error, errors) if failures else None)
+    return (True, not errors, not residue and not errors, failure)
+
+
 def assert_prelaunch_absent(state):
     if state.get("LoadState") != "not-found":
         fail("fixed verification unit is not explicitly absent: "
@@ -1244,25 +1282,26 @@ def assert_prelaunch_absent(state):
     assert_fixed_cgroups_empty("prelaunch")
 
 
-def resolve_outcome(primary_error, cleanup_errors, nonce):
-    primary_error = cancellation_exception() or primary_error
+def resolve_outcome(primary_error, cleanup_errors, nonce, final_evidence):
+    if (type(final_evidence) is not tuple or len(final_evidence) != 4
+            or any(type(bit) is not bool for bit in final_evidence[:3])
+            or final_evidence[2] and not (final_evidence[0] and final_evidence[1])
+            or (final_evidence[:3] != (True, True, True))
+                != (final_evidence[3] is not None)):
+        fail("final cgroup evidence was not immutable and complete")
     if isinstance(primary_error, CgroupFailure):
         record_cgroup_failure(primary_error, "final")
-    primary_error = cancellation_exception() or primary_error
-    final_error = None
-    try:
-        assert_fixed_cgroups_empty("final-close")
-    except BaseException as error:
-        final_error = error
+    final_error = final_evidence[3]
+    if final_error is not None:
         record_cgroup_failure(final_error, "final")
-    primary_error = cancellation_exception() or primary_error
     for error in cleanup_errors:
         if not cleanup_error_mapped(error):
             if isinstance(error, CgroupFailure):
                 record_cgroup_failure(error, "final")
             else:
                 cleanup_result("unexpected", "final", (error,))
-        primary_error = cancellation_exception() or primary_error
+    if not RESULT_EVENTS_COMPLETE:
+        cleanup_errors = [*cleanup_errors, RuntimeError("cleanup event evidence overflowed")]
     if final_error is not None or cleanup_errors:
         errors = []
         if final_error is not None:
@@ -1272,15 +1311,14 @@ def resolve_outcome(primary_error, cleanup_errors, nonce):
         for error in cleanup_errors:
             append_unique_diagnostic(errors, sanitized_diagnostic(error, nonce))
         detail = sanitized_diagnostic("; ".join(errors), nonce)
-        primary_error = cancellation_exception() or primary_error
         if final_error is not None:
-            result_failure(primary_error, detail)
+            result_failure(primary_error, detail, final_evidence)
         if primary_error is not None:
             primary = sanitized_diagnostic(primary_error, nonce)
-            result_failure(primary_error, f"{primary}; cleanup failed: {detail}")
-        result_failure(None, f"cleanup failed: {detail}")
+            result_failure(primary_error, f"{primary}; cleanup failed: {detail}", final_evidence)
+        result_failure(None, f"cleanup failed: {detail}", final_evidence)
     if primary_error is not None:
-        result_failure(primary_error, sanitized_diagnostic(primary_error, nonce))
+        result_failure(primary_error, sanitized_diagnostic(primary_error, nonce), final_evidence)
 
 
 def exec_start_argv(value):
@@ -1636,6 +1674,7 @@ def main():
     launch_barrier_required = False
     primary_error = None
     cleanup_errors = []
+    final_evidence = uncaptured_final_cgroup_evidence()
     result = 1
     try:
         if requested_mode == "client-terminal-race-b":
@@ -1788,7 +1827,7 @@ def main():
             assert_fixed_cgroups_empty("work")
             result = 0
         except BaseException as error:
-            primary_error = primary_exception(error, "final")
+            primary_error = preserve_primary(primary_error, error, "final")
         finally:
             # Preserve the exclusive reserve without granting early failures
             # the rest of the 17-minute transaction for teardown.
@@ -1829,13 +1868,17 @@ def main():
             COMMAND_DEADLINE = work_deadline
             cancellation = cancellation_exception()
             if cancellation is not None:
-                primary_error = cancellation
+                if primary_error is None:
+                    primary_error = cancellation
+                else:
+                    cleanup_result("cancelled", "final", (cancellation,))
+                    cleanup_errors.append(cancellation)
             if RECOVERED_ERRORS:
                 cleanup_errors.extend(RECOVERED_ERRORS)
         if requested_mode == "client-terminal-race-a":
             client_pause("unload", "client-terminal-race-a-unloaded")
     except BaseException as error:
-        primary_error = primary_exception(error, "final")
+        primary_error = preserve_primary(primary_error, error, "final")
     finally:
         try:
             if (launch_barrier_required and nonce is not None
@@ -1847,15 +1890,16 @@ def main():
             cleanup_errors.append(error)
         finally:
             try:
-                close_client_lock(client_lock)
+                final_evidence = capture_final_cgroup_evidence()
             except BaseException as error:
                 cleanup_errors.append(error)
-    return emit_terminal_result(primary_error, cleanup_errors, nonce, result)
+            finally:
+                try:
+                    close_client_lock(client_lock)
+                except BaseException as error:
+                    cleanup_errors.append(error)
+    return emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence)
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as error:
-        raise SystemExit(emit_terminal_result(
-            primary_exception(error, "final"), [], None, 1))
+    raise SystemExit(main())
