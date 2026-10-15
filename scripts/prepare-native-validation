@@ -19,7 +19,7 @@ need() { command -v "$1" >/dev/null 2>&1 || fail "missing '$1'; run scripts/inst
 [[ $(uname -m) == x86_64 ]] || fail "amd64 is required for the pinned metadata probe archive"
 scripts/local-validation-preflight native
 for command in autoconf automake cmake ctest curl git go ldd make meson nasm ninja pkg-config \
-  prlimit python3 sha256sum tar timeout xz; do
+  prlimit python3 sha256sum stat tar timeout xz; do
   need "$command"
 done
 

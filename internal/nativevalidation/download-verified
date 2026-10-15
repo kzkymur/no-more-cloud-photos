@@ -10,12 +10,20 @@ target=$1
 url=$2
 digest=$3
 temporary=''
+owned_identity=''
+
+identity() {
+  stat -c '%d:%i' -- "$1" 2>/dev/null
+}
 
 cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
   if [[ -n $temporary ]]; then
     rm -f -- "$temporary" || true
+  fi
+  if [[ -n $owned_identity && $(identity "$target" || true) == "$owned_identity" ]]; then
+    rm -f -- "$target" 2>/dev/null || true
   fi
   exit "$status"
 }
@@ -30,6 +38,10 @@ verified() {
 }
 
 if [[ -e $target || -L $target ]] && ! verified; then
+  if [[ -d $target && ! -L $target ]]; then
+    printf 'verified download: refusing directory target: %s\n' "$target" >&2
+    exit 73
+  fi
   rm -f -- "$target"
 fi
 
@@ -43,11 +55,17 @@ if ! verified; then
     exit "$status"
   fi
   printf '%s  %s\n' "$digest" "$temporary" | sha256sum --check --status
-  mv -f -- "$temporary" "$target"
+  owned_identity=$(identity "$temporary")
+  mv -fT -- "$temporary" "$target"
   temporary=''
 fi
 
-if ! verified; then
-  rm -f -- "$target" || true
+if [[ -z $owned_identity ]]; then
+  verified
+  exit
+fi
+if [[ $(identity "$target" || true) != "$owned_identity" ]] || ! verified ||
+  [[ $(identity "$target" || true) != "$owned_identity" ]]; then
   exit 1
 fi
+owned_identity=''

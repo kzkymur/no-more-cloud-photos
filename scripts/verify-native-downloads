@@ -49,7 +49,9 @@ done
 [[ -n $output ]]
 printf '%s\n' "$output" >>"$FAKE_CURL_LOG"
 case ${FAKE_CURL_MODE:-success} in
-  success|failed-mv|corrupt-mv) cp -- "$FAKE_CURL_SOURCE" "$output" ;;
+  success|failed-mv|foreign-failed-mv|corrupt-mv|replace-after-mv|race-directory|race-symlink|signal-after-mv)
+    cp -- "$FAKE_CURL_SOURCE" "$output"
+    ;;
   bad-download) printf 'bad downloaded bytes\n' >"$output" ;;
   failure) exit 47 ;;
   signal)
@@ -66,10 +68,39 @@ set -euo pipefail
 if [[ ${FAKE_CURL_MODE:-success} == failed-mv ]]; then
   exit 74
 fi
+if [[ ${FAKE_CURL_MODE:-success} == foreign-failed-mv ]]; then
+  target=${!#}
+  printf 'foreign target\n' >"$target"
+  exit 74
+fi
 if [[ ${FAKE_CURL_MODE:-success} == corrupt-mv ]]; then
   target=${!#}
   /usr/bin/mv "$@"
   printf 'corrupt after publication\n' >"$target"
+  exit 0
+fi
+if [[ ${FAKE_CURL_MODE:-success} == replace-after-mv ]]; then
+  target=${!#}
+  /usr/bin/mv "$@"
+  rm -f -- "$target"
+  cp -- "$FAKE_CURL_SOURCE" "$target"
+  exit 0
+fi
+if [[ ${FAKE_CURL_MODE:-success} == race-directory ]]; then
+  target=${!#}
+  mkdir -- "$target"
+  printf 'attacker-owned sentinel\n' >"$target/sentinel"
+  exec /usr/bin/mv "$@"
+fi
+if [[ ${FAKE_CURL_MODE:-success} == race-symlink ]]; then
+  target=${!#}
+  ln -s -- "$FAKE_OUTSIDE" "$target"
+  exec /usr/bin/mv "$@"
+fi
+if [[ ${FAKE_CURL_MODE:-success} == signal-after-mv ]]; then
+  /usr/bin/mv "$@"
+  kill -TERM "$PPID"
+  sleep 1
   exit 0
 fi
 exec /usr/bin/mv "$@"
@@ -79,6 +110,9 @@ chmod 0755 "$work/bin/curl" "$work/bin/mv"
 printf 'verified native download fixture\n' >"$work/source"
 digest=$(sha256sum "$work/source" | cut -d' ' -f1)
 export FAKE_CURL_SOURCE=$work/source FAKE_CURL_LOG=$work/curl.log
+mkdir -p "$work/outside"
+printf 'outside sentinel\n' >"$work/outside/sentinel"
+export FAKE_OUTSIDE=$work/outside
 
 targets=(
   "$work/cache/.tools/exiftool-13.36.tar.gz"
@@ -100,6 +134,35 @@ done
 PATH="$work/bin:$PATH" "$downloader" "${targets[-1]}" fixture://native "$digest"
 [[ $(wc -l <"$FAKE_CURL_LOG") -eq ${#targets[@]} ]]
 
+# An existing directory is not recursively traversed or removed. It fails
+# closed before network access, while removable nonregular entries recover.
+shape_root=$work/cache/shapes
+mkdir -p "$shape_root/directory.tar.xz"
+printf 'directory sentinel\n' >"$shape_root/directory.tar.xz/sentinel"
+before=$(wc -l <"$FAKE_CURL_LOG")
+if PATH="$work/bin:$PATH" "$downloader" "$shape_root/directory.tar.xz" \
+  fixture://native "$digest"; then
+  printf 'native download fixture: directory target unexpectedly succeeded\n' >&2
+  exit 1
+else
+  [[ $? -eq 73 ]]
+fi
+[[ $(wc -l <"$FAKE_CURL_LOG") -eq $before ]]
+[[ $(<"$shape_root/directory.tar.xz/sentinel") == 'directory sentinel' ]]
+! compgen -G "$shape_root/directory.tar.xz.download.*" >/dev/null
+
+mkfifo "$shape_root/fifo.tar.xz"
+PATH="$work/bin:$PATH" "$downloader" "$shape_root/fifo.tar.xz" fixture://native "$digest"
+[[ -f $shape_root/fifo.tar.xz && ! -L $shape_root/fifo.tar.xz ]]
+cmp -- "$work/source" "$shape_root/fifo.tar.xz"
+
+ln -s -- "$work/outside" "$shape_root/symlink.tar.xz"
+PATH="$work/bin:$PATH" "$downloader" "$shape_root/symlink.tar.xz" fixture://native "$digest"
+[[ -f $shape_root/symlink.tar.xz && ! -L $shape_root/symlink.tar.xz ]]
+cmp -- "$work/source" "$shape_root/symlink.tar.xz"
+[[ $(<"$work/outside/sentinel") == 'outside sentinel' ]]
+[[ $(find "$work/outside" -mindepth 1 -maxdepth 1 -printf '.\n' | wc -l) -eq 1 ]]
+
 assert_failed_cleanly() {
   local mode=$1 expected=$2 target="$work/cache/failures/$1.tar.xz" status
   mkdir -p "$(dirname -- "$target")"
@@ -120,4 +183,59 @@ assert_failed_cleanly bad-download 1
 assert_failed_cleanly failed-mv 74
 assert_failed_cleanly corrupt-mv 1
 assert_failed_cleanly signal 143
+assert_failed_cleanly signal-after-mv 143
+
+# Cleanup keys ownership to the downloaded inode. A foreign regular target
+# substituted around a failed or completed publication is never unlinked, and
+# even a byte-identical replacement cannot satisfy final identity verification.
+foreign_failed=$work/cache/races/foreign-failed.tar.xz
+mkdir -p "$(dirname -- "$foreign_failed")"
+if FAKE_CURL_MODE=foreign-failed-mv PATH="$work/bin:$PATH" \
+  "$downloader" "$foreign_failed" fixture://native "$digest"; then
+  printf 'native download fixture: foreign failed-mv target unexpectedly succeeded\n' >&2
+  exit 1
+else
+  [[ $? -eq 74 ]]
+fi
+[[ $(<"$foreign_failed") == 'foreign target' ]]
+! compgen -G "$foreign_failed.download.*" >/dev/null
+
+foreign_replacement=$work/cache/races/foreign-replacement.tar.xz
+if FAKE_CURL_MODE=replace-after-mv PATH="$work/bin:$PATH" \
+  "$downloader" "$foreign_replacement" fixture://native "$digest"; then
+  printf 'native download fixture: foreign replacement unexpectedly succeeded\n' >&2
+  exit 1
+else
+  [[ $? -eq 1 ]]
+fi
+cmp -- "$work/source" "$foreign_replacement"
+! compgen -G "$foreign_replacement.download.*" >/dev/null
+
+# A directory substituted immediately before publication makes mv -T fail
+# rather than copying inside it. The downloaded temporary remains owned and is
+# cleaned; the foreign directory and its sentinel remain untouched.
+race_directory=$work/cache/races/directory.tar.xz
+mkdir -p "$(dirname -- "$race_directory")"
+if FAKE_CURL_MODE=race-directory PATH="$work/bin:$PATH" \
+  "$downloader" "$race_directory" fixture://native "$digest"; then
+  printf 'native download fixture: directory substitution unexpectedly succeeded\n' >&2
+  exit 1
+else
+  [[ $? -ne 0 ]]
+fi
+[[ -d $race_directory && ! -L $race_directory ]]
+[[ $(<"$race_directory/sentinel") == 'attacker-owned sentinel' ]]
+[[ $(find "$race_directory" -mindepth 1 -maxdepth 1 -printf '.\n' | wc -l) -eq 1 ]]
+! compgen -G "$race_directory.download.*" >/dev/null
+
+# A symlink-to-directory substituted at the same boundary is atomically
+# replaced as the target itself; it cannot redirect bytes into that directory.
+race_symlink=$work/cache/races/symlink.tar.xz
+FAKE_CURL_MODE=race-symlink PATH="$work/bin:$PATH" \
+  "$downloader" "$race_symlink" fixture://native "$digest"
+[[ -f $race_symlink && ! -L $race_symlink ]]
+cmp -- "$work/source" "$race_symlink"
+[[ $(<"$work/outside/sentinel") == 'outside sentinel' ]]
+[[ $(find "$work/outside" -mindepth 1 -maxdepth 1 -printf '.\n' | wc -l) -eq 1 ]]
+! compgen -G "$race_symlink.download.*" >/dev/null
 printf 'Native verified-download fixtures: PASS\n'
