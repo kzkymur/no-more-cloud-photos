@@ -49,6 +49,16 @@ def stable_source_digest(source: str) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def stable_node_source_digest(source: str, node: ast.AST) -> str:
+    fragment = ast.get_source_segment(source, node)
+    require(isinstance(fragment, str) and fragment and "\r" not in fragment,
+            "reviewed node must have canonical UTF-8/LF source bytes")
+    encoded = fragment.encode("utf-8", errors="strict")
+    require(encoded.decode("utf-8", errors="strict") == fragment,
+            "reviewed node did not round-trip canonical UTF-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def verify_nonce_safe_diagnostics(client_path: pathlib.Path, containment_path: pathlib.Path) -> None:
     client = runpy.run_path(str(client_path), run_name="nmcp_client_diagnostic_fixture")
     containment = runpy.run_path(
@@ -1181,33 +1191,21 @@ finally:
     require(len(cleanup_scope_nodes) == 1
             and ast.dump(cleanup_scope_nodes[0]) == ast.dump(expected_cleanup_scope),
             "supervisor local cleanup aggregation/reverse-attempt contract changed")
+    # Bind exact reviewed source fragments rather than ast.dump(): CPython may
+    # add AST fields between patch-supported interpreter versions even when the
+    # executable source and the semantic mutation contracts below are identical.
     reviewed_cleanup_snapshots = {
-        "aggregate": {
-            "af0fa3d57246e7d1e79221535e4cd9fccaceedc3847163cdfe3dda51522c7400",
-            "b7483f09de9a25b49deeb15941a85111348f691b68fd6ce2a2d01c7c94db61b3",
-        },
-        "cleanup": {
-            "ea695de06933ca4eaad86e0f9ac24b74031e69ef91097831ba0238e9f778e5c5",
-            "30c35a13b47fc0e337182a59c829e325435294555a4c0dfb5807d5b16c92719d",
-        },
-        "main": {
-            "243c3080c02e9282062841ade8bc0a36a188b048273cf7de0e2f3000825f06d4",
-            "648470db4069a6f0829d3fd9f7a4c52dab55b5a031169e94cfaaf9c109029c20",
-            "a62a3fa765cb467b4366e29448b955b40f120d38b31c48a6141145d681676690",
-            "cb0f208dd559e4847f6187fd0f0814fc83d4d98abd4d44dffdb3c6e0623c7a5a",
-        },
+        "aggregate": "a7aa62116c41625b896ae355ee4caffa95d3eaaa78a3326acfdca0bfbad1b3df",
+        "cleanup": "272bdf83b09cb93d6dfaaab409128e75232d56cc2c4748b781c6623881c87908",
+        "main": "8b2e50531eb0817c4c5ab0fd371f39b15b24a1903897ce0355096197468f2f8b",
     }
     observed_cleanup_snapshots = {
-        "aggregate": hashlib.sha256(ast.dump(
-            aggregate_nodes[0], include_attributes=False).encode()).hexdigest()
+        "aggregate": stable_node_source_digest(source, aggregate_nodes[0])
         if len(aggregate_nodes) == 1 else "",
-        "cleanup": hashlib.sha256(ast.dump(
-            cleanup_node, include_attributes=False).encode()).hexdigest(),
-        "main": hashlib.sha256(ast.dump(
-            outer_main, include_attributes=False).encode()).hexdigest(),
+        "cleanup": stable_node_source_digest(source, cleanup_node),
+        "main": stable_node_source_digest(source, outer_main),
     }
-    require(all(observed_cleanup_snapshots[name] in fingerprints
-                for name, fingerprints in reviewed_cleanup_snapshots.items()),
+    require(observed_cleanup_snapshots == reviewed_cleanup_snapshots,
             "supervisor reviewed cleanup control-flow snapshot changed")
 
 
