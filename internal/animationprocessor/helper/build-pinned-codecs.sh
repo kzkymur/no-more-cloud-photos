@@ -9,20 +9,13 @@ fi
 prefix=$1
 work=$2
 mkdir -p "$prefix" "$work/downloads" "$work/source" "$work/build"
+repo=$(cd -- "$(dirname -- "$0")/../../.." && pwd)
+download_verified=$repo/internal/nativevalidation/download-verified
 
-download() {
-  local name=$1 url=$2 digest=$3
-  local target="$work/downloads/$name"
-  if [[ ! -f "$target" ]]; then
-    curl --fail --location --silent --show-error "$url" --output "$target"
-  fi
-  printf '%s  %s\n' "$digest" "$target" | sha256sum --check
-}
-
-download libwebp-1.6.0.tar.gz \
+"$download_verified" "$work/downloads/libwebp-1.6.0.tar.gz" \
   https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz \
   e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
-download giflib-5.2.2.tar.gz \
+"$download_verified" "$work/downloads/giflib-5.2.2.tar.gz" \
   https://sourceforge.net/projects/giflib/files/giflib-5.2.2.tar.gz/download \
   be7ffbd057cadebe2aa144542fd90c6838c6a083b5e8a9048b8ee3b66b29d5fb
 

@@ -10,27 +10,20 @@ prefix=$1
 work=$2
 mkdir -p "$prefix" "$work/downloads" "$work/source" "$work/build"
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+repo=$(cd -- "$script_dir/../../.." && pwd)
+download_verified=$repo/internal/nativevalidation/download-verified
 
 read -r inherited_aom_object inherited_aom_digest < <(
   "$script_dir/validate-inherited-toolchain.sh" "$prefix"
 )
 
-download() {
-  local name=$1 url=$2 digest=$3
-  local target="$work/downloads/$name"
-  if [[ ! -f "$target" ]]; then
-    curl --fail --location --silent --show-error "$url" --output "$target"
-  fi
-  printf '%s  %s\n' "$digest" "$target" | sha256sum --check
-}
-
-download zimg-3.0.6.tar.gz \
+"$download_verified" "$work/downloads/zimg-3.0.6.tar.gz" \
   https://github.com/sekrit-twc/zimg/archive/refs/tags/release-3.0.6.tar.gz \
   be89390f13a5c9b2388ce0f44a5e89364a20c1c57ce46d382b1fcc3967057577
-download SVT-AV1-v4.2.0.tar.gz \
+"$download_verified" "$work/downloads/SVT-AV1-v4.2.0.tar.gz" \
   https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v4.2.0/SVT-AV1-v4.2.0.tar.gz \
   c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740
-download ffmpeg-9.0.2.tar.xz \
+"$download_verified" "$work/downloads/ffmpeg-9.0.2.tar.xz" \
   https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz \
   8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 

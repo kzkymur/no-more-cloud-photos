@@ -10,6 +10,7 @@ build=$state/helper-build
 fixtures=$state/fixtures
 downloads=$state/downloads
 env_file=$state/validation.env
+download_verified=$repo/internal/nativevalidation/download-verified
 
 fail() { printf 'native preparation: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || fail "missing '$1'; run scripts/install-local-validation-deps"; }
@@ -24,45 +25,24 @@ done
 
 mkdir -p "$tools" "$downloads" "$build" "$fixtures"
 rm -f -- "$env_file"
+scripts/verify-native-downloads
 
-download() {
-  local target=$1 url=$2 digest=$3
-  if [[ -e $target ]] && ! printf '%s  %s\n' "$digest" "$target" | sha256sum --check >/dev/null 2>&1; then
-    rm -f -- "$target"
-  fi
-  if [[ ! -f $target ]]; then
-    local temporary
-    temporary=$(mktemp "$target.download.XXXXXXXX")
-    if ! curl --fail --location --silent --show-error --retry 2 --retry-all-errors \
-      --connect-timeout 30 --max-time 300 "$url" --output "$temporary"; then
-      rm -f -- "$temporary"
-      return 1
-    fi
-    if ! printf '%s  %s\n' "$digest" "$temporary" | sha256sum --check; then
-      rm -f -- "$temporary"
-      return 1
-    fi
-    mv -f -- "$temporary" "$target"
-  fi
-  printf '%s  %s\n' "$digest" "$target" | sha256sum --check
-}
-
-download "$tools/exiftool-13.36.tar.gz" \
+"$download_verified" "$tools/exiftool-13.36.tar.gz" \
   https://github.com/exiftool/exiftool/archive/refs/tags/13.36.tar.gz \
   f70ecbcdccc18268d4d3c290faf8cf73b1cf128e3e7f8671e24d6604cae4dc73
-download "$tools/ffmpeg-6.0.1-amd64-static.tar.xz" \
+"$download_verified" "$tools/ffmpeg-6.0.1-amd64-static.tar.xz" \
   https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz \
   28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
-download "$downloads/sRGB2014.icc" \
+"$download_verified" "$downloads/sRGB2014.icc" \
   https://registry.color.org/rgb-registry/profiles/sRGB2014.icc \
   384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
-download "$downloads/static-gallery-4.webp" \
+"$download_verified" "$downloads/static-gallery-4.webp" \
   https://www.gstatic.com/webp/gallery/4.webp \
   0858d0afcb2921ded36b05586204f2459d965feb7db54cb083e3cfa059589dd9
-download "$downloads/orientation-6.jpg" \
+"$download_verified" "$downloads/orientation-6.jpg" \
   https://raw.githubusercontent.com/recurser/exif-orientation-examples/219294e144531b0c01247913cb58b6f5531b5081/Landscape_6.jpg \
   9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124
-download "$downloads/canon-a410.dng" \
+"$download_verified" "$downloads/canon-a410.dng" \
   'https://raw.pixls.us/data/Canon/Canon%20PowerShot%20A410/CANON_A410_CHDK_CRW_0741.DNG' \
   f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38
 

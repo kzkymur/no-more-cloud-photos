@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 || $1 != /* || ! $3 =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'usage: %s ABSOLUTE_TARGET URL SHA256\n' "$0" >&2
+  exit 2
+fi
+
+target=$1
+url=$2
+digest=$3
+temporary=''
+
+cleanup() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  if [[ -n $temporary ]]; then
+    rm -f -- "$temporary" || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+verified() {
+  [[ -f $target && ! -L $target ]] &&
+    printf '%s  %s\n' "$digest" "$target" | sha256sum --check --status
+}
+
+if [[ -e $target || -L $target ]] && ! verified; then
+  rm -f -- "$target"
+fi
+
+if ! verified; then
+  temporary=$(mktemp "$target.download.XXXXXXXX")
+  if curl --fail --location --silent --show-error --retry 2 --retry-all-errors \
+    --connect-timeout 30 --max-time 300 "$url" --output "$temporary"; then
+    :
+  else
+    status=$?
+    exit "$status"
+  fi
+  printf '%s  %s\n' "$digest" "$temporary" | sha256sum --check --status
+  mv -f -- "$temporary" "$target"
+  temporary=''
+fi
+
+if ! verified; then
+  rm -f -- "$target" || true
+  exit 1
+fi

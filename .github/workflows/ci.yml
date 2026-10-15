@@ -98,7 +98,7 @@ jobs:
             .tools/*.tar.xz
             .native-work/**/downloads
             .native-work/downloads
-          key: native-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('internal/**/helper/build-pinned-*.sh', 'scripts/prepare-native-validation') }}
+          key: native-sources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('internal/**/helper/build-pinned-*.sh', 'internal/nativevalidation/download-verified', 'scripts/prepare-native-validation') }}
       - name: Install native build dependencies
         run: |
           sudo apt-get update

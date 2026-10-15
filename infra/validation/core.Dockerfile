@@ -27,6 +27,7 @@ WORKDIR /src
 COPY internal/stillprocessor/helper/ internal/stillprocessor/helper/
 COPY internal/animationprocessor/helper/ internal/animationprocessor/helper/
 COPY internal/videoprocessor/helper/ internal/videoprocessor/helper/
+COPY internal/nativevalidation/ internal/nativevalidation/
 RUN internal/stillprocessor/helper/build-pinned-toolchain.sh \
       /opt/nmcp /tmp/nmcp-still-toolchain-work \
  && cmake -S internal/stillprocessor/helper -B /tmp/nmcp-still-helper-build -G Ninja \

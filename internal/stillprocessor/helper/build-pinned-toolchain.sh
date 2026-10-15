@@ -9,26 +9,19 @@ fi
 prefix=$1
 work=$2
 mkdir -p "$prefix" "$work/downloads" "$work/source" "$work/build"
+repo=$(cd -- "$(dirname -- "$0")/../../.." && pwd)
+download_verified=$repo/internal/nativevalidation/download-verified
 
-download() {
-  local name=$1 url=$2 digest=$3
-  local target="$work/downloads/$name"
-  if [[ ! -f "$target" ]]; then
-    curl --fail --location --silent --show-error "$url" --output "$target"
-  fi
-  printf '%s  %s\n' "$digest" "$target" | sha256sum --check
-}
-
-download lcms2-2.14.tar.gz \
+"$download_verified" "$work/downloads/lcms2-2.14.tar.gz" \
   https://github.com/mm2/Little-CMS/releases/download/lcms2.14/lcms2-2.14.tar.gz \
   28474ea6f6591c4d4cee972123587001a4e6e353412a41b3e9e82219818d5740
-download LibRaw-0.22.2.tar.gz \
+"$download_verified" "$work/downloads/LibRaw-0.22.2.tar.gz" \
   https://www.libraw.org/data/LibRaw-0.22.2.tar.gz \
   de86b035655accff8d4010f1a221fdf50d353cb7b1422ba26f14a0db92612cfa
-download libheif-1.23.5.tar.gz \
+"$download_verified" "$work/downloads/libheif-1.23.5.tar.gz" \
   https://github.com/strukturag/libheif/releases/download/v1.23.5/libheif-1.23.5.tar.gz \
   fd9036064c4432f0550d15072ddf34956a248279ee9aeaff0fba3fa0f77d8f1a
-download vips-8.18.7.tar.xz \
+"$download_verified" "$work/downloads/vips-8.18.7.tar.xz" \
   https://github.com/libvips/libvips/releases/download/v8.18.7/vips-8.18.7.tar.xz \
   5baaead3b0bb20ffdb9e9ff09aa9fda08620923df77b63b436654cb5e0b3bf94
 

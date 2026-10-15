@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+downloader=$repo/internal/nativevalidation/download-verified
+work=$(mktemp -d)
+
+cleanup() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$work" || true
+  exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+
+python3 - "$repo" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+consumers = {
+    "scripts/prepare-native-validation": (6, ("exiftool-13.36.tar.gz", "ffmpeg-6.0.1-amd64-static.tar.xz", "canon-a410.dng")),
+    "internal/stillprocessor/helper/build-pinned-toolchain.sh": (4, ("lcms2-2.14.tar.gz", "LibRaw-0.22.2.tar.gz", "libheif-1.23.5.tar.gz", "vips-8.18.7.tar.xz")),
+    "internal/animationprocessor/helper/build-pinned-codecs.sh": (2, ("libwebp-1.6.0.tar.gz", "giflib-5.2.2.tar.gz")),
+    "internal/videoprocessor/helper/build-pinned-toolchain.sh": (3, ("zimg-3.0.6.tar.gz", "SVT-AV1-v4.2.0.tar.gz", "ffmpeg-9.0.2.tar.xz")),
+}
+for relative, (count, names) in consumers.items():
+    text = (root / relative).read_text()
+    assert "curl --" not in text, f"{relative}: bypasses shared downloader"
+    assert "download() {" not in text, f"{relative}: retains private downloader"
+    assert text.count('"$download_verified"') == count, f"{relative}: incomplete shared-downloader coverage"
+    for name in names:
+        assert name in text, f"{relative}: missing pinned input {name}"
+PY
+
+mkdir -p "$work/bin"
+cat >"$work/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=''
+while [[ $# -gt 0 ]]; do
+  if [[ $1 == --output && $# -ge 2 ]]; then
+    output=$2
+    shift 2
+  else
+    shift
+  fi
+done
+[[ -n $output ]]
+printf '%s\n' "$output" >>"$FAKE_CURL_LOG"
+case ${FAKE_CURL_MODE:-success} in
+  success|failed-mv|corrupt-mv) cp -- "$FAKE_CURL_SOURCE" "$output" ;;
+  bad-download) printf 'bad downloaded bytes\n' >"$output" ;;
+  failure) exit 47 ;;
+  signal)
+    cp -- "$FAKE_CURL_SOURCE" "$output"
+    kill -TERM "$PPID"
+    sleep 1
+    ;;
+  *) exit 98 ;;
+esac
+EOF
+cat >"$work/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${FAKE_CURL_MODE:-success} == failed-mv ]]; then
+  exit 74
+fi
+if [[ ${FAKE_CURL_MODE:-success} == corrupt-mv ]]; then
+  target=${!#}
+  /usr/bin/mv "$@"
+  printf 'corrupt after publication\n' >"$target"
+  exit 0
+fi
+exec /usr/bin/mv "$@"
+EOF
+chmod 0755 "$work/bin/curl" "$work/bin/mv"
+
+printf 'verified native download fixture\n' >"$work/source"
+digest=$(sha256sum "$work/source" | cut -d' ' -f1)
+export FAKE_CURL_SOURCE=$work/source FAKE_CURL_LOG=$work/curl.log
+
+targets=(
+  "$work/cache/.tools/exiftool-13.36.tar.gz"
+  "$work/cache/.native-work/downloads/sRGB2014.icc"
+  "$work/cache/.native-work/still/downloads/lcms2-2.14.tar.gz"
+  "$work/cache/.native-work/animation/downloads/libwebp-1.6.0.tar.gz"
+  "$work/cache/.native-work/video/downloads/ffmpeg-9.0.2.tar.xz"
+)
+for target in "${targets[@]}"; do
+  mkdir -p "$(dirname -- "$target")"
+  printf 'corrupt warm cache\n' >"$target"
+  PATH="$work/bin:$PATH" "$downloader" "$target" fixture://native "$digest"
+  cmp -- "$work/source" "$target"
+  ! compgen -G "$target.download.*" >/dev/null
+done
+[[ $(wc -l <"$FAKE_CURL_LOG") -eq ${#targets[@]} ]]
+
+# A valid warm entry must be reused without consulting the network.
+PATH="$work/bin:$PATH" "$downloader" "${targets[-1]}" fixture://native "$digest"
+[[ $(wc -l <"$FAKE_CURL_LOG") -eq ${#targets[@]} ]]
+
+assert_failed_cleanly() {
+  local mode=$1 expected=$2 target="$work/cache/failures/$1.tar.xz" status
+  mkdir -p "$(dirname -- "$target")"
+  if FAKE_CURL_MODE=$mode PATH="$work/bin:$PATH" \
+    "$downloader" "$target" fixture://native "$digest"; then
+    printf 'native download fixture: %s unexpectedly succeeded\n' "$mode" >&2
+    return 1
+  else
+    status=$?
+  fi
+  [[ $status -eq $expected ]]
+  [[ ! -e $target ]]
+  ! compgen -G "$target.download.*" >/dev/null
+}
+
+assert_failed_cleanly failure 47
+assert_failed_cleanly bad-download 1
+assert_failed_cleanly failed-mv 74
+assert_failed_cleanly corrupt-mv 1
+assert_failed_cleanly signal 143
+printf 'Native verified-download fixtures: PASS\n'
