@@ -3784,6 +3784,15 @@ def validate_containment(source: str, phase: str) -> None:
         return "unknown"
     return number if type(number) is int else "unknown"
 ''', "containment errno classification must fail closed without rendering hostile properties")
+    require_exact_function(tree, "evidence_failure_number", '''def evidence_failure_number(phase, operation, resource_class, number):
+    if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS
+            or resource_class not in DIAGNOSTIC_RESOURCES):
+        phase, operation, resource_class = "uncategorized", "unknown", "unknown"
+    if type(number) is not int and number != "unknown":
+        number = "unknown"
+    return EvidenceFailure(
+        f"phase={phase} operation={operation} resource={resource_class} errno={number}")
+''', "containment captured errno evidence must retain only closed categories")
     serialization_contract = {
         "stale_failure_message": ('serialize_diagnostic("stale", failure_category, fields, complete=True)',),
         "sanitized_diagnostic_text": ("<redacted-nonce>", "<redacted-hex64>",
@@ -3886,7 +3895,7 @@ def validate_containment(source: str, phase: str) -> None:
         node for node in tree.body if isinstance(node, ast.FunctionDef)
     }
     expected_containment_functions = {
-        "fail", "diagnostic_errno", "evidence_failure", "retained_diagnostic",
+        "fail", "diagnostic_errno", "evidence_failure_number", "evidence_failure", "retained_diagnostic",
         "os_call", "counter_failure", "parse_counter", "counter_identity",
         "aggregate_counter_failure",
         "try_nonblocking_flock", "popen", "raise_walk_error",
@@ -3929,6 +3938,7 @@ def validate_containment(source: str, phase: str) -> None:
     actual_containment_functions = {node.name for node in reviewed_persistent_functions}
     expected_function_signatures = (
         ("fail", "message"), ("diagnostic_errno", "error"),
+        ("evidence_failure_number", "phase, operation, resource_class, number"),
         ("evidence_failure", "phase, operation, resource_class, error"),
         ("retained_diagnostic", "error, fallback"),
         ("os_call", "phase, operation, resource_class, function, *args, **kwargs"),
@@ -4086,9 +4096,10 @@ class PersistentCgroupFinalityFailure(RuntimeError):
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
     except BlockingIOError as error:
-        if diagnostic_errno(error) == errno.EWOULDBLOCK:
+        number = diagnostic_errno(error)
+        if number == errno.EWOULDBLOCK:
             return False
-        raise evidence_failure(phase, "flock", resource_class, error) from None
+        raise evidence_failure_number(phase, "flock", resource_class, number) from None
     except OSError as error:
         raise evidence_failure(phase, "flock", resource_class, error) from None
 ''', "containment nonblocking flock must distinguish only reviewed contention")
@@ -4493,7 +4504,7 @@ COUNTER_CATEGORIES = (
         "client_stderr_evidence", "cleanup", "cleanup_fixture_invocation", "cleanup_signed_launch",
         "cleanup_signed_launch_if_owned", "cleanup_signed_launch_until",
         "close_transaction_lock",
-        "aggregate_counter_failure", "counter", "counter_failure", "counter_identity", "dict", "evidence_failure",
+        "aggregate_counter_failure", "counter", "counter_failure", "counter_identity", "dict", "evidence_failure_number", "evidence_failure",
         "fail", "function",
         "enumerate", "evaluate_persistent_result", "expected_persistent_result", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
         "launch_identity_matches", "launch_identity_signature", "list", "load_cleanup_intent",
@@ -4583,15 +4594,15 @@ COUNTER_CATEGORIES = (
     )
     reviewed_call_fingerprints = {
         # CPython 3.12 centralized bounded containment diagnostics.
-        ("7c1c969869c6208a625bee5415e849d929af61506c87459c8c0459ff21fd49c5",
-         "584e2858dfd7ecc3e634573e176a94bf9c006179a0e66e2dceeeb5572b98cfda",
+        ("fa0cd94c83c7caba8994bec4dec9a552ae6a50e7790b63fd8c297e4e5866a16d",
+         "ac0a7fe3d698f3bf4942b1b9987e8aa7e495ef8abf20d02503dbbd92f6d94ae7",
          "52db6fe7d050a322c1ae51dd7261ee33ca2da7f07dcecff1350d2e811602fbe0",
-         "e82d23d19c154fd671331969390a08fc65b4b3ed86021b08c566fc3d3c9823b7"),
+         "586828eb260f0fcbca81e76e556b6b63634314c4f697ad2493b8d093fc83d574"),
         # CPython 3.14 centralized bounded containment diagnostics.
-        ("edc5ca4c61973f56d5a7c62a709b5f8a1a320e80a2d31975048e6c8e36fc3de7",
-         "39b6104cc32bea1adf9580ba4212a2d9a6d91d037965e3a7e9dc4d67b164b41a",
+        ("1634fe5a05ba48e3b4e4a31f43848a7c3ec6f02777856e11e3c2fdfe7b06da22",
+         "4992e9e86a08ba4c6b3286281649d305d1cb6b51457605af161aa7d0bd543d64",
          "e11a509b8a1a5344b558c11b2f7f7903ada3c83aa6335500e6c924da3b2f5b07",
-         "4e5eaf60c0a5d5117421d939d1655b034e6ffad7455a80fa8b674921e6476c4c"),
+         "9f6307abd17e6203e33817a0348a93a63f00f0beef5124d6237d4d05ca10f0bd"),
         # CPython 3.14 contradictory final-evidence rejection.
         ("baac808ed0863905a85ef6e2919d7107337fb9121a2f12dc70ac9a1607ce07d5",
          "7e76563f12e29b31b0240d14e17cb89e1efe9835bef6adf23da666b57b635bec",
@@ -5044,9 +5055,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 714, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
-        "Delete": 1, "Expr": 402, "For": 68, "FunctionDef": 109, "If": 312,
-        "Import": 12, "Pass": 5, "Raise": 78, "Return": 113, "Try": 89, "While": 21,
+        "Assign": 716, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
+        "Delete": 1, "Expr": 402, "For": 68, "FunctionDef": 110, "If": 313,
+        "Import": 12, "Pass": 5, "Raise": 78, "Return": 114, "Try": 89, "While": 21,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -5065,6 +5076,8 @@ COUNTER_CATEGORIES = (
                     "223f9a2cdea97ba6c9c2d1f3d02a2be2b1baefa88beb1cea000eeb2fb340111f",
                     "e8e4bfd7c7777a2d0b1f17b6ab05d03b6bb2cf11f15e8990e05a8acd9dc7f737",
                     "877d7ec68d58eef173245737106c519dcbff5d74758ca2139b7e1f9d52b76fc6",
+                    "58bd28ff9b4cca72ccff5836a5ac2499ae2e4a130ef461d779dc58021b605271",
+                    "252a661f888d008a6fea5004e5f3af376a54bcd5280431d040ff0dba80bbe81b",
                     "59ea4e4b2a713ff9b9c2648c0983505ec766445eb6390caf94acc04022fc4069",
                     "feda271f94c137cf97a60f670682f1d1c7049fb4912d80ad7ee915abe8214c50",
                     "d3b505ba580c30ac11cc8b93a56ef579ec755cd312eed30959cf70fed71da358",
@@ -6341,7 +6354,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "f6251248e4d121ceee15f3e4fafc03c62d4436cee328b8c345c8562629c578a7",
+            == "4fdfe05161e12001f68f88e42b9b1e0376904152f51e3a32dc362ca3c867482b",
             "diagnostic fixture source snapshot changed")
 
 
@@ -8284,12 +8297,17 @@ def verify_supervisor_mutations(
             '                fcntl.LOCK_EX | fcntl.LOCK_NB)')),
         ("arbitrary OSError treated as lock contention", replace_once(containment,
             '    except BlockingIOError as error:\n'
-            '        if diagnostic_errno(error) == errno.EWOULDBLOCK:',
+            '        number = diagnostic_errno(error)\n'
+            '        if number == errno.EWOULDBLOCK:',
             '    except OSError as error:\n'
-            '        if diagnostic_errno(error) == errno.EWOULDBLOCK:')),
+            '        number = diagnostic_errno(error)\n'
+            '        if number == errno.EWOULDBLOCK:')),
         ("all BlockingIOError treated as lock contention", replace_once(containment,
-            '        if diagnostic_errno(error) == errno.EWOULDBLOCK:\n            return False',
+            '        if number == errno.EWOULDBLOCK:\n            return False',
             '        if True:\n            return False')),
+        ("captured BlockingIOError errno reread for evidence", replace_once(containment,
+            '        raise evidence_failure_number(phase, "flock", resource_class, number) from None',
+            '        raise evidence_failure(phase, "flock", resource_class, error) from None')),
         ("containment generic errno-only fallback", replace_once(containment,
             '        detail = evidence_failure("uncategorized", "unknown", "unknown", error)',
             '        detail = f"errno={error.errno}"')),

@@ -2431,6 +2431,19 @@ def actual_boundary_cases(client, containment):
     original_flock = containment_globals["fcntl"].flock
     original_close = module_os.close
     try:
+        class StatefulBlockingIOError(BlockingIOError):
+            def __init__(self, observations):
+                self.observations = tuple(observations)
+                self.accesses = 0
+
+            @property
+            def errno(self):
+                self.accesses += 1
+                observation = self.observations[self.accesses - 1]
+                if isinstance(observation, BaseException):
+                    raise observation
+                return observation
+
         containment_globals["fcntl"].flock = lambda *_args: (
             _ for _ in ()).throw(injected())
         assert_raises(lambda: client["lock_client"](90),
@@ -2444,6 +2457,37 @@ def actual_boundary_cases(client, containment):
         require(not containment["try_nonblocking_flock"](
             90, "transaction-lock", "lock"),
                 "expected nonblocking contention was not returned explicitly")
+
+        stateful_cases = (
+            ((errno.EIO, errno.EWOULDBLOCK), False, "errno=5"),
+            ((errno.EWOULDBLOCK, errno.EIO), True, None),
+            ((RuntimeError(SECRET), errno.EWOULDBLOCK), False, "errno=unknown"),
+            ((SECRET, errno.EWOULDBLOCK), False, "errno=unknown"),
+            ((errno.EACCES, RuntimeError(SECRET)), False, "errno=13"),
+        )
+        for observations, expected_contention, expected_evidence in stateful_cases:
+            stateful = StatefulBlockingIOError(observations)
+            containment_globals["fcntl"].flock = lambda *_args, failure=stateful: (
+                _ for _ in ()).throw(failure)
+            if expected_contention:
+                require(not containment["try_nonblocking_flock"](
+                    90, "transaction-lock", "lock"),
+                        "captured EWOULDBLOCK did not retain the contention result")
+            else:
+                try:
+                    containment["try_nonblocking_flock"](
+                        90, "transaction-lock", "lock")
+                except RuntimeError as observed:
+                    rendered = str(observed)
+                    require(expected_evidence in rendered and SECRET not in rendered,
+                            "captured flock errno did not retain closed evidence")
+                else:
+                    raise RuntimeError("non-contention captured flock errno was accepted")
+            require(stateful.accesses == 1,
+                    "caught BlockingIOError errno was not captured exactly once")
+
+        containment_globals["fcntl"].flock = lambda *_args: (
+            _ for _ in ()).throw(contention)
         require(not containment["lock_transaction"](90),
                 "transaction contention was not returned explicitly")
         module_os.open = lambda *_args, **_kwargs: 90
