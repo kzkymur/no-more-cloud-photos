@@ -11,6 +11,7 @@ url=$2
 digest=$3
 temporary=''
 owned_identity=''
+owned_fd=''
 
 identity() {
   stat -c '%d:%i' -- "$1" 2>/dev/null
@@ -24,6 +25,9 @@ cleanup() {
   fi
   if [[ -n $owned_identity && $(identity "$target" || true) == "$owned_identity" ]]; then
     rm -f -- "$target" 2>/dev/null || true
+  fi
+  if [[ -n $owned_fd ]]; then
+    exec {owned_fd}<&-
   fi
   exit "$status"
 }
@@ -55,6 +59,7 @@ if ! verified; then
     exit "$status"
   fi
   printf '%s  %s\n' "$digest" "$temporary" | sha256sum --check --status
+  exec {owned_fd}<"$temporary"
   owned_identity=$(identity "$temporary")
   mv -fT -- "$temporary" "$target"
   temporary=''
@@ -69,3 +74,5 @@ if [[ $(identity "$target" || true) != "$owned_identity" ]] || ! verified ||
   exit 1
 fi
 owned_identity=''
+exec {owned_fd}<&-
+owned_fd=''
