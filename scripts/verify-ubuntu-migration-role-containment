@@ -40,6 +40,7 @@ PERSISTENT_PROPERTY_ERROR = "unit properties remain unknown:"
 PERSISTENT_ACTION_ERROR = " command remains unavailable:"
 STALE_REJECTION_PREFIX = "verification-client: fixed verification unit is not explicitly absent: "
 DIAGNOSTIC_TEXT_LIMIT = 512
+DIAGNOSTIC_PREFIX = "containment-test: "
 PROGRAM = "/run/nmcp-ci/supervisor.py"
 NONCE_VARIABLE = "NMCP_VERIFIER_NONCE"
 DESCRIPTION_PREFIX = "NMCP migration role verifier "
@@ -83,6 +84,12 @@ def fail(message):
 
 class EvidenceFailure(RuntimeError):
     pass
+
+
+class SerializedDiagnosticFailure(RuntimeError):
+    def __init__(self, payload):
+        super().__init__("serialized containment diagnostic")
+        self.payload = payload
 
 
 class PersistentCgroupFinalityFailure(RuntimeError):
@@ -518,7 +525,6 @@ def evaluate_persistent_result(case, expected_case, lifecycle_category, expected
     schema = parsed or {}
     predicates = {
         "case_exact": case == expected_case,
-        "lifecycle_category": lifecycle_category == expected_lifecycle,
         "lifecycle_match": lifecycle_category == expected_lifecycle,
         "schema_shape": stderr_shape["shape"],
         "schema_exact": parsed == expected_result,
@@ -557,39 +563,38 @@ def evaluate_persistent_result(case, expected_case, lifecycle_category, expected
     return predicates
 
 
-def persistent_scalar_diagnostic(case, lifecycle_category, predicates, stderr_shape):
+def persistent_scalar_diagnostic(case, boundary, lifecycle_category, predicates, stderr_shape):
     lifecycle = lifecycle_category if lifecycle_category in (
         "none", "non-canonical", "timeout", "unexpected") else "unexpected"
     bits = {name: diagnostic_bit(value) for name, value in predicates.items()}
     byte_class = ("bounded" if stderr_shape["byte_bounded"] else
                   "empty" if stderr_shape["byte_count"] == 0 else "over")
-    message = (
-        f"persistent-result:case={case};life_cat={lifecycle};"
-        f"case_exact={bits['case_exact']};life_match={bits['lifecycle_match']};"
-        f"schema_shape={bits['schema_shape']};schema_exact={bits['schema_exact']};"
-        f"primary_exact={bits['primary_exact']};events_exact={bits['events_exact']};"
-        f"events_complete={bits['events_complete']};final_scanned={bits['final_scanned']};"
-        f"final_observed={bits['final_observed']};final_empty={bits['final_empty']};"
-        f"ret={bits['return_match']};"
-        f"out={bits['stdout_match']};success={bits['success_match']};"
-        f"retry={bits['retry_match']};intercept={bits['intercept_match']};"
-        f"attempt={bits['attempt_match']};handoff={bits['lock_handoff_ok']};"
-        f"cleanup_empty={bits['cleanup_error_empty']};cleanup_cats={bits['cleanup_categories']};"
-        f"reuse={bits['lock_reuse']};signed_req={bits['signed_cleanup_required']};"
-        f"signed_ran={bits['signed_cleanup_ran']};release={bits['release']};"
-        f"reap={bits['reap']};absent={bits['unit_absent']};"
-        f"recorded_cat={bits['recorded_category']};"
-        f"recorded_req={bits['recorded_required']};recorded_scan={bits['recorded_scan']};"
-        f"canonical_scan={bits['canonical_scan']};"
-        f"recorded_empty={bits['recorded_empty']};canonical_empty={bits['canonical_empty']};"
-        f"artifacts_absent={bits['artifacts_absent']};se_lines={stderr_shape['line_count']};"
-        f"se_bytes={byte_class};se_lws={diagnostic_bit(stderr_shape['leading_whitespace'])};"
-        f"se_tws={diagnostic_bit(stderr_shape['trailing_whitespace'])};"
-        f"se_events={bits['events_exact']}"
+    fields = (
+        ("case", case), ("boundary", boundary), ("life", lifecycle),
+        ("release", bits["release"]), ("reap", bits["reap"]),
+        ("signed_req", bits["signed_cleanup_required"]),
+        ("signed_ran", bits["signed_cleanup_ran"]), ("absent", bits["unit_absent"]),
+        ("rec_cat", bits["recorded_category"]), ("rec_req", bits["recorded_required"]),
+        ("rec_scan", bits["recorded_scan"]), ("can_scan", bits["canonical_scan"]),
+        ("rec_empty", bits["recorded_empty"]), ("can_empty", bits["canonical_empty"]),
+        ("handoff", bits["lock_handoff_ok"]), ("reuse", bits["lock_reuse"]),
+        ("artifacts", bits["artifacts_absent"]),
+        ("cleanup_empty", bits["cleanup_error_empty"]),
+        ("cleanup_cats", bits["cleanup_categories"]),
+        ("ev_complete", bits["events_complete"]),
+        ("fin_scan", bits["final_scanned"]),
+        ("fin_seen", bits["final_observed"]), ("fin_empty", bits["final_empty"]),
+        ("case_exact", bits["case_exact"]), ("life_match", bits["lifecycle_match"]),
+        ("schema_shape", bits["schema_shape"]), ("schema_exact", bits["schema_exact"]),
+        ("primary", bits["primary_exact"]), ("events", bits["events_exact"]),
+        ("ret", bits["return_match"]), ("out", bits["stdout_match"]),
+        ("success", bits["success_match"]), ("retry", bits["retry_match"]),
+        ("intercept", bits["intercept_match"]), ("attempt", bits["attempt_match"]),
+        ("se_lines", str(stderr_shape["line_count"])), ("se_bytes", byte_class),
+        ("se_lws", diagnostic_bit(stderr_shape["leading_whitespace"])),
+        ("se_tws", diagnostic_bit(stderr_shape["trailing_whitespace"])),
     )
-    if len(("containment-test: " + repr(message) + "\n").encode("ascii")) > 512:
-        fail("persistent scalar diagnostic exceeded its complete outer bound")
-    return message
+    return serialize_diagnostic("persistent", "result", fields, complete=True)
 
 
 def stale_expected_rejection(state):
@@ -631,34 +636,33 @@ def stale_failure_message(failure_category, client_zero, classification, unit_ab
     if error_category not in ("none", "fixture", "release", "state", "identity",
                               "action", "post", "lock", "paths"):
         error_category = "invalid"
-    message = (
-        f"stale fixed-unit fixture failed: scenario=stale;failure_category={failure_category};"
-        f"attempted={diagnostic_bit(classification['attempted'])};"
-        f"result_available={diagnostic_bit(classification['result_available'])};"
-        f"client_zero={diagnostic_bit(client_zero)};"
-        f"success_marker={diagnostic_bit(classification['success_marker'])};"
-        f"expected_rejection={diagnostic_bit(classification['expected_rejection'])};"
-        f"wrong_reason={diagnostic_bit(classification['wrong_reason'])};"
-        f"unit_absent={diagnostic_bit(unit_absent)};recorded_empty={diagnostic_bit(recorded_empty)};"
-        f"canonical_empty={diagnostic_bit(canonical_empty)};"
-        f"identity_unchanged={diagnostic_bit(identity_unchanged)};"
-        f"cleanup_attempted={diagnostic_bit(cleanup_attempted)};"
-        f"cleanup_succeeded={diagnostic_bit(cleanup_succeeded)};"
-        f"lock_reusable={diagnostic_bit(lock_reusable)};"
-        f"artifacts_removed={diagnostic_bit(artifacts_removed)};"
-        f"post_evidence_complete={diagnostic_bit(post_evidence_complete)};"
-        f"ready={diagnostic_bit(ready)};release={diagnostic_bit(released)};ack={diagnostic_bit(ack)};"
-        f"error_category={error_category};fixture_error={diagnostic_bit(fixture_error)};"
-        f"client_output={diagnostic_bit(client_output)};"
-        f"client_diagnostic={diagnostic_bit(client_diagnostic)};"
-        f"cleanup_error={diagnostic_bit(cleanup_error)}"
+    fields = (
+        ("attempted", diagnostic_bit(classification["attempted"])),
+        ("result_available", diagnostic_bit(classification["result_available"])),
+        ("client_zero", diagnostic_bit(client_zero)),
+        ("success_marker", diagnostic_bit(classification["success_marker"])),
+        ("expected_rejection", diagnostic_bit(classification["expected_rejection"])),
+        ("wrong_reason", diagnostic_bit(classification["wrong_reason"])),
+        ("unit_absent", diagnostic_bit(unit_absent)),
+        ("recorded_empty", diagnostic_bit(recorded_empty)),
+        ("canonical_empty", diagnostic_bit(canonical_empty)),
+        ("identity_unchanged", diagnostic_bit(identity_unchanged)),
+        ("cleanup_attempted", diagnostic_bit(cleanup_attempted)),
+        ("cleanup_succeeded", diagnostic_bit(cleanup_succeeded)),
+        ("lock_reusable", diagnostic_bit(lock_reusable)),
+        ("artifacts_removed", diagnostic_bit(artifacts_removed)),
+        ("post_evidence_complete", diagnostic_bit(post_evidence_complete)),
+        ("ready", diagnostic_bit(ready)), ("release", diagnostic_bit(released)),
+        ("ack", diagnostic_bit(ack)), ("error_category", error_category),
+        ("fixture_error", diagnostic_bit(fixture_error)),
+        ("client_output", diagnostic_bit(client_output)),
+        ("client_diagnostic", diagnostic_bit(client_diagnostic)),
+        ("cleanup_error", diagnostic_bit(cleanup_error)),
     )
-    if len("containment-test: ''\n") + len(message) > DIAGNOSTIC_TEXT_LIMIT:
-        fail("stale fixed-unit diagnostic schema exceeded its fixed bound")
-    return message
+    return serialize_diagnostic("stale", failure_category, fields, complete=True)
 
 
-def bounded_sanitized_repr(value, active_nonce=None):
+def sanitized_diagnostic_text(value, active_nonce=None):
     if isinstance(value, subprocess.TimeoutExpired):
         text = "subprocess timed out"
     elif isinstance(value, subprocess.CalledProcessError):
@@ -667,7 +671,10 @@ def bounded_sanitized_repr(value, active_nonce=None):
         number = value.errno if type(value.errno) is int else errno.EIO
         text = f"phase=uncategorized operation=unknown resource=unknown errno={number}"
     else:
-        text = str(value)
+        try:
+            text = str(value)
+        except BaseException:
+            text = "diagnostic conversion failed"
     if active_nonce:
         text = text.replace(active_nonce, "<redacted-nonce>")
     if any(marker in text for name in ("Description", "Environment", "ExecStart", "Command")
@@ -690,17 +697,74 @@ def bounded_sanitized_repr(value, active_nonce=None):
             parts.append(text[index])
             index += 1
     text = "".join(parts)
-    if len(text) > DIAGNOSTIC_TEXT_LIMIT:
-        text = text[:DIAGNOSTIC_TEXT_LIMIT] + "...<truncated>"
-    rendered = repr(text)
-    return (rendered[:DIAGNOSTIC_TEXT_LIMIT] + "...<truncated>"
-             if len(rendered) > DIAGNOSTIC_TEXT_LIMIT else rendered)
+    return text
+
+
+def render_diagnostic_message(message):
+    return (DIAGNOSTIC_PREFIX + ascii(message) + "\n").encode("ascii")
+
+
+def serialize_diagnostic(scenario, failure_class, fields=(), detail=None,
+                         active_nonce=None, complete=False):
+    if (not scenario or not failure_class
+            or any(character not in "abcdefghijklmnopqrstuvwxyz-" for character in scenario)
+            or any(character not in "abcdefghijklmnopqrstuvwxyz-" for character in failure_class)):
+        raise RuntimeError("diagnostic class was not a closed token")
+    parts = [f"scenario={scenario}", f"failure={failure_class}"]
+    names = set()
+    for name, value in fields:
+        if (not name or name in names
+                or any(character not in "abcdefghijklmnopqrstuvwxyz_" for character in name)):
+            raise RuntimeError("diagnostic field schema was not unique and closed")
+        value = str(value)
+        if (not value or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)):
+            raise RuntimeError("diagnostic field value was not a closed token")
+        names.add(name)
+        parts.append(f"{name}={value}")
+    fixed = ";".join(parts)
+
+    if detail is None:
+        payload = render_diagnostic_message(fixed)
+    else:
+        text = sanitized_diagnostic_text(detail, active_nonce)
+        payload = render_diagnostic_message(fixed + ";detail=" + text)
+        if len(payload) > DIAGNOSTIC_TEXT_LIMIT and not complete:
+            marker = "...<truncated>"
+            low, high = 0, len(text)
+            while low < high:
+                middle = (low + high + 1) // 2
+                candidate = render_diagnostic_message(
+                    fixed + ";detail=" + text[:middle] + marker)
+                if len(candidate) <= DIAGNOSTIC_TEXT_LIMIT:
+                    low = middle
+                else:
+                    high = middle - 1
+            payload = render_diagnostic_message(fixed + ";detail=" + text[:low] + marker)
+    if len(payload) > DIAGNOSTIC_TEXT_LIMIT:
+        raise RuntimeError("complete diagnostic exceeded its outer byte bound")
+    return payload
 
 
 def top_level_diagnostic(error):
     if isinstance(error, OSError):
-        return str(evidence_failure("uncategorized", "unknown", "unknown", error))
-    return bounded_sanitized_repr(error)
+        detail = evidence_failure("uncategorized", "unknown", "unknown", error)
+        return serialize_diagnostic(
+            "containment", "os-error", (("finality", "unknown"),), detail=detail)
+    return serialize_diagnostic(
+        "containment", "unexpected", (("finality", "unknown"),), detail=error)
+
+
+def write_diagnostic(stream, error):
+    payload = (error.payload if isinstance(error, SerializedDiagnosticFailure)
+               else top_level_diagnostic(error))
+    offset = 0
+    while offset < len(payload):
+        written = stream.write(payload[offset:])
+        if type(written) is not int or written <= 0:
+            raise RuntimeError("diagnostic stream write was not complete")
+        offset += written
+    stream.flush()
+    return len(payload)
 
 
 def sanitized_state(state):
@@ -710,30 +774,7 @@ def sanitized_state(state):
                   "Result", "ExecMainCode", "ExecMainStatus", "ExecMainPID", "MainPID",
                   "EvidenceError", *SERVICE_PROPERTIES)
     safe = {name: state.get(name) for name in safe_names if name in state}
-    return bounded_sanitized_repr(safe)
-
-
-def persistent_failure_diagnostics(mode, boundary, faulted, classification, intercepted,
-                                   attempted, observed, after_exit, signed_cleanup_ran,
-                                   post_cleanup, lock_handoff_error, cleanup_error,
-                                   lock_reuse_error, post_cleanup_cgroup):
-    detail = (
-        f"mode={mode!r}; boundary={boundary!r}; returncode={faulted.returncode!r}; "
-        f"success_in_stdout={classification['success_in_stdout']!r}; "
-        f"property_unknown={classification['property_unknown']!r}; "
-        f"action_unavailable={classification['action_unavailable']!r}; "
-        f"stdout_present={bool(faulted.stdout)!r}; stderr_present={bool(faulted.stderr)!r}; "
-        f"intercepted={intercepted!r}; attempted={attempted!r}; "
-        f"observed_signature={sanitized_state(observed)}; "
-        f"after_exit={sanitized_state(after_exit)}; "
-        f"signed_external_cleanup_ran={signed_cleanup_ran!r}; "
-        f"post_cleanup={sanitized_state(post_cleanup)}; "
-        f"lock_handoff_error={bounded_sanitized_repr(lock_handoff_error)}; "
-        f"cleanup_error={bounded_sanitized_repr(cleanup_error)}; "
-        f"lock_reuse_error={bounded_sanitized_repr(lock_reuse_error)}; "
-        f"post_cleanup_cgroup={bounded_sanitized_repr(post_cleanup_cgroup)}"
-    )
-    return bounded_sanitized_repr(detail)
+    return sanitized_diagnostic_text(safe)
 
 
 def assert_machine_result_contract():
@@ -842,12 +883,58 @@ def assert_machine_result_contract():
         observed = evaluate_persistent_result(**changed)
         if observed.get(expected_false) is not False or all(observed.values()):
             fail(f"persistent evaluator lost hidden conjunct: {expected_false}")
-    message = persistent_scalar_diagnostic(
-        "parse", "non-canonical", {name: False for name in predicates},
-        {**shape, "line_count": 999999, "byte_count": 999999, "byte_bounded": False})
-    emitted = "containment-test: " + bounded_sanitized_repr(RuntimeError(message)) + "\n"
-    if len(emitted.encode("ascii")) > 512 or "<truncated>" in emitted or "x" * 64 in emitted:
-        fail("persistent scalar diagnostic was truncated, unbounded, or retained bulky data")
+    labels = {
+        "release": "release", "reap": "reap",
+        "signed_cleanup_required": "signed_req", "signed_cleanup_ran": "signed_ran",
+        "unit_absent": "absent", "recorded_category": "rec_cat",
+        "recorded_required": "rec_req", "recorded_scan": "rec_scan",
+        "canonical_scan": "can_scan", "recorded_empty": "rec_empty",
+        "canonical_empty": "can_empty", "lock_handoff_ok": "handoff",
+        "lock_reuse": "reuse", "artifacts_absent": "artifacts",
+        "cleanup_error_empty": "cleanup_empty", "cleanup_categories": "cleanup_cats",
+        "events_complete": "ev_complete", "final_scanned": "fin_scan",
+        "final_observed": "fin_seen", "final_empty": "fin_empty",
+        "case_exact": "case_exact", "lifecycle_match": "life_match",
+        "schema_shape": "schema_shape", "schema_exact": "schema_exact",
+        "primary_exact": "primary", "events_exact": "events",
+        "return_match": "ret", "stdout_match": "out", "success_match": "success",
+        "retry_match": "retry", "intercept_match": "intercept", "attempt_match": "attempt",
+    }
+    if set(labels) != set(predicates):
+        fail("persistent diagnostic field map omitted or invented a predicate")
+    worst_shape = {**shape, "line_count": 999999, "byte_count": 999999,
+                   "byte_bounded": False}
+    all_true = persistent_scalar_diagnostic(
+        "parse", "unload", "non-canonical", {name: True for name in predicates}, worst_shape)
+    all_false = persistent_scalar_diagnostic(
+        "parse", "unload", "non-canonical", {name: False for name in predicates}, worst_shape)
+    for emitted, bit in ((all_true, "1"), (all_false, "0")):
+        text = emitted.decode("ascii")
+        if (len(emitted) > DIAGNOSTIC_TEXT_LIMIT or "<truncated>" in text
+                or "x" * 64 in text or not text.endswith("'\n")):
+            fail("persistent scalar diagnostic was truncated, unbounded, or retained bulky data")
+        for label in labels.values():
+            if text.count(f";{label}={bit}") != 1:
+                fail("persistent scalar diagnostic lost a unique predicate field")
+    for predicate, label in labels.items():
+        values = {name: True for name in predicates}
+        values[predicate] = False
+        text = persistent_scalar_diagnostic(
+            "parse", "unload", "non-canonical", values, worst_shape).decode("ascii")
+        if text.count(f";{label}=0") != 1:
+            fail("persistent scalar diagnostic lost a single-failure predicate")
+        for other in set(labels.values()) - {label}:
+            if text.count(f";{other}=1") != 1:
+                fail("persistent scalar diagnostic changed an unrelated predicate")
+    for case in ("normal", "parse", "timeout"):
+        for lifecycle in ("none", "non-canonical", "timeout", "unexpected"):
+            for byte_count, byte_bounded in ((0, False), (999999, True), (999999, False)):
+                emitted = persistent_scalar_diagnostic(
+                    case, "unload", lifecycle, predicates,
+                    {**shape, "line_count": 999999, "byte_count": byte_count,
+                     "byte_bounded": byte_bounded})
+                if len(emitted) > DIAGNOSTIC_TEXT_LIMIT:
+                    fail("persistent scalar diagnostic class exceeded its outer byte bound")
 
 
 def assert_persistent_cgroup_routing_contract():
@@ -922,7 +1009,8 @@ def assert_persistent_failure_contract():
         if observed != expected:
             fail(f"persistent failure classification changed: {observed!r} != {expected!r}")
     secret = "a" * 64
-    rendered = bounded_sanitized_repr(secret + ":" + "x" * DIAGNOSTIC_TEXT_LIMIT)
+    rendered = top_level_diagnostic(
+        RuntimeError(secret + ":" + "x" * DIAGNOSTIC_TEXT_LIMIT)).decode("ascii")
     if secret in rendered or "<redacted-hex64>" not in rendered or "<truncated>" not in rendered:
         fail("persistent failure diagnostics lost redaction or bounded output")
     property_failure = persistent_failure_classification("", cases[0][1])
@@ -1018,7 +1106,7 @@ def show(phase, *properties):
             if attempt < 3:
                 time.sleep(0.05 * (2 ** attempt))
     fail("containment unit properties remain unknown: "
-         + "; ".join(bounded_sanitized_repr(error) for error in errors))
+         + "; ".join(sanitized_diagnostic_text(error) for error in errors))
 
 
 def assert_property_parser_contract(client):
@@ -1799,7 +1887,7 @@ def show_until(phase, deadline, *properties):
                                                   0.05 * (2 ** attempt))
                 time.sleep(delay)
     fail("bounded stale unit properties remain unknown: "
-         + "; ".join(bounded_sanitized_repr(error) for error in errors))
+         + "; ".join(sanitized_diagnostic_text(error) for error in errors))
 
 
 def read_structured_command_until(phase, deadline):
@@ -2258,7 +2346,7 @@ raise SystemExit(73)
             release("stale-cleanup", stale_signal_name)
             stale_release_seen = True
         except Exception as error:
-            stale_release_error = bounded_sanitized_repr(error)
+            stale_release_error = sanitized_diagnostic_text(error)
         if (path_exists("stale-cleanup", "marker", stale_ready)
                 and not path_exists("stale-cleanup", "marker", stale_release_ack)):
             release_deadline = time.monotonic() + 5
@@ -2275,7 +2363,7 @@ raise SystemExit(73)
                 partial = show_identity_until(
                     "stale-cleanup", cleanup_deadline, "ActiveState", "ControlGroup")
             except Exception as error:
-                stale_state_error = bounded_sanitized_repr(error)
+                stale_state_error = sanitized_diagnostic_text(error)
                 if time.monotonic() >= cleanup_deadline:
                     break
                 time.sleep(bounded_cleanup_timeout(cleanup_deadline - time.monotonic(), 0.1))
@@ -2295,7 +2383,7 @@ raise SystemExit(73)
                         and launch_identity_matches(partial, candidate_signature)):
                     stale_signature = candidate_signature
             if stale_signature is None or not launch_identity_matches(partial, stale_signature):
-                stale_identity_error = bounded_sanitized_repr(
+                stale_identity_error = sanitized_diagnostic_text(
                     f"ownership={sanitized_state(partial)}")
                 if time.monotonic() >= cleanup_deadline:
                     break
@@ -2305,7 +2393,7 @@ raise SystemExit(73)
             try:
                 cleanup_signed_launch_until(stale_signature, "stale-cleanup", cleanup_deadline)
             except Exception as error:
-                stale_action_error = stale_action_error or bounded_sanitized_repr(error)
+                stale_action_error = stale_action_error or sanitized_diagnostic_text(error)
             if time.monotonic() >= cleanup_deadline:
                 break
             time.sleep(bounded_cleanup_timeout(cleanup_deadline - time.monotonic(), 0.1))
@@ -2321,16 +2409,16 @@ raise SystemExit(73)
             stale_post_evidence_complete = True
             if (stale_post_cleanup.get("LoadState") != "not-found"
                     or any(stale_post_cleanup_cgroup.values())):
-                stale_post_error = bounded_sanitized_repr(
+                stale_post_error = sanitized_diagnostic_text(
                     f"post={sanitized_state(stale_post_cleanup)}; "
                     f"cgroup={stale_post_cleanup_cgroup}")
         except Exception as error:
-            stale_post_error = bounded_sanitized_repr(error)
+            stale_post_error = sanitized_diagnostic_text(error)
         try:
             assert_client_lock_reusable()
             stale_lock_reusable = True
         except Exception as error:
-            stale_lock_error = bounded_sanitized_repr(error)
+            stale_lock_error = sanitized_diagnostic_text(error)
         if (stale_post_evidence_complete and stale_post_error is None
                 and stale_identity_error is None and stale_action_error is None
                 and stale_post_cleanup.get("LoadState") == "not-found"
@@ -2340,7 +2428,7 @@ raise SystemExit(73)
                             stale_release, stale_release_ack, stale_release_ack + ".new")
                 stale_artifacts_removed = True
             except Exception as error:
-                stale_path_error = bounded_sanitized_repr(error)
+                stale_path_error = sanitized_diagnostic_text(error)
         else:
             stale_path_error = "owned helper and release preserved pending confirmed absence"
     if (stale_failure is not None or stale_release_error or stale_state_error or stale_identity_error
@@ -2375,7 +2463,7 @@ raise SystemExit(73)
             ("lock", bool(stale_lock_error)), ("paths", bool(stale_path_error)),
         )
         error_category = next((name for name, present in error_flags if present), "none")
-        fail(stale_failure_message(
+        raise SerializedDiagnosticFailure(stale_failure_message(
             failure_category, stale_rejected_return == 0, stale_client_class, unit_absent,
             recorded_empty, canonical_empty, stale_identity_unchanged,
             stale_cleanup_attempted, cleanup_succeeded, stale_lock_reusable,
@@ -2812,8 +2900,8 @@ raise SystemExit(73)
             recorded_cgroup_scanned, canonical_cgroup_scanned,
             recorded_empty, canonical_empty, artifacts_absent)
         if not all(predicates.values()):
-            fail(persistent_scalar_diagnostic(
-                case_label, lifecycle_category, predicates, stderr_shape))
+            raise SerializedDiagnosticFailure(persistent_scalar_diagnostic(
+                case_label, boundary, lifecycle_category, predicates, stderr_shape))
         fast_recovery(client, repo, commit, go_binary, mode, "persistent-cleanup")
 
     for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM),
@@ -3097,5 +3185,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as error:
-        print("containment-test: " + top_level_diagnostic(error), file=sys.stderr)
+        write_diagnostic(sys.stderr.buffer, error)
         raise SystemExit(1)
