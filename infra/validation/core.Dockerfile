@@ -18,7 +18,7 @@ ENV PKG_CONFIG_PATH=/opt/nmcp/lib/pkgconfig:/opt/nmcp/lib64/pkgconfig
 ENV LD_LIBRARY_PATH=/opt/nmcp/lib:/opt/nmcp/lib64
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      autoconf automake build-essential ca-certificates cmake curl git libtool \
+      autoconf automake build-essential ca-certificates cmake curl git libtool python3 \
       meson nasm ninja-build pkg-config xz-utils \
       libde265-dev libexif-dev libexpat1-dev libglib2.0-dev libjpeg-turbo8-dev libpng-dev \
       libwebp-dev zlib1g-dev \

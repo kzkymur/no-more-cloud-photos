@@ -1,23 +1,17 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
-downloader=$repo/internal/nativevalidation/download-verified
-work=$(mktemp -d)
-
-cleanup() {
-  local status=$?
-  trap - EXIT HUP INT TERM
-  rm -rf -- "$work" || true
-  exit "$status"
-}
-trap cleanup EXIT HUP INT TERM
-
-python3 - "$repo" <<'PY'
+#!/usr/bin/env python3
+import hashlib
+import os
 import pathlib
-import sys
+import shutil
+import signal
+import stat
+import subprocess
+import tempfile
+import time
 
-root = pathlib.Path(sys.argv[1])
+repo = pathlib.Path(__file__).resolve().parent.parent
+downloader = repo / "internal/nativevalidation/download-verified"
+
 consumers = {
     "scripts/prepare-native-validation": (6, ("exiftool-13.36.tar.gz", "ffmpeg-6.0.1-amd64-static.tar.xz", "canon-a410.dng")),
     "internal/stillprocessor/helper/build-pinned-toolchain.sh": (4, ("lcms2-2.14.tar.gz", "LibRaw-0.22.2.tar.gz", "libheif-1.23.5.tar.gz", "vips-8.18.7.tar.xz")),
@@ -25,217 +19,328 @@ consumers = {
     "internal/videoprocessor/helper/build-pinned-toolchain.sh": (3, ("zimg-3.0.6.tar.gz", "SVT-AV1-v4.2.0.tar.gz", "ffmpeg-9.0.2.tar.xz")),
 }
 for relative, (count, names) in consumers.items():
-    text = (root / relative).read_text()
+    text = (repo / relative).read_text()
     assert "curl --" not in text, f"{relative}: bypasses shared downloader"
     assert "download() {" not in text, f"{relative}: retains private downloader"
     assert text.count('"$download_verified"') == count, f"{relative}: incomplete shared-downloader coverage"
     for name in names:
         assert name in text, f"{relative}: missing pinned input {name}"
-PY
 
-mkdir -p "$work/bin"
-cat >"$work/bin/curl" <<'EOF'
-#!/usr/bin/env bash
+
+def lexists(path):
+    return os.path.lexists(path)
+
+
+def entries(path):
+    return sorted(item.name for item in pathlib.Path(path).iterdir())
+
+
+def assert_no_internal_residue(directory):
+    assert not any(name.startswith(".download-verified.") for name in entries(directory)), entries(directory)
+
+
+def wait_for(path, process):
+    deadline = time.monotonic() + 10
+    while not path.exists():
+        if process.poll() is not None:
+            raise AssertionError(f"downloader exited before barrier {path.name}: {process.returncode}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for barrier {path.name}")
+        time.sleep(0.01)
+
+
+with tempfile.TemporaryDirectory() as temporary:
+    work = pathlib.Path(temporary)
+    fake_bin = work / "bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        """#!/usr/bin/env bash
 set -euo pipefail
-output=''
-while [[ $# -gt 0 ]]; do
-  if [[ $1 == --output && $# -ge 2 ]]; then
-    output=$2
-    shift 2
-  else
-    shift
-  fi
-done
-[[ -n $output ]]
-printf '%s\n' "$output" >>"$FAKE_CURL_LOG"
+printf '%s\\n' "${FAKE_CURL_MODE:-success}" >>"$FAKE_CURL_LOG"
 case ${FAKE_CURL_MODE:-success} in
-  success|failed-mv|foreign-failed-mv|corrupt-mv|replace-after-mv|race-directory|race-symlink|signal-after-mv)
-    cp -- "$FAKE_CURL_SOURCE" "$output"
-    ;;
-  bad-download) printf 'bad downloaded bytes\n' >"$output" ;;
+  success) cat -- "$FAKE_CURL_SOURCE" ;;
+  bad-download) printf 'bad downloaded bytes\\n' ;;
   failure) exit 47 ;;
+  hup)
+    kill -HUP "$PPID"
+    sleep 30
+    ;;
+  interrupt)
+    kill -INT "$PPID"
+    sleep 30
+    ;;
   signal)
-    cp -- "$FAKE_CURL_SOURCE" "$output"
     kill -TERM "$PPID"
-    sleep 1
+    sleep 30
     ;;
   *) exit 98 ;;
 esac
-EOF
-cat >"$work/bin/mv" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ ${FAKE_CURL_MODE:-success} == failed-mv ]]; then
-  exit 74
-fi
-if [[ ${FAKE_CURL_MODE:-success} == foreign-failed-mv ]]; then
-  target=${!#}
-  printf 'foreign target\n' >"$target"
-  exit 74
-fi
-if [[ ${FAKE_CURL_MODE:-success} == corrupt-mv ]]; then
-  target=${!#}
-  /usr/bin/mv "$@"
-  printf 'corrupt after publication\n' >"$target"
-  exit 0
-fi
-if [[ ${FAKE_CURL_MODE:-success} == replace-after-mv ]]; then
-  target=${!#}
-  /usr/bin/mv "$@"
-  rm -f -- "$target"
-  cp -- "$FAKE_CURL_SOURCE" "$target"
-  exit 0
-fi
-if [[ ${FAKE_CURL_MODE:-success} == race-directory ]]; then
-  target=${!#}
-  mkdir -- "$target"
-  printf 'attacker-owned sentinel\n' >"$target/sentinel"
-  exec /usr/bin/mv "$@"
-fi
-if [[ ${FAKE_CURL_MODE:-success} == race-symlink ]]; then
-  target=${!#}
-  ln -s -- "$FAKE_OUTSIDE" "$target"
-  exec /usr/bin/mv "$@"
-fi
-if [[ ${FAKE_CURL_MODE:-success} == signal-after-mv ]]; then
-  /usr/bin/mv "$@"
-  kill -TERM "$PPID"
-  sleep 1
-  exit 0
-fi
-exec /usr/bin/mv "$@"
-EOF
-chmod 0755 "$work/bin/curl" "$work/bin/mv"
+"""
+    )
+    fake_curl.chmod(0o755)
+    source = work / "source"
+    source.write_bytes(b"verified native download fixture\n")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    curl_log = work / "curl.log"
+    outside = work / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_text("outside sentinel\n")
+    base_env = os.environ.copy()
+    base_env.update(
+        {
+            "PATH": f"{fake_bin}:{base_env['PATH']}",
+            "FAKE_CURL_SOURCE": str(source),
+            "FAKE_CURL_LOG": str(curl_log),
+        }
+    )
 
-printf 'verified native download fixture\n' >"$work/source"
-digest=$(sha256sum "$work/source" | cut -d' ' -f1)
-export FAKE_CURL_SOURCE=$work/source FAKE_CURL_LOG=$work/curl.log
-mkdir -p "$work/outside"
-printf 'outside sentinel\n' >"$work/outside/sentinel"
-export FAKE_OUTSIDE=$work/outside
+    def invoke(target, mode="success", env=None):
+        run_env = base_env.copy()
+        run_env["FAKE_CURL_MODE"] = mode
+        if env:
+            run_env.update(env)
+        return subprocess.run(
+            [str(downloader), str(target), "fixture://native", digest],
+            env=run_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-targets=(
-  "$work/cache/.tools/exiftool-13.36.tar.gz"
-  "$work/cache/.native-work/downloads/sRGB2014.icc"
-  "$work/cache/.native-work/still/downloads/lcms2-2.14.tar.gz"
-  "$work/cache/.native-work/animation/downloads/libwebp-1.6.0.tar.gz"
-  "$work/cache/.native-work/video/downloads/ffmpeg-9.0.2.tar.xz"
-)
-for target in "${targets[@]}"; do
-  mkdir -p "$(dirname -- "$target")"
-  printf 'corrupt warm cache\n' >"$target"
-  PATH="$work/bin:$PATH" "$downloader" "$target" fixture://native "$digest"
-  cmp -- "$work/source" "$target"
-  ! compgen -G "$target.download.*" >/dev/null
-done
-[[ $(wc -l <"$FAKE_CURL_LOG") -eq ${#targets[@]} ]]
+    def barrier_case(target, event, mutate, mode="success"):
+        barrier_root = pathlib.Path(tempfile.mkdtemp(prefix="barrier-", dir=work))
+        run_env = base_env.copy()
+        run_env.update(
+            {
+                "FAKE_CURL_MODE": mode,
+                "NMCP_DOWNLOAD_TEST_BARRIER_DIR": str(barrier_root),
+                "NMCP_DOWNLOAD_TEST_BARRIER": event,
+            }
+        )
+        process = subprocess.Popen(
+            [str(downloader), str(target), "fixture://native", digest],
+            env=run_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        ready = barrier_root / f"{event}.ready"
+        release = barrier_root / f"{event}.release"
+        wait_for(ready, process)
+        mutate(process, barrier_root)
+        release.touch()
+        stdout, stderr = process.communicate(timeout=15)
+        return process.returncode, stdout, stderr
 
-# A valid warm entry must be reused without consulting the network.
-PATH="$work/bin:$PATH" "$downloader" "${targets[-1]}" fixture://native "$digest"
-[[ $(wc -l <"$FAKE_CURL_LOG") -eq ${#targets[@]} ]]
+    cache = work / "cache"
+    warm_targets = (
+        cache / ".tools/exiftool-13.36.tar.gz",
+        cache / ".native-work/downloads/sRGB2014.icc",
+        cache / ".native-work/still/downloads/lcms2-2.14.tar.gz",
+        cache / ".native-work/animation/downloads/libwebp-1.6.0.tar.gz",
+        cache / ".native-work/video/downloads/ffmpeg-9.0.2.tar.xz",
+    )
+    for target in warm_targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"corrupt warm cache\n")
+        result = invoke(target)
+        assert result.returncode == 0, result.stderr
+        assert target.read_bytes() == source.read_bytes()
+        assert_no_internal_residue(target.parent)
+    initial_downloads = len(curl_log.read_text().splitlines())
+    assert initial_downloads == len(warm_targets)
+    result = invoke(warm_targets[-1])
+    assert result.returncode == 0, result.stderr
+    assert len(curl_log.read_text().splitlines()) == initial_downloads
 
-# An existing directory is not recursively traversed or removed. It fails
-# closed before network access, while removable nonregular entries recover.
-shape_root=$work/cache/shapes
-mkdir -p "$shape_root/directory.tar.xz"
-printf 'directory sentinel\n' >"$shape_root/directory.tar.xz/sentinel"
-before=$(wc -l <"$FAKE_CURL_LOG")
-if PATH="$work/bin:$PATH" "$downloader" "$shape_root/directory.tar.xz" \
-  fixture://native "$digest"; then
-  printf 'native download fixture: directory target unexpectedly succeeded\n' >&2
-  exit 1
-else
-  [[ $? -eq 73 ]]
-fi
-[[ $(wc -l <"$FAKE_CURL_LOG") -eq $before ]]
-[[ $(<"$shape_root/directory.tar.xz/sentinel") == 'directory sentinel' ]]
-! compgen -G "$shape_root/directory.tar.xz.download.*" >/dev/null
+    failures = cache / "failures"
+    failures.mkdir()
+    for mode, expected in (("failure", 47), ("bad-download", 1), ("hup", 129), ("interrupt", 130), ("signal", 143)):
+        target = failures / f"{mode}.tar.xz"
+        result = invoke(target, mode)
+        assert result.returncode == expected, (mode, result.returncode, result.stderr)
+        assert not lexists(target)
+        assert_no_internal_residue(failures)
 
-mkfifo "$shape_root/fifo.tar.xz"
-PATH="$work/bin:$PATH" "$downloader" "$shape_root/fifo.tar.xz" fixture://native "$digest"
-[[ -f $shape_root/fifo.tar.xz && ! -L $shape_root/fifo.tar.xz ]]
-cmp -- "$work/source" "$shape_root/fifo.tar.xz"
+    shapes = cache / "shapes"
+    shapes.mkdir()
+    directory_target = shapes / "directory.tar.xz"
+    directory_target.mkdir()
+    (directory_target / "sentinel").write_text("directory sentinel\n")
+    before = len(curl_log.read_text().splitlines())
+    result = invoke(directory_target)
+    assert result.returncode == 73, result.stderr
+    assert entries(directory_target) == ["sentinel"]
+    assert len(curl_log.read_text().splitlines()) == before
+    fifo_target = shapes / "fifo.tar.xz"
+    os.mkfifo(fifo_target)
+    result = invoke(fifo_target)
+    assert result.returncode == 0, result.stderr
+    assert stat.S_ISREG(fifo_target.stat().st_mode) and fifo_target.read_bytes() == source.read_bytes()
+    symlink_target = shapes / "symlink.tar.xz"
+    symlink_target.symlink_to(outside, target_is_directory=True)
+    result = invoke(symlink_target)
+    assert result.returncode == 0, result.stderr
+    assert not symlink_target.is_symlink() and symlink_target.read_bytes() == source.read_bytes()
+    assert entries(outside) == ["sentinel"]
+    assert_no_internal_residue(shapes)
 
-ln -s -- "$work/outside" "$shape_root/symlink.tar.xz"
-PATH="$work/bin:$PATH" "$downloader" "$shape_root/symlink.tar.xz" fixture://native "$digest"
-[[ -f $shape_root/symlink.tar.xz && ! -L $shape_root/symlink.tar.xz ]]
-cmp -- "$work/source" "$shape_root/symlink.tar.xz"
-[[ $(<"$work/outside/sentinel") == 'outside sentinel' ]]
-[[ $(find "$work/outside" -mindepth 1 -maxdepth 1 -printf '.\n' | wc -l) -eq 1 ]]
+    unreadable_target = shapes / "unreadable.tar.xz"
+    unreadable_target.write_bytes(b"unreadable corrupt cache\n")
+    unreadable_target.chmod(0)
+    result = invoke(unreadable_target)
+    assert result.returncode == 0, result.stderr
+    assert unreadable_target.read_bytes() == source.read_bytes()
 
-assert_failed_cleanly() {
-  local mode=$1 expected=$2 target="$work/cache/failures/$1.tar.xz" status
-  mkdir -p "$(dirname -- "$target")"
-  if FAKE_CURL_MODE=$mode PATH="$work/bin:$PATH" \
-    "$downloader" "$target" fixture://native "$digest"; then
-    printf 'native download fixture: %s unexpectedly succeeded\n' "$mode" >&2
-    return 1
-  else
-    status=$?
-  fi
-  [[ $status -eq $expected ]]
-  [[ ! -e $target ]]
-  ! compgen -G "$target.download.*" >/dev/null
-}
+    initial_parent = cache / "initial-parent-link"
+    initial_parent.symlink_to(outside, target_is_directory=True)
+    result = invoke(initial_parent / "escaped.tar.xz")
+    assert result.returncode == 1
+    assert entries(outside) == ["sentinel"]
 
-assert_failed_cleanly failure 47
-assert_failed_cleanly bad-download 1
-assert_failed_cleanly failed-mv 74
-assert_failed_cleanly corrupt-mv 1
-assert_failed_cleanly signal 143
-assert_failed_cleanly signal-after-mv 143
+    races = cache / "races"
+    races.mkdir()
 
-# Cleanup keys ownership to the downloaded inode. A foreign regular target
-# substituted around a failed or completed publication is never unlinked, and
-# even a byte-identical replacement cannot satisfy final identity verification.
-foreign_failed=$work/cache/races/foreign-failed.tar.xz
-mkdir -p "$(dirname -- "$foreign_failed")"
-if FAKE_CURL_MODE=foreign-failed-mv PATH="$work/bin:$PATH" \
-  "$downloader" "$foreign_failed" fixture://native "$digest"; then
-  printf 'native download fixture: foreign failed-mv target unexpectedly succeeded\n' >&2
-  exit 1
-else
-  [[ $? -eq 74 ]]
-fi
-[[ $(<"$foreign_failed") == 'foreign target' ]]
-! compgen -G "$foreign_failed.download.*" >/dev/null
+    no_named_temp = races / "unnamed-temp.tar.xz"
+    def assert_unnamed(_process, _barriers):
+        assert entries(races) == []
+    status, _, stderr = barrier_case(no_named_temp, "temp-opened", assert_unnamed)
+    assert status == 0, stderr
+    assert no_named_temp.read_bytes() == source.read_bytes()
 
-foreign_replacement=$work/cache/races/foreign-replacement.tar.xz
-if FAKE_CURL_MODE=replace-after-mv PATH="$work/bin:$PATH" \
-  "$downloader" "$foreign_replacement" fixture://native "$digest"; then
-  printf 'native download fixture: foreign replacement unexpectedly succeeded\n' >&2
-  exit 1
-else
-  [[ $? -eq 1 ]]
-fi
-cmp -- "$work/source" "$foreign_replacement"
-! compgen -G "$foreign_replacement.download.*" >/dev/null
+    for event in ("temp-downloaded", "temp-hashed", "before-publish"):
+        target = races / f"appeared-{event}.tar.xz"
+        def create_foreign(_process, _barriers, target=target):
+            target.write_text("foreign target\n")
+        status, _, _ = barrier_case(target, event, create_foreign)
+        assert status == 1
+        assert target.read_text() == "foreign target\n"
+        assert_no_internal_residue(races)
 
-# A directory substituted immediately before publication makes mv -T fail
-# rather than copying inside it. The downloaded temporary remains owned and is
-# cleaned; the foreign directory and its sentinel remain untouched.
-race_directory=$work/cache/races/directory.tar.xz
-mkdir -p "$(dirname -- "$race_directory")"
-if FAKE_CURL_MODE=race-directory PATH="$work/bin:$PATH" \
-  "$downloader" "$race_directory" fixture://native "$digest"; then
-  printf 'native download fixture: directory substitution unexpectedly succeeded\n' >&2
-  exit 1
-else
-  [[ $? -ne 0 ]]
-fi
-[[ -d $race_directory && ! -L $race_directory ]]
-[[ $(<"$race_directory/sentinel") == 'attacker-owned sentinel' ]]
-[[ $(find "$race_directory" -mindepth 1 -maxdepth 1 -printf '.\n' | wc -l) -eq 1 ]]
-! compgen -G "$race_directory.download.*" >/dev/null
+    warm_swap = races / "warm-open-swap.tar.xz"
+    warm_swap.write_bytes(source.read_bytes())
+    held_warm = races / "warm-open-owned"
+    def replace_warm(_process, _barriers):
+        warm_swap.rename(held_warm)
+        warm_swap.write_bytes(source.read_bytes())
+    status, _, _ = barrier_case(warm_swap, "warm-opened", replace_warm)
+    assert status == 1
+    assert warm_swap.read_bytes() == source.read_bytes()
+    assert held_warm.read_bytes() == source.read_bytes()
 
-# A symlink-to-directory substituted at the same boundary is atomically
-# replaced as the target itself; it cannot redirect bytes into that directory.
-race_symlink=$work/cache/races/symlink.tar.xz
-FAKE_CURL_MODE=race-symlink PATH="$work/bin:$PATH" \
-  "$downloader" "$race_symlink" fixture://native "$digest"
-[[ -f $race_symlink && ! -L $race_symlink ]]
-cmp -- "$work/source" "$race_symlink"
-[[ $(<"$work/outside/sentinel") == 'outside sentinel' ]]
-[[ $(find "$work/outside" -mindepth 1 -maxdepth 1 -printf '.\n' | wc -l) -eq 1 ]]
-! compgen -G "$race_symlink.download.*" >/dev/null
-printf 'Native verified-download fixtures: PASS\n'
+    warm_mutation = races / "warm-hash-mutation.tar.xz"
+    warm_mutation.write_bytes(source.read_bytes())
+    def mutate_warm_inode(_process, _barriers):
+        warm_mutation.write_bytes(b"mutated warm inode\n")
+    status, _, _ = barrier_case(warm_mutation, "warm-hashed", mutate_warm_inode)
+    assert status == 1
+    assert warm_mutation.read_bytes() == b"mutated warm inode\n"
+
+    for event in ("before-final-binding-1", "after-final-binding-1"):
+        target = races / f"final-swap-{event}.tar.xz"
+        held = races / f"held-{event}"
+        def replace_published(_process, _barriers, target=target, held=held):
+            target.rename(held)
+            target.write_bytes(source.read_bytes())
+        status, _, _ = barrier_case(target, event, replace_published)
+        assert status == 1
+        assert target.read_bytes() == source.read_bytes()
+        assert held.read_bytes() == source.read_bytes()
+        assert_no_internal_residue(races)
+
+    aba_target = races / "final-aba.tar.xz"
+    aba_held = races / "final-aba-held"
+    def rename_away_and_back(_process, _barriers):
+        aba_target.rename(aba_held)
+        aba_held.rename(aba_target)
+    status, _, _ = barrier_case(aba_target, "after-final-binding-1", rename_away_and_back)
+    assert status == 1
+    assert not lexists(aba_target)
+    assert_no_internal_residue(races)
+
+    same_inode_mutation = races / "same-inode-after-final-hash.tar.xz"
+    def mutate_published_inode(_process, _barriers):
+        same_inode_mutation.write_bytes(b"mutated after final hash\n")
+    status, _, _ = barrier_case(same_inode_mutation, "after-final-hash", mutate_published_inode)
+    assert status == 1
+    assert not lexists(same_inode_mutation)
+    assert_no_internal_residue(races)
+
+    signal_target = races / "signal-after-publish.tar.xz"
+    def interrupt_after_publish(process, _barriers):
+        process.send_signal(signal.SIGTERM)
+    status, _, _ = barrier_case(signal_target, "after-publish", interrupt_after_publish)
+    assert status == 143
+    assert not lexists(signal_target)
+    assert_no_internal_residue(races)
+
+    rebound_root = cache / "rebound"
+    rebound_parent = rebound_root / "downloads"
+    rebound_parent.mkdir(parents=True)
+    rebound_held = rebound_root / "held"
+    rebound_target = rebound_parent / "archive.tar.xz"
+    def rebind_parent(_process, _barriers):
+        rebound_parent.rename(rebound_held)
+        rebound_parent.symlink_to(outside, target_is_directory=True)
+    status, _, _ = barrier_case(rebound_target, "before-publish", rebind_parent)
+    assert status == 1
+    assert entries(outside) == ["sentinel"]
+    assert entries(rebound_held) == []
+    rebound_parent.unlink()
+    rebound_held.rename(rebound_parent)
+
+    replacement_held = rebound_root / "replacement-held"
+    replacement_target = rebound_parent / "replacement.tar.xz"
+    def replace_parent(_process, _barriers):
+        rebound_parent.rename(replacement_held)
+        rebound_parent.mkdir()
+        (rebound_parent / "sentinel").write_text("replacement sentinel\n")
+    status, _, _ = barrier_case(replacement_target, "before-publish", replace_parent)
+    assert status == 1
+    assert entries(rebound_parent) == ["sentinel"]
+    assert entries(replacement_held) == []
+    shutil.rmtree(rebound_parent)
+    replacement_held.rename(rebound_parent)
+
+    published_rebound_held = rebound_root / "published-held"
+    published_rebound_target = rebound_parent / "published.tar.xz"
+    def rebind_after_publish(_process, _barriers):
+        rebound_parent.rename(published_rebound_held)
+        rebound_parent.symlink_to(outside, target_is_directory=True)
+    status, _, _ = barrier_case(published_rebound_target, "after-publish", rebind_after_publish)
+    assert status == 1
+    assert entries(outside) == ["sentinel"]
+    assert entries(published_rebound_held) == []
+    rebound_parent.unlink()
+    published_rebound_held.rename(rebound_parent)
+
+    invalid_target = races / "invalid-quarantine.tar.xz"
+    invalid_target.write_bytes(b"invalid\n")
+    invalid_held = races / "invalid-held"
+    def replace_before_quarantine(_process, _barriers):
+        invalid_target.rename(invalid_held)
+        invalid_target.write_text("foreign target\n")
+    status, _, _ = barrier_case(invalid_target, "before-invalid-quarantine", replace_before_quarantine)
+    assert status == 1
+    assert invalid_target.read_text() == "foreign target\n"
+    assert invalid_held.read_text() == "invalid\n"
+    assert_no_internal_residue(races)
+
+    quarantined_target = races / "after-quarantine.tar.xz"
+    quarantined_target.write_bytes(b"invalid\n")
+    quarantined_held = races / "quarantined-held"
+    def replace_quarantine(_process, _barriers):
+        quarantine = next(item for item in races.iterdir() if item.name.startswith(".download-verified.quarantine."))
+        entry = quarantine / "entry"
+        entry.rename(quarantined_held)
+        entry.write_text("foreign quarantine\n")
+    status, _, _ = barrier_case(quarantined_target, "after-invalid-quarantine", replace_quarantine)
+    assert status == 1
+    assert quarantined_target.read_text() == "foreign quarantine\n"
+    assert quarantined_held.read_text() == "invalid\n"
+    assert_no_internal_residue(races)
+
+    assert entries(outside) == ["sentinel"]
+
+print("Native descriptor-relative download fixtures: PASS")

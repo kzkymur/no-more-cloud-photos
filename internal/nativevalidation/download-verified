@@ -1,78 +1,491 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+import ctypes
+import hashlib
+import os
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import time
 
-if [[ $# -ne 3 || $1 != /* || ! $3 =~ ^[0-9a-f]{64}$ ]]; then
-  printf 'usage: %s ABSOLUTE_TARGET URL SHA256\n' "$0" >&2
-  exit 2
-fi
+O_PATH = getattr(os, "O_PATH", 0o10000000)
+O_TMPFILE = getattr(os, "O_TMPFILE", 0o20000000)
+AT_EMPTY_PATH = 0x1000
+RENAME_NOREPLACE = 1
+libc = ctypes.CDLL(None, use_errno=True)
+libc.linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+libc.renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
 
-target=$1
-url=$2
-digest=$3
-temporary=''
-owned_identity=''
-owned_fd=''
 
-identity() {
-  stat -c '%d:%i' -- "$1" 2>/dev/null
-}
+class Failure(Exception):
+    def __init__(self, status=1, message=None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
-cleanup() {
-  local status=$?
-  trap - EXIT HUP INT TERM
-  if [[ -n $temporary ]]; then
-    rm -f -- "$temporary" || true
-  fi
-  if [[ -n $owned_identity && $(identity "$target" || true) == "$owned_identity" ]]; then
-    rm -f -- "$target" 2>/dev/null || true
-  fi
-  if [[ -n $owned_fd ]]; then
-    exec {owned_fd}<&-
-  fi
-  exit "$status"
-}
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
-verified() {
-  [[ -f $target && ! -L $target ]] &&
-    printf '%s  %s\n' "$digest" "$target" | sha256sum --check --status
-}
+pending_signal = 0
+curl_child = None
 
-if [[ -e $target || -L $target ]] && ! verified; then
-  if [[ -d $target && ! -L $target ]]; then
-    printf 'verified download: refusing directory target: %s\n' "$target" >&2
-    exit 73
-  fi
-  rm -f -- "$target"
-fi
 
-if ! verified; then
-  temporary=$(mktemp "$target.download.XXXXXXXX")
-  if curl --fail --location --silent --show-error --retry 2 --retry-all-errors \
-    --connect-timeout 30 --max-time 300 "$url" --output "$temporary"; then
-    :
-  else
-    status=$?
-    exit "$status"
-  fi
-  printf '%s  %s\n' "$digest" "$temporary" | sha256sum --check --status
-  exec {owned_fd}<"$temporary"
-  owned_identity=$(identity "$temporary")
-  mv -fT -- "$temporary" "$target"
-  temporary=''
-fi
+def signal_handler(signum, _frame):
+    global pending_signal
+    pending_signal = signum
+    if curl_child is not None and curl_child.poll() is None:
+        try:
+            os.killpg(curl_child.pid, signum)
+        except ProcessLookupError:
+            pass
 
-if [[ -z $owned_identity ]]; then
-  verified
-  exit
-fi
-if [[ $(identity "$target" || true) != "$owned_identity" ]] || ! verified ||
-  [[ $(identity "$target" || true) != "$owned_identity" ]]; then
-  exit 1
-fi
-owned_identity=''
-exec {owned_fd}<&-
-owned_fd=''
+
+for handled_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(handled_signal, signal_handler)
+
+
+def checkpoint():
+    if pending_signal:
+        raise Failure(128 + pending_signal)
+
+
+def inode_identity(value):
+    metadata = os.fstat(value) if isinstance(value, int) else value
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def descriptor_identity(descriptor):
+    mount_id = None
+    with open(f"/proc/self/fdinfo/{descriptor}", encoding="ascii") as fdinfo:
+        for line in fdinfo:
+            if line.startswith("mnt_id:"):
+                mount_id = int(line.split(":", 1)[1])
+                break
+    if mount_id is None:
+        raise Failure(1, "descriptor mount identity is unavailable")
+    return inode_identity(descriptor) + (mount_id,)
+
+
+def same_inode(metadata, descriptor):
+    return inode_identity(metadata) == inode_identity(descriptor)
+
+
+def rename_noreplace(source_fd, source, destination_fd, destination):
+    result = libc.renameat2(
+        source_fd,
+        os.fsencode(source),
+        destination_fd,
+        os.fsencode(destination),
+        RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), source, destination)
+
+
+def publish_unnamed(descriptor, directory_fd, name):
+    result = libc.linkat(
+        descriptor,
+        ctypes.c_char_p(b""),
+        directory_fd,
+        os.fsencode(name),
+        AT_EMPTY_PATH,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+
+
+def entry_metadata(directory_fd, name):
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def bound_to(directory_fd, name, descriptor):
+    try:
+        candidate_fd = open_entry(directory_fd, name)
+    except FileNotFoundError:
+        return False
+    try:
+        return descriptor_identity(candidate_fd) == descriptor_identity(descriptor)
+    finally:
+        os.close(candidate_fd)
+
+
+class ParentChain:
+    def __init__(self, target):
+        if not target.startswith("/") or target != os.path.normpath(target):
+            raise Failure(2, "target must be a normalized absolute path")
+        components = target.split("/")[1:]
+        if not components or any(component in ("", ".", "..") for component in components):
+            raise Failure(2, "target must not contain empty, dot, or parent components")
+        self.name = components[-1]
+        self.root_fd = os.open("/", O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.root_identity = descriptor_identity(self.root_fd)
+        self.parents = []
+        current_fd = self.root_fd
+        try:
+            for component in components[:-1]:
+                descriptor = os.open(
+                    component,
+                    O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=current_fd,
+                )
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise Failure(1, "cache parent is not a directory")
+                self.parents.append((component, descriptor, descriptor_identity(descriptor)))
+                current_fd = descriptor
+        except Exception:
+            self.close()
+            raise
+        self.directory_fd = current_fd
+
+    def validate(self):
+        checkpoint()
+        live_root_fd = os.open("/", O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            if descriptor_identity(live_root_fd) != self.root_identity:
+                raise Failure(1, "root mount identity changed")
+        finally:
+            os.close(live_root_fd)
+        current_fd = self.root_fd
+        for component, pinned_fd, expected in self.parents:
+            try:
+                fresh_fd = os.open(
+                    component,
+                    O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=current_fd,
+                )
+            except OSError as error:
+                raise Failure(1, f"cache parent changed: {error.strerror}") from error
+            try:
+                if descriptor_identity(fresh_fd) != expected or descriptor_identity(pinned_fd) != expected:
+                    raise Failure(1, "cache parent identity changed")
+            finally:
+                os.close(fresh_fd)
+            current_fd = pinned_fd
+        checkpoint()
+
+    def close(self):
+        for _component, descriptor, _expected in reversed(getattr(self, "parents", [])):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self.parents = []
+        if getattr(self, "root_fd", None) is not None:
+            try:
+                os.close(self.root_fd)
+            except OSError:
+                pass
+            self.root_fd = None
+
+
+def barrier(name, url):
+    root = os.environ.get("NMCP_DOWNLOAD_TEST_BARRIER_DIR")
+    selected = os.environ.get("NMCP_DOWNLOAD_TEST_BARRIER")
+    if not root or selected != name or not url.startswith("fixture://"):
+        checkpoint()
+        return
+    ready = os.path.join(root, name + ".ready")
+    release = os.path.join(root, name + ".release")
+    descriptor = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    os.close(descriptor)
+    deadline = time.monotonic() + 15
+    while not os.path.exists(release):
+        checkpoint()
+        if time.monotonic() >= deadline:
+            raise Failure(1, f"test barrier timed out: {name}")
+        time.sleep(0.01)
+    os.unlink(release)
+    os.unlink(ready)
+    checkpoint()
+
+
+def descriptor_state(metadata):
+    return inode_identity(metadata), metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns
+
+
+def digest_fd(descriptor):
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise Failure(1, "download inode is not regular")
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        block = os.pread(descriptor, 1024 * 1024, offset)
+        if not block:
+            break
+        digest.update(block)
+        offset += len(block)
+        checkpoint()
+    after = os.fstat(descriptor)
+    before_state = descriptor_state(before)
+    after_state = descriptor_state(after)
+    if before_state != after_state:
+        raise Failure(1, "download inode changed while hashing")
+    return digest.hexdigest(), after_state
+
+
+def open_entry(directory_fd, name):
+    return os.open(name, O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+
+
+def restore_foreign(quarantine_fd, quarantine, directory_fd, name):
+    try:
+        rename_noreplace(quarantine_fd, quarantine, directory_fd, name)
+        return True
+    except OSError:
+        return False
+
+
+def quarantine_unlink(chain, name, expected_fd, purpose, url, validate_parent=True):
+    metadata = entry_metadata(chain.directory_fd, name)
+    if metadata is None:
+        return False
+    quarantine = f".download-verified.quarantine.{os.getpid()}.{secrets.token_hex(12)}"
+    quarantine_fd = None
+    if validate_parent:
+        chain.validate()
+    barrier(f"before-{purpose}-quarantine", url)
+    renamed = False
+    try:
+        os.mkdir(quarantine, 0o700, dir_fd=chain.directory_fd)
+        quarantine_fd = os.open(
+            quarantine,
+            O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=chain.directory_fd,
+        )
+        if not bound_to(chain.directory_fd, quarantine, quarantine_fd):
+            raise Failure(1, "quarantine directory identity changed")
+        rename_noreplace(chain.directory_fd, name, quarantine_fd, "entry")
+        renamed = True
+    except FileNotFoundError:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+        try:
+            os.rmdir(quarantine, dir_fd=chain.directory_fd)
+        except OSError:
+            pass
+        return False
+    except Exception:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+        try:
+            os.rmdir(quarantine, dir_fd=chain.directory_fd)
+        except OSError:
+            pass
+        raise
+    try:
+        barrier(f"after-{purpose}-quarantine", url)
+        quarantined = entry_metadata(quarantine_fd, "entry")
+        if quarantined is None:
+            raise Failure(1, "quarantined entry disappeared")
+        if not same_inode(quarantined, expected_fd):
+            if restore_foreign(quarantine_fd, "entry", chain.directory_fd, name):
+                renamed = False
+            raise Failure(1, "foreign entry reached quarantine")
+        if validate_parent:
+            chain.validate()
+        os.unlink("entry", dir_fd=quarantine_fd)
+        renamed = False
+        if validate_parent:
+            chain.validate()
+        return True
+    finally:
+        if renamed:
+            quarantined = entry_metadata(quarantine_fd, "entry")
+            if quarantined is not None:
+                if same_inode(quarantined, expected_fd):
+                    try:
+                        os.unlink("entry", dir_fd=quarantine_fd)
+                    except OSError:
+                        pass
+                else:
+                    restore_foreign(quarantine_fd, "entry", chain.directory_fd, name)
+        if quarantine_fd is not None:
+            try:
+                if bound_to(chain.directory_fd, quarantine, quarantine_fd):
+                    os.rmdir(quarantine, dir_fd=chain.directory_fd)
+            except OSError:
+                pass
+            os.close(quarantine_fd)
+
+
+def remove_invalid(chain, descriptor, url):
+    quarantine_unlink(chain, chain.name, descriptor, "invalid", url)
+    if entry_metadata(chain.directory_fd, chain.name) is not None:
+        raise Failure(1, "invalid cache target was replaced")
+
+
+def inspect_warm(chain, expected_digest, url):
+    initial = entry_metadata(chain.directory_fd, chain.name)
+    if initial is None:
+        return False
+    descriptor = open_entry(chain.directory_fd, chain.name)
+    try:
+        opened = os.fstat(descriptor)
+        if stat.S_ISDIR(opened.st_mode):
+            raise Failure(73, "refusing directory target")
+        if not same_inode(initial, descriptor):
+            raise Failure(1, "cache target changed while opening")
+        barrier("warm-opened", url)
+        chain.validate()
+        if not bound_to(chain.directory_fd, chain.name, descriptor):
+            raise Failure(1, "cache target changed before hashing")
+        if stat.S_ISREG(opened.st_mode):
+            try:
+                readable_fd = os.open(
+                    chain.name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=chain.directory_fd,
+                )
+            except OSError:
+                remove_invalid(chain, descriptor, url)
+                return False
+            try:
+                if not same_inode(os.fstat(readable_fd), descriptor):
+                    raise Failure(1, "cache target changed while opening for hashing")
+                opened_state = descriptor_state(os.fstat(readable_fd))
+                actual_digest, hashed_state = digest_fd(readable_fd)
+                barrier("warm-hashed", url)
+                chain.validate()
+                if not bound_to(chain.directory_fd, chain.name, readable_fd):
+                    raise Failure(1, "cache target changed after hashing")
+                if descriptor_state(os.fstat(readable_fd)) != hashed_state:
+                    raise Failure(1, "cache inode changed after hashing")
+                if descriptor_state(os.fstat(readable_fd)) != opened_state:
+                    raise Failure(1, "cache inode namespace identity changed")
+                if actual_digest == expected_digest:
+                    return True
+            finally:
+                os.close(readable_fd)
+        remove_invalid(chain, descriptor, url)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def run_curl(url, output_fd):
+    global curl_child
+    command = [
+        "curl",
+        "--fail",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--retry",
+        "2",
+        "--retry-all-errors",
+        "--connect-timeout",
+        "30",
+        "--max-time",
+        "300",
+        url,
+        "--output",
+        "-",
+    ]
+    curl_child = subprocess.Popen(command, stdout=output_fd, start_new_session=True)
+    try:
+        status = curl_child.wait()
+    finally:
+        curl_child = None
+    checkpoint()
+    if status < 0:
+        raise Failure(128 - status)
+    if status:
+        raise Failure(status)
+
+
+def cleanup_owned_target(chain, descriptor, url):
+    global pending_signal
+    saved_signal = pending_signal
+    pending_signal = 0
+    try:
+        quarantine_unlink(chain, chain.name, descriptor, "owned", url, validate_parent=False)
+    except Exception:
+        pass
+    finally:
+        pending_signal = saved_signal
+
+
+def download(target, url, expected_digest):
+    chain = ParentChain(target)
+    temporary_fd = None
+    published = False
+    success = False
+    try:
+        chain.validate()
+        barrier("parents-pinned", url)
+        chain.validate()
+        if inspect_warm(chain, expected_digest, url):
+            success = True
+            return
+        chain.validate()
+        temporary_fd = os.open(
+            ".",
+            O_TMPFILE | os.O_RDWR | os.O_CLOEXEC,
+            0o600,
+            dir_fd=chain.directory_fd,
+        )
+        barrier("temp-opened", url)
+        run_curl(url, temporary_fd)
+        barrier("temp-downloaded", url)
+        actual_digest, _downloaded_state = digest_fd(temporary_fd)
+        if actual_digest != expected_digest:
+            raise Failure(1, "download checksum mismatch")
+        barrier("temp-hashed", url)
+        chain.validate()
+        barrier("before-publish", url)
+        chain.validate()
+        if entry_metadata(chain.directory_fd, chain.name) is not None:
+            raise Failure(1, "cache target appeared before publication")
+        publish_unnamed(temporary_fd, chain.directory_fd, chain.name)
+        published = True
+        published_state = descriptor_state(os.fstat(temporary_fd))
+        barrier("after-publish", url)
+        chain.validate()
+        barrier("before-final-binding-1", url)
+        if not bound_to(chain.directory_fd, chain.name, temporary_fd):
+            raise Failure(1, "published target does not match verified inode")
+        barrier("after-final-binding-1", url)
+        final_digest, final_state = digest_fd(temporary_fd)
+        if final_digest != expected_digest:
+            raise Failure(1, "published inode checksum changed")
+        barrier("after-final-hash", url)
+        if not bound_to(chain.directory_fd, chain.name, temporary_fd):
+            raise Failure(1, "published target changed after verification")
+        if descriptor_state(os.fstat(temporary_fd)) != final_state:
+            raise Failure(1, "published inode changed after verification")
+        if descriptor_state(os.fstat(temporary_fd)) != published_state:
+            raise Failure(1, "published inode namespace identity changed")
+        chain.validate()
+        success = True
+    finally:
+        if published and not success and temporary_fd is not None:
+            cleanup_owned_target(chain, temporary_fd, url)
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        chain.close()
+
+
+def main():
+    if len(sys.argv) != 4 or not sys.argv[1].startswith("/"):
+        raise Failure(2, f"usage: {sys.argv[0]} ABSOLUTE_TARGET URL SHA256")
+    target, url, expected_digest = sys.argv[1:]
+    if len(expected_digest) != 64 or any(character not in "0123456789abcdef" for character in expected_digest):
+        raise Failure(2, f"usage: {sys.argv[0]} ABSOLUTE_TARGET URL SHA256")
+    download(target, url, expected_digest)
+
+
+try:
+    main()
+except Failure as failure:
+    if failure.message:
+        print(f"verified download: {failure.message}", file=sys.stderr)
+    sys.exit(failure.status)
+except OSError as error:
+    print(f"verified download: {error.strerror}", file=sys.stderr)
+    sys.exit(1)
