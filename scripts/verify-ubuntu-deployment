@@ -6023,41 +6023,17 @@ def validate_fd_wrappers(migration_wrapper: str, role_mode: str) -> None:
 
 
 def validate_validation_env(source: str) -> None:
-    preflight = '''require_container_readable_sql_fixtures() {
-  for fixture in \\
-    "$root/infra/validation/postgres-init.sql" \\
-    "$root/infra/validation/verify-runtime-roles.sql" \\
-    "$root/infra/postgresql/runtime-roles.sql" \\
-    "$root/infra/postgresql/verify-runtime-role-graph.sql" \\
-    "$root/infra/ubuntu/postgresql-roles.sql"; do
-    mode=$(stat -c '%a' "$fixture")
-    case ${mode#${mode%?}} in
-      4|5|6|7) ;;
-      *)
-        echo "error: container SQL bind fixture is not other-readable (chmod 0644): $fixture (mode $mode)" >&2
-        exit 1
-        ;;
-    esac
-  done
+    require("require_container_readable_sql_fixtures" not in source
+            and "container SQL bind fixture is not other-readable" not in source,
+            "validation-env restored obsolete checkout readability preflight")
+    compose = '''compose() {
+  stage_compose_inputs
+  validation_inputs publish >/dev/null
+  validation_inputs run docker compose --project-name "$project" --file "$compose_file" "$@"
 }
 '''
-    require(source.count(preflight) == 1,
-            "validation-env exact five-fixture other-readable SQL preflight changed")
-    require(source.count("require_container_readable_sql_fixtures") == 3,
-            "validation-env SQL preflight must be defined once and invoked exactly twice")
-    dispatch = source[source.index('case "${1:-}" in'):]
-    require(dispatch.count("    require_container_readable_sql_fixtures\n") == 2
-            and "  up)\n    require_container_readable_sql_fixtures\n" in dispatch
-            and "  verify)\n    require_container_readable_sql_fixtures\n" in dispatch,
-            "validation-env SQL preflight must run for up and verify only")
-    fixture_paths = re.findall(r'"\$root/([^" ]+\.sql)"', preflight)
-    require(fixture_paths == [
-        "infra/validation/postgres-init.sql",
-        "infra/validation/verify-runtime-roles.sql",
-        "infra/postgresql/runtime-roles.sql",
-        "infra/postgresql/verify-runtime-role-graph.sql",
-        "infra/ubuntu/postgresql-roles.sql",
-    ], "validation-env SQL bind fixture inventory changed")
+    require(source.count(compose) == 1,
+            "validation-env immutable staged Compose dispatch changed")
 
 
 class WorkflowLoader(yaml.SafeLoader if yaml is not None else object):
@@ -9642,15 +9618,19 @@ def verify_supervisor_mutations(
 
 def verify_validation_env_mutations(source: str) -> None:
     mutations = (
-        ("missing postgres init preflight", replace_once(
-            source, '    "$root/infra/validation/postgres-init.sql" \\\n', "")),
-        ("SQL preflight permits owner-read only", replace_once(source, '      4|5|6|7) ;;', '      0|1|2|3|4|5|6|7) ;;')),
-        ("SQL preflight inaccurate remediation", replace_once(source, '(chmod 0644)', '(chmod 0600)')),
-        ("SQL preflight omitted for up", replace_once(
-            source, '  up)\n    require_container_readable_sql_fixtures\n', '  up)\n')),
-        ("SQL preflight added to down", replace_once(
-            source, '  down)\n    compose down --remove-orphans\n',
-            '  down)\n    require_container_readable_sql_fixtures\n    compose down --remove-orphans\n')),
+        ("obsolete SQL readability preflight restored", replace_once(
+            source, "assert_owned() {",
+            "require_container_readable_sql_fixtures() { :; }\n\nassert_owned() {")),
+        ("Compose input staging omitted", replace_once(
+            source, "  stage_compose_inputs\n  validation_inputs publish >/dev/null",
+            "  validation_inputs publish >/dev/null")),
+        ("Compose input publication omitted", replace_once(
+            source, "  stage_compose_inputs\n  validation_inputs publish >/dev/null",
+            "  stage_compose_inputs")),
+        ("Compose supervisor bypassed", replace_once(
+            source,
+            '  validation_inputs run docker compose --project-name "$project" --file "$compose_file" "$@"',
+            '  docker compose --project-name "$project" --file "$compose_file" "$@"')),
     )
     for label, mutation in mutations:
         expect_rejected(validate_validation_env, mutation, label, "validation-env")

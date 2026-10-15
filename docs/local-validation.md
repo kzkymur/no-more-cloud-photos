@@ -1,7 +1,9 @@
 # Local validation and CI gates
 
-The repository owns the validation entrypoints. GitHub Actions calls the same
-commands; it is not the only place they can run.
+The repository owns the validation entrypoints. CI and Infra validation Actions
+call the same commands; they are not the only place those commands can run. The
+privileged Ubuntu workflow retains its newer commit-bound transaction instead
+of delegating that security boundary to a checkout script.
 
 ## Supported workstation
 
@@ -106,6 +108,9 @@ that registry, stops and checks only registered run-unique transient units, and
 removes only initially absent releases registered by that run. A privileged
 two-run counterexample proves that cleaning one run preserves the other's
 release and a pre-existing release.
+This local dispatcher exercises the reusable Ubuntu deployment substrate, but
+does not replace the workflow's commit-bound migration-role containment and
+repair-mount gates. Those remain direct, structurally verified workflow steps.
 
 ## CI topology and timing baseline
 
@@ -126,13 +131,13 @@ content in the key. Native binaries are deliberately rebuilt: their absolute rpa
 runner package closure make cross-run binary reuse less trustworthy than source
 download reuse. This trades several build minutes for stronger provenance.
 
-`CI` and privileged Ubuntu also run weekly and on manual dispatch. Ubuntu PR
-path selection is conservative: every shared `scripts/**` change triggers it,
-so migration or privileged validation cannot be skipped by editing a shared
-entrypoint. Main-branch pushes always run the privileged workflow. Compare the
-first run after a cache-key change (cold) with the next unchanged run (warm) and
-record both job durations in the pull request; local hardware and Docker cache
-state make a universal wall-clock promise misleading.
+`CI` runs weekly and on manual dispatch. The privileged Ubuntu workflow remains
+manually dispatchable and retains the newer exact PR/main path allowlist guarded
+by its deployment verifier; its older weekly schedule and wrapper consolidation
+are deliberately not restored over that boundary. Compare the first run after
+a cache-key change (cold) with the next unchanged run (warm) and record both job
+durations in the pull request; local hardware and Docker cache state make a
+universal wall-clock promise misleading.
 
 Measured cold native-source-cache evidence for this split is CI run
 `37924475841`: the cache key was absent, the `native-race` job took 25m34s,

@@ -259,24 +259,6 @@ require_tools() {
   fi
 }
 
-require_container_readable_sql_fixtures() {
-  for fixture in \
-    "$root/infra/validation/postgres-init.sql" \
-    "$root/infra/validation/verify-runtime-roles.sql" \
-    "$root/infra/postgresql/runtime-roles.sql" \
-    "$root/infra/postgresql/verify-runtime-role-graph.sql" \
-    "$root/infra/ubuntu/postgresql-roles.sql"; do
-    mode=$(stat -c '%a' "$fixture")
-    case ${mode#${mode%?}} in
-      4|5|6|7) ;;
-      *)
-        echo "error: container SQL bind fixture is not other-readable (chmod 0644): $fixture (mode $mode)" >&2
-        exit 1
-        ;;
-    esac
-  done
-}
-
 assert_owned() {
   for type in container volume network; do
     case "$type" in
@@ -1756,7 +1738,6 @@ case "${1:-}" in
 esac
 case "${1:-}" in
   up)
-    require_container_readable_sql_fixtures
     complete=false
     trap 'if [ "$complete" != true ]; then cleanup; fi' EXIT HUP INT TERM
     start_environment
@@ -1768,7 +1749,6 @@ case "${1:-}" in
     check
     ;;
   verify)
-    require_container_readable_sql_fixtures
     peer_project="${project}-peer"
     guard_project="${project}-guard-$$"
     guard_volume="${guard_project}_foreign"
