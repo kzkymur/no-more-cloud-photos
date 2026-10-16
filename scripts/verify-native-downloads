@@ -247,7 +247,7 @@ tracked = subprocess.run(
     stdout=subprocess.PIPE,
 ).stdout.decode().split("\0")
 snapshot_exclusions = {"internal/nativevalidation/download-verified", "scripts/verify-native-downloads"}
-canonical_repository_sha256 = "64042016782f0ada343b877c07b70f75cf7019712d5b6e048421fdb826b037b6"
+canonical_repository_sha256 = "60866e06b18a9ff7f0b98324a11cd0bd487184bea09780f32d03a3ef78dcac4f"
 
 
 def repository_source_digest(contents):

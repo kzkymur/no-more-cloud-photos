@@ -3618,13 +3618,11 @@ def validate_containment(source: str, phase: str) -> None:
     require(main_phase_inventory == {
         ("pid_exists", "preflight"): 1, ("pid_exists", "service-death"): 1,
         ("popen", "client-fault"): 1, ("popen", "name-reuse"): 1,
-        ("popen", "intent-window"): 2,
         ("popen", "persistent-cleanup"): 1, ("popen", "preflight"): 1,
         ("popen", "signal-cleanup"): 2, ("popen", "slow-cleanup"): 1,
         ("popen", "terminal-race"): 2, ("popen", "transient-cleanup"): 1,
         ("popen", "work-budget"): 1,
         ("process_communicate", "client-fault"): 1,
-        ("process_communicate", "intent-window"): 2,
         ("process_communicate", "name-reuse"): 1,
         ("process_communicate", "persistent-cleanup"): 2,
         ("process_communicate", "signal-cleanup"): 2,
@@ -3649,7 +3647,7 @@ def validate_containment(source: str, phase: str) -> None:
         ("release", "terminal-race"): 3, ("release", "transient-cleanup"): 1,
         ("release", "work-budget"): 1,
         ("reset_paths", "client-fault"): 1, ("reset_paths", "name-reuse"): 1,
-        ("reset_paths", "intent-window"): 3,
+        ("reset_paths", "intent-window"): 1,
         ("reset_paths", "persistent-cleanup"): 3,
         ("reset_paths", "signal-cleanup"): 3, ("reset_paths", "slow-cleanup"): 2,
         ("reset_paths", "stale-cleanup"): 1, ("reset_paths", "stale-setup"): 1,
@@ -3856,7 +3854,7 @@ def validate_containment(source: str, phase: str) -> None:
         "validate_serialized_diagnostic": ('type(payload) is not bytes',
                                             'payload.count(b"\\n") != 1',
                                             '.decode("ascii")',
-                                            'pairs[0][1] not in ("persistent", "stale")',
+                                             'pairs[0][1] not in ("persistent", "producer", "stale")',
                                             "field_names != expected_names",
                                             'fields_by_name.get("error_category")',
                                             "complete=True", "trusted != payload"),
@@ -3868,8 +3866,20 @@ def validate_containment(source: str, phase: str) -> None:
         "persistent_scalar_diagnostic": ('serialize_diagnostic("persistent", "result", fields, complete=True)',
                                          '("boundary", boundary)', '("release", bits["release"])',
                                          '("fin_empty", bits["final_empty"])',
-                                         '("events", bits["events_exact"])',
-                                         '("se_tws", diagnostic_bit(stderr_shape["trailing_whitespace"]))'),
+                                          '("events", bits["events_exact"])',
+                                          '("se_tws", diagnostic_bit(stderr_shape["trailing_whitespace"]))'),
+        "producer_failure_message": (
+            'serialize_diagnostic("producer", category, fields, complete=True)',
+            '("stage", stage)', '("target", INTENT_TARGETS[expected_target])',
+            '("client", evidence.get("client", "unknown"))',
+            '("return_code", evidence.get("return_code", "unknown"))',
+            '("result", evidence.get("result", "unknown"))',
+            '("identity", identity)', '("environment", environment)',
+            '("transaction", evidence.get("transaction", "unknown"))',
+            '("recorded_scan", diagnostic_bit(finality["scanned"]["recorded"]))',
+            '("canonical_scan", diagnostic_bit(finality["scanned"]["canonical"]))',
+            '("client_lock", diagnostic_bit(finality["locks"]["client"]))',
+            '("transaction_lock", diagnostic_bit(finality["locks"]["transaction"]))'),
         "assert_machine_result_contract": ("set(labels) != set(predicates)",
                                            "for predicate, label in labels.items():",
                                            'for lifecycle in ("none", "non-canonical", "timeout", "unexpected")'),
@@ -3878,6 +3888,17 @@ def validate_containment(source: str, phase: str) -> None:
         function_source = ast.get_source_segment(source, named_function(tree, function_name)) or ""
         require(all(fragment in function_source for fragment in fragments),
                 f"containment {function_name} serialization contract changed")
+    immutable_producer_contract = (
+        'return_code = process.poll()',
+        '"return_code": return_code if type(return_code) is int else "unknown"',
+        '"client": "live", "return_code": "unknown", "result": "unavailable"',
+        'parsed["primary"] != "none"',
+        '"reaped": lifecycle["reaped"]',
+        '("reap", diagnostic_bit(finality["reaped"]))',
+    )
+    require(all(fragment in source for fragment in immutable_producer_contract)
+            and source.count('"state": dict(state)') == 2,
+            "containment immutable producer classification contract changed")
     require(not any(isinstance(node, ast.FunctionDef) and node.name == "persistent_failure_diagnostics"
                     for node in tree.body),
             "unused bulky persistent diagnostic emitter returned")
@@ -3929,6 +3950,7 @@ def validate_containment(source: str, phase: str) -> None:
         "SUCCESS", "PERSISTENT_PROPERTY_ERROR", "PERSISTENT_ACTION_ERROR",
         "STALE_REJECTION_PREFIX", "DIAGNOSTIC_TEXT_LIMIT", "DIAGNOSTIC_PREFIX", "COUNTER_MAX",
         "COUNTER_BYTE_LIMIT", "COUNTER_READ_ATTEMPTS", "COUNTER_CATEGORIES",
+        "INTENT_STAGES", "INTENT_TARGETS", "PRODUCER_WAIT_SECONDS",
         "persistent_failure_classification", "diagnostic_errno", "sanitized_diagnostic_text", "render_diagnostic_message", "serialize_diagnostic", "validate_serialized_diagnostic",
         "top_level_diagnostic", "write_diagnostic", "sanitized_state",
         "persistent_result_violation", "persistent_special_result_violation",
@@ -3936,6 +3958,7 @@ def validate_containment(source: str, phase: str) -> None:
         "parse_client_result", "client_stderr_evidence", "expected_persistent_result",
         "retain_persistent_cgroup", "persistent_cgroup_finality",
         "PersistentCgroupFinalityFailure", "SerializedDiagnosticFailure",
+        "ProducerEpochFailure", "producer_failure_message",
         "evaluate_persistent_result", "persistent_scalar_diagnostic",
         "assert_machine_result_contract", "assert_persistent_cgroup_routing_contract",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
@@ -3972,6 +3995,7 @@ def validate_containment(source: str, phase: str) -> None:
         "persistent_launch_paths", "wait_validated_marker",
         "counter", "wait_counter", "release", "wait_unit_absent",
         "assert_client_lock_reusable", "assert_client_lock_held", "assert_transaction_lock_held",
+        "assert_transaction_lock_reusable",
         "assert_client_failure", "expected_signal_result", "signal_result_contract",
         "assert_cancelled_result",
         "fast_recovery", "fault_paths", "assert_interception", "cleanup_fixture_invocation",
@@ -3989,7 +4013,11 @@ def validate_containment(source: str, phase: str) -> None:
         "signed_launch_state_until", "cleanup_signed_launch_until",
         "pid_exists", "cgroup_pids", "process_has_inode", "assert_keeper_lock_coherent",
         "intent_entry", "run_root_entry", "observable_identity", "assert_replaced_or_absent",
-        "open_intent_epoch", "snapshot_intent_epoch",
+        "intent_launch_signature", "producer_unit_evidence", "exact_failed_producer_result",
+        "communicate_producer_once", "intent_journal_evidence", "producer_wait_evidence",
+        "producer_transaction_state", "open_intent_epoch", "snapshot_intent_epoch",
+        "terminate_and_reap_producer", "producer_epoch_finality", "closed_state_value",
+        "producer_failure_message", "exercise_intent_epoch",
         "main",
     }
     actual_containment_functions = {node.name for node in reviewed_persistent_functions}
@@ -4057,6 +4085,7 @@ def validate_containment(source: str, phase: str) -> None:
         ("wait_unit_absent", "phase, timeout=30"), ("assert_client_lock_reusable", ""),
         ("assert_client_lock_held", ""),
         ("assert_transaction_lock_held", ""),
+        ("assert_transaction_lock_reusable", ""),
         ("assert_client_failure", "result, mode, phase"),
         ("expected_signal_result", "mode, signum"),
         ("signal_result_contract", "result, mode, signum"),
@@ -4093,8 +4122,21 @@ def validate_containment(source: str, phase: str) -> None:
         ("assert_keeper_lock_coherent", "keeper_pid, expected"), ("intent_entry", "document, path"),
         ("run_root_entry", "document"), ("observable_identity", "path, recorded"),
         ("assert_replaced_or_absent", "path, identity"),
-        ("open_intent_epoch", "stage, expected_target, prior"),
-        ("snapshot_intent_epoch", "anchor, label"), ("main", ""),
+        ("intent_launch_signature", "state, repo, commit, go_binary, mode, nonce=None"),
+        ("producer_unit_evidence", "repo, commit, go_binary, mode, deadline"),
+        ("exact_failed_producer_result", "process, stdout, stderr"),
+        ("communicate_producer_once", "process, lifecycle, timeout"),
+        ("intent_journal_evidence", "stage, expected_target, nonce"),
+        ("producer_wait_evidence", "process, stage, expected_target, prior, repo, commit, go_binary, mode, deadline, lifecycle"),
+        ("producer_transaction_state", ""),
+        ("open_intent_epoch", "stage, expected_target, prior, repo, commit, go_binary, mode"),
+        ("snapshot_intent_epoch", "anchor, label"),
+        ("terminate_and_reap_producer", "process, lifecycle"),
+        ("producer_epoch_finality", "process, lifecycle, evidence, repo, commit, go_binary, mode"),
+        ("closed_state_value", "value, allowed"),
+        ("producer_failure_message", "category, stage, expected_target, evidence, finality"),
+        ("exercise_intent_epoch", "client, repo, commit, go_binary, stage, expected_target, prior"),
+        ("main", ""),
     )
     actual_function_signatures = tuple(
         (node.name, ast.unparse(node.args)) for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -4114,6 +4156,7 @@ def validate_containment(source: str, phase: str) -> None:
         "wait_counter": [ast.dump(ast.Constant(value=30))],
         "wait_unit_absent": [ast.dump(ast.Constant(value=30))],
         "assert_interception": [ast.dump(ast.Constant(value=False))],
+        "intent_launch_signature": [ast.dump(ast.Constant(value=None))],
         "sanitized_diagnostic_text": [ast.dump(ast.Constant(value=None))],
         "serialize_diagnostic": [ast.dump(ast.Tuple(elts=[], ctx=ast.Load())), ast.dump(ast.Constant(value=None)), ast.dump(ast.Constant(value=None)), ast.dump(ast.Constant(value=False))],
     }
@@ -4137,6 +4180,11 @@ class PersistentCgroupFinalityFailure(RuntimeError):
         self.errors = tuple(errors)
         self.recorded_scanned = recorded_scanned
         self.canonical_scanned = canonical_scanned
+class ProducerEpochFailure(RuntimeError):
+    def __init__(self, category, evidence):
+        super().__init__(category)
+        self.category = category
+        self.evidence = evidence
 ''').body
     protected_persistent_bindings.update(node.name for node in reviewed_persistent_functions)
     require(actual_containment_functions == expected_containment_functions
@@ -4151,7 +4199,7 @@ class PersistentCgroupFinalityFailure(RuntimeError):
             and not any(node.decorator_list for node in reviewed_persistent_functions)
             and {node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
                 == reviewed_persistent_functions | evidence_class_methods
-            and len(evidence_classes) == 3
+            and len(evidence_classes) == 4
             and tuple(map(ast.dump, evidence_classes)) == tuple(map(ast.dump, expected_evidence_classes))
             and not any(isinstance(node, ast.AsyncFunctionDef) for node in ast.walk(tree))
             and {node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
@@ -4215,8 +4263,9 @@ try_nonblocking_flock(cleanup_lock, "persistent-cleanup", "lock")
         "PROGRAM", "NONCE_VARIABLE",
         "DESCRIPTION_PREFIX", "SERVICE_PROPERTIES", "IDENTITY_PROPERTIES",
         "SYSTEMD_UNIT_OBJECT", "CGROUP_SNAPSHOT_ATTEMPTS", "DIAGNOSTIC_PHASES",
-        "DIAGNOSTIC_OPERATIONS", "DIAGNOSTIC_RESOURCES", "COUNTER_MAX",
-        "COUNTER_BYTE_LIMIT", "COUNTER_READ_ATTEMPTS", "COUNTER_CATEGORIES",
+        "DIAGNOSTIC_OPERATIONS", "DIAGNOSTIC_RESOURCES", "INTENT_STAGES",
+        "INTENT_TARGETS", "PRODUCER_WAIT_SECONDS", "COUNTER_MAX", "COUNTER_BYTE_LIMIT",
+        "COUNTER_READ_ATTEMPTS", "COUNTER_CATEGORIES",
     }
     actual_module_assignment_names = [
         node.targets[0].id for node in module_assignments
@@ -4276,6 +4325,14 @@ DIAGNOSTIC_RESOURCES = (
     "cgroup", "cleanup-intent", "client", "counter", "directory", "evidence", "helper",
     "lock", "marker", "pid", "process", "release", "transaction", "unknown",
 )
+INTENT_STAGES = ("after-intent", "after-mkdir", "after-open", "after-register")
+INTENT_TARGETS = {
+    "run-root": "run-root",
+    "/usr/local/libexec/nmcp": "usr-local-libexec-nmcp",
+    "/var/lib/nmcp": "var-lib-nmcp",
+    "/opt/nmcp-role-compatibility": "opt-nmcp-role-compatibility",
+}
+PRODUCER_WAIT_SECONDS = 30
 COUNTER_MAX = 999999
 COUNTER_BYTE_LIMIT = 7
 COUNTER_READ_ATTEMPTS = 4
@@ -4356,20 +4413,21 @@ COUNTER_CATEGORIES = (
         and node.targets[0] not in reviewed_persistent_assignments
     )
     expected_constant_loads = {
-        "UNIT": 22, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
-        "READY": 2, "PID_FILES": 1, "ENV": 14, "SUCCESS": 10,
+        "UNIT": 23, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
+        "READY": 2, "PID_FILES": 1, "ENV": 13, "SUCCESS": 12,
         "RESULT_PREFIX": 5, "RESULT_BYTE_LIMIT": 1, "RESULT_EVENT_LIMIT": 1,
         "CLIENT_STDERR_BYTE_LIMIT": 2,
         "RESULT_PRIMARY_CATEGORIES": 1, "RESULT_BOUNDARIES": 1,
         "RESULT_CLEANUP_CATEGORIES": 1,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "STALE_REJECTION_PREFIX": 1, "DIAGNOSTIC_TEXT_LIMIT": 7, "DIAGNOSTIC_PREFIX": 2,
-        "PROGRAM": 2, "NONCE_VARIABLE": 3,
-        "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 7, "IDENTITY_PROPERTIES": 1,
+        "PROGRAM": 3, "NONCE_VARIABLE": 4,
+        "DESCRIPTION_PREFIX": 3, "SERVICE_PROPERTIES": 7, "IDENTITY_PROPERTIES": 1,
         "SYSTEMD_UNIT_OBJECT": 1, "CGROUP_SNAPSHOT_ATTEMPTS": 1,
         "DIAGNOSTIC_PHASES": 2, "DIAGNOSTIC_OPERATIONS": 1,
         "DIAGNOSTIC_RESOURCES": 1, "COUNTER_MAX": 3, "COUNTER_BYTE_LIMIT": 3,
         "COUNTER_READ_ATTEMPTS": 1, "COUNTER_CATEGORIES": 2,
+        "INTENT_STAGES": 3, "INTENT_TARGETS": 2, "PRODUCER_WAIT_SECONDS": 1,
     }
     actual_constant_loads = {name: 0 for name in expected_module_assignments}
     for node in ast.walk(tree):
@@ -4383,7 +4441,7 @@ COUNTER_CATEGORIES = (
     }
     expected_mutable_constant_contexts = {
         "ENV": {
-            ast.dump(ast.parse('call(env=ENV)', mode="eval").body.keywords[0]): 14,
+            ast.dump(ast.parse('call(env=ENV)', mode="eval").body.keywords[0]): 13,
         },
         "SERVICE_PROPERTIES": {
             ast.dump(ast.parse('(*SERVICE_PROPERTIES,)', mode="eval").body.elts[0]): 3,
@@ -4440,9 +4498,9 @@ COUNTER_CATEGORIES = (
             "containment imports exceed the reviewed modules")
     protected_persistent_bindings.update(reviewed_imports)
     expected_module_loads = {
-        "errno": 8, "fcntl": 5, "functools": 1, "json": 8, "os": 133,
+        "errno": 8, "fcntl": 5, "functools": 1, "json": 8, "os": 140,
         "runpy": 1, "secrets": 2,
-        "signal": 8, "stat": 14, "subprocess": 98, "sys": 3, "time": 74,
+        "signal": 7, "stat": 14, "subprocess": 96, "sys": 3, "time": 81,
     }
     actual_module_loads = {name: 0 for name in reviewed_imports}
     for node in ast.walk(tree):
@@ -4456,25 +4514,25 @@ COUNTER_CATEGORIES = (
         ("fcntl", "flock"): 2, ("functools", "partial"): 1,
         ("json", "JSONDecodeError"): 1, ("json", "dumps"): 5,
         ("json", "loads"): 2, ("os", "O_CREAT"): 2,
-        ("os", "O_DIRECTORY"): 3, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 14,
+        ("os", "O_DIRECTORY"): 3, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 15,
         ("os", "O_NONBLOCK"): 2, ("os", "O_PATH"): 1, ("os", "SEEK_SET"): 1,
-        ("os", "O_RDONLY"): 7, ("os", "O_RDWR"): 4, ("os", "O_TRUNC"): 1,
+        ("os", "O_RDONLY"): 8, ("os", "O_RDWR"): 4, ("os", "O_TRUNC"): 1,
         ("os", "O_WRONLY"): 3,
-        ("os", "close"): 16, ("os", "fchmod"): 2, ("os", "fstat"): 11, ("os", "fsync"): 5,
+        ("os", "close"): 18, ("os", "fchmod"): 2, ("os", "fstat"): 12, ("os", "fsync"): 5,
         ("os", "geteuid"): 1,
-        ("os", "kill"): 7, ("os", "listdir"): 2, ("os", "lseek"): 1, ("os", "lstat"): 3,
-        ("os", "open"): 15, ("os", "path"): 11, ("os", "read"): 3,
+        ("os", "kill"): 6, ("os", "listdir"): 2, ("os", "lseek"): 1, ("os", "lstat"): 3,
+        ("os", "open"): 16, ("os", "path"): 13, ("os", "read"): 3,
         ("os", "replace"): 1, ("os", "stat"): 9,
         ("os", "unlink"): 2, ("os", "walk"): 1, ("os", "write"): 3,
         ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2,
         ("stat", "S_IMODE"): 4, ("stat", "S_ISDIR"): 6, ("stat", "S_ISREG"): 4,
-        ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 4,
+        ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 3,
         ("signal", "SIGQUIT"): 1, ("signal", "SIGTERM"): 1,
         ("subprocess", "CalledProcessError"): 1, ("subprocess", "CompletedProcess"): 22,
-        ("subprocess", "PIPE"): 70, ("subprocess", "TimeoutExpired"): 1,
+        ("subprocess", "PIPE"): 68, ("subprocess", "TimeoutExpired"): 1,
         ("subprocess", "Popen"): 1, ("subprocess", "SubprocessError"): 2,
         ("subprocess", "run"): 1, ("sys", "argv"): 2, ("sys", "stderr"): 1,
-        ("time", "monotonic"): 54, ("time", "sleep"): 20,
+        ("time", "monotonic"): 60, ("time", "sleep"): 21,
     }
     expected_recursive_module_attributes = {
         "errno.EAGAIN": 1, "errno.ESTALE": 6,
@@ -4483,24 +4541,24 @@ COUNTER_CATEGORIES = (
         "fcntl.flock": 2, "functools.partial": 1,
         "json.JSONDecodeError": 1, "json.dumps": 5, "json.loads": 2,
         "os.O_CREAT": 2,
-        "os.O_DIRECTORY": 3, "os.O_EXCL": 2, "os.O_NOFOLLOW": 14,
+        "os.O_DIRECTORY": 3, "os.O_EXCL": 2, "os.O_NOFOLLOW": 15,
         "os.O_NONBLOCK": 2, "os.O_PATH": 1, "os.SEEK_SET": 1,
-        "os.O_RDONLY": 7, "os.O_RDWR": 4, "os.O_TRUNC": 1, "os.O_WRONLY": 3,
-        "os.close": 16, "os.fchmod": 2, "os.fstat": 11, "os.fsync": 5, "os.geteuid": 1,
-        "os.kill": 7, "os.listdir": 2, "os.lstat": 3, "os.open": 15, "os.path": 11,
-        "os.path.abspath": 1, "os.path.basename": 3, "os.path.dirname": 2,
-        "os.path.join": 4, "os.path.relpath": 1,
+        "os.O_RDONLY": 8, "os.O_RDWR": 4, "os.O_TRUNC": 1, "os.O_WRONLY": 3,
+        "os.close": 18, "os.fchmod": 2, "os.fstat": 12, "os.fsync": 5, "os.geteuid": 1,
+        "os.kill": 6, "os.listdir": 2, "os.lstat": 3, "os.open": 16, "os.path": 13,
+        "os.path.abspath": 2, "os.path.basename": 3, "os.path.dirname": 2,
+        "os.path.join": 5, "os.path.relpath": 1,
         "os.lseek": 1, "os.read": 3, "os.replace": 1, "os.stat": 9, "os.unlink": 2,
         "os.walk": 1, "os.write": 3,
         "runpy.run_path": 1, "secrets.token_hex": 2, "stat.S_IMODE": 4,
         "stat.S_ISDIR": 6, "stat.S_ISREG": 4,
-        "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 4,
+        "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 3,
         "signal.SIGQUIT": 1, "signal.SIGTERM": 1,
         "subprocess.CalledProcessError": 1, "subprocess.CompletedProcess": 22,
-        "subprocess.PIPE": 70, "subprocess.TimeoutExpired": 1,
+        "subprocess.PIPE": 68, "subprocess.TimeoutExpired": 1,
         "subprocess.Popen": 1, "subprocess.SubprocessError": 2,
         "subprocess.run": 1, "sys.argv": 2, "sys.stderr": 1, "sys.stderr.buffer": 1,
-        "time.monotonic": 54, "time.sleep": 20,
+        "time.monotonic": 60, "time.sleep": 21,
     }
 
     def rooted_attribute_chain(node):
@@ -4561,9 +4619,9 @@ COUNTER_CATEGORIES = (
                 if isinstance(child, ast.AST):
                     child_relations[id(child)] = (parent, field)
     reviewed_name_callees = {
-        "EvidenceFailure", "PersistentCgroupFinalityFailure", "SerializedDiagnosticFailure", "OSError", "RuntimeError", "SystemExit", "UnicodeEncodeError", "all", "any", "ascii", "assert_cancelled_result", "assert_client_failure",
+        "EvidenceFailure", "PersistentCgroupFinalityFailure", "ProducerEpochFailure", "SerializedDiagnosticFailure", "OSError", "RuntimeError", "SystemExit", "UnicodeEncodeError", "all", "any", "ascii", "assert_cancelled_result", "assert_client_failure",
         "assert_client_lock_held", "assert_client_lock_reusable", "assert_interception",
-        "assert_transaction_lock_held",
+        "assert_transaction_lock_held", "assert_transaction_lock_reusable",
         "assert_cleanup_deadline_contract", "assert_launch_identity_contract",
         "assert_persistent_handoff_contract",
         "assert_launch_signature_counterexamples",
@@ -4575,14 +4633,17 @@ COUNTER_CATEGORIES = (
         "cgroup_open", "cgroup_pids", "cgroup_read", "cgroup_stat", "cgroup_walk",
         "client_stderr_evidence", "cleanup", "cleanup_fixture_invocation", "cleanup_signed_launch",
         "cleanup_signed_launch_if_owned", "cleanup_signed_launch_until",
+        "closed_state_value", "communicate_producer_once",
         "close_transaction_lock",
         "aggregate_counter_failure", "counter", "counter_failure", "counter_identity", "dict", "evidence_failure_number", "evidence_failure",
-        "fail", "function",
+        "exact_failed_producer_result", "exercise_intent_epoch", "fail", "function",
         "enumerate", "evaluate_persistent_result", "expected_persistent_result", "expected_signal_result",
-        "signal_result_contract", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
-        "launch_identity_matches", "launch_identity_signature", "list", "evidence_identity", "read_anchored_json",
+        "signal_result_contract", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "max", "min",
+        "intent_journal_evidence", "intent_launch_signature", "launch_identity_matches", "launch_identity_signature", "list", "evidence_identity", "read_anchored_json",
         "lock_transaction", "map", "next", "observable_identity", "open",
         "open_transaction_lock", "open_intent_epoch", "snapshot_intent_epoch", "os_call", "parse_structured_command", "path_exists", "popen",
+        "producer_epoch_finality", "producer_failure_message", "producer_transaction_state",
+        "producer_unit_evidence", "producer_wait_evidence",
         "parse_client_result", "parse_counter", "parse_unit_properties", "parser",
         "persistent_failure_classification",
         "persistent_cgroup_finality", "persistent_launch_barriers", "persistent_launch_paths",
@@ -4599,25 +4660,25 @@ COUNTER_CATEGORIES = (
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
         "stale_failure_category", "stale_failure_message",
         "structured_command_identity", "successful_terminal_state", "tuple", "type",
-        "top_level_diagnostic", "try_nonblocking_flock", "unique_json_object",
+        "terminate_and_reap_producer", "top_level_diagnostic", "try_nonblocking_flock", "unique_json_object",
         "validated_marker", "validated_payload_marker",
         "wait_counter", "wait_path", "wait_unit_absent", "wait_validated_marker", "zip",
     }
     reviewed_attribute_callee_roots = {
         "after_exit", "body", "budgeted", "calls", "cancelled", "categories", "character",
         "counts", "descendants", "document",
-        "cleanup_errors", "dict", "early_observed", "environment", "errors", "evidence", "expected_slow_counts", "fcntl", "first", "functools",
+        "cleanup_errors", "dict", "early_observed", "environment", "epoch", "errors", "evidence", "expected_slow_counts", "fcntl", "first", "functools",
         "digits", "emitted", "field", "fields_by_name", "found", "json", "kwargs", "kill_stderr", "line", "loaded", "matching", "mode", "mutations",
         "barrier_name", "name", "names", "labels", "message", "observed", "orphaned", "os", "pairs", "part", "parts", "post_cleanup", "post_cleanup_cgroup", "prefix", "process",
         "parsed_events", "predicates", "property_boundaries", "raw_event",
         "partial", "recovered", "recovered_observed", "rendered", "replaced", "result", "runpy",
         "schema", "secrets", "sentinel_state",
-        "identities", "kept", "path", "payload", "results", "signature", "slow", "slow_paths",
+        "identities", "kept", "lifecycle", "mainpid", "path", "payload", "results", "return_code", "signature", "slow", "slow_paths",
         "slow_state", "source", "stat", "state", "stream",
         "stderr",
         "stale_after_client", "stale_observed",
         "stale_post_cleanup", "stale_post_cleanup_cgroup", "stale_program",
-        "stopped", "reset", "RESULT_BOUNDARIES", "RESULT_CLEANUP_CATEGORIES",
+        "stopped", "reset", "INTENT_TARGETS", "RESULT_BOUNDARIES", "RESULT_CLEANUP_CATEGORIES",
         "subprocess", "target", "text", "time", "value", "values", "wait_stderr", "waiting",
     }
     for node in ast.walk(tree):
@@ -4666,6 +4727,21 @@ COUNTER_CATEGORIES = (
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        # CPython 3.14 immutable producer classification evidence.
+        ("346921f35b51fb5e7482b9276d991d599745e6762c484d2986e25a58e43fb991",
+         "b442292e67b6480324b781e20a6dd9d1a2d20d65924e0552d076c5e9b0d2d92c",
+         "248c4bf3fac0ac755a200c6b32b87ce59785a7c116653f2b58148518517e8b74",
+         "4f6495c82f99e06f7c7e1af950f1e4270753349b8faf3213f8cf0e263199390a"),
+        # CPython 3.12 immutable producer classification evidence.
+        ("dc0ed15f1d86417d302192be9bce21be5d901465904ba0f69e76d282ecba5470",
+         "1d90c335a439f46dcfb76ce831320b65de71d32e5ad2f81b7f3ead09e80ec5fd",
+         "3529fa38e5d13619be81174ac1a09e3a5c5ebe7b260a19ce0d0c99be080e34f2",
+         "80d3a64a842887e904e83d78d4dec753946a4125a669654dad499983c2a84e1d"),
+        # CPython 3.14 bounded producer intent epochs.
+        ("d7284cec6fd89a7371fb3e067d38ed6e2c50727722b433a12d71088a6ff431f7",
+         "5d9b13404c370aee24f5d6d5c101b46a8fc7ac0f61304a27a46ae6ac0b6ad0db",
+         "248c4bf3fac0ac755a200c6b32b87ce59785a7c116653f2b58148518517e8b74",
+         "f4253bd823efd588ebab7f0878728bc27789fbf526a0f278365387f61f0c676d"),
         # CPython 3.14 descriptor-anchored intent epochs.
         ("051a51477642c4bdeecd6c3847075ee1ee95edc1affab5ad8c40787e069d4814",
          "11c6ab7d4f30c62bb9800b7d37a9fad1ab52bbf303c452dc8c68604df5f1cef1",
@@ -5001,44 +5077,48 @@ COUNTER_CATEGORIES = (
     protected_call_roots = reviewed_name_callees | reviewed_attribute_callee_roots
     expected_call_root_stores = {'RESULT_BOUNDARIES': 1,
      'RESULT_CLEANUP_CATEGORIES': 1,
+     'INTENT_TARGETS': 1,
      'after_exit': 2,
      'barrier_name': 1,
      'body': 1,
      'budgeted': 1,
      'calls': 1,
      'cancelled': 2,
-     'categories': 2,
-     'character': 17,
-     'cleanup': 1,
+     'categories': 3,
+     'character': 19,
+     'cleanup': 2,
      'cleanup_errors': 1,
      'counts': 1,
      'descendants': 1,
-     'document': 3,
+     'document': 4,
      'digits': 1,
      'early_observed': 1,
      'emitted': 2,
-     'environment': 1,
-     'errors': 3,
-     'evidence': 1,
+     'environment': 3,
+     'epoch': 2,
+     'errors': 5,
+     'evidence': 4,
      'expected_slow_counts': 1,
      'field': 1,
      'fields_by_name': 1,
      'first': 1,
      'found': 1,
      'identities': 1,
-     'identity': 3,
+     'identity': 4,
      'kept': 1,
      'kill_stderr': 1,
      'labels': 1,
      'line': 3,
-      'loaded': 2,
+     'lifecycle': 4,
+     'loaded': 2,
+     'mainpid': 4,
      'matching': 1,
      'message': 2,
      'mode': 8,
      'mutations': 2,
-     'name': 30,
+     'name': 32,
      'names': 3,
-     'observed': 10,
+     'observed': 11,
      'orphaned': 1,
      'parsed_events': 1,
      'parser': 1,
@@ -5046,13 +5126,13 @@ COUNTER_CATEGORIES = (
      'part': 1,
      'partial': 1,
      'parts': 3,
-      'path': 9,
+      'path': 10,
      'payload': 9,
      'post_cleanup': 2,
      'post_cleanup_cgroup': 3,
      'predicates': 3,
-     'prefix': 6,
-     'process': 3,
+     'prefix': 7,
+     'process': 4,
      'property_boundaries': 1,
      'raw_event': 1,
      'reader': 1,
@@ -5063,9 +5143,10 @@ COUNTER_CATEGORIES = (
      'reset': 1,
      'result': 10,
      'results': 1,
+     'return_code': 2,
      'schema': 1,
      'sentinel_state': 1,
-      'signature': 6,
+      'signature': 13,
      'slow': 1,
      'slow_paths': 1,
      'slow_state': 1,
@@ -5075,11 +5156,11 @@ COUNTER_CATEGORIES = (
      'stale_post_cleanup': 3,
      'stale_post_cleanup_cgroup': 2,
      'stale_program': 1,
-      'state': 20,
-     'stderr': 2,
+      'state': 28,
+     'stderr': 3,
      'stopped': 3,
      'successful_terminal_state': 1,
-     'target': 2,
+     'target': 3,
      'text': 11,
      'value': 23,
      'values': 5,
@@ -5096,7 +5177,10 @@ COUNTER_CATEGORIES = (
                                              type(parent).__name__, field, ast.dump(parent)))
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
-                in {"7139afbea76ce31ae44a97638f1a6b9b396b019dd178f53e34a3de008bfc30fd",
+                in {"86e2611f8c2f13db422adba0bcff6b854d8a1511c84d4ed3a42926ec2f69328b",
+                    "02d80aacdb1fb577a3de69d91c26a0d9c7378fd505c930b731770443641430d5",
+                    "5deee54ddb3f1a65d4cf111c0f253f1db5969772614475ed3ce192600b4a5f5b",
+                    "7139afbea76ce31ae44a97638f1a6b9b396b019dd178f53e34a3de008bfc30fd",
                     "e0e16d14456f01e403a84a7997b4f41a810b63f8f4bdcf28fe3c53c350d61056",
                     "c829056d27170ebb10308a25ea86e73995dc2a636ba5263b4a1400c1a0ddde4c",
                     "643a5d2fee958e04d71a5d256863cc09201b07b9e0f9ec32b4c09481eaf57ee8",
@@ -5158,8 +5242,10 @@ COUNTER_CATEGORIES = (
                         "e31276abe1e0508ac96477c4599477c2cb3ba4013c0f1968ff4da1c067398a5b",
                         "7f4100fc0643598e7acc722d1d6c3258c53b26c1cb5cc6241e3b78b930a74f9a",
                          "defe82ecd006a19b9f3dcbf9170f248789c9df8d1fccb75687870f9f16e9989c",
-                         "aa2514d5ac97c314f84aee11d9dd703d4b39e95cf2c47a989a09f8b27934a852",
-                         "52e04d0925935949fc7564838ed6b9fc58619d65eb3d04f1a20c31809f63fe0b"}
+                          "aa2514d5ac97c314f84aee11d9dd703d4b39e95cf2c47a989a09f8b27934a852",
+                          "c7dcb51b5af5a0095b185c34ba47008008e08d0c2bcf8f7fae187c88b07c70f4",
+                          "fa90eac0f6e141f9285c8b5090cf73970dcc72ab1f4aa06342126f5e4e74831c",
+                          "52e04d0925935949fc7564838ed6b9fc58619d65eb3d04f1a20c31809f63fe0b"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -5177,9 +5263,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 766, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
-        "Delete": 1, "Expr": 424, "For": 68, "FunctionDef": 119, "If": 329,
-        "Import": 12, "Pass": 5, "Raise": 78, "Return": 127, "Try": 91, "While": 21,
+        "Assign": 852, "AugAssign": 5, "Break": 10, "ClassDef": 4, "Continue": 12,
+        "Delete": 1, "Expr": 456, "For": 69, "FunctionDef": 133, "If": 353,
+        "Import": 12, "Pass": 9, "Raise": 82, "Return": 147, "Try": 110, "While": 22,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -5193,7 +5279,10 @@ COUNTER_CATEGORIES = (
     # The recursive semantic call/module/binding inventories above remain independently required.
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
-                in {"ac7c43c3c4dd2888b358062fac23a7d3cf7dca5fed793279861cdc69a11762d3",
+                in {"868367d3706a0cfbe8c17e49bab87caaf8ca1fc951900ac70f9cbf36744a459b",
+                    "1d9dd67a9aa8d7d37520ea912ceffb527fb668d7183f2e7e43789d8b9e5663ed",
+                    "f24f2b77306a167497444377eb60452672dcbf478cd708e2ca66ba51890a87d1",
+                    "ac7c43c3c4dd2888b358062fac23a7d3cf7dca5fed793279861cdc69a11762d3",
                     "4c93fda22728100990e0d8ea27f4c6dc9d09067b2e02eeb3c6fd4a3e4a47e6c7",
                     "6859a94c0cb83bd77befc76ace00e29accfa01c13e55fd04ee6ded03e4d3341a",
                     "c42491f1733fda82e3ca18ba20bbfb91471c7a33c8e22fdc08258737b5142968",
@@ -5281,7 +5370,9 @@ COUNTER_CATEGORIES = (
                            "2c04237148a62911294a01d5592a7f42a8d8a62f0d11e6b21dd812f18189314a",
                            "5058b9866161374e5bcf1e181e1bde4dbe35c866bdf284b8b9658f12b5c3a358",
                            "e61b2642965f81cacd616b1f98edcca20247b259da772fbb5eaace60ed836885",
-                           "781f000f05293e7f96c261358b916e25a28fe918d9321399b89bef0ffec68fc5"},
+                           "781f000f05293e7f96c261358b916e25a28fe918d9321399b89bef0ffec68fc5",
+                           "5d457735e7bc905d199967af22c60f65bf53d8ffda558ef2e5d28ffa312bc66f",
+                           "90c3418d8c3092600e3bda4d376df556773b104bb3215aa0fed91b5f69ea0a64"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -5660,17 +5751,25 @@ COUNTER_CATEGORIES = (
         'state.get("LoadState") != "not-found"',
         'cgroup_pids("/system.slice/" + UNIT, phase)',
         'assert_client_lock_reusable()',
-        'for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
+        'for stage in INTENT_STAGES:',
         'f"run-root:{stage}"',
-        'anchor = open_intent_epoch(stage, "run-root", prior)\n'
-        '        os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)',
-        'anchor = open_intent_epoch(stage, target, prior)\n'
-        '            os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)',
-        'faulted_stdout, faulted_stderr = process_communicate("intent-window", faulted, 60)\n'
-        '        if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted_stdout:',
-        'faulted_stdout, faulted_stderr = process_communicate("intent-window", faulted, 60)\n'
-        '            if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted_stdout:',
-        'prior = snapshot_intent_epoch(anchor, label)',
+        'producer_wait_evidence(\n            process, stage, expected_target, prior, repo, commit, go_binary, label,',
+        'if ready_present:\n            anchor = open_intent_epoch(',
+        'return_code = process.poll()\n        if return_code is not None:\n            communicate_producer_once(process, lifecycle, 10)',
+        'raise ProducerEpochFailure("producer-exit-before-ready",',
+        'raise ProducerEpochFailure("producer-timeout-before-ready",',
+        'intent_launch_signature(\n        state, repo, commit, go_binary, mode, nonce)',
+        'os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)',
+        'communicate_producer_once(process, lifecycle, 60)',
+        'snapshot = snapshot_intent_epoch(anchor, label)',
+        'finally:\n        if anchor is not None:',
+        'finality = producer_epoch_finality(',
+        'cleanup_signed_launch_until(signature, "intent-window", deadline)',
+        'for name, path in (("recorded", recorded_cgroup),\n'
+        '                       ("canonical", "/system.slice/" + UNIT)):',
+        'assert_client_lock_reusable()', 'assert_transaction_lock_reusable()',
+        'serialize_diagnostic("producer", category, fields, complete=True)',
+        '"producer-exit-before-ready", "producer-timeout-before-ready"',
         'os.O_RDONLY | os.O_NOFOLLOW',
         'observed.st_nlink != 1 or stat.S_IMODE(observed.st_mode) != 0o600',
         'epoch != {"nonce": nonce, "stage": stage, "target": target}',
@@ -5684,7 +5783,6 @@ COUNTER_CATEGORIES = (
         'raw, document = read_anchored_json(\n            anchor["descriptor"], anchor["stat"], "cleanup-intent")',
         'descriptor = os_call("intent-window", "open", "cleanup-intent", os.open,\n'
         '                         "/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)',
-        'wait_path("intent-window", ready_path, timeout=30)',
         '"/run/nmcp-ci/cleanup-intent.ready.new"',
         '"containment-supervisor-kill"', 'wait_path("preflight", READY)',
         'if not set(descendants) <= set(all_service_pids):',
@@ -5719,9 +5817,9 @@ COUNTER_CATEGORIES = (
         'assert_replaced_or_absent(prior["target"], prior["target_identity"])',
     )
     require(all(fragment in source for fragment in contract)
-            and source.count('("after-intent", "after-mkdir", "after-open", "after-register")') == 2
-            and source.count('popen("intent-window"') == 2
-            and source.count('prior = snapshot_intent_epoch(anchor, label)') == 2,
+            and source.count('for stage in INTENT_STAGES:') == 2
+            and source.count('popen("intent-window"') == 1
+            and source.count('snapshot = snapshot_intent_epoch(anchor, label)') == 1,
             "containment causal death/overlap/lock/recovery/fault contract changed")
     main_node = named_function(tree, "main")
     argument_assignments = [
@@ -6542,7 +6640,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "e69e5ab9e58c277c29919c97bbd0c20c8041e1ae8704249828412a05afdcbfb4",
+            == "e4f5f5b054c5b24e0e27caefdf7c5b4b9bd99ccc41f1bbf10bb8c2d71209a7e0",
             "diagnostic fixture source snapshot changed")
 
 
@@ -9194,25 +9292,55 @@ def verify_supervisor_mutations(
             '        and parsed["primary"] == "verification" and parsed["events"] == ()',
             '        and parsed["primary"] == "verification"')),
         ("stale machine events-complete omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
             '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1',
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
             '        and parsed["final_scanned"] == 1')),
         ("stale machine final-scanned omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
             '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1',
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
             '        and parsed["events_complete"] == 1')),
         ("stale machine final-observed omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
             '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1',
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
             '        and parsed["final_empty"] == 1')),
         ("stale machine final-empty omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
             '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1',
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
             '        and parsed["final_observed"] == 1')),
         ("stale machine return omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
+            '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1\n'
             '        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0)',
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
+            '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1\n'
             '        and parsed["stdout"] == 0 and parsed["success"] == 0)')),
         ("stale machine stdout omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
+            '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1\n'
             '        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0)',
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
+            '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1\n'
             '        and parsed["return"] == 1 and parsed["success"] == 0)')),
         ("stale machine success omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
+            '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1\n'
             '        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0)',
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()\n'
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1\n'
+            '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1\n'
             '        and parsed["return"] == 1 and parsed["stdout"] == 0)')),
         ("stale human shape omitted", replace_once(containment,
             '        stderr_shape["shape"] and len(lines) == 2 and lines[1] == expected_human)',
@@ -9852,13 +9980,71 @@ def verify_supervisor_mutations(
             '("/usr/bin/systemd-run", "--quiet", f"--unit={UNIT}", "--service-type=exec",\n                    f"--description=NMCP migration role verifier {sentinel_nonce}"',
             '("/bin/true",\n                    f"--description=NMCP migration role verifier {sentinel_nonce}"')),
         ("boundary fault omitted", replace_once(containment,
-          'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
-          'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-register"):' )),
-        ("intent kill before journal anchor", replace_once(containment,
-            '        anchor = open_intent_epoch(stage, "run-root", prior)\n'
+          'INTENT_STAGES = ("after-intent", "after-mkdir", "after-open", "after-register")',
+          'INTENT_STAGES = ("after-intent", "after-mkdir", "after-register")')),
+        ("intent marker-only wait restored", replace_once(containment,
+            '        anchor, evidence = producer_wait_evidence(\n'
+            '            process, stage, expected_target, prior, repo, commit, go_binary, label,\n'
+            '            time.monotonic() + PRODUCER_WAIT_SECONDS, lifecycle)',
+            '        wait_path("intent-window", "/run/nmcp-ci/cleanup-intent.ready", timeout=30)\n'
+            '        anchor = open_intent_epoch(stage, expected_target, prior, repo, commit, go_binary, label)')),
+        ("intent producer exit poll omitted", replace_once(containment,
+            '        return_code = process.poll()\n'
+            '        if return_code is not None:\n'
+            '            communicate_producer_once(process, lifecycle, 10)',
+            '        return_code = process.poll()\n'
+            '        if False:\n'
+            '            communicate_producer_once(process, lifecycle, 10)')),
+        ("intent exact label omitted", replace_once(containment,
+            '            process, stage, expected_target, prior, repo, commit, go_binary, label,\n'
+            '            time.monotonic() + PRODUCER_WAIT_SECONDS, lifecycle)',
+            '            process, stage, expected_target, prior, repo, commit, go_binary, "",\n'
+            '            time.monotonic() + PRODUCER_WAIT_SECONDS, lifecycle)')),
+        ("intent launch identity omitted", replace_once(containment,
+            '    _observed_nonce, signature = intent_launch_signature(\n'
+            '        state, repo, commit, go_binary, mode, nonce)',
+            '    _observed_nonce, signature = nonce, {}')),
+        ("intent producer deadline omitted", replace_once(containment,
+            '        if time.monotonic() >= deadline:\n'
+            '            journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"',
+            '        if False:\n'
+            '            journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"')),
+        ("intent exit return snapshot replaced", replace_once(containment,
+            '        return_code = process.poll()\n        if return_code is not None:',
+            '        if process.poll() is not None:\n            return_code = process.returncode')),
+        ("intent timeout client snapshot corrupted", replace_once(containment,
+            '                "client": "live", "return_code": "unknown", "result": "unavailable",',
+            '                "client": "exited", "return_code": 143, "result": "invalid",')),
+        ("intent classification unit snapshot aliased", replace_once(containment,
+            '                "state": dict(state), "nonce": nonce, "signature": signature,\n'
+            '                "recorded_cgroup": recorded_cgroup, "ready": "absent",\n'
+            '                "journal": journal, "transaction": producer_transaction_state(),\n'
+            '                "client": "exited",',
+            '                "state": state, "nonce": nonce, "signature": signature,\n'
+            '                "recorded_cgroup": recorded_cgroup, "ready": "absent",\n'
+            '                "journal": journal, "transaction": producer_transaction_state(),\n'
+            '                "client": "exited",')),
+        ("intent diagnostic reads cleanup reap state for client", replace_once(containment,
+            '        ("client", evidence.get("client", "unknown")),',
+            '        ("client", "exited" if finality["reaped"] else "live"),')),
+        ("intent failed result accepts no primary", replace_once(containment,
+            '        and parsed["primary"] != "none"\n', '')),
+        ("intent epoch finally omitted", replace_once(containment,
+            '    finally:\n        if anchor is not None:',
+            '    except GeneratorExit:\n        if anchor is not None:')),
+        ("intent producer reap omitted", replace_once(containment,
+            '    errors.extend(terminate_and_reap_producer(process, lifecycle))',
+            '    pass')),
+        ("intent finality omitted", replace_once(containment,
+            '        finality = producer_epoch_finality(\n'
+            '            process, lifecycle, evidence, repo, commit, go_binary, label)',
+            '        finality = {"cleanup": "complete", "unit_absent": True, "scans": {}, "locks": {}}')),
+        ("intent name kill substituted", replace_once(containment,
             '        os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)',
-            '        os.kill(int(show("intent-window", "MainPID")["MainPID"]), signal.SIGKILL)\n'
-            '        anchor = open_intent_epoch(stage, "run-root", prior)')),
+            '        run("intent-window", ("/usr/bin/systemctl", "kill", UNIT), check=False)')),
+        ("intent diagnostic evidence deleted", replace_once(containment,
+            '        if isinstance(error, ProducerEpochFailure):\n            evidence = error.evidence',
+            '        if isinstance(error, ProducerEpochFailure):\n            evidence = {}')),
         ("intent snapshot reopens pathname", replace_once(containment,
             '        raw, document = read_anchored_json(\n'
             '            anchor["descriptor"], anchor["stat"], "cleanup-intent")',
@@ -9876,13 +10062,9 @@ def verify_supervisor_mutations(
             '    descriptor = (os.open("/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)\n'
             '                  if os.path.exists("/run/nmcp-ci/cleanup-intent.json") else os.open("/dev/null", os.O_RDONLY))')),
         ("intent next recovery starts before snapshot", replace_once(containment,
-            '        if not faulted_stderr:\n'
-            '            fail(f"SIGKILL fault window omitted its client diagnostic: {stage}")\n'
-            '        prior = snapshot_intent_epoch(anchor, label)',
-            '        if not faulted_stderr:\n'
-            '            fail(f"SIGKILL fault window omitted its client diagnostic: {stage}")\n'
-            '        next_epoch = popen("intent-window", faulted.args, cwd="/", env=ENV)\n'
-            '        prior = snapshot_intent_epoch(anchor, label)')),
+            '        snapshot = snapshot_intent_epoch(anchor, label)\n        anchor = None',
+            '        next_epoch = popen("intent-window", process.args, cwd="/", env=ENV)\n'
+            '        snapshot = snapshot_intent_epoch(anchor, label)\n        anchor = None')),
         ("intent prior inode survival accepted", replace_once(containment,
             '                fail("prior cleanup-intent inode survived recovery")',
             '                pass')),
@@ -9930,6 +10112,17 @@ def verify_supervisor_mutations(
         "persistent alternate cleanup intent branch",
         "persistent early return before retained cleanup",
         "persistent inverted sentinel nonce condition",
+        "intent marker-only wait restored",
+        "intent producer exit poll omitted",
+        "intent exact label omitted",
+        "intent launch identity omitted",
+        "intent producer deadline omitted",
+        "intent epoch finally omitted",
+        "intent producer reap omitted",
+        "intent finality omitted",
+        "intent name kill substituted",
+        "intent diagnostic evidence deleted",
+        "intent next recovery starts before snapshot",
         "persistent unload absence allowed at every boundary",
         "persistent loaded handoff identity ignored",
         "persistent unload absence cgroup residue ignored",

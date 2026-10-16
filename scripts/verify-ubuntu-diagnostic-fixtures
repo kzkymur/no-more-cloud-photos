@@ -2567,14 +2567,23 @@ def actual_boundary_cases(client, containment):
     finally:
         module_os.open = original_open
 
-    original_wait_path = containment_globals["wait_path"]
+    producer_originals = {name: containment_globals[name] for name in (
+        "path_exists", "producer_unit_evidence", "intent_journal_evidence",
+        "producer_transaction_state")}
     try:
-        containment_globals["wait_path"] = lambda *_args, **_kwargs: (
-            _ for _ in ()).throw(RuntimeError("intent epoch publication missing"))
-        assert_fails_with(lambda: containment["open_intent_epoch"](
-            "after-intent", "run-root", None), "intent epoch publication missing")
+        containment_globals["path_exists"] = lambda *_args, **_kwargs: False
+        containment_globals["producer_unit_evidence"] = lambda *_args: (
+            {"LoadState": "not-found"}, None, None)
+        containment_globals["intent_journal_evidence"] = lambda *_args: "absent"
+        containment_globals["producer_transaction_state"] = lambda: "reusable"
+        assert_fails_with(lambda: containment["producer_wait_evidence"](
+            types.SimpleNamespace(poll=lambda: 1), "after-intent", "run-root", None,
+            "/repo", "c" * 40, "/go", "run-root:after-intent", 0,
+            {"communicated": True, "stdout": "", "stderr": "", "reaped": True,
+             "result_exact": False}), "producer-exit-before-ready")
     finally:
-        containment_globals["wait_path"] = original_wait_path
+        for name, value in producer_originals.items():
+            containment_globals[name] = value
 
     original_builtin_open = containment_globals.get("open")
     containment_globals["open"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
@@ -2743,6 +2752,8 @@ def intent_epoch_cases(containment):
         "close", "fstat", "lseek", "lstat", "open", "read", "stat")}
     original_wait_path = globals_["wait_path"]
     original_show = globals_["show"]
+    original_show_identity_until = globals_["show_identity_until"]
+    original_intent_launch_signature = globals_["intent_launch_signature"]
     nonce = "a" * 64
     target = "/run/nmcp-ci/transaction-fixture"
     stage = "after-open"
@@ -2762,7 +2773,8 @@ def intent_epoch_cases(containment):
     document = {"version": 2, "epoch": {"nonce": nonce, "stage": stage,
                                          "target": target}, "entries": [entry]}
     state = {"ready": ready, "document": document, "journal_current": journal_stat,
-             "target_current": target_stat, "reads": []}
+              "target_current": target_stat, "reads": [], "fail_journal_read": False,
+              "closed": []}
 
     def encoded(value):
         return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
@@ -2783,6 +2795,8 @@ def intent_epoch_cases(containment):
 
     def fake_read(descriptor, size):
         state["reads"].append(descriptor)
+        if descriptor == 11 and state["fail_journal_read"]:
+            raise OSError(errno.EIO, "injected anchored journal read failure")
         payload = encoded(state["ready"] if descriptor == 10 else state["document"])
         return payload[:size]
 
@@ -2804,7 +2818,8 @@ def intent_epoch_cases(containment):
 
     def anchor(prior=None):
         update_sizes()
-        return containment["open_intent_epoch"](stage, "run-root", prior)
+        return containment["open_intent_epoch"](
+            stage, "run-root", prior, "/repo", "c" * 40, "/go", f"run-root:{stage}")
 
     try:
         globals_["wait_path"] = lambda *_args, **_kwargs: None
@@ -2812,13 +2827,19 @@ def intent_epoch_cases(containment):
             "ActiveState": "active", "MainPID": "101",
             "Environment": f"NMCP_VERIFIER_NONCE={nonce}",
         }
+        globals_["show_identity_until"] = lambda *_args: {
+            "LoadState": "loaded", "ActiveState": "active", "SubState": "running",
+            "MainPID": "101", "Environment": f"NMCP_VERIFIER_NONCE={nonce}",
+            "ControlGroup": "/system.slice/nmcp-migration-role-verifier.service",
+        }
+        globals_["intent_launch_signature"] = lambda *_args: (nonce, {"signed": True})
         module_os.open = fake_open
         module_os.fstat = fake_fstat
         module_os.lseek = lambda *_args: 0
         module_os.read = fake_read
         module_os.stat = fake_stat
         module_os.lstat = fake_lstat
-        module_os.close = lambda _descriptor: None
+        module_os.close = lambda descriptor: state["closed"].append(descriptor)
 
         observed = anchor()
         snapshot = containment["snapshot_intent_epoch"](observed, f"run-root:{stage}")
@@ -2856,6 +2877,13 @@ def intent_epoch_cases(containment):
             state["ready"] = {key: value for key, value in saved.items() if key != omitted}
             assert_fails_with(lambda: anchor(), "intent epoch ready marker schema changed")
             state["ready"] = saved
+        state["fail_journal_read"] = True
+        closes_before = len(state["closed"])
+        assert_raises(lambda: anchor(),
+                      "phase=intent-window operation=read resource=cleanup-intent errno=5")
+        require(state["closed"][closes_before:] == [10, 11],
+                "failure after ready open before journal anchor leaked evidence descriptors")
+        state["fail_journal_read"] = False
         labels = {f"{kind}:{stage_name}" for kind in (
             "run-root", "path:/usr/local/libexec/nmcp", "path:/var/lib/nmcp",
             "path:/opt/nmcp-role-compatibility") for stage_name in (
@@ -2864,8 +2892,305 @@ def intent_epoch_cases(containment):
     finally:
         globals_["wait_path"] = original_wait_path
         globals_["show"] = original_show
+        globals_["show_identity_until"] = original_show_identity_until
+        globals_["intent_launch_signature"] = original_intent_launch_signature
         for name, value in originals.items():
             setattr(module_os, name, value)
+
+
+def producer_epoch_state_cases(containment):
+    wait_globals = containment["producer_wait_evidence"].__globals__
+    finality_globals = containment["producer_epoch_finality"].__globals__
+    saved = {name: wait_globals[name] for name in (
+        "producer_unit_evidence", "path_exists", "open_intent_epoch",
+        "communicate_producer_once", "intent_journal_evidence",
+        "producer_transaction_state", "reset_paths", "popen",
+        "producer_epoch_finality",
+    )}
+    finality_saved = {name: finality_globals[name] for name in (
+        "terminate_and_reap_producer", "show_identity_until", "show_until",
+        "intent_launch_signature", "cleanup_signed_launch_until", "cgroup_pids",
+        "assert_client_lock_reusable", "assert_transaction_lock_reusable",
+    )}
+    monotonic_original = wait_globals["time"].monotonic
+    sleep_original = wait_globals["time"].sleep
+    nonce = "a" * 64
+    signed_state = {
+        "LoadState": "loaded", "ActiveState": "active", "SubState": "running",
+        "MainPID": "101", "Result": "success", "Environment": f"NMCP_VERIFIER_NONCE={nonce}",
+        "ControlGroup": "/recorded",
+    }
+    absent_state = {"LoadState": "not-found"}
+
+    class Process:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+    def lifecycle():
+        return {"communicated": False, "stdout": "", "stderr": "",
+                "reaped": False, "result_exact": False}
+
+    try:
+        wait_globals["time"].sleep = lambda _delay: None
+        wait_globals["producer_unit_evidence"] = lambda *_args: (
+            signed_state, nonce, {"signed": True})
+        wait_globals["path_exists"] = lambda *_args: False
+        communicate_calls = []
+        def communicate(process, state, _timeout):
+            communicate_calls.append(process)
+            state.update({"communicated": True, "stdout": "", "stderr": "exact",
+                          "reaped": True, "result_exact": True})
+            return "", "exact"
+        wait_globals["communicate_producer_once"] = communicate
+        wait_globals["intent_journal_evidence"] = lambda *_args: "signed"
+        wait_globals["producer_transaction_state"] = lambda: "blocked"
+        state = lifecycle()
+        try:
+            containment["producer_wait_evidence"](
+                Process(1), "after-intent", "run-root", None,
+                "/repo", "c" * 40, "/go", "run-root:after-intent", 10, state)
+        except containment["ProducerEpochFailure"] as error:
+            require(error.category == "producer-exit-before-ready"
+                    and error.evidence["journal"] == "signed"
+                    and error.evidence["transaction"] == "blocked"
+                    and error.evidence["client"] == "exited"
+                    and error.evidence["return_code"] == 1
+                    and error.evidence["result"] == "exact"
+                    and error.evidence["state"] is not signed_state
+                    and len(communicate_calls) == 1 and state["result_exact"],
+                    "signed-journal ready failure lost immutable client or unit evidence")
+        else:
+            raise RuntimeError("early producer exit was accepted without readiness")
+
+        recovery_calls = []
+        def recovery_failure(*_args):
+            recovery_calls.append(True)
+            if len(recovery_calls) == 1:
+                return signed_state, nonce, {"signed": True}
+            raise RuntimeError("injected recovery observation failure")
+        class DelayedExit(Process):
+            def __init__(self):
+                super().__init__(None)
+                self.polls = 0
+
+            def poll(self):
+                self.polls += 1
+                if self.polls >= 2:
+                    self.returncode = 1
+                return self.returncode
+
+        wait_globals["producer_unit_evidence"] = recovery_failure
+        wait_globals["intent_journal_evidence"] = lambda *_args: "unsigned"
+        wait_globals["time"].monotonic = lambda: 0
+        try:
+            containment["producer_wait_evidence"](
+                DelayedExit(), "after-intent", "run-root", None,
+                "/repo", "c" * 40, "/go", "run-root:after-intent", 10, lifecycle())
+        except containment["ProducerEpochFailure"] as error:
+            require(error.category == "producer-exit-before-ready"
+                    and len(recovery_calls) == 2
+                    and error.evidence["signature"] == {"signed": True}
+                    and error.evidence["journal"] == "unsigned",
+                    "recovery observation failure lost unsigned-journal exit evidence")
+        else:
+            raise RuntimeError("unsigned-journal producer exit was accepted")
+
+        wait_globals["producer_unit_evidence"] = lambda *_args: (absent_state, None, None)
+        wait_globals["intent_journal_evidence"] = lambda *_args: "absent"
+        wait_globals["time"].monotonic = lambda: 20
+        try:
+            containment["producer_wait_evidence"](
+                Process(None), "after-mkdir", "/var/lib/nmcp", None,
+                "/repo", "c" * 40, "/go", "path:/var/lib/nmcp:after-mkdir", 10,
+                lifecycle())
+        except containment["ProducerEpochFailure"] as error:
+            require(error.category == "producer-timeout-before-ready"
+                    and error.evidence["state"] == absent_state
+                    and error.evidence["transaction"] == "blocked"
+                    and error.evidence["client"] == "live"
+                    and error.evidence["return_code"] == "unknown"
+                    and error.evidence["result"] == "unavailable",
+                    "transaction-lock blockage did not classify as immutable bounded timeout")
+        else:
+            raise RuntimeError("live producer plus absent unit escaped its deadline")
+
+        wait_globals["time"].monotonic = lambda: 0
+        wait_globals["path_exists"] = lambda *_args: True
+        ready_calls = []
+        def ready_anchor(*_args):
+            ready_calls.append(True)
+            return {"state": signed_state, "nonce": nonce, "signature": {"signed": True},
+                    "recorded_cgroup": "/recorded"}
+        wait_globals["open_intent_epoch"] = ready_anchor
+        anchor, evidence = containment["producer_wait_evidence"](
+            Process(1), "after-open", "run-root", None,
+            "/repo", "c" * 40, "/go", "run-root:after-open", 10, lifecycle())
+        require(len(ready_calls) == 1 and anchor["signature"] == {"signed": True}
+                and evidence["ready"] == "present",
+                "ready-vs-exit race did not require the signed ready anchor")
+
+        finality_calls = []
+        wait_globals["reset_paths"] = lambda *_args: None
+        wait_globals["popen"] = lambda *_args, **_kwargs: Process(1)
+        wait_globals["open_intent_epoch"] = lambda *_args: (
+            _ for _ in ()).throw(RuntimeError("ready open failed before anchor"))
+        wait_globals["producer_epoch_finality"] = lambda process, state, evidence, *_args: (
+            finality_calls.append((process, state, evidence)) or {
+                "cleanup": "complete", "unit_absent": True,
+                "scanned": {"recorded": True, "canonical": True},
+                "scans": {"recorded": [], "canonical": []},
+                "locks": {"client": True, "transaction": True},
+            })
+        assert_fails_with(lambda: containment["exercise_intent_epoch"](
+            "/client", "/repo", "c" * 40, "/go", "after-open", "run-root", None),
+            "ready open failed before anchor")
+        require(len(finality_calls) == 1,
+                "ready-present open-before-anchor failure bypassed epoch finality")
+
+        finality_globals["terminate_and_reap_producer"] = lambda _process, state: (
+            state.update({"reaped": True}) or [])
+        finality_globals["show_identity_until"] = lambda *_args: signed_state
+        finality_globals["show_until"] = lambda *_args: absent_state
+        finality_globals["intent_launch_signature"] = lambda *_args: (nonce, {"signed": True})
+        cleanup_calls = []
+        finality_globals["cleanup_signed_launch_until"] = lambda signature, *_args: (
+            cleanup_calls.append(signature))
+        finality_globals["cgroup_pids"] = lambda *_args: []
+        finality_globals["assert_client_lock_reusable"] = lambda: None
+        finality_globals["assert_transaction_lock_reusable"] = lambda: None
+        final = containment["producer_epoch_finality"](
+            Process(1), lifecycle(), {"signature": {"signed": True}, "nonce": nonce,
+                                      "recorded_cgroup": "/recorded"},
+            "/repo", "c" * 40, "/go", "run-root:after-open")
+        require(final["cleanup"] == "complete" and final["unit_absent"]
+                and final["scanned"] == {"recorded": True, "canonical": True}
+                and not any(final["scans"].values()) and all(final["locks"].values())
+                and cleanup_calls == [{"signed": True}],
+                "timeout finality did not prove signed cleanup, both scans, and both locks")
+
+        failure_cases = (
+            ("action", "cleanup_signed_launch_until"),
+            ("cgroup", "cgroup_pids"),
+            ("lock", "assert_client_lock_reusable"),
+            ("reap", "terminate_and_reap_producer"),
+            ("state", "show_until"),
+        )
+        for category, failing_name in failure_cases:
+            replacements = dict(finality_saved)
+            replacements.update({
+                "terminate_and_reap_producer": lambda _process, state: (
+                    state.update({"reaped": True}) or []),
+                "show_identity_until": lambda *_args: signed_state,
+                "show_until": lambda *_args: absent_state,
+                "intent_launch_signature": lambda *_args: (nonce, {"signed": True}),
+                "cleanup_signed_launch_until": lambda *_args: None,
+                "cgroup_pids": lambda *_args: [],
+                "assert_client_lock_reusable": lambda: None,
+                "assert_transaction_lock_reusable": lambda: None,
+            })
+            replacements[failing_name] = lambda *_args: (
+                [RuntimeError("injected reap failure")]
+                if failing_name == "terminate_and_reap_producer" else
+                (_ for _ in ()).throw(RuntimeError("injected finality failure")))
+            for name, value in replacements.items():
+                finality_globals[name] = value
+            failed = containment["producer_epoch_finality"](
+                Process(1), lifecycle(), {"signature": {"signed": True}, "nonce": nonce,
+                                          "recorded_cgroup": "/recorded"},
+                "/repo", "c" * 40, "/go", "run-root:after-open")
+            require(failed["cleanup"] == category,
+                    f"producer finality did not isolate injected {category} category")
+
+        unsigned_cleanup_calls = []
+        finality_globals["terminate_and_reap_producer"] = lambda _process, state: (
+            state.update({"reaped": True}) or [])
+        finality_globals["show_identity_until"] = lambda *_args: signed_state
+        finality_globals["show_until"] = lambda *_args: absent_state
+        finality_globals["intent_launch_signature"] = lambda *_args: (
+            _ for _ in ()).throw(RuntimeError("unsigned loaded state"))
+        finality_globals["cleanup_signed_launch_until"] = lambda *_args: (
+            unsigned_cleanup_calls.append(True))
+        finality_globals["cgroup_pids"] = lambda *_args: []
+        finality_globals["assert_client_lock_reusable"] = lambda: None
+        finality_globals["assert_transaction_lock_reusable"] = lambda: None
+        unsigned = containment["producer_epoch_finality"](
+            Process(1), lifecycle(), {"signature": None, "nonce": nonce,
+                                      "recorded_cgroup": "/recorded"},
+            "/repo", "c" * 40, "/go", "run-root:after-open")
+        require(unsigned["cleanup"] == "unsigned-loaded" and not unsigned_cleanup_calls,
+                "unsigned loaded fixed name was cleaned without exact launch identity")
+
+        finality_globals["show_identity_until"] = lambda *_args: (
+            _ for _ in ()).throw(RuntimeError("recovery observation failed"))
+        recovered = containment["producer_epoch_finality"](
+            Process(1), lifecycle(), {"signature": None, "nonce": nonce,
+                                      "recorded_cgroup": "/recorded"},
+            "/repo", "c" * 40, "/go", "run-root:after-open")
+        require(recovered["cleanup"] == "action",
+                "recovery observation failure lost its isolated action category")
+
+        fields_finality = {
+            "cleanup": "complete", "reaped": True, "unit_absent": True,
+            "scanned": {"recorded": True, "canonical": True},
+            "scans": {"recorded": [], "canonical": []},
+            "locks": {"client": True, "transaction": True},
+        }
+        diagnostic = containment["producer_failure_message"](
+            "producer-exit-before-ready", "after-register",
+            "/opt/nmcp-role-compatibility",
+            {"state": signed_state, "signature": {"signed": True},
+             "transaction": "blocked", "journal": "signed", "ready": "absent",
+             "client": "exited", "return_code": 1, "result": "exact"},
+            fields_finality)
+        containment["validate_serialized_diagnostic"](diagnostic)
+        require(len(diagnostic) <= containment["DIAGNOSTIC_TEXT_LIMIT"]
+                and b"failure=producer-exit-before-ready" in diagnostic
+                and b"stage=after-register" in diagnostic
+                and b"target=opt-nmcp-role-compatibility" in diagnostic,
+                "producer scalar diagnostic lost its exact bounded label")
+        exact_labels = set()
+        timed_out = {"state": absent_state, "signature": None,
+                     "transaction": "blocked", "journal": "absent", "ready": "absent",
+                     "client": "live", "return_code": "unknown",
+                     "result": "unavailable"}
+        for target, target_label in containment["INTENT_TARGETS"].items():
+            for stage_name in containment["INTENT_STAGES"]:
+                payload = containment["producer_failure_message"](
+                    "producer-timeout-before-ready", stage_name, target,
+                    timed_out, fields_finality)
+                containment["validate_serialized_diagnostic"](payload)
+                require(f"stage={stage_name};target={target_label}".encode("ascii") in payload,
+                        "producer timeout diagnostic lost an exact stage/target label")
+                require(b"client=live;return_code=unknown;result=unavailable" in payload,
+                        "post-cleanup state replaced immutable timeout client evidence")
+                exact_labels.add((stage_name, target_label))
+        require(len(exact_labels) == 16,
+                "producer diagnostics did not cover all 16 exact stage/target labels")
+
+        machine = ("NMCP_CLIENT_RESULT_V1:primary=verification;events=-;events_complete=1;"
+                   "final_scanned=1;final_observed=1;final_empty=1;return=1;stdout=0;"
+                   "success=0")
+        stderr = machine + "\nverification-client: fixture failure\n"
+        require(containment["exact_failed_producer_result"](Process(1), "", stderr),
+                "canonical failed producer result was rejected")
+        none_primary = stderr.replace("primary=verification", "primary=none", 1)
+        require(not containment["exact_failed_producer_result"](
+                    Process(1), "", none_primary)
+                and not containment["exact_failed_producer_result"](
+                    Process(0), "", stderr)
+                and not containment["exact_failed_producer_result"](
+                    Process(1), "unexpected", stderr),
+                "non-failure producer output was accepted as an exact failed result")
+    finally:
+        wait_globals["time"].monotonic = monotonic_original
+        wait_globals["time"].sleep = sleep_original
+        for name, value in saved.items():
+            wait_globals[name] = value
+        for name, value in finality_saved.items():
+            finality_globals[name] = value
 
 
 def client_cleanup_result_cases(client, containment):
@@ -4287,6 +4612,7 @@ def main():
     counter_atomic_cases(client, containment)
     actual_boundary_cases(client, containment)
     intent_epoch_cases(containment)
+    producer_epoch_state_cases(containment)
     client_cleanup_result_cases(client, containment)
     client_terminal_emission_cases(client, containment)
     client_teardown_transition_cases(client, containment)
