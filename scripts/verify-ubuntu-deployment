@@ -483,6 +483,8 @@ def validate_supervisor(source: str) -> None:
             "supervisor historical provenance changed")
     require(literal_assignment(tree, "INTENT_PATH") == "/run/nmcp-ci/cleanup-intent.json",
             "supervisor cleanup intent path changed")
+    require(literal_assignment(tree, "INTENT_READY_PATH") == "/run/nmcp-ci/cleanup-intent.ready",
+            "supervisor cleanup intent ready path changed")
     require(literal_assignment(tree, "TOP_ALLOWLISTS") == {
         "/usr/local/libexec/nmcp": {"postgresql", "set-ubuntu-migration-role-mode", "run-ubuntu-migration-compatibility", "verify-installed-runtime-roles"},
         "/var/lib/nmcp": {"deployment"},
@@ -826,6 +828,7 @@ def validate_supervisor(source: str) -> None:
             "supervisor must rely on authorized loader bytes, not an __file__ path comparison")
 
     intent_contract = (
+        'json.dumps({"version": 2, "epoch": epoch, "entries": entries}, sort_keys=True,',
         'descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)',
         'os.fsync(descriptor)',
         'os.replace(temporary, INTENT_PATH)',
@@ -838,17 +841,24 @@ def validate_supervisor(source: str) -> None:
         'os.stat(os.path.basename(path), dir_fd=parent_fd, follow_symlinks=False)',
         'expected is not None and metadata(top) != expected',
         'remove_tree_fd(parent_fd, os.path.basename(path), entry["allowlist"])',
+        'set(document) != {"version", "epoch", "entries"} or document["version"] != 2',
         'descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)',
         'if allowed is not None and not names <= set(allowed):',
         'old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})',
         'if os.path.lexists(path):',
         '"parent_identity": metadata(os.fstat(parent_fd))',
         '"absence_policy": "must-be-absent"',
-        'entries.append(entry)\n        durable_intents(entries)\n        fault(f"{fault_name or path}:after-intent")',
+        'entries.append(entry)\n        durable_intents(entries)\n        fault(entries, path, "after-intent", fault_name or path)',
         'os.mkdir(name, mode, dir_fd=parent_fd)',
-        'os.fsync(parent_fd)\n        fault(f"{fault_name or path}:after-mkdir")',
+        'os.fsync(parent_fd)\n        fault(entries, path, "after-mkdir", fault_name or path)',
         'top_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)',
-        'entry["identity"] = metadata(top)\n        durable_intents(entries)',
+        'entry["identity"] = metadata(top)\n        fault(entries, path, "after-open", fault_name or path)\n        durable_intents(entries)\n        fault(entries, path, "after-register", fault_name or path)',
+        'epoch = {"nonce": SUPERVISOR_NONCE, "stage": stage, "target": path}',
+        'durable_intents(entries, epoch)\n    publish_intent_ready(epoch)',
+        'observed = os.stat(INTENT_PATH, follow_symlinks=False)',
+        'payload.update({"pid": os.getpid(), "journal_dev": observed.st_dev,',
+        'os.replace(temporary, INTENT_READY_PATH)',
+        'while True:\n        signal.pause()',
         'cleanup.defer("signal-mask-restore", signal.pthread_sigmask,\n'
         '                      signal.SIG_SETMASK, old_mask)',
         'cleanup.defer("owned-parent-close", os.close, parent_fd)',
@@ -858,7 +868,7 @@ def validate_supervisor(source: str) -> None:
     missing_intent_fragments = tuple(
         fragment for fragment in intent_contract if fragment not in source)
     require(not missing_intent_fragments
-            and source.count('fsync_directory("/run/nmcp-ci")') == 3,
+            and source.count('fsync_directory("/run/nmcp-ci")') == 4,
             f"supervisor durable intent/bounded cleanup contract changed: "
             f"{missing_intent_fragments!r}")
     launch_barrier_contract = (
@@ -3608,11 +3618,13 @@ def validate_containment(source: str, phase: str) -> None:
     require(main_phase_inventory == {
         ("pid_exists", "preflight"): 1, ("pid_exists", "service-death"): 1,
         ("popen", "client-fault"): 1, ("popen", "name-reuse"): 1,
+        ("popen", "intent-window"): 2,
         ("popen", "persistent-cleanup"): 1, ("popen", "preflight"): 1,
         ("popen", "signal-cleanup"): 2, ("popen", "slow-cleanup"): 1,
         ("popen", "terminal-race"): 2, ("popen", "transient-cleanup"): 1,
         ("popen", "work-budget"): 1,
         ("process_communicate", "client-fault"): 1,
+        ("process_communicate", "intent-window"): 2,
         ("process_communicate", "name-reuse"): 1,
         ("process_communicate", "persistent-cleanup"): 2,
         ("process_communicate", "signal-cleanup"): 2,
@@ -3624,7 +3636,7 @@ def validate_containment(source: str, phase: str) -> None:
         ("process_wait", "client-death"): 1, ("process_wait", "persistent-cleanup"): 1,
         ("read_pid", "preflight"): 2,
         ("run", "client-death"): 1, ("run", "client-fault"): 1,
-        ("run", "intent-window"): 2, ("run", "name-reuse"): 5,
+        ("run", "name-reuse"): 5,
         ("run", "retained-cleanup"): 2, ("run", "service-death"): 1,
         ("run", "stale-attestation"): 1, ("run", "stale-setup"): 1,
         ("run", "transient-cleanup"): 1,
@@ -3637,6 +3649,7 @@ def validate_containment(source: str, phase: str) -> None:
         ("release", "terminal-race"): 3, ("release", "transient-cleanup"): 1,
         ("release", "work-budget"): 1,
         ("reset_paths", "client-fault"): 1, ("reset_paths", "name-reuse"): 1,
+        ("reset_paths", "intent-window"): 3,
         ("reset_paths", "persistent-cleanup"): 3,
         ("reset_paths", "signal-cleanup"): 3, ("reset_paths", "slow-cleanup"): 2,
         ("reset_paths", "stale-cleanup"): 1, ("reset_paths", "stale-setup"): 1,
@@ -3943,7 +3956,7 @@ def validate_containment(source: str, phase: str) -> None:
         "cgroup_fstat", "cgroup_read", "cgroup_close",
         "path_exists", "process_communicate", "process_wait", "read_pid",
         "open_transaction_lock", "lock_transaction", "close_transaction_lock",
-        "load_cleanup_intent", "top_level_diagnostic",
+        "evidence_identity", "read_anchored_json", "top_level_diagnostic",
         "persistent_failure_classification", "persistent_result_violation",
         "persistent_special_result_violation",
         "parse_client_result", "client_stderr_evidence", "expected_persistent_result",
@@ -3976,6 +3989,7 @@ def validate_containment(source: str, phase: str) -> None:
         "signed_launch_state_until", "cleanup_signed_launch_until",
         "pid_exists", "cgroup_pids", "process_has_inode", "assert_keeper_lock_coherent",
         "intent_entry", "run_root_entry", "observable_identity", "assert_replaced_or_absent",
+        "open_intent_epoch", "snapshot_intent_epoch",
         "main",
     }
     actual_containment_functions = {node.name for node in reviewed_persistent_functions}
@@ -4001,7 +4015,8 @@ def validate_containment(source: str, phase: str) -> None:
         ("process_wait", "phase, process, timeout"),
         ("read_pid", "path, phase"), ("open_transaction_lock", ""),
         ("lock_transaction", "descriptor"), ("close_transaction_lock", "descriptor"),
-        ("load_cleanup_intent", ""),
+        ("evidence_identity", "value"),
+        ("read_anchored_json", "descriptor, observed, resource_class"),
         ("persistent_failure_classification", "stdout, stderr"),
         ("persistent_result_violation", "returncode, classification, lock_handoff_error, cleanup_error, lock_reuse_error, post_cleanup, post_cleanup_cgroup"),
         ("persistent_special_result_violation", "returncode, stdout, stderr, evidence_case, boundary, intercepted, attempted"),
@@ -4075,9 +4090,11 @@ def validate_containment(source: str, phase: str) -> None:
         ("cleanup_signed_launch_until", "signature, phase, deadline"),
         ("pid_exists", "pid, phase"), ("cgroup_pids", "control_group, phase"),
         ("process_has_inode", "pid, expected, phase"),
-        ("assert_keeper_lock_coherent", "keeper_pid, expected"), ("intent_entry", "path"),
-        ("run_root_entry", ""), ("observable_identity", "path, recorded"),
-        ("assert_replaced_or_absent", "path, identity"), ("main", ""),
+        ("assert_keeper_lock_coherent", "keeper_pid, expected"), ("intent_entry", "document, path"),
+        ("run_root_entry", "document"), ("observable_identity", "path, recorded"),
+        ("assert_replaced_or_absent", "path, identity"),
+        ("open_intent_epoch", "stage, expected_target, prior"),
+        ("snapshot_intent_epoch", "anchor, label"), ("main", ""),
     )
     actual_function_signatures = tuple(
         (node.name, ast.unparse(node.args)) for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -4340,7 +4357,7 @@ COUNTER_CATEGORIES = (
     )
     expected_constant_loads = {
         "UNIT": 22, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
-        "READY": 2, "PID_FILES": 1, "ENV": 12, "SUCCESS": 10,
+        "READY": 2, "PID_FILES": 1, "ENV": 14, "SUCCESS": 10,
         "RESULT_PREFIX": 5, "RESULT_BYTE_LIMIT": 1, "RESULT_EVENT_LIMIT": 1,
         "CLIENT_STDERR_BYTE_LIMIT": 2,
         "RESULT_PRIMARY_CATEGORIES": 1, "RESULT_BOUNDARIES": 1,
@@ -4366,7 +4383,7 @@ COUNTER_CATEGORIES = (
     }
     expected_mutable_constant_contexts = {
         "ENV": {
-            ast.dump(ast.parse('call(env=ENV)', mode="eval").body.keywords[0]): 12,
+            ast.dump(ast.parse('call(env=ENV)', mode="eval").body.keywords[0]): 14,
         },
         "SERVICE_PROPERTIES": {
             ast.dump(ast.parse('(*SERVICE_PROPERTIES,)', mode="eval").body.elts[0]): 3,
@@ -4423,9 +4440,9 @@ COUNTER_CATEGORIES = (
             "containment imports exceed the reviewed modules")
     protected_persistent_bindings.update(reviewed_imports)
     expected_module_loads = {
-        "errno": 8, "fcntl": 5, "functools": 1, "json": 6, "os": 112,
+        "errno": 8, "fcntl": 5, "functools": 1, "json": 8, "os": 133,
         "runpy": 1, "secrets": 2,
-        "signal": 6, "stat": 12, "subprocess": 98, "sys": 3, "time": 74,
+        "signal": 8, "stat": 14, "subprocess": 98, "sys": 3, "time": 74,
     }
     actual_module_loads = {name: 0 for name in reviewed_imports}
     for node in ast.walk(tree):
@@ -4437,21 +4454,21 @@ COUNTER_CATEGORIES = (
         ("errno", "EWOULDBLOCK"): 1,
         ("fcntl", "LOCK_EX"): 1, ("fcntl", "LOCK_NB"): 1, ("fcntl", "LOCK_UN"): 1,
         ("fcntl", "flock"): 2, ("functools", "partial"): 1,
-        ("json", "dumps"): 4, ("json", "load"): 1,
-        ("json", "loads"): 1, ("os", "O_CREAT"): 2,
-        ("os", "O_DIRECTORY"): 3, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 12,
-        ("os", "O_NONBLOCK"): 2, ("os", "O_PATH"): 1,
-        ("os", "O_RDONLY"): 5, ("os", "O_RDWR"): 4, ("os", "O_TRUNC"): 1,
+        ("json", "JSONDecodeError"): 1, ("json", "dumps"): 5,
+        ("json", "loads"): 2, ("os", "O_CREAT"): 2,
+        ("os", "O_DIRECTORY"): 3, ("os", "O_EXCL"): 2, ("os", "O_NOFOLLOW"): 14,
+        ("os", "O_NONBLOCK"): 2, ("os", "O_PATH"): 1, ("os", "SEEK_SET"): 1,
+        ("os", "O_RDONLY"): 7, ("os", "O_RDWR"): 4, ("os", "O_TRUNC"): 1,
         ("os", "O_WRONLY"): 3,
-        ("os", "close"): 13, ("os", "fchmod"): 2, ("os", "fstat"): 7, ("os", "fsync"): 5,
+        ("os", "close"): 16, ("os", "fchmod"): 2, ("os", "fstat"): 11, ("os", "fsync"): 5,
         ("os", "geteuid"): 1,
-        ("os", "kill"): 5, ("os", "listdir"): 2, ("os", "lstat"): 3,
-        ("os", "open"): 13, ("os", "path"): 11, ("os", "read"): 2,
-        ("os", "replace"): 1, ("os", "stat"): 6,
+        ("os", "kill"): 7, ("os", "listdir"): 2, ("os", "lseek"): 1, ("os", "lstat"): 3,
+        ("os", "open"): 15, ("os", "path"): 11, ("os", "read"): 3,
+        ("os", "replace"): 1, ("os", "stat"): 9,
         ("os", "unlink"): 2, ("os", "walk"): 1, ("os", "write"): 3,
         ("runpy", "run_path"): 1, ("secrets", "token_hex"): 2,
-        ("stat", "S_IMODE"): 3, ("stat", "S_ISDIR"): 6, ("stat", "S_ISREG"): 3,
-        ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 2,
+        ("stat", "S_IMODE"): 4, ("stat", "S_ISDIR"): 6, ("stat", "S_ISREG"): 4,
+        ("signal", "SIGHUP"): 1, ("signal", "SIGINT"): 1, ("signal", "SIGKILL"): 4,
         ("signal", "SIGQUIT"): 1, ("signal", "SIGTERM"): 1,
         ("subprocess", "CalledProcessError"): 1, ("subprocess", "CompletedProcess"): 22,
         ("subprocess", "PIPE"): 70, ("subprocess", "TimeoutExpired"): 1,
@@ -4464,20 +4481,20 @@ COUNTER_CATEGORIES = (
         "errno.EWOULDBLOCK": 1,
         "fcntl.LOCK_EX": 1, "fcntl.LOCK_NB": 1, "fcntl.LOCK_UN": 1,
         "fcntl.flock": 2, "functools.partial": 1,
-        "json.dumps": 4, "json.load": 1, "json.loads": 1,
+        "json.JSONDecodeError": 1, "json.dumps": 5, "json.loads": 2,
         "os.O_CREAT": 2,
-        "os.O_DIRECTORY": 3, "os.O_EXCL": 2, "os.O_NOFOLLOW": 12,
-        "os.O_NONBLOCK": 2, "os.O_PATH": 1,
-        "os.O_RDONLY": 5, "os.O_RDWR": 4, "os.O_TRUNC": 1, "os.O_WRONLY": 3,
-        "os.close": 13, "os.fchmod": 2, "os.fstat": 7, "os.fsync": 5, "os.geteuid": 1,
-        "os.kill": 5, "os.listdir": 2, "os.lstat": 3, "os.open": 13, "os.path": 11,
+        "os.O_DIRECTORY": 3, "os.O_EXCL": 2, "os.O_NOFOLLOW": 14,
+        "os.O_NONBLOCK": 2, "os.O_PATH": 1, "os.SEEK_SET": 1,
+        "os.O_RDONLY": 7, "os.O_RDWR": 4, "os.O_TRUNC": 1, "os.O_WRONLY": 3,
+        "os.close": 16, "os.fchmod": 2, "os.fstat": 11, "os.fsync": 5, "os.geteuid": 1,
+        "os.kill": 7, "os.listdir": 2, "os.lstat": 3, "os.open": 15, "os.path": 11,
         "os.path.abspath": 1, "os.path.basename": 3, "os.path.dirname": 2,
         "os.path.join": 4, "os.path.relpath": 1,
-        "os.read": 2, "os.replace": 1, "os.stat": 6, "os.unlink": 2,
+        "os.lseek": 1, "os.read": 3, "os.replace": 1, "os.stat": 9, "os.unlink": 2,
         "os.walk": 1, "os.write": 3,
-        "runpy.run_path": 1, "secrets.token_hex": 2, "stat.S_IMODE": 3,
-        "stat.S_ISDIR": 6, "stat.S_ISREG": 3,
-        "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 2,
+        "runpy.run_path": 1, "secrets.token_hex": 2, "stat.S_IMODE": 4,
+        "stat.S_ISDIR": 6, "stat.S_ISREG": 4,
+        "signal.SIGHUP": 1, "signal.SIGINT": 1, "signal.SIGKILL": 4,
         "signal.SIGQUIT": 1, "signal.SIGTERM": 1,
         "subprocess.CalledProcessError": 1, "subprocess.CompletedProcess": 22,
         "subprocess.PIPE": 70, "subprocess.TimeoutExpired": 1,
@@ -4563,9 +4580,9 @@ COUNTER_CATEGORIES = (
         "fail", "function",
         "enumerate", "evaluate_persistent_result", "expected_persistent_result", "expected_signal_result",
         "signal_result_contract", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
-        "launch_identity_matches", "launch_identity_signature", "list", "load_cleanup_intent",
+        "launch_identity_matches", "launch_identity_signature", "list", "evidence_identity", "read_anchored_json",
         "lock_transaction", "map", "next", "observable_identity", "open",
-        "open_transaction_lock", "os_call", "parse_structured_command", "path_exists", "popen",
+        "open_transaction_lock", "open_intent_epoch", "snapshot_intent_epoch", "os_call", "parse_structured_command", "path_exists", "popen",
         "parse_client_result", "parse_counter", "parse_unit_properties", "parser",
         "persistent_failure_classification",
         "persistent_cgroup_finality", "persistent_launch_barriers", "persistent_launch_paths",
@@ -4588,7 +4605,7 @@ COUNTER_CATEGORIES = (
     }
     reviewed_attribute_callee_roots = {
         "after_exit", "body", "budgeted", "calls", "cancelled", "categories", "character",
-        "counts", "descendants",
+        "counts", "descendants", "document",
         "cleanup_errors", "dict", "early_observed", "environment", "errors", "evidence", "expected_slow_counts", "fcntl", "first", "functools",
         "digits", "emitted", "field", "fields_by_name", "found", "json", "kwargs", "kill_stderr", "line", "loaded", "matching", "mode", "mutations",
         "barrier_name", "name", "names", "labels", "message", "observed", "orphaned", "os", "pairs", "part", "parts", "post_cleanup", "post_cleanup_cgroup", "prefix", "process",
@@ -4601,7 +4618,7 @@ COUNTER_CATEGORIES = (
         "stale_after_client", "stale_observed",
         "stale_post_cleanup", "stale_post_cleanup_cgroup", "stale_program",
         "stopped", "reset", "RESULT_BOUNDARIES", "RESULT_CLEANUP_CATEGORIES",
-        "subprocess", "text", "time", "value", "values", "wait_stderr", "waiting",
+        "subprocess", "target", "text", "time", "value", "values", "wait_stderr", "waiting",
     }
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -4649,6 +4666,16 @@ COUNTER_CATEGORIES = (
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        # CPython 3.14 descriptor-anchored intent epochs.
+        ("051a51477642c4bdeecd6c3847075ee1ee95edc1affab5ad8c40787e069d4814",
+         "11c6ab7d4f30c62bb9800b7d37a9fad1ab52bbf303c452dc8c68604df5f1cef1",
+         "3454a1e74d290a6f145f011ff91c8c39bcfc396f351ee1d9f91b529740b414fb",
+         "050cd153a5d8d277b1a6d37168332efa3252b6f2c7adbad7a3cafac22083fa0c"),
+        # CPython 3.12 descriptor-anchored intent epochs.
+        ("bbdafb9e11b63efec4c98a10e5c930253f7f1673971ae5f061a011e38c31e921",
+         "789ae0b0cbaa58c55c656e80182f1d64aacc814956793f38720117ac1e2c11e3",
+         "98e8266a6bd03e4939756653a3921ba2def7702771e7ebdfdc1c39f7bf2b49a4",
+         "22310ff27cc0d2c0dd87f26c735bfd1c3619c324ad595483e3fca1523441fe6f"),
         # CPython 3.14 unload-final handoff evidence.
         ("0755e68ab1785830fe3373cfe21ce03fce3a31b26421c82567c3171db19c834b",
          "aeb6b43f2a61b15999f0a9c02aa8068db8e8140bacc5bfb9d57bac61493b4ff4",
@@ -4981,11 +5008,12 @@ COUNTER_CATEGORIES = (
      'calls': 1,
      'cancelled': 2,
      'categories': 2,
-     'character': 16,
+     'character': 17,
      'cleanup': 1,
      'cleanup_errors': 1,
      'counts': 1,
      'descendants': 1,
+     'document': 3,
      'digits': 1,
      'early_observed': 1,
      'emitted': 2,
@@ -5010,7 +5038,7 @@ COUNTER_CATEGORIES = (
      'mutations': 2,
      'name': 30,
      'names': 3,
-     'observed': 9,
+     'observed': 10,
      'orphaned': 1,
      'parsed_events': 1,
      'parser': 1,
@@ -5041,16 +5069,17 @@ COUNTER_CATEGORIES = (
      'slow': 1,
      'slow_paths': 1,
      'slow_state': 1,
-     'source': 3,
+     'source': 2,
      'stale_after_client': 2,
      'stale_observed': 3,
      'stale_post_cleanup': 3,
      'stale_post_cleanup_cgroup': 2,
      'stale_program': 1,
-      'state': 19,
+      'state': 20,
      'stderr': 2,
      'stopped': 3,
      'successful_terminal_state': 1,
+     'target': 2,
      'text': 11,
      'value': 23,
      'values': 5,
@@ -5067,7 +5096,9 @@ COUNTER_CATEGORIES = (
                                              type(parent).__name__, field, ast.dump(parent)))
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
-                in {"c829056d27170ebb10308a25ea86e73995dc2a636ba5263b4a1400c1a0ddde4c",
+                in {"7139afbea76ce31ae44a97638f1a6b9b396b019dd178f53e34a3de008bfc30fd",
+                    "e0e16d14456f01e403a84a7997b4f41a810b63f8f4bdcf28fe3c53c350d61056",
+                    "c829056d27170ebb10308a25ea86e73995dc2a636ba5263b4a1400c1a0ddde4c",
                     "643a5d2fee958e04d71a5d256863cc09201b07b9e0f9ec32b4c09481eaf57ee8",
                     "4d2b36d7285838671c9cdeb17dd9a3234fe8a550f070f3f2c5cacd4ad1201fad",
                     "0276e35c67a1983df99188618f153ee296f155599a965487a3363036cddb5bc3",
@@ -5146,9 +5177,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 742, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
-        "Delete": 1, "Expr": 403, "For": 68, "FunctionDef": 116, "If": 318,
-        "Import": 12, "Pass": 5, "Raise": 78, "Return": 124, "Try": 89, "While": 21,
+        "Assign": 766, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
+        "Delete": 1, "Expr": 424, "For": 68, "FunctionDef": 119, "If": 329,
+        "Import": 12, "Pass": 5, "Raise": 78, "Return": 127, "Try": 91, "While": 21,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -5162,7 +5193,9 @@ COUNTER_CATEGORIES = (
     # The recursive semantic call/module/binding inventories above remain independently required.
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
-                in {"6859a94c0cb83bd77befc76ace00e29accfa01c13e55fd04ee6ded03e4d3341a",
+                in {"ac7c43c3c4dd2888b358062fac23a7d3cf7dca5fed793279861cdc69a11762d3",
+                    "4c93fda22728100990e0d8ea27f4c6dc9d09067b2e02eeb3c6fd4a3e4a47e6c7",
+                    "6859a94c0cb83bd77befc76ace00e29accfa01c13e55fd04ee6ded03e4d3341a",
                     "c42491f1733fda82e3ca18ba20bbfb91471c7a33c8e22fdc08258737b5142968",
                     "223f9a2cdea97ba6c9c2d1f3d02a2be2b1baefa88beb1cea000eeb2fb340111f",
                     "e8e4bfd7c7777a2d0b1f17b6ab05d03b6bb2cf11f15e8990e05a8acd9dc7f737",
@@ -5256,6 +5289,7 @@ COUNTER_CATEGORIES = (
     reviewed_fixture_calls_clear = ast.dump(ast.parse('calls.clear()', mode="eval").body)
     reviewed_json_loads = ast.dump(ast.parse(
         'json.loads(result.stdout, object_pairs_hook=unique_json_object)', mode="eval").body)
+    reviewed_intent_json_loads = ast.dump(ast.parse('json.loads(raw)', mode="eval").body)
     reviewed_evidence_attribute_stores = {
         node for evidence_class in evidence_classes for node in ast.walk(evidence_class)
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)
@@ -5328,7 +5362,7 @@ COUNTER_CATEGORIES = (
               and node.func.attr in {"globals", "locals", "vars", "setattr", "delattr",
                                     "getattr", "exec", "eval", "compile", "__import__",
                                     "FunctionType", "MethodType", "CodeType", "loads"}
-              and ast.dump(node) != reviewed_json_loads):
+              and ast.dump(node) not in {reviewed_json_loads, reviewed_intent_json_loads}):
             persistent_binding_violations.append(node)
         elif (isinstance(node, ast.Attribute)
               and (node.attr.startswith("__") or node.attr in {
@@ -5628,7 +5662,30 @@ COUNTER_CATEGORIES = (
         'assert_client_lock_reusable()',
         'for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
         'f"run-root:{stage}"',
-        'path_exists("intent-window", "cleanup-intent",',
+        'anchor = open_intent_epoch(stage, "run-root", prior)\n'
+        '        os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)',
+        'anchor = open_intent_epoch(stage, target, prior)\n'
+        '            os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)',
+        'faulted_stdout, faulted_stderr = process_communicate("intent-window", faulted, 60)\n'
+        '        if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted_stdout:',
+        'faulted_stdout, faulted_stderr = process_communicate("intent-window", faulted, 60)\n'
+        '            if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted_stdout:',
+        'prior = snapshot_intent_epoch(anchor, label)',
+        'os.O_RDONLY | os.O_NOFOLLOW',
+        'observed.st_nlink != 1 or stat.S_IMODE(observed.st_mode) != 0o600',
+        'epoch != {"nonce": nonce, "stage": stage, "target": target}',
+        'evidence_identity(current) != evidence_identity(observed)',
+        'nonce == prior["nonce"]',
+        '(observed.st_dev, observed.st_ino) == prior["journal_identity"]',
+        'assert_replaced_or_absent(prior["target"], prior["target_identity"])',
+        'raw != anchor["raw"] or document != anchor["document"]',
+        'evidence_identity(after) != evidence_identity(anchor["stat"])',
+        'fail("prior cleanup-intent inode survived recovery")',
+        'raw, document = read_anchored_json(\n            anchor["descriptor"], anchor["stat"], "cleanup-intent")',
+        'descriptor = os_call("intent-window", "open", "cleanup-intent", os.open,\n'
+        '                         "/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)',
+        'wait_path("intent-window", ready_path, timeout=30)',
+        '"/run/nmcp-ci/cleanup-intent.ready.new"',
         '"containment-supervisor-kill"', 'wait_path("preflight", READY)',
         'if not set(descendants) <= set(all_service_pids):',
         'os_call("preflight", "kill", "process", os.kill, first.pid, signal.SIGKILL)',
@@ -5659,10 +5716,12 @@ COUNTER_CATEGORIES = (
         'if (recovered.returncode\n            or path_exists(',
         '"retained-dependency recovery did not harden and clean"',
         'for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):',
-        'assert_replaced_or_absent(*prior)',
+        'assert_replaced_or_absent(prior["target"], prior["target_identity"])',
     )
     require(all(fragment in source for fragment in contract)
-            and source.count('("after-intent", "after-mkdir", "after-open", "after-register")') == 2,
+            and source.count('("after-intent", "after-mkdir", "after-open", "after-register")') == 2
+            and source.count('popen("intent-window"') == 2
+            and source.count('prior = snapshot_intent_epoch(anchor, label)') == 2,
             "containment causal death/overlap/lock/recovery/fault contract changed")
     main_node = named_function(tree, "main")
     argument_assignments = [
@@ -6483,7 +6542,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "aa4c24b0aa072d6d366e09deeb609ac5c2e08e5fcdb21046b75cfdd5394c38b2",
+            == "e69e5ab9e58c277c29919c97bbd0c20c8041e1ae8704249828412a05afdcbfb4",
             "diagnostic fixture source snapshot changed")
 
 
@@ -6764,7 +6823,18 @@ def verify_supervisor_mutations(
         ("boundary start omission", replace_once(supervisor, '            trace.append(f"boundary-start:{phase}")\n', ''), "descriptor/trace"),
         ("boundary start reorder", replace_once(supervisor, '            trace.append(f"phase-success:{phase}")\n            trace.append(f"boundary-start:{phase}")', '            trace.append(f"boundary-start:{phase}")\n            trace.append(f"phase-success:{phase}")'), "trace order"),
         ("cleanup top allowlist widened", replace_once(supervisor, '"/var/lib/nmcp": {"deployment"}', '"/var/lib/nmcp": {"deployment", "media"}'), "top-level allowlists"),
-        ("intent not durable before mkdir", replace_once(supervisor, 'entries.append(entry)\n        durable_intents(entries)\n        fault(f"{fault_name or path}:after-intent")', 'entries.append(entry)\n        fault(f"{fault_name or path}:after-intent")'), "durable intent"),
+        ("intent not durable before mkdir", replace_once(supervisor, 'entries.append(entry)\n        durable_intents(entries)\n        fault(entries, path, "after-intent", fault_name or path)', 'entries.append(entry)\n        fault(entries, path, "after-intent", fault_name or path)'), "durable intent"),
+        ("intent ready before durable epoch publication", replace_once(supervisor,
+            '    durable_intents(entries, epoch)\n    publish_intent_ready(epoch)',
+            '    publish_intent_ready(epoch)\n    durable_intents(entries, epoch)'), "durable intent"),
+        ("intent ready publication omitted", replace_once(supervisor,
+            '    publish_intent_ready(epoch)\n', ''), "durable intent"),
+        ("intent epoch stage omitted", replace_once(supervisor,
+            'epoch = {"nonce": SUPERVISOR_NONCE, "stage": stage, "target": path}',
+            'epoch = {"nonce": SUPERVISOR_NONCE, "target": path}'), "durable intent"),
+        ("intent epoch nonce omitted", replace_once(supervisor,
+            'epoch = {"nonce": SUPERVISOR_NONCE, "stage": stage, "target": path}',
+            'epoch = {"stage": stage, "target": path}'), "durable intent"),
         ("intent parent identity omitted", replace_once(supervisor, '"parent_identity": metadata(os.fstat(parent_fd))', '"parent_identity": {}'), "durable intent"),
         ("intent absence policy weakened", replace_once(supervisor, '"absence_policy": "must-be-absent"', '"absence_policy": "replace"'), "durable intent"),
         ("intent signals unmasked", replace_once(supervisor, 'old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})', 'old_mask = set()'), "durable intent"),
@@ -9343,7 +9413,10 @@ def verify_supervisor_mutations(
         ("persistent nonce length weakened", replace_once(containment,
             '    if (len(nonce) != 64', '    if (len(nonce) < 32')),
         ("persistent nonce alphabet comparison omitted", replace_once(containment,
-            '            or any(character not in "0123456789abcdef" for character in nonce)\n', '')),
+            '            or any(character not in "0123456789abcdef" for character in nonce)):\n'
+            '        fail("persistent launch nonce was not canonical")',
+            '            or False):\n'
+            '        fail("persistent launch nonce was not canonical")')),
         ("structured command multiple records accepted", replace_once(containment,
             '            or type(payload.get("data")) is not list or len(payload["data"]) != 1):',
             '            or type(payload.get("data")) is not list or not payload["data"]):')),
@@ -9781,6 +9854,38 @@ def verify_supervisor_mutations(
         ("boundary fault omitted", replace_once(containment,
           'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):',
           'prior = None\n    for stage in ("after-intent", "after-mkdir", "after-register"):' )),
+        ("intent kill before journal anchor", replace_once(containment,
+            '        anchor = open_intent_epoch(stage, "run-root", prior)\n'
+            '        os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)',
+            '        os.kill(int(show("intent-window", "MainPID")["MainPID"]), signal.SIGKILL)\n'
+            '        anchor = open_intent_epoch(stage, "run-root", prior)')),
+        ("intent snapshot reopens pathname", replace_once(containment,
+            '        raw, document = read_anchored_json(\n'
+            '            anchor["descriptor"], anchor["stat"], "cleanup-intent")',
+            '        reopened = os.open("/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)\n'
+            '        raw, document = read_anchored_json(\n'
+            '            reopened, os.fstat(reopened), "cleanup-intent")')),
+        ("intent descriptor identity omitted", replace_once(containment,
+            '                or evidence_identity(after) != evidence_identity(anchor["stat"])\n', '')),
+        ("intent current name identity omitted", replace_once(containment,
+            '                or evidence_identity(current) != evidence_identity(anchor["stat"])):',
+            '                or False):')),
+        ("intent ENOENT accepted across epochs", replace_once(containment,
+            '    descriptor = os_call("intent-window", "open", "cleanup-intent", os.open,\n'
+            '                         "/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)',
+            '    descriptor = (os.open("/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)\n'
+            '                  if os.path.exists("/run/nmcp-ci/cleanup-intent.json") else os.open("/dev/null", os.O_RDONLY))')),
+        ("intent next recovery starts before snapshot", replace_once(containment,
+            '        if not faulted_stderr:\n'
+            '            fail(f"SIGKILL fault window omitted its client diagnostic: {stage}")\n'
+            '        prior = snapshot_intent_epoch(anchor, label)',
+            '        if not faulted_stderr:\n'
+            '            fail(f"SIGKILL fault window omitted its client diagnostic: {stage}")\n'
+            '        next_epoch = popen("intent-window", faulted.args, cwd="/", env=ENV)\n'
+            '        prior = snapshot_intent_epoch(anchor, label)')),
+        ("intent prior inode survival accepted", replace_once(containment,
+            '                fail("prior cleanup-intent inode survived recovery")',
+            '                pass')),
         ("retained failure accepted", replace_once(containment, 'if retained.returncode == 0:', 'if False:')),
         ("cleanup failure evidence weakened", replace_once(containment,
             'CLEANUP_DATABASE_FAILURE not in retained.stderr\n            or CLEANUP_ROLES_FAILURE not in retained.stderr',

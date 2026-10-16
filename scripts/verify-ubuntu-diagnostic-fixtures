@@ -4,6 +4,7 @@
 import errno
 import fcntl
 import io
+import json
 import os
 import pathlib
 import runpy
@@ -2566,6 +2567,15 @@ def actual_boundary_cases(client, containment):
     finally:
         module_os.open = original_open
 
+    original_wait_path = containment_globals["wait_path"]
+    try:
+        containment_globals["wait_path"] = lambda *_args, **_kwargs: (
+            _ for _ in ()).throw(RuntimeError("intent epoch publication missing"))
+        assert_fails_with(lambda: containment["open_intent_epoch"](
+            "after-intent", "run-root", None), "intent epoch publication missing")
+    finally:
+        containment_globals["wait_path"] = original_wait_path
+
     original_builtin_open = containment_globals.get("open")
     containment_globals["open"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(injected())
     try:
@@ -2575,10 +2585,6 @@ def actual_boundary_cases(client, containment):
         module_os.open = original_open
         containment_globals["open"] = lambda *_args, **_kwargs: (
             _ for _ in ()).throw(injected(errno.ENOENT))
-        assert_raises(containment["load_cleanup_intent"],
-                      "phase=intent-window operation=open resource=cleanup-intent errno=2")
-        assert_raises(containment["run_root_entry"],
-                      "phase=intent-window operation=open resource=cleanup-intent errno=2")
         assert_raises(lambda: containment["read_pid"](HOSTILE_PATH, "preflight"),
                       "phase=preflight operation=open resource=pid errno=2")
     finally:
@@ -2728,6 +2734,138 @@ def actual_boundary_cases(client, containment):
                 "pid_exists", "open_transaction_lock", "lock_transaction",
                 "process_has_inode", "close_transaction_lock"), keeper_originals):
             keeper_globals[name] = value
+
+
+def intent_epoch_cases(containment):
+    globals_ = containment["open_intent_epoch"].__globals__
+    module_os = globals_["os"]
+    originals = {name: getattr(module_os, name) for name in (
+        "close", "fstat", "lseek", "lstat", "open", "read", "stat")}
+    original_wait_path = globals_["wait_path"]
+    original_show = globals_["show"]
+    nonce = "a" * 64
+    target = "/run/nmcp-ci/transaction-fixture"
+    stage = "after-open"
+    regular = stat.S_IFREG | 0o600
+    ready_stat = types.SimpleNamespace(st_dev=1, st_ino=11, st_mode=regular, st_uid=0,
+                                       st_gid=0, st_nlink=1, st_size=0,
+                                       st_mtime_ns=1, st_ctime_ns=1)
+    journal_stat = types.SimpleNamespace(st_dev=2, st_ino=22, st_mode=regular, st_uid=0,
+                                         st_gid=0, st_nlink=1, st_size=0,
+                                         st_mtime_ns=2, st_ctime_ns=2)
+    target_stat = types.SimpleNamespace(st_dev=3, st_ino=33)
+    ready = {"journal_dev": 2, "journal_ino": 22, "nonce": nonce, "pid": 101,
+             "stage": stage, "target": target}
+    entry = {"path": target, "parent": "/run/nmcp-ci", "parent_identity": {},
+             "absence_policy": "must-be-absent", "expected_metadata": {},
+             "identity": {"dev": 3, "ino": 33}, "allowlist": []}
+    document = {"version": 2, "epoch": {"nonce": nonce, "stage": stage,
+                                         "target": target}, "entries": [entry]}
+    state = {"ready": ready, "document": document, "journal_current": journal_stat,
+             "target_current": target_stat, "reads": []}
+
+    def encoded(value):
+        return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+
+    def update_sizes():
+        ready_stat.st_size = len(encoded(state["ready"]))
+        journal_stat.st_size = len(encoded(state["document"]))
+
+    def fake_open(path, *_args, **_kwargs):
+        if path == "/run/nmcp-ci/cleanup-intent.ready":
+            return 10
+        if path == "/run/nmcp-ci/cleanup-intent.json":
+            return 11
+        raise RuntimeError(f"unexpected intent fixture open: {path}")
+
+    def fake_fstat(descriptor):
+        return ready_stat if descriptor == 10 else journal_stat
+
+    def fake_read(descriptor, size):
+        state["reads"].append(descriptor)
+        payload = encoded(state["ready"] if descriptor == 10 else state["document"])
+        return payload[:size]
+
+    def fake_stat(path, **_kwargs):
+        if path == "/run/nmcp-ci/cleanup-intent.ready":
+            return ready_stat
+        if path == "/run/nmcp-ci/cleanup-intent.json":
+            current = state["journal_current"]
+            if current is None:
+                raise FileNotFoundError(errno.ENOENT, "missing")
+            return current
+        raise RuntimeError(f"unexpected intent fixture stat: {path}")
+
+    def fake_lstat(path):
+        current = state["target_current"]
+        if current is None:
+            raise FileNotFoundError(errno.ENOENT, "missing", path)
+        return current
+
+    def anchor(prior=None):
+        update_sizes()
+        return containment["open_intent_epoch"](stage, "run-root", prior)
+
+    try:
+        globals_["wait_path"] = lambda *_args, **_kwargs: None
+        globals_["show"] = lambda *_args: {
+            "ActiveState": "active", "MainPID": "101",
+            "Environment": f"NMCP_VERIFIER_NONCE={nonce}",
+        }
+        module_os.open = fake_open
+        module_os.fstat = fake_fstat
+        module_os.lseek = lambda *_args: 0
+        module_os.read = fake_read
+        module_os.stat = fake_stat
+        module_os.lstat = fake_lstat
+        module_os.close = lambda _descriptor: None
+
+        observed = anchor()
+        snapshot = containment["snapshot_intent_epoch"](observed, f"run-root:{stage}")
+        require(snapshot["nonce"] == nonce and snapshot["target"] == target,
+                "valid intent epoch did not preserve its exact binding")
+
+        observed = anchor()
+        state["journal_current"] = None
+        reads_before = state["reads"].count(11)
+        assert_raises(lambda: containment["snapshot_intent_epoch"](
+            observed, f"run-root:{stage}"),
+            "phase=intent-window operation=stat resource=cleanup-intent errno=2")
+        require(state["reads"].count(11) == reads_before + 1,
+                "missing current intent name bypassed the anchored descriptor read")
+
+        state["journal_current"] = journal_stat
+        observed = anchor()
+        state["journal_current"] = types.SimpleNamespace(**{
+            **journal_stat.__dict__, "st_ino": 23})
+        assert_fails_with(lambda: containment["snapshot_intent_epoch"](
+            observed, f"run-root:{stage}"),
+            f"cleanup intent epoch changed after intended kill: run-root:{stage}")
+
+        state["journal_current"] = journal_stat
+        prior = {"nonce": "b" * 64, "target": target, "target_identity": None,
+                 "journal_identity": (journal_stat.st_dev, journal_stat.st_ino)}
+        assert_fails_with(lambda: anchor(prior), "prior cleanup-intent inode survived recovery")
+        prior["journal_identity"] = (9, 99)
+        prior["target_identity"] = {"dev": 3, "ino": 33}
+        assert_fails_with(lambda: anchor(prior),
+                          f"prior cleanup-intent inode survived recovery: {target}")
+
+        for omitted in ("stage", "nonce"):
+            saved = state["ready"]
+            state["ready"] = {key: value for key, value in saved.items() if key != omitted}
+            assert_fails_with(lambda: anchor(), "intent epoch ready marker schema changed")
+            state["ready"] = saved
+        labels = {f"{kind}:{stage_name}" for kind in (
+            "run-root", "path:/usr/local/libexec/nmcp", "path:/var/lib/nmcp",
+            "path:/opt/nmcp-role-compatibility") for stage_name in (
+                "after-intent", "after-mkdir", "after-open", "after-register")}
+        require(len(labels) == 16, "intent epoch fixture did not cover all 16 labels")
+    finally:
+        globals_["wait_path"] = original_wait_path
+        globals_["show"] = original_show
+        for name, value in originals.items():
+            setattr(module_os, name, value)
 
 
 def client_cleanup_result_cases(client, containment):
@@ -3982,8 +4120,8 @@ def supervisor_cleanup_cases(supervisor):
             globals_["os"].mkdir = lambda *_args, **_kwargs: None
             globals_["os"].fsync = lambda _descriptor: None
             globals_["durable_intents"] = lambda _entries: None
-            globals_["fault"] = lambda point: (_ for _ in ()).throw(primary) if point.endswith(
-                ":after-register") else None
+            globals_["fault"] = lambda _entries, _path, stage, _label: (
+                (_ for _ in ()).throw(primary) if stage == "after-register" else None)
             def causal_close(descriptor):
                 local_calls.append(("close", descriptor))
                 raise OSError(errno.EIO, f"close {descriptor}")
@@ -4148,6 +4286,7 @@ def main():
     client_phase_routing_cases(client)
     counter_atomic_cases(client, containment)
     actual_boundary_cases(client, containment)
+    intent_epoch_cases(containment)
     client_cleanup_result_cases(client, containment)
     client_terminal_emission_cases(client, containment)
     client_teardown_transition_cases(client, containment)

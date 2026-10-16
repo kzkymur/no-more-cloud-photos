@@ -313,16 +313,30 @@ def close_transaction_lock(descriptor):
     os_call("transaction-lock", "close", "transaction", os.close, descriptor)
 
 
-def load_cleanup_intent():
-    source = os_call("intent-window", "open", "cleanup-intent", open,
-                     "/run/nmcp-ci/cleanup-intent.json", encoding="ascii")
+def evidence_identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_gid, value.st_nlink, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+def read_anchored_json(descriptor, observed, resource_class):
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != 0 or observed.st_gid != 0
+            or observed.st_nlink != 1 or stat.S_IMODE(observed.st_mode) != 0o600):
+        fail(f"{resource_class} has unsafe ownership, type, mode, or link count")
+    os_call("intent-window", "seek", resource_class, os.lseek, descriptor, 0, os.SEEK_SET)
+    raw = os_call("intent-window", "read", resource_class, os.read,
+                  descriptor, observed.st_size + 1)
+    after = os_call("intent-window", "stat", resource_class, os.fstat, descriptor)
+    if evidence_identity(after) != evidence_identity(observed) or len(raw) != observed.st_size:
+        fail(f"{resource_class} changed while anchored")
     try:
-        try:
-            return json.load(source)
-        except OSError as error:
-            raise evidence_failure("intent-window", "read", "cleanup-intent", error) from None
-    finally:
-        os_call("intent-window", "close", "cleanup-intent", source.close)
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail(f"{resource_class} was not canonical JSON")
+    canonical = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    if raw != canonical:
+        fail(f"{resource_class} was not canonical JSON")
+    return raw, document
 
 
 def persistent_failure_classification(stdout, stderr):
@@ -2283,16 +2297,15 @@ def assert_keeper_lock_coherent(keeper_pid, expected):
         close_transaction_lock(lock)
 
 
-def intent_entry(path):
-    document = load_cleanup_intent()
+def intent_entry(document, path):
     matches = [entry for entry in document["entries"] if entry["path"] == path]
     if len(matches) != 1:
         fail(f"cleanup intent does not identify exactly one target: {path}")
     return matches[0]
 
 
-def run_root_entry():
-    entries = load_cleanup_intent()["entries"]
+def run_root_entry(document):
+    entries = document["entries"]
     matches = [entry for entry in entries if entry["path"].startswith("/run/nmcp-ci/transaction-")]
     if len(matches) != 1:
         fail("cleanup intent does not identify exactly one transaction root")
@@ -2320,6 +2333,85 @@ def assert_replaced_or_absent(path, identity):
         raise evidence_failure("intent-window", "stat", "evidence", error) from None
     if (current.st_dev, current.st_ino) == (identity["dev"], identity["ino"]):
         fail(f"prior cleanup-intent inode survived recovery: {path}")
+
+
+def open_intent_epoch(stage, expected_target, prior):
+    ready_path = "/run/nmcp-ci/cleanup-intent.ready"
+    wait_path("intent-window", ready_path, timeout=30)
+    ready_fd = os_call("intent-window", "open", "marker", os.open, ready_path,
+                       os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        ready_stat = os_call("intent-window", "stat", "marker", os.fstat, ready_fd)
+        _ready_raw, ready = read_anchored_json(ready_fd, ready_stat, "marker")
+        ready_current = os_call("intent-window", "stat", "marker", os.stat, ready_path,
+                                follow_symlinks=False)
+        if evidence_identity(ready_current) != evidence_identity(ready_stat):
+            fail("intent epoch ready marker was replaced while anchored")
+    finally:
+        os_call("intent-window", "close", "marker", os.close, ready_fd)
+    if set(ready) != {"journal_dev", "journal_ino", "nonce", "pid", "stage", "target"}:
+        fail("intent epoch ready marker schema changed")
+    nonce = ready["nonce"]
+    target = ready["target"]
+    if (type(nonce) is not str or len(nonce) != 64
+            or any(character not in "0123456789abcdef" for character in nonce)
+            or ready["stage"] != stage or type(target) is not str
+            or (expected_target == "run-root" and not target.startswith("/run/nmcp-ci/transaction-"))
+            or (expected_target != "run-root" and target != expected_target)
+            or type(ready["pid"]) is not int or ready["pid"] <= 1
+            or type(ready["journal_dev"]) is not int or type(ready["journal_ino"]) is not int):
+        fail(f"intent epoch ready marker did not bind {expected_target}:{stage}")
+    state = show("intent-window", "MainPID", "ActiveState", "Environment")
+    if (state.get("ActiveState") != "active" or int(state.get("MainPID", "0")) != ready["pid"]
+            or state.get("Environment") != f"NMCP_VERIFIER_NONCE={nonce}"):
+        fail(f"intent epoch marker did not bind the live supervisor: {expected_target}:{stage}")
+    descriptor = os_call("intent-window", "open", "cleanup-intent", os.open,
+                         "/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        observed = os_call("intent-window", "stat", "cleanup-intent", os.fstat, descriptor)
+        raw, document = read_anchored_json(descriptor, observed, "cleanup-intent")
+        current = os_call("intent-window", "stat", "cleanup-intent", os.stat,
+                          "/run/nmcp-ci/cleanup-intent.json", follow_symlinks=False)
+        epoch = document.get("epoch")
+        if (set(document) != {"version", "epoch", "entries"} or document["version"] != 2
+                or type(epoch) is not dict or set(epoch) != {"nonce", "stage", "target"}
+                or epoch != {"nonce": nonce, "stage": stage, "target": target}
+                or (observed.st_dev, observed.st_ino) != (ready["journal_dev"], ready["journal_ino"])
+                or evidence_identity(current) != evidence_identity(observed)):
+            fail(f"cleanup intent epoch did not bind {expected_target}:{stage}")
+        if prior is not None:
+            if nonce == prior["nonce"]:
+                fail("next cleanup intent epoch reused the prior nonce")
+            assert_replaced_or_absent(prior["target"], prior["target_identity"])
+            if (observed.st_dev, observed.st_ino) == prior["journal_identity"]:
+                fail("prior cleanup-intent inode survived recovery")
+        entry = run_root_entry(document) if expected_target == "run-root" else intent_entry(document, target)
+        return {"descriptor": descriptor, "raw": raw, "stat": observed, "document": document,
+                "entry": entry, "nonce": nonce, "pid": ready["pid"], "target": target}
+    except BaseException:
+        os_call("intent-window", "close", "cleanup-intent", os.close, descriptor)
+        raise
+
+
+def snapshot_intent_epoch(anchor, label):
+    try:
+        raw, document = read_anchored_json(
+            anchor["descriptor"], anchor["stat"], "cleanup-intent")
+        current = os_call("intent-window", "stat", "cleanup-intent", os.stat,
+                          "/run/nmcp-ci/cleanup-intent.json", follow_symlinks=False)
+        after = os_call("intent-window", "stat", "cleanup-intent", os.fstat,
+                        anchor["descriptor"])
+        if (raw != anchor["raw"] or document != anchor["document"]
+                or evidence_identity(after) != evidence_identity(anchor["stat"])
+                or evidence_identity(current) != evidence_identity(anchor["stat"])):
+            fail(f"cleanup intent epoch changed after intended kill: {label}")
+        target_identity = observable_identity(anchor["target"], anchor["entry"]["identity"])
+        return {"nonce": anchor["nonce"], "target": anchor["target"],
+                "target_identity": target_identity,
+                "journal_identity": (anchor["stat"].st_dev, anchor["stat"].st_ino)}
+    finally:
+        os_call("intent-window", "close", "cleanup-intent", os.close,
+                anchor["descriptor"])
 
 
 def main():
@@ -3132,27 +3224,36 @@ raise SystemExit(73)
 
     prior = None
     for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):
-        faulted = run("intent-window", ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
-                       f"run-root:{stage}"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted.stdout:
+        label = f"run-root:{stage}"
+        reset_paths("intent-window", "/run/nmcp-ci/cleanup-intent.ready",
+                    "/run/nmcp-ci/cleanup-intent.ready.new")
+        faulted = popen("intent-window", ("/usr/bin/python3", "-I", "-S", client, repo, commit,
+                         go_binary, label), cwd="/", env=ENV, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True)
+        anchor = open_intent_epoch(stage, "run-root", prior)
+        os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)
+        faulted_stdout, faulted_stderr = process_communicate("intent-window", faulted, 60)
+        if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted_stdout:
             fail(f"SIGKILL fault window unexpectedly succeeded: {stage}")
-        if not path_exists("intent-window", "cleanup-intent",
-                           "/run/nmcp-ci/cleanup-intent.json"):
-            fail(f"SIGKILL fault window was not durably registered: {stage}")
-        if prior is not None:
-            assert_replaced_or_absent(*prior)
-        entry = run_root_entry()
-        prior = (entry["path"], observable_identity(entry["path"], entry["identity"]))
+        if not faulted_stderr:
+            fail(f"SIGKILL fault window omitted its client diagnostic: {stage}")
+        prior = snapshot_intent_epoch(anchor, label)
     for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):
         for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):
-            faulted = run("intent-window", ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
-                           f"path:{target}:{stage}"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted.stdout:
+            label = f"path:{target}:{stage}"
+            reset_paths("intent-window", "/run/nmcp-ci/cleanup-intent.ready",
+                        "/run/nmcp-ci/cleanup-intent.ready.new")
+            faulted = popen("intent-window", ("/usr/bin/python3", "-I", "-S", client, repo, commit,
+                             go_binary, label), cwd="/", env=ENV, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+            anchor = open_intent_epoch(stage, target, prior)
+            os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)
+            faulted_stdout, faulted_stderr = process_communicate("intent-window", faulted, 60)
+            if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted_stdout:
                 fail(f"persistent-path SIGKILL fault unexpectedly succeeded: {target}:{stage}")
-            if prior is not None:
-                assert_replaced_or_absent(*prior)
-            entry = intent_entry(target)
-            prior = (target, observable_identity(target, entry["identity"]))
+            if not faulted_stderr:
+                fail(f"persistent-path SIGKILL omitted its client diagnostic: {target}:{stage}")
+            prior = snapshot_intent_epoch(anchor, label)
     first = popen("preflight", ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                               "containment-supervisor-kill"), cwd="/", env=ENV,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -3269,7 +3370,7 @@ raise SystemExit(73)
         # the following invocation must recover this durable intent.
         pass
     if prior is not None:
-        assert_replaced_or_absent(*prior)
+        assert_replaced_or_absent(prior["target"], prior["target_identity"])
 
     # Replace an owned unit behind a paused client. Its finally block must
     # detect InvocationID loss and never issue a name-based command to B.
@@ -3367,6 +3468,8 @@ raise SystemExit(73)
         mode = f"client-cleanup-persistent-{boundary}"
         reset_paths("persistent-cleanup", *fault_paths(mode, boundary),
                     f"/run/nmcp-ci/{mode}.blocked", f"/run/nmcp-ci/{mode}.release")
+    reset_paths("intent-window", "/run/nmcp-ci/cleanup-intent.ready",
+                "/run/nmcp-ci/cleanup-intent.ready.new")
     for mode, boundary in property_boundaries.items():
         reset_paths("transient-cleanup", *fault_paths(mode, boundary))
     return 0
