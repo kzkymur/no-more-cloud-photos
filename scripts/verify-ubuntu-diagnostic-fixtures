@@ -610,6 +610,8 @@ def signed_cleanup_lock_cases(containment):
 
 def stale_diagnostic_cases(containment):
     classify = containment["stale_client_classification"]
+    identity_evidence = containment["stale_identity_evidence"]
+    failure_category = containment["stale_failure_category"]
     diagnostic = containment["stale_failure_message"]
     expected = containment["stale_expected_rejection"]({
         "LoadState": "loaded", "InvocationID": "i" * 32, "ActiveState": "failed",
@@ -620,44 +622,103 @@ def stale_diagnostic_cases(containment):
             + "{'LoadState': 'loaded', 'InvocationID': '" + "i" * 32
             + "', 'ActiveState': 'failed', 'SubState': 'failed', 'ControlGroup': ''}\n",
             "stale expected rejection did not match the exact prelaunch state diagnostic")
+    machine = (
+        containment["RESULT_PREFIX"] + "primary=verification;events=-;events_complete=1;"
+        "final_scanned=1;final_observed=1;final_empty=1;return=1;stdout=0;success=0")
+    exact_stderr = machine + "\n" + expected
     cases = (
-        (False, None, containment["SUCCESS"], expected,
-         (False, False, False, False, False, False)),
-        (True, None, containment["SUCCESS"], expected,
-         (True, False, False, False, False, False)),
-        (True, 0, "", expected, (True, True, True, False, False, False)),
-        (True, 1, containment["SUCCESS"], expected,
-         (True, True, True, True, False, False)),
-        (True, 1, "", expected, (True, True, False, False, True, False)),
-        (True, 1, "", expected + "appended", (True, True, False, False, False, True)),
-        (True, 1, "", expected.replace("loaded", "failed"),
-         (True, True, False, False, False, True)),
-        (True, 1, "", containment["STALE_REJECTION_PREFIX"],
-         (True, True, False, False, False, True)),
-        (True, 1, "", expected + "second-line\n",
-         (True, True, False, False, False, True)),
+        (False, None, "", exact_stderr,
+         (False, False, False, False, True, True, False, False, False)),
+        (True, None, "", exact_stderr,
+         (True, False, False, False, True, True, False, False, False)),
+        (True, 0, "", exact_stderr,
+         (True, True, True, False, True, True, False, False, False)),
+        (True, 1, containment["SUCCESS"], exact_stderr,
+         (True, True, True, True, True, True, False, False, False)),
+        (True, 1, "", exact_stderr,
+         (True, True, False, False, True, True, True, True, False)),
     )
     for attempted, returncode, stdout, stderr, wanted in cases:
         observed = classify(attempted, returncode, stdout, stderr, expected)
         require(tuple(observed[name] for name in (
             "attempted", "result_available", "accepted", "success_marker",
+            "machine_contract", "human_rejection", "result_contract",
             "expected_rejection", "wrong_reason")) == wanted,
             "stale client outcome classification lost exact result/rejection semantics")
 
-    classification = classify(True, 1, "", "verification-client: unrelated failure\n", expected)
+    stderr_mutations = (
+        machine + "\n", expected,
+        machine + "\n" + expected + "extra\n",
+        expected + machine + "\n",
+        " " + machine + "\n" + expected,
+        machine + "\n " + expected,
+        machine + "\n" + expected.rstrip("\n") + " appended\n",
+        machine.replace("primary=verification", "primary=unexpected") + "\n" + expected,
+        machine.replace("events=-", "events=0.final.unexpected.0.0.0") + "\n" + expected,
+        machine.replace("events_complete=1", "events_complete=0") + "\n" + expected,
+        machine.replace("final_scanned=1", "final_scanned=0") + "\n" + expected,
+        machine.replace("final_observed=1", "final_observed=0") + "\n" + expected,
+        machine.replace("final_empty=1", "final_empty=0") + "\n" + expected,
+        machine.replace("return=1", "return=0") + "\n" + expected,
+        machine.replace("stdout=0", "stdout=1") + "\n" + expected,
+        machine.replace("success=0", "success=1") + "\n" + expected,
+    )
+    for mutated in stderr_mutations:
+        observed = classify(True, 1, "", mutated, expected)
+        require(not observed["result_contract"] and observed["wrong_reason"],
+                "stale classifier accepted a missing, extra, reordered, padded, or wrong contract")
+    for returncode, stdout in ((2, ""), (1, "unexpected")):
+        observed = classify(True, returncode, stdout, exact_stderr, expected)
+        require(not observed["result_contract"] and observed["wrong_reason"],
+                "stale classifier ignored the actual return/stdout contract")
+
+    signature = containment["launch_identity_signature"](
+        "a" * 32, "exact fixture", "KEY=value", "/bin/true", ("/bin/true",))
+    terminal = {
+        "LoadState": "loaded", "InvocationID": "a" * 32,
+        "Description": "exact fixture", "Environment": "KEY=value",
+        "Command": {"path": "/bin/true", "argv": ("/bin/true",)},
+        **containment["SERVICE_PROPERTIES"], "ActiveState": "failed", "SubState": "failed",
+        "Result": "exit-code", "ExecMainCode": "1", "ExecMainStatus": "73",
+        "ExecMainPID": "1234",
+    }
+    unchanged = identity_evidence(terminal, signature, "1234", ())
+    require(unchanged == {
+        "signature_unchanged": True, "terminal_unchanged": True,
+        "pid_unchanged": True, "cgroup_empty": True, "identity_unchanged": True,
+    }, "stale exact post-client identity evidence was not retained independently")
+    identity_mutations = (
+        ({**terminal, "InvocationID": "b" * 32}, ()),
+        ({**terminal, "ExecMainStatus": "1"}, ()),
+        ({**terminal, "ExecMainPID": "4321"}, ()),
+        (terminal, (4321,)),
+    )
+    require(all(not identity_evidence(state, signature, "1234", pids)["identity_unchanged"]
+                for state, pids in identity_mutations),
+            "stale identity evidence accepted changed signature, terminal, PID, or cgroup state")
+    exact = classify(True, 1, "", exact_stderr, expected)
+    wrong = classify(True, 1, "", machine + "\nverification-client: unrelated failure\n", expected)
+    require(failure_category(wrong, False, True) == "wrong-reason"
+            and failure_category(exact, True, True) == "identity-change"
+            and failure_category(wrong, True, True) == "result-identity",
+            "stale result-contract and identity-change categories were collapsed")
+
+    classification = wrong
     rendered = diagnostic(
-        "wrong-reason", False, classification, True, True, True, True,
-        True, True, True, True, True, True, True, True, "fixture", True,
-        False, True, False).decode("ascii")
+        "wrong-reason", False, classification, True, True, True, True, False,
+        True, True, True, True, True, True, True, True, "none", False,
+        False, False).decode("ascii")
     fields = (
         "scenario=stale;", ";failure=wrong-reason;", ";attempted=1;",
         ";result_available=1;", ";client_zero=0;", ";success_marker=0;",
+        ";machine_contract=1;", ";human_rejection=0;", ";result_contract=0;",
         ";expected_rejection=0;", ";wrong_reason=1;", ";unit_absent=1;",
         ";recorded_empty=1;", ";canonical_empty=1;", ";identity_unchanged=1;",
+        ";identity_changed=0;",
         ";cleanup_attempted=1;", ";cleanup_succeeded=1;", ";lock_reusable=1;",
         ";artifacts_removed=1;", ";post_evidence_complete=1;", ";ready=1;",
-        ";release=1;", ";ack=1;", ";error_category=fixture;", ";fixture_error=1;",
-        ";client_output=0;", ";client_diagnostic=1;", ";cleanup_error=0",
+        ";release=1;", ";ack=1;", ";error_category=none;", ";fixture_error=0;",
+        ";client_output=0;", ";cleanup_error=0",
     )
     positions = [rendered.index(field) for field in fields]
     require(positions == sorted(positions) and all(rendered.count(field) == 1 for field in fields),
@@ -665,14 +726,14 @@ def stale_diagnostic_cases(containment):
     hostile = "x" * 4096
     equivalents = (RuntimeError(hostile), {"Description": hostile}, ("signature", hostile))
     messages = []
-    for failure_category in ("accepted", "wrong-reason", "fixture-error", "cleanup-error",
-                             hostile):
+    for failure_name in ("accepted", "wrong-reason", "identity-change", "result-identity",
+                         "fixture-error", "cleanup-error", hostile):
         for error_category in ("none", "fixture", "release", "state", "identity",
                                "action", "post", "lock", "paths", hostile):
             emitted = diagnostic(
-                failure_category, False, classification, False, False, False, False,
+                failure_name, False, classification, False, False, False, False, True,
                 True, False, False, False, False, True, True, True, error_category,
-                True, True, True, True)
+                True, True, True)
             require(len(emitted) <= 512 and b"<truncated>" not in emitted,
                     "complete stale diagnostic exceeded its final emitted bound")
             messages.append(emitted)
@@ -820,9 +881,10 @@ def containment_serialization_cases(containment):
     stale_payload = containment["stale_failure_message"](
         "accepted", True,
         {"attempted": True, "result_available": True, "accepted": True,
-         "success_marker": False, "expected_rejection": False, "wrong_reason": False},
-        True, True, True, True, True, True, True, True, True, True, True, True,
-        "none", False, False, False, False)
+         "success_marker": False, "machine_contract": True, "human_rejection": True,
+         "result_contract": False, "expected_rejection": False, "wrong_reason": False},
+        True, True, True, True, False, True, True, True, True, True, True, True, True,
+        "none", False, False, False)
     accepted_stream = io.BytesIO()
     containment["write_diagnostic"](
         accepted_stream, containment["SerializedDiagnosticFailure"](stale_payload))

@@ -3757,23 +3757,36 @@ def validate_containment(source: str, phase: str) -> None:
     safe = {name: state.get(name) for name in safe_names if name in state}
     return STALE_REJECTION_PREFIX + str(safe) + "\\n"
 ''', "containment must derive the one exact canonical stale rejection")
-    require_exact_function(tree, "stale_client_classification", '''def stale_client_classification(attempted, returncode, stdout, stderr, expected_stderr):
+    require_exact_function(tree, "stale_client_classification", '''def stale_client_classification(attempted, returncode, stdout, stderr, expected_human):
     result_available = attempted and type(returncode) is int
     success_marker = result_available and SUCCESS in stdout
     accepted = result_available and (returncode == 0 or success_marker)
-    expected_rejection = bool(
-        result_available and returncode != 0 and not success_marker
-        and stderr == expected_stderr)
+    parsed, stderr_shape = client_stderr_evidence(stderr)
+    lines = stderr.splitlines(keepends=True) if type(stderr) is str else []
+    machine_contract = bool(
+        stderr_shape["shape"] and parsed is not None
+        and parsed["primary"] == "verification" and parsed["events"] == ()
+        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1
+        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1
+        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0)
+    human_rejection = bool(
+        stderr_shape["shape"] and len(lines) == 2 and lines[1] == expected_human)
+    result_contract = bool(
+        result_available and returncode == 1 and stdout == "" and not success_marker
+        and machine_contract and human_rejection)
     return {
         "attempted": bool(attempted),
         "result_available": result_available,
         "accepted": accepted,
         "success_marker": success_marker,
-        "expected_rejection": expected_rejection,
+        "machine_contract": machine_contract,
+        "human_rejection": human_rejection,
+        "result_contract": result_contract,
+        "expected_rejection": result_contract,
         "wrong_reason": (result_available and returncode != 0
-                         and not success_marker and not expected_rejection),
+                         and not success_marker and not result_contract),
     }
-''', "containment stale client outcomes require an attempted available exact result")
+''', "containment stale client outcomes require the exact two-line machine/human contract")
     require_exact_function(tree, "diagnostic_bit", '''def diagnostic_bit(value):
     return "1" if bool(value) else "0"
 ''', "containment stale diagnostic flags must use fixed one-byte tokens")
@@ -3887,7 +3900,7 @@ def validate_containment(source: str, phase: str) -> None:
         "evaluate_persistent_result", "persistent_scalar_diagnostic",
         "assert_machine_result_contract", "assert_persistent_cgroup_routing_contract",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
-        "stale_failure_message",
+        "stale_failure_category", "stale_failure_message",
         "len", "str", "repr", "sorted", "bool", "any", "next",
     }
     protected_persistent_string_bindings = set(protected_persistent_bindings)
@@ -3911,7 +3924,7 @@ def validate_containment(source: str, phase: str) -> None:
         "evaluate_persistent_result", "persistent_scalar_diagnostic",
         "assert_machine_result_contract", "assert_persistent_cgroup_routing_contract",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
-        "stale_failure_message",
+        "stale_failure_category", "stale_failure_message",
         "sanitized_diagnostic_text", "render_diagnostic_message", "serialize_diagnostic", "validate_serialized_diagnostic", "sanitized_state", "write_diagnostic",
         "assert_persistent_failure_contract", "run", "parse_unit_properties", "show",
         "assert_property_parser_contract", "wait_path", "reset_signal_paths", "reset_paths",
@@ -3923,7 +3936,7 @@ def validate_containment(source: str, phase: str) -> None:
         "fast_recovery", "fault_paths", "assert_interception", "cleanup_fixture_invocation",
         "unique_json_object", "parse_structured_command", "structured_command_identity",
         "launch_identity_signature",
-        "launch_identity_matches", "stale_terminal_matches",
+        "launch_identity_matches", "stale_identity_evidence", "stale_terminal_matches",
         "structured_command_fixture_result", "assert_launch_identity_contract",
         "persistent_supervisor_mode", "persistent_launch_signature",
         "assert_launch_signature_counterexamples", "signed_launch_state",
@@ -3970,9 +3983,10 @@ def validate_containment(source: str, phase: str) -> None:
         ("evaluate_persistent_result", "case, expected_case, lifecycle_category, expected_lifecycle, parsed, stderr_shape, expected_result, returncode, stdout, intercepted, attempted, lock_handoff_error, cleanup_error, cleanup_categories, lock_reuse_error, expected_signed_cleanup_required, signed_cleanup_required, signed_cleanup_ran, release_ok, reap_ok, unit_absent, recorded_category, recorded_required, recorded_path_present, recorded_scanned, canonical_scanned, recorded_empty, canonical_empty, artifacts_absent"),
         ("persistent_scalar_diagnostic", "case, boundary, lifecycle_category, predicates, stderr_shape"),
         ("stale_expected_rejection", "state"),
-        ("stale_client_classification", "attempted, returncode, stdout, stderr, expected_stderr"),
+        ("stale_client_classification", "attempted, returncode, stdout, stderr, expected_human"),
         ("diagnostic_bit", "value"),
-        ("stale_failure_message", "failure_category, client_zero, classification, unit_absent, recorded_empty, canonical_empty, identity_unchanged, cleanup_attempted, cleanup_succeeded, lock_reusable, artifacts_removed, post_evidence_complete, ready, released, ack, error_category, fixture_error, client_output, client_diagnostic, cleanup_error"),
+        ("stale_failure_category", "classification, identity_changed, fixture_error"),
+        ("stale_failure_message", "failure_category, client_zero, classification, unit_absent, recorded_empty, canonical_empty, identity_unchanged, identity_changed, cleanup_attempted, cleanup_succeeded, lock_reusable, artifacts_removed, post_evidence_complete, ready, released, ack, error_category, fixture_error, client_output, cleanup_error"),
         ("sanitized_diagnostic_text", "value, active_nonce=None"),
         ("render_diagnostic_message", "message"),
         ("serialize_diagnostic", "scenario, failure_class, fields=(), detail=None, active_nonce=None, complete=False"),
@@ -4008,6 +4022,7 @@ def validate_containment(source: str, phase: str) -> None:
         ("structured_command_identity", "exec_start_result, exec_start_ex_result"),
         ("launch_identity_signature", "invocation, description, environment, path, argv"),
         ("launch_identity_matches", "state, signature"),
+        ("stale_identity_evidence", "state, signature, expected_main_pid, control_group_pids"),
         ("stale_terminal_matches", "state, signature, expected_main_pid, control_group_pids"),
         ("structured_command_fixture_result", "property_name, path, argv, behavior, runtime"),
         ("assert_launch_identity_contract", ""),
@@ -4522,9 +4537,9 @@ COUNTER_CATEGORIES = (
         "identity", "repr", "reset_paths", "reset_signal_paths", "retained_diagnostic", "run", "run_root_entry",
         "sanitized_state", "set", "show", "show_identity_until", "show_until", "sum",
         "signed_launch_state", "signed_launch_state_until",
-        "sorted", "stale_terminal_matches", "str", "structured_command_fixture_result", "super",
+        "sorted", "stale_identity_evidence", "stale_terminal_matches", "str", "structured_command_fixture_result", "super",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
-        "stale_failure_message",
+        "stale_failure_category", "stale_failure_message",
         "structured_command_identity", "successful_terminal_state", "tuple", "type",
         "top_level_diagnostic", "try_nonblocking_flock", "unique_json_object",
         "validated_marker", "validated_payload_marker",
@@ -4533,7 +4548,7 @@ COUNTER_CATEGORIES = (
     reviewed_attribute_callee_roots = {
         "after_exit", "body", "budgeted", "calls", "cancelled", "categories", "character",
         "counts", "descendants",
-        "cleanup_errors", "dict", "early_observed", "environment", "errors", "expected_slow_counts", "fcntl", "first", "functools",
+        "cleanup_errors", "dict", "early_observed", "environment", "errors", "evidence", "expected_slow_counts", "fcntl", "first", "functools",
         "digits", "emitted", "field", "fields_by_name", "found", "json", "kwargs", "kill_stderr", "line", "loaded", "matching", "mode", "mutations",
         "barrier_name", "name", "names", "labels", "message", "observed", "orphaned", "os", "pairs", "part", "parts", "post_cleanup", "post_cleanup_cgroup", "prefix", "process",
         "parsed_events", "predicates", "property_boundaries", "raw_event",
@@ -4593,6 +4608,16 @@ COUNTER_CATEGORIES = (
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        # CPython 3.14 separated live stale contract/identity reporting.
+        ("1ab1356b83ef3ac74a33a3cfb7daf06586ec6d16ce5fcc1826b01103675ba608",
+         "30f0da41c71c073d53b1042e1544d4a3831493a6c51bcebec743e18e1da5e4d3",
+         "e11a509b8a1a5344b558c11b2f7f7903ada3c83aa6335500e6c924da3b2f5b07",
+         "2fc384798efca151fd6cea6c4fe38fd5f82f67486c144825e60f590e204ceb42"),
+        # CPython 3.12 separated live stale contract/identity reporting.
+        ("88bddcfe38d78334fbb1d841ef3ffd67b9eb628cb8478b1fc63df7cdeae80802",
+         "616b9614e8faa11f085ef1e6236db61806d098373edbc58244104d8dde7c6eed",
+         "52db6fe7d050a322c1ae51dd7261ee33ca2da7f07dcecff1350d2e811602fbe0",
+         "d5d2e2e4bec5ba5984d98730a4dabf66e53e888f3a9d9d025596ea0a7c2a1ee2"),
         # CPython 3.12 centralized bounded containment diagnostics.
         ("fa0cd94c83c7caba8994bec4dec9a552ae6a50e7790b63fd8c297e4e5866a16d",
          "ac0a7fe3d698f3bf4942b1b9987e8aa7e495ef8abf20d02503dbbd92f6d94ae7",
@@ -4905,6 +4930,7 @@ COUNTER_CATEGORIES = (
      'emitted': 2,
      'environment': 1,
      'errors': 3,
+     'evidence': 1,
      'expected_slow_counts': 1,
      'field': 1,
      'fields_by_name': 1,
@@ -5037,7 +5063,9 @@ COUNTER_CATEGORIES = (
                          "48d2a1f1d48b5f0eb5dd74aef6463e9f007f4db2212f232c185c64b8599b0a21",
                          "b5e491cc5deae20c6608be730f2d5122ee53d0fec91aacaef1daf62d64931c10",
                          "3eb17733448b2be2ddd3e01caa09045921602fcf56beed5243215d70db5282ea",
-                         "e31276abe1e0508ac96477c4599477c2cb3ba4013c0f1968ff4da1c067398a5b"}
+                        "e31276abe1e0508ac96477c4599477c2cb3ba4013c0f1968ff4da1c067398a5b",
+                        "7f4100fc0643598e7acc722d1d6c3258c53b26c1cb5cc6241e3b78b930a74f9a",
+                        "defe82ecd006a19b9f3dcbf9170f248789c9df8d1fccb75687870f9f16e9989c"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -5055,9 +5083,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 716, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
-        "Delete": 1, "Expr": 402, "For": 68, "FunctionDef": 110, "If": 313,
-        "Import": 12, "Pass": 5, "Raise": 78, "Return": 114, "Try": 89, "While": 21,
+        "Assign": 724, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
+        "Delete": 1, "Expr": 400, "For": 68, "FunctionDef": 112, "If": 314,
+        "Import": 12, "Pass": 5, "Raise": 78, "Return": 121, "Try": 89, "While": 21,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -5151,7 +5179,9 @@ COUNTER_CATEGORIES = (
                           "21fbbd0107cd38a1daaa410cf89c1f6ac4001652fb46633d9af352ee2c41745d",
                           "10cff3bf959ecb4997e6d39a6035b8a906fe4b21da1c6e020b3113d1cdd68436",
                           "b4411eb49334757c6d18df04b3f8781fb0aeab31a8e09ab4007b595fd2463af6",
-                          "b0bac21bf3291be909d81a1507e4696d14a372000a7831ae0dfc27545ae30abf"},
+                          "b0bac21bf3291be909d81a1507e4696d14a372000a7831ae0dfc27545ae30abf",
+                          "7ff3f1f1379fcdea85325e959ba5ab219b90b486c8193c8015129a092f6813fd",
+                          "0ce0b6ad603cb2454a704499bd19440607613526c4fadcc0a8f967aaaa47532a"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -5473,6 +5503,7 @@ COUNTER_CATEGORIES = (
         'show_identity_until(phase, deadline, "ActiveState", "ControlGroup")',
         'structured_command_identity(*results)',
         'launch_identity_matches(state, signature)',
+        'stale_identity_evidence(',
         'stale_terminal_matches(',
         'wait_path("stale-attestation", stale_ready, timeout=30)',
         'release("stale-attestation", stale_signal_name)',
@@ -5669,7 +5700,7 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
                        and any(isinstance(child, ast.Constant)
                                  and child.value == "/usr/bin/systemd-run"
                                  for child in ast.walk(node))]
-    require(len(stale_nodes) == 46 and len(stale_tries) == 1
+    require(len(stale_nodes) == 48 and len(stale_tries) == 1
             and len(stale_phase_tries) == 1 and bool(stale_phase_tries[0].finalbody)
             and len(stale_run_calls) == 1
             and any(keyword.arg == "check" and isinstance(keyword.value, ast.Constant)
@@ -5693,7 +5724,9 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
                      "f373dac7efd8e4c82403c9b1fd0c9bd8bd6e3129c77514bda5948e008941999e",
                      "20c79e55ce002919f44642434a25b8e1eb9e20242cc36feb10b31b4478e8a7fc",
                      "ed953f486022b3e0e0075c8ff3548ac7bd39825c2749578f27bf2755afe3b425",
-                     "f0f75e2264dc66be2bbbea5884142d36580fd976878e6c44edd3b57aa4a83353"},
+                     "f0f75e2264dc66be2bbbea5884142d36580fd976878e6c44edd3b57aa4a83353",
+                     "c79161a6fcaff46a5ed60fc016d05cd0a4b6a29b1308e07bcda463fd93df8c8b",
+                     "5e31cf755f83272bfca7dcfbd46ee50f7f7553ad2edcf4443fb24e65ccfa81b8"},
             "containment stale loaded fixed-unit rejection/identity/cleanup flow changed")
 
     persistent_loops = []
@@ -6354,7 +6387,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "4fdfe05161e12001f68f88e42b9b1e0376904152f51e3a32dc362ca3c867482b",
+            == "1c05934dc6b69a4706cbd50a6d5134209f8bc23e427ce9bfcdaed18783847461",
             "diagnostic fixture source snapshot changed")
 
 
@@ -8763,14 +8796,21 @@ def verify_supervisor_mutations(
         ("containment subprocess wait unbounded", replace_once(containment,
             '    kwargs.setdefault("timeout", 18 * 60)', '    pass')),
         ("stale loaded client success accepted", replace_once(containment,
-            '        if not stale_client_class["expected_rejection"]:',
-            '    if False:')),
+            '        if stale_client_class["expected_rejection"] and stale_identity_unchanged:',
+            '        if stale_identity_unchanged:')),
         ("stale loaded identity change accepted", replace_once(containment,
-            '        stale_identity_unchanged = stale_terminal_matches(\n'
-            '                stale_after_client, stale_signature, stale_main_pid,\n'
-            '                cgroup_pids(stale_after_client.get("ControlGroup", ""), "stale-attestation"))\n'
-            '        if not stale_identity_unchanged:',
-            '        stale_identity_unchanged = True\n        if False:')),
+            '        stale_identity_unchanged = stale_after_identity["identity_unchanged"]',
+            '        stale_identity_unchanged = True')),
+        ("stale live result-contract reporting omitted", replace_once(containment,
+            '    if (not stale_client_class["expected_rejection"] or stale_identity_changed\n'
+            '            or stale_failure is not None',
+            '    if (stale_identity_changed\n'
+            '            or stale_failure is not None')),
+        ("stale live identity-change reporting omitted", replace_once(containment,
+            '    if (not stale_client_class["expected_rejection"] or stale_identity_changed\n'
+            '            or stale_failure is not None',
+            '    if (not stale_client_class["expected_rejection"]\n'
+            '            or stale_failure is not None')),
         ("stale live normalized identity omitted", replace_once(containment,
             '                or not launch_identity_matches(stale_observed, stale_signature)\n',
             '                or False\n')),
@@ -8909,12 +8949,27 @@ def verify_supervisor_mutations(
         ("stale invocation pin omitted", replace_once(containment,
             '            if not launch_identity_matches(stale_observed, stale_signature):',
             '            if stale_observed.get("LoadState") != "loaded":')),
+        ("stale after-client signature comparison omitted", replace_once(containment,
+            '        "signature_unchanged": launch_identity_matches(state, signature),',
+            '        "signature_unchanged": True,')),
+        ("stale after-client active/substate comparison omitted", replace_once(containment,
+            '            state.get("ActiveState") == "failed" and state.get("SubState") == "failed"',
+            '            True')),
         ("stale result check omitted", replace_once(containment,
             '            and state.get("Result") == "exit-code"',
             '            and True')),
-        ("stale distinctive status check omitted", replace_once(containment,
-            '            and state.get("ExecMainStatus") == "73"',
+        ("stale main-code check omitted", replace_once(containment,
+            '            and state.get("ExecMainCode") in ("1", "exited")',
             '            and True')),
+        ("stale distinctive status check omitted", replace_once(containment,
+            '            and state.get("ExecMainStatus") == "73")',
+            '            and True)')),
+        ("stale after-client PID comparison omitted", replace_once(containment,
+            '        "pid_unchanged": state.get("ExecMainPID") == expected_main_pid,',
+            '        "pid_unchanged": True,')),
+        ("stale after-client cgroup comparison omitted", replace_once(containment,
+            '        "cgroup_empty": not control_group_pids,',
+            '        "cgroup_empty": True,')),
         ("stale failure timeout omitted", replace_once(containment,
             '            if time.monotonic() >= deadline:\n'
             '                fail("released stale fixed-unit did not reach failed state: "',
@@ -8938,15 +8993,63 @@ def verify_supervisor_mutations(
             '    result_available = attempted')),
         ("stale attempted evidence omitted", replace_once(containment,
             '        "attempted": bool(attempted),', '        "attempted": True,')),
-        ("stale expected rejection uses substring", replace_once(containment,
-            '        and stderr == expected_stderr)',
-            '        and expected_stderr in stderr)')),
-        ("stale expected rejection accepts a changed suffix", replace_once(containment,
-            '        and stderr == expected_stderr)',
-            '        and stderr.startswith(STALE_REJECTION_PREFIX))')),
+        ("stale result restores obsolete whole-stderr equality", replace_once(containment,
+            '        and machine_contract and human_rejection)',
+            '        and stderr == expected_human)')),
+        ("stale machine parser omitted", replace_once(containment,
+            '    parsed, stderr_shape = client_stderr_evidence(stderr)',
+            '    parsed, stderr_shape = {}, {"shape": True}')),
+        ("stale machine shape omitted", replace_once(containment,
+            '        stderr_shape["shape"] and parsed is not None',
+            '        parsed is not None')),
+        ("stale machine primary omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()',
+            '        and parsed["events"] == ()')),
+        ("stale machine events omitted", replace_once(containment,
+            '        and parsed["primary"] == "verification" and parsed["events"] == ()',
+            '        and parsed["primary"] == "verification"')),
+        ("stale machine events-complete omitted", replace_once(containment,
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1',
+            '        and parsed["final_scanned"] == 1')),
+        ("stale machine final-scanned omitted", replace_once(containment,
+            '        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1',
+            '        and parsed["events_complete"] == 1')),
+        ("stale machine final-observed omitted", replace_once(containment,
+            '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1',
+            '        and parsed["final_empty"] == 1')),
+        ("stale machine final-empty omitted", replace_once(containment,
+            '        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1',
+            '        and parsed["final_observed"] == 1')),
+        ("stale machine return omitted", replace_once(containment,
+            '        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0)',
+            '        and parsed["stdout"] == 0 and parsed["success"] == 0)')),
+        ("stale machine stdout omitted", replace_once(containment,
+            '        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0)',
+            '        and parsed["return"] == 1 and parsed["success"] == 0)')),
+        ("stale machine success omitted", replace_once(containment,
+            '        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0)',
+            '        and parsed["return"] == 1 and parsed["stdout"] == 0)')),
+        ("stale human shape omitted", replace_once(containment,
+            '        stderr_shape["shape"] and len(lines) == 2 and lines[1] == expected_human)',
+            '        len(lines) == 2 and lines[1] == expected_human)')),
+        ("stale human line count omitted", replace_once(containment,
+            '        stderr_shape["shape"] and len(lines) == 2 and lines[1] == expected_human)',
+            '        stderr_shape["shape"] and lines[1] == expected_human)')),
+        ("stale human exact equality weakened", replace_once(containment,
+            '        stderr_shape["shape"] and len(lines) == 2 and lines[1] == expected_human)',
+            '        stderr_shape["shape"] and len(lines) == 2 and expected_human in lines[1])')),
+        ("stale actual return omitted", replace_once(containment,
+            '        result_available and returncode == 1 and stdout == "" and not success_marker',
+            '        result_available and stdout == "" and not success_marker')),
+        ("stale actual stdout omitted", replace_once(containment,
+            '        result_available and returncode == 1 and stdout == "" and not success_marker',
+            '        result_available and returncode == 1 and not success_marker')),
+        ("stale actual success marker omitted", replace_once(containment,
+            '        result_available and returncode == 1 and stdout == "" and not success_marker',
+            '        result_available and returncode == 1 and stdout == ""')),
         ("stale wrong reason collapsed", replace_once(containment,
             '        "wrong_reason": (result_available and returncode != 0\n'
-            '                         and not success_marker and not expected_rejection),',
+            '                         and not success_marker and not result_contract),',
             '        "wrong_reason": False,')),
         ("stale unavailable result classified as wrong reason", replace_once(containment,
             '        "wrong_reason": (result_available and returncode != 0',
@@ -9035,17 +9138,44 @@ def verify_supervisor_mutations(
             '        stale_client_attempted = True\n        rejected = run(',
             '        rejected = run(')),
         ("stale exact expected diagnostic omitted", replace_once(containment,
-            '        stale_expected_stderr = stale_expected_rejection(stale_observed)',
-            '        stale_expected_stderr = STALE_REJECTION_PREFIX')),
+            '        stale_expected_human = stale_expected_rejection(stale_observed)',
+            '        stale_expected_human = STALE_REJECTION_PREFIX')),
+        ("stale result classified before after-client evidence", replace_once(containment,
+            '        stale_after_client = show_identity_until("stale-attestation",\n'
+            '            time.monotonic() + 10, "ActiveState", "SubState", "Result", "ExecMainPID",\n'
+            '            "ExecMainCode", "ExecMainStatus", "ControlGroup")',
+            '        stale_client_class = stale_client_classification(\n'
+            '            stale_client_attempted, rejected.returncode, rejected.stdout, rejected.stderr,\n'
+            '            stale_expected_human)\n'
+            '        stale_after_client = show_identity_until("stale-attestation",\n'
+            '            time.monotonic() + 10, "ActiveState", "SubState", "Result", "ExecMainPID",\n'
+            '            "ExecMainCode", "ExecMainStatus", "ControlGroup")')),
+        ("stale result raised before identity verdict", replace_once(containment,
+            '        stale_after_client = show_identity_until("stale-attestation",',
+            '        if rejected.returncode != 1:\n'
+            '            fail("client result failed before identity capture")\n'
+            '        stale_after_client = show_identity_until("stale-attestation",')),
         ("stale client stdout capture omitted", replace_once(containment,
             '        stale_rejected_stdout = rejected.stdout',
             '        stale_rejected_stdout = ""')),
         ("stale wrong-reason category hidden", replace_once(containment,
-            '        elif stale_client_class["wrong_reason"]:\n            failure_category = "wrong-reason"',
-            '        elif stale_client_class["wrong_reason"]:\n            failure_category = "fixture-error"')),
+            '    if classification["wrong_reason"]:\n        return "wrong-reason"',
+            '    if classification["wrong_reason"]:\n        return "fixture-error"')),
+        ("stale identity-change category hidden", replace_once(containment,
+            '    if identity_changed:\n        return "identity-change"',
+            '    if identity_changed:\n        return "fixture-error"')),
+        ("stale combined result-identity category hidden", replace_once(containment,
+            '    if classification["wrong_reason"] and identity_changed:\n'
+            '        return "result-identity"',
+            '    if classification["wrong_reason"] and identity_changed:\n'
+            '        return "wrong-reason"')),
+        ("stale diagnostic result-contract bit omitted", replace_once(containment,
+            '        ("result_contract", diagnostic_bit(classification["result_contract"])),', '')),
+        ("stale diagnostic identity-change bit omitted", replace_once(containment,
+            '        ("identity_changed", diagnostic_bit(identity_changed)),', '')),
         ("stale diagnostic call omits cleanup finality", replace_once(containment,
-            '            bool(stale_rejected_stderr), cleanup_error))',
-            '            bool(stale_rejected_stderr), False))')),
+            '            stale_failure is not None, bool(stale_rejected_stdout), cleanup_error))',
+            '            stale_failure is not None, bool(stale_rejected_stdout), False))')),
         ("stale ownership mismatch made transient", replace_once(containment,
             '                stale_identity_error = sanitized_diagnostic_text(\n'
             '                    f"ownership={sanitized_state(partial)}")',
