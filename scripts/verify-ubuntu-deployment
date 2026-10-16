@@ -1207,7 +1207,7 @@ def validate_client(source: str, *, enforce_snapshot: bool = True) -> None:
     # bypass this snapshot and must be rejected by the detailed inventories below.
     if enforce_snapshot:
         require(stable_source_digest(source)
-                == "1b2c38a6622d6d67eeae32b0b902980b0835cff422d61291729aed76f9536b29",
+                == "5ead6b684489aaa8793b6870ce9918eb47c8224ddfb34907e3c3a659c5a21d15",
                 "client reviewed stable UTF-8/LF source snapshot changed")
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     expected_imports = ast.parse('''import fcntl
@@ -1277,7 +1277,11 @@ import time
     require_exact_assignment(tree, "RESULT_BYTE_LIMIT", "RESULT_BYTE_LIMIT = select.PIPE_BUF",
                                "client result bound changed")
     require_exact_assignment(tree, "RESULT_EVENT_LIMIT", "RESULT_EVENT_LIMIT = 48",
-                             "client result event bound changed")
+                              "client result event bound changed")
+    require_exact_assignment(tree, "CANCELLATION_FAILURE", "CANCELLATION_FAILURE = None",
+                              "client cancellation identity latch changed")
+    require_exact_assignment(tree, "CANCELLATION_ACCOUNTED", "CANCELLATION_ACCOUNTED = False",
+                              "client cancellation accounting latch changed")
     require_exact_assignment(tree, "PRIMARY_CATEGORIES", '''PRIMARY_CATEGORIES = (
     "none", "cleanup-test", "cancelled", "verification", "unexpected",
 )
@@ -1368,7 +1372,12 @@ import time
     return error.category if isinstance(error, PrimaryFailure) else "unexpected"
 ''', "client primary result derivation changed")
     require_exact_function(tree, "cancellation_exception", '''def cancellation_exception():
-    return CancellationFailure(CANCELLED[0]) if CANCELLED else None
+    global CANCELLATION_FAILURE
+    if not CANCELLED:
+        return None
+    if CANCELLATION_FAILURE is None:
+        CANCELLATION_FAILURE = CancellationFailure(CANCELLED[0])
+    return CANCELLATION_FAILURE
 ''', "client cancellation detection must create a typed primary failure")
     require_exact_function(tree, "terminal_cancellation_exception", '''def terminal_cancellation_exception():
     pending = signal.sigpending() & CANCELLATION_SIGNALS
@@ -1398,6 +1407,21 @@ import time
                    boundary, (candidate,))
     return primary_error
 ''', "client first primary, including cancellation, must remain authoritative")
+    require_exact_function(tree, "account_latched_cancellation", '''def account_latched_cancellation(primary_error, cleanup_errors, cancellation):
+    global CANCELLATION_ACCOUNTED
+    if cancellation is None or CANCELLATION_ACCOUNTED:
+        return primary_error, cleanup_errors
+    CANCELLATION_ACCOUNTED = True
+    if isinstance(primary_error, CancellationFailure):
+        return primary_error, cleanup_errors
+    if primary_error is None:
+        return cancellation, cleanup_errors
+    if not cleanup_error_mapped(cancellation):
+        cleanup_result("cancelled", "final", (cancellation,))
+    if not any(error is cancellation for error in cleanup_errors):
+        cleanup_errors = [*cleanup_errors, cancellation]
+    return primary_error, cleanup_errors
+''', "client latched cancellation must be classified exactly once")
     render_source = ast.get_source_segment(source, named_function(tree, "render_client_result")) or ""
     render_contract = (
         "def render_client_result(primary_error, final_evidence):",
@@ -1481,8 +1505,7 @@ import time
         "def emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence):",
         "signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)",
         "cancellation = terminal_cancellation_exception()",
-        "if primary_error is None:",
-        'cleanup_result("cancelled", "final", (cancellation,))',
+        "primary_error, cleanup_errors = account_latched_cancellation(",
         "resolve_outcome(primary_error, cleanup_errors, nonce, final_evidence)",
         "top_level_diagnostic(failure)",
         "write_terminal_payload(descriptor, payload)",
@@ -2668,12 +2691,8 @@ finally:
             cleanup_errors.append(error)
     COMMAND_DEADLINE = work_deadline
     cancellation = cancellation_exception()
-    if cancellation is not None:
-        if primary_error is None:
-            primary_error = cancellation
-        else:
-            cleanup_result("cancelled", "final", (cancellation,))
-            cleanup_errors.append(cancellation)
+    primary_error, cleanup_errors = account_latched_cancellation(
+        primary_error, cleanup_errors, cancellation)
     if RECOVERED_ERRORS:
         cleanup_errors.extend(RECOVERED_ERRORS)
 ''').body[0].finalbody
@@ -3940,7 +3959,8 @@ def validate_containment(source: str, phase: str) -> None:
         "persistent_launch_paths", "wait_validated_marker",
         "counter", "wait_counter", "release", "wait_unit_absent",
         "assert_client_lock_reusable", "assert_client_lock_held", "assert_transaction_lock_held",
-        "assert_client_failure", "assert_cancelled_result",
+        "assert_client_failure", "expected_signal_result", "signal_result_contract",
+        "assert_cancelled_result",
         "fast_recovery", "fault_paths", "assert_interception", "cleanup_fixture_invocation",
         "unique_json_object", "parse_structured_command", "structured_command_identity",
         "launch_identity_signature",
@@ -4023,7 +4043,9 @@ def validate_containment(source: str, phase: str) -> None:
         ("assert_client_lock_held", ""),
         ("assert_transaction_lock_held", ""),
         ("assert_client_failure", "result, mode, phase"),
-        ("assert_cancelled_result", "result, mode"),
+        ("expected_signal_result", "mode, signum"),
+        ("signal_result_contract", "result, mode, signum"),
+        ("assert_cancelled_result", "result, mode, signum"),
         ("fast_recovery", "client, repo, commit, go_binary, context, phase"),
         ("fault_paths", "mode, boundary"),
         ("assert_interception", "mode, boundary, phase, *, persistent=False"),
@@ -4318,7 +4340,7 @@ COUNTER_CATEGORIES = (
     )
     expected_constant_loads = {
         "UNIT": 22, "CLEANUP_DATABASE_FAILURE": 1, "CLEANUP_ROLES_FAILURE": 1,
-        "READY": 2, "PID_FILES": 1, "ENV": 12, "SUCCESS": 9,
+        "READY": 2, "PID_FILES": 1, "ENV": 12, "SUCCESS": 10,
         "RESULT_PREFIX": 5, "RESULT_BYTE_LIMIT": 1, "RESULT_EVENT_LIMIT": 1,
         "CLIENT_STDERR_BYTE_LIMIT": 2,
         "RESULT_PRIMARY_CATEGORIES": 1, "RESULT_BOUNDARIES": 1,
@@ -4539,7 +4561,8 @@ COUNTER_CATEGORIES = (
         "close_transaction_lock",
         "aggregate_counter_failure", "counter", "counter_failure", "counter_identity", "dict", "evidence_failure_number", "evidence_failure",
         "fail", "function",
-        "enumerate", "evaluate_persistent_result", "expected_persistent_result", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
+        "enumerate", "evaluate_persistent_result", "expected_persistent_result", "expected_signal_result",
+        "signal_result_contract", "fast_recovery", "fault_paths", "int", "intent_entry", "isinstance", "iter", "len", "main", "min",
         "launch_identity_matches", "launch_identity_signature", "list", "load_cleanup_intent",
         "lock_transaction", "map", "next", "observable_identity", "open",
         "open_transaction_lock", "os_call", "parse_structured_command", "path_exists", "popen",
@@ -4935,6 +4958,16 @@ COUNTER_CATEGORIES = (
          "72ecbfd763a929e7fbf51c4957af3d1e00b17d43821b6fefcc49ea7ac39ac808",
          "52db6fe7d050a322c1ae51dd7261ee33ca2da7f07dcecff1350d2e811602fbe0",
          "b740fc173f46e0ea5921992a276657fb16382a7ec279dfd2b1b367312efe40fa"),
+        # CPython 3.14 exact lifecycle signal result schemas.
+        ("65865a5fe5106f0597e57e7959aa5bbf24620d69c2eb2d8e127dc54416ab0c14",
+         "c2b7c4ca9a8c39b3bb1a497b6bcb9bbc6b1e919c754814c4b564550754cdf7b2",
+         "e11a509b8a1a5344b558c11b2f7f7903ada3c83aa6335500e6c924da3b2f5b07",
+         "48ddfa5cd067cde69bb08289c1b2eda8f40f5fb76a27739176f7831ece1f12c1"),
+        # CPython 3.12 exact lifecycle signal result schemas.
+        ("c12d81ff266faa09e32ec33d00c5bb31bc0683ab10372a266085d94d1b051bd9",
+         "d853529558d26504209475dcd0d032b816499ee90d2d60554a977173d536526b",
+         "52db6fe7d050a322c1ae51dd7261ee33ca2da7f07dcecff1350d2e811602fbe0",
+         "5b48b7b7e65aae0c1e90c58a0b1c4d1d150f2ae1db1c51f35e474c6ad74f6176"),
     }
     require(observed_call_fingerprints in reviewed_call_fingerprints,
             "containment call targets, arguments, or use-site contexts changed")
@@ -5113,9 +5146,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 732, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
-        "Delete": 1, "Expr": 402, "For": 68, "FunctionDef": 114, "If": 316,
-        "Import": 12, "Pass": 5, "Raise": 78, "Return": 122, "Try": 89, "While": 21,
+        "Assign": 742, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
+        "Delete": 1, "Expr": 403, "For": 68, "FunctionDef": 116, "If": 318,
+        "Import": 12, "Pass": 5, "Raise": 78, "Return": 124, "Try": 89, "While": 21,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -5213,7 +5246,9 @@ COUNTER_CATEGORIES = (
                           "7ff3f1f1379fcdea85325e959ba5ab219b90b486c8193c8015129a092f6813fd",
                            "0ce0b6ad603cb2454a704499bd19440607613526c4fadcc0a8f967aaaa47532a",
                            "2c04237148a62911294a01d5592a7f42a8d8a62f0d11e6b21dd812f18189314a",
-                           "5058b9866161374e5bcf1e181e1bde4dbe35c866bdf284b8b9658f12b5c3a358"},
+                           "5058b9866161374e5bcf1e181e1bde4dbe35c866bdf284b8b9658f12b5c3a358",
+                           "e61b2642965f81cacd616b1f98edcca20247b259da772fbb5eaace60ed836885",
+                           "781f000f05293e7f96c261358b916e25a28fe918d9321399b89bef0ffec68fc5"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -5340,14 +5375,40 @@ COUNTER_CATEGORIES = (
         fail(f"client fault left processes in the fixed unit cgroup: {mode}")
     assert_client_lock_reusable()
 ''', "containment causal client failure residue/lock assertions changed")
-    require_exact_function(tree, "assert_cancelled_result", '''def assert_cancelled_result(result, mode):
-    assert_client_failure(result, mode, "signal-cleanup")
+    require_exact_function(tree, "expected_signal_result", '''def expected_signal_result(mode, signum):
+    boundary = mode.rsplit("-", 1)[1]
+    if boundary in ("startup", "work"):
+        primary = "cancelled"
+        events = ()
+        human = f"verification client cancelled by signal {signum}"
+    elif boundary in ("kill", "stop", "wait", "reset", "unload"):
+        primary = "cleanup-test"
+        events = ((0, "final", "cancelled", 0, 0, 0),)
+        stage = "before cleanup boundary test" if boundary in ("kill", "wait") else "at terminal cleanup boundary test"
+        human = (f"injected client failure {stage}; cleanup failed: "
+                 f"verification client cancelled by signal {signum}")
+    else:
+        fail("client signal result used an unknown lifecycle boundary")
+    return ({
+        "primary": primary, "events": events, "events_complete": 1,
+        "final_scanned": 1, "final_observed": 1, "final_empty": 1,
+        "return": 1, "stdout": 0, "success": 0,
+    }, human)
+''', "containment signal lifecycle schema changed")
+    require_exact_function(tree, "signal_result_contract", '''def signal_result_contract(result, mode, signum):
     parsed, shape = client_stderr_evidence(result.stderr)
-    if (not shape["shape"] or parsed is None or parsed["primary"] != "cancelled"
-            or parsed["return"] != 1 or parsed["stdout"] != 0
-            or parsed["success"] != 0):
-        fail(f"client signal result did not report one machine primary cancellation: {mode}")
-''', "containment signal checks must require one canonical machine cancellation result")
+    expected, human = expected_signal_result(mode, signum)
+    lines = result.stderr.splitlines(keepends=True) if type(result.stderr) is str else []
+    return bool(
+        result.returncode == 1 and result.stdout == "" and SUCCESS not in result.stdout
+        and shape["shape"] and parsed == expected and len(lines) == 2
+        and lines[1] == "verification-client: " + human + "\\n")
+''', "containment signal result oracle changed")
+    require_exact_function(tree, "assert_cancelled_result", '''def assert_cancelled_result(result, mode, signum):
+    assert_client_failure(result, mode, "signal-cleanup")
+    if not signal_result_contract(result, mode, signum):
+        fail(f"client signal result did not match its exact lifecycle schema: {mode}")
+''', "containment signal checks must require the exact lifecycle result")
     require_exact_function(tree, "fast_recovery", '''def fast_recovery(client, repo, commit, go_binary, context, phase):
     recovered = run(phase, ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                      "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -5560,7 +5621,7 @@ COUNTER_CATEGORIES = (
         'for lifecycle in ("startup", "work"):',
         'mode = f"client-signal-{signal_name}-{boundary}"',
         'os_call("signal-cleanup", "kill", "process", os.kill, cancelled.pid, signum)',
-        'assert_cancelled_result(result, mode)',
+        'assert_cancelled_result(result, mode, signum)',
         'if result.returncode == 0 or SUCCESS in result.stdout:',
         'state.get("LoadState") != "not-found"',
         'cgroup_pids("/system.slice/" + UNIT, phase)',
@@ -6422,7 +6483,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "e90a5877fe11ee31ab34f86001f31dde62e9eff439e38ee2e16c89128ab7efcf",
+            == "aa4c24b0aa072d6d366e09deeb609ac5c2e08e5fcdb21046b75cfdd5394c38b2",
             "diagnostic fixture source snapshot changed")
 
 
@@ -7774,14 +7835,11 @@ def verify_supervisor_mutations(
             '    cancellation = cancellation_exception()\n'
             '    return cancellation or (CancellationFailure(min(pending)) if pending else None)',
             '    return CancellationFailure(min(pending)) if pending else None')),
-        ("terminal cancellation replacement removed", replace_once(client,
-            '    if cancellation is not None:\n'
-            '        if primary_error is None:\n'
-            '            primary_error = cancellation\n'
-            '        else:\n'
-            '            cleanup_result("cancelled", "final", (cancellation,))\n'
-            '            cleanup_errors = [*cleanup_errors, cancellation]',
-            '    if cancellation is not None:\n        pass')),
+        ("terminal cancellation accounting removed", replace_once(client,
+            '    cancellation = terminal_cancellation_exception()\n'
+            '    primary_error, cleanup_errors = account_latched_cancellation(\n'
+            '        primary_error, cleanup_errors, cancellation)',
+            '    cancellation = terminal_cancellation_exception()')),
         ("terminal low-level write duplicated", replace_once(client,
             '    write_terminal_payload(descriptor, payload)\n    return status',
             '    write_terminal_payload(descriptor, payload)\n'
@@ -7823,8 +7881,30 @@ def verify_supervisor_mutations(
             '    return error.category if isinstance(error, PrimaryFailure) else "unexpected"',
             '    return "verification"')),
         ("cancellation detection downgraded to RuntimeError", replace_once(client,
-            '    return CancellationFailure(CANCELLED[0]) if CANCELLED else None',
-            '    return RuntimeError(f"verification client cancelled by signal {CANCELLED[0]}") if CANCELLED else None')),
+            '        CANCELLATION_FAILURE = CancellationFailure(CANCELLED[0])',
+            '        CANCELLATION_FAILURE = RuntimeError(f"verification client cancelled by signal {CANCELLED[0]}")')),
+        ("cancellation identity is not latched", replace_once(client,
+            '    return CANCELLATION_FAILURE',
+            '    return CancellationFailure(CANCELLED[0])')),
+        ("cancellation accounting is not idempotent", replace_once(client,
+            '    if cancellation is None or CANCELLATION_ACCOUNTED:',
+            '    if cancellation is None:')),
+        ("uniform cancellation replaces boundary primary", replace_once(client,
+            '    if primary_error is None:\n        return cancellation, cleanup_errors',
+            '    if primary_error is not None:\n        return cancellation, cleanup_errors')),
+        ("boundary cancellation event dropped", replace_once(client,
+            '        cleanup_result("cancelled", "final", (cancellation,))',
+            '        pass')),
+        ("boundary cancellation event duplicated", replace_once(client,
+            '        cleanup_result("cancelled", "final", (cancellation,))',
+            '        cleanup_result("cancelled", "final", (cancellation,))\n'
+            '        cleanup_result("cancelled", "final", (cancellation,))')),
+        ("boundary cancellation event category changed", replace_once(client,
+            '        cleanup_result("cancelled", "final", (cancellation,))',
+            '        cleanup_result("unexpected", "final", (cancellation,))')),
+        ("boundary cancellation event boundary changed", replace_once(client,
+            '        cleanup_result("cancelled", "final", (cancellation,))',
+            '        cleanup_result("cancelled", "unload", (cancellation,))')),
         ("cancellation wrapped as verification", replace_once(client,
             '    if isinstance(error, CancellationFailure):\n        return error',
             '    if isinstance(error, CancellationFailure):\n'
@@ -9236,8 +9316,8 @@ def verify_supervisor_mutations(
             '        fail(f"client fault left processes in the fixed unit cgroup: {mode}")',
             '    if False:\n        pass')),
         ("fault lock reuse unchecked", replace_once(containment,
-            '    assert_client_lock_reusable()\n\n\ndef assert_cancelled_result',
-            '    pass\n\n\ndef assert_cancelled_result')),
+            '    assert_client_lock_reusable()\n\n\ndef expected_signal_result',
+            '    pass\n\n\ndef expected_signal_result')),
         ("client lock reuse acquisition omitted", replace_once(containment,
             '        if not try_nonblocking_flock(descriptor, "transaction-lock", "lock"):\n'
             '            fail("client lock was not reusable after client exit")',
@@ -9607,10 +9687,48 @@ def verify_supervisor_mutations(
             '("kill", "stop", "wait", "reset")', 2)),
         ("signal cancellation reduced to text-only", replace_once(containment,
             '    parsed, shape = client_stderr_evidence(result.stderr)\n'
-            '    if (not shape["shape"] or parsed is None or parsed["primary"] != "cancelled"\n'
-            '            or parsed["return"] != 1 or parsed["stdout"] != 0\n'
-            '            or parsed["success"] != 0):',
-            '    if "cancelled by signal" not in result.stderr:')),
+            '    expected, human = expected_signal_result(mode, signum)',
+            '    parsed, shape = client_stderr_evidence(result.stderr)\n'
+            '    return "cancelled by signal" in result.stderr')),
+        ("signal lifecycle primary made uniform", replace_once(containment,
+            '        primary = "cleanup-test"\n        events = ((0, "final", "cancelled", 0, 0, 0),)',
+            '        primary = "cancelled"\n        events = ((0, "final", "cancelled", 0, 0, 0),)')),
+        ("signal lifecycle event dropped", replace_once(containment,
+            '        events = ((0, "final", "cancelled", 0, 0, 0),)',
+            '        events = ()')),
+        ("signal lifecycle event duplicated", replace_once(containment,
+            '        events = ((0, "final", "cancelled", 0, 0, 0),)',
+            '        events = ((0, "final", "cancelled", 0, 0, 0),) * 2')),
+        ("signal lifecycle event boundary changed", replace_once(containment,
+            '        events = ((0, "final", "cancelled", 0, 0, 0),)',
+            '        events = ((0, "unload", "cancelled", 0, 0, 0),)')),
+        ("signal lifecycle event category changed", replace_once(containment,
+            '        events = ((0, "final", "cancelled", 0, 0, 0),)',
+            '        events = ((0, "final", "unexpected", 0, 0, 0),)')),
+        ("signal lifecycle event count changed", replace_once(containment,
+            '        events = ((0, "final", "cancelled", 0, 0, 0),)',
+            '        events = ((1, "final", "cancelled", 0, 0, 0),)')),
+        ("signal lifecycle event counters changed", replace_once(containment,
+            '        events = ((0, "final", "cancelled", 0, 0, 0),)',
+            '        events = ((0, "final", "cancelled", 1, 0, 0),)')),
+        ("signal lifecycle finality made dirty", replace_once(containment,
+            '        "final_scanned": 1, "final_observed": 1, "final_empty": 1,',
+            '        "final_scanned": 1, "final_observed": 1, "final_empty": 0,')),
+        ("signal lifecycle event completeness omitted", replace_once(containment,
+            '        "primary": primary, "events": events, "events_complete": 1,',
+            '        "primary": primary, "events": events, "events_complete": 0,')),
+        ("signal lifecycle return weakened", replace_once(containment,
+            '        result.returncode == 1 and result.stdout == "" and SUCCESS not in result.stdout',
+            '        result.returncode != 0 and result.stdout == "" and SUCCESS not in result.stdout')),
+        ("signal lifecycle stdout weakened", replace_once(containment,
+            '        result.returncode == 1 and result.stdout == "" and SUCCESS not in result.stdout',
+            '        result.returncode == 1 and SUCCESS not in result.stdout')),
+        ("signal lifecycle stderr shape weakened", replace_once(containment,
+            '        and shape["shape"] and parsed == expected and len(lines) == 2',
+            '        and parsed == expected')),
+        ("signal lifecycle human line weakened", replace_once(containment,
+            '        and lines[1] == "verification-client: " + human + "\\n")',
+            '        and "cancelled by signal" in lines[1])')),
         ("client death omitted", replace_once(containment,
             'os_call("preflight", "kill", "process", os.kill, first.pid, signal.SIGKILL)',
             'first.terminate()')),
