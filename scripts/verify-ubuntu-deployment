@@ -9140,7 +9140,12 @@ def verify_supervisor_mutations(
         ("stale exact expected diagnostic omitted", replace_once(containment,
             '        stale_expected_human = stale_expected_rejection(stale_observed)',
             '        stale_expected_human = STALE_REJECTION_PREFIX')),
-        ("stale result classified before after-client evidence", replace_once(containment,
+        ("stale result classified before after-client evidence", replace_once(
+            replace_once(containment,
+                '        stale_client_class = stale_client_classification(\n'
+                '            stale_client_attempted, rejected.returncode, rejected.stdout, rejected.stderr,\n'
+                '            stale_expected_human)\n',
+                ''),
             '        stale_after_client = show_identity_until("stale-attestation",\n'
             '            time.monotonic() + 10, "ActiveState", "SubState", "Result", "ExecMainPID",\n'
             '            "ExecMainCode", "ExecMainStatus", "ControlGroup")',
@@ -9685,6 +9690,7 @@ def verify_supervisor_mutations(
         "stale release deleted without confirmed absence",
         "stale residue artifacts not preserved",
         "stale release acknowledgment wait omitted",
+        "stale result classified before after-client evidence",
         "stale client stdout capture omitted",
         "stale client diagnostic return omitted",
         "stale client diagnostic streams omitted",
