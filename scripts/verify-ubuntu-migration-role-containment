@@ -1736,6 +1736,14 @@ def launch_identity_matches(state, signature):
             and all(state.get(name) == expected for name, expected in signature.items()))
 
 
+def persistent_handoff_state_accepted(boundary, state, signature, recorded_cgroup_pids):
+    loaded_exact = (state.get("LoadState") == "loaded"
+                    and launch_identity_matches(state, signature))
+    unloaded_after_reset = (boundary == "unload" and state.get("LoadState") == "not-found"
+                              and not recorded_cgroup_pids)
+    return loaded_exact or unloaded_after_reset
+
+
 def stale_identity_evidence(state, signature, expected_main_pid, control_group_pids):
     evidence = {
         "signature_unchanged": launch_identity_matches(state, signature),
@@ -1858,6 +1866,29 @@ def assert_launch_identity_contract():
     except RuntimeError:
         return
     fail("structured ExecStartEx disagreement was accepted")
+
+
+def assert_persistent_handoff_contract():
+    path = "/usr/bin/env"
+    argv = (path, "-i", "KEY=value", "/opt/nmcp/helper", "--mode", "exact")
+    signature = launch_identity_signature("a" * 32, "exact fixture", "KEY=value", path, argv)
+    loaded = {
+        "LoadState": "loaded", "InvocationID": "a" * 32,
+        "Description": "exact fixture", "Environment": "KEY=value",
+        "Command": {"path": path, "argv": argv}, **SERVICE_PROPERTIES,
+    }
+    absent = {"LoadState": "not-found"}
+    if (not persistent_handoff_state_accepted("unload", absent, signature, [])
+            or not persistent_handoff_state_accepted("unload", loaded, signature, [])):
+        fail("persistent unload handoff rejected explicit absence or exact retained identity")
+    rejected = (
+        ("reset", absent, []),
+        ("unload", {**loaded, "InvocationID": "b" * 32}, []),
+        ("unload", absent, [1234]),
+    )
+    if any(persistent_handoff_state_accepted(boundary, state, signature, pids)
+           for boundary, state, pids in rejected):
+        fail("persistent handoff accepted wrong boundary, identity, or recorded cgroup residue")
 
 
 def persistent_supervisor_mode(mode):
@@ -2273,6 +2304,7 @@ def main():
     assert_persistent_cgroup_routing_contract()
     assert_cleanup_deadline_contract()
     assert_launch_identity_contract()
+    assert_persistent_handoff_contract()
 
     # A stale loaded fixed name is never launch-ready merely because it is
     # failed and cgroup-empty. The new client must fail without touching it.
@@ -2815,16 +2847,16 @@ raise SystemExit(73)
             wait_path("persistent-cleanup", handoff_ready, timeout=30)
             observed = show_identity_until(
                 "persistent-cleanup", time.monotonic() + 10, "ControlGroup")
-            if observed["LoadState"] == "not-found":
-                fail("persistent client exited before its attested handoff")
-            if not launch_identity_matches(observed, signature):
-                fail("persistent launch identity changed before boundary handoff")
-            recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(
-                recorded_cgroup, observed)
-            if evidence_case != "normal" and not requires_live:
-                fail("injected persistent evidence case did not use fast-hold")
+            if observed.get("LoadState") == "loaded":
+                recorded_cgroup, recorded_cgroup_category = retain_persistent_cgroup(
+                    recorded_cgroup, observed)
             handoff_pids = (cgroup_pids(recorded_cgroup, "persistent-cleanup")
                             if recorded_cgroup else [])
+            if not persistent_handoff_state_accepted(
+                    boundary, observed, signature, handoff_pids):
+                fail("persistent handoff lacked exact retained identity or unload finality")
+            if evidence_case != "normal" and not requires_live:
+                fail("injected persistent evidence case did not use fast-hold")
             if requires_live and not handoff_pids:
                 fail("fast-hold persistent handoff had no live service cgroup process")
             if not requires_live and handoff_pids:

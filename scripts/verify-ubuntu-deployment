@@ -3752,6 +3752,13 @@ def validate_containment(source: str, phase: str) -> None:
         or intercepted != expected_interceptions or attempted != 0
     )
 ''', "containment special persistent client result predicate changed")
+    require_exact_function(tree, "persistent_handoff_state_accepted", '''def persistent_handoff_state_accepted(boundary, state, signature, recorded_cgroup_pids):
+    loaded_exact = (state.get("LoadState") == "loaded"
+                    and launch_identity_matches(state, signature))
+    unloaded_after_reset = (boundary == "unload" and state.get("LoadState") == "not-found"
+                              and not recorded_cgroup_pids)
+    return loaded_exact or unloaded_after_reset
+''', "persistent handoff must allow only exact loaded identity or empty post-reset unload absence")
     require_exact_function(tree, "stale_expected_rejection", '''def stale_expected_rejection(state):
     safe_names = ("LoadState", "InvocationID", "ActiveState", "SubState", "ControlGroup")
     safe = {name: state.get(name) for name in safe_names if name in state}
@@ -3901,6 +3908,7 @@ def validate_containment(source: str, phase: str) -> None:
         "assert_machine_result_contract", "assert_persistent_cgroup_routing_contract",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
         "stale_failure_category", "stale_failure_message",
+        "persistent_handoff_state_accepted", "assert_persistent_handoff_contract",
         "len", "str", "repr", "sorted", "bool", "any", "next",
     }
     protected_persistent_string_bindings = set(protected_persistent_bindings)
@@ -3936,8 +3944,10 @@ def validate_containment(source: str, phase: str) -> None:
         "fast_recovery", "fault_paths", "assert_interception", "cleanup_fixture_invocation",
         "unique_json_object", "parse_structured_command", "structured_command_identity",
         "launch_identity_signature",
-        "launch_identity_matches", "stale_identity_evidence", "stale_terminal_matches",
+        "launch_identity_matches", "persistent_handoff_state_accepted",
+        "stale_identity_evidence", "stale_terminal_matches",
         "structured_command_fixture_result", "assert_launch_identity_contract",
+        "assert_persistent_handoff_contract",
         "persistent_supervisor_mode", "persistent_launch_signature",
         "assert_launch_signature_counterexamples", "signed_launch_state",
         "cleanup_signed_launch", "cleanup_signed_launch_if_owned",
@@ -4022,10 +4032,12 @@ def validate_containment(source: str, phase: str) -> None:
         ("structured_command_identity", "exec_start_result, exec_start_ex_result"),
         ("launch_identity_signature", "invocation, description, environment, path, argv"),
         ("launch_identity_matches", "state, signature"),
+        ("persistent_handoff_state_accepted", "boundary, state, signature, recorded_cgroup_pids"),
         ("stale_identity_evidence", "state, signature, expected_main_pid, control_group_pids"),
         ("stale_terminal_matches", "state, signature, expected_main_pid, control_group_pids"),
         ("structured_command_fixture_result", "property_name, path, argv, behavior, runtime"),
         ("assert_launch_identity_contract", ""),
+        ("assert_persistent_handoff_contract", ""),
         ("persistent_supervisor_mode", "mode"),
         ("persistent_launch_signature", "state, repo, commit, go_binary, mode"),
         ("assert_launch_signature_counterexamples", "state, repo, commit, go_binary, mode"),
@@ -4314,7 +4326,7 @@ COUNTER_CATEGORIES = (
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
         "STALE_REJECTION_PREFIX": 1, "DIAGNOSTIC_TEXT_LIMIT": 7, "DIAGNOSTIC_PREFIX": 2,
         "PROGRAM": 2, "NONCE_VARIABLE": 3,
-        "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 6, "IDENTITY_PROPERTIES": 1,
+        "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 7, "IDENTITY_PROPERTIES": 1,
         "SYSTEMD_UNIT_OBJECT": 1, "CGROUP_SNAPSHOT_ATTEMPTS": 1,
         "DIAGNOSTIC_PHASES": 2, "DIAGNOSTIC_OPERATIONS": 1,
         "DIAGNOSTIC_RESOURCES": 1, "COUNTER_MAX": 3, "COUNTER_BYTE_LIMIT": 3,
@@ -4348,6 +4360,11 @@ COUNTER_CATEGORIES = (
                 '{"LoadState": "loaded", "Command": active_command, '
                 '"InvocationID": "a" * 32, "Description": "exact fixture", '
                 '"Environment": "KEY=value", **SERVICE_PROPERTIES}', mode="eval").body): 1,
+            ast.dump(ast.parse(
+                '{"LoadState": "loaded", "InvocationID": "a" * 32, '
+                '"Description": "exact fixture", "Environment": "KEY=value", '
+                '"Command": {"path": path, "argv": argv}, **SERVICE_PROPERTIES}',
+                mode="eval").body): 1,
         },
         "IDENTITY_PROPERTIES": {
             ast.dump(ast.parse('(*IDENTITY_PROPERTIES,)', mode="eval").body.elts[0]): 1,
@@ -4509,6 +4526,7 @@ COUNTER_CATEGORIES = (
         "assert_client_lock_held", "assert_client_lock_reusable", "assert_interception",
         "assert_transaction_lock_held",
         "assert_cleanup_deadline_contract", "assert_launch_identity_contract",
+        "assert_persistent_handoff_contract",
         "assert_launch_signature_counterexamples",
         "assert_keeper_lock_coherent", "assert_machine_result_contract",
         "assert_persistent_cgroup_routing_contract", "assert_persistent_failure_contract",
@@ -4528,7 +4546,7 @@ COUNTER_CATEGORIES = (
         "parse_client_result", "parse_counter", "parse_unit_properties", "parser",
         "persistent_failure_classification",
         "persistent_cgroup_finality", "persistent_launch_barriers", "persistent_launch_paths",
-        "persistent_launch_signature",
+        "persistent_launch_signature", "persistent_handoff_state_accepted",
         "persistent_result_violation", "wait_persistent_launch_required",
         "persistent_scalar_diagnostic", "persistent_special_result_violation",
         "persistent_supervisor_mode", "pid_exists", "process_communicate",
@@ -4608,6 +4626,16 @@ COUNTER_CATEGORIES = (
         hashlib.sha256(repr(sorted(control_flow_call_contexts)).encode()).hexdigest(),
     )
     reviewed_call_fingerprints = {
+        # CPython 3.14 unload-final handoff evidence.
+        ("0755e68ab1785830fe3373cfe21ce03fce3a31b26421c82567c3171db19c834b",
+         "aeb6b43f2a61b15999f0a9c02aa8068db8e8140bacc5bfb9d57bac61493b4ff4",
+         "e11a509b8a1a5344b558c11b2f7f7903ada3c83aa6335500e6c924da3b2f5b07",
+         "9945bec24ed1d6014738e06aa8bb4e8e24fba42724e314a7bf9e465bf77528c8"),
+        # CPython 3.12 unload-final handoff evidence.
+        ("a9d10f168168ac4023bf8ab1280632a832e051d418530f1f3d897e597a8c7f70",
+         "d4c1ad6da31c33f65f5cdda0a731cee879cf80f9bb53bd18c652a09306605cf4",
+         "52db6fe7d050a322c1ae51dd7261ee33ca2da7f07dcecff1350d2e811602fbe0",
+         "503b74d8ef76431138907a9b9fa64f844c8870e506704f71f5777464b4762b97"),
         # CPython 3.14 separated live stale contract/identity reporting.
         ("1ab1356b83ef3ac74a33a3cfb7daf06586ec6d16ce5fcc1826b01103675ba608",
          "30f0da41c71c073d53b1042e1544d4a3831493a6c51bcebec743e18e1da5e4d3",
@@ -4942,7 +4970,7 @@ COUNTER_CATEGORIES = (
      'kill_stderr': 1,
      'labels': 1,
      'line': 3,
-     'loaded': 1,
+      'loaded': 2,
      'matching': 1,
      'message': 2,
      'mode': 8,
@@ -4957,7 +4985,7 @@ COUNTER_CATEGORIES = (
      'part': 1,
      'partial': 1,
      'parts': 3,
-     'path': 8,
+      'path': 9,
      'payload': 9,
      'post_cleanup': 2,
      'post_cleanup_cgroup': 3,
@@ -4976,7 +5004,7 @@ COUNTER_CATEGORIES = (
      'results': 1,
      'schema': 1,
      'sentinel_state': 1,
-     'signature': 5,
+      'signature': 6,
      'slow': 1,
      'slow_paths': 1,
      'slow_state': 1,
@@ -4986,7 +5014,7 @@ COUNTER_CATEGORIES = (
      'stale_post_cleanup': 3,
      'stale_post_cleanup_cgroup': 2,
      'stale_program': 1,
-     'state': 18,
+      'state': 19,
      'stderr': 2,
      'stopped': 3,
      'successful_terminal_state': 1,
@@ -5065,7 +5093,9 @@ COUNTER_CATEGORIES = (
                          "3eb17733448b2be2ddd3e01caa09045921602fcf56beed5243215d70db5282ea",
                         "e31276abe1e0508ac96477c4599477c2cb3ba4013c0f1968ff4da1c067398a5b",
                         "7f4100fc0643598e7acc722d1d6c3258c53b26c1cb5cc6241e3b78b930a74f9a",
-                        "defe82ecd006a19b9f3dcbf9170f248789c9df8d1fccb75687870f9f16e9989c"}
+                         "defe82ecd006a19b9f3dcbf9170f248789c9df8d1fccb75687870f9f16e9989c",
+                         "aa2514d5ac97c314f84aee11d9dd703d4b39e95cf2c47a989a09f8b27934a852",
+                         "52e04d0925935949fc7564838ed6b9fc58619d65eb3d04f1a20c31809f63fe0b"}
             and not any(isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del)
                         and node.id in protected_call_roots for node in ast.walk(tree))
             and not any(isinstance(node, (ast.Global, ast.Nonlocal))
@@ -5083,9 +5113,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 724, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
-        "Delete": 1, "Expr": 400, "For": 68, "FunctionDef": 112, "If": 314,
-        "Import": 12, "Pass": 5, "Raise": 78, "Return": 121, "Try": 89, "While": 21,
+        "Assign": 732, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
+        "Delete": 1, "Expr": 402, "For": 68, "FunctionDef": 114, "If": 316,
+        "Import": 12, "Pass": 5, "Raise": 78, "Return": 122, "Try": 89, "While": 21,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -5181,7 +5211,9 @@ COUNTER_CATEGORIES = (
                           "b4411eb49334757c6d18df04b3f8781fb0aeab31a8e09ab4007b595fd2463af6",
                           "b0bac21bf3291be909d81a1507e4696d14a372000a7831ae0dfc27545ae30abf",
                           "7ff3f1f1379fcdea85325e959ba5ab219b90b486c8193c8015129a092f6813fd",
-                          "0ce0b6ad603cb2454a704499bd19440607613526c4fadcc0a8f967aaaa47532a"},
+                           "0ce0b6ad603cb2454a704499bd19440607613526c4fadcc0a8f967aaaa47532a",
+                           "2c04237148a62911294a01d5592a7f42a8d8a62f0d11e6b21dd812f18189314a",
+                           "5058b9866161374e5bcf1e181e1bde4dbe35c866bdf284b8b9658f12b5c3a358"},
             "containment statements or control-flow structure changed")
     persistent_binding_violations = []
     reviewed_kwargs_setdefault = ast.dump(ast.parse(
@@ -5485,7 +5517,8 @@ COUNTER_CATEGORIES = (
         '                    release("persistent-cleanup", "launch-" + nonce)',
         'release_ok = validated_payload_marker(\n'
         '                    "persistent-cleanup", handoff_release, b"release\\n", "release")',
-        'if not launch_identity_matches(observed, signature):',
+        'if not persistent_handoff_state_accepted(\n'
+        '                    boundary, observed, signature, handoff_pids):',
         'show("persistent-cleanup", "LoadState", "ControlGroup")\n'
         '                          if signature is None',
         'signed_launch_state(signature, "persistent-cleanup")',
@@ -5498,6 +5531,7 @@ COUNTER_CATEGORIES = (
         'assert_persistent_cgroup_routing_contract()',
         'assert_cleanup_deadline_contract()',
         'assert_launch_identity_contract()',
+        'assert_persistent_handoff_contract()',
         'observed = show_identity_until(\n'
         '                "persistent-cleanup", time.monotonic() + 10, "ControlGroup")',
         'show_identity_until(phase, deadline, "ActiveState", "ControlGroup")',
@@ -5865,8 +5899,9 @@ fast_recovery(client, repo, commit, go_binary, slow_mode, "slow-cleanup")
         'wait_counter("persistent-cleanup", intercepted, expected_interceptions, timeout=30)',
         'observed_interceptions = counter("persistent-cleanup", intercepted)',
         'wait_path("persistent-cleanup", handoff_ready, timeout=30)',
-        'fail("persistent client exited before its attested handoff")',
-        'if not launch_identity_matches(observed, signature):',
+        'if observed.get("LoadState") == "loaded":',
+        'if not persistent_handoff_state_accepted(',
+        'fail("persistent handoff lacked exact retained identity or unload finality")',
         'requires_live = persistent_supervisor_mode(mode) == "fast-hold"',
         'if evidence_case != "normal" and not requires_live:',
         'handoff_pids = (cgroup_pids(recorded_cgroup, "persistent-cleanup")',
@@ -6387,7 +6422,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "1c05934dc6b69a4706cbd50a6d5134209f8bc23e427ce9bfcdaed18783847461",
+            == "e90a5877fe11ee31ab34f86001f31dde62e9eff439e38ee2e16c89128ab7efcf",
             "diagnostic fixture source snapshot changed")
 
 
@@ -9392,9 +9427,15 @@ def verify_supervisor_mutations(
             '                if False:')),
         ("persistent launch transaction lock unchecked", replace_once(containment,
             '            assert_transaction_lock_held()', '            pass')),
-        ("persistent later invocation change accepted", replace_once(containment,
-            '            if not launch_identity_matches(observed, signature):',
-            '            if False:')),
+        ("persistent unload absence allowed at every boundary", replace_once(containment,
+            '    unloaded_after_reset = (boundary == "unload" and state.get("LoadState") == "not-found"',
+            '    unloaded_after_reset = (True and state.get("LoadState") == "not-found"')),
+        ("persistent loaded handoff identity ignored", replace_once(containment,
+            '                    and launch_identity_matches(state, signature))',
+            '                    and True)')),
+        ("persistent unload absence cgroup residue ignored", replace_once(containment,
+            '                              and not recorded_cgroup_pids)',
+            '                              and True)')),
         ("persistent handoff waits reordered", replace_once(containment,
             '            wait_counter("persistent-cleanup", intercepted, expected_interceptions, timeout=30)\n'
             '            observed_interceptions = counter("persistent-cleanup", intercepted)\n'
@@ -9486,10 +9527,6 @@ def verify_supervisor_mutations(
         ("persistent parse boundary loses fast-hold", replace_once(containment,
             '    if boundary in ("kill", "wait"):\n        return "fast-hold"',
             '    if boundary == "wait":\n        return "fast-hold"')),
-        ("persistent early client exit accepted", replace_once(containment,
-            '            if observed["LoadState"] == "not-found":\n'
-            '                fail("persistent client exited before its attested handoff")',
-            '            if False:\n                pass')),
         ("persistent no-launch reachability accepted", replace_once(containment,
             '            if not cgroup_pids(recorded_cgroup, "persistent-cleanup"):\n'
             '                fail("persistent launch barrier had no live service cgroup process")',
@@ -9670,6 +9707,9 @@ def verify_supervisor_mutations(
         "persistent alternate cleanup intent branch",
         "persistent early return before retained cleanup",
         "persistent inverted sentinel nonce condition",
+        "persistent unload absence allowed at every boundary",
+        "persistent loaded handoff identity ignored",
+        "persistent unload absence cgroup residue ignored",
         "stale ready wait omitted",
         "stale release omitted before classification",
         "stale failure classified before release",
@@ -9701,8 +9741,13 @@ def verify_supervisor_mutations(
         if label in runtime_valid_containment_mutations:
             ast.parse(mutation, filename=f"<containment mutation: {label}>")
             compile(mutation, f"<containment mutation: {label}>", "exec")
-        expect_rejected(lambda value: validate_containment(value, phase), mutation, label,
-                        "containment")
+        expected = ("persistent handoff must allow only exact loaded identity or empty post-reset unload absence"
+                    if label in {
+                        "persistent unload absence allowed at every boundary",
+                        "persistent loaded handoff identity ignored",
+                        "persistent unload absence cgroup residue ignored",
+                    } else "containment")
+        expect_rejected(lambda value: validate_containment(value, phase), mutation, label, expected)
     stage_mutations = [
         ("manifest omission allowed", replace_once(stage, "        if actual != expected:", "        if actual < expected:"), "manifest/inventory"),
         ("manifest extra allowed", replace_once(stage, "        if actual != expected:", "        if expected <= actual:"), "manifest/inventory"),
