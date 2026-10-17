@@ -40,6 +40,11 @@ jobs:
         with:
           go-version: 1.27.1
           cache: true
+      - name: Provision stable PostgreSQL runtime roles
+        run: >-
+          psql "$TEST_DATABASE_URL" --set ON_ERROR_STOP=1
+          --set nmcp_migrator_role=nmcp
+          --file infra/postgresql/runtime-roles.sql
       - name: Install metadata probe tools
         run: |
           mkdir -p .tools

@@ -28,6 +28,9 @@ type database interface {
 }
 
 type acceptanceRepository interface {
+	RegisterAttempt(context.Context, string, string) error
+	HeartbeatAttempt(context.Context, string) error
+	CompleteAttempt(context.Context, string, string) error
 	DefaultTimezone(context.Context) (string, error)
 	Finalize(context.Context, acceptance, func() (string, error)) (Outcome, error)
 }
@@ -50,11 +53,36 @@ type acceptance struct {
 	Size        int64
 	Filename    *string
 	OriginalID  string
+	AttemptID   string
 	MediaID     string
 	Timezone    string
 	Metadata    metadata.Result
 	EXIFJSON    json.RawMessage
 	SourceJSON  json.RawMessage
+}
+
+func (r *pgRepository) RegisterAttempt(ctx context.Context, attemptID, originalID string) error {
+	var expiresAt time.Time
+	if err := r.db.QueryRow(ctx, `SELECT nmcp_register_upload_attempt($1,$2)`, attemptID, originalID).Scan(&expiresAt); err != nil {
+		return fmt.Errorf("register upload attempt: %w", err)
+	}
+	return nil
+}
+
+func (r *pgRepository) HeartbeatAttempt(ctx context.Context, attemptID string) error {
+	var expiresAt time.Time
+	if err := r.db.QueryRow(ctx, `SELECT nmcp_heartbeat_upload_attempt($1)`, attemptID).Scan(&expiresAt); err != nil {
+		return fmt.Errorf("heartbeat upload attempt: %w", err)
+	}
+	return nil
+}
+
+func (r *pgRepository) CompleteAttempt(ctx context.Context, attemptID, terminalEvent string) error {
+	var completed bool
+	if err := r.db.QueryRow(ctx, `SELECT nmcp_complete_upload_attempt($1,$2) IS NULL`, attemptID, terminalEvent).Scan(&completed); err != nil {
+		return fmt.Errorf("complete upload attempt: %w", err)
+	}
+	return nil
 }
 
 type profileSnapshot struct {
@@ -82,12 +110,15 @@ func (r *pgRepository) Finalize(ctx context.Context, input acceptance, publish f
 		_ = tx.Rollback(rollbackCtx)
 	}()
 
-	var maintenanceMode string
-	if err := tx.QueryRow(ctx, `SELECT mode FROM maintenance_state WHERE id = 1 FOR SHARE`).Scan(&maintenanceMode); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT nmcp_require_normal_maintenance()`); err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "55000" {
+			return Outcome{}, &Failure{Status: 503, Code: "unavailable", Message: "service is temporarily unavailable"}
+		}
 		return Outcome{}, fmt.Errorf("lock maintenance state: %w", err)
 	}
-	if maintenanceMode != "normal" {
-		return Outcome{}, &Failure{Status: 503, Code: "unavailable", Message: "service is temporarily unavailable"}
+	if _, err := tx.Exec(ctx, `SELECT nmcp_require_live_upload_attempt($1,$2)`, input.AttemptID, input.OriginalID); err != nil {
+		return Outcome{}, fmt.Errorf("lock upload attempt: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `SELECT pg_catalog.pg_advisory_xact_lock($1)`, IdempotencyAdvisoryLock(IdempotencyScopeMediaUpload, input.Key)); err != nil {
@@ -162,6 +193,9 @@ func (r *pgRepository) Finalize(ctx context.Context, input acceptance, publish f
 	relativePath, err := publish()
 	if err != nil {
 		return Outcome{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT nmcp_complete_upload_attempt($1,'published')`, input.AttemptID); err != nil {
+		return Outcome{}, fmt.Errorf("complete published upload attempt: %w", err)
 	}
 
 	width, height := input.Metadata.Width, input.Metadata.Height

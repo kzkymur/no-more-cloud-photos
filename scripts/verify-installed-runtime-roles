@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 0077
+
+[[ $EUID -eq 0 ]] || { printf 'must run as root\n' >&2; exit 1; }
+[[ $# -eq 1 && $1 =~ ^[0-9]+$ ]] || {
+  printf 'usage: verify-installed-runtime-roles SQL_FD\n' >&2
+  exit 2
+}
+
+sql_fd=$1
+[[ -r /proc/self/fd/$sql_fd ]] || {
+  printf 'runtime verifier descriptor is not readable\n' >&2
+  exit 1
+}
+
+exec /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C HOME=/var/lib/postgresql \
+  /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc \
+  --host=/var/run/postgresql --port=5432 --username=postgres --dbname=nmcp \
+  --set=ON_ERROR_STOP=1 <&"$sql_fd"

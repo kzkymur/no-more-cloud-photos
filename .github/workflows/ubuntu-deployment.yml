@@ -6,6 +6,15 @@ on:
       - ".github/workflows/ubuntu-deployment.yml"
       - "docs/ubuntu-deployment.md"
       - "infra/ubuntu/**"
+      - "infra/postgresql/**"
+      - "infra/validation/verify-runtime-roles.sql"
+      - "infra/validation/repair-mount-verifier/**"
+      - "cmd/nmcp-admin/**"
+      - "internal/database/**"
+      - "internal/reconciliation/**"
+      - "internal/storage/**"
+      - "go.mod"
+      - "go.sum"
       - "scripts/assert-ubuntu-files-endpoint"
       - "scripts/capture-trusted-inputs"
       - "scripts/check-ubuntu-services"
@@ -18,13 +27,23 @@ on:
       - "scripts/render-ubuntu-postgresql-dependency"
       - "scripts/renew-ubuntu-tls"
       - "scripts/run-ubuntu-migration"
+      - "scripts/run-ubuntu-migration-compatibility"
+      - "scripts/set-ubuntu-migration-role-mode"
       - "scripts/validate-ubuntu-config"
       - "scripts/verify-ubuntu-deployment"
+      - "scripts/verify-ubuntu-diagnostic-fixtures"
       - "scripts/verify-ubuntu-config-boundaries"
       - "scripts/verify-ubuntu-firewall"
       - "scripts/verify-ubuntu-firewall-fixtures"
       - "scripts/verify-ubuntu-installed-nginx"
+      - "scripts/verify-installed-runtime-roles"
       - "scripts/verify-ubuntu-migration-lock"
+      - "scripts/verify-ubuntu-migration-role-compatibility"
+      - "scripts/verify-ubuntu-migration-role-client"
+      - "scripts/verify-ubuntu-migration-role-containment"
+      - "scripts/verify-ubuntu-migration-role-stage"
+      - "scripts/verify-ubuntu-migration-role-supervisor"
+      - "scripts/verify-ubuntu-repair-mount-boundaries"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
       - "scripts/verify-ubuntu-service-gate"
@@ -39,6 +58,15 @@ on:
       - ".github/workflows/ubuntu-deployment.yml"
       - "docs/ubuntu-deployment.md"
       - "infra/ubuntu/**"
+      - "infra/postgresql/**"
+      - "infra/validation/verify-runtime-roles.sql"
+      - "infra/validation/repair-mount-verifier/**"
+      - "cmd/nmcp-admin/**"
+      - "internal/database/**"
+      - "internal/reconciliation/**"
+      - "internal/storage/**"
+      - "go.mod"
+      - "go.sum"
       - "scripts/assert-ubuntu-files-endpoint"
       - "scripts/capture-trusted-inputs"
       - "scripts/check-ubuntu-services"
@@ -51,13 +79,23 @@ on:
       - "scripts/render-ubuntu-postgresql-dependency"
       - "scripts/renew-ubuntu-tls"
       - "scripts/run-ubuntu-migration"
+      - "scripts/run-ubuntu-migration-compatibility"
+      - "scripts/set-ubuntu-migration-role-mode"
       - "scripts/validate-ubuntu-config"
       - "scripts/verify-ubuntu-deployment"
+      - "scripts/verify-ubuntu-diagnostic-fixtures"
       - "scripts/verify-ubuntu-config-boundaries"
       - "scripts/verify-ubuntu-firewall"
       - "scripts/verify-ubuntu-firewall-fixtures"
       - "scripts/verify-ubuntu-installed-nginx"
+      - "scripts/verify-installed-runtime-roles"
       - "scripts/verify-ubuntu-migration-lock"
+      - "scripts/verify-ubuntu-migration-role-compatibility"
+      - "scripts/verify-ubuntu-migration-role-client"
+      - "scripts/verify-ubuntu-migration-role-containment"
+      - "scripts/verify-ubuntu-migration-role-stage"
+      - "scripts/verify-ubuntu-migration-role-supervisor"
+      - "scripts/verify-ubuntu-repair-mount-boundaries"
       - "scripts/verify-ubuntu-nginx-http"
       - "scripts/verify-ubuntu-postgresql-dependency"
       - "scripts/verify-ubuntu-service-gate"
@@ -78,29 +116,102 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
 
       - name: Install parser and HTTP test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends nginx-core shellcheck
+          sudo apt-get install --yes --no-install-recommends \
+            ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck util-linux
+
+      - name: Run trusted migration compatibility transaction
+        run: |
+          go_binary=$(command -v go)
+          cd /
+          /usr/bin/sudo -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LC_ALL=C HOME=/root \
+            GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            NMCP_WORKSPACE="$GITHUB_WORKSPACE" NMCP_CURRENT_COMMIT="${{ github.sha }}" \
+            NMCP_GO_BINARY="$go_binary" /usr/bin/python3 -I -S - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          workspace = os.environ["NMCP_WORKSPACE"]
+          commit = os.environ["NMCP_CURRENT_COMMIT"]
+          go_binary = os.environ["NMCP_GO_BINARY"]
+          git_environment = {
+              "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+              "LC_ALL": "C",
+              "HOME": "/root",
+              "GIT_NO_REPLACE_OBJECTS": "1",
+              "GIT_CONFIG_NOSYSTEM": "1",
+              "GIT_CONFIG_GLOBAL": "/dev/null",
+          }
+          resolved = subprocess.run(
+              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
+               "rev-parse", "--verify", f"{commit}^{{commit}}"),
+              cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
+          ).stdout.decode("ascii").strip()
+          if resolved != commit:
+              raise SystemExit("candidate commit identity mismatch")
+          source = subprocess.run(
+              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
+               "show", f"{commit}:scripts/verify-ubuntu-migration-role-containment"),
+              cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
+          ).stdout
+          client = subprocess.run(
+              ("/usr/bin/git", "-c", f"safe.directory={workspace}", "-C", workspace,
+               "show", f"{commit}:scripts/verify-ubuntu-migration-role-client"),
+              cwd="/", env=git_environment, check=True, stdout=subprocess.PIPE,
+          ).stdout
+          os.makedirs("/run/nmcp-ci", mode=0o700, exist_ok=True)
+          client_path = "/run/nmcp-ci/containment-client.py"
+          descriptor = os.open(client_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o500)
+          try:
+              os.write(descriptor, client)
+              os.fchmod(descriptor, 0o500)
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          sys.argv = ["verify-ubuntu-migration-role-containment", client_path, workspace, commit, go_binary]
+          namespace = {"__name__": "__main__", "__file__": f"{commit}:scripts/verify-ubuntu-migration-role-containment"}
+          exec(compile(source, namespace["__file__"], "exec"), namespace)
+          PY
 
       - name: Check shell scripts
         run: |
-          shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
+          /usr/bin/shellcheck scripts/install-ubuntu-host scripts/install-ubuntu-release \
             scripts/check-ubuntu-tls-expiry scripts/renew-ubuntu-tls \
-            scripts/run-ubuntu-migration scripts/verify-ubuntu-migration-lock \
+            scripts/run-ubuntu-migration scripts/run-ubuntu-migration-compatibility \
+            scripts/set-ubuntu-migration-role-mode scripts/verify-ubuntu-migration-lock \
+            scripts/verify-ubuntu-migration-role-compatibility scripts/verify-ubuntu-repair-mount-boundaries \
             scripts/verify-ubuntu-config-boundaries scripts/verify-ubuntu-firewall-fixtures \
             scripts/verify-ubuntu-installed-nginx scripts/verify-ubuntu-nginx-http \
             scripts/verify-ubuntu-postgresql-dependency scripts/verify-ubuntu-release-failures \
             scripts/verify-ubuntu-service-gate scripts/verify-ubuntu-tls-certificate \
             scripts/verify-ubuntu-systemd-environment scripts/verify-ubuntu-systemd-mounts \
-            scripts/verify-ubuntu-trusted-inputs
+            scripts/verify-ubuntu-trusted-inputs scripts/verify-installed-runtime-roles
 
       - name: Verify deployment assets
-        run: scripts/verify-ubuntu-deployment
+        run: /usr/bin/python3 scripts/verify-ubuntu-deployment
+
+      - name: Verify privileged repair mount boundaries
+        run: |
+          go test -c -o /tmp/nmcp-storage-repair.test ./internal/storage
+          go build -o /tmp/nmcp-repair-late-bind ./infra/validation/repair-mount-verifier
+          sudo scripts/verify-ubuntu-repair-mount-boundaries \
+            /tmp/nmcp-storage-repair.test /tmp/nmcp-repair-late-bind
 
       - name: Verify configuration and firewall counterexamples
         run: |

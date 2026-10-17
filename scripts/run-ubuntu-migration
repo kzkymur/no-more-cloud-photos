@@ -29,5 +29,5 @@ else
   /usr/bin/rm -f -- "$completion"
   exit 0
 fi
-exec /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+exec /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
   "$release/bin/nmcp-admin" migrate up --json

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 0077
+
+[[ $EUID -eq 0 ]] || {
+  printf 'set-ubuntu-migration-role-mode: must run as root\n' >&2
+  exit 1
+}
+mode=${1:-}
+[[ $# -eq 1 && ( $mode == compatibility || $mode == hardened ) ]] || {
+  printf 'usage: set-ubuntu-migration-role-mode compatibility|hardened\n' >&2
+  exit 2
+}
+
+bootstrap_dir=/usr/local/libexec/nmcp/postgresql
+bootstrap=${NMCP_RUNTIME_ROLES:-$bootstrap_dir/runtime-roles.sql}
+verifier=${NMCP_VERIFY_ROLE_GRAPH:-$bootstrap_dir/verify-runtime-role-graph.sql}
+checksums=/var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256
+for path in "$bootstrap" "$verifier"; do
+  if [[ $path =~ ^/proc/self/fd/[0-9]+$ ]]; then
+    [[ -f $path && $(/usr/bin/stat -L -c '%U:%G:%a' "$path") == root:root:644 ]]
+  else
+    [[ -f $path && ! -L $path && $(/usr/bin/stat -c '%U:%G:%a' "$path") == root:root:644 ]]
+  fi || {
+    printf 'set-ubuntu-migration-role-mode: unsafe pinned SQL asset: %s\n' "$path" >&2
+    exit 1
+  }
+done
+[[ -f $checksums && ! -L $checksums \
+  && $(/usr/bin/stat -c '%U:%G:%a' "$checksums") == root:root:600 ]] || {
+  printf 'set-ubuntu-migration-role-mode: unsafe checksum evidence\n' >&2
+  exit 1
+}
+if [[ -z ${NMCP_RUNTIME_ROLES:-} && -z ${NMCP_VERIFY_ROLE_GRAPH:-} ]]; then
+  (cd -- "$bootstrap_dir" && /usr/bin/sha256sum --check --status "$checksums") || {
+    printf 'set-ubuntu-migration-role-mode: pinned SQL checksum mismatch\n' >&2
+    exit 1
+  }
+fi
+
+compatibility=FALSE
+[[ $mode == hardened ]] || compatibility=TRUE
+psql_local() {
+  /usr/bin/env -i /usr/sbin/runuser -u postgres -- \
+    /usr/bin/psql --no-psqlrc --host=/var/run/postgresql --port=5432 \
+    --username=postgres --dbname=nmcp "$@"
+}
+psql_local \
+  --set=nmcp_migrator_role=nmcp_migrator \
+  --set=nmcp_api_role=nmcp_api \
+  --set=nmcp_worker_role=nmcp_worker \
+  --set="nmcp_migration_compatibility=$compatibility" <"$bootstrap"
+
+if [[ $mode == hardened ]]; then
+  if [[ ${NMCP_TEST_PAUSE_BEFORE_GRAPH_VERIFY:-} == 1 ]]; then
+    /usr/bin/touch /run/nmcp-test-before-role-graph-verify.ready
+    while [[ ! -e /run/nmcp-test-before-role-graph-verify.go ]]; do
+      /usr/bin/sleep 0.05
+    done
+  fi
+  psql_local <"$verifier"
+fi

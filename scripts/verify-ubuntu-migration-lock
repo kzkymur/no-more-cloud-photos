@@ -17,6 +17,15 @@ trap cleanup EXIT
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp
 /usr/bin/install -o root -g root -m 0755 "$repo/scripts/run-ubuntu-migration" \
   /usr/local/libexec/nmcp/run-ubuntu-migration
+# This fixture isolates deployment/execution-lock behavior. Model the production
+# compatibility wrapper's non-root migration execution without requiring a
+# PostgreSQL role graph, which has its own end-to-end verifier.
+cat > /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility <<'EOF'
+#!/bin/sh
+exec /usr/sbin/runuser -u nmcp -- "$@"
+EOF
+/usr/bin/chown root:root /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
+/usr/bin/chmod 0755 /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
 /usr/bin/install -o root -g root -m 0755 "$repo/scripts/acquire-ubuntu-deployment-locks" \
   /usr/local/libexec/nmcp/acquire-ubuntu-deployment-locks
 /usr/bin/install -o root -g root -m 0755 "$repo/scripts/handoff-ubuntu-migration-lock" \

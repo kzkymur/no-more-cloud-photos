@@ -25,6 +25,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatal(err)
 	}
 	input := integrationAcceptance(t, "first-key", "first-request", timezone, []byte("same-content"), testUUIDs[0], testUUIDs[1])
+	registerIntegrationAcceptance(t, repository, input)
 	publishes := 0
 	outcome, err := repository.Finalize(ctx, input, func() (string, error) {
 		publishes++
@@ -47,7 +48,8 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatalf("row counts media/original/job/event = %d/%d/%d/%d", mediaCount, originalCount, jobCount, eventCount)
 	}
 
-	replay, err := repository.Finalize(ctx, input, func() (string, error) {
+	replayInput := freshReplayAcceptance(t, repository, input)
+	replay, err := repository.Finalize(ctx, replayInput, func() (string, error) {
 		t.Fatal("replay published")
 		return "", nil
 	})
@@ -55,7 +57,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatalf("replay=%+v err=%v", replay, err)
 	}
 
-	conflictInput := input
+	conflictInput := freshReplayAcceptance(t, repository, input)
 	conflictInput.RequestHash = sha256.Sum256([]byte("different request"))
 	conflict, err := repository.Finalize(ctx, conflictInput, func() (string, error) {
 		t.Fatal("conflict published")
@@ -66,6 +68,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 	}
 
 	duplicateInput := integrationAcceptance(t, "duplicate-key", "duplicate-request", timezone, []byte("same-content"), testUUIDs[2], testUUIDs[3])
+	registerIntegrationAcceptance(t, repository, duplicateInput)
 	duplicate, err := repository.Finalize(ctx, duplicateInput, func() (string, error) {
 		t.Fatal("duplicate published")
 		return "", nil
@@ -74,8 +77,9 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		!bytesContain(duplicate.Body, `"request_id":"duplicate-request"`) {
 		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
 	}
-	duplicateInput.RequestID = "current-replay-request"
-	duplicateReplay, err := repository.Finalize(ctx, duplicateInput, func() (string, error) {
+	duplicateReplayInput := freshReplayAcceptance(t, repository, duplicateInput)
+	duplicateReplayInput.RequestID = "current-replay-request"
+	duplicateReplay, err := repository.Finalize(ctx, duplicateReplayInput, func() (string, error) {
 		t.Fatal("duplicate replay published")
 		return "", nil
 	})
@@ -88,6 +92,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 		t.Fatal(err)
 	}
 	deletedDuplicate := integrationAcceptance(t, "deleted-duplicate-key", "deleted-request", timezone, []byte("same-content"), testUUIDs[3], testUUIDs[4])
+	registerIntegrationAcceptance(t, repository, deletedDuplicate)
 	deletedOutcome, err := repository.Finalize(ctx, deletedDuplicate, func() (string, error) {
 		t.Fatal("deleted duplicate published")
 		return "", nil
@@ -114,6 +119,7 @@ func TestRepositoryIntegrationAcceptanceReplayConflictAndDuplicate(t *testing.T)
 	originalID, _ := NewUUIDv4()
 	mediaID, _ := NewUUIDv4()
 	profileInput := integrationAcceptance(t, "profile-key", "profile-request", timezone, []byte("different-content"), originalID, mediaID)
+	registerIntegrationAcceptance(t, repository, profileInput)
 	profileOutcome, err := repository.Finalize(ctx, profileInput, func() (string, error) {
 		return "originals/11/11111111-1111-4111-8111-111111111111/original.jpg", nil
 	})
@@ -144,7 +150,13 @@ func TestRepositoryIntegrationConcurrentSameKeyReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := integrationAcceptance(t, "concurrent-replay", "replay-request", timezone, []byte("concurrent-replay-content"), testUUIDs[0], testUUIDs[1])
+	inputs := []acceptance{
+		integrationAcceptance(t, "concurrent-replay", "replay-request", timezone, []byte("concurrent-replay-content"), testUUIDs[0], testUUIDs[1]),
+		integrationAcceptance(t, "concurrent-replay", "replay-request", timezone, []byte("concurrent-replay-content"), testUUIDs[2], testUUIDs[3]),
+	}
+	for _, input := range inputs {
+		registerIntegrationAcceptance(t, repository, input)
+	}
 	type result struct {
 		outcome Outcome
 		err     error
@@ -157,19 +169,19 @@ func TestRepositoryIntegrationConcurrentSameKeyReplay(t *testing.T) {
 	var publishes atomic.Int32
 	var ready sync.WaitGroup
 	ready.Add(2)
-	for range 2 {
-		go func() {
+	for index := range inputs {
+		go func(index int) {
 			ready.Done()
 			<-start
 			calling <- struct{}{}
-			outcome, err := repository.Finalize(ctx, input, func() (string, error) {
+			outcome, err := repository.Finalize(ctx, inputs[index], func() (string, error) {
 				publishes.Add(1)
 				publishReached <- struct{}{}
 				<-releasePublish
 				return "originals/00/concurrent-replay/original.jpg", nil
 			})
 			results <- result{outcome: outcome, err: err}
-		}()
+		}(index)
 	}
 	ready.Wait()
 	close(start)
@@ -201,6 +213,9 @@ func TestRepositoryIntegrationConcurrentDifferentKeysSameSHA(t *testing.T) {
 	inputs := []acceptance{
 		integrationAcceptance(t, "sha-key-a", "sha-request-a", timezone, []byte("shared-sha-content"), testUUIDs[0], testUUIDs[1]),
 		integrationAcceptance(t, "sha-key-b", "sha-request-b", timezone, []byte("shared-sha-content"), testUUIDs[2], testUUIDs[3]),
+	}
+	for _, input := range inputs {
+		registerIntegrationAcceptance(t, repository, input)
 	}
 	type result struct {
 		outcome Outcome
@@ -287,6 +302,7 @@ func TestRepositoryIntegrationMaintenanceAndTimezoneRejection(t *testing.T) {
 			t.Fatal(err)
 		}
 		input := integrationAcceptance(t, "timezone-key", "timezone-request", timezone, []byte("timezone-content"), testUUIDs[0], testUUIDs[1])
+		registerIntegrationAcceptance(t, repository, input)
 		_, err = repository.Finalize(ctx, input, func() (string, error) {
 			t.Fatal("timezone-change request published")
 			return "", nil
@@ -346,6 +362,12 @@ func uploadIntegrationPool(t *testing.T, configure func(*pgxpool.Config, *pgxpoo
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Integration races may need an operation, an explicit blocker, and an
+	// independent observer connection at the same time. Do not inherit a
+	// single-connection DSN that turns lock evidence into pool starvation.
+	if config.MaxConns < 4 {
+		config.MaxConns = 4
+	}
 	config.AfterConnect = func(ctx context.Context, connection *pgx.Conn) error {
 		_, err := connection.Exec(ctx, `SELECT pg_catalog.set_config('search_path',$1,false)`, schema+",pg_catalog,pg_temp")
 		return err
@@ -399,9 +421,32 @@ func integrationAcceptance(t *testing.T, key, requestID, timezone string, conten
 	filename := "photo.jpg"
 	return acceptance{
 		Key: key, RequestID: requestID, RequestHash: CanonicalRequestHashV1(digest, uint64(len(content)), &filename),
-		SHA256: digest, Size: int64(len(content)), Filename: &filename, OriginalID: originalID, MediaID: mediaID,
+		SHA256: digest, Size: int64(len(content)), Filename: &filename, OriginalID: originalID, AttemptID: mediaID, MediaID: mediaID,
 		Timezone: timezone, Metadata: result, EXIFJSON: json.RawMessage(exif), SourceJSON: json.RawMessage(source),
 	}
+}
+
+func registerIntegrationAcceptance(t *testing.T, repository *pgRepository, input acceptance) {
+	t.Helper()
+	if err := repository.RegisterAttempt(context.Background(), input.AttemptID, input.OriginalID); err != nil {
+		t.Fatalf("register upload attempt: %v", err)
+	}
+}
+
+func freshReplayAcceptance(t *testing.T, repository *pgRepository, input acceptance) acceptance {
+	t.Helper()
+	var err error
+	if input.OriginalID, err = NewUUIDv4(); err != nil {
+		t.Fatal(err)
+	}
+	if input.AttemptID, err = NewUUIDv4(); err != nil {
+		t.Fatal(err)
+	}
+	if input.MediaID, err = NewUUIDv4(); err != nil {
+		t.Fatal(err)
+	}
+	registerIntegrationAcceptance(t, repository, input)
+	return input
 }
 
 func bytesContain(body []byte, value string) bool { return strings.Contains(string(body), value) }

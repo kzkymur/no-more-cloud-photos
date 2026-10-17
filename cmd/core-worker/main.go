@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/animationprocessor"
@@ -14,7 +16,10 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
+	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
+	"github.com/kzkymur/no-more-cloud-photos/internal/purgeexecutor"
+	"github.com/kzkymur/no-more-cloud-photos/internal/renditioncleanup"
 	"github.com/kzkymur/no-more-cloud-photos/internal/stillprocessor"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 	"github.com/kzkymur/no-more-cloud-photos/internal/transformcapability"
@@ -88,12 +93,56 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("configure job worker: %w", err)
 	}
+	purgeService, err := medialifecycle.NewService(pool, cfg.FileBaseURL)
+	if err != nil {
+		return fmt.Errorf("configure purge service: %w", err)
+	}
+	purgeWorker, err := worker.New(purgeexecutor.Repository{Service: purgeService}, map[job.Type]worker.Executor{
+		job.TypePurge: purgeexecutor.Executor{Service: purgeService, Store: store},
+	}, worker.Options{DatabaseTimeout: 30 * time.Second}, logger)
+	if err != nil {
+		return fmt.Errorf("configure purge worker: %w", err)
+	}
+	cleanupRunner, err := renditioncleanup.New(purgeService, store, renditioncleanup.Options{}, logger)
+	if err != nil {
+		return fmt.Errorf("configure rendition cleanup: %w", err)
+	}
 	logger.LogAttrs(ctx, slog.LevelInfo, "core Worker ready", cfg.LogAttrs()...)
-	if err := jobWorker.Run(ctx); err != nil {
-		return fmt.Errorf("run job worker: %w", err)
+	if err := runWorkers(ctx, jobWorker, purgeWorker, cleanupRunner); err != nil {
+		return fmt.Errorf("run core workers: %w", err)
 	}
 	logger.Info("core Worker stopped")
 	return nil
+}
+
+type workerLoop interface{ Run(context.Context) error }
+
+func runWorkers(ctx context.Context, loops ...workerLoop) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, len(loops))
+	for _, loop := range loops {
+		go func(loop workerLoop) { results <- loop.Run(runCtx) }(loop)
+	}
+	var first error
+	for index := range loops {
+		err := <-results
+		// A loop reporting the shared run context's terminal cause is a normal
+		// consequence of either process shutdown or sibling cancellation. Keep
+		// the originating loop failure, if any, rather than converting graceful
+		// SIGTERM into a non-zero process exit.
+		expectedCancellation := runCtx.Err() != nil && errors.Is(err, runCtx.Err())
+		if err != nil && !expectedCancellation && first == nil {
+			first = err
+		}
+		if err == nil && index == 0 && ctx.Err() == nil && first == nil {
+			first = fmt.Errorf("worker loop exited unexpectedly")
+		}
+		if index == 0 {
+			cancel()
+		}
+	}
+	return first
 }
 
 func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, repository *job.Repository, store *storage.Store) (*transformexecutor.Executor, transformcapability.Envelope, error) {

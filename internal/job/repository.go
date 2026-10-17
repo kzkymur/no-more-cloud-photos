@@ -99,15 +99,25 @@ func (r *Repository) claim(ctx context.Context, registeredTypes []Type, allowedP
 	if len(types) == 0 {
 		return Lease{}, ErrNoWork
 	}
-	token, err := r.uuid()
-	if err != nil {
-		return Lease{}, fmt.Errorf("generate lease token: %w", err)
-	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return Lease{}, classifyDatabaseError(err)
 	}
 	defer rollback(tx)
+	// Claim participates in the normal-write barrier before allocating a lease
+	// or touching Job/Target/attempt history. The share lock remains held until
+	// commit, so maintenance entry cannot interleave with claim mutation.
+	if _, err := tx.Exec(ctx, `SELECT nmcp_require_normal_maintenance()`); err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == "55000" {
+			return Lease{}, ErrNoWork
+		}
+		return Lease{}, classifyDatabaseError(err)
+	}
+	token, err := r.uuid()
+	if err != nil {
+		return Lease{}, fmt.Errorf("generate lease token: %w", err)
+	}
 
 	var lease Lease
 	var originalID *string
@@ -235,6 +245,13 @@ func (r *TransformClaimer) PublishRendition(ctx context.Context, candidate Rendi
 	return r.repository.PublishRendition(ctx, candidate)
 }
 
+func (r *TransformClaimer) PublishRenditionFile(ctx context.Context, candidate Rendition, publish func() (int64, string, error)) (Publication, error) {
+	if r == nil || !r.bound || r.repository == nil || r.profileIDs == nil {
+		return Publication{}, ErrInvalid
+	}
+	return r.repository.PublishRenditionFile(ctx, candidate, publish)
+}
+
 // ClaimableTransformProfiles returns the exact profile definitions that this
 // repository may expose through a transform claim. Active profiles are joined
 // by retired profiles already pinned by queued or running work.
@@ -336,6 +353,34 @@ func (r *Repository) FinishAttempt(ctx context.Context, jobID, token string, cod
 	if !ok {
 		return ErrInvalid
 	}
+	if code == FailureMaintenancePaused {
+		return r.transitionLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
+			// The claim already consumed an attempt before maintenance won the
+			// publication fence. Preserve monotonic attempt history and compensate
+			// exactly one retry allowance rather than decrementing attempts or
+			// requiring an administrative retry.
+			tag, err := tx.Exec(ctx, `UPDATE jobs SET status='queued',max_attempts=max_attempts+1,
+				available_at=clock_timestamp(),lease_token=NULL,lease_expires_at=NULL,
+				error_code=$2,error_message=$3,finished_at=NULL,updated_at=clock_timestamp()
+				WHERE id=$1 AND status='running' AND lease_token=$4 AND lease_expires_at>clock_timestamp()
+				  AND max_attempts<2147483647`, jobID, code, message, token)
+			if err != nil {
+				return classifyDatabaseError(err)
+			}
+			if tag.RowsAffected() != 1 {
+				var live bool
+				if err := tx.QueryRow(ctx, `SELECT status='running' AND lease_token=$2
+					AND lease_expires_at>clock_timestamp() FROM jobs WHERE id=$1`, jobID, token).Scan(&live); err != nil {
+					return classifyDatabaseError(err)
+				}
+				if !live {
+					return ErrLeaseLost
+				}
+				return ErrInvariant
+			}
+			return nil
+		})
+	}
 	return r.transitionLiveLease(ctx, jobID, token, func(tx pgx.Tx) error {
 		var attempts int
 		if err := tx.QueryRow(ctx, `SELECT attempts FROM jobs WHERE id=$1`, jobID).Scan(&attempts); err != nil {
@@ -397,7 +442,7 @@ func (r *Repository) ReclaimExpired(ctx context.Context) (int, error) {
 	}
 	defer rollback(tx)
 	rows, err := tx.Query(ctx, `SELECT id::text,attempts FROM jobs
-		WHERE status='running' AND lease_expires_at<=clock_timestamp()
+		WHERE type='transform' AND status='running' AND lease_expires_at<=clock_timestamp()
 		ORDER BY lease_expires_at,id FOR UPDATE SKIP LOCKED LIMIT $1`, r.reclaimBatch)
 	if err != nil {
 		return 0, classifyDatabaseError(err)
@@ -429,7 +474,7 @@ func (r *Repository) ReclaimExpired(ctx context.Context) (int, error) {
 			available_at=CASE WHEN attempts<max_attempts THEN clock_timestamp()+$2::interval ELSE available_at END,
 			lease_token=NULL,lease_expires_at=NULL,error_code=$3,error_message=$4,
 			finished_at=CASE WHEN attempts<max_attempts THEN NULL ELSE clock_timestamp() END,updated_at=clock_timestamp()
-			WHERE id=$1`, item.id, intervalText(delay), FailureLeaseExpired, safeFailureMessages[FailureLeaseExpired])
+			WHERE id=$1 AND type='transform'`, item.id, intervalText(delay), FailureLeaseExpired, safeFailureMessages[FailureLeaseExpired])
 		if err != nil {
 			return 0, classifyDatabaseError(err)
 		}

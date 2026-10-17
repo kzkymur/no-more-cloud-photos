@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func TestLifecycleRepositoryIntegrationDeferredCommitRejectionRollsBack(t *testing.T) {
@@ -241,6 +244,142 @@ func TestLifecycleRepositoryIntegrationPostCommitResponseLossConverges(t *testin
 			t.Fatalf("purge jobs = %d, %v", jobs, err)
 		}
 	})
+
+	t.Run("purge reclaim", func(t *testing.T) {
+		ctx := context.Background()
+		pool, setupService := integrationService(t)
+		mediaID := integrationUUID(773)
+		insertMedia(t, pool, mediaID, integrationUUID(774))
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := setupService.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, err := setupService.StartPurge(ctx, enqueued.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, first.JobID); err != nil {
+			t.Fatal(err)
+		}
+		fault := errors.New("purge reclaim commit response lost")
+		service := lifecycleServiceWithOnePostCommitFailure(pool, fault)
+		_, err = service.StartNextPurge(ctx, 10)
+		assertCommitOutcomeUnknown(t, err, fault)
+		retry, err := service.StartNextPurge(ctx, 10)
+		if err != nil || retry.JobID != first.JobID || retry.Attempts != 2 || !retry.StartedAt.Equal(first.StartedAt) || retry.Token == first.Token {
+			t.Fatalf("StartNextPurge retry = %#v, %v", retry, err)
+		}
+	})
+
+	t.Run("initial purge start", func(t *testing.T) {
+		ctx := context.Background()
+		pool, setupService := integrationService(t)
+		mediaID := integrationUUID(775)
+		insertMedia(t, pool, mediaID, integrationUUID(776))
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := setupService.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fault := errors.New("initial purge start response lost")
+		faultyService := lifecycleServiceWithOnePostCommitFailure(pool, fault)
+		_, err = faultyService.StartPurge(ctx, enqueued.Job.ID)
+		assertCommitOutcomeUnknown(t, err, fault)
+		var durableToken string
+		var firstStartedAt time.Time
+		var attempts int
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status,attempts,lease_token::text,started_at FROM jobs WHERE id=$1`, enqueued.Job.ID).Scan(
+			&status, &attempts, &durableToken, &firstStartedAt); err != nil {
+			t.Fatal(err)
+		}
+		if status != "running" || attempts != 1 || durableToken == "" || firstStartedAt.IsZero() {
+			t.Fatalf("durable initial purge status=%s attempts=%d token=%q started=%s", status, attempts, durableToken, firstStartedAt)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, enqueued.Job.ID); err != nil {
+			t.Fatal(err)
+		}
+		repository := setupService.repository.(*PostgresRepository)
+		repository.jitter = func(time.Duration) time.Duration { return 0 }
+		reclaimed, err := repository.ReclaimExpiredPurges(ctx, 10)
+		if err != nil || len(reclaimed) != 1 || reclaimed[0] != enqueued.Job.ID {
+			t.Fatalf("reclaim unknown-start purge = %#v, %v", reclaimed, err)
+		}
+		retry, err := setupService.StartNextPurge(ctx, 10)
+		if err != nil || retry.JobID != enqueued.Job.ID || retry.Attempts != 2 || !retry.StartedAt.Equal(firstStartedAt) || retry.Token == durableToken {
+			t.Fatalf("unknown-start retry = %#v, %v", retry, err)
+		}
+	})
+
+	t.Run("purge file progress", func(t *testing.T) {
+		ctx := context.Background()
+		pool, setupService := integrationService(t)
+		mediaID := integrationUUID(777)
+		insertMedia(t, pool, mediaID, integrationUUID(778))
+		if _, err := setupService.Delete(ctx, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := setupService.EnqueuePurge(ctx, mediaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := setupService.StartPurge(ctx, enqueued.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fault := errors.New("purge progress commit response lost")
+		faultyService := lifecycleServiceWithOnePostCommitFailure(pool, fault)
+		faultyRepository := faultyService.repository.(*PostgresRepository)
+		var relativePath string
+		if err := pool.QueryRow(ctx, `SELECT relative_path FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&relativePath); err != nil {
+			t.Fatal(err)
+		}
+		root := t.TempDir()
+		writePurgeFixture(t, root, relativePath, []byte("0123456789"))
+		store, err := storage.Open(root, storage.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		_, err = faultyRepository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, StoragePurgeFileAction(store))
+		assertCommitOutcomeUnknown(t, err, fault)
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relativePath))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("purge file after lost commit response stat error = %v", err)
+		}
+		var disposition string
+		if err := pool.QueryRow(ctx, `SELECT disposition FROM purge_file_progress WHERE job_id=$1`, lease.JobID).Scan(&disposition); err != nil {
+			t.Fatal(err)
+		}
+		if disposition != "deleted" {
+			t.Fatalf("durable purge progress disposition = %s", disposition)
+		}
+		retry, err := faultyRepository.RunPurgeFileStep(ctx, lease.JobID, lease.Token, func(context.Context, PurgeFile) (PurgeFileDisposition, error) {
+			t.Fatal("terminal progress row was invoked after unknown commit")
+			return "", nil
+		})
+		if err != nil || !retry.Done {
+			t.Fatalf("purge progress retry = %#v, %v", retry, err)
+		}
+		finalFault := errors.New("purge finalizer commit response lost")
+		finalRepository := lifecycleServiceWithOnePostCommitFailure(pool, finalFault).repository.(*PostgresRepository)
+		if err := finalRepository.FinalizePurge(ctx, lease.JobID, lease.Token); err == nil {
+			t.Fatal("lost finalizer commit response reported success")
+		} else {
+			assertCommitOutcomeUnknown(t, err, finalFault)
+		}
+		if err := finalRepository.FinalizePurge(ctx, lease.JobID, lease.Token); err != nil {
+			t.Fatalf("finalizer convergence: %v", err)
+		}
+		var events int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM change_events WHERE media_id=$1 AND event_type='media_purged' AND reason='physical_purge'`, mediaID).Scan(&events); err != nil || events != 1 {
+			t.Fatalf("finalizer events=%d error=%v", events, err)
+		}
+	})
 }
 
 func TestLifecycleRepositoryIntegrationDeleteVersusTransformPublication(t *testing.T) {
@@ -435,6 +574,7 @@ func lifecycleServiceWithOnePostCommitFailure(pool *pgxpool.Pool, fault error) *
 	var failed atomic.Bool
 	repository := &PostgresRepository{
 		db: pool, fileBaseURL: "https://files.example/files/", newID: newUUIDv4,
+		jitter: func(time.Duration) time.Duration { return 0 },
 		afterCommit: func(context.Context) error {
 			if failed.CompareAndSwap(false, true) {
 				return fault

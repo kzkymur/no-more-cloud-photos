@@ -26,6 +26,11 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/videoprocessor"
 )
 
+type maintenanceClaimOutcome struct {
+	lease Lease
+	err   error
+}
+
 func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	pool, repository := integrationRepository(t, Options{})
 	ctx := context.Background()
@@ -64,6 +69,204 @@ func TestClaimIntegrationOrderingTypesAvailabilityAndHydration(t *testing.T) {
 	}
 	if _, err := repository.Claim(ctx, []Type{"unsupported"}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unregistered API type error = %v", err)
+	}
+}
+
+func TestClaimIntegrationMaintenanceBarrierNoMutationAndDrain(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	jobID, targets := insertTransformJob(t, pool, 3, 1)
+	if _, err := pool.Exec(ctx, `UPDATE job_targets SET status='failed',error_code='process_failed',error_message='retry fixture' WHERE id=$1`, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='claim blocked',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	before := claimMaintenanceSnapshot(t, pool, jobID)
+	if _, err := repository.Claim(ctx, []Type{TypeTransform}); !errors.Is(err, ErrNoWork) {
+		t.Fatalf("Claim() during maintenance error = %v, want ErrNoWork", err)
+	}
+	if after := claimMaintenanceSnapshot(t, pool, jobID); after != before {
+		t.Fatalf("maintenance Claim mutated Job/Target/attempt history\nbefore: %s\nafter:  %s", before, after)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(context.Background())
+	if _, err := blocker.Exec(ctx, `SELECT id FROM job_targets WHERE id=$1 FOR UPDATE`, targets[0]); err != nil {
+		t.Fatal(err)
+	}
+	var blockerPID int32
+	if err := blocker.QueryRow(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&blockerPID); err != nil {
+		t.Fatal(err)
+	}
+	claimResult := make(chan maintenanceClaimOutcome, 1)
+	go func() {
+		lease, err := repository.Claim(ctx, []Type{TypeTransform})
+		claimResult <- maintenanceClaimOutcome{lease: lease, err: err}
+	}()
+	waitForBlockedLockChain(t, ctx, pool, blockerPID, 1)
+
+	maintenanceConnection, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenanceConnection.Release()
+	var maintenancePID int32
+	if err := maintenanceConnection.QueryRow(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&maintenancePID); err != nil {
+		t.Fatal(err)
+	}
+	maintenanceResult := make(chan error, 1)
+	go func() {
+		_, err := maintenanceConnection.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='claim drain',owner='test',entered_at=clock_timestamp() WHERE id=1`)
+		maintenanceResult <- err
+	}()
+	awaitClaimMaintenanceWait(t, ctx, pool, maintenancePID, claimResult, maintenanceResult)
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var claimed maintenanceClaimOutcome
+	select {
+	case claimed = <-claimResult:
+	case <-ctx.Done():
+		t.Fatalf("await Claim after target release: %v", ctx.Err())
+	}
+	if claimed.err != nil || claimed.lease.ID != jobID || claimed.lease.Attempts != 1 {
+		t.Fatalf("Claim() after target release = %+v, %v", claimed.lease, claimed.err)
+	}
+	select {
+	case err := <-maintenanceResult:
+		if err != nil {
+			t.Fatalf("enter maintenance after Claim commit: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("await maintenance after Claim commit: %v", ctx.Err())
+	}
+}
+
+func TestMaintenancePauseIntegrationFencesCancelledAndExpiredLeases(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	t.Run("cancelled pause does not grant retry allowance", func(t *testing.T) {
+		jobID, lease := claimFinalTransformAttempt(t, ctx, pool, repository)
+		before := claimMaintenanceSnapshot(t, pool, jobID)
+		cancelled, stop := context.WithCancel(ctx)
+		stop()
+		if err := repository.FinishAttempt(cancelled, jobID, lease.Token, FailureMaintenancePaused); !errors.Is(err, ErrDatabaseUnavailable) {
+			t.Fatalf("cancelled maintenance pause error = %v, want ErrDatabaseUnavailable", err)
+		}
+		if after := claimMaintenanceSnapshot(t, pool, jobID); after != before {
+			t.Fatalf("cancelled maintenance pause mutated state\nbefore: %s\nafter:  %s", before, after)
+		}
+		if err := repository.FinishAttempt(ctx, jobID, lease.Token, FailureMaintenancePaused); err != nil {
+			t.Fatalf("live maintenance pause: %v", err)
+		}
+		assertJobAttemptBudget(t, pool, jobID, StatusQueued, 3, 4)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()+interval '1 day' WHERE id=$1`, jobID); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("expired crash path does not invent maintenance allowance", func(t *testing.T) {
+		jobID, lease := claimFinalTransformAttempt(t, ctx, pool, repository)
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1 AND lease_token=$2`, jobID, lease.Token); err != nil {
+			t.Fatal(err)
+		}
+		if count, err := repository.ReclaimExpired(ctx); err != nil || count != 1 {
+			t.Fatalf("ReclaimExpired() = %d, %v; want 1", count, err)
+		}
+		assertJobAttemptBudget(t, pool, jobID, StatusFailed, 3, 3)
+		before := claimMaintenanceSnapshot(t, pool, jobID)
+		if err := repository.FinishAttempt(ctx, jobID, lease.Token, FailureMaintenancePaused); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("expired maintenance pause error = %v, want ErrLeaseLost", err)
+		}
+		if after := claimMaintenanceSnapshot(t, pool, jobID); after != before {
+			t.Fatalf("expired maintenance pause mutated state\nbefore: %s\nafter:  %s", before, after)
+		}
+	})
+}
+
+func claimFinalTransformAttempt(t *testing.T, ctx context.Context, pool *pgxpool.Pool, repository *integrationTestRepository) (string, Lease) {
+	t.Helper()
+	jobID, _ := insertTransformJob(t, pool, 3, 1)
+	var lease Lease
+	for attempt := 1; attempt <= 3; attempt++ {
+		var err error
+		lease, err = repository.Claim(ctx, []Type{TypeTransform})
+		if err != nil {
+			t.Fatalf("Claim attempt %d: %v", attempt, err)
+		}
+		if attempt == 3 {
+			break
+		}
+		if err := repository.FinishAttempt(ctx, jobID, lease.Token, FailureProcessFailed); err != nil {
+			t.Fatalf("FinishAttempt attempt %d: %v", attempt, err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp() WHERE id=$1`, jobID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return jobID, lease
+}
+
+func assertJobAttemptBudget(t *testing.T, pool *pgxpool.Pool, jobID string, wantStatus Status, wantAttempts, wantMaximum int) {
+	t.Helper()
+	var status Status
+	var attempts, maximum int
+	if err := pool.QueryRow(context.Background(), `SELECT status,attempts,max_attempts FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts, &maximum); err != nil {
+		t.Fatal(err)
+	}
+	if status != wantStatus || attempts != wantAttempts || maximum != wantMaximum {
+		t.Fatalf("job attempt budget = %s/%d/%d, want %s/%d/%d", status, attempts, maximum, wantStatus, wantAttempts, wantMaximum)
+	}
+}
+
+func claimMaintenanceSnapshot(t *testing.T, pool *pgxpool.Pool, jobID string) string {
+	t.Helper()
+	var snapshot string
+	if err := pool.QueryRow(context.Background(), `SELECT jsonb_build_object(
+		'job',to_jsonb(j),
+		'targets',(SELECT COALESCE(jsonb_agg(to_jsonb(jt) ORDER BY jt.id),'[]'::jsonb) FROM job_targets AS jt WHERE jt.job_id=j.id),
+		'attempts',(SELECT COALESCE(jsonb_agg(to_jsonb(sa) ORDER BY sa.id),'[]'::jsonb) FROM storage_attempts AS sa WHERE sa.job_id=j.id),
+		'attempt_events',(SELECT COALESCE(jsonb_agg(to_jsonb(se) ORDER BY se.id),'[]'::jsonb) FROM storage_attempt_events AS se JOIN storage_attempts AS sa ON sa.id=se.attempt_id WHERE sa.job_id=j.id)
+	)::text FROM jobs AS j WHERE j.id=$1`, jobID).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func awaitClaimMaintenanceWait(t *testing.T, ctx context.Context, pool *pgxpool.Pool, maintenancePID int32, claim <-chan maintenanceClaimOutcome, maintenance <-chan error) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx, `SELECT COALESCE(wait_event_type='Lock'
+			AND cardinality(pg_catalog.pg_blocking_pids(pid))>0
+			AND position('UPDATE maintenance_state SET mode=''maintenance''' in query)>0,false)
+			FROM pg_catalog.pg_stat_activity WHERE pid=$1`, maintenancePID).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case result := <-claim:
+			t.Fatalf("Claim returned before target release: lease=%+v error=%v", result.lease, result.err)
+		case err := <-maintenance:
+			t.Fatalf("maintenance returned before Claim commit: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("maintenance backend %d did not wait for Claim share fence: %v", maintenancePID, ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -801,6 +1004,36 @@ func TestCompleteSucceededRejectsExpiredTransformAndPurgeIntegration(t *testing.
 	}
 	if !deletedAfter.Equal(deletedBefore) || !purgeAfter.Equal(purgeBefore) {
 		t.Fatalf("purge completion changed Media: deleted %s→%s purge %s→%s", deletedBefore, deletedAfter, purgeBefore, purgeAfter)
+	}
+}
+
+func TestTransformReclaimDoesNotOwnExpiredPurgeIntegration(t *testing.T) {
+	pool, repository := integrationRepository(t, Options{Jitter: func(time.Duration) time.Duration { return 0 }})
+	ctx := context.Background()
+	purgeID, mediaID, token := newTestUUID(t), newTestUUID(t), newTestUUID(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after)
+		VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp())`, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts)
+		VALUES ($1,'purge',$2,'queued',3)`, purgeID, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,
+		lease_expires_at=clock_timestamp(),started_at=clock_timestamp() WHERE id=$1`, purgeID, token); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := repository.ReclaimExpired(ctx); err != nil || count != 0 {
+		t.Fatalf("transform reclaim count = %d, %v", count, err)
+	}
+	var status Status
+	var retainedToken string
+	var attempts int
+	if err := pool.QueryRow(ctx, `SELECT status,lease_token::text,attempts FROM jobs WHERE id=$1`, purgeID).Scan(&status, &retainedToken, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != StatusRunning || retainedToken != token || attempts != 1 {
+		t.Fatalf("transform reclaim mutated purge status=%s token=%s attempts=%d", status, retainedToken, attempts)
 	}
 }
 

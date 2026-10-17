@@ -164,6 +164,14 @@ run_admin() {
     return 1
   }
   owner_start=$(/usr/local/libexec/nmcp/handoff-ubuntu-migration-lock process-start "$$")
+  local -a admin_command
+  if [[ $operation == migrate && $subcommand == up ]]; then
+    admin_command=(/usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
+      "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json)
+  else
+    admin_command=(/usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs
+      "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json)
+  fi
   /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$$" "$owner_start" "$handoff" \
     /run/nmcp-deploy/migration-execution.lock 8 "$runner_file" \
     "$unit.service" "$operation_timeout" \
@@ -176,9 +184,7 @@ run_admin() {
     --property=NoNewPrivileges=yes --property=PrivateTmp=yes \
     --property=ProtectSystem=strict --property=ProtectHome=yes \
     -- /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock receive "$handoff" \
-    /run/nmcp-deploy/migration-execution.lock \
-    /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
-    "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json \
+    /run/nmcp-deploy/migration-execution.lock "${admin_command[@]}" \
     9>&- &
   runner=$!
   wait "$runner" || status=$?
@@ -193,6 +199,9 @@ run_migration() {
   local migration_release token=/run/nmcp-migration-complete temporary
   migration_release=$(/usr/bin/readlink -f -- "$current")
   temporary=$token.new.$$
+  # Invalidate any prior RemainAfterExit success before compatibility mode can
+  # be entered. API/Worker Requires= this unit and cannot use stale readiness.
+  /usr/bin/systemctl stop nmcp-migrate.service
   run_admin "$migration_release" migrate up || return 1
   /usr/bin/printf '%s\n' "$(/usr/bin/readlink -f -- "$current")" > "$temporary"
   /usr/bin/chown root:root "$temporary"
