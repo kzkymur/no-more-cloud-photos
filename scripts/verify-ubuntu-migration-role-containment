@@ -111,13 +111,19 @@ def diagnostic_errno(error):
     return number if type(number) is int else "unknown"
 
 
-def evidence_failure(phase, operation, resource_class, error):
+def evidence_failure_number(phase, operation, resource_class, number):
     if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS
             or resource_class not in DIAGNOSTIC_RESOURCES):
         phase, operation, resource_class = "uncategorized", "unknown", "unknown"
-    number = diagnostic_errno(error) if isinstance(error, OSError) else "unknown"
+    if type(number) is not int and number != "unknown":
+        number = "unknown"
     return EvidenceFailure(
         f"phase={phase} operation={operation} resource={resource_class} errno={number}")
+
+
+def evidence_failure(phase, operation, resource_class, error):
+    number = diagnostic_errno(error) if isinstance(error, OSError) else "unknown"
+    return evidence_failure_number(phase, operation, resource_class, number)
 
 
 def retained_diagnostic(error, fallback):
@@ -184,9 +190,10 @@ def try_nonblocking_flock(descriptor, phase, resource_class):
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
     except BlockingIOError as error:
-        if diagnostic_errno(error) == errno.EWOULDBLOCK:
+        number = diagnostic_errno(error)
+        if number == errno.EWOULDBLOCK:
             return False
-        raise evidence_failure(phase, "flock", resource_class, error) from None
+        raise evidence_failure_number(phase, "flock", resource_class, number) from None
     except OSError as error:
         raise evidence_failure(phase, "flock", resource_class, error) from None
 
