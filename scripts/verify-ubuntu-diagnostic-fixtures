@@ -3,6 +3,7 @@
 
 import errno
 import fcntl
+import io
 import os
 import pathlib
 import runpy
@@ -348,8 +349,11 @@ def diagnostic_cases(client, containment):
 
     assert_safe(client["top_level_diagnostic"](injected(errno.EIO)),
                 "phase=uncategorized operation=unknown resource=unknown errno=5")
-    assert_safe(containment["top_level_diagnostic"](injected(errno.EIO)),
-                "phase=uncategorized operation=unknown resource=unknown errno=5")
+    containment_line = containment["top_level_diagnostic"](injected(errno.EIO))
+    require(containment_line ==
+            b"containment-test: 'scenario=containment;failure=os-error;finality=unknown;"
+            b"detail=phase=uncategorized operation=unknown resource=unknown errno=5'\n",
+            "containment top-level OS diagnostic was not an exact serialized line")
 
     categorized = containment["evidence_failure"](
         "persistent-cleanup", "read", "evidence", hostile)
@@ -644,9 +648,9 @@ def stale_diagnostic_cases(containment):
     rendered = diagnostic(
         "wrong-reason", False, classification, True, True, True, True,
         True, True, True, True, True, True, True, True, "fixture", True,
-        False, True, False)
+        False, True, False).decode("ascii")
     fields = (
-        "scenario=stale;", ";failure_category=wrong-reason;", ";attempted=1;",
+        "scenario=stale;", ";failure=wrong-reason;", ";attempted=1;",
         ";result_available=1;", ";client_zero=0;", ";success_marker=0;",
         ";expected_rejection=0;", ";wrong_reason=1;", ";unit_absent=1;",
         ";recorded_empty=1;", ";canonical_empty=1;", ";identity_unchanged=1;",
@@ -665,25 +669,141 @@ def stale_diagnostic_cases(containment):
                              hostile):
         for error_category in ("none", "fixture", "release", "state", "identity",
                                "action", "post", "lock", "paths", hostile):
-            message = diagnostic(
+            emitted = diagnostic(
                 failure_category, False, classification, False, False, False, False,
                 True, False, False, False, False, True, True, True, error_category,
                 True, True, True, True)
-            emitted = "containment-test: " + containment["top_level_diagnostic"](
-                RuntimeError(message)) + "\n"
-            require(len(emitted.encode("ascii")) <= 512 and "<truncated>" not in emitted,
+            require(len(emitted) <= 512 and b"<truncated>" not in emitted,
                     "complete stale diagnostic exceeded its final emitted bound")
             messages.append(emitted)
-    require(all(value for value in equivalents) and all(hostile not in value for value in messages),
+    require(all(value for value in equivalents)
+            and all(hostile.encode("ascii") not in value for value in messages),
             "stale diagnostic depended on hostile error/signature/state equivalents")
-    emitted = "containment-test: " + containment["top_level_diagnostic"](
-        RuntimeError(rendered)) + "\n"
-    require(len(emitted.encode("ascii")) <= 512 and "<truncated>" not in emitted,
+    emitted = rendered.encode("ascii")
+    require(len(emitted) <= 512 and b"<truncated>" not in emitted,
             "required stale diagnostic fields were truncated by top-level rendering")
     forbidden = ("signature=", "state=", "InvocationID", "Description", "Environment",
                  "Command", "stdout=", "stderr=", "/run/", "pid=", "nonce")
-    require(not any(item in emitted for item in forbidden),
+    require(not any(item.encode("ascii") in emitted for item in forbidden),
             "stale diagnostic leaked forbidden identity, stream, path, PID, or nonce evidence")
+
+
+def containment_serialization_cases(containment):
+    class UnrenderableError(Exception):
+        def __str__(self):
+            raise RuntimeError("hostile string conversion")
+
+    class PartialStream:
+        def __init__(self):
+            self.payload = bytearray()
+            self.flushed = 0
+
+        def write(self, payload):
+            written = min(7, len(payload))
+            self.payload.extend(payload[:written])
+            return written
+
+        def flush(self):
+            self.flushed += 1
+
+    containment["assert_machine_result_contract"]()
+    long_line = containment["top_level_diagnostic"](RuntimeError("x" * 4096))
+    require(len(long_line) == 512 and long_line.count(b"\n") == 1
+            and long_line.endswith(b"...<truncated>'\n")
+            and long_line.startswith(
+                b"containment-test: 'scenario=containment;failure=unexpected;finality=unknown;"),
+            "long top-level diagnostic did not retain exact bounded leading evidence")
+    escaped = containment["top_level_diagnostic"](
+        RuntimeError("quote=' newline=\n nonascii=é"))
+    require(len(escaped) == 117 and escaped.count(b"\n") == 1
+            and b"newline=\\n" in escaped and b"nonascii=\\xe9" in escaped,
+            "escaping or non-ASCII changed the exact serialized byte form")
+    redacted = containment["top_level_diagnostic"](RuntimeError("a" * 64))
+    require(len(redacted) == 101 and b"<redacted-hex64>" in redacted
+            and b"a" * 64 not in redacted,
+            "hex64 redaction changed the exact serialized byte form")
+    nonce = "nonce-value-that-must-not-survive"
+    nonce_line = containment["serialize_diagnostic"](
+        "containment", "unexpected", (("finality", "unknown"),),
+        detail="prefix-" + nonce + "-suffix", active_nonce=nonce)
+    require(nonce.encode("ascii") not in nonce_line and b"<redacted-nonce>" in nonce_line,
+            "active nonce survived centralized serialization")
+    state_line = containment["top_level_diagnostic"](
+        RuntimeError("Description=hostile Environment=secret"))
+    require(b"Description" not in state_line and b"Environment" not in state_line
+            and b"diagnostic contained redacted launch identity" in state_line,
+            "launch state survived centralized serialization")
+    conversion_line = containment["top_level_diagnostic"](UnrenderableError())
+    require(b"detail=diagnostic conversion failed" in conversion_line
+            and len(conversion_line) <= 512,
+            "hostile exception string conversion suppressed the bounded diagnostic")
+    stream = io.BytesIO()
+    written = containment["write_diagnostic"](stream, RuntimeError("x" * 4096))
+    require(written == 512 and stream.getvalue() == long_line,
+            "real diagnostic write did not preserve the exact serialized byte line")
+    partial = PartialStream()
+    written = containment["write_diagnostic"](partial, RuntimeError("partial"))
+    require(written == len(partial.payload) and partial.flushed == 1,
+            "diagnostic writer did not complete bounded short writes and flush exactly once")
+    for result in (0, None):
+        broken = PartialStream()
+        broken.write = lambda _payload, observed=result: observed
+        try:
+            containment["write_diagnostic"](broken, RuntimeError("broken"))
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("diagnostic writer accepted a non-progressing stream")
+
+    predicate_names = (
+        "case_exact", "lifecycle_match", "schema_shape", "schema_exact", "primary_exact",
+        "events_exact", "return_match", "stdout_match", "success_match", "events_complete",
+        "final_scanned", "final_observed", "final_empty", "intercept_match", "attempt_match",
+        "retry_match", "lock_handoff_ok", "cleanup_error_empty", "cleanup_categories",
+        "lock_reuse", "signed_cleanup_required", "signed_cleanup_ran", "release", "reap",
+        "unit_absent", "recorded_category", "recorded_required", "recorded_scan",
+        "canonical_scan", "recorded_empty", "canonical_empty", "artifacts_absent",
+    )
+    families = tuple((boundary, "normal", "none") for boundary in
+                     ("show", "kill", "stop", "wait", "reset", "unload")) + (
+                         ("kill", "parse", "non-canonical"),
+                         ("wait", "timeout", "timeout"),
+                     )
+    for boundary, case, lifecycle in families:
+        for failed in predicate_names:
+            predicates = {name: True for name in predicate_names}
+            predicates[failed] = False
+            payload = containment["persistent_scalar_diagnostic"](
+                case, boundary, lifecycle, predicates,
+                {"line_count": 999999, "byte_count": 999999, "byte_bounded": False,
+                 "leading_whitespace": False, "trailing_whitespace": False})
+            require(len(payload) <= 512 and b"<truncated>" not in payload
+                    and f";boundary={boundary};".encode("ascii") in payload,
+                    "persistent case/boundary finality failure lost complete serialization")
+            stream = io.BytesIO()
+            failure = containment["SerializedDiagnosticFailure"](payload)
+            written = containment["write_diagnostic"](stream, failure)
+            require(written == len(payload) and stream.getvalue() == payload,
+                    "live persistent failure path replaced or recomposed fixed finality evidence")
+
+    serializer = containment["serialize_diagnostic"]
+    for fields in (
+            (("finality", "unknown"), ("finality", "complete")),
+            (("bad-name", "unknown"),),
+            (("finality", "bad.value"),)):
+        try:
+            serializer("containment", "unexpected", fields, complete=True)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("diagnostic schema accepted duplicate or open fields")
+    try:
+        serializer("containment", "unexpected", (("finality", "unknown"),),
+                   detail="x" * 4096, complete=True)
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("complete diagnostic accepted an over-cap tail")
 
 
 def client_cgroup_lifecycle_cases(client):
@@ -3714,6 +3834,7 @@ def main():
     release_marker_security_cases(client, containment)
     signed_cleanup_lock_cases(containment)
     stale_diagnostic_cases(containment)
+    containment_serialization_cases(containment)
     client_cgroup_lifecycle_cases(client)
     client_prelaunch_production_path_case(client)
     client_final_residue_diagnostic_cases(client)
