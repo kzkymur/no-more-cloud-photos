@@ -469,6 +469,30 @@ def persistent_launch_release_cases(containment):
         globals_["persistent_launch_barriers"] = original_barriers
 
 
+def persistent_handoff_state_cases(containment):
+    function = containment["persistent_handoff_state_accepted"]
+    path = "/usr/bin/env"
+    argv = (path, "-i", "KEY=value", "/opt/nmcp/helper", "--mode", "exact")
+    signature = containment["launch_identity_signature"](
+        "a" * 32, "exact fixture", "KEY=value", path, argv)
+    loaded = {
+        "LoadState": "loaded", "InvocationID": "a" * 32,
+        "Description": "exact fixture", "Environment": "KEY=value",
+        "Command": {"path": path, "argv": argv}, **containment["SERVICE_PROPERTIES"],
+    }
+    absent = {"LoadState": "not-found"}
+    require(function("unload", absent, signature, []),
+            "unload handoff rejected explicit post-reset absence")
+    require(function("unload", loaded, signature, []),
+            "unload handoff rejected exact retained launch identity")
+    require(not function("reset", absent, signature, []),
+            "non-unload handoff accepted explicit absence")
+    require(not function("unload", {**loaded, "InvocationID": "b" * 32}, signature, []),
+            "unload handoff accepted changed loaded identity")
+    require(not function("unload", absent, signature, [1234]),
+            "unload handoff accepted recorded cgroup residue")
+
+
 def release_marker_security_cases(client, containment):
     client_globals = client["durable_marker"].__globals__
     original_run = client_globals["RUN"]
@@ -4007,6 +4031,7 @@ def main():
     diagnostic_cases(client, containment)
     explicit_marker_phase_cases(containment)
     persistent_launch_release_cases(containment)
+    persistent_handoff_state_cases(containment)
     release_marker_security_cases(client, containment)
     signed_cleanup_lock_cases(containment)
     stale_diagnostic_cases(containment)
