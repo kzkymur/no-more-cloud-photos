@@ -103,11 +103,19 @@ class PersistentCgroupFinalityFailure(RuntimeError):
         self.canonical_scanned = canonical_scanned
 
 
+def diagnostic_errno(error):
+    try:
+        number = error.errno
+    except BaseException:
+        return "unknown"
+    return number if type(number) is int else "unknown"
+
+
 def evidence_failure(phase, operation, resource_class, error):
     if (phase not in DIAGNOSTIC_PHASES or operation not in DIAGNOSTIC_OPERATIONS
             or resource_class not in DIAGNOSTIC_RESOURCES):
         phase, operation, resource_class = "uncategorized", "unknown", "unknown"
-    number = error.errno if isinstance(error, OSError) and type(error.errno) is int else errno.EIO
+    number = diagnostic_errno(error) if isinstance(error, OSError) else "unknown"
     return EvidenceFailure(
         f"phase={phase} operation={operation} resource={resource_class} errno={number}")
 
@@ -176,7 +184,7 @@ def try_nonblocking_flock(descriptor, phase, resource_class):
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
     except BlockingIOError as error:
-        if error.errno == errno.EWOULDBLOCK:
+        if diagnostic_errno(error) == errno.EWOULDBLOCK:
             return False
         raise evidence_failure(phase, "flock", resource_class, error) from None
     except OSError as error:
@@ -668,7 +676,7 @@ def sanitized_diagnostic_text(value, active_nonce=None):
     elif isinstance(value, subprocess.CalledProcessError):
         text = f"subprocess failed with status {value.returncode}"
     elif isinstance(value, OSError):
-        number = value.errno if type(value.errno) is int else errno.EIO
+        number = diagnostic_errno(value)
         text = f"phase=uncategorized operation=unknown resource=unknown errno={number}"
     else:
         try:
@@ -745,6 +753,79 @@ def serialize_diagnostic(scenario, failure_class, fields=(), detail=None,
     return payload
 
 
+def validate_serialized_diagnostic(payload):
+    prefix = (DIAGNOSTIC_PREFIX + "'").encode("ascii")
+    if (type(payload) is not bytes or not payload or len(payload) > DIAGNOSTIC_TEXT_LIMIT
+            or not payload.startswith(prefix) or not payload.endswith(b"'\n")
+            or payload.count(b"\n") != 1):
+        raise RuntimeError("serialized diagnostic framing was invalid")
+    try:
+        message = payload[len(prefix):-2].decode("ascii")
+    except UnicodeDecodeError:
+        raise RuntimeError("serialized diagnostic was not ASCII") from None
+    pairs = []
+    for part in message.split(";"):
+        name, separator, value = part.partition("=")
+        if (not separator or not name or not value
+                or any(character not in "abcdefghijklmnopqrstuvwxyz_" for character in name)
+                or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)):
+            raise RuntimeError("serialized diagnostic schema was invalid")
+        pairs.append((name, value))
+    if (len(pairs) < 2 or pairs[0][0] != "scenario" or pairs[1][0] != "failure"
+            or pairs[0][1] not in ("persistent", "stale")
+            or (pairs[0][1] == "persistent" and pairs[1][1] != "result")
+            or (pairs[0][1] == "stale" and pairs[1][1] not in (
+                "accepted", "wrong-reason", "fixture-error", "cleanup-error", "invalid"))):
+        raise RuntimeError("serialized diagnostic class was invalid")
+    serialized_fields = tuple(pairs[2:])
+    field_names = tuple(name for name, _value in serialized_fields)
+    fields_by_name = dict(serialized_fields)
+    if pairs[0][1] == "persistent":
+        expected_names = (
+            "case", "boundary", "life", "release", "reap", "signed_req", "signed_ran",
+            "absent", "rec_cat", "rec_req", "rec_scan", "can_scan", "rec_empty",
+            "can_empty", "handoff", "reuse", "artifacts", "cleanup_empty",
+            "cleanup_cats", "ev_complete", "fin_scan", "fin_seen", "fin_empty",
+            "case_exact", "life_match", "schema_shape", "schema_exact", "primary",
+            "events", "ret", "out", "success", "retry", "intercept", "attempt",
+            "se_lines", "se_bytes", "se_lws", "se_tws",
+        )
+        bit_names = expected_names[3:35] + expected_names[37:]
+        line_count = fields_by_name.get("se_lines", "")
+        valid_domains = (
+            fields_by_name.get("case") in ("normal", "parse", "timeout")
+            and fields_by_name.get("boundary") in ("show", "kill", "stop", "wait", "reset", "unload")
+            and fields_by_name.get("life") in ("none", "non-canonical", "timeout", "unexpected")
+            and all(fields_by_name.get(name) in ("0", "1") for name in bit_names)
+            and line_count != "" and all(character in "0123456789" for character in line_count)
+            and (line_count == "0" or line_count[0] != "0")
+            and fields_by_name.get("se_bytes") in ("bounded", "empty", "over")
+        )
+    else:
+        expected_names = (
+            "attempted", "result_available", "client_zero", "success_marker",
+            "expected_rejection", "wrong_reason", "unit_absent", "recorded_empty",
+            "canonical_empty", "identity_unchanged", "cleanup_attempted",
+            "cleanup_succeeded", "lock_reusable", "artifacts_removed",
+            "post_evidence_complete", "ready", "release", "ack", "error_category",
+            "fixture_error", "client_output", "client_diagnostic", "cleanup_error",
+        )
+        bit_names = expected_names[:18] + expected_names[19:]
+        valid_domains = (
+            all(fields_by_name.get(name) in ("0", "1") for name in bit_names)
+            and fields_by_name.get("error_category") in (
+                "none", "fixture", "release", "state", "identity", "action", "post",
+                "lock", "paths", "invalid")
+        )
+    if field_names != expected_names or not valid_domains:
+        raise RuntimeError("serialized diagnostic fields were incomplete")
+    trusted = serialize_diagnostic(
+        pairs[0][1], pairs[1][1], serialized_fields, complete=True)
+    if trusted != payload:
+        raise RuntimeError("serialized diagnostic was not canonical and complete")
+    return payload
+
+
 def top_level_diagnostic(error):
     if isinstance(error, OSError):
         detail = evidence_failure("uncategorized", "unknown", "unknown", error)
@@ -755,12 +836,13 @@ def top_level_diagnostic(error):
 
 
 def write_diagnostic(stream, error):
-    payload = (error.payload if isinstance(error, SerializedDiagnosticFailure)
+    payload = (validate_serialized_diagnostic(error.payload)
+               if isinstance(error, SerializedDiagnosticFailure)
                else top_level_diagnostic(error))
     offset = 0
     while offset < len(payload):
         written = stream.write(payload[offset:])
-        if type(written) is not int or written <= 0:
+        if type(written) is not int or written <= 0 or written > len(payload) - offset:
             raise RuntimeError("diagnostic stream write was not complete")
         offset += written
     stream.flush()

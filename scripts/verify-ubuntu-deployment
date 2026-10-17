@@ -3777,17 +3777,33 @@ def validate_containment(source: str, phase: str) -> None:
     require_exact_function(tree, "diagnostic_bit", '''def diagnostic_bit(value):
     return "1" if bool(value) else "0"
 ''', "containment stale diagnostic flags must use fixed one-byte tokens")
+    require_exact_function(tree, "diagnostic_errno", '''def diagnostic_errno(error):
+    try:
+        number = error.errno
+    except BaseException:
+        return "unknown"
+    return number if type(number) is int else "unknown"
+''', "containment errno classification must fail closed without rendering hostile properties")
     serialization_contract = {
         "stale_failure_message": ('serialize_diagnostic("stale", failure_category, fields, complete=True)',),
         "sanitized_diagnostic_text": ("<redacted-nonce>", "<redacted-hex64>",
                                       "diagnostic contained redacted launch identity"),
         "render_diagnostic_message": ("DIAGNOSTIC_PREFIX + ascii(message)", '.encode("ascii")'),
         "serialize_diagnostic": ("render_diagnostic_message(fixed)",
-                                 "if len(payload) > DIAGNOSTIC_TEXT_LIMIT",
-                                 'raise RuntimeError("complete diagnostic exceeded its outer byte bound")'),
+                                  "if len(payload) > DIAGNOSTIC_TEXT_LIMIT",
+                                  'raise RuntimeError("complete diagnostic exceeded its outer byte bound")'),
+        "validate_serialized_diagnostic": ('type(payload) is not bytes',
+                                            'payload.count(b"\\n") != 1',
+                                            '.decode("ascii")',
+                                            'pairs[0][1] not in ("persistent", "stale")',
+                                            "field_names != expected_names",
+                                            'fields_by_name.get("error_category")',
+                                            "complete=True", "trusted != payload"),
         "top_level_diagnostic": ("serialize_diagnostic(", '(("finality", "unknown"),)'),
-        "write_diagnostic": ("isinstance(error, SerializedDiagnosticFailure)",
-                             "while offset < len(payload):", "stream.flush()"),
+        "write_diagnostic": ("validate_serialized_diagnostic(error.payload)",
+                              "isinstance(error, SerializedDiagnosticFailure)",
+                              "written > len(payload) - offset",
+                              "while offset < len(payload):", "stream.flush()"),
         "persistent_scalar_diagnostic": ('serialize_diagnostic("persistent", "result", fields, complete=True)',
                                          '("boundary", boundary)', '("release", bits["release"])',
                                          '("fin_empty", bits["final_empty"])',
@@ -3852,7 +3868,7 @@ def validate_containment(source: str, phase: str) -> None:
         "SUCCESS", "PERSISTENT_PROPERTY_ERROR", "PERSISTENT_ACTION_ERROR",
         "STALE_REJECTION_PREFIX", "DIAGNOSTIC_TEXT_LIMIT", "DIAGNOSTIC_PREFIX", "COUNTER_MAX",
         "COUNTER_BYTE_LIMIT", "COUNTER_READ_ATTEMPTS", "COUNTER_CATEGORIES",
-        "persistent_failure_classification", "sanitized_diagnostic_text", "render_diagnostic_message", "serialize_diagnostic",
+        "persistent_failure_classification", "diagnostic_errno", "sanitized_diagnostic_text", "render_diagnostic_message", "serialize_diagnostic", "validate_serialized_diagnostic",
         "top_level_diagnostic", "write_diagnostic", "sanitized_state",
         "persistent_result_violation", "persistent_special_result_violation",
         "assert_persistent_failure_contract",
@@ -3870,7 +3886,7 @@ def validate_containment(source: str, phase: str) -> None:
         node for node in tree.body if isinstance(node, ast.FunctionDef)
     }
     expected_containment_functions = {
-        "fail", "evidence_failure", "retained_diagnostic",
+        "fail", "diagnostic_errno", "evidence_failure", "retained_diagnostic",
         "os_call", "counter_failure", "parse_counter", "counter_identity",
         "aggregate_counter_failure",
         "try_nonblocking_flock", "popen", "raise_walk_error",
@@ -3887,7 +3903,7 @@ def validate_containment(source: str, phase: str) -> None:
         "assert_machine_result_contract", "assert_persistent_cgroup_routing_contract",
         "stale_expected_rejection", "stale_client_classification", "diagnostic_bit",
         "stale_failure_message",
-        "sanitized_diagnostic_text", "render_diagnostic_message", "serialize_diagnostic", "sanitized_state", "write_diagnostic",
+        "sanitized_diagnostic_text", "render_diagnostic_message", "serialize_diagnostic", "validate_serialized_diagnostic", "sanitized_state", "write_diagnostic",
         "assert_persistent_failure_contract", "run", "parse_unit_properties", "show",
         "assert_property_parser_contract", "wait_path", "reset_signal_paths", "reset_paths",
         "validated_payload_marker", "validated_marker", "persistent_launch_barriers", "wait_persistent_launch_required",
@@ -3912,7 +3928,7 @@ def validate_containment(source: str, phase: str) -> None:
     }
     actual_containment_functions = {node.name for node in reviewed_persistent_functions}
     expected_function_signatures = (
-        ("fail", "message"),
+        ("fail", "message"), ("diagnostic_errno", "error"),
         ("evidence_failure", "phase, operation, resource_class, error"),
         ("retained_diagnostic", "error, fallback"),
         ("os_call", "phase, operation, resource_class, function, *args, **kwargs"),
@@ -3950,6 +3966,7 @@ def validate_containment(source: str, phase: str) -> None:
         ("sanitized_diagnostic_text", "value, active_nonce=None"),
         ("render_diagnostic_message", "message"),
         ("serialize_diagnostic", "scenario, failure_class, fields=(), detail=None, active_nonce=None, complete=False"),
+        ("validate_serialized_diagnostic", "payload"),
         ("top_level_diagnostic", "error"), ("write_diagnostic", "stream, error"),
         ("sanitized_state", "state"),
         ("assert_machine_result_contract", ""),
@@ -4069,7 +4086,7 @@ class PersistentCgroupFinalityFailure(RuntimeError):
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
     except BlockingIOError as error:
-        if error.errno == errno.EWOULDBLOCK:
+        if diagnostic_errno(error) == errno.EWOULDBLOCK:
             return False
         raise evidence_failure(phase, "flock", resource_class, error) from None
     except OSError as error:
@@ -4269,7 +4286,7 @@ COUNTER_CATEGORIES = (
         "RESULT_PRIMARY_CATEGORIES": 1, "RESULT_BOUNDARIES": 1,
         "RESULT_CLEANUP_CATEGORIES": 1,
         "PERSISTENT_PROPERTY_ERROR": 1, "PERSISTENT_ACTION_ERROR": 1,
-        "STALE_REJECTION_PREFIX": 1, "DIAGNOSTIC_TEXT_LIMIT": 6, "DIAGNOSTIC_PREFIX": 1,
+        "STALE_REJECTION_PREFIX": 1, "DIAGNOSTIC_TEXT_LIMIT": 7, "DIAGNOSTIC_PREFIX": 2,
         "PROGRAM": 2, "NONCE_VARIABLE": 3,
         "DESCRIPTION_PREFIX": 2, "SERVICE_PROPERTIES": 6, "IDENTITY_PROPERTIES": 1,
         "SYSTEMD_UNIT_OBJECT": 1, "CGROUP_SNAPSHOT_ATTEMPTS": 1,
@@ -4341,7 +4358,7 @@ COUNTER_CATEGORIES = (
             "containment imports exceed the reviewed modules")
     protected_persistent_bindings.update(reviewed_imports)
     expected_module_loads = {
-        "errno": 10, "fcntl": 5, "functools": 1, "json": 6, "os": 112,
+        "errno": 8, "fcntl": 5, "functools": 1, "json": 6, "os": 112,
         "runpy": 1, "secrets": 2,
         "signal": 6, "stat": 12, "subprocess": 98, "sys": 3, "time": 74,
     }
@@ -4351,7 +4368,7 @@ COUNTER_CATEGORIES = (
                 and node.id in actual_module_loads):
             actual_module_loads[node.id] += 1
     expected_module_attributes = {
-        ("errno", "EAGAIN"): 1, ("errno", "EIO"): 2, ("errno", "ESTALE"): 6,
+        ("errno", "EAGAIN"): 1, ("errno", "ESTALE"): 6,
         ("errno", "EWOULDBLOCK"): 1,
         ("fcntl", "LOCK_EX"): 1, ("fcntl", "LOCK_NB"): 1, ("fcntl", "LOCK_UN"): 1,
         ("fcntl", "flock"): 2, ("functools", "partial"): 1,
@@ -4378,7 +4395,7 @@ COUNTER_CATEGORIES = (
         ("time", "monotonic"): 54, ("time", "sleep"): 20,
     }
     expected_recursive_module_attributes = {
-        "errno.EAGAIN": 1, "errno.EIO": 2, "errno.ESTALE": 6,
+        "errno.EAGAIN": 1, "errno.ESTALE": 6,
         "errno.EWOULDBLOCK": 1,
         "fcntl.LOCK_EX": 1, "fcntl.LOCK_NB": 1, "fcntl.LOCK_UN": 1,
         "fcntl.flock": 2, "functools.partial": 1,
@@ -4471,7 +4488,7 @@ COUNTER_CATEGORIES = (
         "assert_persistent_cgroup_routing_contract", "assert_persistent_failure_contract",
         "assert_property_parser_contract", "assert_replaced_or_absent", "bool", "bytearray",
         "bytes",
-        "bounded_cleanup_timeout", "sanitized_diagnostic_text", "render_diagnostic_message", "serialize_diagnostic", "write_diagnostic", "cgroup_close", "cgroup_fstat",
+        "bounded_cleanup_timeout", "diagnostic_errno", "sanitized_diagnostic_text", "render_diagnostic_message", "serialize_diagnostic", "validate_serialized_diagnostic", "write_diagnostic", "cgroup_close", "cgroup_fstat",
         "cgroup_open", "cgroup_pids", "cgroup_read", "cgroup_stat", "cgroup_walk",
         "client_stderr_evidence", "cleanup", "cleanup_fixture_invocation", "cleanup_signed_launch",
         "cleanup_signed_launch_if_owned", "cleanup_signed_launch_until",
@@ -4506,8 +4523,8 @@ COUNTER_CATEGORIES = (
         "after_exit", "body", "budgeted", "calls", "cancelled", "categories", "character",
         "counts", "descendants",
         "cleanup_errors", "dict", "early_observed", "environment", "errors", "expected_slow_counts", "fcntl", "first", "functools",
-        "digits", "emitted", "field", "found", "json", "kwargs", "kill_stderr", "line", "loaded", "matching", "mode", "mutations",
-        "barrier_name", "name", "names", "labels", "observed", "orphaned", "os", "parts", "post_cleanup", "post_cleanup_cgroup", "process",
+        "digits", "emitted", "field", "fields_by_name", "found", "json", "kwargs", "kill_stderr", "line", "loaded", "matching", "mode", "mutations",
+        "barrier_name", "name", "names", "labels", "message", "observed", "orphaned", "os", "pairs", "part", "parts", "post_cleanup", "post_cleanup_cgroup", "prefix", "process",
         "parsed_events", "predicates", "property_boundaries", "raw_event",
         "partial", "recovered", "recovered_observed", "rendered", "replaced", "result", "runpy",
         "schema", "secrets", "sentinel_state",
@@ -4566,15 +4583,15 @@ COUNTER_CATEGORIES = (
     )
     reviewed_call_fingerprints = {
         # CPython 3.12 centralized bounded containment diagnostics.
-        ("409405f86422bae180bfd568a156dd2cdd322f2081e23990f8261fc5863b4189",
-         "ab2b4c855eecde282058ce16bdadf832cd2979e670d784b8a735e489189dbc5a",
+        ("7c1c969869c6208a625bee5415e849d929af61506c87459c8c0459ff21fd49c5",
+         "584e2858dfd7ecc3e634573e176a94bf9c006179a0e66e2dceeeb5572b98cfda",
          "52db6fe7d050a322c1ae51dd7261ee33ca2da7f07dcecff1350d2e811602fbe0",
-         "a500e6f424a189979af5035f3beb521891d9354e5985f8308a8b1dc783b56ad5"),
+         "e82d23d19c154fd671331969390a08fc65b4b3ed86021b08c566fc3d3c9823b7"),
         # CPython 3.14 centralized bounded containment diagnostics.
-        ("d13177dbf98f50b6ab8eec6c6b9fd8484c691197106693c1d0df8bdf51fee1e3",
-         "dde5d76f4d3138b482a6ed6ace0551b3c01c772dd5a540fe39491b6852e4bf94",
+        ("edc5ca4c61973f56d5a7c62a709b5f8a1a320e80a2d31975048e6c8e36fc3de7",
+         "39b6104cc32bea1adf9580ba4212a2d9a6d91d037965e3a7e9dc4d67b164b41a",
          "e11a509b8a1a5344b558c11b2f7f7903ada3c83aa6335500e6c924da3b2f5b07",
-         "5d4f2791611b7d35cb6776cb8b6b2b69fafe0cfc0de26e87e02b4af65271f94d"),
+         "4e5eaf60c0a5d5117421d939d1655b034e6ffad7455a80fa8b674921e6476c4c"),
         # CPython 3.14 contradictory final-evidence rejection.
         ("baac808ed0863905a85ef6e2919d7107337fb9121a2f12dc70ac9a1607ce07d5",
          "7e76563f12e29b31b0240d14e17cb89e1efe9835bef6adf23da666b57b635bec",
@@ -4867,7 +4884,7 @@ COUNTER_CATEGORIES = (
      'calls': 1,
      'cancelled': 2,
      'categories': 2,
-     'character': 13,
+     'character': 16,
      'cleanup': 1,
      'cleanup_errors': 1,
      'counts': 1,
@@ -4879,6 +4896,7 @@ COUNTER_CATEGORIES = (
      'errors': 3,
      'expected_slow_counts': 1,
      'field': 1,
+     'fields_by_name': 1,
      'first': 1,
      'found': 1,
      'identities': 1,
@@ -4889,14 +4907,17 @@ COUNTER_CATEGORIES = (
      'line': 3,
      'loaded': 1,
      'matching': 1,
+     'message': 2,
      'mode': 8,
      'mutations': 2,
-     'name': 26,
+     'name': 30,
      'names': 3,
      'observed': 9,
      'orphaned': 1,
      'parsed_events': 1,
      'parser': 1,
+     'pairs': 1,
+     'part': 1,
      'partial': 1,
      'parts': 3,
      'path': 8,
@@ -4904,6 +4925,7 @@ COUNTER_CATEGORIES = (
      'post_cleanup': 2,
      'post_cleanup_cgroup': 3,
      'predicates': 3,
+     'prefix': 6,
      'process': 3,
      'property_boundaries': 1,
      'raw_event': 1,
@@ -4932,7 +4954,7 @@ COUNTER_CATEGORIES = (
      'stopped': 3,
      'successful_terminal_state': 1,
      'text': 11,
-     'value': 22,
+     'value': 23,
      'values': 5,
      'wait_stderr': 1,
      'waiting': 1}
@@ -4948,6 +4970,10 @@ COUNTER_CATEGORIES = (
     require(actual_call_root_stores == expected_call_root_stores
             and hashlib.sha256(repr(sorted(call_root_store_contexts)).encode()).hexdigest()
                 in {"c829056d27170ebb10308a25ea86e73995dc2a636ba5263b4a1400c1a0ddde4c",
+                    "643a5d2fee958e04d71a5d256863cc09201b07b9e0f9ec32b4c09481eaf57ee8",
+                    "4d2b36d7285838671c9cdeb17dd9a3234fe8a550f070f3f2c5cacd4ad1201fad",
+                    "0276e35c67a1983df99188618f153ee296f155599a965487a3363036cddb5bc3",
+                    "f28bf0f8b1d6ad9ab04697fab915a079c1aa53994867c56059a496756b951325",
                     "fdf220ce97f89b7b4bbf49ed05574660303e33b224f7733603734e2ac40b8b4c",
                     "bd73ea022bd485052460cecb87ef6cd0250058beeef86cfa4ae73e6791c877a7",
                     "3263bdb50155b6a45ef6bed004b9baad4bbbc6db3b4917b50f144aee1c241cd3",
@@ -5018,9 +5044,9 @@ COUNTER_CATEGORIES = (
                         and node not in reviewed_import_aliases for node in ast.walk(tree)),
             "containment callable roots were rebound or shadowed")
     expected_statement_inventory = {
-        "Assign": 698, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
-        "Delete": 1, "Expr": 401, "For": 67, "FunctionDef": 107, "If": 306,
-        "Import": 12, "Pass": 5, "Raise": 72, "Return": 110, "Try": 87, "While": 21,
+        "Assign": 714, "AugAssign": 5, "Break": 10, "ClassDef": 3, "Continue": 11,
+        "Delete": 1, "Expr": 402, "For": 68, "FunctionDef": 109, "If": 312,
+        "Import": 12, "Pass": 5, "Raise": 78, "Return": 113, "Try": 89, "While": 21,
     }
     actual_statement_inventory = {}
     statement_contexts = []
@@ -5035,6 +5061,10 @@ COUNTER_CATEGORIES = (
     require(actual_statement_inventory == expected_statement_inventory
             and hashlib.sha256(repr(sorted(statement_contexts)).encode()).hexdigest()
                 in {"6859a94c0cb83bd77befc76ace00e29accfa01c13e55fd04ee6ded03e4d3341a",
+                    "c42491f1733fda82e3ca18ba20bbfb91471c7a33c8e22fdc08258737b5142968",
+                    "223f9a2cdea97ba6c9c2d1f3d02a2be2b1baefa88beb1cea000eeb2fb340111f",
+                    "e8e4bfd7c7777a2d0b1f17b6ab05d03b6bb2cf11f15e8990e05a8acd9dc7f737",
+                    "877d7ec68d58eef173245737106c519dcbff5d74758ca2139b7e1f9d52b76fc6",
                     "59ea4e4b2a713ff9b9c2648c0983505ec766445eb6390caf94acc04022fc4069",
                     "feda271f94c137cf97a60f670682f1d1c7049fb4912d80ad7ee915abe8214c50",
                     "d3b505ba580c30ac11cc8b93a56ef579ec755cd312eed30959cf70fed71da358",
@@ -6335,7 +6365,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "5492027b6b88c8b0db657bedaeec2b77572a79f8b4e80266ab3b78934b1d8b8d",
+            == "f6251248e4d121ceee15f3e4fafc03c62d4436cee328b8c345c8562629c578a7",
             "diagnostic fixture source snapshot changed")
 
 
@@ -8233,6 +8263,33 @@ def verify_supervisor_mutations(
         ("containment top fallback unsanitized", replace_once(containment,
             '        write_diagnostic(sys.stderr.buffer, error)',
             '        sys.stderr.buffer.write(str(error).encode())')),
+        ("containment serialized payload sink validation bypassed", replace_once(containment,
+            '    payload = (validate_serialized_diagnostic(error.payload)\n'
+            '               if isinstance(error, SerializedDiagnosticFailure)',
+            '    payload = (error.payload\n'
+            '               if isinstance(error, SerializedDiagnosticFailure)')),
+        ("containment serialized payload canonical check removed", replace_once(containment,
+            '    if trusted != payload:\n'
+            '        raise RuntimeError("serialized diagnostic was not canonical and complete")',
+            '    if False:\n'
+            '        raise RuntimeError("serialized diagnostic was not canonical and complete")')),
+        ("containment serialized payload field inventory bypassed", replace_once(containment,
+            '    if field_names != expected_names or not valid_domains:',
+            '    if False or not valid_domains:')),
+        ("containment serialized payload field domains bypassed", replace_once(containment,
+            '    if field_names != expected_names or not valid_domains:',
+            '    if field_names != expected_names or False:')),
+        ("containment impossible diagnostic write count accepted", replace_once(containment,
+            '        if type(written) is not int or written <= 0 or written > len(payload) - offset:',
+            '        if type(written) is not int or written <= 0:')),
+        ("containment hostile errno property accessed directly", replace_once(containment,
+            '    number = diagnostic_errno(error) if isinstance(error, OSError) else "unknown"',
+            '    number = error.errno if isinstance(error, OSError) else "unknown"')),
+        ("containment sanitized hostile errno property accessed directly", replace_once(containment,
+            '        number = diagnostic_errno(value)\n'
+            '        text = f"phase=uncategorized operation=unknown resource=unknown errno={number}"',
+            '        number = value.errno\n'
+            '        text = f"phase=uncategorized operation=unknown resource=unknown errno={number}"')),
         ("containment OS diagnostic uses raw error", replace_once(containment,
             '    return EvidenceFailure(\n'
             '        f"phase={phase} operation={operation} resource={resource_class} errno={number}")',
@@ -8251,11 +8308,11 @@ def verify_supervisor_mutations(
             '                fcntl.LOCK_EX | fcntl.LOCK_NB)')),
         ("arbitrary OSError treated as lock contention", replace_once(containment,
             '    except BlockingIOError as error:\n'
-            '        if error.errno == errno.EWOULDBLOCK:',
+            '        if diagnostic_errno(error) == errno.EWOULDBLOCK:',
             '    except OSError as error:\n'
-            '        if error.errno == errno.EWOULDBLOCK:')),
+            '        if diagnostic_errno(error) == errno.EWOULDBLOCK:')),
         ("all BlockingIOError treated as lock contention", replace_once(containment,
-            '        if error.errno == errno.EWOULDBLOCK:\n            return False',
+            '        if diagnostic_errno(error) == errno.EWOULDBLOCK:\n            return False',
             '        if True:\n            return False')),
         ("containment generic errno-only fallback", replace_once(containment,
             '        detail = evidence_failure("uncategorized", "unknown", "unknown", error)',

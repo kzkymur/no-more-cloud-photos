@@ -693,6 +693,16 @@ def containment_serialization_cases(containment):
         def __str__(self):
             raise RuntimeError("hostile string conversion")
 
+    class HostileErrno(OSError):
+        @property
+        def errno(self):
+            raise RuntimeError(SECRET)
+
+    class OpenErrno(OSError):
+        @property
+        def errno(self):
+            return SECRET
+
     class PartialStream:
         def __init__(self):
             self.payload = bytearray()
@@ -737,6 +747,15 @@ def containment_serialization_cases(containment):
     require(b"detail=diagnostic conversion failed" in conversion_line
             and len(conversion_line) <= 512,
             "hostile exception string conversion suppressed the bounded diagnostic")
+    for hostile_errno in (HostileErrno(), OpenErrno()):
+        require(containment["diagnostic_errno"](hostile_errno) == "unknown",
+                "hostile errno property escaped the closed unknown category")
+        errno_line = containment["top_level_diagnostic"](hostile_errno)
+        require(b"errno=unknown" in errno_line and SECRET.encode("ascii") not in errno_line,
+                "hostile errno property broke or leaked through serialization")
+        errno_text = containment["sanitized_diagnostic_text"](hostile_errno)
+        require(errno_text.endswith("errno=unknown") and SECRET not in errno_text,
+                "hostile errno property broke or leaked through sanitized text")
     stream = io.BytesIO()
     written = containment["write_diagnostic"](stream, RuntimeError("x" * 4096))
     require(written == 512 and stream.getvalue() == long_line,
@@ -754,6 +773,14 @@ def containment_serialization_cases(containment):
             pass
         else:
             raise RuntimeError("diagnostic writer accepted a non-progressing stream")
+    overcount = PartialStream()
+    overcount.write = lambda payload: len(payload) + 1
+    try:
+        containment["write_diagnostic"](overcount, RuntimeError("overcount"))
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("diagnostic writer accepted an impossible write count")
 
     predicate_names = (
         "case_exact", "lifecycle_match", "schema_shape", "schema_exact", "primary_exact",
@@ -785,6 +812,49 @@ def containment_serialization_cases(containment):
             written = containment["write_diagnostic"](stream, failure)
             require(written == len(payload) and stream.getvalue() == payload,
                     "live persistent failure path replaced or recomposed fixed finality evidence")
+
+    trusted_payload = containment["persistent_scalar_diagnostic"](
+        "normal", "kill", "none", {name: True for name in predicate_names},
+        {"line_count": 1, "byte_count": 1, "byte_bounded": True,
+         "leading_whitespace": False, "trailing_whitespace": False})
+    stale_payload = containment["stale_failure_message"](
+        "accepted", True,
+        {"attempted": True, "result_available": True, "accepted": True,
+         "success_marker": False, "expected_rejection": False, "wrong_reason": False},
+        True, True, True, True, True, True, True, True, True, True, True, True,
+        "none", False, False, False, False)
+    accepted_stream = io.BytesIO()
+    containment["write_diagnostic"](
+        accepted_stream, containment["SerializedDiagnosticFailure"](stale_payload))
+    require(accepted_stream.getvalue() == stale_payload,
+            "diagnostic sink rejected a complete stale payload")
+    invalid_internal_payloads = (
+        bytearray(trusted_payload),
+        trusted_payload.replace(b"containment-test: ", b"untrusted: ", 1),
+        trusted_payload[:-1],
+        trusted_payload[:-2] + b";bad=\xff'\n",
+        trusted_payload + b"x" * 512,
+        b"containment-test: 'scenario=containment;failure=unexpected;finality=unknown'\n",
+        trusted_payload.replace(b";case=", b";case=normal;case=", 1),
+        trusted_payload.replace(b";release=1", b"", 1),
+        trusted_payload.replace(b";release=1", b";invented=1;release=1", 1),
+        trusted_payload.replace(b";case=normal;boundary=kill;",
+                                b";boundary=kill;case=normal;", 1),
+        trusted_payload.replace(b";release=1", b";release=2", 1),
+        stale_payload.replace(b";attempted=1", b";attempted=2", 1),
+        stale_payload.replace(b";error_category=none", b";error_category=unknown", 1),
+    )
+    for invalid_payload in invalid_internal_payloads:
+        rejected_stream = io.BytesIO()
+        try:
+            containment["write_diagnostic"](
+                rejected_stream, containment["SerializedDiagnosticFailure"](invalid_payload))
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("diagnostic sink accepted an untrusted internal payload")
+        require(rejected_stream.getvalue() == b"",
+                "diagnostic sink wrote an internal payload before validation")
 
     serializer = containment["serialize_diagnostic"]
     for fields in (
