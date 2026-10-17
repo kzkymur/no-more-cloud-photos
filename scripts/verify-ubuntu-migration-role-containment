@@ -618,21 +618,34 @@ def stale_expected_rejection(state):
     return STALE_REJECTION_PREFIX + str(safe) + "\n"
 
 
-def stale_client_classification(attempted, returncode, stdout, stderr, expected_stderr):
+def stale_client_classification(attempted, returncode, stdout, stderr, expected_human):
     result_available = attempted and type(returncode) is int
     success_marker = result_available and SUCCESS in stdout
     accepted = result_available and (returncode == 0 or success_marker)
-    expected_rejection = bool(
-        result_available and returncode != 0 and not success_marker
-        and stderr == expected_stderr)
+    parsed, stderr_shape = client_stderr_evidence(stderr)
+    lines = stderr.splitlines(keepends=True) if type(stderr) is str else []
+    machine_contract = bool(
+        stderr_shape["shape"] and parsed is not None
+        and parsed["primary"] == "verification" and parsed["events"] == ()
+        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1
+        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1
+        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0)
+    human_rejection = bool(
+        stderr_shape["shape"] and len(lines) == 2 and lines[1] == expected_human)
+    result_contract = bool(
+        result_available and returncode == 1 and stdout == "" and not success_marker
+        and machine_contract and human_rejection)
     return {
         "attempted": bool(attempted),
         "result_available": result_available,
         "accepted": accepted,
         "success_marker": success_marker,
-        "expected_rejection": expected_rejection,
+        "machine_contract": machine_contract,
+        "human_rejection": human_rejection,
+        "result_contract": result_contract,
+        "expected_rejection": result_contract,
         "wrong_reason": (result_available and returncode != 0
-                         and not success_marker and not expected_rejection),
+                         and not success_marker and not result_contract),
     }
 
 
@@ -640,13 +653,27 @@ def diagnostic_bit(value):
     return "1" if bool(value) else "0"
 
 
+def stale_failure_category(classification, identity_changed, fixture_error):
+    if classification["accepted"]:
+        return "accepted"
+    if classification["wrong_reason"] and identity_changed:
+        return "result-identity"
+    if classification["wrong_reason"]:
+        return "wrong-reason"
+    if identity_changed:
+        return "identity-change"
+    if fixture_error:
+        return "fixture-error"
+    return "cleanup-error"
+
+
 def stale_failure_message(failure_category, client_zero, classification, unit_absent,
-                          recorded_empty, canonical_empty, identity_unchanged,
+                          recorded_empty, canonical_empty, identity_unchanged, identity_changed,
                           cleanup_attempted, cleanup_succeeded, lock_reusable,
                           artifacts_removed, post_evidence_complete, ready, released, ack,
-                          error_category, fixture_error, client_output, client_diagnostic,
-                          cleanup_error):
-    if failure_category not in ("accepted", "wrong-reason", "fixture-error", "cleanup-error"):
+                          error_category, fixture_error, client_output, cleanup_error):
+    if failure_category not in ("accepted", "wrong-reason", "identity-change",
+                                "result-identity", "fixture-error", "cleanup-error"):
         failure_category = "invalid"
     if error_category not in ("none", "fixture", "release", "state", "identity",
                               "action", "post", "lock", "paths"):
@@ -656,12 +683,16 @@ def stale_failure_message(failure_category, client_zero, classification, unit_ab
         ("result_available", diagnostic_bit(classification["result_available"])),
         ("client_zero", diagnostic_bit(client_zero)),
         ("success_marker", diagnostic_bit(classification["success_marker"])),
+        ("machine_contract", diagnostic_bit(classification["machine_contract"])),
+        ("human_rejection", diagnostic_bit(classification["human_rejection"])),
+        ("result_contract", diagnostic_bit(classification["result_contract"])),
         ("expected_rejection", diagnostic_bit(classification["expected_rejection"])),
         ("wrong_reason", diagnostic_bit(classification["wrong_reason"])),
         ("unit_absent", diagnostic_bit(unit_absent)),
         ("recorded_empty", diagnostic_bit(recorded_empty)),
         ("canonical_empty", diagnostic_bit(canonical_empty)),
         ("identity_unchanged", diagnostic_bit(identity_unchanged)),
+        ("identity_changed", diagnostic_bit(identity_changed)),
         ("cleanup_attempted", diagnostic_bit(cleanup_attempted)),
         ("cleanup_succeeded", diagnostic_bit(cleanup_succeeded)),
         ("lock_reusable", diagnostic_bit(lock_reusable)),
@@ -671,7 +702,6 @@ def stale_failure_message(failure_category, client_zero, classification, unit_ab
         ("ack", diagnostic_bit(ack)), ("error_category", error_category),
         ("fixture_error", diagnostic_bit(fixture_error)),
         ("client_output", diagnostic_bit(client_output)),
-        ("client_diagnostic", diagnostic_bit(client_diagnostic)),
         ("cleanup_error", diagnostic_bit(cleanup_error)),
     )
     return serialize_diagnostic("stale", failure_category, fields, complete=True)
@@ -782,7 +812,8 @@ def validate_serialized_diagnostic(payload):
             or pairs[0][1] not in ("persistent", "stale")
             or (pairs[0][1] == "persistent" and pairs[1][1] != "result")
             or (pairs[0][1] == "stale" and pairs[1][1] not in (
-                "accepted", "wrong-reason", "fixture-error", "cleanup-error", "invalid"))):
+                "accepted", "wrong-reason", "identity-change", "result-identity",
+                "fixture-error", "cleanup-error", "invalid"))):
         raise RuntimeError("serialized diagnostic class was invalid")
     serialized_fields = tuple(pairs[2:])
     field_names = tuple(name for name, _value in serialized_fields)
@@ -811,13 +842,14 @@ def validate_serialized_diagnostic(payload):
     else:
         expected_names = (
             "attempted", "result_available", "client_zero", "success_marker",
+            "machine_contract", "human_rejection", "result_contract",
             "expected_rejection", "wrong_reason", "unit_absent", "recorded_empty",
-            "canonical_empty", "identity_unchanged", "cleanup_attempted",
+            "canonical_empty", "identity_unchanged", "identity_changed", "cleanup_attempted",
             "cleanup_succeeded", "lock_reusable", "artifacts_removed",
             "post_evidence_complete", "ready", "release", "ack", "error_category",
-            "fixture_error", "client_output", "client_diagnostic", "cleanup_error",
+            "fixture_error", "client_output", "cleanup_error",
         )
-        bit_names = expected_names[:18] + expected_names[19:]
+        bit_names = expected_names[:22] + expected_names[23:]
         valid_domains = (
             all(fields_by_name.get(name) in ("0", "1") for name in bit_names)
             and fields_by_name.get("error_category") in (
@@ -1704,13 +1736,24 @@ def launch_identity_matches(state, signature):
             and all(state.get(name) == expected for name, expected in signature.items()))
 
 
-def stale_terminal_matches(state, signature, expected_main_pid, control_group_pids):
-    return (launch_identity_matches(state, signature)
-            and state.get("ActiveState") == "failed" and state.get("SubState") == "failed"
+def stale_identity_evidence(state, signature, expected_main_pid, control_group_pids):
+    evidence = {
+        "signature_unchanged": launch_identity_matches(state, signature),
+        "terminal_unchanged": (
+            state.get("ActiveState") == "failed" and state.get("SubState") == "failed"
             and state.get("Result") == "exit-code"
             and state.get("ExecMainCode") in ("1", "exited")
-            and state.get("ExecMainStatus") == "73"
-            and state.get("ExecMainPID") == expected_main_pid and not control_group_pids)
+            and state.get("ExecMainStatus") == "73"),
+        "pid_unchanged": state.get("ExecMainPID") == expected_main_pid,
+        "cgroup_empty": not control_group_pids,
+    }
+    evidence["identity_unchanged"] = all(evidence.values())
+    return evidence
+
+
+def stale_terminal_matches(state, signature, expected_main_pid, control_group_pids):
+    return stale_identity_evidence(
+        state, signature, expected_main_pid, control_group_pids)["identity_unchanged"]
 
 
 def structured_command_fixture_result(property_name, path, argv, behavior, runtime):
@@ -2314,9 +2357,14 @@ raise SystemExit(73)
     stale_rejected_stdout = ""
     stale_rejected_stderr = ""
     stale_client_attempted = False
-    stale_expected_stderr = ""
+    stale_expected_human = ""
     stale_client_class = stale_client_classification(False, None, "", "", "")
     stale_identity_unchanged = False
+    stale_identity_changed = False
+    stale_after_identity = {
+        "signature_unchanged": False, "terminal_unchanged": False,
+        "pid_unchanged": False, "cgroup_empty": False, "identity_unchanged": False,
+    }
     stale_lock_reusable = False
     stale_after_client = {}
     try:
@@ -2406,28 +2454,28 @@ raise SystemExit(73)
                 stale_observed, stale_signature, stale_main_pid,
                 cgroup_pids(stale_observed.get("ControlGroup", ""), "stale-attestation")):
             fail("released stale fixed-unit had an unexpected exact terminal state")
-        stale_expected_stderr = stale_expected_rejection(stale_observed)
+        stale_expected_human = stale_expected_rejection(stale_observed)
         stale_client_attempted = True
         rejected = run("stale-attestation", ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                         "fast-success"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stale_rejected_return = rejected.returncode
         stale_rejected_stdout = rejected.stdout
         stale_rejected_stderr = rejected.stderr
-        stale_client_class = stale_client_classification(
-            stale_client_attempted, rejected.returncode, rejected.stdout, rejected.stderr,
-            stale_expected_stderr)
         stale_after_client = show_identity_until("stale-attestation",
             time.monotonic() + 10, "ActiveState", "SubState", "Result", "ExecMainPID",
             "ExecMainCode", "ExecMainStatus", "ControlGroup")
-        if not stale_client_class["expected_rejection"]:
-            fail("client accepted a stale loaded fixed unit")
-        stale_identity_unchanged = stale_terminal_matches(
-                stale_after_client, stale_signature, stale_main_pid,
-                cgroup_pids(stale_after_client.get("ControlGroup", ""), "stale-attestation"))
-        if not stale_identity_unchanged:
-            fail("rejected prelaunch client touched the exact stale fixed-unit evidence")
-        assert_client_lock_reusable()
-        stale_lock_reusable = True
+        stale_after_client_pids = cgroup_pids(
+            stale_after_client.get("ControlGroup", ""), "stale-attestation")
+        stale_after_identity = stale_identity_evidence(
+            stale_after_client, stale_signature, stale_main_pid, stale_after_client_pids)
+        stale_identity_unchanged = stale_after_identity["identity_unchanged"]
+        stale_identity_changed = not stale_identity_unchanged
+        stale_client_class = stale_client_classification(
+            stale_client_attempted, rejected.returncode, rejected.stdout, rejected.stderr,
+            stale_expected_human)
+        if stale_client_class["expected_rejection"] and stale_identity_unchanged:
+            assert_client_lock_reusable()
+            stale_lock_reusable = True
     except Exception as error:
         stale_failure = error
     finally:
@@ -2520,11 +2568,12 @@ raise SystemExit(73)
                 stale_path_error = sanitized_diagnostic_text(error)
         else:
             stale_path_error = "owned helper and release preserved pending confirmed absence"
-    if (stale_failure is not None or stale_release_error or stale_state_error or stale_identity_error
+    if (not stale_client_class["expected_rejection"] or stale_identity_changed
+            or stale_failure is not None or stale_release_error or stale_state_error or stale_identity_error
             or stale_action_error or stale_post_error or stale_lock_error or stale_path_error):
         stale_client_class = stale_client_classification(
             stale_client_attempted, stale_rejected_return, stale_rejected_stdout,
-            stale_rejected_stderr, stale_expected_stderr)
+            stale_rejected_stderr, stale_expected_human)
         recorded_empty = bool(stale_post_evidence_complete and stale_post_cleanup_cgroup
                               and not stale_post_cleanup_cgroup["recorded"])
         canonical_empty = bool(stale_post_evidence_complete and stale_post_cleanup_cgroup
@@ -2537,14 +2586,8 @@ raise SystemExit(73)
         cleanup_succeeded = bool(unit_absent and recorded_empty and canonical_empty
                                  and stale_lock_reusable and stale_artifacts_removed
                                  and not cleanup_error)
-        if stale_client_class["accepted"]:
-            failure_category = "accepted"
-        elif stale_client_class["wrong_reason"]:
-            failure_category = "wrong-reason"
-        elif stale_failure is not None:
-            failure_category = "fixture-error"
-        else:
-            failure_category = "cleanup-error"
+        failure_category = stale_failure_category(
+            stale_client_class, stale_identity_changed, stale_failure is not None)
         error_flags = (
             ("fixture", stale_failure is not None), ("release", bool(stale_release_error)),
             ("state", bool(stale_state_error)), ("identity", bool(stale_identity_error)),
@@ -2554,12 +2597,11 @@ raise SystemExit(73)
         error_category = next((name for name, present in error_flags if present), "none")
         raise SerializedDiagnosticFailure(stale_failure_message(
             failure_category, stale_rejected_return == 0, stale_client_class, unit_absent,
-            recorded_empty, canonical_empty, stale_identity_unchanged,
+            recorded_empty, canonical_empty, stale_identity_unchanged, stale_identity_changed,
             stale_cleanup_attempted, cleanup_succeeded, stale_lock_reusable,
             stale_artifacts_removed, stale_post_evidence_complete, stale_ready_seen,
             stale_release_seen, stale_release_ack_seen, error_category,
-            stale_failure is not None, bool(stale_rejected_stdout),
-            bool(stale_rejected_stderr), cleanup_error))
+            stale_failure is not None, bool(stale_rejected_stdout), cleanup_error))
 
     client_faults = (
         "client-fault-after-launch", "client-fault-missing-invocation",
