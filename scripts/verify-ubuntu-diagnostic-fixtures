@@ -7,6 +7,7 @@ import io
 import os
 import pathlib
 import runpy
+import signal
 import stat
 import subprocess
 import tempfile
@@ -491,6 +492,104 @@ def persistent_handoff_state_cases(containment):
             "unload handoff accepted changed loaded identity")
     require(not function("unload", absent, signature, [1234]),
             "unload handoff accepted recorded cgroup residue")
+
+
+def cancellation_accounting_cases(client):
+    helper = client["account_latched_cancellation"]
+    globals_ = helper.__globals__
+    original_events = list(globals_["RESULT_EVENTS"])
+    original_mapped = set(globals_["RESULT_MAPPED_CLEANUP_ERRORS"])
+    original_complete = globals_["RESULT_EVENTS_COMPLETE"]
+    original_accounted = globals_["CANCELLATION_ACCOUNTED"]
+    original_failure = globals_["CANCELLATION_FAILURE"]
+    original_cancelled = list(globals_["CANCELLED"])
+    original_sigpending = globals_["signal"].sigpending
+
+    def reset():
+        globals_["RESULT_EVENTS"][:] = []
+        globals_["RESULT_MAPPED_CLEANUP_ERRORS"].clear()
+        globals_["RESULT_EVENTS_COMPLETE"] = True
+        globals_["CANCELLATION_ACCOUNTED"] = False
+        globals_["CANCELLATION_FAILURE"] = None
+        globals_["CANCELLED"][:] = []
+
+    try:
+        reset()
+        prior = client["PrimaryFailure"]("cleanup-test", "prior")
+        cancellation = client["CancellationFailure"](signal.SIGINT)
+        primary, cleanup = helper(prior, [], cancellation)
+        primary, cleanup = helper(primary, cleanup, cancellation)
+        require(primary is prior and cleanup == [cancellation]
+                and globals_["RESULT_EVENTS"] == [(0, "final", "cancelled", 0, 0, 0)],
+                "post-teardown and terminal cancellation accounting duplicated or replaced primary")
+
+        reset()
+        cancellation = client["CancellationFailure"](signal.SIGTERM)
+        primary, cleanup = helper(None, [], cancellation)
+        primary, cleanup = helper(primary, cleanup, cancellation)
+        require(primary is cancellation and cleanup == [] and globals_["RESULT_EVENTS"] == [],
+                "first cancellation was not retained as the sole primary")
+
+        reset()
+        globals_["signal"].sigpending = lambda: {signal.SIGTERM}
+        pending = client["terminal_cancellation_exception"]()
+        primary, cleanup = helper(None, [], pending)
+        primary, cleanup = helper(primary, cleanup, pending)
+        require(isinstance(primary, client["CancellationFailure"])
+                and cleanup == [] and globals_["RESULT_EVENTS"] == [],
+                "terminal-mask pending cancellation was lost or duplicated")
+
+        reset()
+        prior = client["PrimaryFailure"]("cleanup-test", "prior")
+        cancellation = client["CancellationFailure"](signal.SIGINT)
+        client["cleanup_result"]("cancelled", "final", (cancellation,))
+        primary, cleanup = helper(prior, [], cancellation)
+        primary, cleanup = helper(primary, cleanup, cancellation)
+        require(primary is prior and cleanup == [cancellation]
+                and globals_["RESULT_EVENTS"] == [(0, "final", "cancelled", 0, 0, 0)],
+                "already-mapped cancellation was dropped or duplicated")
+    finally:
+        globals_["RESULT_EVENTS"][:] = original_events
+        globals_["RESULT_MAPPED_CLEANUP_ERRORS"].clear()
+        globals_["RESULT_MAPPED_CLEANUP_ERRORS"].update(original_mapped)
+        globals_["RESULT_EVENTS_COMPLETE"] = original_complete
+        globals_["CANCELLATION_ACCOUNTED"] = original_accounted
+        globals_["CANCELLATION_FAILURE"] = original_failure
+        globals_["CANCELLED"][:] = original_cancelled
+        globals_["signal"].sigpending = original_sigpending
+
+
+def signal_result_cases(containment):
+    prefix = containment["RESULT_PREFIX"]
+
+    def result(mode, signum):
+        expected, human = containment["expected_signal_result"](mode, signum)
+        events = (",".join(
+            f"{ordinal}.{boundary}.{category}.{retries}.{interceptions}.{attempts}"
+            for ordinal, boundary, category, retries, interceptions, attempts
+            in expected["events"]) or "-")
+        machine = (
+            f"{prefix}primary={expected['primary']};events={events};"
+            f"events_complete={expected['events_complete']};"
+            f"final_scanned={expected['final_scanned']};"
+            f"final_observed={expected['final_observed']};final_empty={expected['final_empty']};"
+            f"return={expected['return']};stdout={expected['stdout']};success={expected['success']}")
+        stderr = machine + "\nverification-client: " + human + "\n"
+        return subprocess.CompletedProcess(("client", mode), 1, "", stderr)
+
+    for signal_name, signum in (("int", signal.SIGINT), ("term", signal.SIGTERM)):
+        for boundary in ("startup", "work", "kill", "stop"):
+            mode = f"client-signal-{signal_name}-{boundary}"
+            exact = result(mode, signum)
+            require(containment["signal_result_contract"](exact, mode, signum),
+                    f"exact {signal_name}/{boundary} signal schema was rejected")
+            dirty = subprocess.CompletedProcess(
+                exact.args, 1, "", exact.stderr.replace("final_empty=1", "final_empty=0", 1))
+            missing = subprocess.CompletedProcess(
+                exact.args, 1, "", exact.stderr.replace("final_observed=1;", "", 1))
+            require(not containment["signal_result_contract"](dirty, mode, signum)
+                    and not containment["signal_result_contract"](missing, mode, signum),
+                    f"dirty or missing {signal_name}/{boundary} finality was accepted")
 
 
 def release_marker_security_cases(client, containment):
@@ -3155,6 +3254,8 @@ def client_terminal_emission_cases(client, containment):
         writes.clear()
         masks.clear()
         globals_["CANCELLED"].clear()
+        globals_["CANCELLATION_FAILURE"] = None
+        globals_["CANCELLATION_ACCOUNTED"] = False
         globals_["RESULT_EVENTS"].clear()
         globals_["RESULT_EVENTS_COMPLETE"] = True
         globals_["RESULT_MAPPED_CLEANUP_ERRORS"].clear()
@@ -4032,6 +4133,8 @@ def main():
     explicit_marker_phase_cases(containment)
     persistent_launch_release_cases(containment)
     persistent_handoff_state_cases(containment)
+    cancellation_accounting_cases(client)
+    signal_result_cases(containment)
     release_marker_security_cases(client, containment)
     signed_cleanup_lock_cases(containment)
     stale_diagnostic_cases(containment)

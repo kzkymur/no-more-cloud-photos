@@ -87,6 +87,8 @@ CLIENT_FAULTS = {
 }
 CANCELLATION_SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}
 CANCELLED = []
+CANCELLATION_FAILURE = None
+CANCELLATION_ACCOUNTED = False
 REQUESTED_MODE = ""
 COMMAND_DEADLINE = None
 CLEANUP_ACTIVE = False
@@ -256,7 +258,12 @@ def primary_result_category(error):
 
 
 def cancellation_exception():
-    return CancellationFailure(CANCELLED[0]) if CANCELLED else None
+    global CANCELLATION_FAILURE
+    if not CANCELLED:
+        return None
+    if CANCELLATION_FAILURE is None:
+        CANCELLATION_FAILURE = CancellationFailure(CANCELLED[0])
+    return CANCELLATION_FAILURE
 
 
 def terminal_cancellation_exception():
@@ -289,6 +296,22 @@ def preserve_primary(primary_error, error, boundary):
     cleanup_result("cancelled" if isinstance(candidate, CancellationFailure) else "unexpected",
                    boundary, (candidate,))
     return primary_error
+
+
+def account_latched_cancellation(primary_error, cleanup_errors, cancellation):
+    global CANCELLATION_ACCOUNTED
+    if cancellation is None or CANCELLATION_ACCOUNTED:
+        return primary_error, cleanup_errors
+    CANCELLATION_ACCOUNTED = True
+    if isinstance(primary_error, CancellationFailure):
+        return primary_error, cleanup_errors
+    if primary_error is None:
+        return cancellation, cleanup_errors
+    if not cleanup_error_mapped(cancellation):
+        cleanup_result("cancelled", "final", (cancellation,))
+    if not any(error is cancellation for error in cleanup_errors):
+        cleanup_errors = [*cleanup_errors, cancellation]
+    return primary_error, cleanup_errors
 
 
 def render_client_result(primary_error, final_evidence):
@@ -334,12 +357,8 @@ def write_terminal_payload(descriptor, payload):
 def emit_terminal_result(primary_error, cleanup_errors, nonce, result, final_evidence):
     signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
     cancellation = terminal_cancellation_exception()
-    if cancellation is not None:
-        if primary_error is None:
-            primary_error = cancellation
-        else:
-            cleanup_result("cancelled", "final", (cancellation,))
-            cleanup_errors = [*cleanup_errors, cancellation]
+    primary_error, cleanup_errors = account_latched_cancellation(
+        primary_error, cleanup_errors, cancellation)
     failure = None
     try:
         resolve_outcome(primary_error, cleanup_errors, nonce, final_evidence)
@@ -1867,12 +1886,8 @@ def main():
                     cleanup_errors.append(error)
             COMMAND_DEADLINE = work_deadline
             cancellation = cancellation_exception()
-            if cancellation is not None:
-                if primary_error is None:
-                    primary_error = cancellation
-                else:
-                    cleanup_result("cancelled", "final", (cancellation,))
-                    cleanup_errors.append(cancellation)
+            primary_error, cleanup_errors = account_latched_cancellation(
+                primary_error, cleanup_errors, cancellation)
             if RECOVERED_ERRORS:
                 cleanup_errors.extend(RECOVERED_ERRORS)
         if requested_mode == "client-terminal-race-a":

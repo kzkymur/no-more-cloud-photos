@@ -1605,13 +1605,41 @@ def assert_client_failure(result, mode, phase):
     assert_client_lock_reusable()
 
 
-def assert_cancelled_result(result, mode):
-    assert_client_failure(result, mode, "signal-cleanup")
+def expected_signal_result(mode, signum):
+    boundary = mode.rsplit("-", 1)[1]
+    if boundary in ("startup", "work"):
+        primary = "cancelled"
+        events = ()
+        human = f"verification client cancelled by signal {signum}"
+    elif boundary in ("kill", "stop", "wait", "reset", "unload"):
+        primary = "cleanup-test"
+        events = ((0, "final", "cancelled", 0, 0, 0),)
+        stage = "before cleanup boundary test" if boundary in ("kill", "wait") else "at terminal cleanup boundary test"
+        human = (f"injected client failure {stage}; cleanup failed: "
+                 f"verification client cancelled by signal {signum}")
+    else:
+        fail("client signal result used an unknown lifecycle boundary")
+    return ({
+        "primary": primary, "events": events, "events_complete": 1,
+        "final_scanned": 1, "final_observed": 1, "final_empty": 1,
+        "return": 1, "stdout": 0, "success": 0,
+    }, human)
+
+
+def signal_result_contract(result, mode, signum):
     parsed, shape = client_stderr_evidence(result.stderr)
-    if (not shape["shape"] or parsed is None or parsed["primary"] != "cancelled"
-            or parsed["return"] != 1 or parsed["stdout"] != 0
-            or parsed["success"] != 0):
-        fail(f"client signal result did not report one machine primary cancellation: {mode}")
+    expected, human = expected_signal_result(mode, signum)
+    lines = result.stderr.splitlines(keepends=True) if type(result.stderr) is str else []
+    return bool(
+        result.returncode == 1 and result.stdout == "" and SUCCESS not in result.stdout
+        and shape["shape"] and parsed == expected and len(lines) == 2
+        and lines[1] == "verification-client: " + human + "\n")
+
+
+def assert_cancelled_result(result, mode, signum):
+    assert_client_failure(result, mode, "signal-cleanup")
+    if not signal_result_contract(result, mode, signum):
+        fail(f"client signal result did not match its exact lifecycle schema: {mode}")
 
 
 def fast_recovery(client, repo, commit, go_binary, context, phase):
@@ -3083,7 +3111,7 @@ raise SystemExit(73)
                 "signal-cleanup", cancelled, 30)
             result = subprocess.CompletedProcess(cancelled.args, cancelled.returncode,
                                                  cancelled_stdout, cancelled_stderr)
-            assert_cancelled_result(result, mode)
+            assert_cancelled_result(result, mode, signum)
             fast_recovery(client, repo, commit, go_binary, mode, "signal-cleanup")
         for boundary in ("kill", "stop", "wait", "reset", "unload"):
             mode = f"client-signal-{signal_name}-{boundary}"
@@ -3099,7 +3127,7 @@ raise SystemExit(73)
                 "signal-cleanup", cancelled, 30)
             result = subprocess.CompletedProcess(cancelled.args, cancelled.returncode,
                                                  cancelled_stdout, cancelled_stderr)
-            assert_cancelled_result(result, mode)
+            assert_cancelled_result(result, mode, signum)
             fast_recovery(client, repo, commit, go_binary, mode, "signal-cleanup")
 
     prior = None
