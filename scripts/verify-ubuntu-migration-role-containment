@@ -491,6 +491,18 @@ def client_stderr_evidence(stderr):
     }
 
 
+def client_primary_diagnostic(stderr):
+    parsed, shape = client_stderr_evidence(stderr)
+    if not shape["shape"] or parsed is None:
+        return "invalid", "client stderr did not match its bounded result schema"
+    lines = stderr.splitlines()
+    prefix = "verification-client: "
+    detail = lines[1][len(prefix):] if len(lines) == 2 and lines[1].startswith(prefix) else ""
+    if not detail:
+        detail = "client diagnostic detail was absent"
+    return parsed["primary"], detail
+
+
 def expected_persistent_result(case, boundary):
     if case not in ("normal", "parse", "timeout"):
         fail("persistent evidence case was not explicitly labeled")
@@ -834,7 +846,7 @@ def validate_serialized_diagnostic(payload):
         name, separator, value = part.partition("=")
         if (not separator or not name or not value
                 or any(character not in "abcdefghijklmnopqrstuvwxyz_" for character in name)
-                or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)):
+                or (name != "detail" and any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value))):
             raise RuntimeError("serialized diagnostic schema was invalid")
         pairs.append((name, value))
     if (len(pairs) < 2 or pairs[0][0] != "scenario" or pairs[1][0] != "failure"
@@ -847,6 +859,9 @@ def validate_serialized_diagnostic(payload):
                 "fixture-error", "cleanup-error", "invalid"))):
         raise RuntimeError("serialized diagnostic class was invalid")
     serialized_fields = tuple(pairs[2:])
+    detail_present = bool(serialized_fields and serialized_fields[-1][0] == "detail")
+    if detail_present:
+        serialized_fields = serialized_fields[:-1]
     field_names = tuple(name for name, _value in serialized_fields)
     fields_by_name = dict(serialized_fields)
     if pairs[0][1] == "persistent":
@@ -889,13 +904,13 @@ def validate_serialized_diagnostic(payload):
         )
     else:
         expected_names = (
-            "stage", "target", "client", "return_code", "result", "load",
+            "stage", "target", "client", "return_code", "result", "primary", "load",
             "active", "sub", "mainpid", "unit_result", "identity", "environment",
             "transaction", "journal", "ready", "reap", "cleanup", "unit_absent",
             "recorded_scan", "canonical_scan", "recorded_empty", "canonical_empty",
             "client_lock", "transaction_lock",
         )
-        bit_names = expected_names[15:16] + expected_names[17:]
+        bit_names = expected_names[16:17] + expected_names[18:]
         return_code = fields_by_name.get("return_code", "")
         mainpid = fields_by_name.get("mainpid", "")
         valid_domains = (
@@ -905,6 +920,7 @@ def validate_serialized_diagnostic(payload):
             and return_code != "" and (return_code == "unknown"
                 or return_code.lstrip("-").isdecimal())
             and fields_by_name.get("result") in ("exact", "invalid", "unavailable")
+            and fields_by_name.get("primary") in RESULT_PRIMARY_CATEGORIES + ("invalid", "unknown")
             and fields_by_name.get("load") in ("loaded", "not-found", "unknown")
             and fields_by_name.get("active") in ("active", "failed", "inactive", "unknown")
             and fields_by_name.get("sub") in ("running", "exited", "failed", "dead", "unknown")
@@ -925,7 +941,8 @@ def validate_serialized_diagnostic(payload):
     if field_names != expected_names or not valid_domains:
         raise RuntimeError("serialized diagnostic fields were incomplete")
     trusted = serialize_diagnostic(
-        pairs[0][1], pairs[1][1], serialized_fields, complete=True)
+        pairs[0][1], pairs[1][1], serialized_fields,
+        detail=pairs[-1][1] if detail_present else None)
     if trusted != payload:
         raise RuntimeError("serialized diagnostic was not canonical and complete")
     return payload
@@ -2537,6 +2554,8 @@ def producer_wait_evidence(process, stage, expected_target, prior, repo, commit,
                                 "ready": "present", "journal": "signed",
                                 "transaction": "blocked"}
             communicate_producer_once(process, lifecycle, 10)
+            primary_category, primary_detail = client_primary_diagnostic(
+                lifecycle["stderr"])
             journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"
             raise ProducerEpochFailure("producer-exit-before-ready", {
                 "state": dict(state), "nonce": nonce, "signature": signature,
@@ -2545,6 +2564,7 @@ def producer_wait_evidence(process, stage, expected_target, prior, repo, commit,
                 "client": "exited",
                 "return_code": return_code if type(return_code) is int else "unknown",
                 "result": "exact" if lifecycle["result_exact"] else "invalid",
+                "primary": primary_category, "primary_detail": primary_detail,
             })
         if time.monotonic() >= deadline:
             journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"
@@ -2775,6 +2795,7 @@ def producer_failure_message(category, stage, expected_target, evidence, finalit
         ("client", evidence.get("client", "unknown")),
         ("return_code", evidence.get("return_code", "unknown")),
         ("result", evidence.get("result", "unknown")),
+        ("primary", evidence.get("primary", "unknown")),
         ("load", load),
         ("active", closed_state_value(
             state.get("ActiveState"), ("active", "failed", "inactive"))),
@@ -2797,7 +2818,8 @@ def producer_failure_message(category, stage, expected_target, evidence, finalit
         ("client_lock", diagnostic_bit(finality["locks"]["client"])),
         ("transaction_lock", diagnostic_bit(finality["locks"]["transaction"])),
     )
-    return serialize_diagnostic("producer", category, fields, complete=True)
+    return serialize_diagnostic(
+        "producer", category, fields, detail=evidence.get("primary_detail"))
 
 
 def exercise_intent_epoch(client, repo, commit, go_binary, stage, expected_target, prior):
