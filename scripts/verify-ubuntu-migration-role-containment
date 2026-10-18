@@ -505,7 +505,15 @@ def client_primary_diagnostic(stderr):
         token = detail[len("journal_failure="):].partition(";")[0]
         diagnostic_category = token if token in ("timeout", "exit", "malformed", "io") else "invalid"
     elif detail.startswith("terminal_failure="):
-        diagnostic_category = detail[len("terminal_failure="):]
+        token = detail[len("terminal_failure="):]
+        subset, separator, values = token.partition("-")
+        subsets = ("r", "c", "s", "a", "u", "rc", "rs", "ra", "ru", "cs", "ca", "cu",
+                   "sa", "su", "au", "rcs", "rca", "rcu", "rsa", "rsu", "rau", "csa",
+                   "csu", "cau", "sau", "rcsa", "rcsu", "rcau", "rsau", "csau", "rcsau")
+        valid_values = (separator == "-" and subset in subsets and len(values) == 4
+                        and values[0] in "segtmo" and values[1] in "zno"
+                        and values[2] in "afigdo" and values[3] in "efdrsto")
+        diagnostic_category = token if valid_values else "invalid"
     elif detail == "exact invocation journal lacks one final success marker":
         diagnostic_category = "marker"
     elif parsed["primary"] == "verification":
@@ -931,11 +939,16 @@ def validate_serialized_diagnostic(payload):
                 or return_code.lstrip("-").isdecimal())
             and fields_by_name.get("result") in ("exact", "invalid", "unavailable")
             and fields_by_name.get("primary") in RESULT_PRIMARY_CATEGORIES + ("invalid", "unknown")
-            and fields_by_name.get("jf") in ("none", "timeout", "exit", "malformed", "io", "invalid",
+            and (fields_by_name.get("jf") in ("none", "timeout", "exit", "malformed", "io", "invalid",
                 "r", "c", "s", "a", "u", "rc", "rs", "ra", "ru", "cs", "ca", "cu",
                 "sa", "su", "au", "rcs", "rca", "rcu", "rsa", "rsu", "rau",
                 "csa", "csu", "cau", "sau", "rcsa", "rcsu", "rcau", "rsau",
                 "csau", "rcsau", "marker", "other")
+                or client_primary_diagnostic(
+                    "NMCP_CLIENT_RESULT_V1:primary=verification;events=-;events_complete=1;"
+                    "final_scanned=1;final_observed=1;final_empty=1;return=1;stdout=0;success=0\n"
+                    "verification-client: terminal_failure=" + fields_by_name.get("jf", "") + "\n"
+                )[1] == fields_by_name.get("jf"))
             and fields_by_name.get("load") in ("loaded", "not-found", "unknown")
             and fields_by_name.get("active") in ("active", "failed", "inactive", "unknown")
             and fields_by_name.get("sub") in ("running", "exited", "failed", "dead", "unknown")
