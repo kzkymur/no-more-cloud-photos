@@ -504,8 +504,8 @@ def client_primary_diagnostic(stderr):
     if detail.startswith("journal_failure="):
         token = detail[len("journal_failure="):].partition(";")[0]
         diagnostic_category = token if token in ("timeout", "exit", "malformed", "io") else "invalid"
-    elif detail.startswith("verification invocation failed:"):
-        diagnostic_category = "terminal"
+    elif detail.startswith("terminal_failure="):
+        diagnostic_category = detail[len("terminal_failure="):]
     elif detail == "exact invocation journal lacks one final success marker":
         diagnostic_category = "marker"
     elif parsed["primary"] == "verification":
@@ -931,7 +931,15 @@ def validate_serialized_diagnostic(payload):
                 or return_code.lstrip("-").isdecimal())
             and fields_by_name.get("result") in ("exact", "invalid", "unavailable")
             and fields_by_name.get("primary") in RESULT_PRIMARY_CATEGORIES + ("invalid", "unknown")
-            and fields_by_name.get("jf") in ("none", "timeout", "exit", "malformed", "io", "invalid", "terminal", "marker", "other")
+            and fields_by_name.get("jf") in ("none", "timeout", "exit", "malformed", "io", "invalid", "result", "code", "status", "active", "sub",
+                "result_code", "result_status", "result_active", "result_sub",
+                "code_status", "code_active", "code_sub", "status_active", "status_sub",
+                "active_sub", "result_code_status", "result_code_active", "result_code_sub",
+                "result_status_active", "result_status_sub", "result_active_sub",
+                "code_status_active", "code_status_sub", "code_active_sub", "status_active_sub",
+                "result_code_status_active", "result_code_status_sub", "result_code_active_sub",
+                "result_status_active_sub", "code_status_active_sub", "result_code_status_active_sub",
+                "marker", "other")
             and fields_by_name.get("load") in ("loaded", "not-found", "unknown")
             and fields_by_name.get("active") in ("active", "failed", "inactive", "unknown")
             and fields_by_name.get("sub") in ("running", "exited", "failed", "dead", "unknown")

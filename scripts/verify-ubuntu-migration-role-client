@@ -1852,9 +1852,18 @@ def main():
                         time.sleep(0.1)
                         owned_state("work", invocation, nonce, exec_argv)
                         journal_evidence = bounded_journal_evidence(invocation)
-                fail(f"verification invocation failed: {sanitized_state(current)}; "
-                     f"cleanup_database_failed={journal_evidence[1]}; "
-                     f"cleanup_roles_failed={journal_evidence[2]}")
+                mismatches = []
+                if current.get("Result") != "success":
+                    mismatches.append("result")
+                if current.get("ExecMainCode") not in ("1", "exited"):
+                    mismatches.append("code")
+                if current.get("ExecMainStatus") not in (0, "0"):
+                    mismatches.append("status")
+                if current.get("ActiveState") != "active":
+                    mismatches.append("active")
+                if current.get("SubState") != "exited":
+                    mismatches.append("sub")
+                primary_fail("verification", "terminal_failure=" + "_".join(mismatches))
             deadline = bounded_deadline(5)
             while not journal_evidence[0]:
                 if time.monotonic() >= deadline:
