@@ -3169,7 +3169,8 @@ def producer_epoch_state_cases(containment):
             {"state": signed_state, "signature": {"signed": True},
              "transaction": "blocked", "journal": "signed", "ready": "absent",
              "client": "exited", "return_code": 1, "result": "exact",
-             "primary": "verification", "primary_detail": "fixture failure"},
+             "primary": "verification", "journal_failure": "none",
+             "primary_detail": "fixture failure"},
             fields_finality)
         containment["validate_serialized_diagnostic"](diagnostic)
         require(len(diagnostic) <= containment["DIAGNOSTIC_TEXT_LIMIT"]
@@ -3177,13 +3178,15 @@ def producer_epoch_state_cases(containment):
                 and b"stage=after-register" in diagnostic
                 and b"target=opt-nmcp-role-compatibility" in diagnostic
                 and b"primary=verification" in diagnostic
+                and b"jf=none" in diagnostic
                 and b"detail=fixture failure" in diagnostic,
                 "producer scalar diagnostic lost its exact bounded label")
         exact_labels = set()
         timed_out = {"state": absent_state, "signature": None,
                      "transaction": "blocked", "journal": "absent", "ready": "absent",
                      "client": "live", "return_code": "unknown",
-                     "result": "unavailable", "primary": "unknown"}
+                     "result": "unavailable", "primary": "unknown",
+                     "journal_failure": "none"}
         for target, target_label in containment["INTENT_TARGETS"].items():
             for stage_name in containment["INTENT_STAGES"]:
                 payload = containment["producer_failure_message"](
@@ -3202,11 +3205,12 @@ def producer_epoch_state_cases(containment):
                    "final_scanned=1;final_observed=1;final_empty=1;return=1;stdout=0;"
                    "success=0")
         stderr = machine + "\nverification-client: fixture failure\n"
-        primary_category, primary_detail = containment["client_primary_diagnostic"](stderr)
-        require(primary_category == "verification" and primary_detail == "fixture failure",
+        primary_category, journal_category, primary_detail = containment["client_primary_diagnostic"](stderr)
+        require(primary_category == "verification" and journal_category == "none"
+                and primary_detail == "fixture failure",
                 "producer diagnostic discarded the bounded primary client stderr")
-        invalid_category, invalid_detail = containment["client_primary_diagnostic"]("malformed")
-        require(invalid_category == "invalid" and invalid_detail,
+        invalid_category, invalid_journal, invalid_detail = containment["client_primary_diagnostic"]("malformed")
+        require(invalid_category == "invalid" and invalid_journal == "none" and invalid_detail,
                 "producer diagnostic accepted malformed client stderr")
         require(containment["exact_failed_producer_result"](Process(1), "", stderr),
                 "canonical failed producer result was rejected")

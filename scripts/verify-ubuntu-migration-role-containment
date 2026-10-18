@@ -494,13 +494,17 @@ def client_stderr_evidence(stderr):
 def client_primary_diagnostic(stderr):
     parsed, shape = client_stderr_evidence(stderr)
     if not shape["shape"] or parsed is None:
-        return "invalid", "client stderr did not match its bounded result schema"
+        return "invalid", "none", "client stderr did not match its bounded result schema"
     lines = stderr.splitlines()
     prefix = "verification-client: "
     detail = lines[1][len(prefix):] if len(lines) == 2 and lines[1].startswith(prefix) else ""
     if not detail:
         detail = "client diagnostic detail was absent"
-    return parsed["primary"], detail
+    journal_category = "none"
+    if detail.startswith("journal_failure="):
+        token = detail[len("journal_failure="):].partition(";")[0]
+        journal_category = token if token in ("timeout", "exit", "malformed", "io") else "invalid"
+    return parsed["primary"], journal_category, detail
 
 
 def expected_persistent_result(case, boundary):
@@ -904,13 +908,13 @@ def validate_serialized_diagnostic(payload):
         )
     else:
         expected_names = (
-            "stage", "target", "client", "return_code", "result", "primary", "load",
+            "stage", "target", "client", "return_code", "result", "primary", "jf", "load",
             "active", "sub", "mainpid", "unit_result", "identity", "environment",
             "transaction", "journal", "ready", "reap", "cleanup", "unit_absent",
             "recorded_scan", "canonical_scan", "recorded_empty", "canonical_empty",
             "client_lock", "transaction_lock",
         )
-        bit_names = expected_names[16:17] + expected_names[18:]
+        bit_names = expected_names[17:18] + expected_names[19:]
         return_code = fields_by_name.get("return_code", "")
         mainpid = fields_by_name.get("mainpid", "")
         valid_domains = (
@@ -921,6 +925,7 @@ def validate_serialized_diagnostic(payload):
                 or return_code.lstrip("-").isdecimal())
             and fields_by_name.get("result") in ("exact", "invalid", "unavailable")
             and fields_by_name.get("primary") in RESULT_PRIMARY_CATEGORIES + ("invalid", "unknown")
+            and fields_by_name.get("jf") in ("none", "timeout", "exit", "malformed", "io", "invalid")
             and fields_by_name.get("load") in ("loaded", "not-found", "unknown")
             and fields_by_name.get("active") in ("active", "failed", "inactive", "unknown")
             and fields_by_name.get("sub") in ("running", "exited", "failed", "dead", "unknown")
@@ -2554,7 +2559,7 @@ def producer_wait_evidence(process, stage, expected_target, prior, repo, commit,
                                 "ready": "present", "journal": "signed",
                                 "transaction": "blocked"}
             communicate_producer_once(process, lifecycle, 10)
-            primary_category, primary_detail = client_primary_diagnostic(
+            primary_category, journal_category, primary_detail = client_primary_diagnostic(
                 lifecycle["stderr"])
             journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"
             raise ProducerEpochFailure("producer-exit-before-ready", {
@@ -2564,7 +2569,8 @@ def producer_wait_evidence(process, stage, expected_target, prior, repo, commit,
                 "client": "exited",
                 "return_code": return_code if type(return_code) is int else "unknown",
                 "result": "exact" if lifecycle["result_exact"] else "invalid",
-                "primary": primary_category, "primary_detail": primary_detail,
+                "primary": primary_category, "journal_failure": journal_category,
+                "primary_detail": primary_detail,
             })
         if time.monotonic() >= deadline:
             journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"
@@ -2796,6 +2802,7 @@ def producer_failure_message(category, stage, expected_target, evidence, finalit
         ("return_code", evidence.get("return_code", "unknown")),
         ("result", evidence.get("result", "unknown")),
         ("primary", evidence.get("primary", "unknown")),
+        ("jf", evidence.get("journal_failure", "none")),
         ("load", load),
         ("active", closed_state_value(
             state.get("ActiveState"), ("active", "failed", "inactive"))),
