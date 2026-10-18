@@ -122,7 +122,9 @@ class IntentPublishFailure(RuntimeError):
                   "entry-append": 84, "call": 85, "signal-mask": 86,
                   "parent-mkdir": 87, "parent-lstat": 88,
                   "parent-type": 89, "parent-owner": 90, "parent-mode": 91,
-                  "fault-parse": 92, "fault-domain": 93}
+                  "fault-parse": 92, "fault-domain": 93,
+                  "parent-mode-libexec": 94, "parent-mode-varlib": 95,
+                  "parent-mode-opt": 96}
 
     def __init__(self, operation, error):
         self.operation = operation
@@ -665,7 +667,10 @@ def prepare_required_parent(path, mode):
         raise IntentPublishFailure("parent-owner", RuntimeError(f"unsafe required parent: {path}"))
     observed_mode = stat.S_IMODE(observed.st_mode)
     if observed_mode & 0o022:
-        raise IntentPublishFailure("parent-mode", RuntimeError(f"unsafe required parent: {path}"))
+        operation = {"/usr/local/libexec": "parent-mode-libexec",
+                     "/var/lib": "parent-mode-varlib",
+                     "/opt": "parent-mode-opt"}.get(path, "parent-mode")
+        raise IntentPublishFailure(operation, RuntimeError(f"unsafe required parent: {path}"))
 
 
 def create_owned_top(path, mode, entries, allowlist, fault_name=None, stage=None):
