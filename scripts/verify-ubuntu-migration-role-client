@@ -1920,7 +1920,7 @@ def main():
                         journal_evidence = bounded_journal_evidence(invocation)
                 supervisor_stage = bounded_supervisor_stage(invocation, nonce)
                 supervisor_status = current.get("ExecMainStatus")
-                allowed_statuses = {"1", *(str(status) for status in range(71, 86))}
+                allowed_statuses = {"1", *(str(status) for status in range(71, 94))}
                 status_token = str(supervisor_status)
                 if status_token not in allowed_statuses:
                     status_token = "u"

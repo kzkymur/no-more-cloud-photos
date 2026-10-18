@@ -507,7 +507,7 @@ def client_primary_diagnostic(stderr):
     elif detail.startswith("supervisor_stage="):
         payload = detail[len("supervisor_stage="):]
         token, separator, status_field = payload.partition(";")
-        allowed_statuses = {"1", *(str(status) for status in range(71, 86)), "u"}
+        allowed_statuses = {"1", *(str(status) for status in range(71, 94)), "u"}
         status = (status_field[len("supervisor_status="):]
                   if separator and status_field.startswith("supervisor_status=") else "")
         if status not in allowed_statuses:
@@ -960,7 +960,7 @@ def validate_serialized_diagnostic(payload):
                 "csau", "rcsau", "marker", "other")
                 or (lambda value: (
                     len(value.rsplit("-", 1)) == 2
-                    and value.rsplit("-", 1)[1] in ({"1", "u"} | {str(status) for status in range(71, 86)})
+                    and value.rsplit("-", 1)[1] in ({"1", "u"} | {str(status) for status in range(71, 94)})
                     and value.rsplit("-", 1)[0] in (
                         "s", "b", "v", "i", "f", "u", "r0", "r1", "r2", "t0", "t1", "t2", "t3",
                         *("p" + format(index, "x") for index in range(13)),
