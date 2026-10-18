@@ -1863,7 +1863,9 @@ def main():
                     mismatches.append("active")
                 if current.get("SubState") != "exited":
                     mismatches.append("sub")
-                primary_fail("verification", "terminal_failure=" + "_".join(mismatches))
+                primary_fail("verification", "terminal_failure=" + "".join(
+                    {"result": "r", "code": "c", "status": "s", "active": "a", "sub": "u"}[item]
+                    for item in mismatches))
             deadline = bounded_deadline(5)
             while not journal_evidence[0]:
                 if time.monotonic() >= deadline:
