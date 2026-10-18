@@ -2801,8 +2801,7 @@ def producer_failure_message(category, stage, expected_target, evidence, finalit
 
 
 def exercise_intent_epoch(client, repo, commit, go_binary, stage, expected_target, prior):
-    label = (f"run-root:{stage}" if expected_target == "run-root"
-             else f"path:{expected_target}:{stage}")
+    label = f"intent:{INTENT_TARGETS[expected_target]}:{stage}"
     reset_paths("intent-window", "/run/nmcp-ci/cleanup-intent.ready",
                 "/run/nmcp-ci/cleanup-intent.ready.new")
     process = popen("intent-window", ("/usr/bin/python3", "-I", "-S", client, repo,

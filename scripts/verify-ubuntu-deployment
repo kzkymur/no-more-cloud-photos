@@ -2464,7 +2464,7 @@ elif (requested_mode.startswith("client-cleanup-fault-")
 elif requested_mode in WORK_BUDGET_MODES:
     supervisor_mode = "fast-success" if requested_mode.endswith("-journal") else "fast-hold"
 elif requested_mode in ("client-terminal-race-b", "client-reuse-pause"):
-    supervisor_mode = "run-root:after-intent"
+    supervisor_mode = "intent:run-root:after-intent"
 ''').body
     require(len(routing_starts) == 1
             and [ast.dump(node) for node in main_node.body[routing_starts[0]:routing_starts[0] + 2]]

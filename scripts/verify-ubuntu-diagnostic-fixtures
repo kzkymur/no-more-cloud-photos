@@ -2578,7 +2578,7 @@ def actual_boundary_cases(client, containment):
         containment_globals["producer_transaction_state"] = lambda: "reusable"
         assert_fails_with(lambda: containment["producer_wait_evidence"](
             types.SimpleNamespace(poll=lambda: 1), "after-intent", "run-root", None,
-            "/repo", "c" * 40, "/go", "run-root:after-intent", 0,
+            "/repo", "c" * 40, "/go", "intent:run-root:after-intent", 0,
             {"communicated": True, "stdout": "", "stderr": "", "reaped": True,
              "result_exact": False}), "producer-exit-before-ready")
     finally:
@@ -2885,8 +2885,8 @@ def intent_epoch_cases(containment):
                 "failure after ready open before journal anchor leaked evidence descriptors")
         state["fail_journal_read"] = False
         labels = {f"{kind}:{stage_name}" for kind in (
-            "run-root", "path:/usr/local/libexec/nmcp", "path:/var/lib/nmcp",
-            "path:/opt/nmcp-role-compatibility") for stage_name in (
+            "intent:run-root", "intent:usr-local-libexec-nmcp",
+            "intent:var-lib-nmcp", "intent:opt-nmcp-role-compatibility") for stage_name in (
                 "after-intent", "after-mkdir", "after-open", "after-register")}
         require(len(labels) == 16, "intent epoch fixture did not cover all 16 labels")
     finally:
@@ -2951,7 +2951,7 @@ def producer_epoch_state_cases(containment):
         try:
             containment["producer_wait_evidence"](
                 Process(1), "after-intent", "run-root", None,
-                "/repo", "c" * 40, "/go", "run-root:after-intent", 10, state)
+                "/repo", "c" * 40, "/go", "intent:run-root:after-intent", 10, state)
         except containment["ProducerEpochFailure"] as error:
             require(error.category == "producer-exit-before-ready"
                     and error.evidence["journal"] == "signed"
@@ -2988,7 +2988,7 @@ def producer_epoch_state_cases(containment):
         try:
             containment["producer_wait_evidence"](
                 DelayedExit(), "after-intent", "run-root", None,
-                "/repo", "c" * 40, "/go", "run-root:after-intent", 10, lifecycle())
+                "/repo", "c" * 40, "/go", "intent:run-root:after-intent", 10, lifecycle())
         except containment["ProducerEpochFailure"] as error:
             require(error.category == "producer-exit-before-ready"
                     and len(recovery_calls) == 2
@@ -3004,7 +3004,7 @@ def producer_epoch_state_cases(containment):
         try:
             containment["producer_wait_evidence"](
                 Process(None), "after-mkdir", "/var/lib/nmcp", None,
-                "/repo", "c" * 40, "/go", "path:/var/lib/nmcp:after-mkdir", 10,
+                "/repo", "c" * 40, "/go", "intent:var-lib-nmcp:after-mkdir", 10,
                 lifecycle())
         except containment["ProducerEpochFailure"] as error:
             require(error.category == "producer-timeout-before-ready"
@@ -3027,7 +3027,7 @@ def producer_epoch_state_cases(containment):
         wait_globals["open_intent_epoch"] = ready_anchor
         anchor, evidence = containment["producer_wait_evidence"](
             Process(1), "after-open", "run-root", None,
-            "/repo", "c" * 40, "/go", "run-root:after-open", 10, lifecycle())
+            "/repo", "c" * 40, "/go", "intent:run-root:after-open", 10, lifecycle())
         require(len(ready_calls) == 1 and anchor["signature"] == {"signed": True}
                 and evidence["ready"] == "present",
                 "ready-vs-exit race did not require the signed ready anchor")
@@ -3040,7 +3040,7 @@ def producer_epoch_state_cases(containment):
         ready_calls.clear()
         anchor, evidence = containment["producer_wait_evidence"](
             Process(1), "after-open", "run-root", None,
-            "/repo", "c" * 40, "/go", "run-root:after-open", 10, lifecycle())
+            "/repo", "c" * 40, "/go", "intent:run-root:after-open", 10, lifecycle())
         require(len(ready_calls) == 1 and anchor["nonce"] == nonce
                 and anchor["signature"] == {"signed": True}
                 and evidence["ready"] == "present",
@@ -3054,7 +3054,7 @@ def producer_epoch_state_cases(containment):
                 _ for _ in ()).throw(RuntimeError(f"ready {mismatch} mismatch"))
             assert_fails_with(lambda: containment["producer_wait_evidence"](
                 Process(1), "after-open", "run-root", None,
-                "/repo", "c" * 40, "/go", "run-root:after-open", 10, lifecycle()),
+                "/repo", "c" * 40, "/go", "intent:run-root:after-open", 10, lifecycle()),
                 f"ready {mismatch} mismatch")
 
         finality_calls = []
@@ -3089,7 +3089,7 @@ def producer_epoch_state_cases(containment):
         final = containment["producer_epoch_finality"](
             Process(1), lifecycle(), {"signature": {"signed": True}, "nonce": nonce,
                                       "recorded_cgroup": "/recorded"},
-            "/repo", "c" * 40, "/go", "run-root:after-open")
+            "/repo", "c" * 40, "/go", "intent:run-root:after-open")
         require(final["cleanup"] == "complete" and final["unit_absent"]
                 and final["scanned"] == {"recorded": True, "canonical": True}
                 and not any(final["scans"].values()) and all(final["locks"].values())
@@ -3125,7 +3125,7 @@ def producer_epoch_state_cases(containment):
             failed = containment["producer_epoch_finality"](
                 Process(1), lifecycle(), {"signature": {"signed": True}, "nonce": nonce,
                                           "recorded_cgroup": "/recorded"},
-                "/repo", "c" * 40, "/go", "run-root:after-open")
+                "/repo", "c" * 40, "/go", "intent:run-root:after-open")
             require(failed["cleanup"] == category,
                     f"producer finality did not isolate injected {category} category")
 
@@ -3144,7 +3144,7 @@ def producer_epoch_state_cases(containment):
         unsigned = containment["producer_epoch_finality"](
             Process(1), lifecycle(), {"signature": None, "nonce": nonce,
                                       "recorded_cgroup": "/recorded"},
-            "/repo", "c" * 40, "/go", "run-root:after-open")
+            "/repo", "c" * 40, "/go", "intent:run-root:after-open")
         require(unsigned["cleanup"] == "unsigned-loaded" and not unsigned_cleanup_calls,
                 "unsigned loaded fixed name was cleaned without exact launch identity")
 
@@ -3153,7 +3153,7 @@ def producer_epoch_state_cases(containment):
         recovered = containment["producer_epoch_finality"](
             Process(1), lifecycle(), {"signature": None, "nonce": nonce,
                                       "recorded_cgroup": "/recorded"},
-            "/repo", "c" * 40, "/go", "run-root:after-open")
+            "/repo", "c" * 40, "/go", "intent:run-root:after-open")
         require(recovered["cleanup"] == "action",
                 "recovery observation failure lost its isolated action category")
 

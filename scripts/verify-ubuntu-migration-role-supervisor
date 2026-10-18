@@ -56,6 +56,16 @@ SUPERVISOR_NONCE = ""
 HANDLED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
 CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
+INTENT_MODE_TARGETS = {
+    "run-root": "run-root",
+    "usr-local-libexec-nmcp": "/usr/local/libexec/nmcp",
+    "var-lib-nmcp": "/var/lib/nmcp",
+    "opt-nmcp-role-compatibility": "/opt/nmcp-role-compatibility",
+}
+
+INTENT_TARGET_TOKEN = {path: token for token, path in INTENT_MODE_TARGETS.items()
+                       if path != "run-root"}
+
 TOP_ALLOWLISTS = {
     "/usr/local/libexec/nmcp": {"postgresql", "set-ubuntu-migration-role-mode", "run-ubuntu-migration-compatibility", "verify-installed-runtime-roles"},
     "/var/lib/nmcp": {"deployment"},
@@ -653,7 +663,7 @@ def supervisor_body(resources):
     run_root = "/run/nmcp-ci/transaction-" + secrets.token_hex(16)
     create_owned_top(run_root, 0o700, intents,
                      {"current-source", "v18-source", "nmcp-admin-current.build",
-                      "nmcp-admin-v18.build", "snapshot", "snapshot.build"}, "run-root")
+                      "nmcp-admin-v18.build", "snapshot", "snapshot.build"}, "intent:run-root")
     try:
         lock_keeper = launch_lock_keeper(resources, lock_fd)
         keeper_pid_fd = os.open(LOCK_KEEPER_PID_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -696,11 +706,19 @@ def supervisor_body(resources):
                 signal.pause()
         if fast_success:
             return 0
-        if FAULT_MODE.startswith("path:"):
+        if FAULT_MODE.startswith("intent:"):
+            parts = FAULT_MODE.split(":")
+            if (len(parts) != 3 or parts[1] not in INTENT_MODE_TARGETS
+                    or parts[2] not in {"after-intent", "after-mkdir", "after-open", "after-register"}):
+                die("invalid opaque intent fault mode")
+            selected = INTENT_MODE_TARGETS[parts[1]]
+            if selected == "run-root":
+                die("run-root intent fault mode did not stop during run root creation")
             for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
                                ("/opt/nmcp-role-compatibility", 0o755)):
-                create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path], f"path:{path}")
-            die("path fault mode reached the end without its required SIGKILL")
+                create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path],
+                                 f"intent:{INTENT_TARGET_TOKEN[path]}")
+            die("intent fault mode reached the end without its required SIGKILL")
         current_source = os.path.join(run_root, "current-source")
         historical_source = os.path.join(run_root, "v18-source")
         os.mkdir(current_source, 0o700)
