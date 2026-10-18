@@ -495,6 +495,52 @@ def persistent_handoff_state_cases(containment):
             "unload handoff accepted recorded cgroup residue")
 
 
+def journal_no_match_exit_case(client):
+    globals_ = client["bounded_journal_evidence"].__globals__
+    original_popen = globals_["subprocess"].Popen
+    original_select = globals_["select"].select
+    original_read = globals_["os"].read
+    original_set_blocking = globals_["os"].set_blocking
+    original_close = globals_["os"].close
+
+    class Stream:
+        def fileno(self):
+            return 91
+
+        def close(self):
+            return None
+
+    class Process:
+        def __init__(self, status):
+            self.stdout = Stream()
+            self.status = status
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.status
+
+        def poll(self):
+            return self.status
+
+    try:
+        globals_["select"].select = lambda *_args: ((91,), (), ())
+        globals_["os"].read = lambda *_args: b""
+        globals_["os"].set_blocking = lambda *_args: None
+        globals_["os"].close = lambda *_args: None
+        globals_["subprocess"].Popen = lambda *_args, **_kwargs: Process(1)
+        require(client["bounded_journal_evidence"]("0" * 32) == (False, False, False),
+                "journal grep no-match status was rejected")
+        globals_["subprocess"].Popen = lambda *_args, **_kwargs: Process(2)
+        assert_raises(lambda: client["bounded_journal_evidence"]("0" * 32),
+                      "journal_failure=exit;status=2")
+    finally:
+        globals_["subprocess"].Popen = original_popen
+        globals_["select"].select = original_select
+        globals_["os"].read = original_read
+        globals_["os"].set_blocking = original_set_blocking
+        globals_["os"].close = original_close
+
+
 def cancellation_accounting_cases(client):
     helper = client["account_latched_cancellation"]
     globals_ = helper.__globals__
@@ -4631,6 +4677,7 @@ def main():
     supervisor_cleanup_cases(supervisor)
     containment["assert_persistent_cgroup_routing_contract"]()
     diagnostic_cases(client, containment)
+    journal_no_match_exit_case(client)
     explicit_marker_phase_cases(containment)
     persistent_launch_release_cases(containment)
     persistent_handoff_state_cases(containment)

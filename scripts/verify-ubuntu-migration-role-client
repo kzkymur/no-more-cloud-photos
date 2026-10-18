@@ -888,7 +888,7 @@ def bounded_journal_evidence(invocation):
             status = os_call("journal", "wait", "journal", process.wait, timeout=remaining)
         except subprocess.TimeoutExpired:
             raise JournalEvidenceFailure("timeout")
-        if status:
+        if status not in (0, 1):
             raise JournalEvidenceFailure("exit", status=status)
     finally:
         if process.poll() is None:
