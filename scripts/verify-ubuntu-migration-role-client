@@ -953,8 +953,10 @@ def bounded_supervisor_stage(invocation, nonce):
         return "unknown"
     value = line[len(prefix):-1]
     fixed = {"startup": "s", "build": "b", "stage-verify": "v", "install": "i", "final": "f",
-             "intent-after-intent": "t0", "intent-after-mkdir": "t1",
-             "intent-after-open": "t2", "intent-after-register": "t3"}
+             "intent-before-replace": "r0", "intent-after-replace": "r1",
+             "intent-after-fsync": "r2", "intent-after-intent": "t0",
+             "intent-after-mkdir": "t1", "intent-after-open": "t2",
+             "intent-after-register": "t3"}
     if value in fixed:
         return fixed[value]
     for index, phase in enumerate(SUPERVISOR_PHASES):

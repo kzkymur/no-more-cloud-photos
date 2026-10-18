@@ -66,7 +66,7 @@ def supervisor_stage(stage):
     allowed = ("startup", "build", "stage-verify", "install", "final",
                *("phase-" + phase for phase in PHASES),
                *("boundary-" + phase for phase in PHASES),
-               *("intent-" + boundary for boundary in ("after-intent", "after-mkdir", "after-open", "after-register")))
+               *("intent-" + boundary for boundary in ("before-replace", "after-replace", "after-fsync", "after-intent", "after-mkdir", "after-open", "after-register")))
     if stage not in allowed or len(SUPERVISOR_NONCE) != 64:
         die("supervisor stage evidence was not closed and identity-bound")
     payload = ("v1:" + SUPERVISOR_NONCE + ":" + stage + "\n").encode("ascii")
@@ -472,7 +472,7 @@ def metadata(value):
             "gid": value.st_gid, "mode": stat.S_IMODE(value.st_mode)}
 
 
-def durable_intents(entries, epoch=None):
+def durable_intents(entries, epoch=None, stage=None):
     raw = (json.dumps({"version": 2, "epoch": epoch, "entries": entries}, sort_keys=True,
                       separators=(",", ":")) + "\n").encode("ascii")
     temporary = INTENT_PATH + ".new"
@@ -486,8 +486,14 @@ def durable_intents(entries, epoch=None):
         write_all(descriptor, raw)
         os.fchmod(descriptor, 0o600)
         os.fsync(descriptor)
+    if stage is not None:
+        stage("intent-before-replace")
     os.replace(temporary, INTENT_PATH)
+    if stage is not None:
+        stage("intent-after-replace")
     fsync_directory("/run/nmcp-ci")
+    if stage is not None:
+        stage("intent-after-fsync")
 
 
 def publish_intent_ready(epoch):
@@ -608,8 +614,10 @@ def create_owned_top(path, mode, entries, allowlist, fault_name=None, stage=None
                  "absence_policy": "must-be-absent", "expected_metadata": {"uid": 0, "gid": 0, "mode": mode},
                  "identity": None, "allowlist": sorted(allowlist)}
         entries.append(entry)
-        durable_intents(entries)
-        if stage is not None:
+        if stage is None:
+            durable_intents(entries)
+        else:
+            durable_intents(entries, stage=stage)
             stage("intent-after-intent")
         fault(entries, path, "after-intent", fault_name or path)
         # mkdir(2) applies the process umask. Publish the exact journaled mode
