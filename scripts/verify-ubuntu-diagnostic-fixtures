@@ -3032,6 +3032,31 @@ def producer_epoch_state_cases(containment):
                 and evidence["ready"] == "present",
                 "ready-vs-exit race did not require the signed ready anchor")
 
+        # Exercise the narrower race: readiness is absent during the ordinary
+        # observation but becomes visible after poll reports exit.  The final
+        # observation must still pass through the full identity-bound anchor.
+        ready_observations = iter((False, True))
+        wait_globals["path_exists"] = lambda *_args: next(ready_observations)
+        ready_calls.clear()
+        anchor, evidence = containment["producer_wait_evidence"](
+            Process(1), "after-open", "run-root", None,
+            "/repo", "c" * 40, "/go", "run-root:after-open", 10, lifecycle())
+        require(len(ready_calls) == 1 and anchor["nonce"] == nonce
+                and anchor["signature"] == {"signed": True}
+                and evidence["ready"] == "present",
+                "final identity-bound ready observation did not win the exit race")
+
+        # Mere post-exit file presence or a mismatched nonce/stage/target/inode
+        # must remain rejected by the existing anchored validator.
+        wait_globals["path_exists"] = lambda *_args: True
+        for mismatch in ("nonce", "stage", "target", "inode"):
+            wait_globals["open_intent_epoch"] = lambda *_args, mismatch=mismatch: (
+                _ for _ in ()).throw(RuntimeError(f"ready {mismatch} mismatch"))
+            assert_fails_with(lambda: containment["producer_wait_evidence"](
+                Process(1), "after-open", "run-root", None,
+                "/repo", "c" * 40, "/go", "run-root:after-open", 10, lifecycle()),
+                f"ready {mismatch} mismatch")
+
         finality_calls = []
         wait_globals["reset_paths"] = lambda *_args: None
         wait_globals["popen"] = lambda *_args, **_kwargs: Process(1)

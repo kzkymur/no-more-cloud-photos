@@ -2521,6 +2521,21 @@ def producer_wait_evidence(process, stage, expected_target, prior, repo, commit,
                             "transaction": "blocked"}
         return_code = process.poll()
         if return_code is not None:
+            # The producer may publish the durable, identity-bound ready marker just
+            # before its launcher is reaped.  Give that already-durable evidence one
+            # final anchored observation before classifying an early exit; mere path
+            # presence remains insufficient because open_intent_epoch validates the
+            # nonce, stage, target, journal identity, and signed unit launch.
+            if time.monotonic() < deadline and path_exists(
+                    "intent-window", "marker", "/run/nmcp-ci/cleanup-intent.ready"):
+                anchor = open_intent_epoch(
+                    stage, expected_target, prior, repo, commit, go_binary, mode)
+                anchor["recorded_cgroup"] = anchor["state"].get("ControlGroup", "")
+                return anchor, {"state": anchor["state"], "nonce": anchor["nonce"],
+                                "signature": anchor["signature"],
+                                "recorded_cgroup": anchor["recorded_cgroup"],
+                                "ready": "present", "journal": "signed",
+                                "transaction": "blocked"}
             communicate_producer_once(process, lifecycle, 10)
             journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"
             raise ProducerEpochFailure("producer-exit-before-ready", {

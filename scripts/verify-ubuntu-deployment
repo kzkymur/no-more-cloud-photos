@@ -10009,11 +10009,17 @@ def verify_supervisor_mutations(
             '        anchor = open_intent_epoch(stage, expected_target, prior, repo, commit, go_binary, label)')),
         ("intent producer exit poll omitted", replace_once(containment,
             '        return_code = process.poll()\n'
-            '        if return_code is not None:\n'
-            '            communicate_producer_once(process, lifecycle, 10)',
+            '        if return_code is not None:',
             '        return_code = process.poll()\n'
-            '        if False:\n'
-            '            communicate_producer_once(process, lifecycle, 10)')),
+            '        if False:')),
+        ("intent final ready observation omitted", replace_once(containment,
+            '            if time.monotonic() < deadline and path_exists(\n'
+            '                    "intent-window", "marker", "/run/nmcp-ci/cleanup-intent.ready"):',
+            '            if False:')),
+        ("intent final ready accepted by presence", replace_once(containment,
+            '                anchor = open_intent_epoch(\n'
+            '                    stage, expected_target, prior, repo, commit, go_binary, mode)',
+            '                anchor = {"state": state, "nonce": nonce, "signature": signature}')),
         ("intent exact label omitted", replace_once(containment,
             '            process, stage, expected_target, prior, repo, commit, go_binary, label,\n'
             '            time.monotonic() + PRODUCER_WAIT_SECONDS, lifecycle)',
