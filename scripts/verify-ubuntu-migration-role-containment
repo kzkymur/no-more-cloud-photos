@@ -508,13 +508,13 @@ def client_primary_diagnostic(stderr):
         payload = detail[len("supervisor_stage="):]
         token, separator, status_field = payload.partition(";")
         allowed_statuses = {"1", *(str(status) for status in range(71, 86)), "u"}
-        if not separator or not status_field.startswith("supervisor_status="):
-            token = "invalid"
-        elif status_field[len("supervisor_status="):] not in allowed_statuses:
+        status = (status_field[len("supervisor_status="):]
+                  if separator and status_field.startswith("supervisor_status=") else "")
+        if status not in allowed_statuses:
             token = "invalid"
         stages = ("s", "b", "v", "i", "f", "u", "r0", "r1", "r2", "t0", "t1", "t2", "t3", *("p" + format(index, "x") for index in range(13)),
                   *("q" + format(index, "x") for index in range(13)))
-        diagnostic_category = token if token in stages else "invalid"
+        diagnostic_category = token + "-" + status if token in stages else "invalid"
     elif detail.startswith("terminal_failure="):
         token = detail[len("terminal_failure="):]
         parts = token.split("-", 2)

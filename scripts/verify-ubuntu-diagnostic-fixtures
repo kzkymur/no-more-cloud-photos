@@ -3256,10 +3256,10 @@ def producer_epoch_state_cases(containment):
                 and primary_detail == "fixture failure",
                 "producer diagnostic discarded the bounded primary client stderr")
         for detail, category in (
-                ("supervisor_stage=r0;supervisor_status=71", "r0"),
-                ("supervisor_stage=t0;supervisor_status=85", "t0"),
-                ("supervisor_stage=p0;supervisor_status=1", "p0"),
-                ("supervisor_stage=p0;supervisor_status=u", "p0"),
+                ("supervisor_stage=r0;supervisor_status=71", "r0-71"),
+                ("supervisor_stage=t0;supervisor_status=85", "t0-85"),
+                ("supervisor_stage=p0;supervisor_status=1", "p0-1"),
+                ("supervisor_stage=p0;supervisor_status=u", "p0-u"),
                 ("supervisor_stage=p0", "invalid"),
                 ("supervisor_stage=p0;supervisor_status=70", "invalid"),
                 ("supervisor_stage=pz;supervisor_status=71", "invalid"),
