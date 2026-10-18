@@ -138,7 +138,7 @@ jobs:
         sudo apt-get install --yes --no-install-recommends \
           ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck util-linux
     - name: Provision isolated VM identity
-      run: sudo systemd-sysusers infra/ubuntu/sysusers.d/nmcp.conf
+      run: sudo systemd-sysusers "$GITHUB_WORKSPACE/infra/ubuntu/sysusers.d/nmcp.conf"
     - name: Direct runner unit tests
       run: python3 scripts/test-ubuntu-direct-compatibility
     - name: Direct exact candidate compatibility
@@ -284,7 +284,7 @@ jobs:
         sudo apt-get install --yes --no-install-recommends \
           ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck util-linux
     - name: Provision isolated VM identity
-      run: sudo systemd-sysusers infra/ubuntu/sysusers.d/nmcp.conf
+      run: sudo systemd-sysusers "$GITHUB_WORKSPACE/infra/ubuntu/sysusers.d/nmcp.conf"
     - name: ${{ matrix.gate }}
       env:
         RELEASE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}
