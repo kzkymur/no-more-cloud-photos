@@ -137,6 +137,30 @@ class SupervisorCleanupFailure(RuntimeError):
         super().__init__(message)
 
 
+def find_intent_publish_failure(error):
+    seen = set()
+    pending = [error]
+    while pending:
+        candidate = pending.pop()
+        identity = id(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(candidate, IntentPublishFailure):
+            return candidate
+        if isinstance(candidate, SupervisorCleanupFailure):
+            if candidate.primary_error is not None:
+                pending.append(candidate.primary_error)
+            pending.extend(cleanup_error for _category, cleanup_error in candidate.cleanup_errors)
+        cause = getattr(candidate, "__cause__", None)
+        context = getattr(candidate, "__context__", None)
+        if cause is not None:
+            pending.append(cause)
+        if context is not None:
+            pending.append(context)
+    return None
+
+
 class CleanupScope:
     def __init__(self):
         self.actions = []
@@ -1232,15 +1256,10 @@ if __name__ == "__main__":
     except IntentPublishFailure as error:
         print(f"trusted-supervisor: {error}", file=sys.stderr)
         raise SystemExit(IntentPublishFailure.EXIT_CODES[error.operation])
-    except SupervisorCleanupFailure as error:
-        if (isinstance(error.primary_error, IntentPublishFailure)
-                and all(category == "intent-recovery"
-                        for category, _cleanup_error in error.cleanup_errors)):
-            operation = error.primary_error.operation
-            print(f"trusted-supervisor: {error}", file=sys.stderr)
-            raise SystemExit(IntentPublishFailure.EXIT_CODES[operation])
-        print(f"trusted-supervisor: {error}", file=sys.stderr)
-        raise SystemExit(1)
     except Exception as error:
+        intent_error = find_intent_publish_failure(error)
+        if intent_error is not None:
+            print(f"trusted-supervisor: {error}", file=sys.stderr)
+            raise SystemExit(IntentPublishFailure.EXIT_CODES[intent_error.operation])
         print(f"trusted-supervisor: {error}", file=sys.stderr)
         raise SystemExit(1)
