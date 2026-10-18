@@ -500,11 +500,17 @@ def client_primary_diagnostic(stderr):
     detail = lines[1][len(prefix):] if len(lines) == 2 and lines[1].startswith(prefix) else ""
     if not detail:
         detail = "client diagnostic detail was absent"
-    journal_category = "none"
+    diagnostic_category = "none"
     if detail.startswith("journal_failure="):
         token = detail[len("journal_failure="):].partition(";")[0]
-        journal_category = token if token in ("timeout", "exit", "malformed", "io") else "invalid"
-    return parsed["primary"], journal_category, detail
+        diagnostic_category = token if token in ("timeout", "exit", "malformed", "io") else "invalid"
+    elif detail.startswith("verification invocation failed:"):
+        diagnostic_category = "terminal"
+    elif detail == "exact invocation journal lacks one final success marker":
+        diagnostic_category = "marker"
+    elif parsed["primary"] == "verification":
+        diagnostic_category = "other"
+    return parsed["primary"], diagnostic_category, detail
 
 
 def expected_persistent_result(case, boundary):
@@ -925,7 +931,7 @@ def validate_serialized_diagnostic(payload):
                 or return_code.lstrip("-").isdecimal())
             and fields_by_name.get("result") in ("exact", "invalid", "unavailable")
             and fields_by_name.get("primary") in RESULT_PRIMARY_CATEGORIES + ("invalid", "unknown")
-            and fields_by_name.get("jf") in ("none", "timeout", "exit", "malformed", "io", "invalid")
+            and fields_by_name.get("jf") in ("none", "timeout", "exit", "malformed", "io", "invalid", "terminal", "marker", "other")
             and fields_by_name.get("load") in ("loaded", "not-found", "unknown")
             and fields_by_name.get("active") in ("active", "failed", "inactive", "unknown")
             and fields_by_name.get("sub") in ("running", "exited", "failed", "dead", "unknown")
@@ -2559,7 +2565,7 @@ def producer_wait_evidence(process, stage, expected_target, prior, repo, commit,
                                 "ready": "present", "journal": "signed",
                                 "transaction": "blocked"}
             communicate_producer_once(process, lifecycle, 10)
-            primary_category, journal_category, primary_detail = client_primary_diagnostic(
+            primary_category, diagnostic_category, primary_detail = client_primary_diagnostic(
                 lifecycle["stderr"])
             journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"
             raise ProducerEpochFailure("producer-exit-before-ready", {
@@ -2569,7 +2575,7 @@ def producer_wait_evidence(process, stage, expected_target, prior, repo, commit,
                 "client": "exited",
                 "return_code": return_code if type(return_code) is int else "unknown",
                 "result": "exact" if lifecycle["result_exact"] else "invalid",
-                "primary": primary_category, "journal_failure": journal_category,
+                "primary": primary_category, "journal_failure": diagnostic_category,
                 "primary_detail": primary_detail,
             })
         if time.monotonic() >= deadline:

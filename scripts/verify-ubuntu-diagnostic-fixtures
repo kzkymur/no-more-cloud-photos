@@ -3252,9 +3252,17 @@ def producer_epoch_state_cases(containment):
                    "success=0")
         stderr = machine + "\nverification-client: fixture failure\n"
         primary_category, journal_category, primary_detail = containment["client_primary_diagnostic"](stderr)
-        require(primary_category == "verification" and journal_category == "none"
+        require(primary_category == "verification" and journal_category == "other"
                 and primary_detail == "fixture failure",
                 "producer diagnostic discarded the bounded primary client stderr")
+        for detail, category in (
+                ("verification invocation failed: fixture", "terminal"),
+                ("exact invocation journal lacks one final success marker", "marker")):
+            shaped = machine + "\nverification-client: " + detail + "\n"
+            parsed_category, parsed_failure, parsed_detail = containment["client_primary_diagnostic"](shaped)
+            require(parsed_category == "verification" and parsed_failure == category
+                    and parsed_detail == detail,
+                    "producer diagnostic lost exact verification failure classification")
         invalid_category, invalid_journal, invalid_detail = containment["client_primary_diagnostic"]("malformed")
         require(invalid_category == "invalid" and invalid_journal == "none" and invalid_detail,
                 "producer diagnostic accepted malformed client stderr")
