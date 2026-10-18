@@ -18,7 +18,7 @@ import time
 UNIT = "nmcp-migration-role-verifier.service"
 CLEANUP_DATABASE_FAILURE = "cleanup_database_failed=True"
 CLEANUP_ROLES_FAILURE = "cleanup_roles_failed=True"
-READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
+READY = "/run/nmcp-ci/role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
 SUCCESS = "Ubuntu migration role compatibility verification passed"
@@ -74,7 +74,7 @@ INTENT_TARGETS = {
     "run-root": "run-root",
     "/usr/local/libexec/nmcp": "usr-local-libexec-nmcp",
     "/var/lib/nmcp": "var-lib-nmcp",
-    "/opt/nmcp-role-compatibility": "opt-nmcp-role-compatibility",
+    "/run/nmcp-ci/role-compatibility": "run-role-compatibility",
 }
 PRODUCER_WAIT_SECONDS = 30
 COUNTER_MAX = 999999
@@ -3736,7 +3736,7 @@ raise SystemExit(73)
     for stage in INTENT_STAGES:
         prior = exercise_intent_epoch(
             client, repo, commit, go_binary, stage, "run-root", prior)
-    for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):
+    for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/run/nmcp-ci/role-compatibility"):
         for stage in INTENT_STAGES:
             prior = exercise_intent_epoch(
                 client, repo, commit, go_binary, stage, target, prior)

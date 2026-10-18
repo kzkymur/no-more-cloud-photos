@@ -412,7 +412,7 @@ def explicit_marker_phase_cases(containment):
     original_stat = module_os.stat
     original_open = module_os.open
     wait_cases = (
-        ("preflight", "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"),
+        ("preflight", "/run/nmcp-ci/role-compatibility/test-work/kill/supervisor-kill.ready"),
         ("stale-attestation", "/run/nmcp-ci/stale-ready"),
         ("client-fault", "/run/nmcp-ci/client-fault.ready"),
         ("work-budget", "/run/nmcp-ci/client-work-budget-launch.ready"),
@@ -2932,7 +2932,7 @@ def intent_epoch_cases(containment):
         state["fail_journal_read"] = False
         labels = {f"{kind}:{stage_name}" for kind in (
             "intent:run-root", "intent:usr-local-libexec-nmcp",
-            "intent:var-lib-nmcp", "intent:opt-nmcp-role-compatibility") for stage_name in (
+            "intent:var-lib-nmcp", "intent:run-role-compatibility") for stage_name in (
                 "after-intent", "after-mkdir", "after-open", "after-register")}
         require(len(labels) == 16, "intent epoch fixture did not cover all 16 labels")
     finally:
@@ -3211,7 +3211,7 @@ def producer_epoch_state_cases(containment):
         }
         diagnostic = containment["producer_failure_message"](
             "producer-exit-before-ready", "after-register",
-            "/opt/nmcp-role-compatibility",
+            "/run/nmcp-ci/role-compatibility",
             {"state": signed_state, "signature": {"signed": True},
              "transaction": "blocked", "journal": "signed", "ready": "absent",
              "client": "exited", "return_code": 1, "result": "exact",
@@ -3222,7 +3222,7 @@ def producer_epoch_state_cases(containment):
         require(len(diagnostic) <= containment["DIAGNOSTIC_TEXT_LIMIT"]
                 and b"failure=producer-exit-before-ready" in diagnostic
                 and b"stage=after-register" in diagnostic
-                and b"target=opt-nmcp-role-compatibility" in diagnostic
+                and b"target=run-role-compatibility" in diagnostic
                 and b"primary=verification" in diagnostic
                 and b"jf=none" in diagnostic
                 and b"detail=fixture failure" in diagnostic,

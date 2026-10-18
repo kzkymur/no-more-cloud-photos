@@ -97,7 +97,7 @@ INTENT_MODE_TARGETS = {
     "run-root": "run-root",
     "usr-local-libexec-nmcp": "/usr/local/libexec/nmcp",
     "var-lib-nmcp": "/var/lib/nmcp",
-    "opt-nmcp-role-compatibility": "/opt/nmcp-role-compatibility",
+    "run-role-compatibility": "/run/nmcp-ci/role-compatibility",
 }
 
 INTENT_TARGET_TOKEN = {path: token for token, path in INTENT_MODE_TARGETS.items()
@@ -106,7 +106,7 @@ INTENT_TARGET_TOKEN = {path: token for token, path in INTENT_MODE_TARGETS.items(
 TOP_ALLOWLISTS = {
     "/usr/local/libexec/nmcp": {"postgresql", "set-ubuntu-migration-role-mode", "run-ubuntu-migration-compatibility", "verify-installed-runtime-roles"},
     "/var/lib/nmcp": {"deployment"},
-    "/opt/nmcp-role-compatibility": {"current", "v18", "test-work"},
+    "/run/nmcp-ci/role-compatibility": {"current", "v18", "test-work"},
 }
 
 
@@ -839,7 +839,6 @@ def supervisor_body(resources):
         if FAULT_MODE.startswith("intent:"):
             prepare_required_parent("/usr/local/libexec", 0o755)
             prepare_required_parent("/var/lib", 0o755)
-            prepare_required_parent("/opt", 0o755)
             parts = intent_publish_operation("fault-parse", FAULT_MODE.split, ":")
             if (len(parts) != 3 or parts[1] not in INTENT_MODE_TARGETS
                     or parts[2] not in {"after-intent", "after-mkdir", "after-open", "after-register"}):
@@ -848,7 +847,7 @@ def supervisor_body(resources):
             if selected == "run-root":
                 die("run-root intent fault mode did not stop during run root creation")
             for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
-                               ("/opt/nmcp-role-compatibility", 0o755)):
+                               ("/run/nmcp-ci/role-compatibility", 0o755)):
                 try:
                     create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path],
                                      f"intent:{INTENT_TARGET_TOKEN[path]}", supervisor_stage)
@@ -912,15 +911,15 @@ def supervisor_body(resources):
 
         supervisor_stage("install")
         for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
-                           ("/opt/nmcp-role-compatibility", 0o755)):
+                           ("/run/nmcp-ci/role-compatibility", 0o755)):
             entry = create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path])
             owned.append((path, (entry["identity"]["dev"], entry["identity"]["ino"])))
         for path, mode in (("/usr/local/libexec/nmcp/postgresql", 0o755), ("/var/lib/nmcp/deployment", 0o700),
-                           ("/opt/nmcp-role-compatibility/current/bin", 0o755), ("/opt/nmcp-role-compatibility/v18/bin", 0o755)):
+                           ("/run/nmcp-ci/role-compatibility/current/bin", 0o755), ("/run/nmcp-ci/role-compatibility/v18/bin", 0o755)):
             os.makedirs(path, mode=mode)
             os.chmod(path, mode)
-        for path in ("/usr/local/libexec/nmcp", "/opt/nmcp-role-compatibility",
-                     "/opt/nmcp-role-compatibility/current", "/opt/nmcp-role-compatibility/v18"):
+        for path in ("/usr/local/libexec/nmcp", "/run/nmcp-ci/role-compatibility",
+                     "/run/nmcp-ci/role-compatibility/current", "/run/nmcp-ci/role-compatibility/v18"):
             os.chmod(path, 0o755)
         installs = {
             "role-mode": "/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode",
@@ -930,8 +929,8 @@ def supervisor_body(resources):
             "verify-role-graph.sql": "/usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql",
             "postgresql-roles.sql": "/usr/local/libexec/nmcp/postgresql/postgresql-roles.sql",
             "verify-runtime-roles.sql": "/usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql",
-            "nmcp-admin-current": "/opt/nmcp-role-compatibility/current/bin/nmcp-admin",
-            "nmcp-admin-v18": "/opt/nmcp-role-compatibility/v18/bin/nmcp-admin",
+            "nmcp-admin-current": "/run/nmcp-ci/role-compatibility/current/bin/nmcp-admin",
+            "nmcp-admin-v18": "/run/nmcp-ci/role-compatibility/v18/bin/nmcp-admin",
         }
         for name, destination in installs.items():
             source_fd = open_verified(snapshot_fd, manifest, name)
@@ -946,7 +945,7 @@ def supervisor_body(resources):
                 cleanup.defer("install-target-close", os.close, target_fd)
                 write_all(target_fd, data); os.fchmod(target_fd, manifest[name]["mode"]); os.fsync(target_fd)
         for directory in ("/usr/local/libexec/nmcp", "/usr/local/libexec/nmcp/postgresql",
-                          "/opt/nmcp-role-compatibility/current/bin", "/opt/nmcp-role-compatibility/v18/bin"):
+                          "/run/nmcp-ci/role-compatibility/current/bin", "/run/nmcp-ci/role-compatibility/v18/bin"):
             fsync_directory(directory)
         checksum = subprocess.run(("/usr/bin/sha256sum", "runtime-roles.sql", "verify-runtime-role-graph.sql"),
                                   cwd="/usr/local/libexec/nmcp/postgresql", env=clean_env(), check=True, stdout=subprocess.PIPE).stdout
@@ -963,7 +962,7 @@ def supervisor_body(resources):
                 cleanup.defer("sysusers-close", os.close, sysusers_fd)
                 run(("/usr/bin/systemd-sysusers", f"/proc/self/fd/{sysusers_fd}"), pass_fds=(sysusers_fd,))
         phase_env = clean_env("/root")
-        phase_env.update({"NMCP_COMPAT_WORK": "/opt/nmcp-role-compatibility/test-work",
+        phase_env.update({"NMCP_COMPAT_WORK": "/run/nmcp-ci/role-compatibility/test-work",
                           "NMCP_DATABASE_URL": "postgres://nmcp_migrator:nmcp-migrator-wrapper-test@127.0.0.1:5432/nmcp?sslmode=disable",
                           "NMCP_LOG_LEVEL": "info", "NMCP_SHUTDOWN_TIMEOUT": "10s"})
         if FAULT_MODE == "containment-supervisor-kill":

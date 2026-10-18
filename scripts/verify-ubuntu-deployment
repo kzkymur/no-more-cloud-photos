@@ -488,7 +488,7 @@ def validate_supervisor(source: str) -> None:
     require(literal_assignment(tree, "TOP_ALLOWLISTS") == {
         "/usr/local/libexec/nmcp": {"postgresql", "set-ubuntu-migration-role-mode", "run-ubuntu-migration-compatibility", "verify-installed-runtime-roles"},
         "/var/lib/nmcp": {"deployment"},
-        "/opt/nmcp-role-compatibility": {"current", "v18", "test-work"},
+        "/run/nmcp-ci/role-compatibility": {"current", "v18", "test-work"},
     }, "supervisor cleanup top-level allowlists changed")
     require_exact_function(tree, "git", '''def git(repo, *args, stdout=None):
     return subprocess.run(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo, *args), cwd="/", env=clean_env(),
@@ -795,10 +795,10 @@ def validate_supervisor(source: str) -> None:
         '            or lock_stat.st_gid != 0 or lock_stat.st_nlink != 1\n'
         '            or stat.S_IMODE(lock_stat.st_mode) != 0o600):',
         'for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),\n'
-        '                           ("/opt/nmcp-role-compatibility", 0o755)):\n'
+        '                           ("/run/nmcp-ci/role-compatibility", 0o755)):\n'
         '            entry = create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path])',
-        'for path in ("/usr/local/libexec/nmcp", "/opt/nmcp-role-compatibility",\n'
-        '                     "/opt/nmcp-role-compatibility/current", "/opt/nmcp-role-compatibility/v18"):\n'
+        'for path in ("/usr/local/libexec/nmcp", "/run/nmcp-ci/role-compatibility",\n'
+        '                     "/run/nmcp-ci/role-compatibility/current", "/run/nmcp-ci/role-compatibility/v18"):\n'
         '            os.chmod(path, 0o755)',
         'fsync_directory(snapshot_build)\n        os.rename(snapshot_build, snapshot)\n'
         '        fsync_directory(run_root)\n        snapshot_fd = os.open(snapshot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)',
@@ -4275,7 +4275,7 @@ try_nonblocking_flock(cleanup_lock, "persistent-cleanup", "lock")
     expected_assignment_nodes = ast.parse('''UNIT = "nmcp-migration-role-verifier.service"
 CLEANUP_DATABASE_FAILURE = "cleanup_database_failed=True"
 CLEANUP_ROLES_FAILURE = "cleanup_roles_failed=True"
-READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"
+READY = "/run/nmcp-ci/role-compatibility/test-work/kill/supervisor-kill.ready"
 PID_FILES = ("wrapper.pid", "admin.pid", "descendant.pid")
 ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}
 SUCCESS = "Ubuntu migration role compatibility verification passed"
@@ -4331,7 +4331,7 @@ INTENT_TARGETS = {
     "run-root": "run-root",
     "/usr/local/libexec/nmcp": "usr-local-libexec-nmcp",
     "/var/lib/nmcp": "var-lib-nmcp",
-    "/opt/nmcp-role-compatibility": "opt-nmcp-role-compatibility",
+    "/run/nmcp-ci/role-compatibility": "run-role-compatibility",
 }
 PRODUCER_WAIT_SECONDS = 30
 COUNTER_MAX = 999999
@@ -5814,7 +5814,7 @@ COUNTER_CATEGORIES = (
         '"failed retained-dependency cleanup emitted success"',
         'if (recovered.returncode\n            or path_exists(',
         '"retained-dependency recovery did not harden and clean"',
-        'for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):',
+        'for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/run/nmcp-ci/role-compatibility"):',
         'assert_replaced_or_absent(prior["target"], prior["target_identity"])',
     )
     require(all(fragment in source for fragment in contract)
@@ -6665,7 +6665,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "b8cdd1c2fed0879397236115ffc68e3edc9bfbd89ec43c13fb2e98273262262c",
+            == "14d60ef0468b6fe11982baba45be95b96183935a6cd118caea6a6b36149379e4",
             "diagnostic fixture source snapshot changed")
 
 
@@ -8899,7 +8899,7 @@ def verify_supervisor_mutations(
             'def wait_counter(phase, path, expected, timeout=30):',
             'def wait_counter(phase, path, timeout, expected=30):')),
         ("persistent ready constant changed", replace_once(containment,
-            'READY = "/opt/nmcp-role-compatibility/test-work/kill/supervisor-kill.ready"',
+            'READY = "/run/nmcp-ci/role-compatibility/test-work/kill/supervisor-kill.ready"',
             'READY = "/tmp/unreviewed.ready"')),
         ("persistent environment constant cleared", replace_once(containment,
             'ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "LANG": "C", "HOME": "/root"}',
