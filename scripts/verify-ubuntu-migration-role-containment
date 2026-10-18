@@ -505,7 +505,13 @@ def client_primary_diagnostic(stderr):
         token = detail[len("journal_failure="):].partition(";")[0]
         diagnostic_category = token if token in ("timeout", "exit", "malformed", "io") else "invalid"
     elif detail.startswith("supervisor_stage="):
-        token = detail[len("supervisor_stage="):].partition(";")[0]
+        payload = detail[len("supervisor_stage="):]
+        token, separator, status_field = payload.partition(";")
+        allowed_statuses = {"1", *(str(status) for status in range(71, 86)), "u"}
+        if not separator or not status_field.startswith("supervisor_status="):
+            token = "invalid"
+        elif status_field[len("supervisor_status="):] not in allowed_statuses:
+            token = "invalid"
         stages = ("s", "b", "v", "i", "f", "u", "r0", "r1", "r2", "t0", "t1", "t2", "t3", *("p" + format(index, "x") for index in range(13)),
                   *("q" + format(index, "x") for index in range(13)))
         diagnostic_category = token if token in stages else "invalid"
