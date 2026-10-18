@@ -119,7 +119,7 @@ class IntentPublishFailure(RuntimeError):
                   "chmod": 75, "fsync": 76, "close": 77,
                   "mode-parse": 78, "target-select": 79, "parent-open": 80,
                   "path-exists": 81, "parent-stat": 82, "allowlist-sort": 83,
-                  "entry-append": 84, "call": 85}
+                  "entry-append": 84, "call": 85, "signal-mask": 86}
 
     def __init__(self, operation, error):
         self.operation = operation
@@ -655,18 +655,25 @@ def recover_intents():
 
 def create_owned_top(path, mode, entries, allowlist, fault_name=None, stage=None):
     parent, name = os.path.dirname(path), os.path.basename(path)
-    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})
+    old_mask = intent_publish_operation(
+        "signal-mask", signal.pthread_sigmask, signal.SIG_BLOCK,
+        {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})
     with CleanupScope() as cleanup:
         cleanup.defer("signal-mask-restore", signal.pthread_sigmask,
                       signal.SIG_SETMASK, old_mask)
-        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent_fd = intent_publish_operation(
+            "parent-open", os.open, parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         cleanup.defer("owned-parent-close", os.close, parent_fd)
-        if os.path.lexists(path):
+        if intent_publish_operation("path-exists", os.path.lexists, path):
             die(f"refusing existing path: {path}")
-        entry = {"path": path, "parent": parent, "parent_identity": metadata(os.fstat(parent_fd)),
+        parent_identity = intent_publish_operation(
+            "parent-stat", lambda: metadata(os.fstat(parent_fd)))
+        sorted_allowlist = intent_publish_operation("allowlist-sort", sorted, allowlist)
+        entry = {"path": path, "parent": parent, "parent_identity": parent_identity,
                  "absence_policy": "must-be-absent", "expected_metadata": {"uid": 0, "gid": 0, "mode": mode},
-                 "identity": None, "allowlist": sorted(allowlist)}
-        entries.append(entry)
+                 "identity": None, "allowlist": sorted_allowlist}
+        intent_publish_operation("entry-append", entries.append, entry)
         if stage is None:
             durable_intents(entries)
         else:
