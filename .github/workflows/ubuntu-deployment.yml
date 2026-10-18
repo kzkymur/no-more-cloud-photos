@@ -200,7 +200,9 @@ jobs:
             sudo ip address add 100.64.0.10/32 dev lo
             scripts/verify-ubuntu-nginx-http
         - gate: 08-verify-exact-installed-nginx-service-and-tls-renewal
-          command: sudo scripts/verify-ubuntu-installed-nginx
+          command: |
+            sudo ip address add 100.64.0.10/32 dev lo
+            sudo scripts/verify-ubuntu-installed-nginx
         - gate: 09-verify-systemd-read-only-storage-namespace
           command: sudo scripts/verify-ubuntu-systemd-mounts
         - gate: 10-verify-concrete-postgresql-stopped-instance-recovery
