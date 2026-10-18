@@ -167,6 +167,23 @@ class ClientResultFailure(RuntimeError):
         self.machine = machine
 
 
+class JournalEvidenceFailure(RuntimeError):
+    def __init__(self, category, *, status=None):
+        if category not in ("timeout", "exit", "malformed", "io"):
+            raise RuntimeError("invalid journal evidence failure category")
+        if category == "exit":
+            if type(status) is not int or status <= 0:
+                raise RuntimeError("invalid journal evidence exit status")
+            detail = f"journal_failure=exit;status={min(status, 255)}"
+        else:
+            if status is not None:
+                raise RuntimeError("unexpected journal evidence status")
+            detail = f"journal_failure={category}"
+        super().__init__(detail)
+        self.category = category
+        self.status = status
+
+
 class TerminalEmissionFailure(BaseException):
     pass
 
@@ -392,6 +409,8 @@ def os_call(phase, operation, resource_class, function, *args, **kwargs):
     try:
         return function(*args, **kwargs)
     except OSError as error:
+        if phase == "journal" and resource_class == "journal":
+            raise JournalEvidenceFailure("io") from None
         raise evidence_failure(phase, operation, resource_class, error) from None
 
 
@@ -810,23 +829,23 @@ def command(argv, phase, *, check=True, stdout=subprocess.PIPE, timeout=30):
 
 def parse_journal_evidence(payload):
     if len(payload) > JOURNAL_BYTE_LIMIT:
-        fail("journal evidence exceeded byte limit")
+        raise JournalEvidenceFailure("malformed")
     try:
         output = payload.decode("ascii")
     except UnicodeDecodeError:
-        fail("journal evidence was not ASCII")
+        raise JournalEvidenceFailure("malformed")
     if not output:
         return (False, False, False)
     lines = output.splitlines(keepends=True)
     if len(lines) > JOURNAL_LINE_LIMIT:
-        fail("journal evidence contained extra lines")
+        raise JournalEvidenceFailure("malformed")
     allowed = (CLEANUP_DATABASE_FAILURE, CLEANUP_ROLES_FAILURE, SUCCESS)
     observed = [line[:-1] for line in lines if line.endswith("\n")]
     if (len(observed) != len(lines) or len(set(observed)) != len(observed)
             or any(line not in allowed for line in observed)
             or observed != [line for line in allowed if line in observed]
             or (SUCCESS in observed and len(observed) != 1)):
-        fail("journal evidence was not an exact ordered allowlist")
+        raise JournalEvidenceFailure("malformed")
     return (SUCCESS in observed, CLEANUP_DATABASE_FAILURE in observed,
             CLEANUP_ROLES_FAILURE in observed)
 
@@ -841,7 +860,7 @@ def bounded_journal_evidence(invocation):
         process = subprocess.Popen(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
     except OSError as error:
-        raise evidence_failure("journal", "popen", "journal", error) from None
+        raise JournalEvidenceFailure("io") from None
     payload = bytearray()
     try:
         os_call("journal", "set-blocking", "journal", os.set_blocking,
@@ -849,28 +868,28 @@ def bounded_journal_evidence(invocation):
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                fail("journal evidence query timed out")
+                raise JournalEvidenceFailure("timeout")
             readable, _writable, _exceptional = os_call(
                 "journal", "read", "journal", select.select,
                 (process.stdout.fileno(),), (), (), remaining)
             if not readable:
-                fail("journal evidence query timed out")
+                raise JournalEvidenceFailure("timeout")
             chunk = os_call("journal", "read", "journal", os.read, process.stdout.fileno(),
                             JOURNAL_BYTE_LIMIT + 1 - len(payload))
             if not chunk:
                 break
             payload.extend(chunk)
             if len(payload) > JOURNAL_BYTE_LIMIT:
-                fail("journal evidence exceeded byte limit")
+                raise JournalEvidenceFailure("malformed")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            fail("journal evidence query timed out")
+            raise JournalEvidenceFailure("timeout")
         try:
             status = os_call("journal", "wait", "journal", process.wait, timeout=remaining)
         except subprocess.TimeoutExpired:
-            fail("journal evidence query timed out")
+            raise JournalEvidenceFailure("timeout")
         if status:
-            fail(f"journal evidence query failed with status {status}")
+            raise JournalEvidenceFailure("exit", status=status)
     finally:
         if process.poll() is None:
             os_call("journal", "kill", "journal", process.kill)

@@ -337,7 +337,7 @@ def diagnostic_cases(client, containment):
         assert_raises(lambda: containment["popen"]("client-fault", HOSTILE_ARGV),
                       "phase=client-fault operation=popen resource=process errno=8")
         assert_raises(lambda: client["bounded_journal_evidence"](SECRET),
-                      "phase=journal operation=popen resource=journal errno=8")
+                      "journal_failure=io")
     finally:
         subprocess.Popen = original_popen
 
