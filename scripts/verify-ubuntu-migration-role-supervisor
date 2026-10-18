@@ -73,6 +73,10 @@ def supervisor_stage(stage):
     if len(payload) > 128:
         die("supervisor stage evidence exceeded its fixed bound")
     temporary = STAGE_PATH + ".new"
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         write_all(descriptor, payload)
