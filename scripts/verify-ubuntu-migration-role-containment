@@ -505,7 +505,7 @@ def client_primary_diagnostic(stderr):
         token = detail[len("journal_failure="):].partition(";")[0]
         diagnostic_category = token if token in ("timeout", "exit", "malformed", "io") else "invalid"
     elif detail.startswith("supervisor_stage="):
-        token = detail[len("supervisor_stage="):]
+        token = detail[len("supervisor_stage="):].partition(";")[0]
         stages = ("b", "v", "i", "f", "u", *("p" + format(index, "x") for index in range(13)),
                   *("q" + format(index, "x") for index in range(13)))
         diagnostic_category = token if token in stages else "invalid"
