@@ -663,7 +663,8 @@ def prepare_required_parent(path, mode):
         raise IntentPublishFailure("parent-type", RuntimeError(f"unsafe required parent: {path}"))
     if observed.st_uid != 0 or observed.st_gid != 0:
         raise IntentPublishFailure("parent-owner", RuntimeError(f"unsafe required parent: {path}"))
-    if stat.S_IMODE(observed.st_mode) != mode:
+    observed_mode = stat.S_IMODE(observed.st_mode)
+    if observed_mode & 0o022:
         raise IntentPublishFailure("parent-mode", RuntimeError(f"unsafe required parent: {path}"))
 
 
