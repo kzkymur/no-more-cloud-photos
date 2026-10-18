@@ -45,6 +45,13 @@ jobs:
           psql "$TEST_DATABASE_URL" --set ON_ERROR_STOP=1
           --set nmcp_migrator_role=nmcp
           --file infra/postgresql/runtime-roles.sql
+      - name: Restore content-addressed fixture archive
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .tools/downloads/ffmpeg-6.0.1-amd64-static-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5.tar.xz
+          key: fixture-ffmpeg-linux-amd64-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
+      - name: Test bounded pinned acquisition
+        run: python3 scripts/test-fetch-pinned-ffmpeg
       - name: Install metadata probe tools
         run: |
           mkdir -p .tools
@@ -53,12 +60,9 @@ jobs:
           curl --fail --location --silent --show-error \
             https://github.com/exiftool/exiftool/archive/refs/tags/13.36.tar.gz \
             --output .tools/exiftool-13.36.tar.gz
-          curl --fail --location --silent --show-error \
-            https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz \
-            --output .tools/ffmpeg-6.0.1-amd64-static.tar.xz
+          python3 scripts/fetch-pinned-ffmpeg
           printf '%s  %s\n' \
-            f70ecbcdccc18268d4d3c290faf8cf73b1cf128e3e7f8671e24d6604cae4dc73 .tools/exiftool-13.36.tar.gz \
-            28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5 .tools/ffmpeg-6.0.1-amd64-static.tar.xz | sha256sum --check
+            f70ecbcdccc18268d4d3c290faf8cf73b1cf128e3e7f8671e24d6604cae4dc73 .tools/exiftool-13.36.tar.gz | sha256sum --check
           tar -xzf .tools/exiftool-13.36.tar.gz -C .tools
           tar -xJf .tools/ffmpeg-6.0.1-amd64-static.tar.xz -C .tools
           .tools/exiftool-13.36/exiftool -ver
@@ -343,3 +347,12 @@ jobs:
         run: go test -v -count=1 -run '^TestLifecycleRepositoryIntegration' ./internal/medialifecycle
       - name: Explicit lifecycle HTTP and PostgreSQL integration evidence
         run: go test -v -count=1 -run '^TestLifecycleHTTPPostgreSQLIntegration$' ./internal/httpapi
+      - name: Preserve failed probe acquisition identity
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: probe-acquisition-${{ github.sha }}-${{ github.run_attempt }}
+          path: .tools/probe-download-evidence/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

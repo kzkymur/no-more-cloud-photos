@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Acquire the existing CI-only fixture tool; never trust cache or response bytes."""
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+EXPECTED_SIZE = 41164188  # Independently observed canonical archive, Oct 12/18 2026.
+
+
+def pin():
+    values = {}
+    for line in (ROOT / 'internal/videoprocessor/testdata/fixture-tool.lock').read_text().splitlines():
+        key, _, value = line.partition(' ')
+        if key in ('url', 'sha256'):
+            if key in values:
+                raise ValueError('duplicate fixture pin')
+            values[key] = value
+    if (set(values) != {'url', 'sha256'} or len(values['sha256']) != 64
+            or any(c not in '0123456789abcdef' for c in values['sha256'])
+            or values['url'] != 'https://johnvansickle.com/ffmpeg/old-releases/ffmpeg-6.0.1-amd64-static.tar.xz'):
+        raise ValueError('invalid fixture tool pin')
+    return values
+
+
+def identity(path):
+    size = path.stat().st_size
+    if size > EXPECTED_SIZE:
+        return {'bytes': size, 'sha256': None, 'digest_error': 'exceeds fixed acquisition bound'}
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return {'bytes': path.stat().st_size, 'sha256': digest.hexdigest()}
+
+
+def verify(path, expected, size):
+    actual = identity(path)
+    if actual['sha256'] != expected or actual['bytes'] != size:
+        raise RuntimeError('fixture identity mismatch: ' + json.dumps(actual, sort_keys=True))
+    # Test compression integrity without extracting or executing the archive.
+    subprocess.run(['xz', '--test', '--', str(path)], check=True, timeout=60)
+
+
+def download(url, target, evidence):
+    # Exactly one bounded request; curl redirects may not downgrade to HTTP.
+    # There is no retry on digest mismatch or automatic CI rerun.
+    result = subprocess.run([
+        'curl', '--fail-with-body', '--location', '--silent', '--show-error',
+        '--proto', '=https', '--proto-redir', '=https',
+        '--connect-timeout', '20', '--max-time', '180',
+        '--max-filesize', str(EXPECTED_SIZE),
+        '--dump-header', str(evidence / 'response.headers'),
+        '--output', str(target), '--write-out', '%{json}', url,
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=200)
+    (evidence / 'curl.json').write_text(result.stdout)
+    (evidence / 'curl.stderr').write_text(result.stderr)
+    return result.returncode, json.loads(result.stdout)
+
+
+def acquire(tools, expected, size=EXPECTED_SIZE, fetcher=download):
+    tools = Path(tools)
+    evidence = tools / 'probe-download-evidence'
+    evidence.mkdir(parents=True, exist_ok=True)
+    cache = tools / 'downloads' / ('ffmpeg-6.0.1-amd64-static-' + expected['sha256'] + '.tar.xz')
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    record = {'expected_url': expected['url'], 'expected_sha256': expected['sha256'],
+              'expected_bytes': size, 'source': 'cache' if cache.exists() else 'https'}
+    report = evidence / 'identity.json'
+    candidate = None
+    try:
+        if cache.is_symlink():
+            raise RuntimeError('fixture cache must not be a symlink')
+        if cache.exists():
+            candidate = cache
+            # A corrupt cache is an error, not a license to silently replace it.
+        else:
+            candidate = evidence / 'response.tar.xz.part'
+            code, metrics = fetcher(expected['url'], candidate, evidence)
+            record.update(curl_exit=code, http=metrics)
+            if candidate.exists():
+                record['actual'] = identity(candidate)
+            if code != 0 or metrics.get('http_code', metrics.get('response_code')) != 200:
+                raise RuntimeError('bounded fixture HTTP acquisition failed')
+        record['actual'] = identity(candidate)
+        verify(candidate, expected['sha256'], size)
+        if candidate != cache:
+            if (candidate.is_symlink() or candidate.resolve().parent != evidence.resolve()
+                    or cache.resolve().parent != (tools / 'downloads').resolve()):
+                raise RuntimeError('unexpected acquisition promotion path')
+            candidate.replace(cache)
+        # Keep original filename/tool paths consumed by existing build/tests.
+        destination = tools / 'ffmpeg-6.0.1-amd64-static.tar.xz'
+        shutil.copyfile(cache, destination)
+        record['verified'] = True
+        return destination
+    except Exception as error:
+        record['verified'] = False
+        record['error'] = str(error)
+        raise
+    finally:
+        if candidate is not None and candidate.exists() and 'actual' not in record:
+            record['actual'] = identity(candidate)
+        report.write_text(json.dumps(record, indent=2, sort_keys=True) + '\n')
+        print(report.read_text(), flush=True)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 2:
+        raise SystemExit('usage: fetch-pinned-ffmpeg [TOOLS_DIRECTORY]')
+    acquire(Path(sys.argv[1]) if len(sys.argv) == 2 else ROOT / '.tools', pin())
