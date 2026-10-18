@@ -74,7 +74,7 @@ def supervisor_stage(stage):
     temporary = STAGE_PATH + ".new"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(descriptor, payload)
+        write_all(descriptor, payload)
         os.fsync(descriptor)
     except BaseException:
         try:
