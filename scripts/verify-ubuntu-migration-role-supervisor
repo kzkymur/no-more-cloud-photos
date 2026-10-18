@@ -49,8 +49,10 @@ CLEANUP_TRANSITION_ERRORS = None
 SIGNAL_ERRORS = []
 BODY_ACTIVE = False
 INTENT_PATH = "/run/nmcp-ci/cleanup-intent.json"
+INTENT_READY_PATH = "/run/nmcp-ci/cleanup-intent.ready"
 LOCK_KEEPER_PID_PATH = "/run/nmcp-ci/lock-keeper.pid"
 FAULT_MODE = ""
+SUPERVISOR_NONCE = ""
 HANDLED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
 CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
@@ -427,8 +429,8 @@ def metadata(value):
             "gid": value.st_gid, "mode": stat.S_IMODE(value.st_mode)}
 
 
-def durable_intents(entries):
-    raw = (json.dumps({"version": 1, "entries": entries}, sort_keys=True,
+def durable_intents(entries, epoch=None):
+    raw = (json.dumps({"version": 2, "epoch": epoch, "entries": entries}, sort_keys=True,
                       separators=(",", ":")) + "\n").encode("ascii")
     temporary = INTENT_PATH + ".new"
     try:
@@ -445,9 +447,35 @@ def durable_intents(entries):
     fsync_directory("/run/nmcp-ci")
 
 
-def fault(point):
-    if FAULT_MODE == point:
-        os.kill(os.getpid(), signal.SIGKILL)
+def publish_intent_ready(epoch):
+    observed = os.stat(INTENT_PATH, follow_symlinks=False)
+    payload = dict(epoch)
+    payload.update({"pid": os.getpid(), "journal_dev": observed.st_dev,
+                    "journal_ino": observed.st_ino})
+    raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    temporary = INTENT_READY_PATH + ".new"
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with CleanupScope() as cleanup:
+        cleanup.defer("intent-ready-close", os.close, descriptor)
+        write_all(descriptor, raw)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    os.replace(temporary, INTENT_READY_PATH)
+    fsync_directory("/run/nmcp-ci")
+
+
+def fault(entries, path, stage, label):
+    if FAULT_MODE != f"{label}:{stage}":
+        return
+    epoch = {"nonce": SUPERVISOR_NONCE, "stage": stage, "target": path}
+    durable_intents(entries, epoch)
+    publish_intent_ready(epoch)
+    while True:
+        signal.pause()
 
 
 def remove_tree_fd(parent_fd, name, allowed):
@@ -483,7 +511,16 @@ def recover_intents():
             die("unsafe cleanup intent journal")
         raw = os.read(descriptor, observed.st_size + 1)
     document = json.loads(raw)
-    if set(document) != {"version", "entries"} or document["version"] != 1:
+    epoch = document.get("epoch")
+    if (set(document) != {"version", "epoch", "entries"} or document["version"] != 2
+            or (epoch is not None and (
+                type(epoch) is not dict or set(epoch) != {"nonce", "stage", "target"}
+                or type(epoch["nonce"]) is not str or len(epoch["nonce"]) != 64
+                or any(character not in "0123456789abcdef" for character in epoch["nonce"])
+                or epoch["stage"] not in {"after-intent", "after-mkdir", "after-open", "after-register"}
+                or type(epoch["target"]) is not str
+                or len([entry for entry in document["entries"]
+                        if type(entry) is dict and entry.get("path") == epoch["target"]]) != 1))):
         die("invalid cleanup intent journal")
     for entry in reversed(document["entries"]):
         if (set(entry) != {"path", "parent", "parent_identity", "absence_policy", "expected_metadata", "identity", "allowlist"}
@@ -529,23 +566,23 @@ def create_owned_top(path, mode, entries, allowlist, fault_name=None):
                  "identity": None, "allowlist": sorted(allowlist)}
         entries.append(entry)
         durable_intents(entries)
-        fault(f"{fault_name or path}:after-intent")
+        fault(entries, path, "after-intent", fault_name or path)
         # mkdir(2) applies the process umask. Publish the exact journaled mode
         # while the rest of this process deliberately retains umask 077.
         previous_umask = os.umask(0)
         cleanup.defer("umask-restore", os.umask, previous_umask)
         os.mkdir(name, mode, dir_fd=parent_fd)
         os.fsync(parent_fd)
-        fault(f"{fault_name or path}:after-mkdir")
+        fault(entries, path, "after-mkdir", fault_name or path)
         top_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
         cleanup.defer("owned-top-close", os.close, top_fd)
         top = os.fstat(top_fd)
         if top.st_uid != 0 or top.st_gid != 0 or stat.S_IMODE(top.st_mode) != mode:
             die(f"new top directory metadata mismatch: {path}")
-        fault(f"{fault_name or path}:after-open")
         entry["identity"] = metadata(top)
+        fault(entries, path, "after-open", fault_name or path)
         durable_intents(entries)
-        fault(f"{fault_name or path}:after-register")
+        fault(entries, path, "after-register", fault_name or path)
     return entry
 
 
@@ -574,7 +611,7 @@ def open_verified(root_fd, manifest, name):
 
 
 def supervisor_body(resources):
-    global FAULT_MODE
+    global FAULT_MODE, SUPERVISOR_NONCE
     if os.geteuid() != 0 or len(sys.argv) not in (5, 6, 7):
         die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO NONCE "
             "[FAULT_POINT] [--persistent-launch-required=PATH]")
@@ -593,6 +630,7 @@ def supervisor_body(resources):
     if len(optional) > 1:
         die("supervisor received an invalid optional argument sequence")
     FAULT_MODE = optional[0] if optional else ""
+    SUPERVISOR_NONCE = nonce
     repo, current_commit, go_binary = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
     if current_commit != git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip():
         die("checkout HEAD is not the requested candidate commit")

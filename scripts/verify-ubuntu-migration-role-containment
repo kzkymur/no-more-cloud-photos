@@ -69,6 +69,14 @@ DIAGNOSTIC_RESOURCES = (
     "cgroup", "cleanup-intent", "client", "counter", "directory", "evidence", "helper",
     "lock", "marker", "pid", "process", "release", "transaction", "unknown",
 )
+INTENT_STAGES = ("after-intent", "after-mkdir", "after-open", "after-register")
+INTENT_TARGETS = {
+    "run-root": "run-root",
+    "/usr/local/libexec/nmcp": "usr-local-libexec-nmcp",
+    "/var/lib/nmcp": "var-lib-nmcp",
+    "/opt/nmcp-role-compatibility": "opt-nmcp-role-compatibility",
+}
+PRODUCER_WAIT_SECONDS = 30
 COUNTER_MAX = 999999
 COUNTER_BYTE_LIMIT = 7
 COUNTER_READ_ATTEMPTS = 4
@@ -101,6 +109,13 @@ class PersistentCgroupFinalityFailure(RuntimeError):
         self.errors = tuple(errors)
         self.recorded_scanned = recorded_scanned
         self.canonical_scanned = canonical_scanned
+
+
+class ProducerEpochFailure(RuntimeError):
+    def __init__(self, category, evidence):
+        super().__init__(category)
+        self.category = category
+        self.evidence = evidence
 
 
 def diagnostic_errno(error):
@@ -313,16 +328,30 @@ def close_transaction_lock(descriptor):
     os_call("transaction-lock", "close", "transaction", os.close, descriptor)
 
 
-def load_cleanup_intent():
-    source = os_call("intent-window", "open", "cleanup-intent", open,
-                     "/run/nmcp-ci/cleanup-intent.json", encoding="ascii")
+def evidence_identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_gid, value.st_nlink, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+def read_anchored_json(descriptor, observed, resource_class):
+    if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != 0 or observed.st_gid != 0
+            or observed.st_nlink != 1 or stat.S_IMODE(observed.st_mode) != 0o600):
+        fail(f"{resource_class} has unsafe ownership, type, mode, or link count")
+    os_call("intent-window", "seek", resource_class, os.lseek, descriptor, 0, os.SEEK_SET)
+    raw = os_call("intent-window", "read", resource_class, os.read,
+                  descriptor, observed.st_size + 1)
+    after = os_call("intent-window", "stat", resource_class, os.fstat, descriptor)
+    if evidence_identity(after) != evidence_identity(observed) or len(raw) != observed.st_size:
+        fail(f"{resource_class} changed while anchored")
     try:
-        try:
-            return json.load(source)
-        except OSError as error:
-            raise evidence_failure("intent-window", "read", "cleanup-intent", error) from None
-    finally:
-        os_call("intent-window", "close", "cleanup-intent", source.close)
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail(f"{resource_class} was not canonical JSON")
+    canonical = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    if raw != canonical:
+        fail(f"{resource_class} was not canonical JSON")
+    return raw, document
 
 
 def persistent_failure_classification(stdout, stderr):
@@ -809,8 +838,10 @@ def validate_serialized_diagnostic(payload):
             raise RuntimeError("serialized diagnostic schema was invalid")
         pairs.append((name, value))
     if (len(pairs) < 2 or pairs[0][0] != "scenario" or pairs[1][0] != "failure"
-            or pairs[0][1] not in ("persistent", "stale")
+            or pairs[0][1] not in ("persistent", "producer", "stale")
             or (pairs[0][1] == "persistent" and pairs[1][1] != "result")
+            or (pairs[0][1] == "producer" and pairs[1][1] not in (
+                "producer-exit-before-ready", "producer-timeout-before-ready"))
             or (pairs[0][1] == "stale" and pairs[1][1] not in (
                 "accepted", "wrong-reason", "identity-change", "result-identity",
                 "fixture-error", "cleanup-error", "invalid"))):
@@ -839,7 +870,7 @@ def validate_serialized_diagnostic(payload):
             and (line_count == "0" or line_count[0] != "0")
             and fields_by_name.get("se_bytes") in ("bounded", "empty", "over")
         )
-    else:
+    elif pairs[0][1] == "stale":
         expected_names = (
             "attempted", "result_available", "client_zero", "success_marker",
             "machine_contract", "human_rejection", "result_contract",
@@ -855,6 +886,41 @@ def validate_serialized_diagnostic(payload):
             and fields_by_name.get("error_category") in (
                 "none", "fixture", "release", "state", "identity", "action", "post",
                 "lock", "paths", "invalid")
+        )
+    else:
+        expected_names = (
+            "stage", "target", "client", "return_code", "result", "load",
+            "active", "sub", "mainpid", "unit_result", "identity", "environment",
+            "transaction", "journal", "ready", "reap", "cleanup", "unit_absent",
+            "recorded_scan", "canonical_scan", "recorded_empty", "canonical_empty",
+            "client_lock", "transaction_lock",
+        )
+        bit_names = expected_names[15:16] + expected_names[17:]
+        return_code = fields_by_name.get("return_code", "")
+        mainpid = fields_by_name.get("mainpid", "")
+        valid_domains = (
+            fields_by_name.get("stage") in INTENT_STAGES
+            and fields_by_name.get("target") in set(INTENT_TARGETS.values())
+            and fields_by_name.get("client") in ("exited", "live", "unknown")
+            and return_code != "" and (return_code == "unknown"
+                or return_code.lstrip("-").isdecimal())
+            and fields_by_name.get("result") in ("exact", "invalid", "unavailable")
+            and fields_by_name.get("load") in ("loaded", "not-found", "unknown")
+            and fields_by_name.get("active") in ("active", "failed", "inactive", "unknown")
+            and fields_by_name.get("sub") in ("running", "exited", "failed", "dead", "unknown")
+            and mainpid != "" and (mainpid == "unknown" or mainpid.isdecimal())
+            and fields_by_name.get("unit_result") in (
+                "success", "exit-code", "signal", "timeout", "unknown")
+            and fields_by_name.get("identity") in ("exact", "mismatch", "absent", "unknown")
+            and fields_by_name.get("environment") in ("exact", "mismatch", "absent", "unknown")
+            and fields_by_name.get("transaction") in ("blocked", "reusable", "unknown")
+            and fields_by_name.get("journal") in (
+                "signed", "unsigned", "absent", "unknown")
+            and fields_by_name.get("ready") in ("present", "absent", "unknown")
+            and fields_by_name.get("cleanup") in (
+                "complete", "action", "cgroup", "lock", "reap", "state",
+                "unsigned-loaded", "multiple", "unknown")
+            and all(fields_by_name.get(name) in ("0", "1") for name in bit_names)
         )
     if field_names != expected_names or not valid_domains:
         raise RuntimeError("serialized diagnostic fields were incomplete")
@@ -1592,6 +1658,15 @@ def assert_transaction_lock_held():
         close_transaction_lock(descriptor)
 
 
+def assert_transaction_lock_reusable():
+    descriptor = open_transaction_lock()
+    try:
+        if not lock_transaction(descriptor):
+            fail("transaction lock was not reusable after producer exit")
+    finally:
+        close_transaction_lock(descriptor)
+
+
 def assert_client_failure(result, mode, phase):
     if result.returncode == 0 or SUCCESS in result.stdout:
         fail(f"client fault unexpectedly succeeded or emitted canonical success: {mode}")
@@ -2283,16 +2358,15 @@ def assert_keeper_lock_coherent(keeper_pid, expected):
         close_transaction_lock(lock)
 
 
-def intent_entry(path):
-    document = load_cleanup_intent()
+def intent_entry(document, path):
     matches = [entry for entry in document["entries"] if entry["path"] == path]
     if len(matches) != 1:
         fail(f"cleanup intent does not identify exactly one target: {path}")
     return matches[0]
 
 
-def run_root_entry():
-    entries = load_cleanup_intent()["entries"]
+def run_root_entry(document):
+    entries = document["entries"]
     matches = [entry for entry in entries if entry["path"].startswith("/run/nmcp-ci/transaction-")]
     if len(matches) != 1:
         fail("cleanup intent does not identify exactly one transaction root")
@@ -2320,6 +2394,446 @@ def assert_replaced_or_absent(path, identity):
         raise evidence_failure("intent-window", "stat", "evidence", error) from None
     if (current.st_dev, current.st_ino) == (identity["dev"], identity["ino"]):
         fail(f"prior cleanup-intent inode survived recovery: {path}")
+
+
+def intent_launch_signature(state, repo, commit, go_binary, mode, nonce=None):
+    environment = state.get("Environment", "")
+    prefix = NONCE_VARIABLE + "="
+    observed_nonce = environment[len(prefix):] if environment.startswith(prefix) else ""
+    if nonce is not None and observed_nonce != nonce:
+        fail("intent producer nonce changed between ready and unit state")
+    if (len(observed_nonce) != 64
+            or any(character not in "0123456789abcdef" for character in observed_nonce)
+            or environment != prefix + observed_nonce):
+        fail("intent producer environment was not one exact nonce")
+    supervisor_argv = ("/usr/bin/python3", "-I", "-S", PROGRAM,
+                       os.path.abspath(os.path.join("/", repo)), commit, go_binary,
+                       observed_nonce, mode)
+    expected_argv = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+                     "LC_ALL=C", "LANG=C", "HOME=/root", prefix + observed_nonce,
+                     *supervisor_argv)
+    invocation = state.get("InvocationID", "")
+    signature = launch_identity_signature(
+        invocation, DESCRIPTION_PREFIX + observed_nonce, environment,
+        "/usr/bin/env", expected_argv)
+    if (len(invocation) != 32
+            or any(character not in "0123456789abcdef" for character in invocation)
+            or not launch_identity_matches(state, signature)):
+        fail("intent producer lacked its exact nonce, argv, mode, and fixed-unit identity")
+    return observed_nonce, signature
+
+
+def producer_unit_evidence(repo, commit, go_binary, mode, deadline):
+    state = show_identity_until(
+        "intent-window", deadline, "ActiveState", "SubState", "MainPID", "Result",
+        "ControlGroup")
+    if state.get("LoadState") == "not-found":
+        return state, None, None
+    try:
+        nonce, signature = intent_launch_signature(
+            state, repo, commit, go_binary, mode)
+    except RuntimeError:
+        return state, None, None
+    return state, nonce, signature
+
+
+def exact_failed_producer_result(process, stdout, stderr):
+    parsed, shape = client_stderr_evidence(stderr)
+    return bool(
+        type(process.returncode) is int and process.returncode == 1
+        and type(stdout) is str and stdout == "" and SUCCESS not in stdout
+        and shape["shape"] and parsed is not None
+        and parsed["primary"] != "none"
+        and parsed["return"] == 1 and parsed["stdout"] == 0 and parsed["success"] == 0
+        and parsed["events_complete"] == 1 and parsed["final_scanned"] == 1
+        and parsed["final_observed"] == 1 and parsed["final_empty"] == 1)
+
+
+def communicate_producer_once(process, lifecycle, timeout):
+    if lifecycle["communicated"]:
+        return lifecycle["stdout"], lifecycle["stderr"]
+    lifecycle["communicated"] = True
+    stdout, stderr = process_communicate("intent-window", process, timeout)
+    lifecycle["stdout"], lifecycle["stderr"] = stdout, stderr
+    lifecycle["reaped"] = process.poll() is not None
+    lifecycle["result_exact"] = exact_failed_producer_result(process, stdout, stderr)
+    return stdout, stderr
+
+
+def intent_journal_evidence(stage, expected_target, nonce):
+    try:
+        descriptor = os.open(
+            "/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    try:
+        observed = os.fstat(descriptor)
+        _raw, document = read_anchored_json(descriptor, observed, "cleanup-intent")
+        epoch = document.get("epoch")
+        target = epoch.get("target") if type(epoch) is dict else None
+        target_matches = (type(target) is str and (
+            target.startswith("/run/nmcp-ci/transaction-")
+            if expected_target == "run-root" else target == expected_target))
+        if (set(document) == {"version", "epoch", "entries"}
+                and document.get("version") == 2 and type(epoch) is dict
+                and set(epoch) == {"nonce", "stage", "target"}
+                and epoch.get("nonce") == nonce and epoch.get("stage") == stage
+                and target_matches):
+            return "signed"
+        return "unsigned"
+    except BaseException:
+        return "unknown"
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def producer_wait_evidence(process, stage, expected_target, prior, repo, commit, go_binary, mode,
+                           deadline, lifecycle):
+    state = {"LoadState": "not-found"}
+    nonce = None
+    signature = None
+    recorded_cgroup = ""
+    while True:
+        observation_deadline = min(deadline, time.monotonic() + 2)
+        try:
+            state, observed_nonce, observed_signature = producer_unit_evidence(
+                repo, commit, go_binary, mode, observation_deadline)
+            if observed_signature is not None:
+                nonce, signature = observed_nonce, observed_signature
+                recorded_cgroup = state.get("ControlGroup", "") or recorded_cgroup
+        except BaseException:
+            pass
+        ready_present = path_exists(
+            "intent-window", "marker", "/run/nmcp-ci/cleanup-intent.ready")
+        if ready_present:
+            anchor = open_intent_epoch(
+                stage, expected_target, prior, repo, commit, go_binary, mode)
+            anchor["recorded_cgroup"] = anchor["state"].get("ControlGroup", "")
+            return anchor, {"state": anchor["state"], "nonce": anchor["nonce"],
+                            "signature": anchor["signature"],
+                            "recorded_cgroup": anchor["recorded_cgroup"],
+                            "ready": "present", "journal": "signed",
+                            "transaction": "blocked"}
+        return_code = process.poll()
+        if return_code is not None:
+            communicate_producer_once(process, lifecycle, 10)
+            journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"
+            raise ProducerEpochFailure("producer-exit-before-ready", {
+                "state": dict(state), "nonce": nonce, "signature": signature,
+                "recorded_cgroup": recorded_cgroup, "ready": "absent",
+                "journal": journal, "transaction": producer_transaction_state(),
+                "client": "exited",
+                "return_code": return_code if type(return_code) is int else "unknown",
+                "result": "exact" if lifecycle["result_exact"] else "invalid",
+            })
+        if time.monotonic() >= deadline:
+            journal = intent_journal_evidence(stage, expected_target, nonce) if nonce else "unknown"
+            raise ProducerEpochFailure("producer-timeout-before-ready", {
+                "state": dict(state), "nonce": nonce, "signature": signature,
+                "recorded_cgroup": recorded_cgroup, "ready": "absent",
+                "journal": journal, "transaction": producer_transaction_state(),
+                "client": "live", "return_code": "unknown", "result": "unavailable",
+            })
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
+
+def producer_transaction_state():
+    descriptor = None
+    try:
+        descriptor = open_transaction_lock()
+        return "reusable" if lock_transaction(descriptor) else "blocked"
+    except BaseException:
+        return "unknown"
+    finally:
+        if descriptor is not None:
+            try:
+                close_transaction_lock(descriptor)
+            except BaseException:
+                pass
+
+
+def open_intent_epoch(stage, expected_target, prior, repo, commit, go_binary, mode):
+    ready_path = "/run/nmcp-ci/cleanup-intent.ready"
+    ready_fd = os_call("intent-window", "open", "marker", os.open, ready_path,
+                       os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        ready_stat = os_call("intent-window", "stat", "marker", os.fstat, ready_fd)
+        _ready_raw, ready = read_anchored_json(ready_fd, ready_stat, "marker")
+        ready_current = os_call("intent-window", "stat", "marker", os.stat, ready_path,
+                                follow_symlinks=False)
+        if evidence_identity(ready_current) != evidence_identity(ready_stat):
+            fail("intent epoch ready marker was replaced while anchored")
+    finally:
+        os_call("intent-window", "close", "marker", os.close, ready_fd)
+    if set(ready) != {"journal_dev", "journal_ino", "nonce", "pid", "stage", "target"}:
+        fail("intent epoch ready marker schema changed")
+    nonce = ready["nonce"]
+    target = ready["target"]
+    if (type(nonce) is not str or len(nonce) != 64
+            or any(character not in "0123456789abcdef" for character in nonce)
+            or ready["stage"] != stage or type(target) is not str
+            or (expected_target == "run-root" and not target.startswith("/run/nmcp-ci/transaction-"))
+            or (expected_target != "run-root" and target != expected_target)
+            or type(ready["pid"]) is not int or ready["pid"] <= 1
+            or type(ready["journal_dev"]) is not int or type(ready["journal_ino"]) is not int):
+        fail(f"intent epoch ready marker did not bind {expected_target}:{stage}")
+    state = show_identity_until(
+        "intent-window", time.monotonic() + 10, "MainPID", "ActiveState", "SubState",
+        "Result", "ControlGroup")
+    _observed_nonce, signature = intent_launch_signature(
+        state, repo, commit, go_binary, mode, nonce)
+    if (state.get("ActiveState") != "active" or state.get("SubState") != "running"
+            or int(state.get("MainPID", "0")) != ready["pid"]):
+        fail(f"intent epoch marker did not bind the live supervisor: {expected_target}:{stage}")
+    descriptor = os_call("intent-window", "open", "cleanup-intent", os.open,
+                         "/run/nmcp-ci/cleanup-intent.json", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        observed = os_call("intent-window", "stat", "cleanup-intent", os.fstat, descriptor)
+        raw, document = read_anchored_json(descriptor, observed, "cleanup-intent")
+        current = os_call("intent-window", "stat", "cleanup-intent", os.stat,
+                          "/run/nmcp-ci/cleanup-intent.json", follow_symlinks=False)
+        epoch = document.get("epoch")
+        if (set(document) != {"version", "epoch", "entries"} or document["version"] != 2
+                or type(epoch) is not dict or set(epoch) != {"nonce", "stage", "target"}
+                or epoch != {"nonce": nonce, "stage": stage, "target": target}
+                or (observed.st_dev, observed.st_ino) != (ready["journal_dev"], ready["journal_ino"])
+                or evidence_identity(current) != evidence_identity(observed)):
+            fail(f"cleanup intent epoch did not bind {expected_target}:{stage}")
+        if prior is not None:
+            if nonce == prior["nonce"]:
+                fail("next cleanup intent epoch reused the prior nonce")
+            assert_replaced_or_absent(prior["target"], prior["target_identity"])
+            if (observed.st_dev, observed.st_ino) == prior["journal_identity"]:
+                fail("prior cleanup-intent inode survived recovery")
+        entry = run_root_entry(document) if expected_target == "run-root" else intent_entry(document, target)
+        return {"descriptor": descriptor, "raw": raw, "stat": observed, "document": document,
+                "entry": entry, "nonce": nonce, "pid": ready["pid"], "target": target,
+                "signature": signature, "state": state}
+    except BaseException:
+        os_call("intent-window", "close", "cleanup-intent", os.close, descriptor)
+        raise
+
+
+def snapshot_intent_epoch(anchor, label):
+    try:
+        raw, document = read_anchored_json(
+            anchor["descriptor"], anchor["stat"], "cleanup-intent")
+        current = os_call("intent-window", "stat", "cleanup-intent", os.stat,
+                          "/run/nmcp-ci/cleanup-intent.json", follow_symlinks=False)
+        after = os_call("intent-window", "stat", "cleanup-intent", os.fstat,
+                        anchor["descriptor"])
+        if (raw != anchor["raw"] or document != anchor["document"]
+                or evidence_identity(after) != evidence_identity(anchor["stat"])
+                or evidence_identity(current) != evidence_identity(anchor["stat"])):
+            fail(f"cleanup intent epoch changed after intended kill: {label}")
+        target_identity = observable_identity(anchor["target"], anchor["entry"]["identity"])
+        return {"nonce": anchor["nonce"], "target": anchor["target"],
+                "target_identity": target_identity,
+                "journal_identity": (anchor["stat"].st_dev, anchor["stat"].st_ino)}
+    finally:
+        os_call("intent-window", "close", "cleanup-intent", os.close,
+                anchor["descriptor"])
+
+
+def terminate_and_reap_producer(process, lifecycle):
+    errors = []
+    if process.poll() is None:
+        try:
+            os_call("intent-window", "kill", "process", process.terminate)
+            process_wait("intent-window", process, 5)
+        except BaseException as error:
+            errors.append(error)
+    if process.poll() is None:
+        try:
+            os_call("intent-window", "kill", "process", process.kill)
+            process_wait("intent-window", process, 5)
+        except BaseException as error:
+            errors.append(error)
+    if not lifecycle["communicated"] and process.poll() is not None:
+        try:
+            communicate_producer_once(process, lifecycle, 5)
+        except BaseException as error:
+            errors.append(error)
+    lifecycle["reaped"] = process.poll() is not None
+    return errors
+
+
+def producer_epoch_finality(process, lifecycle, evidence, repo, commit, go_binary, mode):
+    errors = []
+    categories = []
+    errors.extend(terminate_and_reap_producer(process, lifecycle))
+    if errors:
+        categories.append("reap")
+    signature = evidence.get("signature")
+    recorded_cgroup = evidence.get("recorded_cgroup", "")
+    state = {"LoadState": "unknown"}
+    deadline = time.monotonic() + 45
+    try:
+        state = show_identity_until(
+            "intent-window", deadline, "ActiveState", "SubState", "MainPID", "Result",
+            "ControlGroup")
+        recorded_cgroup = state.get("ControlGroup", "") or recorded_cgroup
+        if state.get("LoadState") == "loaded" and signature is None:
+            try:
+                _nonce, signature = intent_launch_signature(
+                    state, repo, commit, go_binary, mode, evidence.get("nonce"))
+            except BaseException:
+                categories.append("unsigned-loaded")
+        if state.get("LoadState") == "loaded" and signature is not None:
+            cleanup_signed_launch_until(signature, "intent-window", deadline)
+    except BaseException as error:
+        errors.append(error)
+        categories.append("action")
+    try:
+        state = show_until(
+            "intent-window", deadline, "ActiveState", "SubState", "MainPID", "Result",
+            "ControlGroup")
+        recorded_cgroup = state.get("ControlGroup", "") or recorded_cgroup
+    except BaseException as error:
+        errors.append(error)
+        categories.append("state")
+        state = {"LoadState": "unknown"}
+    scans = {"recorded": ["unobserved"], "canonical": ["unobserved"]}
+    scanned = {"recorded": False, "canonical": False}
+    for name, path in (("recorded", recorded_cgroup),
+                       ("canonical", "/system.slice/" + UNIT)):
+        if not path:
+            errors.append(RuntimeError("intent producer lacked a recorded cgroup"))
+            categories.append("cgroup")
+            continue
+        scanned[name] = True
+        try:
+            scans[name] = cgroup_pids(path, "intent-window")
+        except BaseException as error:
+            errors.append(error)
+            categories.append("cgroup")
+    lock_results = {"client": False, "transaction": False}
+    try:
+        assert_client_lock_reusable()
+        lock_results["client"] = True
+    except BaseException as error:
+        errors.append(error)
+        categories.append("lock")
+    try:
+        assert_transaction_lock_reusable()
+        lock_results["transaction"] = True
+    except BaseException as error:
+        errors.append(error)
+        categories.append("lock")
+    unique_categories = tuple(dict.fromkeys(categories))
+    cleanup = ("complete" if not unique_categories else
+               unique_categories[0] if len(unique_categories) == 1 else "multiple")
+    return {
+        "state": state, "signature": signature, "recorded_cgroup": recorded_cgroup,
+        "scans": scans, "scanned": scanned, "locks": lock_results,
+        "cleanup": cleanup, "errors": tuple(errors),
+        "reaped": lifecycle["reaped"],
+        "unit_absent": state.get("LoadState") == "not-found",
+    }
+
+
+def closed_state_value(value, allowed):
+    return value if type(value) is str and value in allowed else "unknown"
+
+
+def producer_failure_message(category, stage, expected_target, evidence, finality):
+    state = evidence.get("state") or {"LoadState": "unknown"}
+    mainpid = state.get("MainPID", "unknown")
+    if type(mainpid) is not str:
+        mainpid = str(mainpid) if type(mainpid) is int and mainpid >= 0 else "unknown"
+    if not mainpid.isdecimal():
+        mainpid = "unknown"
+    load = closed_state_value(state.get("LoadState"), ("loaded", "not-found"))
+    identity = ("absent" if load == "not-found" else
+                "exact" if evidence.get("signature") is not None else
+                "mismatch" if load == "loaded" else "unknown")
+    environment = ("absent" if load == "not-found" else
+                   "exact" if evidence.get("signature") is not None else
+                   "mismatch" if state.get("Environment") else "unknown")
+    fields = (
+        ("stage", stage), ("target", INTENT_TARGETS[expected_target]),
+        ("client", evidence.get("client", "unknown")),
+        ("return_code", evidence.get("return_code", "unknown")),
+        ("result", evidence.get("result", "unknown")),
+        ("load", load),
+        ("active", closed_state_value(
+            state.get("ActiveState"), ("active", "failed", "inactive"))),
+        ("sub", closed_state_value(
+            state.get("SubState"), ("running", "exited", "failed", "dead"))),
+        ("mainpid", mainpid),
+        ("unit_result", closed_state_value(
+            state.get("Result"), ("success", "exit-code", "signal", "timeout"))),
+        ("identity", identity), ("environment", environment),
+        ("transaction", evidence.get("transaction", "unknown")),
+        ("journal", evidence.get("journal", "unknown")),
+        ("ready", evidence.get("ready", "unknown")),
+        ("reap", diagnostic_bit(finality["reaped"])),
+        ("cleanup", finality["cleanup"]),
+        ("unit_absent", diagnostic_bit(finality["unit_absent"])),
+        ("recorded_scan", diagnostic_bit(finality["scanned"]["recorded"])),
+        ("canonical_scan", diagnostic_bit(finality["scanned"]["canonical"])),
+        ("recorded_empty", diagnostic_bit(not finality["scans"]["recorded"])),
+        ("canonical_empty", diagnostic_bit(not finality["scans"]["canonical"])),
+        ("client_lock", diagnostic_bit(finality["locks"]["client"])),
+        ("transaction_lock", diagnostic_bit(finality["locks"]["transaction"])),
+    )
+    return serialize_diagnostic("producer", category, fields, complete=True)
+
+
+def exercise_intent_epoch(client, repo, commit, go_binary, stage, expected_target, prior):
+    label = (f"run-root:{stage}" if expected_target == "run-root"
+             else f"path:{expected_target}:{stage}")
+    reset_paths("intent-window", "/run/nmcp-ci/cleanup-intent.ready",
+                "/run/nmcp-ci/cleanup-intent.ready.new")
+    process = popen("intent-window", ("/usr/bin/python3", "-I", "-S", client, repo,
+                    commit, go_binary, label), cwd="/", env=ENV,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    lifecycle = {"communicated": False, "stdout": "", "stderr": "",
+                 "reaped": False, "result_exact": False}
+    evidence = {"state": {"LoadState": "unknown"}, "nonce": None,
+                "signature": None, "recorded_cgroup": "", "ready": "unknown",
+                "journal": "unknown", "transaction": "unknown"}
+    anchor = None
+    snapshot = None
+    primary = None
+    try:
+        anchor, evidence = producer_wait_evidence(
+            process, stage, expected_target, prior, repo, commit, go_binary, label,
+            time.monotonic() + PRODUCER_WAIT_SECONDS, lifecycle)
+        os_call("intent-window", "kill", "process", os.kill, anchor["pid"], signal.SIGKILL)
+        stdout, _stderr = communicate_producer_once(process, lifecycle, 60)
+        if process.returncode == 0 or SUCCESS in stdout or not lifecycle["result_exact"]:
+            fail(f"intent producer did not return its exact failed result: {label}")
+        snapshot = snapshot_intent_epoch(anchor, label)
+        anchor = None
+    except BaseException as error:
+        primary = error
+        if isinstance(error, ProducerEpochFailure):
+            evidence = error.evidence
+    finally:
+        if anchor is not None:
+            try:
+                os_call("intent-window", "close", "cleanup-intent", os.close,
+                        anchor["descriptor"])
+            except BaseException:
+                pass
+        finality = producer_epoch_finality(
+            process, lifecycle, evidence, repo, commit, go_binary, label)
+    if isinstance(primary, ProducerEpochFailure):
+        raise SerializedDiagnosticFailure(producer_failure_message(
+            primary.category, stage, expected_target, evidence, finality))
+    if primary is not None:
+        raise primary
+    if (finality["cleanup"] != "complete" or not finality["unit_absent"]
+            or any(finality["scans"].values()) or not all(finality["locks"].values())
+            or not lifecycle["reaped"]):
+        fail(f"intent producer finality was incomplete: {label}")
+    return snapshot
 
 
 def main():
@@ -3131,28 +3645,13 @@ raise SystemExit(73)
             fast_recovery(client, repo, commit, go_binary, mode, "signal-cleanup")
 
     prior = None
-    for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):
-        faulted = run("intent-window", ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
-                       f"run-root:{stage}"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted.stdout:
-            fail(f"SIGKILL fault window unexpectedly succeeded: {stage}")
-        if not path_exists("intent-window", "cleanup-intent",
-                           "/run/nmcp-ci/cleanup-intent.json"):
-            fail(f"SIGKILL fault window was not durably registered: {stage}")
-        if prior is not None:
-            assert_replaced_or_absent(*prior)
-        entry = run_root_entry()
-        prior = (entry["path"], observable_identity(entry["path"], entry["identity"]))
+    for stage in INTENT_STAGES:
+        prior = exercise_intent_epoch(
+            client, repo, commit, go_binary, stage, "run-root", prior)
     for target in ("/usr/local/libexec/nmcp", "/var/lib/nmcp", "/opt/nmcp-role-compatibility"):
-        for stage in ("after-intent", "after-mkdir", "after-open", "after-register"):
-            faulted = run("intent-window", ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
-                           f"path:{target}:{stage}"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if faulted.returncode == 0 or "Ubuntu migration role compatibility verification passed" in faulted.stdout:
-                fail(f"persistent-path SIGKILL fault unexpectedly succeeded: {target}:{stage}")
-            if prior is not None:
-                assert_replaced_or_absent(*prior)
-            entry = intent_entry(target)
-            prior = (target, observable_identity(target, entry["identity"]))
+        for stage in INTENT_STAGES:
+            prior = exercise_intent_epoch(
+                client, repo, commit, go_binary, stage, target, prior)
     first = popen("preflight", ("/usr/bin/python3", "-I", "-S", client, repo, commit, go_binary,
                               "containment-supervisor-kill"), cwd="/", env=ENV,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -3269,7 +3768,7 @@ raise SystemExit(73)
         # the following invocation must recover this durable intent.
         pass
     if prior is not None:
-        assert_replaced_or_absent(*prior)
+        assert_replaced_or_absent(prior["target"], prior["target_identity"])
 
     # Replace an owned unit behind a paused client. Its finally block must
     # detect InvocationID loss and never issue a name-based command to B.
@@ -3367,6 +3866,8 @@ raise SystemExit(73)
         mode = f"client-cleanup-persistent-{boundary}"
         reset_paths("persistent-cleanup", *fault_paths(mode, boundary),
                     f"/run/nmcp-ci/{mode}.blocked", f"/run/nmcp-ci/{mode}.release")
+    reset_paths("intent-window", "/run/nmcp-ci/cleanup-intent.ready",
+                "/run/nmcp-ci/cleanup-intent.ready.new")
     for mode, boundary in property_boundaries.items():
         reset_paths("transient-cleanup", *fault_paths(mode, boundary))
     return 0
