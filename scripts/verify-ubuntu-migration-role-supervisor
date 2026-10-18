@@ -119,7 +119,10 @@ class IntentPublishFailure(RuntimeError):
                   "chmod": 75, "fsync": 76, "close": 77,
                   "mode-parse": 78, "target-select": 79, "parent-open": 80,
                   "path-exists": 81, "parent-stat": 82, "allowlist-sort": 83,
-                  "entry-append": 84, "call": 85, "signal-mask": 86}
+                  "entry-append": 84, "call": 85, "signal-mask": 86,
+                  "parent-mkdir": 87, "parent-lstat": 88,
+                  "parent-type": 89, "parent-owner": 90, "parent-mode": 91,
+                  "fault-parse": 92, "fault-domain": 93}
 
     def __init__(self, operation, error):
         self.operation = operation
@@ -654,11 +657,14 @@ def recover_intents():
 
 
 def prepare_required_parent(path, mode):
-    os.makedirs(path, mode=mode, exist_ok=True)
-    observed = os.lstat(path)
-    if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != 0
-            or observed.st_gid != 0 or stat.S_IMODE(observed.st_mode) != mode):
-        die(f"unsafe required parent: {path}")
+    intent_publish_operation("parent-mkdir", os.makedirs, path, mode=mode, exist_ok=True)
+    observed = intent_publish_operation("parent-lstat", os.lstat, path)
+    if not stat.S_ISDIR(observed.st_mode):
+        raise IntentPublishFailure("parent-type", RuntimeError(f"unsafe required parent: {path}"))
+    if observed.st_uid != 0 or observed.st_gid != 0:
+        raise IntentPublishFailure("parent-owner", RuntimeError(f"unsafe required parent: {path}"))
+    if stat.S_IMODE(observed.st_mode) != mode:
+        raise IntentPublishFailure("parent-mode", RuntimeError(f"unsafe required parent: {path}"))
 
 
 def create_owned_top(path, mode, entries, allowlist, fault_name=None, stage=None):
@@ -828,10 +834,10 @@ def supervisor_body(resources):
             prepare_required_parent("/usr/local/libexec", 0o755)
             prepare_required_parent("/var/lib", 0o755)
             prepare_required_parent("/opt", 0o755)
-            parts = FAULT_MODE.split(":")
+            parts = intent_publish_operation("fault-parse", FAULT_MODE.split, ":")
             if (len(parts) != 3 or parts[1] not in INTENT_MODE_TARGETS
                     or parts[2] not in {"after-intent", "after-mkdir", "after-open", "after-register"}):
-                die("invalid opaque intent fault mode")
+                raise IntentPublishFailure("fault-domain", RuntimeError("invalid opaque intent fault mode"))
             selected = intent_publish_operation("target-select", INTENT_MODE_TARGETS.__getitem__, parts[1])
             if selected == "run-root":
                 die("run-root intent fault mode did not stop during run root creation")
