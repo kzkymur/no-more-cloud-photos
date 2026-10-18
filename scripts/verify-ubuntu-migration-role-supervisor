@@ -114,6 +114,16 @@ def die(message):
     raise RuntimeError(message)
 
 
+class IntentPublishFailure(RuntimeError):
+    EXIT_CODES = {"encode": 71, "unlink": 72, "open": 73, "write": 74,
+                  "chmod": 75, "fsync": 76, "close": 77}
+
+    def __init__(self, operation, error):
+        self.operation = operation
+        self.error = error
+        super().__init__(f"intent publish {operation} failed: {error}")
+
+
 class SupervisorCleanupFailure(RuntimeError):
     def __init__(self, primary_error, cleanup_errors):
         self.primary_error = primary_error
@@ -476,20 +486,32 @@ def metadata(value):
             "gid": value.st_gid, "mode": stat.S_IMODE(value.st_mode)}
 
 
+def intent_publish_operation(operation, action, *args, **kwargs):
+    try:
+        return action(*args, **kwargs)
+    except BaseException as error:
+        raise IntentPublishFailure(operation, error) from error
+
+
 def durable_intents(entries, epoch=None, stage=None):
-    raw = (json.dumps({"version": 2, "epoch": epoch, "entries": entries}, sort_keys=True,
-                      separators=(",", ":")) + "\n").encode("ascii")
+    raw = intent_publish_operation(
+        "encode", lambda: (json.dumps({"version": 2, "epoch": epoch, "entries": entries},
+                                      sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
     temporary = INTENT_PATH + ".new"
     try:
-        os.unlink(temporary)
-    except FileNotFoundError:
-        pass
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with CleanupScope() as cleanup:
-        cleanup.defer("intent-publish-close", os.close, descriptor)
-        write_all(descriptor, raw)
-        os.fchmod(descriptor, 0o600)
-        os.fsync(descriptor)
+        intent_publish_operation("unlink", os.unlink, temporary)
+    except IntentPublishFailure as error:
+        if not isinstance(error.error, FileNotFoundError):
+            raise
+    descriptor = intent_publish_operation(
+        "open", os.open, temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        intent_publish_operation("write", write_all, descriptor, raw)
+        intent_publish_operation("chmod", os.fchmod, descriptor, 0o600)
+        intent_publish_operation("fsync", os.fsync, descriptor)
+    finally:
+        intent_publish_operation("close", os.close, descriptor)
     if stage is not None:
         stage("intent-before-replace")
     os.replace(temporary, INTENT_PATH)
@@ -1207,6 +1229,9 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except IntentPublishFailure as error:
+        print(f"trusted-supervisor: {error}", file=sys.stderr)
+        raise SystemExit(IntentPublishFailure.EXIT_CODES[error.operation])
     except Exception as error:
         print(f"trusted-supervisor: {error}", file=sys.stderr)
         raise SystemExit(1)
