@@ -910,6 +910,19 @@ def bounded_journal_evidence(invocation):
 
 
 
+
+def reset_stage_paths(*paths):
+    for path in paths:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    directory = os.open(RUN, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
 def bounded_supervisor_stage(invocation, nonce):
     try:
         descriptor = os.open(SUPERVISOR_STAGE_PATH, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
@@ -1796,7 +1809,7 @@ def main():
                                  "SubState", "ControlGroup",
                                  context="prelaunch", retain=False)
         assert_prelaunch_absent(before)
-        reset_paths("source-publication", SUPERVISOR_STAGE_PATH, SUPERVISOR_STAGE_PATH + ".new")
+        reset_stage_paths(SUPERVISOR_STAGE_PATH, SUPERVISOR_STAGE_PATH + ".new")
         publish_supervisor(repo, commit)
         check_cancelled()
         service_argv = (
@@ -1958,7 +1971,7 @@ def main():
             if RECOVERED_ERRORS:
                 cleanup_errors.extend(RECOVERED_ERRORS)
             try:
-                reset_paths("final-close", SUPERVISOR_STAGE_PATH, SUPERVISOR_STAGE_PATH + ".new")
+                reset_stage_paths(SUPERVISOR_STAGE_PATH, SUPERVISOR_STAGE_PATH + ".new")
             except BaseException as error:
                 cleanup_errors.append(error)
         if requested_mode == "client-terminal-race-a":
