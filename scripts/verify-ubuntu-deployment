@@ -6665,7 +6665,7 @@ def expect_rejected(validator, source: str, label: str, expected: str) -> None:
 
 def validate_diagnostic_fixture(source: str) -> None:
     require(stable_source_digest(source)
-            == "e4f5f5b054c5b24e0e27caefdf7c5b4b9bd99ccc41f1bbf10bb8c2d71209a7e0",
+            == "b8cdd1c2fed0879397236115ffc68e3edc9bfbd89ec43c13fb2e98273262262c",
             "diagnostic fixture source snapshot changed")
 
 

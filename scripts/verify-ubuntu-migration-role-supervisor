@@ -57,11 +57,35 @@ HANDLED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
 CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
 STAGE_PREFIX = "NMCP supervisor stage: "
+STAGE_PATH = "/run/nmcp-ci/supervisor-stage"
 CURRENT_STAGE = "startup"
 
 
 def supervisor_stage(stage):
     global CURRENT_STAGE
+    allowed = ("build", "stage-verify", "install", "final",
+               *("phase-" + phase for phase in PHASES),
+               *("boundary-" + phase for phase in PHASES))
+    if stage not in allowed or len(SUPERVISOR_NONCE) != 64:
+        die("supervisor stage evidence was not closed and identity-bound")
+    payload = ("v1:" + SUPERVISOR_NONCE + ":" + stage + "\n").encode("ascii")
+    if len(payload) > 128:
+        die("supervisor stage evidence exceeded its fixed bound")
+    temporary = STAGE_PATH + ".new"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, STAGE_PATH)
+    fsync_directory(os.path.dirname(STAGE_PATH))
     CURRENT_STAGE = stage
     print(STAGE_PREFIX + stage, flush=True)
 INTENT_MODE_TARGETS = {
