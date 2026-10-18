@@ -65,7 +65,8 @@ def supervisor_stage(stage):
     global CURRENT_STAGE
     allowed = ("startup", "build", "stage-verify", "install", "final",
                *("phase-" + phase for phase in PHASES),
-               *("boundary-" + phase for phase in PHASES))
+               *("boundary-" + phase for phase in PHASES),
+               *("intent-" + boundary for boundary in ("after-intent", "after-mkdir", "after-open", "after-register")))
     if stage not in allowed or len(SUPERVISOR_NONCE) != 64:
         die("supervisor stage evidence was not closed and identity-bound")
     payload = ("v1:" + SUPERVISOR_NONCE + ":" + stage + "\n").encode("ascii")
@@ -593,7 +594,7 @@ def recover_intents():
     fsync_directory("/run/nmcp-ci")
 
 
-def create_owned_top(path, mode, entries, allowlist, fault_name=None):
+def create_owned_top(path, mode, entries, allowlist, fault_name=None, stage=None):
     parent, name = os.path.dirname(path), os.path.basename(path)
     old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})
     with CleanupScope() as cleanup:
@@ -608,6 +609,8 @@ def create_owned_top(path, mode, entries, allowlist, fault_name=None):
                  "identity": None, "allowlist": sorted(allowlist)}
         entries.append(entry)
         durable_intents(entries)
+        if stage is not None:
+            stage("intent-after-intent")
         fault(entries, path, "after-intent", fault_name or path)
         # mkdir(2) applies the process umask. Publish the exact journaled mode
         # while the rest of this process deliberately retains umask 077.
@@ -615,6 +618,8 @@ def create_owned_top(path, mode, entries, allowlist, fault_name=None):
         cleanup.defer("umask-restore", os.umask, previous_umask)
         os.mkdir(name, mode, dir_fd=parent_fd)
         os.fsync(parent_fd)
+        if stage is not None:
+            stage("intent-after-mkdir")
         fault(entries, path, "after-mkdir", fault_name or path)
         top_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
         cleanup.defer("owned-top-close", os.close, top_fd)
@@ -622,8 +627,12 @@ def create_owned_top(path, mode, entries, allowlist, fault_name=None):
         if top.st_uid != 0 or top.st_gid != 0 or stat.S_IMODE(top.st_mode) != mode:
             die(f"new top directory metadata mismatch: {path}")
         entry["identity"] = metadata(top)
+        if stage is not None:
+            stage("intent-after-open")
         fault(entries, path, "after-open", fault_name or path)
         durable_intents(entries)
+        if stage is not None:
+            stage("intent-after-register")
         fault(entries, path, "after-register", fault_name or path)
     return entry
 
@@ -750,7 +759,7 @@ def supervisor_body(resources):
             for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
                                ("/opt/nmcp-role-compatibility", 0o755)):
                 create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path],
-                                 f"intent:{INTENT_TARGET_TOKEN[path]}")
+                                 f"intent:{INTENT_TARGET_TOKEN[path]}", supervisor_stage)
             die("intent fault mode reached the end without its required SIGKILL")
         supervisor_stage("build")
         current_source = os.path.join(run_root, "current-source")

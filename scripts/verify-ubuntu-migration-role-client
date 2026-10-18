@@ -952,7 +952,9 @@ def bounded_supervisor_stage(invocation, nonce):
     if not line.startswith(prefix) or not line.endswith("\n") or line.count("\n") != 1:
         return "unknown"
     value = line[len(prefix):-1]
-    fixed = {"startup": "s", "build": "b", "stage-verify": "v", "install": "i", "final": "f"}
+    fixed = {"startup": "s", "build": "b", "stage-verify": "v", "install": "i", "final": "f",
+             "intent-after-intent": "t0", "intent-after-mkdir": "t1",
+             "intent-after-open": "t2", "intent-after-register": "t3"}
     if value in fixed:
         return fixed[value]
     for index, phase in enumerate(SUPERVISOR_PHASES):

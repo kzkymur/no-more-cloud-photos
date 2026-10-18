@@ -506,7 +506,7 @@ def client_primary_diagnostic(stderr):
         diagnostic_category = token if token in ("timeout", "exit", "malformed", "io") else "invalid"
     elif detail.startswith("supervisor_stage="):
         token = detail[len("supervisor_stage="):].partition(";")[0]
-        stages = ("s", "b", "v", "i", "f", "u", *("p" + format(index, "x") for index in range(13)),
+        stages = ("s", "b", "v", "i", "f", "u", "t0", "t1", "t2", "t3", *("p" + format(index, "x") for index in range(13)),
                   *("q" + format(index, "x") for index in range(13)))
         diagnostic_category = token if token in stages else "invalid"
     elif detail.startswith("terminal_failure="):
@@ -516,7 +516,7 @@ def client_primary_diagnostic(stderr):
         subsets = ("r", "c", "s", "a", "u", "rc", "rs", "ra", "ru", "cs", "ca", "cu",
                    "sa", "su", "au", "rcs", "rca", "rcu", "rsa", "rsu", "rau", "csa",
                    "csu", "cau", "sau", "rcsa", "rcsu", "rcau", "rsau", "csau", "rcsau")
-        stages = ("s", "b", "v", "i", "f", "u", *("p" + format(index, "x") for index in range(13)),
+        stages = ("s", "b", "v", "i", "f", "u", "t0", "t1", "t2", "t3", *("p" + format(index, "x") for index in range(13)),
                   *("q" + format(index, "x") for index in range(13)))
         valid_values = (subset in subsets and len(values) == 4 and stage in stages
                         and values[0] in "segtmo" and values[1] in "zno"
