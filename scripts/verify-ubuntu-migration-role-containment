@@ -958,6 +958,14 @@ def validate_serialized_diagnostic(payload):
                 "sa", "su", "au", "rcs", "rca", "rcu", "rsa", "rsu", "rau",
                 "csa", "csu", "cau", "sau", "rcsa", "rcsu", "rcau", "rsau",
                 "csau", "rcsau", "marker", "other")
+                or (lambda value: (
+                    len(value.rsplit("-", 1)) == 2
+                    and value.rsplit("-", 1)[1] in ({"1", "u"} | {str(status) for status in range(71, 86)})
+                    and value.rsplit("-", 1)[0] in (
+                        "s", "b", "v", "i", "f", "u", "r0", "r1", "r2", "t0", "t1", "t2", "t3",
+                        *("p" + format(index, "x") for index in range(13)),
+                        *("q" + format(index, "x") for index in range(13))))
+                    )(fields_by_name.get("jf", ""))
                 or client_primary_diagnostic(
                     "NMCP_CLIENT_RESULT_V1:primary=verification;events=-;events_complete=1;"
                     "final_scanned=1;final_observed=1;final_empty=1;return=1;stdout=0;success=0\n"
