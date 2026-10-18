@@ -1232,6 +1232,15 @@ if __name__ == "__main__":
     except IntentPublishFailure as error:
         print(f"trusted-supervisor: {error}", file=sys.stderr)
         raise SystemExit(IntentPublishFailure.EXIT_CODES[error.operation])
+    except SupervisorCleanupFailure as error:
+        if (isinstance(error.primary_error, IntentPublishFailure)
+                and all(category == "intent-recovery"
+                        for category, _cleanup_error in error.cleanup_errors)):
+            operation = error.primary_error.operation
+            print(f"trusted-supervisor: {error}", file=sys.stderr)
+            raise SystemExit(IntentPublishFailure.EXIT_CODES[operation])
+        print(f"trusted-supervisor: {error}", file=sys.stderr)
+        raise SystemExit(1)
     except Exception as error:
         print(f"trusted-supervisor: {error}", file=sys.stderr)
         raise SystemExit(1)
