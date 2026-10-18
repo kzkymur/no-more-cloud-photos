@@ -653,6 +653,14 @@ def recover_intents():
     fsync_directory("/run/nmcp-ci")
 
 
+def prepare_required_parent(path, mode):
+    os.makedirs(path, mode=mode, exist_ok=True)
+    observed = os.lstat(path)
+    if (not stat.S_ISDIR(observed.st_mode) or observed.st_uid != 0
+            or observed.st_gid != 0 or stat.S_IMODE(observed.st_mode) != mode):
+        die(f"unsafe required parent: {path}")
+
+
 def create_owned_top(path, mode, entries, allowlist, fault_name=None, stage=None):
     parent, name = os.path.dirname(path), os.path.basename(path)
     old_mask = intent_publish_operation(
@@ -817,6 +825,9 @@ def supervisor_body(resources):
         if fast_success:
             return 0
         if FAULT_MODE.startswith("intent:"):
+            prepare_required_parent("/usr/local/libexec", 0o755)
+            prepare_required_parent("/var/lib", 0o755)
+            prepare_required_parent("/opt", 0o755)
             parts = FAULT_MODE.split(":")
             if (len(parts) != 3 or parts[1] not in INTENT_MODE_TARGETS
                     or parts[2] not in {"after-intent", "after-mkdir", "after-open", "after-register"}):
