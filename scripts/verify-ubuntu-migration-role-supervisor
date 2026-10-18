@@ -56,6 +56,14 @@ SUPERVISOR_NONCE = ""
 HANDLED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
 CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
+STAGE_PREFIX = "NMCP supervisor stage: "
+CURRENT_STAGE = "startup"
+
+
+def supervisor_stage(stage):
+    global CURRENT_STAGE
+    CURRENT_STAGE = stage
+    print(STAGE_PREFIX + stage, flush=True)
 INTENT_MODE_TARGETS = {
     "run-root": "run-root",
     "usr-local-libexec-nmcp": "/usr/local/libexec/nmcp",
@@ -719,6 +727,7 @@ def supervisor_body(resources):
                 create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path],
                                  f"intent:{INTENT_TARGET_TOKEN[path]}")
             die("intent fault mode reached the end without its required SIGKILL")
+        supervisor_stage("build")
         current_source = os.path.join(run_root, "current-source")
         historical_source = os.path.join(run_root, "v18-source")
         os.mkdir(current_source, 0o700)
@@ -765,11 +774,13 @@ def supervisor_body(resources):
         resources["snapshot_fd"] = snapshot_fd
         manifest = {item["name"]: item for item in records}
 
+        supervisor_stage("stage-verify")
         verifier_fd = open_verified(snapshot_fd, manifest, "verify-stage")
         with CleanupScope() as cleanup:
             cleanup.defer("stage-verifier-close", os.close, verifier_fd)
             run(("/usr/bin/python3", "-I", "-S", f"/proc/self/fd/{verifier_fd}", snapshot), pass_fds=(verifier_fd,))
 
+        supervisor_stage("install")
         for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
                            ("/opt/nmcp-role-compatibility", 0o755)):
             entry = create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path])
@@ -830,6 +841,7 @@ def supervisor_body(resources):
         os.mkdir(phase_env["NMCP_COMPAT_WORK"], 0o755)
         os.chmod(phase_env["NMCP_COMPAT_WORK"], 0o755)
         for phase in PHASES:
+            supervisor_stage("phase-" + phase)
             trace.append(f"phase-start:{phase}")
             phase_fd = open_verified(snapshot_fd, manifest, "phase")
             phase_inputs = {}
@@ -878,6 +890,7 @@ def supervisor_body(resources):
                           env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))
             trace.append(f"phase-success:{phase}")
             trace.append(f"boundary-start:{phase}")
+            supervisor_stage("boundary-" + phase)
             staged_helper = open_verified(snapshot_fd, manifest, "runtime-helper")
             with CleanupScope() as cleanup:
                 cleanup.defer("boundary-staged-close", os.close, staged_helper)
@@ -910,6 +923,7 @@ def supervisor_body(resources):
                 run(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{installed_helper}", str(installed_sql)),
                     pass_fds=(installed_helper, installed_sql, staged_helper, staged_sql), stdout=subprocess.DEVNULL)
             trace.append(f"boundary-success:{phase}")
+        supervisor_stage("final")
         expected = [entry for phase in PHASES for entry in (f"phase-start:{phase}", f"phase-success:{phase}", f"boundary-start:{phase}", f"boundary-success:{phase}")]
         if trace != expected:
             die("final trace differs from the fixed phase table")

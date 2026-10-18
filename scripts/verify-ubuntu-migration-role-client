@@ -43,12 +43,19 @@ CLEANUP_CATEGORIES = (
 )
 CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
 CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
+STAGE_PREFIX = "NMCP supervisor stage: "
 CGROUP_RESIDUE_FAILURE = "fixed-cgroup-residue=true"
 JOURNAL_TIMEOUT = 5
 JOURNAL_BYTE_LIMIT = 256
 JOURNAL_LINE_LIMIT = 3
 JOURNAL_QUERY_LINE_LIMIT = 4
 CGROUP_SNAPSHOT_ATTEMPTS = 4
+SUPERVISOR_PHASES = (
+    "fresh-current", "current-rerun", "hostile-libpq", "stale-compatibility",
+    "migration-failure", "signal-int", "signal-term", "sigkill-recovery",
+    "graph-verifier-failure", "upgrade-v18-v19", "unfinished-v18-rejection",
+    "completed-v18-rejection", "writer-drain",
+)
 DIAGNOSTIC_PHASES = (
     "final-close", "immediate", "journal", "launch", "ownership-read", "prelaunch",
     "recovery", "source-publication", "startup", "teardown", "transaction-lock",
@@ -900,6 +907,27 @@ def bounded_journal_evidence(invocation):
         os_call("journal", "close", "journal", process.stdout.close)
     return parse_journal_evidence(bytes(payload))
 
+
+
+def bounded_supervisor_stage(invocation):
+    argv = ("/usr/bin/journalctl", "--quiet", "--no-pager", "--output=cat",
+            "--case-sensitive=yes", "--since=-20min", "--lines=1",
+            f"--grep=^{STAGE_PREFIX}", f"_SYSTEMD_INVOCATION_ID={invocation}")
+    try:
+        result = subprocess.run(argv, cwd="/", env=ENVIRONMENT, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=JOURNAL_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if result.returncode not in (0, 1) or len(result.stdout) > 96:
+        return "unknown"
+    try:
+        line = result.stdout.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return "unknown"
+    stages = ("build", "stage-verify", "install", "final", *("phase-" + value for value in SUPERVISOR_PHASES),
+              *("boundary-" + value for value in SUPERVISOR_PHASES))
+    value = line[len(STAGE_PREFIX):] if line.startswith(STAGE_PREFIX) else ""
+    return value if value in stages else "unknown"
 
 def record_counter(phase, name):
     if not CLIENT_LOCK_HELD:
@@ -1868,9 +1896,11 @@ def main():
                 status_class = "z" if status_value in (0, "0") else "n" if str(status_value).lstrip("-").isdigit() else "o"
                 active_value = {"active": "a", "failed": "f", "inactive": "i", "activating": "g", "deactivating": "d"}.get(current.get("ActiveState"), "o")
                 sub_value = {"exited": "e", "failed": "f", "dead": "d", "running": "r", "start": "s", "stop": "t"}.get(current.get("SubState"), "o")
+                supervisor_stage = bounded_supervisor_stage(invocation)
                 primary_fail("verification", "terminal_failure=" + "".join(
                     {"result": "r", "code": "c", "status": "s", "active": "a", "sub": "u"}[item]
-                    for item in mismatches) + "-" + result_value + status_class + active_value + sub_value)
+                    for item in mismatches) + "-" + result_value + status_class + active_value + sub_value
+                    + "-" + supervisor_stage)
             deadline = bounded_deadline(5)
             while not journal_evidence[0]:
                 if time.monotonic() >= deadline:
