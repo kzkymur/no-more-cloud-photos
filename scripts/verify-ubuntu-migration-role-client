@@ -924,10 +924,16 @@ def bounded_supervisor_stage(invocation):
         line = result.stdout.decode("ascii").strip()
     except UnicodeDecodeError:
         return "unknown"
-    stages = ("build", "stage-verify", "install", "final", *("phase-" + value for value in SUPERVISOR_PHASES),
-              *("boundary-" + value for value in SUPERVISOR_PHASES))
     value = line[len(STAGE_PREFIX):] if line.startswith(STAGE_PREFIX) else ""
-    return value if value in stages else "unknown"
+    fixed = {"build": "b", "stage-verify": "v", "install": "i", "final": "f"}
+    if value in fixed:
+        return fixed[value]
+    for index, phase in enumerate(SUPERVISOR_PHASES):
+        if value == "phase-" + phase:
+            return "p" + format(index, "x")
+        if value == "boundary-" + phase:
+            return "q" + format(index, "x")
+    return "u"
 
 def record_counter(phase, name):
     if not CLIENT_LOCK_HELD:

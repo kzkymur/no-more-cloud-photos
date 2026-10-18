@@ -3256,7 +3256,7 @@ def producer_epoch_state_cases(containment):
                 and primary_detail == "fixture failure",
                 "producer diagnostic discarded the bounded primary client stderr")
         for detail, category in (
-                ("terminal_failure=rsau-szid-phase-fresh-current", "rsau-szid-phase-fresh-current"),
+                ("terminal_failure=rsau-szid-p0", "rsau-szid-p0"),
                 ("terminal_failure=rsauseid", "invalid"),
                 ("exact invocation journal lacks one final success marker", "marker")):
             shaped = machine + "\nverification-client: " + detail + "\n"

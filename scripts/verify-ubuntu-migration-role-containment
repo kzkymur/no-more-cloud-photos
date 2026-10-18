@@ -511,12 +511,8 @@ def client_primary_diagnostic(stderr):
         subsets = ("r", "c", "s", "a", "u", "rc", "rs", "ra", "ru", "cs", "ca", "cu",
                    "sa", "su", "au", "rcs", "rca", "rcu", "rsa", "rsu", "rau", "csa",
                    "csu", "cau", "sau", "rcsa", "rcsu", "rcau", "rsau", "csau", "rcsau")
-        phases = ("fresh-current", "current-rerun", "hostile-libpq", "stale-compatibility",
-                  "migration-failure", "signal-int", "signal-term", "sigkill-recovery",
-                  "graph-verifier-failure", "upgrade-v18-v19", "unfinished-v18-rejection",
-                  "completed-v18-rejection", "writer-drain")
-        stages = ("build", "stage-verify", "install", "final", "unknown",
-                  *("phase-" + value for value in phases), *("boundary-" + value for value in phases))
+        stages = ("b", "v", "i", "f", "u", *("p" + format(index, "x") for index in range(13)),
+                  *("q" + format(index, "x") for index in range(13)))
         valid_values = (subset in subsets and len(values) == 4 and stage in stages
                         and values[0] in "segtmo" and values[1] in "zno"
                         and values[2] in "afigdo" and values[3] in "efdrsto")
