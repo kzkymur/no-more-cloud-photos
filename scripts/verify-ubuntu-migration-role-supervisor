@@ -63,7 +63,7 @@ CURRENT_STAGE = "startup"
 
 def supervisor_stage(stage):
     global CURRENT_STAGE
-    allowed = ("build", "stage-verify", "install", "final",
+    allowed = ("startup", "build", "stage-verify", "install", "final",
                *("phase-" + phase for phase in PHASES),
                *("boundary-" + phase for phase in PHASES))
     if stage not in allowed or len(SUPERVISOR_NONCE) != 64:
@@ -731,6 +731,7 @@ def supervisor_body(resources):
     retained_process = None
     fast_success = FAULT_MODE == "fast-success"
     try:
+        supervisor_stage("startup")
         if FAULT_MODE == "fast-fail":
             die("injected fast supervisor failure before builds")
         if FAULT_MODE == "fast-hold":
