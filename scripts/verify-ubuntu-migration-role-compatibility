@@ -125,7 +125,7 @@ case $phase in
     test_signal term TERM 143
     ;;
   sigkill-recovery)
-    if [[ ${NMCP_TEST_SUPERVISOR_CONTAINMENT:-} == 1 ]]; then
+    if [[ ${NMCP_TEST_SUPERVISOR_CONTAINMENT:-} == 1 || ${NMCP_TEST_CGROUP_CRASH:-} == 1 ]]; then
       make_admin "$work/kill" "trap '' TERM; printf '%s\n' \$\$ >'$work/kill/admin.pid'; /usr/bin/setsid /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \$\$ >\"$work/kill/descendant.pid\"; touch \"$work/kill/ready\"; exec /usr/bin/sleep 300' & wait"
       /usr/bin/setsid "$wrapper" "$work/kill/nmcp-admin" migrate up --json &
       wrapper_pid=$!

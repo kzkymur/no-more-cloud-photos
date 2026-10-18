@@ -10273,6 +10273,9 @@ def verify_validation_env_mutations(source: str) -> None:
 
 
 def main() -> int:
+    production_only = sys.argv[1:] == ["--production-only"]
+    require(not sys.argv[1:] or production_only,
+            "usage: verify-ubuntu-deployment [--production-only]")
     scripts = [
         ROOT / "scripts" / "install-ubuntu-host",
         ROOT / "scripts" / "install-ubuntu-release",
@@ -10319,9 +10322,10 @@ def main() -> int:
         require(os.access(script, os.X_OK), f"{script.name} is not executable")
         ast.parse(text(script), filename=str(script))
 
-    ubuntu_workflow = text(ROOT / ".github" / "workflows" / "ubuntu-deployment.yml")
-    validate_ubuntu_workflow(ubuntu_workflow)
-    verify_ubuntu_workflow_mutations(ubuntu_workflow)
+    if not production_only:
+        ubuntu_workflow = text(ROOT / ".github" / "workflows" / "ubuntu-deployment.yml")
+        validate_ubuntu_workflow(ubuntu_workflow)
+        verify_ubuntu_workflow_mutations(ubuntu_workflow)
 
     units = UBUNTU / "systemd"
     slice_text = text(units / "nmcp.slice")
@@ -10405,104 +10409,108 @@ def main() -> int:
         stat.S_IMODE(runtime_verifier_helper_path.stat().st_mode) == 0o755,
         "installed runtime verifier helper must be executable mode 0755",
     )
-    stage_verifier = text(ROOT / "scripts" / "verify-ubuntu-migration-role-stage")
-    supervisor = text(ROOT / "scripts" / "verify-ubuntu-migration-role-supervisor")
-    client = text(ROOT / "scripts" / "verify-ubuntu-migration-role-client")
-    containment = text(ROOT / "scripts" / "verify-ubuntu-migration-role-containment")
-    diagnostic_fixture_path = ROOT / "scripts" / "verify-ubuntu-diagnostic-fixtures"
-    diagnostic_fixture = text(diagnostic_fixture_path)
-    require(stat.S_IMODE(diagnostic_fixture_path.stat().st_mode) == 0o755,
-            "diagnostic fixture executable mode changed")
-    validate_diagnostic_fixture(diagnostic_fixture)
-    dead_fdopen_fixture = replace_once(
-        diagnostic_fixture,
-        "    actual_boundary_cases(client, containment)",
-        "    if False:\n        actual_boundary_cases(client, containment)")
-    expect_rejected(validate_diagnostic_fixture, dead_fdopen_fixture,
-                    "fdopen causal fixture call is dead", "source snapshot changed")
-    dead_lock_gate_fixture = replace_once(
-        diagnostic_fixture,
-        "    signed_cleanup_lock_cases(containment)",
-        "    if False:\n        signed_cleanup_lock_cases(containment)")
-    expect_rejected(validate_diagnostic_fixture, dead_lock_gate_fixture,
-                    "signed cleanup lock fixture call is dead", "source snapshot changed")
-    dead_cgroup_lifecycle_fixture = replace_once(
-        diagnostic_fixture,
-        "    client_cgroup_lifecycle_cases(client)",
-        "    if False:\n        client_cgroup_lifecycle_cases(client)")
-    expect_rejected(validate_diagnostic_fixture, dead_cgroup_lifecycle_fixture,
-                    "client cgroup lifecycle fixture call is dead", "source snapshot changed")
-    dead_prelaunch_production_fixture = replace_once(
-        diagnostic_fixture,
-        "    client_prelaunch_production_path_case(client)",
-        "    if False:\n        client_prelaunch_production_path_case(client)")
-    expect_rejected(validate_diagnostic_fixture, dead_prelaunch_production_fixture,
-                    "client prelaunch production fixture call is dead", "source snapshot changed")
-    dead_final_residue_fixture = replace_once(
-        diagnostic_fixture,
-        "    client_final_residue_diagnostic_cases(client)",
-        "    if False:\n        client_final_residue_diagnostic_cases(client)")
-    expect_rejected(validate_diagnostic_fixture, dead_final_residue_fixture,
-                    "client final residue fixture call is dead", "source snapshot changed")
-    dead_terminal_empty_fixture = replace_once(
-        diagnostic_fixture,
-        "    client_terminal_empty_launch_routing_cases(client)",
-        "    if False:\n        client_terminal_empty_launch_routing_cases(client)")
-    expect_rejected(validate_diagnostic_fixture, dead_terminal_empty_fixture,
-                    "client terminal empty routing fixture call is dead", "source snapshot changed")
-    dead_cgroup_observation_fixture = replace_once(
-        diagnostic_fixture,
-        "    client_cgroup_observation_cases(client)",
-        "    if False:\n        client_cgroup_observation_cases(client)")
-    expect_rejected(validate_diagnostic_fixture, dead_cgroup_observation_fixture,
-                    "client cgroup observation fixture call is dead", "source snapshot changed")
-    dead_cgroup_dedup_fixture = replace_once(
-        diagnostic_fixture,
-        "    client_cgroup_diagnostic_dedup_cases(client)",
-        "    if False:\n        client_cgroup_diagnostic_dedup_cases(client)")
-    expect_rejected(validate_diagnostic_fixture, dead_cgroup_dedup_fixture,
-                    "client cgroup diagnostic dedup fixture call is dead", "source snapshot changed")
-    dead_phase_routing_fixture = replace_once(
-        diagnostic_fixture,
-        "    client_phase_routing_cases(client)",
-        "    if False:\n        client_phase_routing_cases(client)")
-    expect_rejected(validate_diagnostic_fixture, dead_phase_routing_fixture,
-                    "client phase routing fixture call is dead", "source snapshot changed")
-    dead_supervisor_cleanup_fixture = replace_once(
-        diagnostic_fixture,
-        "    supervisor_cleanup_cases(supervisor)",
-        "    if False:\n        supervisor_cleanup_cases(supervisor)")
-    expect_rejected(validate_diagnostic_fixture, dead_supervisor_cleanup_fixture,
-                    "supervisor cleanup causal fixture call is dead", "source snapshot changed")
-    dead_atomic_launch_fixture = replace_once(
-        diagnostic_fixture,
-        "    supervisor_atomic_launch_cases(supervisor)",
-        "    if False:\n        supervisor_atomic_launch_cases(supervisor)")
-    expect_rejected(validate_diagnostic_fixture, dead_atomic_launch_fixture,
-                    "supervisor atomic launch fixture call is dead", "source snapshot changed")
     role_mode = text(ROOT / "scripts" / "set-ubuntu-migration-role-mode")
-    validate_runtime_helper(runtime_verifier_helper)
-    validate_stage_verifier(stage_verifier)
-    validate_compatibility_phase(migration_role_compatibility)
-    validate_supervisor(supervisor)
-    validate_client(client)
-    validate_containment(containment, migration_role_compatibility)
-    verify_nonce_safe_diagnostics(
-        ROOT / "scripts" / "verify-ubuntu-migration-role-client",
-        ROOT / "scripts" / "verify-ubuntu-migration-role-containment",
-    )
-    run((str(diagnostic_fixture_path),))
     validate_fd_wrappers(migration_compatibility, role_mode)
-    verify_supervisor_mutations(
-        supervisor,
-        stage_verifier,
-        migration_role_compatibility,
-        client,
-        containment,
-        runtime_verifier_helper,
-        migration_compatibility,
-        role_mode,
-    )
+    # Legacy harness source-shape, fault labels and diagnostic self-tests are
+    # deliberately not production acceptance. Use the historical workflow for
+    # those tests; direct CI validates real production contracts below.
+    if not production_only:
+        stage_verifier = text(ROOT / "scripts" / "verify-ubuntu-migration-role-stage")
+        supervisor = text(ROOT / "scripts" / "verify-ubuntu-migration-role-supervisor")
+        client = text(ROOT / "scripts" / "verify-ubuntu-migration-role-client")
+        containment = text(ROOT / "scripts" / "verify-ubuntu-migration-role-containment")
+        diagnostic_fixture_path = ROOT / "scripts" / "verify-ubuntu-diagnostic-fixtures"
+        diagnostic_fixture = text(diagnostic_fixture_path)
+        require(stat.S_IMODE(diagnostic_fixture_path.stat().st_mode) == 0o755,
+                "diagnostic fixture executable mode changed")
+        validate_diagnostic_fixture(diagnostic_fixture)
+        dead_fdopen_fixture = replace_once(
+            diagnostic_fixture,
+            "    actual_boundary_cases(client, containment)",
+            "    if False:\n        actual_boundary_cases(client, containment)")
+        expect_rejected(validate_diagnostic_fixture, dead_fdopen_fixture,
+                        "fdopen causal fixture call is dead", "source snapshot changed")
+        dead_lock_gate_fixture = replace_once(
+            diagnostic_fixture,
+            "    signed_cleanup_lock_cases(containment)",
+            "    if False:\n        signed_cleanup_lock_cases(containment)")
+        expect_rejected(validate_diagnostic_fixture, dead_lock_gate_fixture,
+                        "signed cleanup lock fixture call is dead", "source snapshot changed")
+        dead_cgroup_lifecycle_fixture = replace_once(
+            diagnostic_fixture,
+            "    client_cgroup_lifecycle_cases(client)",
+            "    if False:\n        client_cgroup_lifecycle_cases(client)")
+        expect_rejected(validate_diagnostic_fixture, dead_cgroup_lifecycle_fixture,
+                        "client cgroup lifecycle fixture call is dead", "source snapshot changed")
+        dead_prelaunch_production_fixture = replace_once(
+            diagnostic_fixture,
+            "    client_prelaunch_production_path_case(client)",
+            "    if False:\n        client_prelaunch_production_path_case(client)")
+        expect_rejected(validate_diagnostic_fixture, dead_prelaunch_production_fixture,
+                        "client prelaunch production fixture call is dead", "source snapshot changed")
+        dead_final_residue_fixture = replace_once(
+            diagnostic_fixture,
+            "    client_final_residue_diagnostic_cases(client)",
+            "    if False:\n        client_final_residue_diagnostic_cases(client)")
+        expect_rejected(validate_diagnostic_fixture, dead_final_residue_fixture,
+                        "client final residue fixture call is dead", "source snapshot changed")
+        dead_terminal_empty_fixture = replace_once(
+            diagnostic_fixture,
+            "    client_terminal_empty_launch_routing_cases(client)",
+            "    if False:\n        client_terminal_empty_launch_routing_cases(client)")
+        expect_rejected(validate_diagnostic_fixture, dead_terminal_empty_fixture,
+                        "client terminal empty routing fixture call is dead", "source snapshot changed")
+        dead_cgroup_observation_fixture = replace_once(
+            diagnostic_fixture,
+            "    client_cgroup_observation_cases(client)",
+            "    if False:\n        client_cgroup_observation_cases(client)")
+        expect_rejected(validate_diagnostic_fixture, dead_cgroup_observation_fixture,
+                        "client cgroup observation fixture call is dead", "source snapshot changed")
+        dead_cgroup_dedup_fixture = replace_once(
+            diagnostic_fixture,
+            "    client_cgroup_diagnostic_dedup_cases(client)",
+            "    if False:\n        client_cgroup_diagnostic_dedup_cases(client)")
+        expect_rejected(validate_diagnostic_fixture, dead_cgroup_dedup_fixture,
+                        "client cgroup diagnostic dedup fixture call is dead", "source snapshot changed")
+        dead_phase_routing_fixture = replace_once(
+            diagnostic_fixture,
+            "    client_phase_routing_cases(client)",
+            "    if False:\n        client_phase_routing_cases(client)")
+        expect_rejected(validate_diagnostic_fixture, dead_phase_routing_fixture,
+                        "client phase routing fixture call is dead", "source snapshot changed")
+        dead_supervisor_cleanup_fixture = replace_once(
+            diagnostic_fixture,
+            "    supervisor_cleanup_cases(supervisor)",
+            "    if False:\n        supervisor_cleanup_cases(supervisor)")
+        expect_rejected(validate_diagnostic_fixture, dead_supervisor_cleanup_fixture,
+                        "supervisor cleanup causal fixture call is dead", "source snapshot changed")
+        dead_atomic_launch_fixture = replace_once(
+            diagnostic_fixture,
+            "    supervisor_atomic_launch_cases(supervisor)",
+            "    if False:\n        supervisor_atomic_launch_cases(supervisor)")
+        expect_rejected(validate_diagnostic_fixture, dead_atomic_launch_fixture,
+                        "supervisor atomic launch fixture call is dead", "source snapshot changed")
+        validate_runtime_helper(runtime_verifier_helper)
+        validate_stage_verifier(stage_verifier)
+        validate_compatibility_phase(migration_role_compatibility)
+        validate_supervisor(supervisor)
+        validate_client(client)
+        validate_containment(containment, migration_role_compatibility)
+        verify_nonce_safe_diagnostics(
+            ROOT / "scripts" / "verify-ubuntu-migration-role-client",
+            ROOT / "scripts" / "verify-ubuntu-migration-role-containment",
+        )
+        run((str(diagnostic_fixture_path),))
+        verify_supervisor_mutations(
+            supervisor,
+            stage_verifier,
+            migration_role_compatibility,
+            client,
+            containment,
+            runtime_verifier_helper,
+            migration_compatibility,
+            role_mode,
+        )
     release_installer = text(ROOT / "scripts" / "install-ubuntu-release")
     require(
         "run-ubuntu-migration-compatibility" in migration_runner
