@@ -116,7 +116,10 @@ def die(message):
 
 class IntentPublishFailure(RuntimeError):
     EXIT_CODES = {"encode": 71, "unlink": 72, "open": 73, "write": 74,
-                  "chmod": 75, "fsync": 76, "close": 77}
+                  "chmod": 75, "fsync": 76, "close": 77,
+                  "mode-parse": 78, "target-select": 79, "parent-open": 80,
+                  "path-exists": 81, "parent-stat": 82, "allowlist-sort": 83,
+                  "entry-append": 84, "call": 85}
 
     def __init__(self, operation, error):
         self.operation = operation
@@ -811,13 +814,18 @@ def supervisor_body(resources):
             if (len(parts) != 3 or parts[1] not in INTENT_MODE_TARGETS
                     or parts[2] not in {"after-intent", "after-mkdir", "after-open", "after-register"}):
                 die("invalid opaque intent fault mode")
-            selected = INTENT_MODE_TARGETS[parts[1]]
+            selected = intent_publish_operation("target-select", INTENT_MODE_TARGETS.__getitem__, parts[1])
             if selected == "run-root":
                 die("run-root intent fault mode did not stop during run root creation")
             for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
                                ("/opt/nmcp-role-compatibility", 0o755)):
-                create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path],
-                                 f"intent:{INTENT_TARGET_TOKEN[path]}", supervisor_stage)
+                try:
+                    create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path],
+                                     f"intent:{INTENT_TARGET_TOKEN[path]}", supervisor_stage)
+                except (IntentPublishFailure, SupervisorCleanupFailure):
+                    raise
+                except BaseException as error:
+                    raise IntentPublishFailure("call", error) from error
             die("intent fault mode reached the end without its required SIGKILL")
         supervisor_stage("build")
         current_source = os.path.join(run_root, "current-source")
