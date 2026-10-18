@@ -1886,27 +1886,8 @@ def main():
                         time.sleep(0.1)
                         owned_state("work", invocation, nonce, exec_argv)
                         journal_evidence = bounded_journal_evidence(invocation)
-                mismatches = []
-                if current.get("Result") != "success":
-                    mismatches.append("result")
-                if current.get("ExecMainCode") not in ("1", "exited"):
-                    mismatches.append("code")
-                if current.get("ExecMainStatus") not in (0, "0"):
-                    mismatches.append("status")
-                if current.get("ActiveState") != "active":
-                    mismatches.append("active")
-                if current.get("SubState") != "exited":
-                    mismatches.append("sub")
-                result_value = {"success": "s", "exit-code": "e", "signal": "g", "timeout": "t", "": "m"}.get(current.get("Result"), "o")
-                status_value = current.get("ExecMainStatus")
-                status_class = "z" if status_value in (0, "0") else "n" if str(status_value).lstrip("-").isdigit() else "o"
-                active_value = {"active": "a", "failed": "f", "inactive": "i", "activating": "g", "deactivating": "d"}.get(current.get("ActiveState"), "o")
-                sub_value = {"exited": "e", "failed": "f", "dead": "d", "running": "r", "start": "s", "stop": "t"}.get(current.get("SubState"), "o")
                 supervisor_stage = bounded_supervisor_stage(invocation)
-                primary_fail("verification", "terminal_failure=" + "".join(
-                    {"result": "r", "code": "c", "status": "s", "active": "a", "sub": "u"}[item]
-                    for item in mismatches) + "-" + result_value + status_class + active_value + sub_value
-                    + "-" + supervisor_stage)
+                primary_fail("verification", "supervisor_stage=" + supervisor_stage)
             deadline = bounded_deadline(5)
             while not journal_evidence[0]:
                 if time.monotonic() >= deadline:
