@@ -113,4 +113,53 @@ func TestChangesIntegration(t *testing.T) {
 			t.Fatal("invalid request accepted")
 		}
 	}
+	// Independent parallel transactions must each publish exactly once with
+	// contiguous committed positions; consume across irregular page boundaries.
+	results := make(chan error, 12)
+	for n := 10; n < 22; n++ {
+		go func(id int) {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				results <- err
+				return
+			}
+			defer tx.Rollback(context.Background())
+			_, err = tx.Exec(ctx, `WITH allocated AS (UPDATE change_feed_state SET last_position=last_position+1 WHERE id=1 RETURNING last_position) INSERT INTO change_events(id,position,event_type,reason,media_id) SELECT $1,last_position,'media_deleted','logical_delete',$2 FROM allocated`, integrationUUID(id), integrationUUID(id+1000))
+			if err == nil {
+				err = tx.Commit(ctx)
+			}
+			results <- err
+		}(n)
+	}
+	for n := 0; n < 12; n++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	cursor := empty.NextCursor
+	seen := map[string]bool{}
+	for n := 0; n < 4; n++ {
+		page, err := fresh.ListChanges(ctx, ChangesRequest{Cursor: cursor, Limit: 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Items) != 3 {
+			t.Fatalf("parallel page: %+v", page)
+		}
+		for _, event := range page.Items {
+			if seen[event.ID] {
+				t.Fatal("duplicate across pages")
+			}
+			seen[event.ID] = true
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != 12 {
+		t.Fatal("parallel events missing")
+	}
+	final, err := fresh.ListChanges(ctx, ChangesRequest{Cursor: cursor, Limit: 1})
+	if err != nil || len(final.Items) != 0 {
+		t.Fatalf("final: %+v %v", final, err)
+	}
+
 }

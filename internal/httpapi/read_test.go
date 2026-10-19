@@ -18,6 +18,7 @@ import (
 )
 
 type recordingReadService struct {
+	changes     readapi.ChangesRequest
 	calls       []string
 	mediaList   readapi.MediaListRequest
 	jobList     readapi.JobListRequest
@@ -530,5 +531,51 @@ func assertReadFields(t *testing.T, response *httptest.ResponseRecorder, want ma
 
 func (f *recordingReadService) ListChanges(_ context.Context, request readapi.ChangesRequest) (readapi.ChangesPage, error) {
 	f.calls = append(f.calls, "ListChanges")
-	return readapi.ChangesPage{Items: []readapi.ChangeEvent{}, NextCursor: "cursor"}, nil
+	f.changes = request
+	if result, ok := f.result.(readapi.ChangesPage); ok {
+		return result, f.err
+	}
+	return readapi.ChangesPage{Items: []readapi.ChangeEvent{}, NextCursor: "cursor"}, f.err
+}
+
+func TestChangesHTTP(t *testing.T) {
+	for _, test := range []struct {
+		query         string
+		status, limit int
+	}{
+		{"", 200, 100}, {"?limit=1000&cursor=opaque", 200, 1000}, {"?limit=1", 200, 1},
+		{"?limit=1001", 400, 0}, {"?limit=0", 400, 0}, {"?limit=01", 400, 0},
+		{"?limit=-1", 400, 0}, {"?limit=1&limit=2", 400, 0}, {"?cursor=", 400, 0},
+		{"?profile=standard", 400, 0}, {"?limit=999999999999999999999", 400, 0},
+	} {
+		t.Run(test.query, func(t *testing.T) {
+			reads := &recordingReadService{}
+			h := NewHandler(Dependencies{Reads: reads})
+			response := serve(h, http.MethodGet, "/changes"+test.query, "changes-test")
+			if response.Code != test.status {
+				t.Fatalf("status %d: %s", response.Code, response.Body.String())
+			}
+			if test.status == 200 {
+				if len(reads.calls) != 1 || reads.calls[0] != "ListChanges" || reads.changes.Limit != test.limit {
+					t.Fatalf("dispatch %+v", reads)
+				}
+				if !strings.Contains(response.Body.String(), `"items":[]`) || !strings.Contains(response.Body.String(), `"next_cursor":"cursor"`) {
+					t.Fatal(response.Body.String())
+				}
+			} else if len(reads.calls) != 0 {
+				t.Fatal("invalid request reached service")
+			}
+		})
+	}
+	for _, method := range []string{http.MethodPost, http.MethodHead, http.MethodDelete} {
+		response := serve(NewHandler(Dependencies{Reads: &recordingReadService{}}), method, "/changes", "method-test")
+		if response.Code != 405 || response.Header().Get("Allow") != "GET" {
+			t.Fatalf("method %s: %d", method, response.Code)
+		}
+	}
+	reads := &recordingReadService{err: readapi.NewInvalidCursor()}
+	response := serve(NewHandler(Dependencies{Reads: reads}), http.MethodGet, "/changes?cursor=bad", "bad-cursor")
+	if response.Code != 400 || !strings.Contains(response.Body.String(), `"code":"invalid_cursor"`) {
+		t.Fatal(response.Body.String())
+	}
 }

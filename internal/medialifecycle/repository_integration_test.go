@@ -718,6 +718,41 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	if _, err := service.Restore(ctx, mediaID); err != nil {
 		t.Fatal(err)
 	}
+	// Capture the feed before physical removal, then require exact replay after
+	// every Media/Original/Rendition row is gone.
+	codec, err := readapi.NewCursorCodec([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed, err := readapi.NewService(pool, codec, "https://files.example/files/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePurge, err := feed.ListChanges(ctx, readapi.ChangesRequest{Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := feed.ListChanges(ctx, readapi.ChangesRequest{Cursor: beforePurge.NextCursor, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.Items) != 1 || restored.Items[0].Reason != "restore" {
+		t.Fatalf("restore feed: %+v", restored)
+	}
+	var snapshot map[string]json.RawMessage
+	if err := json.Unmarshal(restored.Items[0].Media, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := snapshot["jobs"]; ok {
+		t.Fatal("feed exposed jobs")
+	}
+	if !strings.Contains(string(snapshot["current_renditions"]), "file_url") {
+		t.Fatal("restore omitted current rendition URL")
+	}
+	restoreJSON, err := json.Marshal(restored.Items)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := service.Delete(ctx, mediaID); err != nil {
 		t.Fatal(err)
 	}
@@ -1008,6 +1043,22 @@ func TestLifecycleRepositoryIntegrationPurgeManifestAndExactFileStep(t *testing.
 	if mediaCount != 0 || originalCount != 0 || renditionCount != 0 || jobStatus != "succeeded" || eventCount != 1 || progressCount != 3 || targetCount != 2 || transformNullOriginals != 2 || identityState != "purged" || identityJobID != activeLease.JobID {
 		t.Fatalf("final purge media=%d originals=%d renditions=%d job=%s events=%d progress=%d targets=%d null_originals=%d identity=%s identity_job=%s", mediaCount, originalCount, renditionCount, jobStatus, eventCount, progressCount, targetCount, transformNullOriginals, identityState, identityJobID)
 	}
+	replay, err := feed.ListChanges(ctx, readapi.ChangesRequest{Cursor: beforePurge.NextCursor, Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayJSON, err := json.Marshal(replay.Items)
+	if err != nil || string(replayJSON) != string(restoreJSON) {
+		t.Fatalf("purge changed immutable snapshot: %s %v", replayJSON, err)
+	}
+	remainder, err := feed.ListChanges(ctx, readapi.ChangesRequest{Cursor: replay.NextCursor, Limit: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remainder.Items) != 2 || remainder.Items[0].Type != "media_deleted" || remainder.Items[1].Type != "media_purged" || remainder.Items[1].MediaID != mediaID || string(remainder.Items[1].Media) != "null" {
+		t.Fatalf("purged feed: %+v", remainder)
+	}
+
 }
 
 func insertPurgeRenditionFixtures(t *testing.T, pool *pgxpool.Pool, mediaID, originalID string, base int) []string {
