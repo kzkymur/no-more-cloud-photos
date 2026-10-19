@@ -37,6 +37,8 @@ Cursors are versioned, base64url-encoded, authenticated tokens. They contain the
 - Changes order is the durable feed position described in [section 7](#7-change-feed). It does not use a PostgreSQL sequence value allocated outside the mutation's serialization lock.
 - `next_cursor` is `null` at a known end for media/jobs. Changes return the input position when no event is available because their end is open-ended.
 
+Changes cursor wire v1 uses the same `NMCP` authenticated envelope as media/jobs, with route kind `0x03`, value class `0x00`, the non-negative signed 64-bit position in the eight-byte tuple slot, and sixteen zero reserved bytes in the UUID slot. Its filter fingerprint is SHA-256 of `NMCP-CURSOR-FILTER-SHA256-V1\0 || 0x01 || 0x03` (no filters). The common HMAC domain and canonical unpadded base64url rules apply. Position zero is valid only as a cursor, not an event. An empty initial page returns an authenticated zero-position token; an empty subsequent page returns the same input token. Keep the configured cursor signing key across process restarts. Limit changes do not invalidate a token.
+
 Cursor pagination is keyset pagination. It provides no historical snapshot across pages: concurrent state changes may affect later pages, while a stable dataset has neither gaps nor duplicates.
 
 ## 2. Resource schemas

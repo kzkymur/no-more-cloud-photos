@@ -25,6 +25,7 @@ const (
 	readJobList
 	readJob
 	readProfileList
+	readChanges
 )
 
 type readRoute struct {
@@ -34,6 +35,8 @@ type readRoute struct {
 
 func matchReadRoute(path string) (readRoute, bool) {
 	switch path {
+	case "/changes":
+		return readRoute{kind: readChanges}, true
 	case "/jobs":
 		return readRoute{kind: readJobList}, true
 	case "/profiles":
@@ -95,6 +98,8 @@ func (h *handler) read(w http.ResponseWriter, r *http.Request, requestID string,
 
 	var response any
 	switch route.kind {
+	case readChanges:
+		response, err = h.dependencies.Reads.ListChanges(r.Context(), query.changes)
 	case readMediaList:
 		result, serviceErr := h.dependencies.Reads.ListMedia(r.Context(), query.media)
 		response, err = readapi.NewMediaPage(result.Items, result.NextCursor), serviceErr
@@ -162,6 +167,7 @@ func closeIfDeclaredBody(w http.ResponseWriter, r *http.Request) {
 }
 
 type readQuery struct {
+	changes  readapi.ChangesRequest
 	media    readapi.MediaListRequest
 	jobs     readapi.JobListRequest
 	profiles readapi.ProfileListRequest
@@ -177,6 +183,8 @@ func parseReadQuery(raw string, kind readRouteKind) (readQuery, error) {
 
 	allowed := map[string]bool{}
 	switch kind {
+	case readChanges:
+		allowed = map[string]bool{"cursor": true, "limit": true}
 	case readMediaList:
 		allowed = map[string]bool{"profile": true, "deleted": true, "cursor": true, "limit": true}
 	case readJobList:
@@ -199,6 +207,12 @@ func parseReadQuery(raw string, kind readRouteKind) (readQuery, error) {
 		jobs:  readapi.NewJobListRequest(),
 	}
 	switch kind {
+	case readChanges:
+		query.changes = readapi.ChangesRequest{Limit: readapi.DefaultChangesLimit}
+		query.changes.Cursor, _ = singleValue(values, "cursor")
+		if value, ok := singleValue(values, "limit"); ok {
+			query.changes.Limit, fields["limit"] = parseLimitMax(value, readapi.MaxChangesLimit)
+		}
 	case readMediaList:
 		if value, ok := singleValue(values, "profile"); ok {
 			query.media.Profile = value
@@ -264,7 +278,8 @@ func singleValue(values url.Values, key string) (string, bool) {
 	return entries[0], true
 }
 
-func parseLimit(value string) (int, string) {
+func parseLimit(value string) (int, string) { return parseLimitMax(value, readapi.MaxLimit) }
+func parseLimitMax(value string, maximum int) (int, string) {
 	if value == "" || value[0] == '0' {
 		return 0, "invalid"
 	}
@@ -274,7 +289,7 @@ func parseLimit(value string) (int, string) {
 		}
 	}
 	parsed, err := strconv.ParseUint(value, 10, 64)
-	if err != nil || parsed > readapi.MaxLimit {
+	if err != nil || parsed > uint64(maximum) {
 		return 0, "out_of_range"
 	}
 	return int(parsed), ""
