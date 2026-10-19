@@ -55,6 +55,7 @@ type UploadAcceptor interface {
 
 // ReadService is the read capability required by the HTTP API.
 type ReadService interface {
+	ListChanges(context.Context, readapi.ChangesRequest) (readapi.ChangesPage, error)
 	ListMedia(context.Context, readapi.MediaListRequest) (readapi.MediaPage, error)
 	GetMedia(context.Context, string) (readapi.MediaDetail, error)
 	GetOriginal(context.Context, string) (readapi.Original, error)

@@ -527,3 +527,8 @@ func assertReadFields(t *testing.T, response *httptest.ResponseRecorder, want ma
 		t.Fatalf("details.fields = %#v, want %#v", got, want)
 	}
 }
+
+func (f *recordingReadService) ListChanges(_ context.Context, request readapi.ChangesRequest) (readapi.ChangesPage, error) {
+	f.calls = append(f.calls, "ListChanges")
+	return readapi.ChangesPage{Items: []readapi.ChangeEvent{}, NextCursor: "cursor"}, nil
+}
