@@ -46,4 +46,17 @@ func TestChangesCursor(t *testing.T) {
 	if _, err := codec.DecodeChanges(wrongRoute); err == nil {
 		t.Fatal("jobs accepted as changes")
 	}
+	// Even correctly MACed envelopes must reject unsupported field layouts.
+	fingerprint := changesFingerprint()
+	for _, token := range []string{
+		codec.encode(CursorKindChangesV1, cursorClassNull, fingerprint, 1, [cursorUUIDSize]byte{}),
+		codec.encode(CursorKindChangesV1, cursorClassValue, fingerprint, -1, [cursorUUIDSize]byte{}),
+		codec.encode(CursorKindChangesV1, cursorClassValue, fingerprint, 1, [cursorUUIDSize]byte{1}),
+		codec.encode(CursorKindChangesV1, cursorClassValue, [32]byte{}, 1, [cursorUUIDSize]byte{}),
+	} {
+		if _, err := codec.DecodeChanges(token); err == nil {
+			t.Fatal("noncanonical signed envelope accepted")
+		}
+	}
+
 }
