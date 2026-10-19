@@ -1,0 +1,1208 @@
+#!/usr/bin/env python3
+"""Build, seal, execute, and remove migration-role compatibility evidence.
+
+Independent review authorizes candidate bytes. Manifests and AST checks provide
+regression/integrity evidence, never authentication. Without an externally
+protected workflow they cannot defend against candidate/verifier collusion.
+The hostile-root threat model is explicitly out of scope.
+"""
+
+import fcntl
+import hashlib
+import io
+import json
+import os
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+CURRENT_ASSETS = {
+    "supervisor": ("scripts/verify-ubuntu-migration-role-supervisor", "trusted root supervisor", 0o500),
+    "phase": ("scripts/verify-ubuntu-migration-role-compatibility", "compatibility phase entrypoint", 0o500),
+    "runtime-helper": ("scripts/verify-installed-runtime-roles", "runtime boundary helper", 0o500),
+    "verify-stage": ("scripts/verify-ubuntu-migration-role-stage", "closed snapshot verifier", 0o500),
+    "role-mode": ("scripts/set-ubuntu-migration-role-mode", "migration role mode wrapper", 0o755),
+    "migration-wrapper": ("scripts/run-ubuntu-migration-compatibility", "migration compatibility wrapper", 0o755),
+    "runtime-roles.sql": ("infra/postgresql/runtime-roles.sql", "runtime role bootstrap SQL", 0o644),
+    "verify-role-graph.sql": ("infra/postgresql/verify-runtime-role-graph.sql", "role graph verifier SQL", 0o644),
+    "postgresql-roles.sql": ("infra/ubuntu/postgresql-roles.sql", "database bootstrap SQL", 0o644),
+    "verify-runtime-roles.sql": ("infra/validation/verify-runtime-roles.sql", "independent runtime verifier SQL", 0o644),
+    "nmcp.sysusers": ("infra/ubuntu/sysusers.d/nmcp.conf", "nmcp system user declaration", 0o400),
+}
+PHASES = (
+    "fresh-current", "current-rerun", "hostile-libpq", "stale-compatibility",
+    "migration-failure", "signal-int", "signal-term", "sigkill-recovery",
+    "graph-verifier-failure", "upgrade-v18-v19", "unfinished-v18-rejection",
+    "completed-v18-rejection", "writer-drain",
+)
+HISTORICAL = "172583179d860619ae2c79505971e10ae7f394fc"
+MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+ACTIVE_PHASE = None
+OWNED_PHASE_GROUP = None
+CLEANUP_TRANSITION_ERRORS = None
+SIGNAL_ERRORS = []
+BODY_ACTIVE = False
+INTENT_PATH = "/run/nmcp-ci/cleanup-intent.json"
+INTENT_READY_PATH = "/run/nmcp-ci/cleanup-intent.ready"
+LOCK_KEEPER_PID_PATH = "/run/nmcp-ci/lock-keeper.pid"
+FAULT_MODE = ""
+SUPERVISOR_NONCE = ""
+HANDLED_TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+CLEANUP_DATABASE_FAILURE = "NMCP cleanup result: drop database failed"
+CLEANUP_ROLES_FAILURE = "NMCP cleanup result: drop roles failed"
+STAGE_PREFIX = "NMCP supervisor stage: "
+STAGE_PATH = "/run/nmcp-ci/supervisor-stage"
+CURRENT_STAGE = "startup"
+
+
+def supervisor_stage(stage):
+    global CURRENT_STAGE
+    allowed = ("startup", "build", "stage-verify", "install", "final",
+               *("phase-" + phase for phase in PHASES),
+               *("boundary-" + phase for phase in PHASES),
+               *("intent-" + boundary for boundary in ("before-replace", "after-replace", "after-fsync", "after-intent", "after-mkdir", "after-open", "after-register")))
+    if stage not in allowed or len(SUPERVISOR_NONCE) != 64:
+        die("supervisor stage evidence was not closed and identity-bound")
+    payload = ("v1:" + SUPERVISOR_NONCE + ":" + stage + "\n").encode("ascii")
+    if len(payload) > 128:
+        die("supervisor stage evidence exceeded its fixed bound")
+    temporary = STAGE_PATH + ".new"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        write_all(descriptor, payload)
+        os.fsync(descriptor)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, STAGE_PATH)
+    fsync_directory(os.path.dirname(STAGE_PATH))
+    CURRENT_STAGE = stage
+    print(STAGE_PREFIX + stage, flush=True)
+INTENT_MODE_TARGETS = {
+    "run-root": "run-root",
+    "usr-local-libexec-nmcp": "/usr/local/libexec/nmcp",
+    "var-lib-nmcp": "/var/lib/nmcp",
+    "opt-nmcp-role-compatibility": "/opt/nmcp-role-compatibility",
+}
+
+INTENT_TARGET_TOKEN = {path: token for token, path in INTENT_MODE_TARGETS.items()
+                       if path != "run-root"}
+
+TOP_ALLOWLISTS = {
+    "/usr/local/libexec/nmcp": {"postgresql", "set-ubuntu-migration-role-mode", "run-ubuntu-migration-compatibility", "verify-installed-runtime-roles"},
+    "/var/lib/nmcp": {"deployment"},
+    "/opt/nmcp-role-compatibility": {"current", "v18", "test-work"},
+}
+
+
+def die(message):
+    raise RuntimeError(message)
+
+
+class SupervisorCleanupFailure(RuntimeError):
+    def __init__(self, primary_error, cleanup_errors):
+        self.primary_error = primary_error
+        self.cleanup_errors = tuple(cleanup_errors)
+        details = "; ".join(
+            f"{category}: {error}" for category, error in self.cleanup_errors)
+        if primary_error is None:
+            message = "cleanup failed: " + details
+        else:
+            message = f"{primary_error}; cleanup failed: {details}"
+        super().__init__(message)
+
+
+class CleanupScope:
+    def __init__(self):
+        self.actions = []
+
+    def __enter__(self):
+        return self
+
+    def defer(self, category, function, *args, **kwargs):
+        self.actions.append((category, function, args, kwargs))
+
+    def __exit__(self, _kind, primary_error, _traceback):
+        cleanup_errors = []
+        for category, function, args, kwargs in reversed(self.actions):
+            try:
+                function(*args, **kwargs)
+            except BaseException as error:
+                cleanup_errors.append((category, error))
+        if cleanup_errors:
+            cause = primary_error if primary_error is not None else cleanup_errors[0][1]
+            raise SupervisorCleanupFailure(primary_error, cleanup_errors) from cause
+        return False
+
+
+def interrupted(signum, _frame):
+    error = RuntimeError(f"supervisor interrupted by signal {signum}")
+    SIGNAL_ERRORS.append(("cleanup-transition-signal", error))
+    if BODY_ACTIVE:
+        raise error
+
+
+def run_supervisor_body(resources):
+    global BODY_ACTIVE
+    try:
+        BODY_ACTIVE = True
+        return supervisor_body(resources)
+    finally:
+        BODY_ACTIVE = False
+
+
+def clean_env(home="/root"):
+    return {
+        "PATH": MINIMAL_PATH, "LC_ALL": "C", "LANG": "C", "HOME": home,
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GOWORK": "off",
+        "GOFLAGS": "-mod=readonly", "GOTOOLCHAIN": "local",
+    }
+
+
+def run(argv, *, cwd="/", env=None, pass_fds=(), stdin=None, stdout=None):
+    return subprocess.run(argv, cwd=cwd, env=env or clean_env(), check=True,
+                          pass_fds=pass_fds, stdin=stdin, stdout=stdout)
+
+
+def run_phase(argv, *, env, pass_fds):
+    global ACTIVE_PHASE, OWNED_PHASE_GROUP
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)
+    with CleanupScope() as launch_cleanup:
+        launch_cleanup.defer("phase-signal-mask-restore", signal.pthread_sigmask,
+                             signal.SIG_SETMASK, old_mask)
+        process = subprocess.Popen(argv, cwd="/", env=env, pass_fds=pass_fds,
+                                   start_new_session=True)
+        group = provisional_process_group(process)
+        OWNED_PHASE_GROUP = group
+        ACTIVE_PHASE = process
+        validate_owned_process_group(group)
+    with CleanupScope() as cleanup:
+        cleanup.defer("phase-process-state", clear_active_phase, process)
+        status = process.wait()
+        if status:
+            raise subprocess.CalledProcessError(status, argv)
+        if process_group_exists(group["pgid"]):
+            die("phase leader exited while its process group remained live")
+        OWNED_PHASE_GROUP = None
+
+
+def clear_active_phase(process):
+    global ACTIVE_PHASE
+    if process.poll() is not None:
+        ACTIVE_PHASE = None
+
+
+def provisional_process_group(process):
+    return {"process": process, "pgid": process.pid}
+
+
+def validate_owned_process_group(group):
+    process = group["process"]
+    pgid = group["pgid"]
+    if (type(pgid) is not int or pgid <= 0 or pgid == os.getpgrp()
+            or process.pid != pgid):
+        die("unsafe owned process-group identity")
+    if os.getpgid(pgid) != pgid:
+        die("launched process did not establish its owned session group")
+
+
+def launch_lock_keeper(resources, lock_fd):
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)
+    with CleanupScope() as cleanup:
+        cleanup.defer("keeper-signal-mask-restore", signal.pthread_sigmask,
+                      signal.SIG_SETMASK, old_mask)
+        process = subprocess.Popen(
+            ("/bin/sh", "-c", "trap '' TERM INT HUP QUIT; while :; do /usr/bin/sleep 300; done"),
+            cwd="/", env=clean_env(), pass_fds=(lock_fd,), start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        group = provisional_process_group(process)
+        resources["lock_keeper_group"] = group
+        resources["lock_keeper"] = process
+        validate_owned_process_group(group)
+    return process
+
+
+def launch_retained_process(resources):
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)
+    with CleanupScope() as cleanup:
+        cleanup.defer("retained-signal-mask-restore", signal.pthread_sigmask,
+                      signal.SIG_SETMASK, old_mask)
+        process = subprocess.Popen(
+            ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
+             "--dbname=nmcp", "--command", "SELECT pg_sleep(300)"),
+            cwd="/", env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        group = provisional_process_group(process)
+        resources["retained_group"] = group
+        resources["retained_process"] = process
+        validate_owned_process_group(group)
+    return process
+
+
+def process_group_exists(pgid):
+    if type(pgid) is not int or pgid <= 0 or pgid == os.getpgrp():
+        die("unsafe process-group probe identity")
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def git(repo, *args, stdout=None):
+    return subprocess.run(("/usr/bin/git", "-c", f"safe.directory={repo}", "-C", repo, *args), cwd="/", env=clean_env(),
+                          check=True, stdout=stdout or subprocess.PIPE).stdout
+
+
+def archive_tree(repo, commit, destination):
+    resolved = git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}").decode().strip()
+    if resolved != commit:
+        die(f"commit identity mismatch: {commit}")
+    tree = git(repo, "rev-parse", "--verify", f"{commit}^{{tree}}").decode().strip()
+    listing = git(repo, "ls-tree", "-r", "-z", commit).split(b"\0")
+    expected_files = {}
+    for record in filter(None, listing):
+        metadata, raw_name = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.split(b" ")
+        if kind != b"blob" or mode not in (b"100644", b"100755"):
+            die(f"submodule or unexpected git mode in {commit}: {record!r}")
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise RuntimeError("non-UTF-8 archive name") from error
+        expected_files[name] = (
+            0o755 if mode == b"100755" else 0o644,
+            object_id.decode("ascii"),
+        )
+    expected_directories = set()
+    for name in expected_files:
+        parent = os.path.dirname(name)
+        while parent:
+            expected_directories.add(parent)
+            parent = os.path.dirname(parent)
+    archive = git(repo, "archive", "--format=tar", commit)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as source:
+        seen_files = set()
+        seen_directories = set()
+        for member in source.getmembers():
+            normalized = os.path.normpath(member.name)
+            if normalized != member.name.rstrip("/") or normalized.startswith("../") or os.path.isabs(member.name):
+                die("archive path escapes build tree")
+            if member.isdir() and normalized in expected_directories:
+                seen_directories.add(normalized)
+                if member.mode not in (0o755, 0o775):
+                    die(f"archive contains unexpected directory mode: {member.name}")
+                member.mode = 0o755
+            elif member.isreg() and normalized in expected_files:
+                seen_files.add(normalized)
+                expected_mode, _object_id = expected_files[normalized]
+                if member.mode not in (expected_mode, expected_mode | 0o020):
+                    die(f"archive contains unexpected file mode: {member.name}")
+                member.mode = expected_mode
+            else:
+                die(f"archive contains nonregular member: {member.name}")
+        if seen_files != set(expected_files) or seen_directories != expected_directories:
+            die("archive inventory differs from the commit tree")
+        source.extractall(destination, filter=lambda member, _path: member)
+    # Git attributes such as export-subst may rewrite archive members. Bind
+    # every extracted byte sequence back to its exact reviewed tree blob before
+    # any build or snapshot consumes it.
+    for name, (expected_mode, object_id) in expected_files.items():
+        path = os.path.join(destination, name)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with CleanupScope() as cleanup:
+            cleanup.defer("archive-member-close", os.close, descriptor)
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                    or stat.S_IMODE(metadata.st_mode) != expected_mode):
+                die(f"unsafe extracted archive member: {name}")
+            extracted = bytearray()
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                extracted.extend(block)
+            after = os.fstat(descriptor)
+            identity = lambda value: (
+                value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                value.st_gid, value.st_nlink, value.st_size,
+                value.st_mtime_ns, value.st_ctime_ns,
+            )
+            if identity(after) != identity(metadata):
+                die(f"archive member changed while verified: {name}")
+        blob = git(repo, "cat-file", "blob", object_id)
+        if extracted != blob:
+            die(f"archive member differs from reviewed Git blob: {name}")
+    return tree
+
+
+def build_admin(source, output, go_binary):
+    if not os.path.isabs(go_binary):
+        die("Go tool path must be absolute")
+    version = subprocess.run((go_binary, "version"), env=clean_env(), cwd="/",
+                             check=True, text=True, stdout=subprocess.PIPE).stdout
+    if " go1.27.1 " not in version:
+        die(f"unexpected Go toolchain: {version.strip()}")
+    env = clean_env(source)
+    env["PATH"] = os.path.dirname(go_binary) + ":/usr/bin:/bin"
+    run((go_binary, "build", "-trimpath", "-o", output, "./cmd/nmcp-admin"), cwd=source, env=env)
+    return version.strip()
+
+
+def write_all(descriptor, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            die("short write while publishing trusted input")
+        view = view[written:]
+
+
+def copy_regular(source, destination, mode):
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    with CleanupScope() as cleanup:
+        cleanup.defer("source-close", os.close, source_fd)
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            die(f"unsafe source asset: {source}")
+        data = bytearray()
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(source_fd, 1024 * 1024)
+            if not block:
+                break
+            data.extend(block)
+            digest.update(block)
+        after = os.fstat(source_fd)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )
+        if identity(before) != identity(after) or len(data) != before.st_size:
+            die(f"source changed while copied: {source}")
+    target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with CleanupScope() as cleanup:
+        cleanup.defer("target-close", os.close, target_fd)
+        write_all(target_fd, data)
+        os.fchmod(target_fd, mode)
+        os.fsync(target_fd)
+        target = os.fstat(target_fd)
+        if target.st_nlink != 1 or target.st_size != len(data):
+            die(f"unsafe published asset: {destination}")
+    return digest.hexdigest(), len(data)
+
+
+def remove_owned(path, identity):
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (observed.st_dev, observed.st_ino) != identity:
+        die(f"cleanup identity changed: {path}")
+    if stat.S_ISDIR(observed.st_mode):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    with CleanupScope() as cleanup:
+        cleanup.defer("directory-close", os.close, descriptor)
+        os.fsync(descriptor)
+
+
+def validate_launch_marker(path, nonce, suffix, absent_ok=False):
+    root = "/run/nmcp-ci"
+    expected_path = root + "/launch-" + nonce + suffix
+    if path != expected_path:
+        die("persistent launch protocol path does not match its nonce")
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    with CleanupScope() as cleanup:
+        cleanup.defer("launch-marker-directory-close", os.close, directory)
+        try:
+            descriptor = os.open(os.path.basename(path),
+                                 os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            if absent_ok:
+                return False
+            raise
+        cleanup.defer("launch-marker-close", os.close, descriptor)
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_gid != 0
+                or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600):
+            die("unsafe persistent launch protocol marker")
+        payload = os.read(descriptor, len(nonce) + 2)
+        after = os.fstat(descriptor)
+        current = os.stat(os.path.basename(path), dir_fd=directory, follow_symlinks=False)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )
+        expected_payload = (nonce + "\n").encode("ascii")
+        if (identity(before) != identity(after) or identity(before) != identity(current)
+                or before.st_size != len(expected_payload) or payload != expected_payload):
+            die("persistent launch protocol marker was malformed or replaced")
+        return True
+
+
+def validate_launch_required(path, nonce):
+    validate_launch_marker(path, nonce, ".required")
+
+
+def metadata(value):
+    return {"dev": value.st_dev, "ino": value.st_ino, "uid": value.st_uid,
+            "gid": value.st_gid, "mode": stat.S_IMODE(value.st_mode)}
+
+
+def durable_intents(entries, epoch=None, stage=None):
+    raw = (json.dumps({"version": 2, "epoch": epoch, "entries": entries}, sort_keys=True,
+                      separators=(",", ":")) + "\n").encode("ascii")
+    temporary = INTENT_PATH + ".new"
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with CleanupScope() as cleanup:
+        cleanup.defer("intent-publish-close", os.close, descriptor)
+        write_all(descriptor, raw)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    if stage is not None:
+        stage("intent-before-replace")
+    os.replace(temporary, INTENT_PATH)
+    if stage is not None:
+        stage("intent-after-replace")
+    fsync_directory("/run/nmcp-ci")
+    if stage is not None:
+        stage("intent-after-fsync")
+
+
+def publish_intent_ready(epoch):
+    observed = os.stat(INTENT_PATH, follow_symlinks=False)
+    payload = dict(epoch)
+    payload.update({"pid": os.getpid(), "journal_dev": observed.st_dev,
+                    "journal_ino": observed.st_ino})
+    raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    temporary = INTENT_READY_PATH + ".new"
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with CleanupScope() as cleanup:
+        cleanup.defer("intent-ready-close", os.close, descriptor)
+        write_all(descriptor, raw)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    os.replace(temporary, INTENT_READY_PATH)
+    fsync_directory("/run/nmcp-ci")
+
+
+def fault(entries, path, stage, label):
+    if FAULT_MODE != f"{label}:{stage}":
+        return
+    epoch = {"nonce": SUPERVISOR_NONCE, "stage": stage, "target": path}
+    durable_intents(entries, epoch)
+    publish_intent_ready(epoch)
+    while True:
+        signal.pause()
+
+
+def remove_tree_fd(parent_fd, name, allowed):
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    with CleanupScope() as cleanup:
+        cleanup.defer("intent-tree-close", os.close, descriptor)
+        names = set(os.listdir(descriptor))
+        if allowed is not None and not names <= set(allowed):
+            die(f"cleanup subtree outside allowlist: {name}: {sorted(names - set(allowed))}")
+        for child in names:
+            observed = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(observed.st_mode):
+                remove_tree_fd(descriptor, child, None)
+            elif stat.S_ISREG(observed.st_mode):
+                os.unlink(child, dir_fd=descriptor)
+            else:
+                die(f"cleanup encountered unsafe object: {name}/{child}")
+        os.fsync(descriptor)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def recover_intents():
+    try:
+        descriptor = os.open(INTENT_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    with CleanupScope() as cleanup:
+        cleanup.defer("intent-read-close", os.close, descriptor)
+        observed = os.fstat(descriptor)
+        if (not stat.S_ISREG(observed.st_mode) or observed.st_uid != 0 or observed.st_gid != 0
+                or observed.st_nlink != 1 or stat.S_IMODE(observed.st_mode) != 0o600):
+            die("unsafe cleanup intent journal")
+        raw = os.read(descriptor, observed.st_size + 1)
+    document = json.loads(raw)
+    epoch = document.get("epoch")
+    if (set(document) != {"version", "epoch", "entries"} or document["version"] != 2
+            or (epoch is not None and (
+                type(epoch) is not dict or set(epoch) != {"nonce", "stage", "target"}
+                or type(epoch["nonce"]) is not str or len(epoch["nonce"]) != 64
+                or any(character not in "0123456789abcdef" for character in epoch["nonce"])
+                or epoch["stage"] not in {"after-intent", "after-mkdir", "after-open", "after-register"}
+                or type(epoch["target"]) is not str
+                or len([entry for entry in document["entries"]
+                        if type(entry) is dict and entry.get("path") == epoch["target"]]) != 1))):
+        die("invalid cleanup intent journal")
+    for entry in reversed(document["entries"]):
+        if (set(entry) != {"path", "parent", "parent_identity", "absence_policy", "expected_metadata", "identity", "allowlist"}
+                or entry["absence_policy"] != "must-be-absent"):
+            die("invalid cleanup intent entry")
+        path = entry["path"]
+        parent = entry["parent"]
+        if os.path.dirname(path) != parent or os.path.basename(path) in ("", ".", ".."):
+            die("unsafe cleanup intent path")
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        with CleanupScope() as cleanup:
+            cleanup.defer("intent-parent-close", os.close, parent_fd)
+            if metadata(os.fstat(parent_fd)) != entry["parent_identity"]:
+                die(f"cleanup parent identity changed: {parent}")
+            try:
+                top = os.stat(os.path.basename(path), dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISDIR(top.st_mode) or top.st_uid != entry["expected_metadata"]["uid"]
+                    or top.st_gid != entry["expected_metadata"]["gid"]
+                    or stat.S_IMODE(top.st_mode) != entry["expected_metadata"]["mode"]):
+                die(f"cleanup target metadata mismatch: {path}")
+            expected = entry["identity"]
+            if expected is not None and metadata(top) != expected:
+                die(f"cleanup target identity changed: {path}")
+            remove_tree_fd(parent_fd, os.path.basename(path), entry["allowlist"])
+    os.unlink(INTENT_PATH)
+    fsync_directory("/run/nmcp-ci")
+
+
+def create_owned_top(path, mode, entries, allowlist, fault_name=None, stage=None):
+    parent, name = os.path.dirname(path), os.path.basename(path)
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT})
+    with CleanupScope() as cleanup:
+        cleanup.defer("signal-mask-restore", signal.pthread_sigmask,
+                      signal.SIG_SETMASK, old_mask)
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        cleanup.defer("owned-parent-close", os.close, parent_fd)
+        if os.path.lexists(path):
+            die(f"refusing existing path: {path}")
+        entry = {"path": path, "parent": parent, "parent_identity": metadata(os.fstat(parent_fd)),
+                 "absence_policy": "must-be-absent", "expected_metadata": {"uid": 0, "gid": 0, "mode": mode},
+                 "identity": None, "allowlist": sorted(allowlist)}
+        entries.append(entry)
+        if stage is None:
+            durable_intents(entries)
+        else:
+            durable_intents(entries, stage=stage)
+            stage("intent-after-intent")
+        fault(entries, path, "after-intent", fault_name or path)
+        # mkdir(2) applies the process umask. Publish the exact journaled mode
+        # while the rest of this process deliberately retains umask 077.
+        previous_umask = os.umask(0)
+        cleanup.defer("umask-restore", os.umask, previous_umask)
+        os.mkdir(name, mode, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if stage is not None:
+            stage("intent-after-mkdir")
+        fault(entries, path, "after-mkdir", fault_name or path)
+        top_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        cleanup.defer("owned-top-close", os.close, top_fd)
+        top = os.fstat(top_fd)
+        if top.st_uid != 0 or top.st_gid != 0 or stat.S_IMODE(top.st_mode) != mode:
+            die(f"new top directory metadata mismatch: {path}")
+        entry["identity"] = metadata(top)
+        if stage is not None:
+            stage("intent-after-open")
+        fault(entries, path, "after-open", fault_name or path)
+        durable_intents(entries)
+        if stage is not None:
+            stage("intent-after-register")
+        fault(entries, path, "after-register", fault_name or path)
+    return entry
+
+
+def open_verified(root_fd, manifest, name):
+    item = manifest[name]
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+    before = os.fstat(fd)
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    after = os.fstat(fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+    values = (after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode), after.st_size, digest.hexdigest())
+    expected = (item["uid"], item["gid"], item["mode"], item["size"], item["sha256"])
+    identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+        value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+    if identity(before) != identity(after) or after.st_nlink != 1 or not stat.S_ISREG(after.st_mode) or values != expected:
+        os.close(fd)
+        die(f"manifest binding failed: {name}")
+    return fd
+
+
+def supervisor_body(resources):
+    global FAULT_MODE, SUPERVISOR_NONCE
+    if os.geteuid() != 0 or len(sys.argv) not in (5, 6, 7):
+        die("usage: supervisor REPOSITORY CURRENT_COMMIT ABSOLUTE_GO NONCE "
+            "[FAULT_POINT] [--persistent-launch-required=PATH]")
+    os.chdir("/")
+    os.umask(0o077)
+    for signum in HANDLED_TERMINATION_SIGNALS:
+        signal.signal(signum, interrupted)
+    nonce = sys.argv[4]
+    if (len(nonce) != 64 or any(character not in "0123456789abcdef" for character in nonce)
+            or os.environ.get("NMCP_VERIFIER_NONCE") != nonce):
+        die("supervisor launch nonce does not match its environment")
+    optional = list(sys.argv[5:])
+    launch_required = None
+    if optional and optional[-1].startswith("--persistent-launch-required="):
+        launch_required = optional.pop().partition("=")[2]
+    if len(optional) > 1:
+        die("supervisor received an invalid optional argument sequence")
+    FAULT_MODE = optional[0] if optional else ""
+    SUPERVISOR_NONCE = nonce
+    repo, current_commit, go_binary = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
+    if current_commit != git(repo, "rev-parse", "--verify", "HEAD^{commit}").decode().strip():
+        die("checkout HEAD is not the requested candidate commit")
+    os.makedirs("/run/nmcp-ci", mode=0o700, exist_ok=True)
+    run_stat = os.lstat("/run/nmcp-ci")
+    if not stat.S_ISDIR(run_stat.st_mode) or run_stat.st_uid != 0 or run_stat.st_gid != 0 or stat.S_IMODE(run_stat.st_mode) != 0o700:
+        die("unsafe /run/nmcp-ci")
+    lock_fd = os.open("/run/nmcp-ci/transaction.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    resources["lock_fd"] = lock_fd
+    lock_stat = os.fstat(lock_fd)
+    if (not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != 0
+            or lock_stat.st_gid != 0 or lock_stat.st_nlink != 1
+            or stat.S_IMODE(lock_stat.st_mode) != 0o600):
+        die("unsafe transaction lock")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    resources["lock_held"] = True
+    resources["intents_acquired"] = True
+    recover_intents()
+    intents = []
+    run_root = "/run/nmcp-ci/transaction-" + secrets.token_hex(16)
+    create_owned_top(run_root, 0o700, intents,
+                     {"current-source", "v18-source", "nmcp-admin-current.build",
+                      "nmcp-admin-v18.build", "snapshot", "snapshot.build"}, "intent:run-root")
+    try:
+        lock_keeper = launch_lock_keeper(resources, lock_fd)
+        keeper_pid_fd = os.open(LOCK_KEEPER_PID_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        resources["keeper_marker"] = True
+        with CleanupScope() as cleanup:
+            cleanup.defer("lock-keeper-marker-close", os.close, keeper_pid_fd)
+            write_all(keeper_pid_fd, f"{lock_keeper.pid}\n".encode("ascii"))
+            os.fchmod(keeper_pid_fd, 0o600)
+            os.fsync(keeper_pid_fd)
+        fsync_directory(os.path.dirname(LOCK_KEEPER_PID_PATH))
+        if launch_required is not None:
+            validate_launch_required(launch_required, nonce)
+            launch_barrier = "/run/nmcp-ci/launch-" + nonce
+            ready_fd = os.open(launch_barrier + ".ready",
+                               os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with CleanupScope() as cleanup:
+                cleanup.defer("launch-ready-close", os.close, ready_fd)
+                write_all(ready_fd, (nonce + "\n").encode("ascii"))
+                os.fsync(ready_fd)
+            fsync_directory("/run/nmcp-ci")
+            deadline = time.monotonic() + 30
+            while not validate_launch_marker(
+                    launch_barrier + ".release", nonce, ".release", absent_ok=True):
+                if time.monotonic() >= deadline:
+                    die("timed out awaiting live launch attestation")
+                time.sleep(0.05)
+    except BaseException:
+        raise
+    run_identity = (os.lstat(run_root).st_dev, os.lstat(run_root).st_ino)
+    owned = []
+    trace = []
+    snapshot_fd = None
+    retained_process = None
+    fast_success = FAULT_MODE == "fast-success"
+    try:
+        supervisor_stage("startup")
+        if FAULT_MODE == "fast-fail":
+            die("injected fast supervisor failure before builds")
+        if FAULT_MODE == "fast-hold":
+            while True:
+                signal.pause()
+        if fast_success:
+            return 0
+        if FAULT_MODE.startswith("intent:"):
+            parts = FAULT_MODE.split(":")
+            if (len(parts) != 3 or parts[1] not in INTENT_MODE_TARGETS
+                    or parts[2] not in {"after-intent", "after-mkdir", "after-open", "after-register"}):
+                die("invalid opaque intent fault mode")
+            selected = INTENT_MODE_TARGETS[parts[1]]
+            if selected == "run-root":
+                die("run-root intent fault mode did not stop during run root creation")
+            for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
+                               ("/opt/nmcp-role-compatibility", 0o755)):
+                create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path],
+                                 f"intent:{INTENT_TARGET_TOKEN[path]}", supervisor_stage)
+            die("intent fault mode reached the end without its required SIGKILL")
+        supervisor_stage("build")
+        current_source = os.path.join(run_root, "current-source")
+        historical_source = os.path.join(run_root, "v18-source")
+        os.mkdir(current_source, 0o700)
+        os.mkdir(historical_source, 0o700)
+        current_tree = archive_tree(repo, current_commit, current_source)
+        historical_tree = archive_tree(repo, HISTORICAL, historical_source)
+        current_admin = os.path.join(run_root, "nmcp-admin-current.build")
+        historical_admin = os.path.join(run_root, "nmcp-admin-v18.build")
+        current_toolchain = build_admin(current_source, current_admin, go_binary)
+        historical_toolchain = build_admin(historical_source, historical_admin, go_binary)
+        if current_toolchain != historical_toolchain:
+            die("admin builds used different Go toolchains")
+
+        snapshot = os.path.join(run_root, "snapshot")
+        snapshot_build = os.path.join(run_root, "snapshot.build")
+        os.mkdir(snapshot_build, 0o700)
+        records = []
+        for name, (relative, purpose, mode) in CURRENT_ASSETS.items():
+            digest, size = copy_regular(os.path.join(current_source, relative), os.path.join(snapshot_build, name), mode)
+            records.append({"name": name, "purpose": purpose, "provenance_commit": current_commit,
+                            "provenance_tree": current_tree, "type": "regular", "uid": 0, "gid": 0,
+                            "mode": mode, "size": size, "sha256": digest, "toolchain": None})
+        for name, source, purpose, commit, tree, toolchain in (
+            ("nmcp-admin-current", current_admin, "candidate migration admin", current_commit, current_tree, current_toolchain),
+            ("nmcp-admin-v18", historical_admin, "approved v18 migration admin", HISTORICAL, historical_tree, historical_toolchain),
+        ):
+            digest, size = copy_regular(source, os.path.join(snapshot_build, name), 0o755)
+            records.append({"name": name, "purpose": purpose, "provenance_commit": commit,
+                            "provenance_tree": tree, "type": "regular", "uid": 0, "gid": 0,
+                            "mode": 0o755, "size": size, "sha256": digest, "toolchain": toolchain})
+        records.sort(key=lambda item: item["name"])
+        raw_manifest = (json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("ascii")
+        manifest_path = os.path.join(snapshot_build, "manifest.json")
+        manifest_fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with CleanupScope() as cleanup:
+            cleanup.defer("manifest-close", os.close, manifest_fd)
+            write_all(manifest_fd, raw_manifest)
+            os.fchmod(manifest_fd, 0o400)
+            os.fsync(manifest_fd)
+        fsync_directory(snapshot_build)
+        os.rename(snapshot_build, snapshot)
+        fsync_directory(run_root)
+        snapshot_fd = os.open(snapshot, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        resources["snapshot_fd"] = snapshot_fd
+        manifest = {item["name"]: item for item in records}
+
+        supervisor_stage("stage-verify")
+        verifier_fd = open_verified(snapshot_fd, manifest, "verify-stage")
+        with CleanupScope() as cleanup:
+            cleanup.defer("stage-verifier-close", os.close, verifier_fd)
+            run(("/usr/bin/python3", "-I", "-S", f"/proc/self/fd/{verifier_fd}", snapshot), pass_fds=(verifier_fd,))
+
+        supervisor_stage("install")
+        for path, mode in (("/usr/local/libexec/nmcp", 0o755), ("/var/lib/nmcp", 0o700),
+                           ("/opt/nmcp-role-compatibility", 0o755)):
+            entry = create_owned_top(path, mode, intents, TOP_ALLOWLISTS[path])
+            owned.append((path, (entry["identity"]["dev"], entry["identity"]["ino"])))
+        for path, mode in (("/usr/local/libexec/nmcp/postgresql", 0o755), ("/var/lib/nmcp/deployment", 0o700),
+                           ("/opt/nmcp-role-compatibility/current/bin", 0o755), ("/opt/nmcp-role-compatibility/v18/bin", 0o755)):
+            os.makedirs(path, mode=mode)
+            os.chmod(path, mode)
+        for path in ("/usr/local/libexec/nmcp", "/opt/nmcp-role-compatibility",
+                     "/opt/nmcp-role-compatibility/current", "/opt/nmcp-role-compatibility/v18"):
+            os.chmod(path, 0o755)
+        installs = {
+            "role-mode": "/usr/local/libexec/nmcp/set-ubuntu-migration-role-mode",
+            "migration-wrapper": "/usr/local/libexec/nmcp/run-ubuntu-migration-compatibility",
+            "runtime-helper": "/usr/local/libexec/nmcp/verify-installed-runtime-roles",
+            "runtime-roles.sql": "/usr/local/libexec/nmcp/postgresql/runtime-roles.sql",
+            "verify-role-graph.sql": "/usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql",
+            "postgresql-roles.sql": "/usr/local/libexec/nmcp/postgresql/postgresql-roles.sql",
+            "verify-runtime-roles.sql": "/usr/local/libexec/nmcp/postgresql/verify-runtime-roles.sql",
+            "nmcp-admin-current": "/opt/nmcp-role-compatibility/current/bin/nmcp-admin",
+            "nmcp-admin-v18": "/opt/nmcp-role-compatibility/v18/bin/nmcp-admin",
+        }
+        for name, destination in installs.items():
+            source_fd = open_verified(snapshot_fd, manifest, name)
+            with CleanupScope() as cleanup:
+                cleanup.defer("install-source-close", os.close, source_fd)
+                data = b""
+                while True:
+                    block = os.read(source_fd, 1024 * 1024)
+                    if not block: break
+                    data += block
+                target_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, manifest[name]["mode"])
+                cleanup.defer("install-target-close", os.close, target_fd)
+                write_all(target_fd, data); os.fchmod(target_fd, manifest[name]["mode"]); os.fsync(target_fd)
+        for directory in ("/usr/local/libexec/nmcp", "/usr/local/libexec/nmcp/postgresql",
+                          "/opt/nmcp-role-compatibility/current/bin", "/opt/nmcp-role-compatibility/v18/bin"):
+            fsync_directory(directory)
+        checksum = subprocess.run(("/usr/bin/sha256sum", "runtime-roles.sql", "verify-runtime-role-graph.sql"),
+                                  cwd="/usr/local/libexec/nmcp/postgresql", env=clean_env(), check=True, stdout=subprocess.PIPE).stdout
+        checksum_fd = os.open("/var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with CleanupScope() as cleanup:
+            cleanup.defer("checksum-close", os.close, checksum_fd)
+            write_all(checksum_fd, checksum); os.fsync(checksum_fd)
+        fsync_directory("/var/lib/nmcp/deployment")
+        resources["database_cleanup"] = True
+        run(("/usr/bin/systemctl", "start", "postgresql"))
+        if subprocess.run(("/usr/bin/id", "nmcp"), env=clean_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            sysusers_fd = open_verified(snapshot_fd, manifest, "nmcp.sysusers")
+            with CleanupScope() as cleanup:
+                cleanup.defer("sysusers-close", os.close, sysusers_fd)
+                run(("/usr/bin/systemd-sysusers", f"/proc/self/fd/{sysusers_fd}"), pass_fds=(sysusers_fd,))
+        phase_env = clean_env("/root")
+        phase_env.update({"NMCP_COMPAT_WORK": "/opt/nmcp-role-compatibility/test-work",
+                          "NMCP_DATABASE_URL": "postgres://nmcp_migrator:nmcp-migrator-wrapper-test@127.0.0.1:5432/nmcp?sslmode=disable",
+                          "NMCP_LOG_LEVEL": "info", "NMCP_SHUTDOWN_TIMEOUT": "10s"})
+        if FAULT_MODE == "containment-supervisor-kill":
+            phase_env["NMCP_TEST_SUPERVISOR_CONTAINMENT"] = "1"
+        os.mkdir(phase_env["NMCP_COMPAT_WORK"], 0o755)
+        os.chmod(phase_env["NMCP_COMPAT_WORK"], 0o755)
+        for phase in PHASES:
+            supervisor_stage("phase-" + phase)
+            trace.append(f"phase-start:{phase}")
+            phase_fd = open_verified(snapshot_fd, manifest, "phase")
+            phase_inputs = {}
+            with CleanupScope() as cleanup:
+                cleanup.defer("phase-close", os.close, phase_fd)
+                for variable, name in (
+                    ("NMCP_WRAPPER", "migration-wrapper"),
+                    ("NMCP_ROLE_MODE", "role-mode"),
+                    ("NMCP_CURRENT_ADMIN", "nmcp-admin-current"),
+                    ("NMCP_V18_ADMIN", "nmcp-admin-v18"),
+                    ("NMCP_POSTGRESQL_ROLES", "postgresql-roles.sql"),
+                    ("NMCP_RUNTIME_ROLES", "runtime-roles.sql"),
+                    ("NMCP_VERIFY_ROLE_GRAPH", "verify-role-graph.sql"),
+                ):
+                    installed_fd = os.open(installs[name], os.O_RDONLY | os.O_NOFOLLOW)
+                    cleanup.defer("phase-input-close", os.close, installed_fd)
+                    item = manifest[name]
+                    before = os.fstat(installed_fd)
+                    digest = hashlib.sha256()
+                    while True:
+                        block = os.read(installed_fd, 1024 * 1024)
+                        if not block:
+                            break
+                        digest.update(block)
+                    after = os.fstat(installed_fd)
+                    identity = lambda value: (
+                        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                        value.st_gid, value.st_nlink, value.st_size,
+                        value.st_mtime_ns, value.st_ctime_ns,
+                    )
+                    observed = (
+                        after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode),
+                        after.st_size, digest.hexdigest(),
+                    )
+                    expected = (
+                        item["uid"], item["gid"], item["mode"], item["size"], item["sha256"],
+                    )
+                    if (identity(before) != identity(after) or not stat.S_ISREG(after.st_mode)
+                            or after.st_nlink != 1 or observed != expected):
+                        die(f"installed phase asset mismatch: {name}")
+                    os.lseek(installed_fd, 0, os.SEEK_SET)
+                    phase_inputs[variable] = installed_fd
+                    phase_env[variable] = f"/proc/self/fd/{installed_fd}"
+                    cleanup.defer("phase-env-remove", phase_env.pop, variable, None)
+                run_phase(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{phase_fd}", phase),
+                          env=phase_env, pass_fds=(phase_fd, *phase_inputs.values()))
+            trace.append(f"phase-success:{phase}")
+            trace.append(f"boundary-start:{phase}")
+            supervisor_stage("boundary-" + phase)
+            staged_helper = open_verified(snapshot_fd, manifest, "runtime-helper")
+            with CleanupScope() as cleanup:
+                cleanup.defer("boundary-staged-close", os.close, staged_helper)
+                staged_sql = open_verified(snapshot_fd, manifest, "verify-runtime-roles.sql")
+                cleanup.defer("boundary-staged-close", os.close, staged_sql)
+                installed_helper = os.open(installs["runtime-helper"], os.O_RDONLY | os.O_NOFOLLOW)
+                cleanup.defer("boundary-installed-close", os.close, installed_helper)
+                installed_sql = os.open(installs["verify-runtime-roles.sql"], os.O_RDONLY | os.O_NOFOLLOW)
+                cleanup.defer("boundary-installed-close", os.close, installed_sql)
+                for fd, name in ((installed_helper, "runtime-helper"), (installed_sql, "verify-runtime-roles.sql")):
+                    before = os.fstat(fd)
+                    hasher = hashlib.sha256()
+                    while True:
+                        block = os.read(fd, 1024 * 1024)
+                        if not block:
+                            break
+                        hasher.update(block)
+                    observed = os.fstat(fd)
+                    digest = hasher.hexdigest()
+                    os.lseek(fd, 0, 0)
+                    item = manifest[name]
+                    identity = lambda value: (
+                        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                        value.st_gid, value.st_nlink, value.st_size,
+                        value.st_mtime_ns, value.st_ctime_ns,
+                    )
+                    if identity(before) != identity(observed) or observed.st_nlink != 1 or not stat.S_ISREG(observed.st_mode) or (observed.st_uid, observed.st_gid, stat.S_IMODE(observed.st_mode), observed.st_size, digest) != (0, 0, item["mode"], item["size"], item["sha256"]):
+                        die(f"installed boundary asset mismatch: {name}")
+                # Execute the installed helper and feed the independently opened installed SQL descriptor.
+                run(("/bin/bash", "--noprofile", "--norc", f"/proc/self/fd/{installed_helper}", str(installed_sql)),
+                    pass_fds=(installed_helper, installed_sql, staged_helper, staged_sql), stdout=subprocess.DEVNULL)
+            trace.append(f"boundary-success:{phase}")
+        supervisor_stage("final")
+        expected = [entry for phase in PHASES for entry in (f"phase-start:{phase}", f"phase-success:{phase}", f"boundary-start:{phase}", f"boundary-success:{phase}")]
+        if trace != expected:
+            die("final trace differs from the fixed phase table")
+        print("\n".join(trace), flush=True)
+        if FAULT_MODE == "retained-cleanup-dependency":
+            retained_process = launch_retained_process(resources)
+            for _attempt in range(100):
+                probe = subprocess.run(
+                    ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
+                     "--dbname=postgres", "--tuples-only", "--no-align", "--command",
+                     "SELECT count(*) FROM pg_stat_activity WHERE datname='nmcp' AND query LIKE 'SELECT pg_sleep(300)%'"),
+                    cwd="/", env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                if probe.returncode == 0 and probe.stdout.strip() == "1":
+                    break
+                time.sleep(0.05)
+            else:
+                die("retained cleanup connection did not become observable")
+    finally:
+        pass
+    return 0
+
+
+def terminate_process_group(group, category, timeout, cleanup_errors):
+    if group is None:
+        return True
+    process = group["process"]
+    pgid = group["pgid"]
+    try:
+        live = process_group_exists(pgid)
+    except BaseException as error:
+        cleanup_errors.append((category + "-probe", error))
+        live = None
+    if live is False:
+        try:
+            process.poll()
+        except BaseException as error:
+            cleanup_errors.append((category + "-reap", error))
+        return True
+    if live is True:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            live = False
+        except BaseException as error:
+            cleanup_errors.append((category + "-kill", error))
+    timing_failed = False
+    try:
+        deadline = time.monotonic() + timeout
+    except BaseException as error:
+        cleanup_errors.append((category + "-wait-timing", error))
+        timing_failed = True
+        deadline = None
+    while live is True and deadline is not None:
+        try:
+            expired = time.monotonic() >= deadline
+        except BaseException as error:
+            cleanup_errors.append((category + "-wait-timing", error))
+            timing_failed = True
+            break
+        if expired:
+            break
+        try:
+            process.poll()
+        except BaseException as error:
+            cleanup_errors.append((category + "-reap", error))
+        try:
+            live = process_group_exists(pgid)
+        except BaseException as error:
+            cleanup_errors.append((category + "-probe", error))
+            live = None
+            break
+        if live:
+            try:
+                time.sleep(0.05)
+            except BaseException as error:
+                cleanup_errors.append((category + "-wait-timing", error))
+                timing_failed = True
+                break
+    if live is True:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            live = False
+        except BaseException as error:
+            cleanup_errors.append((category + "-force-kill", error))
+        try:
+            deadline = time.monotonic() + timeout
+        except BaseException as error:
+            cleanup_errors.append((category + "-force-wait-timing", error))
+            timing_failed = True
+            deadline = None
+        while live is True and deadline is not None:
+            try:
+                expired = time.monotonic() >= deadline
+            except BaseException as error:
+                cleanup_errors.append((category + "-force-wait-timing", error))
+                timing_failed = True
+                break
+            if expired:
+                break
+            try:
+                process.poll()
+            except BaseException as error:
+                cleanup_errors.append((category + "-reap", error))
+            try:
+                live = process_group_exists(pgid)
+            except BaseException as error:
+                cleanup_errors.append((category + "-probe", error))
+                live = None
+                break
+            if live:
+                try:
+                    time.sleep(0.05)
+                except BaseException as error:
+                    cleanup_errors.append((category + "-force-wait-timing", error))
+                    timing_failed = True
+                    break
+    if live is False and not timing_failed:
+        try:
+            process.poll()
+        except BaseException as error:
+            cleanup_errors.append((category + "-reap", error))
+        return True
+    cleanup_errors.append((category + "-containment-retained", RuntimeError(
+        "process-group absence was not confirmed; transaction containment retained")))
+    return False
+
+
+def cleanup_supervisor(resources):
+    cleanup_errors = []
+    active_dead = terminate_process_group(
+        OWNED_PHASE_GROUP, "active-phase", 5, cleanup_errors)
+    retained_dead = terminate_process_group(
+        resources["retained_group"], "retained-process", 1, cleanup_errors)
+    snapshot_fd = resources["snapshot_fd"]
+    if snapshot_fd is not None:
+        try:
+            os.close(snapshot_fd)
+        except BaseException as error:
+            cleanup_errors.append(("snapshot-close", error))
+    if not (active_dead and retained_dead):
+        return tuple(cleanup_errors)
+
+    cleanup_commands = (
+        ("drop database", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/dropdb", "--if-exists", "nmcp")),
+        ("drop roles", ("/usr/sbin/runuser", "-u", "postgres", "--", "/usr/bin/psql", "--no-psqlrc",
+                        "--dbname=postgres", "--set=ON_ERROR_STOP=1", "--command",
+                        "DROP ROLE IF EXISTS nmcp_graph_probe,nmcp_graph_bridge,nmcp_api,nmcp_worker,nmcp_migrator,nmcp_runtime,nmcp_worker_runtime,nmcp_purge_function_owner,nmcp_check_runtime,nmcp_repair_runtime,nmcp_check_function_owner,nmcp_repair_function_owner")),
+    ) if resources["database_cleanup"] else ()
+    for label, arguments in cleanup_commands:
+        marker = CLEANUP_DATABASE_FAILURE if label == "drop database" else CLEANUP_ROLES_FAILURE
+        try:
+            result = subprocess.run(arguments, cwd="/", env=clean_env(), stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            if result.returncode:
+                cleanup_errors.append((label, RuntimeError(
+                    f"{label} exited {result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}")))
+                try:
+                    print(marker, file=sys.stderr, flush=True)
+                except BaseException as error:
+                    cleanup_errors.append((label + "-report", error))
+        except BaseException as error:
+            cleanup_errors.append((label, RuntimeError(f"{label} could not run: {error}")))
+            try:
+                print(marker, file=sys.stderr, flush=True)
+            except BaseException as report_error:
+                cleanup_errors.append((label + "-report", report_error))
+
+    keeper_dead = terminate_process_group(
+        resources["lock_keeper_group"], "lock-keeper", 1, cleanup_errors)
+    if not keeper_dead:
+        return tuple(cleanup_errors)
+    if resources["keeper_marker"] and resources["lock_held"]:
+        try:
+            os.unlink(LOCK_KEEPER_PID_PATH)
+        except FileNotFoundError:
+            pass
+        except BaseException as error:
+            cleanup_errors.append(("lock-keeper-marker-unlink", error))
+        try:
+            fsync_directory(os.path.dirname(LOCK_KEEPER_PID_PATH))
+        except BaseException as error:
+            cleanup_errors.append(("lock-keeper-marker-fsync", error))
+    if resources["intents_acquired"] and resources["lock_held"]:
+        try:
+            recover_intents()
+        except BaseException as error:
+            cleanup_errors.append(("intent-recovery", error))
+    lock_fd = resources["lock_fd"]
+    if lock_fd is not None:
+        try:
+            os.close(lock_fd)
+        except BaseException as error:
+            cleanup_errors.append(("lock-close", error))
+    return tuple(cleanup_errors)
+
+
+def main():
+    global CLEANUP_TRANSITION_ERRORS
+    SIGNAL_ERRORS.clear()
+    resources = {
+        "lock_fd": None, "lock_keeper": None, "lock_keeper_group": None,
+        "snapshot_fd": None, "retained_process": None, "retained_group": None,
+        "lock_held": False, "intents_acquired": False,
+        "keeper_marker": False, "database_cleanup": False,
+    }
+    primary_error = None
+    result = 1
+    try:
+        try:
+            result = run_supervisor_body(resources)
+        except BaseException as error:
+            primary_error = error
+    finally:
+        CLEANUP_TRANSITION_ERRORS = SIGNAL_ERRORS
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_TERMINATION_SIGNALS)
+        except BaseException as error:
+            CLEANUP_TRANSITION_ERRORS.append(("cleanup-transition-mask", error))
+        supervisor_cleanup_errors = cleanup_supervisor(resources)
+        cleanup_errors = (*(
+            item for item in CLEANUP_TRANSITION_ERRORS if item[1] is not primary_error
+        ), *supervisor_cleanup_errors)
+    if primary_error is not None:
+        if cleanup_errors:
+            raise SupervisorCleanupFailure(primary_error, cleanup_errors) from primary_error
+        raise primary_error
+    if cleanup_errors:
+        raise SupervisorCleanupFailure(None, cleanup_errors) from cleanup_errors[0][1]
+    print("Ubuntu migration role compatibility verification passed", flush=True)
+    return result
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"trusted-supervisor: {error}", file=sys.stderr)
+        raise SystemExit(1)

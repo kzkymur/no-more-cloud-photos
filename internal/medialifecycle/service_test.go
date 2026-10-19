@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -15,6 +16,11 @@ type stubRepository struct {
 	restoreResult RestoreResult
 	enqueueResult EnqueueResult
 	startResult   PurgeLease
+	discovered    []string
+	reclaimed     []string
+	startErrors   []error
+	startedIDs    []string
+	cleanupID     string
 	err           error
 	calls         int
 }
@@ -34,9 +40,72 @@ func (r *stubRepository) EnqueuePurge(context.Context, string) (EnqueueResult, e
 	return r.enqueueResult, r.err
 }
 
-func (r *stubRepository) StartPurge(context.Context, string) (PurgeLease, error) {
+func (r *stubRepository) EnqueueDuePurge(context.Context, string) (EnqueueResult, error) {
 	r.calls++
+	return r.enqueueResult, r.err
+}
+
+func (r *stubRepository) ScanDuePurges(context.Context, time.Time, *DuePurgeCursor, int) ([]DuePurgeCandidate, error) {
+	r.calls++
+	return nil, r.err
+}
+
+func (r *stubRepository) DatabaseNow(context.Context) (time.Time, error) {
+	r.calls++
+	return time.Time{}, r.err
+}
+
+func (r *stubRepository) DiscoverPurgeJobs(context.Context, int) ([]string, error) {
+	r.calls++
+	return r.discovered, r.err
+}
+
+func (r *stubRepository) ReclaimExpiredPurges(context.Context, int) ([]string, error) {
+	r.calls++
+	return r.reclaimed, r.err
+}
+
+func (r *stubRepository) StartPurge(_ context.Context, jobID string) (PurgeLease, error) {
+	r.calls++
+	r.startedIDs = append(r.startedIDs, jobID)
+	if len(r.startErrors) >= len(r.startedIDs) && r.startErrors[len(r.startedIDs)-1] != nil {
+		return PurgeLease{}, r.startErrors[len(r.startedIDs)-1]
+	}
+	if r.startResult.JobID == "" {
+		r.startResult.JobID = jobID
+	}
 	return r.startResult, r.err
+}
+
+func (r *stubRepository) RunPurgeFileStep(context.Context, string, string, PurgeFileAction) (PurgeStepResult, error) {
+	r.calls++
+	return PurgeStepResult{}, r.err
+}
+
+func (r *stubRepository) FinalizePurge(context.Context, string, string) error {
+	r.calls++
+	return r.err
+}
+func (r *stubRepository) HeartbeatPurge(context.Context, string, string) (time.Time, error) {
+	return time.Time{}, r.err
+}
+func (r *stubRepository) FinishPurgeAttempt(context.Context, string, string, string) error {
+	return r.err
+}
+func (r *stubRepository) CleanupNextRendition(context.Context, string, []string, func(context.Context, string, string, int64) (bool, error)) (string, error) {
+	r.calls++
+	return r.cleanupID, r.err
+}
+
+func TestCleanupNextRenditionPreservesSelectedIDOnDatabaseFailure(t *testing.T) {
+	repository := &stubRepository{cleanupID: unitMediaID, err: &pgconn.PgError{Code: "08006"}}
+	service := newService(repository)
+	id, err := service.CleanupNextRendition(context.Background(), "", nil, func(context.Context, string, string, int64) (bool, error) {
+		return false, nil
+	})
+	if id != unitMediaID || !IsKind(err, KindDatabaseUnavailable) {
+		t.Fatalf("CleanupNextRendition() = %q, %#v; want selected ID and database unavailable", id, err)
+	}
 }
 
 func TestServiceRejectsInvalidIDBeforeRepository(t *testing.T) {
@@ -51,6 +120,9 @@ func TestServiceRejectsInvalidIDBeforeRepository(t *testing.T) {
 	if _, err := service.EnqueuePurge(context.Background(), "not-a-uuid"); !IsKind(err, KindInvalidRequest) {
 		t.Fatalf("EnqueuePurge error = %#v", err)
 	}
+	if _, err := service.EnqueueDuePurge(context.Background(), "not-a-uuid"); !IsKind(err, KindInvalidRequest) {
+		t.Fatalf("EnqueueDuePurge error = %#v", err)
+	}
 	if _, err := service.StartPurge(context.Background(), "not-a-uuid"); !IsKind(err, KindInvalidRequest) {
 		t.Fatalf("StartPurge error = %#v", err)
 	}
@@ -63,6 +135,9 @@ func TestServicePreservesNoPurgeWork(t *testing.T) {
 	repository := &stubRepository{err: ErrNoPurgeWork}
 	if _, err := newService(repository).StartPurge(context.Background(), unitMediaID); !errors.Is(err, ErrNoPurgeWork) {
 		t.Fatalf("StartPurge error = %#v", err)
+	}
+	if _, err := newService(repository).EnqueueDuePurge(context.Background(), unitMediaID); !errors.Is(err, ErrNoPurgeWork) {
+		t.Fatalf("EnqueueDuePurge error = %#v", err)
 	}
 }
 
@@ -79,6 +154,61 @@ func TestServicePreservesResultsAndSemanticErrors(t *testing.T) {
 	repository.err = wantErr
 	if _, err := service.EnqueuePurge(context.Background(), unitMediaID); !errors.Is(err, wantErr) {
 		t.Fatalf("semantic error = %#v", err)
+	}
+}
+
+func TestStartNextPurgeFeedsDiscoveredIDsOnlyThroughStartPurge(t *testing.T) {
+	repository := &stubRepository{
+		discovered:  []string{"10000000-0000-4000-8000-000000000010", "10000000-0000-4000-8000-000000000011"},
+		startErrors: []error{ErrNoPurgeWork, nil},
+	}
+	lease, err := newService(repository).StartNextPurge(context.Background(), 10)
+	if err != nil || lease.JobID != repository.discovered[1] {
+		t.Fatalf("StartNextPurge = %#v, %v", lease, err)
+	}
+	if len(repository.startedIDs) != 2 || repository.startedIDs[0] != repository.discovered[0] || repository.startedIDs[1] != repository.discovered[1] {
+		t.Fatalf("started IDs = %#v", repository.startedIDs)
+	}
+	if repository.calls != 4 {
+		t.Fatalf("repository calls = %d, want reclaim + discover + two starts", repository.calls)
+	}
+}
+
+func TestPurgeRetryBackoffAndInvalidJitter(t *testing.T) {
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: 0, want: 5 * time.Second},
+		{attempt: 1, want: 5 * time.Second},
+		{attempt: 2, want: 10 * time.Second},
+		{attempt: 3, want: 20 * time.Second},
+		{attempt: 8, want: 10*time.Minute + 40*time.Second},
+		{attempt: 9, want: 15 * time.Minute},
+		{attempt: 100, want: 15 * time.Minute},
+	}
+	for _, test := range tests {
+		maximum := purgeBackoffMaximum(test.attempt)
+		if maximum != test.want {
+			t.Fatalf("attempt %d maximum = %s, want %s", test.attempt, maximum, test.want)
+		}
+		got, err := purgeRetryDelay(func(value time.Duration) time.Duration { return value }, test.attempt)
+		if err != nil || got != test.want {
+			t.Fatalf("attempt %d delay = %s, %v", test.attempt, got, err)
+		}
+	}
+	for name, jitter := range map[string]func(time.Duration) time.Duration{
+		"nil":      nil,
+		"negative": func(time.Duration) time.Duration { return -time.Nanosecond },
+		"over maximum": func(maximum time.Duration) time.Duration {
+			return maximum + time.Nanosecond
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := purgeRetryDelay(jitter, 3); !IsKind(err, KindInvariant) {
+				t.Fatalf("invalid jitter error = %#v", err)
+			}
+		})
 	}
 }
 

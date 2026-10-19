@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Bounded acquisition tests: never contact upstream or execute fixture tools."""
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import lzma
+from pathlib import Path
+import tempfile
+import unittest
+
+path = Path(__file__).with_name('fetch-pinned-ffmpeg')
+loader = importlib.machinery.SourceFileLoader('fetch', str(path))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+fetch = importlib.util.module_from_spec(spec)
+loader.exec_module(fetch)
+
+
+class FetchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.body = lzma.compress(b'fixed synthetic fixture archive, not an executable')
+        self.pin = {'url': 'https://example.invalid/fixed.tar.xz',
+                    'sha256': hashlib.sha256(self.body).hexdigest()}
+        self.calls = 0
+
+    def response(self, body=None, status=200, code=0):
+        def download(url, target, evidence):
+            self.calls += 1
+            target.write_bytes(self.body if body is None else body)
+            return code, {'http_code': status, 'content_type': 'application/x-xz',
+                          'url_effective': url}
+        return download
+
+    def report(self):
+        return json.loads((self.root / 'probe-download-evidence/identity.json').read_text())
+
+    def acquire(self, response):
+        return fetch.acquire(self.root, self.pin, len(self.body), response)
+
+    def test_matching_download_and_rehashed_cache(self):
+        destination = self.acquire(self.response())
+        self.assertEqual(destination.read_bytes(), self.body)
+        self.acquire(self.response(body=b'must not be fetched'))
+        self.assertEqual(self.calls, 1)
+        self.assertTrue(self.report()['verified'])
+        self.assertEqual(self.report()['source'], 'cache')
+
+    def test_http_error_preserves_body_and_metrics(self):
+        with self.assertRaises(RuntimeError):
+            self.acquire(self.response(body=b'not found', status=404, code=22))
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.report()['http']['http_code'], 404)
+        self.assertFalse(self.report()['verified'])
+        self.assertTrue((self.root / 'probe-download-evidence/response.tar.xz.part').exists())
+
+    def test_http200_error_page_rejected_before_extract(self):
+        with self.assertRaises(RuntimeError):
+            self.acquire(self.response(body=b'<html>not an archive</html>'))
+        self.assertEqual(self.calls, 1)
+        self.assertFalse(self.report()['verified'])
+        self.assertFalse((self.root / 'ffmpeg-6.0.1-amd64-static.tar.xz').exists())
+
+    def test_truncation_rejected(self):
+        with self.assertRaises(RuntimeError):
+            self.acquire(self.response(body=self.body[:-1]))
+        self.assertFalse(self.report()['verified'])
+
+    def test_corrupt_cache_never_trusted_or_silently_refetched(self):
+        self.acquire(self.response())
+        cache = next((self.root / 'downloads').iterdir())
+        cache.write_bytes(b'corrupt cache')
+        with self.assertRaises(RuntimeError):
+            self.acquire(self.response())
+        self.assertEqual(self.calls, 1)
+        self.assertFalse(self.report()['verified'])
+
+    def test_transfer_error_with_http200_is_failure_without_retry(self):
+        with self.assertRaises(RuntimeError):
+            self.acquire(self.response(body=self.body[:-2], status=200, code=18))
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.report()['curl_exit'], 18)
+        self.assertFalse(self.report()['verified'])
+
+    def test_pinned_non_xz_bytes_still_fail_integrity(self):
+        body = b'not xz despite matching hash'
+        self.pin['sha256'] = hashlib.sha256(body).hexdigest()
+        with self.assertRaises(Exception):
+            fetch.acquire(self.root, self.pin, len(body), self.response(body=body))
+        self.assertFalse(self.report()['verified'])
+        self.assertFalse((self.root / 'ffmpeg-6.0.1-amd64-static.tar.xz').exists())
+
+    def test_symlink_cache_is_not_dereferenced(self):
+        self.acquire(self.response())
+        cache = next((self.root / 'downloads').iterdir())
+        # Replace a verified synthetic test file only, without deleting it.
+        moved = self.root / 'prior-synthetic-cache'
+        self.assertEqual(cache.resolve().parent, (self.root / 'downloads').resolve())
+        self.assertEqual(moved.resolve().parent, self.root.resolve())
+        cache.rename(moved)
+        cache.symlink_to(moved)
+        with self.assertRaisesRegex(RuntimeError, 'symlink'):
+            self.acquire(self.response())
+        self.assertEqual(self.calls, 1)
+
+    def test_repository_pin_is_unchanged(self):
+        self.assertEqual(fetch.pin()['sha256'],
+                         '28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5')
+
+
+if __name__ == '__main__':
+    unittest.main()

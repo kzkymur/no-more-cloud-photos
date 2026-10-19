@@ -26,6 +26,26 @@ The validation-only password and cursor key in `compose.yaml` are intentionally
 non-secret and must never be copied into deployment configuration. Production
 secrets belong in root-owned systemd credentials/environment files readable by
 the service manager and service identity, not in the repository or arguments.
+Validation migrations run as the non-superuser `nmcp_migrator`. A dedicated
+bootstrap-only container first verifies the closed role graph and enables
+inheritance on exactly the three function-owner memberships. A second
+bootstrap-only container always restores the hardened `INHERIT FALSE` graph and
+runs the independent graph verifier before Compose may start API or Worker; the
+validation driver invokes that hardener explicitly after a failed startup as
+well. The bootstrap password is present only in those disposable administrator
+containers and is not inherited by application services.
+
+Storage initialization creates the sole canonical quarantine directory at
+`/var/lib/nmcp/media/.quarantine` as UID/GID 10001 mode 0700 and verifies that it
+has the same device ID as the storage root. There is no dotless `quarantine`
+fixture and no quarantine-path environment override. A private sentinel proves
+the File Server cannot address the directory, while mount inspection continues
+to inspect every live mount and require exactly the two read-only volume
+subpaths `originals` and `renditions`. Retained-volume upgrade evidence rejects
+both empty and populated legacy dotless directories without deleting them.
+Because
+the disposable API and Worker deliberately share UID/GID 10001 and the media
+volume, this is serving/layout evidence rather than OS-level process isolation.
 
 ## Commands
 
@@ -63,9 +83,17 @@ immutable cache, and nosniff independently for both Nginx storage locations.
 It also proves non-GET rejection (`405`), directory-listing denial, raw dot
 segment and encoded-separator rejection against existing control objects,
 canonical shard equality, canonical-name Original and Rendition symlink denial,
-and an existing non-public backup sentinel. It asserts that Nginx has only its isolated
-network, shares no network with PostgreSQL, and receives exactly two read-only
-Original/Rendition subpath mounts. It also records the live PostgreSQL, Nginx,
+and existing non-public backup and `.quarantine` sentinels. It asserts that
+Nginx has only its isolated network, shares no network with PostgreSQL, and
+receives exactly two read-only Original/Rendition subpath volume mounts and
+three read-write tmpfs mounts at `/var/cache/nginx`, `/var/run`, and `/tmp`,
+with the exact configured size/mode/UID/GID option map. The inspection treats
+only equivalent Engine renderings as normalization: size suffixes are converted
+to bytes, and a leading-zero octal mode or Engine's decimal mode are compared as
+the same numeric value; Alpine's `/var/run` symlink appears as `/run` in live
+`mountinfo`. Missing, extra, wrong-type, or wrong-RW live mounts fail.
+It also
+records the live PostgreSQL, Nginx,
 ExifTool, FFprobe, and `prlimit`
 versions. It builds the merged issue #11 source-pinned native still toolchain
 through its single canonical build script, runs `nmcp-still-helper capabilities`,

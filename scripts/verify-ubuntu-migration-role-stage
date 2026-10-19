@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Validate a closed, canonical supervisor snapshot without following links."""
+
+import hashlib
+import json
+import os
+import stat
+import sys
+
+ALLOWED = {
+    "migration-wrapper": ("migration compatibility wrapper", 0o755),
+    "nmcp-admin-current": ("candidate migration admin", 0o755),
+    "nmcp-admin-v18": ("approved v18 migration admin", 0o755),
+    "nmcp.sysusers": ("nmcp system user declaration", 0o400),
+    "phase": ("compatibility phase entrypoint", 0o500),
+    "postgresql-roles.sql": ("database bootstrap SQL", 0o644),
+    "role-mode": ("migration role mode wrapper", 0o755),
+    "runtime-helper": ("runtime boundary helper", 0o500),
+    "runtime-roles.sql": ("runtime role bootstrap SQL", 0o644),
+    "supervisor": ("trusted root supervisor", 0o500),
+    "verify-role-graph.sql": ("role graph verifier SQL", 0o644),
+    "verify-runtime-roles.sql": ("independent runtime verifier SQL", 0o644),
+    "verify-stage": ("closed snapshot verifier", 0o500),
+}
+
+
+def fail(message):
+    raise SystemExit(f"verify-stage: {message}")
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 2:
+        fail("usage: verify-ubuntu-migration-role-stage SNAPSHOT")
+    root = os.path.abspath(sys.argv[1])
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        root_stat = os.fstat(root_fd)
+        if root_stat.st_uid != 0 or root_stat.st_gid != 0 or stat.S_IMODE(root_stat.st_mode) != 0o700:
+            fail("unsafe snapshot directory")
+        manifest_fd = os.open("manifest.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            manifest_stat = os.fstat(manifest_fd)
+            if manifest_stat.st_nlink != 1 or manifest_stat.st_uid != 0 or manifest_stat.st_gid != 0:
+                fail("unsafe manifest metadata")
+            if stat.S_IMODE(manifest_stat.st_mode) != 0o400 or not stat.S_ISREG(manifest_stat.st_mode):
+                fail("unsafe manifest type or mode")
+            raw = os.read(manifest_fd, manifest_stat.st_size + 1)
+            if len(raw) != manifest_stat.st_size:
+                fail("manifest changed while read")
+        finally:
+            os.close(manifest_fd)
+        manifest = json.loads(raw)
+        canonical = (json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("ascii")
+        if raw != canonical or not isinstance(manifest, list):
+            fail("manifest is not canonical")
+        names = [item.get("name") for item in manifest]
+        if names != sorted(names) or len(names) != len(set(names)) or set(names) != set(ALLOWED):
+            fail("manifest names are not sorted and unique")
+        actual = set(os.listdir(root_fd))
+        expected = set(names) | {"manifest.json"}
+        if actual != expected:
+            fail(f"snapshot extras or omissions: {sorted(actual ^ expected)}")
+        required = {"name", "purpose", "provenance_commit", "provenance_tree", "toolchain", "type", "uid", "gid", "mode", "size", "sha256"}
+        for item in manifest:
+            if set(item) != required or item["type"] != "regular":
+                fail("invalid manifest schema")
+            purpose, mode = ALLOWED[item["name"]]
+            if item["purpose"] != purpose or item["mode"] != mode or item["uid"] != 0 or item["gid"] != 0:
+                fail(f"manifest allowlist mismatch: {item['name']}")
+            if not isinstance(item["provenance_commit"], str) or len(item["provenance_commit"]) != 40:
+                fail(f"invalid provenance commit: {item['name']}")
+            if not isinstance(item["provenance_tree"], str) or len(item["provenance_tree"]) != 40:
+                fail(f"invalid provenance tree: {item['name']}")
+            if item["name"] == "nmcp-admin-v18":
+                if item["provenance_commit"] != "172583179d860619ae2c79505971e10ae7f394fc":
+                    fail("historical admin provenance changed")
+            if item["name"].startswith("nmcp-admin-"):
+                if not isinstance(item["toolchain"], str) or " go1.27.1 " not in item["toolchain"]:
+                    fail(f"admin toolchain provenance changed: {item['name']}")
+            elif item["toolchain"] is not None:
+                fail(f"non-binary asset has toolchain provenance: {item['name']}")
+            fd = os.open(item["name"], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+            try:
+                before = os.fstat(fd)
+                digest = hashlib.sha256()
+                size = 0
+                while True:
+                    block = os.read(fd, 1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+                    size += len(block)
+                after = os.fstat(fd)
+                identity = (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid, before.st_nlink, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                if identity != (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid, after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                    fail(f"asset changed while read: {item['name']}")
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                    fail(f"unsafe asset type or links: {item['name']}")
+                observed = (before.st_uid, before.st_gid, stat.S_IMODE(before.st_mode), size, digest.hexdigest())
+                recorded = (item["uid"], item["gid"], item["mode"], item["size"], item["sha256"])
+                if observed != recorded:
+                    fail(f"asset differs from manifest: {item['name']}")
+            finally:
+                os.close(fd)
+    finally:
+        os.close(root_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

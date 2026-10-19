@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2317 # EXIT/signal trap dispatch reaches cleanup indirectly
+set -euo pipefail
+umask 0077
+
+[[ $EUID -eq 0 ]] || { printf 'must run as root\n' >&2; exit 1; }
+[[ $# -eq 1 && -n ${NMCP_COMPAT_WORK:-} ]] || { printf 'usage: compatibility PHASE\n' >&2; exit 2; }
+phase=$1
+work=$NMCP_COMPAT_WORK
+wrapper=${NMCP_WRAPPER:?missing staged wrapper descriptor}
+role_mode=${NMCP_ROLE_MODE:?missing staged role-mode descriptor}
+current=${NMCP_CURRENT_ADMIN:?missing staged current admin descriptor}
+v18=${NMCP_V18_ADMIN:?missing staged v18 admin descriptor}
+postgresql_roles=${NMCP_POSTGRESQL_ROLES:?missing staged PostgreSQL bootstrap descriptor}
+runtime_roles=${NMCP_RUNTIME_ROLES:?missing staged runtime roles descriptor}
+verify_role_graph=${NMCP_VERIFY_ROLE_GRAPH:?missing staged role graph descriptor}
+wrapper_pid=
+migration_pid=
+writer_pid=
+launcher_pid=
+cleanup() {
+  trap - EXIT INT TERM
+  local pid
+  for pid in "$launcher_pid" "$wrapper_pid" "$migration_pid" "$writer_pid"; do
+    [[ -z $pid ]] || /usr/bin/kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
+  for pid in "$launcher_pid" "$wrapper_pid" "$migration_pid" "$writer_pid"; do
+    [[ -z $pid ]] || wait "$pid" >/dev/null 2>&1 || true
+  done
+  /usr/bin/rm -f /run/nmcp-test-before-role-graph-verify.ready \
+    /run/nmcp-test-before-role-graph-verify.go
+}
+trap cleanup EXIT INT TERM
+
+psql_root() {
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C HOME=/var/lib/postgresql \
+    /usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc \
+    --host=/var/run/postgresql --port=5432 --username=postgres --dbname=nmcp \
+    --set=ON_ERROR_STOP=1 "$@"
+}
+reset_database() {
+  /usr/sbin/runuser -u postgres -- /usr/bin/dropdb --if-exists nmcp
+  /usr/sbin/runuser -u postgres -- /usr/bin/createdb nmcp
+  psql_root --set="nmcp_runtime_roles_file=$runtime_roles" <"$postgresql_roles"
+  psql_root --command "ALTER ROLE nmcp_migrator PASSWORD 'nmcp-migrator-wrapper-test'"
+}
+run_wrapper() { "$wrapper" "$@"; }
+assert_hardened() {
+  psql_root <"$verify_role_graph" >/dev/null
+}
+assert_compatibility() {
+  [[ $(psql_root --tuples-only --no-align --command \
+    "SELECT count(*) FROM pg_catalog.pg_auth_members WHERE member='nmcp_migrator'::regrole AND roleid IN ('nmcp_purge_function_owner'::regrole,'nmcp_check_function_owner'::regrole,'nmcp_repair_function_owner'::regrole) AND NOT admin_option AND inherit_option AND set_option") == 3 ]]
+}
+assert_migration() {
+  local version=$1 name=$2 checksum=$3
+  [[ $(psql_root --tuples-only --no-align --command \
+    "SELECT count(*) FILTER (WHERE version=$version AND name='$name' AND checksum='$checksum' AND NOT dirty)||':'||count(*) FILTER (WHERE dirty OR version>$version)||':'||max(version) FROM schema_migrations") == "1:0:$version" ]]
+}
+wait_for_path() {
+  local path=$1 attempt
+  for attempt in {1..100}; do
+    [[ ! -e $path ]] || return 0
+    /usr/bin/sleep 0.05
+  done
+  printf 'timed out waiting for %s\n' "$path" >&2
+  return 1
+}
+make_admin() {
+  local directory=$1 body=$2
+  /usr/bin/install -d -o nmcp -g nmcp -m 0700 "$directory"
+  /usr/bin/printf '%s\n' '#!/bin/sh' "$body" >"$directory/nmcp-admin"
+  /usr/bin/chown nmcp:nmcp "$directory/nmcp-admin"
+  /usr/bin/chmod 0700 "$directory/nmcp-admin"
+}
+test_signal() {
+  local name=$1 signal=$2 expected=$3 status
+  make_admin "$work/$name" "trap '' INT TERM; touch '$work/$name/ready'; exec /usr/bin/sleep 300"
+  /usr/bin/python3 -I -S -c 'import os,signal,subprocess,sys; signal.signal(signal.SIGINT,signal.SIG_DFL); signal.signal(signal.SIGTERM,signal.SIG_DFL); p=subprocess.Popen(sys.argv[2:],env={**os.environ,"NMCP_TEST_SIGNAL_GRACE_ATTEMPTS":"5"},close_fds=False); open(sys.argv[1],"w").write(str(p.pid)); s=p.wait(); raise SystemExit(s if s>=0 else 128-s)' \
+    "$work/$name/wrapper.pid" "$wrapper" "$work/$name/nmcp-admin" migrate up --json &
+  launcher_pid=$!
+  wait_for_path "$work/$name/wrapper.pid"
+  wrapper_pid=$(/usr/bin/cat "$work/$name/wrapper.pid")
+  wait_for_path "$work/$name/ready"
+  /usr/bin/kill -s "$signal" "$wrapper_pid"
+  set +e; wait "$launcher_pid"; status=$?; set -e
+  launcher_pid=
+  [[ $status -eq $expected ]]
+  assert_hardened
+}
+
+case $phase in
+  fresh-current)
+    reset_database
+    run_wrapper "$current" migrate up --json
+    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_hardened
+    ;;
+  current-rerun)
+    run_wrapper "$current" migrate up --json
+    assert_hardened
+    ;;
+  hostile-libpq)
+    /usr/bin/env PGHOST=/nonexistent PGPORT=1 PGUSER=rogue PGDATABASE=rogue PGSERVICE=rogue \
+      PGSERVICEFILE=/nonexistent PGPASSFILE=/nonexistent PGPASSWORD=rogue \
+      PGOPTIONS='-c search_path=pg_temp' "$role_mode" hardened
+    assert_hardened
+    ;;
+  stale-compatibility)
+    "$role_mode" compatibility
+    assert_compatibility
+    run_wrapper "$current" migrate up --json
+    assert_hardened
+    ;;
+  migration-failure)
+    make_admin "$work/fail" 'exit 42'
+    set +e; run_wrapper "$work/fail/nmcp-admin" migrate up --json; status=$?; set -e
+    [[ $status -eq 42 ]]
+    assert_hardened
+    ;;
+  signal-int)
+    test_signal int INT 130
+    ;;
+  signal-term)
+    test_signal term TERM 143
+    ;;
+  sigkill-recovery)
+    if [[ ${NMCP_TEST_SUPERVISOR_CONTAINMENT:-} == 1 || ${NMCP_TEST_CGROUP_CRASH:-} == 1 ]]; then
+      make_admin "$work/kill" "trap '' TERM; printf '%s\n' \$\$ >'$work/kill/admin.pid'; /usr/bin/setsid /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \$\$ >\"$work/kill/descendant.pid\"; touch \"$work/kill/ready\"; exec /usr/bin/sleep 300' & wait"
+      /usr/bin/setsid "$wrapper" "$work/kill/nmcp-admin" migrate up --json &
+      wrapper_pid=$!
+      wait_for_path "$work/kill/ready"
+      /usr/bin/printf '%s\n' "$wrapper_pid" >"$work/kill/wrapper.pid"
+      /usr/bin/touch "$work/kill/supervisor-kill.ready"
+      wait "$wrapper_pid"
+      exit 97
+    fi
+    make_admin "$work/kill" "printf '%s\n' \$\$ >'$work/kill/admin.pid'; touch '$work/kill/ready'; /usr/bin/sleep 300"
+    /usr/bin/setsid "$wrapper" "$work/kill/nmcp-admin" migrate up --json &
+    wrapper_pid=$!
+    wait_for_path "$work/kill/ready"
+    /usr/bin/kill -KILL -- "-$wrapper_pid"
+    wait "$wrapper_pid" >/dev/null 2>&1 || true
+    wrapper_pid=
+    admin_pid=$(/usr/bin/cat "$work/kill/admin.pid")
+    [[ $admin_pid =~ ^[1-9][0-9]*$ ]]
+    /usr/bin/kill -KILL -- "-$admin_pid" >/dev/null 2>&1 || true
+    assert_compatibility
+    run_wrapper "$current" migrate up --json
+    assert_hardened
+    ;;
+  graph-verifier-failure)
+    make_admin "$work/harden" "touch '$work/harden/ready'; while [ ! -e '$work/harden/go' ]; do /usr/bin/sleep 0.05; done; exit 0"
+    NMCP_TEST_PAUSE_BEFORE_GRAPH_VERIFY=1 "$wrapper" "$work/harden/nmcp-admin" migrate up --json &
+    wrapper_pid=$!
+    wait_for_path "$work/harden/ready"
+    /usr/bin/touch "$work/harden/go"
+    wait_for_path /run/nmcp-test-before-role-graph-verify.ready
+    psql_root --command "ALTER ROLE nmcp_check_runtime LOGIN"
+    /usr/bin/touch /run/nmcp-test-before-role-graph-verify.go
+    set +e; wait "$wrapper_pid"; status=$?; set -e
+    wrapper_pid=
+    [[ $status -ne 0 ]]
+    [[ $(psql_root --tuples-only --no-align --command \
+      "SELECT count(*) FROM pg_auth_members WHERE member='nmcp_migrator'::regrole AND roleid IN ('nmcp_purge_function_owner'::regrole,'nmcp_check_function_owner'::regrole,'nmcp_repair_function_owner'::regrole) AND NOT inherit_option") == 3 ]]
+    psql_root --command "ALTER ROLE nmcp_check_runtime NOLOGIN"
+    /usr/bin/rm -f /run/nmcp-test-before-role-graph-verify.ready /run/nmcp-test-before-role-graph-verify.go
+    "$role_mode" hardened
+    assert_hardened
+    ;;
+  upgrade-v18-v19)
+    reset_database
+    run_wrapper "$v18" migrate up --json
+    assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24
+    run_wrapper "$current" migrate up --json
+    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_hardened
+    ;;
+  unfinished-v18-rejection)
+    reset_database
+    run_wrapper "$v18" migrate up --json
+    psql_root --command "
+      INSERT INTO reconciliation_check_reports(id,format_version,classifier_version,scope,migration_version,migration_name,migration_checksum,db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at)
+      SELECT '00000000-0000-4000-8000-000000000011',1,1,'all',version,name,checksum,statement_timestamp()-interval '10 seconds',statement_timestamp()-interval '9 seconds',statement_timestamp()-interval '8 seconds',statement_timestamp()-interval '7 seconds',statement_timestamp()-interval '48 hours 9 seconds' FROM schema_migrations WHERE version=18;
+      INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at) VALUES('00000000-0000-4000-8000-000000000011',0,clock_timestamp()-interval '6 seconds');
+      INSERT INTO reconciliation_repair_runs(id,source_report_id,authorization_id,authorized_actor) VALUES('00000000-0000-4000-8000-000000000012','00000000-0000-4000-8000-000000000011','00000000-0000-4000-8000-000000000013','ubuntu-preflight');"
+    set +e; run_wrapper "$current" migrate up --json; status=$?; set -e
+    [[ $status -ne 0 ]]
+    assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24
+    [[ $(psql_root --tuples-only --no-align --command "SELECT (to_regclass('reconciliation_repair_plan_seals') IS NOT NULL)::text||':'||EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='reconciliation_repair_manifest_items'::regclass AND conname='reconciliation_repair_manifest_items_source_relative_key_key')::text") == false:true ]]
+    assert_hardened
+    # Preserve the rejection assertions above, then establish a fresh v19
+    # runtime catalog for the supervisor's independent phase boundary.
+    reset_database
+    run_wrapper "$current" migrate up --json
+    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_hardened
+    ;;
+  completed-v18-rejection)
+    reset_database
+    run_wrapper "$v18" migrate up --json
+    psql_root --command "
+      INSERT INTO reconciliation_check_reports(id,format_version,classifier_version,scope,migration_version,migration_name,migration_checksum,db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at)
+      SELECT '00000000-0000-4000-8000-000000000021',1,1,'all',version,name,checksum,statement_timestamp()-interval '10 seconds',statement_timestamp()-interval '9 seconds',statement_timestamp()-interval '8 seconds',statement_timestamp()-interval '7 seconds',statement_timestamp()-interval '48 hours 9 seconds' FROM schema_migrations WHERE version=18;
+      INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at) VALUES('00000000-0000-4000-8000-000000000021',0,clock_timestamp()-interval '6 seconds');
+      INSERT INTO reconciliation_repair_runs(id,source_report_id,authorization_id,authorized_actor) VALUES('00000000-0000-4000-8000-000000000022','00000000-0000-4000-8000-000000000021','00000000-0000-4000-8000-000000000023','completed-v18');
+      ALTER TABLE reconciliation_repair_results DISABLE TRIGGER USER;
+      INSERT INTO reconciliation_repair_results(run_id,result,manifest_count,quarantined_count,stale_count,resolved_count,failed_count,unknown_count) VALUES('00000000-0000-4000-8000-000000000022','succeeded',0,0,0,0,0,0);
+      ALTER TABLE reconciliation_repair_results ENABLE TRIGGER USER;"
+    set +e; run_wrapper "$current" migrate up --json; status=$?; set -e
+    [[ $status -ne 0 ]]
+    assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24
+    [[ $(psql_root --tuples-only --no-align --command "SELECT r.authorized_actor||':'||result.result||':'||result.manifest_count FROM reconciliation_repair_runs AS r JOIN reconciliation_repair_results AS result ON result.run_id=r.id WHERE r.id='00000000-0000-4000-8000-000000000022'") == completed-v18:succeeded:0 ]]
+    [[ $(psql_root --tuples-only --no-align --command "SELECT (to_regclass('reconciliation_repair_plan_seals') IS NOT NULL)::text||':'||EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='reconciliation_repair_manifest_items'::regclass AND conname='reconciliation_repair_manifest_items_source_relative_key_key')::text") == false:true ]]
+    assert_hardened
+    # Preserve the rejection assertions above, then establish a fresh v19
+    # runtime catalog for the supervisor's independent phase boundary.
+    reset_database
+    run_wrapper "$current" migrate up --json
+    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_hardened
+    ;;
+  writer-drain)
+    reset_database
+    run_wrapper "$v18" migrate up --json
+    /usr/bin/install -d -o postgres -g postgres -m 0700 "$work/writer"
+    psql_root --command "BEGIN; LOCK TABLE reconciliation_repair_runs IN ROW EXCLUSIVE MODE; COPY (SELECT '') TO PROGRAM '/bin/sh -c \"touch $work/writer/ready; while [ ! -e $work/writer/go ]; do sleep 0.05; done\"'; COMMIT;" >"$work/writer/psql.log" 2>&1 &
+    writer_pid=$!
+    wait_for_path "$work/writer/ready"
+    run_wrapper "$current" migrate up --json &
+    migration_pid=$!
+    for attempt in {1..100}; do
+      waiting=$(psql_root --tuples-only --no-align --command "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='reconciliation_repair_runs'::regclass AND mode='AccessExclusiveLock' AND NOT granted)")
+      [[ $waiting != t ]] || break
+      [[ $attempt -lt 100 ]] || { printf 'migration did not wait for writer\n' >&2; exit 1; }
+      /usr/bin/sleep 0.05
+    done
+    /usr/bin/touch "$work/writer/go"
+    wait "$writer_pid"
+    writer_pid=
+    wait "$migration_pid"
+    migration_pid=
+    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_hardened
+    ;;
+  *) printf 'unknown compatibility phase: %s\n' "$phase" >&2; exit 2 ;;
+esac

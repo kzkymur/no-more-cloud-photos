@@ -58,6 +58,20 @@ if [[ $files_load != not-found \
   printf 'install-ubuntu-host: nmcp-files.service must be exactly inactive/dead before reinstall\n' >&2
   exit 1
 fi
+if [[ -e /var/lib/nmcp/media/quarantine || -L /var/lib/nmcp/media/quarantine ]]; then
+  printf '%s\n' \
+    'install-ubuntu-host: legacy /var/lib/nmcp/media/quarantine exists; review and migrate it before installation' >&2
+  exit 1
+fi
+if [[ -e /var/lib/nmcp/media/.quarantine || -L /var/lib/nmcp/media/.quarantine ]]; then
+  [[ -d /var/lib/nmcp/media/.quarantine \
+    && ! -L /var/lib/nmcp/media/.quarantine \
+    && $(/usr/bin/stat -c '%U:%G:%a' /var/lib/nmcp/media/.quarantine) == nmcp:nmcp:700 \
+    && $(/usr/bin/stat -c '%d' /var/lib/nmcp/media) == $(/usr/bin/stat -c '%d' /var/lib/nmcp/media/.quarantine) ]] || {
+    printf 'install-ubuntu-host: existing canonical quarantine ownership, mode, or device is unsafe\n' >&2
+    exit 1
+  }
+fi
 for command in /usr/sbin/nginx /usr/sbin/ufw /usr/bin/systemd-analyze \
   /usr/bin/systemd-sysusers /usr/bin/systemd-tmpfiles /usr/bin/openssl /usr/bin/python3; do
   [[ -x $command ]] || { printf 'install-ubuntu-host: missing %s\n' "$command" >&2; exit 1; }
@@ -157,10 +171,18 @@ tls_link=/etc/nmcp/tls-current.new.$$
 /usr/bin/chown root:root /etc/nmcp-nginx/nginx.conf
 /usr/bin/chmod 0644 /etc/nmcp-nginx/nginx.conf
 
+/usr/bin/install -d -o root -g root -m 0755 /etc/sysusers.d /etc/tmpfiles.d
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/sysusers.d/nmcp.conf" /etc/sysusers.d/nmcp.conf
 /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/tmpfiles.d/nmcp.conf" /etc/tmpfiles.d/nmcp.conf
 /usr/bin/systemd-sysusers /etc/sysusers.d/nmcp.conf
 /usr/bin/systemd-tmpfiles --create /etc/tmpfiles.d/nmcp.conf
+[[ -d /var/lib/nmcp/media/.quarantine \
+  && ! -L /var/lib/nmcp/media/.quarantine \
+  && $(/usr/bin/stat -c '%U:%G:%a' /var/lib/nmcp/media/.quarantine) == nmcp:nmcp:700 \
+  && $(/usr/bin/stat -c '%d' /var/lib/nmcp/media) == $(/usr/bin/stat -c '%d' /var/lib/nmcp/media/.quarantine) ]] || {
+  printf 'install-ubuntu-host: canonical quarantine ownership, mode, or device is unsafe\n' >&2
+  exit 1
+}
 /usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
 
 for unit in nmcp.slice nmcp-migrate.service nmcp-api.service nmcp-worker.service \
@@ -177,10 +199,27 @@ done
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp /usr/share/doc/nmcp
 for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
   acquire-ubuntu-deployment-locks capture-trusted-inputs handoff-ubuntu-migration-lock \
-  run-ubuntu-migration validate-ubuntu-config \
+  run-ubuntu-migration run-ubuntu-migration-compatibility set-ubuntu-migration-role-mode \
+  validate-ubuntu-config \
   verify-ubuntu-firewall verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done
+/usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp/postgresql
+/usr/bin/install -o root -g root -m 0644 \
+  "$repo_root/infra/postgresql/runtime-roles.sql" \
+  /usr/local/libexec/nmcp/postgresql/runtime-roles.sql
+/usr/bin/install -o root -g root -m 0644 \
+  "$repo_root/infra/postgresql/verify-runtime-role-graph.sql" \
+  /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
+bootstrap_checksums=$(/usr/bin/mktemp /var/lib/nmcp/deployment/postgresql-role-bootstrap.XXXXXX)
+(
+  cd /usr/local/libexec/nmcp/postgresql
+  /usr/bin/sha256sum runtime-roles.sql verify-runtime-role-graph.sql
+) > "$bootstrap_checksums"
+/usr/bin/chown root:root "$bootstrap_checksums"
+/usr/bin/chmod 0600 "$bootstrap_checksums"
+/usr/bin/mv -f "$bootstrap_checksums" \
+  /var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256
 /usr/bin/install -o root -g root -m 0644 "$repo_root/docs/ubuntu-deployment.md" /usr/share/doc/nmcp/ubuntu-deployment.md
 
 /usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' \

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -38,8 +39,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 7 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version seven", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 19 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version nineteen", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -62,12 +63,755 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 7 || status.ExpectedVersion != 7 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version seven", status)
+		if status.CurrentVersion != 19 || status.ExpectedVersion != 19 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version nineteen", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
 		}
+	})
+
+	t.Run("reconciliation upgrade rejects duplicate legacy transform ownership atomically", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:16]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one through sixteen: %v", err)
+		}
+		profileID := insertDraftProfile(t, pool, "legacy-duplicate-owner", 1)
+		jobIDs := make([]string, 0, 2)
+		for index := 0; index < 2; index++ {
+			mediaID := newUUIDv4(t)
+			insertMedia(t, pool, mediaID)
+			originalID := insertOriginal(t, pool, mediaID, fmt.Sprintf("%x", index+4), newUUIDv4(t))
+			targetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+			var jobID string
+			if err := pool.QueryRow(context.Background(), `SELECT job_id::text FROM job_targets WHERE id=$1`, targetID).Scan(&jobID); err != nil {
+				t.Fatal(err)
+			}
+			jobIDs = append(jobIDs, jobID)
+		}
+		duplicateLease := newUUIDv4(t)
+		for _, jobID := range jobIDs {
+			if _, err := pool.Exec(context.Background(), `UPDATE jobs SET lease_token=$2 WHERE id=$1`, jobID, duplicateLease); err != nil {
+				t.Fatalf("stage duplicate v16 transform owner: %v", err)
+			}
+		}
+		if err := full.Up(context.Background()); err == nil {
+			t.Fatal("migration accepted duplicate legacy transform ownership")
+		}
+		var version int64
+		var storageTablesAbsent bool
+		if err := pool.QueryRow(context.Background(), `SELECT
+			(SELECT max(version) FROM schema_migrations WHERE NOT dirty),
+			to_regclass('storage_attempts') IS NULL AND to_regclass('reconciliation_check_reports') IS NULL`).Scan(&version, &storageTablesAbsent); err != nil {
+			t.Fatal(err)
+		}
+		if version != 16 || !storageTablesAbsent {
+			t.Fatalf("failed upgrade rollback version=%d tables_absent=%t", version, storageTablesAbsent)
+		}
+	})
+
+	t.Run("reconciliation cutover waits for v16 transform writer and backfills its commit", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:16]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one through sixteen: %v", err)
+		}
+		mediaID := newUUIDv4(t)
+		insertMedia(t, pool, mediaID)
+		originalID := insertOriginal(t, pool, mediaID, "6", newUUIDv4(t))
+		profileID := insertDraftProfile(t, pool, "legacy-cutover-writer", 1)
+		targetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		var jobID string
+		if err := pool.QueryRow(context.Background(), `SELECT job_id::text FROM job_targets WHERE id=$1`, targetID).Scan(&jobID); err != nil {
+			t.Fatal(err)
+		}
+		writer, err := pool.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Rollback(context.Background())
+		cutoverLease := newUUIDv4(t)
+		if _, err := writer.Exec(context.Background(), `UPDATE jobs SET lease_token=$2 WHERE id=$1`, jobID, cutoverLease); err != nil {
+			t.Fatalf("stage v16 lease writer: %v", err)
+		}
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(context.Background()) }()
+		select {
+		case err := <-migrationResult:
+			t.Fatalf("migration did not wait for v16 Jobs writer: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if err := writer.Commit(context.Background()); err != nil {
+			t.Fatalf("commit v16 Jobs writer: %v", err)
+		}
+		if err := awaitResult(t, migrationResult); err != nil {
+			t.Fatalf("migration after v16 Jobs writer: %v", err)
+		}
+		var coverage string
+		if err := pool.QueryRow(context.Background(), `SELECT coverage FROM storage_attempts WHERE id=$1 AND job_id=$2`, cutoverLease, jobID).Scan(&coverage); err != nil || coverage != "legacy_active" {
+			t.Fatalf("cutover committed lease coverage=%q error=%v", coverage, err)
+		}
+	})
+
+	t.Run("reconciliation evidence upgrade preserves legacy as non executable", func(t *testing.T) {
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:16]).Up(context.Background()); err != nil {
+			t.Fatalf("apply versions one through sixteen: %v", err)
+		}
+		legacyID := newUUIDv4(t)
+		if _, err := pool.Exec(context.Background(), `INSERT INTO reconciliation_reports
+			(id,scope,findings,repair_disposition) VALUES ($1,'all','[]','{}')`, legacyID); err != nil {
+			t.Fatalf("insert v16 legacy report: %v", err)
+		}
+		mediaID := newUUIDv4(t)
+		insertMedia(t, pool, mediaID)
+		originalID := insertOriginal(t, pool, mediaID, "d", newUUIDv4(t))
+		profileID := insertDraftProfile(t, pool, "legacy-evidence-upgrade", 1)
+		targetID := insertPendingTransform(t, pool, mediaID, originalID, profileID)
+		var jobID, legacyLease string
+		if err := pool.QueryRow(context.Background(), `SELECT j.id::text,j.lease_token::text FROM jobs AS j JOIN job_targets AS t ON t.job_id=j.id WHERE t.id=$1`, targetID).Scan(&jobID, &legacyLease); err != nil {
+			t.Fatalf("read v16 running transform: %v", err)
+		}
+		if err := newMigrator(pool, full.migrations[:17]).Up(context.Background()); err != nil {
+			t.Fatalf("apply reconciliation evidence boundary: %v", err)
+		}
+		var version int64
+		var format string
+		if err := pool.QueryRow(context.Background(), `SELECT
+			(SELECT max(version) FROM schema_migrations WHERE NOT dirty),
+			(SELECT format FROM reconciliation_reports WHERE id=$1)`, legacyID).Scan(&version, &format); err != nil {
+			t.Fatal(err)
+		}
+		if version != 17 || format != "legacy" {
+			t.Fatalf("upgrade version/legacy format=%d/%q, want 17/legacy", version, format)
+		}
+		expectExecError(t, pool, `INSERT INTO reconciliation_reports
+			(id,scope,findings,repair_disposition) VALUES ($1,'all','[]','{}')`, newUUIDv4(t))
+		expectExecError(t, pool, `UPDATE reconciliation_reports SET scope='files' WHERE id=$1`, legacyID)
+		expectExecError(t, pool, `DELETE FROM reconciliation_reports WHERE id=$1`, legacyID)
+		expectExecError(t, pool, `TRUNCATE reconciliation_reports`)
+		expectExecError(t, pool, `SELECT nmcp_begin_repair_run($1,$2,$3,'legacy-probe')`, newUUIDv4(t), legacyID, newUUIDv4(t))
+		var coverage string
+		var history []string
+		if err := pool.QueryRow(context.Background(), `SELECT a.coverage,array_agg(e.event_type ORDER BY e.sequence)
+			FROM storage_attempts AS a JOIN storage_attempt_events AS e ON e.attempt_id=a.id
+			WHERE a.id=$1 AND a.job_id=$2 GROUP BY a.coverage`, legacyLease, jobID).Scan(&coverage, &history); err != nil {
+			t.Fatalf("read legacy-active transform backfill: %v", err)
+		}
+		if coverage != "legacy_active" || fmt.Sprint(history) != "[claimed]" {
+			t.Fatalf("legacy-active transform coverage/history=%q/%v", coverage, history)
+		}
+	})
+
+	t.Run("reconciliation checker sources upgrade from exact version seventeen", func(t *testing.T) {
+		ctx := context.Background()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(full.migrations) != 19 {
+			t.Fatalf("migration count = %d, want 19", len(full.migrations))
+		}
+		migrationUnderTest := full.migrations[17]
+		if migrationUnderTest.version != 18 || migrationUnderTest.name != "reconciliation_checker_sources" ||
+			migrationUnderTest.checksum != "34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24" {
+			t.Fatalf("migration 18 identity = version %d name %q checksum %q", migrationUnderTest.version, migrationUnderTest.name, migrationUnderTest.checksum)
+		}
+		if err := newMigrator(pool, full.migrations[:17]).Up(ctx); err != nil {
+			t.Fatalf("apply exact versions one through seventeen: %v", err)
+		}
+		if err := full.Up(ctx); err != nil {
+			t.Fatalf("upgrade exact version seventeen to eighteen: %v", err)
+		}
+		var version int64
+		var name, checksum string
+		var signatures int
+		if err := pool.QueryRow(ctx, `SELECT version,name,checksum,
+			(SELECT count(*) FROM unnest(ARRAY[
+				to_regprocedure('nmcp_read_check_database_references(timestamptz)'),
+				to_regprocedure('nmcp_read_check_attempt_owners()'),
+				to_regprocedure('nmcp_read_check_report_outcome(nmcp_uuid_v4)')
+			]) AS signatures(signature) WHERE signature IS NOT NULL)
+			FROM schema_migrations WHERE version=18 AND NOT dirty`).Scan(&version, &name, &checksum, &signatures); err != nil {
+			t.Fatal(err)
+		}
+		if version != 18 || name != migrationUnderTest.name || checksum != migrationUnderTest.checksum || signatures != 3 {
+			t.Fatalf("migration 18 evidence = %d/%q/%q signatures=%d", version, name, checksum, signatures)
+		}
+		if err := full.Up(ctx); err != nil {
+			t.Fatalf("rerun after version eighteen: %v", err)
+		}
+	})
+
+	t.Run("rendition cleanup boundary upgrade drains legacy state", func(t *testing.T) {
+		prepareVersionFifteen := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
+			t.Helper()
+			pool := integrationPool(t, databaseURL)
+			full, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := newMigrator(pool, full.migrations[:15]).Up(context.Background()); err != nil {
+				t.Fatalf("apply versions one through fifteen: %v", err)
+			}
+			return pool, full
+		}
+		insertLegacyCleanup := func(t *testing.T, pool *pgxpool.Pool, disposition string) (string, string, string) {
+			t.Helper()
+			ctx := context.Background()
+			mediaID := newUUIDv4(t)
+			insertMedia(t, pool, mediaID)
+			originalID := insertOriginal(t, pool, mediaID, "7", "v16-cutover-"+mediaID)
+			oldTargetID := insertPendingTransform(t, pool, mediaID, originalID, profile.StandardV1ID)
+			oldRenditionID := newUUIDv4(t)
+			oldPath := "renditions/77/v16-cutover-" + oldRenditionID + "/output.avif"
+			publish := func(targetID, renditionID, path string, current bool) {
+				t.Helper()
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				if _, err = tx.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID); err == nil {
+					_, err = tx.Exec(ctx, `INSERT INTO renditions
+						(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,size_bytes,sha256,width,height,processor_audit)
+						VALUES ($1,$2,$3,'ignored',$4,$5,'image/avif',7,$6,1,1,'{"fixture":"v16-cutover"}')`,
+						renditionID, mediaID, targetID, current, path, strings.Repeat("7", 64))
+				}
+				if err == nil {
+					_, err = tx.Exec(ctx, `UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp()
+						WHERE id=(SELECT job_id FROM job_targets WHERE id=$1)`, targetID)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			publish(oldTargetID, oldRenditionID, oldPath, true)
+			if _, err := pool.Exec(ctx, `UPDATE renditions SET is_current=false,purge_after=clock_timestamp()-interval '1 second' WHERE id=$1`, oldRenditionID); err != nil {
+				t.Fatal(err)
+			}
+			currentTargetID := insertPendingTransform(t, pool, mediaID, originalID, profile.StandardV1ID)
+			publish(currentTargetID, newUUIDv4(t), "renditions/77/v16-current-"+currentTargetID+"/output.avif", true)
+
+			cleanupID := newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO rendition_cleanup_progress
+				(id,media_id_snapshot,rendition_id,job_target_id,relative_path,size_bytes,purge_after)
+				SELECT $1,media_id,id,job_target_id,relative_path,size_bytes,purge_after FROM renditions WHERE id=$2`, cleanupID, oldRenditionID); err != nil {
+				t.Fatal(err)
+			}
+			if disposition != "pending" {
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = tx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID); err == nil {
+					_, err = tx.Exec(ctx, `UPDATE rendition_cleanup_progress SET disposition=$2 WHERE id=$1`, cleanupID, disposition)
+				}
+				if err != nil {
+					_ = tx.Rollback(ctx)
+					t.Fatal(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return mediaID, oldRenditionID, cleanupID
+		}
+
+		t.Run("in-flight guarded delete completes before cutover", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			pool, full := prepareVersionFifteen(t)
+			mediaID, renditionID, cleanupID := insertLegacyCleanup(t, pool, "missing")
+			barrier, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer barrier.Release()
+			const barrierKey = int64(0x4e4d435030303136) // "NMCP0016"
+			if _, err := barrier.Exec(ctx, `SELECT pg_catalog.pg_advisory_lock($1)`, barrierKey); err != nil {
+				t.Fatal(err)
+			}
+			defer barrier.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1)`, barrierKey)
+
+			migrations := append([]migration(nil), full.migrations[:16]...)
+			const lockStatement = "LOCK TABLE rendition_cleanup_progress IN SHARE ROW EXCLUSIVE MODE;"
+			instrumentedSQL := strings.Replace(migrations[15].sql, lockStatement,
+				lockStatement+fmt.Sprintf("\nSELECT pg_catalog.pg_advisory_xact_lock(%d);", barrierKey), 1)
+			if instrumentedSQL == migrations[15].sql {
+				t.Fatal("version sixteen progress lock was not found for instrumentation")
+			}
+			migrations[15].sql = instrumentedSQL
+			migrations[15].checksum = checksumSQL([]byte(instrumentedSQL))
+			migrationResult := make(chan error, 1)
+			go func() { migrationResult <- newMigrator(pool, migrations).Up(ctx) }()
+			awaitRelationLock(t, pool, ctx, 0, "rendition_cleanup_progress", "ShareRowExclusiveLock", true)
+
+			deleteResult := make(chan error, 1)
+			go func() {
+				tx, err := pool.Begin(ctx)
+				if err == nil {
+					_, err = tx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.rendition_cleanup_progress_id',$1,true)`, cleanupID)
+				}
+				if err == nil {
+					_, err = tx.Exec(ctx, `DELETE FROM renditions WHERE id=$1 AND media_id=$2`, renditionID, mediaID)
+				}
+				if err == nil {
+					err = tx.Commit(ctx)
+				} else if tx != nil {
+					_ = tx.Rollback(context.Background())
+				}
+				deleteResult <- err
+			}()
+			if err := awaitContextResult(t, ctx, deleteResult); err != nil {
+				t.Fatalf("legacy guarded delete while cutover held progress lock: %v", err)
+			}
+			if _, err := barrier.Exec(ctx, `SELECT pg_catalog.pg_advisory_unlock($1)`, barrierKey); err != nil {
+				t.Fatal(err)
+			}
+			if err := awaitContextResult(t, ctx, migrationResult); err != nil {
+				t.Fatalf("version sixteen after legacy delete: %v", err)
+			}
+			var version int64
+			var renditionRows int
+			if err := pool.QueryRow(ctx, `SELECT max(version),(SELECT count(*) FROM renditions WHERE id=$1) FROM schema_migrations WHERE NOT dirty`, renditionID).Scan(&version, &renditionRows); err != nil {
+				t.Fatal(err)
+			}
+			if version != 16 || renditionRows != 0 {
+				t.Fatalf("cutover result version=%d rendition_rows=%d", version, renditionRows)
+			}
+			var ownerAfter, configAfter string
+			var securityDefiner, publicRevoked bool
+			if err := pool.QueryRow(ctx, `SELECT pg_catalog.pg_get_userbyid(proowner),prosecdef,COALESCE(array_to_string(proconfig,','),''),
+				NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(proacl,acldefault('f',proowner))) WHERE grantee=0 AND privilege_type='EXECUTE')
+				FROM pg_catalog.pg_proc WHERE oid='nmcp_check_target_rendition()'::regprocedure`).Scan(&ownerAfter, &securityDefiner, &configAfter, &publicRevoked); err != nil {
+				t.Fatal(err)
+			}
+			if ownerAfter != "nmcp_purge_function_owner" || !securityDefiner || !strings.Contains(configAfter, "search_path=") || !publicRevoked {
+				t.Fatalf("cardinality function owner=%q security_definer=%t config=%q public_revoked=%t", ownerAfter, securityDefiner, configAfter, publicRevoked)
+			}
+		})
+
+		for _, disposition := range []string{"pending", "missing"} {
+			t.Run("rejects and rolls back "+disposition+" legacy progress", func(t *testing.T) {
+				pool, full := prepareVersionFifteen(t)
+				_, renditionID, cleanupID := insertLegacyCleanup(t, pool, disposition)
+				var functionBefore string
+				if err := pool.QueryRow(context.Background(), `SELECT pg_catalog.pg_get_functiondef('nmcp_check_target_rendition()'::regprocedure)`).Scan(&functionBefore); err != nil {
+					t.Fatal(err)
+				}
+				if err := full.Up(context.Background()); err == nil {
+					t.Fatalf("version sixteen accepted %s legacy progress", disposition)
+				}
+				var version int64
+				var completionFunction, completionTrigger bool
+				var functionAfter, storedDisposition string
+				if err := pool.QueryRow(context.Background(), `SELECT max(version),
+					to_regprocedure('nmcp_complete_rendition_cleanup(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)') IS NOT NULL,
+					EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid='rendition_cleanup_progress'::regclass AND tgname='rendition_cleanup_progress_completed'),
+					pg_catalog.pg_get_functiondef('nmcp_check_target_rendition()'::regprocedure),
+					(SELECT disposition FROM rendition_cleanup_progress WHERE id=$1)
+					FROM schema_migrations WHERE NOT dirty`, cleanupID).Scan(&version, &completionFunction, &completionTrigger, &functionAfter, &storedDisposition); err != nil {
+					t.Fatal(err)
+				}
+				var renditionRows int
+				if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM renditions WHERE id=$1`, renditionID).Scan(&renditionRows); err != nil {
+					t.Fatal(err)
+				}
+				if version != 15 || completionFunction || completionTrigger || functionAfter != functionBefore || storedDisposition != disposition || renditionRows != 1 {
+					t.Fatalf("rollback disposition=%q version=%d function=%t trigger=%t cardinality_changed=%t stored=%q rendition_rows=%d",
+						disposition, version, completionFunction, completionTrigger, functionAfter != functionBefore, storedDisposition, renditionRows)
+				}
+			})
+		}
+	})
+
+	t.Run("physical purge tombstone upgrade rejects duplicate legacy history atomically", func(t *testing.T) {
+		ctx := context.Background()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:11]).Up(ctx); err != nil {
+			t.Fatal(err)
+		}
+		mediaID := newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		for position := 1; position <= 2; position++ {
+			if _, err := pool.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,$2,'media_purged','physical_purge',$3)`, newUUIDv4(t), position, mediaID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := full.Up(ctx); err == nil {
+			t.Fatal("duplicate legacy tombstones accepted")
+		}
+		var version int
+		var indexExists bool
+		if err := pool.QueryRow(ctx, `SELECT max(version),to_regclass('change_events_one_physical_purge_per_media') IS NOT NULL FROM schema_migrations WHERE NOT dirty`).Scan(&version, &indexExists); err != nil {
+			t.Fatal(err)
+		}
+		if version != 11 || indexExists {
+			t.Fatalf("rollback version=%d index=%t", version, indexExists)
+		}
+	})
+
+	t.Run("identity completion rejects noncanonical in-flight legacy tombstone atomically", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:12]).Up(ctx); err != nil {
+			t.Fatal(err)
+		}
+		mediaID := newUUIDv4(t)
+		writer, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Exec(ctx, `INSERT INTO change_events (id,position,event_type,reason,media_id) VALUES ($1,1,'media_purged','physical_purge',$2)`, newUUIDv4(t), mediaID); err != nil {
+			t.Fatal(err)
+		}
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(ctx) }()
+		awaitRelationLock(t, pool, ctx, 0, "change_events", "ShareLock", false)
+		if err := writer.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-migrationResult; err == nil {
+			t.Fatal("identity completion accepted noncanonical legacy tombstone")
+		}
+		var state string
+		if err := pool.QueryRow(ctx, `SELECT state FROM media_purge_identity_guard WHERE media_id=$1`, mediaID).Scan(&state); err != nil || state != "purged" {
+			t.Fatalf("cutover guard state=%q error=%v", state, err)
+		}
+		var version int
+		var completionTrigger, completionColumn, completionFunction bool
+		if err := pool.QueryRow(ctx, `SELECT max(version),
+			EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid='media_purge_identity_guard'::regclass AND tgname='media_identity_retirement_completed'),
+			EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid='media_purge_identity_guard'::regclass AND attname='purge_job_id' AND NOT attisdropped),
+			to_regprocedure('nmcp_require_completed_media_identity_retirement()') IS NOT NULL
+			FROM schema_migrations WHERE NOT dirty`).Scan(&version, &completionTrigger, &completionColumn, &completionFunction); err != nil {
+			t.Fatal(err)
+		}
+		if version != 14 || completionTrigger || completionColumn || completionFunction {
+			t.Fatalf("failed identity completion migration version=%d trigger=%t column=%t function=%t", version, completionTrigger, completionColumn, completionFunction)
+		}
+	})
+
+	t.Run("identity retirement cutover drains Media writer before guard alteration", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:13]).Up(ctx); err != nil {
+			t.Fatal(err)
+		}
+		mediaID := newUUIDv4(t)
+		writer, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(ctx) }()
+		awaitRelationLock(t, pool, ctx, 0, "media", "ShareLock", false)
+		if err := writer.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-migrationResult; err != nil {
+			t.Fatal(err)
+		}
+		var state string
+		if err := pool.QueryRow(ctx, `SELECT state FROM media_purge_identity_guard WHERE media_id=$1`, mediaID).Scan(&state); err != nil || state != "live" {
+			t.Fatalf("cutover Media guard state=%q error=%v", state, err)
+		}
+	})
+
+	t.Run("purge progress boundary upgrades version eight after prior writer drains", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		pool := integrationPool(t, databaseURL)
+		full, err := NewMigrator(pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := newMigrator(pool, full.migrations[:8]).Up(ctx); err != nil {
+			t.Fatalf("apply versions one through eight: %v", err)
+		}
+		mediaID, originalID, jobID, token := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+		if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source,deleted_at,purge_after) VALUES ($1,'image/jpeg','unknown',clock_timestamp(),clock_timestamp())`, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`, originalID, mediaID, strings.Repeat("e", 64), "originals/ee/v9-upgrade/original.jpg"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO jobs (id,type,media_id_snapshot,status,max_attempts) VALUES ($1,'purge',$2,'queued',3)`, jobID, mediaID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute',started_at=clock_timestamp() WHERE id=$1`, jobID, token); err != nil {
+			t.Fatal(err)
+		}
+		manifestTx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = manifestTx.Exec(ctx, `SELECT pg_catalog.set_config('nmcp.purge_lease_token',$1,true)`, token); err == nil {
+			_, err = manifestTx.Exec(ctx, `INSERT INTO purge_file_progress (job_id,media_id_snapshot,object_kind,object_id,relative_path,size_bytes) SELECT $1,$2,'original',id,relative_path,size_bytes FROM originals WHERE id=$3`, jobID, mediaID, originalID)
+		}
+		if err != nil {
+			_ = manifestTx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := manifestTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := pool.Exec(ctx, `CREATE FUNCTION nmcp_v9_conflict() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `CREATE TRIGGER purge_file_progress_00_ordered_boundary BEFORE UPDATE ON purge_file_progress FOR EACH ROW EXECUTE FUNCTION nmcp_v9_conflict()`); err != nil {
+			t.Fatal(err)
+		}
+		if err := full.Up(ctx); err == nil {
+			t.Fatal("version nine accepted conflicting boundary trigger")
+		}
+		var version int64
+		var completionExists bool
+		if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT to_regprocedure('nmcp_complete_purge_file_progress(nmcp_uuid_v4,nmcp_uuid_v4,text,nmcp_uuid_v4,text,text)') IS NOT NULL`).Scan(&completionExists); err != nil {
+			t.Fatal(err)
+		}
+		if version != 8 || completionExists {
+			t.Fatalf("failed v9 migration version=%d completion_exists=%t", version, completionExists)
+		}
+		if _, err := pool.Exec(ctx, `DROP TRIGGER purge_file_progress_00_ordered_boundary ON purge_file_progress`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `DROP FUNCTION nmcp_v9_conflict()`); err != nil {
+			t.Fatal(err)
+		}
+
+		writer, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Rollback(ctx)
+		if _, err := writer.Exec(ctx, `SELECT 1 FROM purge_file_progress WHERE job_id=$1 FOR UPDATE`, jobID); err != nil {
+			t.Fatal(err)
+		}
+		migrationResult := make(chan error, 1)
+		go func() { migrationResult <- full.Up(ctx) }()
+		awaitRelationLock(t, pool, ctx, 0, "purge_file_progress", "AccessExclusiveLock", false)
+		if err := writer.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-migrationResult; err != nil {
+			t.Fatalf("upgrade versions nine through fifteen: %v", err)
+		}
+
+		var securityDefiner, ownerNoLogin, fixedSearchPath, workerExecute, publicRevoked, workerSelect, workerInsert, workerNoUpdate bool
+		if err := pool.QueryRow(ctx, `SELECT p.prosecdef,
+			p.proowner=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname='nmcp_purge_function_owner'),
+			NOT owner_role.rolcanlogin,
+			array_to_string(p.proconfig,',') LIKE 'search_path='||current_schema()||', pg_catalog, pg_temp%',
+			has_function_privilege('nmcp_worker_runtime',p.oid,'EXECUTE'),
+			NOT EXISTS (SELECT 1 FROM aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) WHERE grantee=0 AND privilege_type='EXECUTE'),
+			has_table_privilege('nmcp_worker_runtime','purge_file_progress','SELECT'),
+			has_table_privilege('nmcp_worker_runtime','purge_file_progress','INSERT'),
+			NOT has_table_privilege('nmcp_worker_runtime','purge_file_progress','UPDATE')
+			FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_roles AS owner_role ON owner_role.oid=p.proowner
+			WHERE p.oid='nmcp_complete_purge_file_progress(nmcp_uuid_v4,nmcp_uuid_v4,text,nmcp_uuid_v4,text,text)'::regprocedure`).Scan(
+			&securityDefiner, &completionExists, &ownerNoLogin, &fixedSearchPath, &workerExecute, &publicRevoked, &workerSelect, &workerInsert, &workerNoUpdate); err != nil {
+			t.Fatal(err)
+		}
+		if !securityDefiner || !completionExists || !ownerNoLogin || !fixedSearchPath || !workerExecute || !publicRevoked || !workerSelect || !workerInsert || !workerNoUpdate {
+			t.Fatalf("v10 boundary security=%t owner=%t no_login=%t search_path=%t execute=%t public_revoked=%t select=%t insert=%t no_update=%t",
+				securityDefiner, completionExists, ownerNoLogin, fixedSearchPath, workerExecute, publicRevoked, workerSelect, workerInsert, workerNoUpdate)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE purge_file_progress SET disposition='deleted' WHERE job_id=$1`, jobID); err == nil {
+			t.Fatal("migration/table owner bypassed ordered purge boundary")
+		}
+		var runtimeHistorySelect, runtimeHistoryNoWrite, workerHistorySelect, workerHistoryNoWrite bool
+		if err := pool.QueryRow(ctx, `SELECT
+			has_table_privilege('nmcp_runtime','schema_migrations','SELECT'),
+			NOT (has_table_privilege('nmcp_runtime','schema_migrations','INSERT') OR has_table_privilege('nmcp_runtime','schema_migrations','UPDATE') OR has_table_privilege('nmcp_runtime','schema_migrations','DELETE') OR has_table_privilege('nmcp_runtime','schema_migrations','TRUNCATE')),
+			has_table_privilege('nmcp_worker_runtime','schema_migrations','SELECT'),
+			NOT (has_table_privilege('nmcp_worker_runtime','schema_migrations','INSERT') OR has_table_privilege('nmcp_worker_runtime','schema_migrations','UPDATE') OR has_table_privilege('nmcp_worker_runtime','schema_migrations','DELETE') OR has_table_privilege('nmcp_worker_runtime','schema_migrations','TRUNCATE'))`).Scan(
+			&runtimeHistorySelect, &runtimeHistoryNoWrite, &workerHistorySelect, &workerHistoryNoWrite); err != nil {
+			t.Fatal(err)
+		}
+		if !runtimeHistorySelect || !runtimeHistoryNoWrite || !workerHistorySelect || !workerHistoryNoWrite {
+			t.Fatalf("migration history ACL runtime=(%t,%t) worker=(%t,%t)", runtimeHistorySelect, runtimeHistoryNoWrite, workerHistorySelect, workerHistoryNoWrite)
+		}
+		var schemaName string
+		if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schemaName); err != nil {
+			t.Fatal(err)
+		}
+		for _, roleName := range []string{"nmcp_runtime", "nmcp_worker_runtime"} {
+			rolePool := integrationRolePool(t, databaseURL, schemaName, roleName)
+			roleMigrator, err := NewMigrator(rolePool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, err := roleMigrator.Status(ctx)
+			if err != nil || !status.Ready() || status.CurrentVersion != 19 {
+				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
+			}
+			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
+				t.Fatalf("%s migration Up error = %v", roleName, err)
+			}
+			if _, err := rolePool.Exec(ctx, `UPDATE schema_migrations SET dirty=dirty WHERE false`); err == nil {
+				t.Fatalf("%s wrote migration history", roleName)
+			}
+		}
+	})
+
+	t.Run("purge cleanup invariant upgrade rejects invalid live history atomically", func(t *testing.T) {
+		ctx := context.Background()
+		prepareVersionSeven := func(t *testing.T) (*pgxpool.Pool, *Migrator) {
+			t.Helper()
+			pool := integrationPool(t, databaseURL)
+			full, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := newMigrator(pool, full.migrations[:7]).Up(ctx); err != nil {
+				t.Fatalf("apply versions one through seven: %v", err)
+			}
+			return pool, full
+		}
+		insertInvalidTarget := func(t *testing.T, pool *pgxpool.Pool) string {
+			t.Helper()
+			mediaID, originalID, jobID, targetID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`, originalID, mediaID, strings.Repeat("a", 64), "originals/aa/v8-preflight/original.jpg"); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `ALTER TABLE job_targets DISABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `ALTER TABLE job_targets ENABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			return targetID
+		}
+		assertRollback := func(t *testing.T, pool *pgxpool.Pool) {
+			t.Helper()
+			var version int64
+			var progressTable, guardFunction bool
+			if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT to_regclass('purge_file_progress') IS NOT NULL, to_regprocedure('nmcp_guard_media_purge_delete()') IS NOT NULL`).Scan(&progressTable, &guardFunction); err != nil {
+				t.Fatal(err)
+			}
+			if version != 7 || progressTable || guardFunction {
+				t.Fatalf("failed migration state version=%d progress=%t guard=%t", version, progressTable, guardFunction)
+			}
+		}
+
+		pool, migrator := prepareVersionSeven(t)
+		insertInvalidTarget(t, pool)
+		if err := migrator.Up(ctx); err == nil {
+			t.Fatal("migration accepted succeeded live Target without Rendition")
+		}
+		assertRollback(t, pool)
+
+		t.Run("waits for earlier target writer before preflight", func(t *testing.T) {
+			pool, migrator := prepareVersionSeven(t)
+			mediaID, originalID, jobID, targetID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+			if _, err := pool.Exec(ctx, `INSERT INTO media (id,media_type,taken_at_source) VALUES ($1,'image/jpeg','unknown')`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `INSERT INTO originals (id,media_id,sha256,relative_path,mime_type,size_bytes) VALUES ($1,$2,$3,$4,'image/jpeg',1)`, originalID, mediaID, strings.Repeat("b", 64), "originals/bb/v8-lock/original.jpg"); err != nil {
+				t.Fatal(err)
+			}
+			setupTx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer setupTx.Rollback(ctx)
+			if _, err := setupTx.Exec(ctx, `INSERT INTO jobs (id,type,original_id,media_id_snapshot,status,max_attempts) VALUES ($1,'transform',$2,$3,'queued',3)`, jobID, originalID, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := setupTx.Exec(ctx, `INSERT INTO job_targets (id,job_id,profile_id,status) VALUES ($1,$2,$3,'pending')`, targetID, jobID, profile.StandardV1ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := setupTx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			writer, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Rollback(ctx)
+			if _, err := writer.Exec(ctx, `ALTER TABLE job_targets DISABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.Exec(ctx, `UPDATE job_targets SET status='succeeded' WHERE id=$1`, targetID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := writer.Exec(ctx, `ALTER TABLE job_targets ENABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() { result <- migrator.Up(ctx) }()
+			awaitRelationLock(t, pool, ctx, 0, "job_targets", "AccessExclusiveLock", false)
+			if err := writer.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := awaitContextResult(t, ctx, result); err == nil {
+				t.Fatal("migration accepted invalid target committed by earlier writer")
+			}
+			assertRollback(t, pool)
+		})
 	})
 
 	t.Run("lifecycle guard upgrade validates legacy state and lock order", func(t *testing.T) {
@@ -236,9 +980,26 @@ func TestMigratorIntegration(t *testing.T) {
 			if _, err := configBlocker.Exec(raceCtx, `LOCK TABLE system_config IN ACCESS EXCLUSIVE MODE`); err != nil {
 				t.Fatal(err)
 			}
+			// Version six predates the narrow maintenance function used by the
+			// current repository. Model the legacy Delete lock prefix explicitly;
+			// the migration race under test is maintenance -> Media -> config.
 			deleteResult := make(chan error, 1)
 			go func() {
-				_, err := repository.Delete(raceCtx, mediaID)
+				tx, err := pool.Begin(raceCtx)
+				if err == nil {
+					_, err = tx.Exec(raceCtx, `SELECT 1 FROM maintenance_state WHERE id=1 AND mode='normal' FOR SHARE`)
+				}
+				if err == nil {
+					_, err = tx.Exec(raceCtx, `SELECT 1 FROM media WHERE id=$1 FOR UPDATE`, mediaID)
+				}
+				if err == nil {
+					_, err = tx.Exec(raceCtx, `SELECT 1 FROM system_config WHERE id=1 FOR SHARE`)
+				}
+				if err == nil {
+					err = tx.Commit(raceCtx)
+				} else if tx != nil {
+					_ = tx.Rollback(context.Background())
+				}
 				deleteResult <- err
 			}()
 			// Waiting for config proves Delete acquired the maintenance prefix and
@@ -254,10 +1015,13 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := awaitContextResult(t, raceCtx, deleteResult); err != nil {
-				t.Fatalf("Delete after config release: %v", err)
+				t.Fatalf("legacy Delete lock prefix after config release: %v", err)
 			}
 			if err := awaitContextResult(t, raceCtx, migrationResult); err != nil {
 				t.Fatalf("migration after Delete: %v", err)
+			}
+			if _, err := repository.Delete(raceCtx, mediaID); err != nil {
+				t.Fatalf("Delete after migration: %v", err)
 			}
 			var deleted bool
 			var migratedVersion int64
@@ -267,7 +1031,7 @@ func TestMigratorIntegration(t *testing.T) {
 			if err := pool.QueryRow(raceCtx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&migratedVersion); err != nil {
 				t.Fatal(err)
 			}
-			if !deleted || migratedVersion != 7 {
+			if !deleted || migratedVersion != expectedVersion(migrator.migrations) {
 				t.Fatalf("converged state deleted=%t version=%d", deleted, migratedVersion)
 			}
 		})
@@ -1485,6 +2249,472 @@ CREATE INDEX CONCURRENTLY indexed_photos_id_idx ON indexed_photos (id)`)},
 	})
 }
 
+func TestCheckerDefinerCatalogFreshAndV17Upgrade(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	for _, mode := range []string{"fresh", "v17_upgrade"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pool := integrationPool(t, databaseURL)
+			migrator, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "v17_upgrade" {
+				partial := *migrator
+				partial.migrations = nil
+				for _, candidate := range migrator.migrations {
+					if candidate.version <= 17 {
+						partial.migrations = append(partial.migrations, candidate)
+					}
+				}
+				if err := partial.Up(ctx); err != nil {
+					t.Fatalf("apply exact v17 prefix: %v", err)
+				}
+			}
+			if err := migrator.Up(ctx); err != nil {
+				t.Fatalf("apply migrations through 19: %v", err)
+			}
+			assertCheckerDefinerCatalog(t, ctx, pool)
+			assertCheckerTempShadowCannotIntercept(t, ctx, pool)
+		})
+	}
+}
+
+func TestRepairMigrationCatalogFreshAndV18Upgrade(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	for _, mode := range []string{"fresh", "v18_upgrade"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			pool := integrationPool(t, databaseURL)
+			migrator, err := NewMigrator(pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(migrator.migrations) != 19 || migrator.migrations[18].version != 19 || migrator.migrations[18].name != "reconciliation_repair_execution" {
+				t.Fatalf("migration 19 identity = %+v", migrator.migrations[18])
+			}
+			if mode == "v18_upgrade" {
+				if err := newMigrator(pool, migrator.migrations[:18]).Up(ctx); err != nil {
+					t.Fatalf("apply exact v18 prefix: %v", err)
+				}
+			}
+			if err := migrator.Up(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var version int64
+			var name, checksum string
+			if err := pool.QueryRow(ctx, `SELECT version,name,checksum FROM schema_migrations WHERE version=19 AND NOT dirty`).Scan(&version, &name, &checksum); err != nil {
+				t.Fatal(err)
+			}
+			if version != 19 || name != "reconciliation_repair_execution" || checksum != migrator.migrations[18].checksum {
+				t.Fatalf("migration row=%d/%q/%q", version, name, checksum)
+			}
+			var relation bool
+			if err := pool.QueryRow(ctx, `SELECT to_regclass('reconciliation_repair_plan_seals') IS NOT NULL`).Scan(&relation); err != nil || !relation {
+				t.Fatalf("plan seal relation=%t error=%v", relation, err)
+			}
+			assertRepairDefinerSetClosure(t, ctx, pool)
+		})
+	}
+}
+
+func TestRepairMigrationRejectsUnfinishedV18StateWithoutPartialDDL(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool := integrationPool(t, databaseURL)
+	migrator, err := NewMigrator(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newMigrator(pool, migrator.migrations[:18]).Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reportID, runID, authorizationID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_reports(
+		id,format_version,classifier_version,scope,migration_version,migration_name,migration_checksum,
+		db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at)
+		SELECT $1,1,1,'all',version,name,checksum,statement_timestamp()-interval '10 seconds',
+		statement_timestamp()-interval '9 seconds',statement_timestamp()-interval '8 seconds',
+		statement_timestamp()-interval '7 seconds',statement_timestamp()-interval '48 hours 9 seconds'
+		FROM schema_migrations WHERE version=18`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at) VALUES($1,0,clock_timestamp()-interval '6 seconds')`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_repair_runs(id,source_report_id,authorization_id,authorized_actor) VALUES($1,$2,$3,'unfinished-v18')`, runID, reportID, authorizationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrator.Up(ctx); err == nil {
+		t.Fatal("migration 19 accepted an unfinished v18 repair run")
+	}
+	var version int64
+	var planTable bool
+	var legacyPathConstraint bool
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('reconciliation_repair_plan_seals') IS NOT NULL`).Scan(&planTable); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='reconciliation_repair_manifest_items'::regclass AND conname='reconciliation_repair_manifest_items_source_relative_key_key')`).Scan(&legacyPathConstraint); err != nil {
+		t.Fatal(err)
+	}
+	if version != 18 || planTable || !legacyPathConstraint {
+		t.Fatalf("failed migration leaked state: version=%d plan_table=%t legacy_constraint=%t", version, planTable, legacyPathConstraint)
+	}
+}
+
+func TestRepairMigrationRejectsCompletedV18HistoryWithoutInventingAuthority(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool := integrationPool(t, databaseURL)
+	migrator, err := NewMigrator(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newMigrator(pool, migrator.migrations[:18]).Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reportID, runID, authorizationID := newUUIDv4(t), newUUIDv4(t), newUUIDv4(t)
+	if _, err := pool.Exec(ctx, `INSERT INTO reconciliation_check_reports(
+		id,format_version,classifier_version,scope,migration_version,migration_name,migration_checksum,
+		db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at)
+		SELECT $1,1,1,'all',version,name,checksum,statement_timestamp()-interval '10 seconds',
+		statement_timestamp()-interval '9 seconds',statement_timestamp()-interval '8 seconds',
+		statement_timestamp()-interval '7 seconds',statement_timestamp()-interval '48 hours 9 seconds'
+		FROM schema_migrations WHERE version=18`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at) VALUES($1,0,clock_timestamp()-interval '6 seconds')`, []any{reportID}},
+		{`INSERT INTO reconciliation_repair_runs(id,source_report_id,authorization_id,authorized_actor) VALUES($1,$2,$3,'completed-v18')`, []any{runID, reportID, authorizationID}},
+		{`ALTER TABLE reconciliation_repair_results DISABLE TRIGGER USER`, nil},
+		{`INSERT INTO reconciliation_repair_results(run_id,result,manifest_count,quarantined_count,stale_count,resolved_count,failed_count,unknown_count) VALUES($1,'succeeded',0,0,0,0,0,0)`, []any{runID}},
+		{`ALTER TABLE reconciliation_repair_results ENABLE TRIGGER USER`, nil},
+	} {
+		if _, err := pool.Exec(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := migrator.Up(ctx); err == nil {
+		t.Fatal("migration 19 invented execution authority for completed v18 history")
+	}
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 18 {
+		t.Fatalf("completed-v18 rejection version=%d error=%v", version, err)
+	}
+	var result string
+	if err := pool.QueryRow(ctx, `SELECT result FROM reconciliation_repair_results WHERE run_id=$1`, runID).Scan(&result); err != nil || result != "succeeded" {
+		t.Fatalf("completed v18 history was not preserved: %q, %v", result, err)
+	}
+}
+
+func TestRepairMigrationDrainsExistingRepairWriter(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool := integrationPool(t, databaseURL)
+	migrator, err := NewMigrator(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := newMigrator(pool, migrator.migrations[:18]).Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Release()
+	blockerTx, err := blocker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockerTx.Rollback(context.Background())
+	if _, err := blockerTx.Exec(ctx, `LOCK TABLE reconciliation_repair_runs IN ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- migrator.Up(ctx) }()
+	awaitRelationLock(t, pool, ctx, 0, "reconciliation_repair_runs", "AccessExclusiveLock", false)
+	awaitRelationLock(t, pool, ctx, 0, "maintenance_state", "AccessExclusiveLock", true)
+	if err := blockerTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := awaitContextResult(t, ctx, result); err != nil {
+		t.Fatal(err)
+	}
+	var version int64
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 19 {
+		t.Fatalf("migration version after writer drain = %d, %v", version, err)
+	}
+}
+
+func assertRepairDefinerSetClosure(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	expected := []string{
+		"nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)",
+		"nmcp_append_check_finding_once(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)",
+		"nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone)",
+		"nmcp_complete_check_source(nmcp_uuid_v4,text,text)", "nmcp_read_check_attempt_owners()",
+		"nmcp_read_check_database_references(timestamp with time zone)", "nmcp_read_check_database_references_v18(timestamp with time zone)",
+		"nmcp_read_check_report_outcome(nmcp_uuid_v4)", "nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamp with time zone)",
+		"nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)",
+		"nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)",
+		"nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)",
+		"nmcp_complete_upload_attempt(nmcp_uuid_v4,text)", "nmcp_finish_repair_run(nmcp_uuid_v4)",
+		"nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)", "nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_read_repair_plan_digest(nmcp_uuid_v4)",
+		"nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)",
+		"nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)",
+		"nmcp_read_repair_run_by_authorization(nmcp_uuid_v4)", "nmcp_read_repair_run_outcome(nmcp_uuid_v4)",
+		"nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)",
+		"nmcp_record_transform_storage_attempt()", "nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)", "nmcp_require_normal_maintenance()",
+		"nmcp_require_terminal_repair_attempt()", "nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)",
+	}
+	for index, signature := range expected {
+		if err := pool.QueryRow(ctx, `SELECT $1::regprocedure::text`, signature).Scan(&expected[index]); err != nil {
+			t.Fatalf("resolve expected definer %s: %v", signature, err)
+		}
+	}
+	rows, err := pool.Query(ctx, `SELECT p.oid::regprocedure::text
+		FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_roles AS owner ON owner.oid=p.proowner
+		WHERE p.prosecdef AND owner.rolname IN ('nmcp_check_function_owner','nmcp_repair_function_owner')
+		AND p.pronamespace=current_schema()::regnamespace ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var actual []string
+	for rows.Next() {
+		var signature string
+		if err := rows.Scan(&signature); err != nil {
+			t.Fatal(err)
+		}
+		actual = append(actual, signature)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(expected)
+	slices.Sort(actual)
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("reconciliation SECURITY DEFINER set\nactual=%q\nexpected=%q", actual, expected)
+	}
+	for _, signature := range actual {
+		var owner string
+		var searchPath []string
+		var publicExecute bool
+		if err := pool.QueryRow(ctx, `SELECT owner.rolname,p.proconfig,
+			EXISTS(SELECT 1 FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) acl WHERE acl.grantee=0 AND acl.privilege_type='EXECUTE')
+			FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_roles owner ON owner.oid=p.proowner WHERE p.oid=$1::regprocedure`, signature).Scan(&owner, &searchPath, &publicExecute); err != nil {
+			t.Fatal(err)
+		}
+		if len(searchPath) != 1 || searchPath[0] != "search_path="+schemaForPool(t, ctx, pool)+", pg_catalog, pg_temp" || publicExecute {
+			t.Fatalf("definer %s owner=%s proconfig=%v public=%t", signature, owner, searchPath, publicExecute)
+		}
+	}
+	repairRuntimeSignatures := []string{
+		"nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)",
+		"nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)",
+		"nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_read_repair_plan_digest(nmcp_uuid_v4)",
+		"nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)",
+		"nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)",
+		"nmcp_read_repair_run_outcome(nmcp_uuid_v4)",
+		"nmcp_read_repair_run_by_authorization(nmcp_uuid_v4)",
+		"nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)",
+		"nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)",
+		"nmcp_finish_repair_run(nmcp_uuid_v4)",
+	}
+	for _, signature := range repairRuntimeSignatures {
+		var exactACL bool
+		if err := pool.QueryRow(ctx, `SELECT (
+			SELECT count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee=runtime.oid AND NOT acl.is_grantable)=1
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee<>p.proowner)=1
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee NOT IN (p.proowner,runtime.oid))=0
+			   AND count(*) FILTER (WHERE acl.is_grantable)=0
+			   AND count(*) FILTER (WHERE acl.privilege_type<>'EXECUTE')=0
+			FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) AS acl
+			CROSS JOIN pg_catalog.pg_roles AS runtime WHERE runtime.rolname='nmcp_repair_runtime')
+			FROM pg_catalog.pg_proc AS p WHERE p.oid=$1::regprocedure`, signature).Scan(&exactACL); err != nil || !exactACL {
+			t.Fatalf("repair API exact ACL %s = %t, %v", signature, exactACL, err)
+		}
+	}
+	for _, revoked := range []string{
+		"nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)",
+		"nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)",
+		"nmcp_read_check_database_references_v18(timestamp with time zone)",
+	} {
+		var allowed bool
+		if err := pool.QueryRow(ctx, `SELECT pg_catalog.has_function_privilege('nmcp_repair_runtime',$1,'EXECUTE')`, revoked).Scan(&allowed); err != nil || allowed {
+			t.Fatalf("repair runtime revoked API %s allowed=%t error=%v", revoked, allowed, err)
+		}
+	}
+	var checkerRepairColumns []string
+	if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(c.relname||'.'||a.attname ORDER BY c.relname,a.attnum),ARRAY[]::text[])
+		FROM pg_catalog.pg_class AS c
+		JOIN pg_catalog.pg_attribute AS a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+		WHERE c.relnamespace=current_schema()::regnamespace
+		  AND c.relname IN ('reconciliation_repair_manifest_items','reconciliation_repair_attempts','reconciliation_repair_events')
+		  AND pg_catalog.has_column_privilege('nmcp_check_function_owner',c.oid,a.attnum,'SELECT')`).Scan(&checkerRepairColumns); err != nil {
+		t.Fatal(err)
+	}
+	wantCheckerRepairColumns := []string{
+		"reconciliation_repair_attempts.id",
+		"reconciliation_repair_attempts.manifest_item_id",
+		"reconciliation_repair_attempts.attempt_number",
+		"reconciliation_repair_events.attempt_id",
+		"reconciliation_repair_events.error_code",
+		"reconciliation_repair_events.sequence",
+		"reconciliation_repair_events.event_type",
+		"reconciliation_repair_events.outcome_code",
+		"reconciliation_repair_events.observed_size_bytes",
+		"reconciliation_repair_events.observed_sha256",
+		"reconciliation_repair_events.occurred_at",
+		"reconciliation_repair_manifest_items.id",
+		"reconciliation_repair_manifest_items.quarantine_id",
+		"reconciliation_repair_manifest_items.media_id",
+		"reconciliation_repair_manifest_items.job_id",
+		"reconciliation_repair_manifest_items.job_target_id",
+		"reconciliation_repair_manifest_items.destination_relative_key",
+		"reconciliation_repair_manifest_items.expected_size_bytes",
+		"reconciliation_repair_manifest_items.report_observed_sha256",
+		"reconciliation_repair_manifest_items.prepared_at",
+	}
+	slices.Sort(checkerRepairColumns)
+	slices.Sort(wantCheckerRepairColumns)
+	if !reflect.DeepEqual(checkerRepairColumns, wantCheckerRepairColumns) {
+		t.Fatalf("checker repair column grants\nactual=%q\nexpected=%q", checkerRepairColumns, wantCheckerRepairColumns)
+	}
+	for _, relation := range []string{"reconciliation_repair_manifest_items", "reconciliation_repair_attempts", "reconciliation_repair_events"} {
+		var tableSelect bool
+		if err := pool.QueryRow(ctx, `SELECT pg_catalog.has_table_privilege('nmcp_check_function_owner',$1,'SELECT')`, relation).Scan(&tableSelect); err != nil || tableSelect {
+			t.Fatalf("checker has table-wide repair SELECT on %s: %t, %v", relation, tableSelect, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION nmcp_unexpected_repair_definer_probe() RETURNS integer LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'; ALTER FUNCTION nmcp_unexpected_repair_definer_probe() OWNER TO nmcp_repair_function_owner`); err != nil {
+		t.Fatal(err)
+	}
+	var closureCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_roles AS owner ON owner.oid=p.proowner WHERE p.prosecdef AND owner.rolname IN ('nmcp_check_function_owner','nmcp_repair_function_owner') AND p.pronamespace=current_schema()::regnamespace`).Scan(&closureCount); err != nil {
+		t.Fatal(err)
+	}
+	if closureCount != len(expected)+1 {
+		t.Fatalf("unexpected definer was not visible to closure query: count=%d want=%d", closureCount, len(expected)+1)
+	}
+	if _, err := pool.Exec(ctx, `DROP FUNCTION nmcp_unexpected_repair_definer_probe()`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func schemaForPool(t *testing.T, ctx context.Context, pool *pgxpool.Pool) string {
+	t.Helper()
+	var schema string
+	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	return schema
+}
+
+func assertCheckerDefinerCatalog(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	var schema string
+	if err := pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	signatures := []string{
+		"nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)",
+		"nmcp_complete_check_source(nmcp_uuid_v4,text,text)",
+		"nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)",
+		"nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)",
+		"nmcp_read_check_database_references(timestamptz)",
+		"nmcp_read_check_attempt_owners()",
+		"nmcp_read_check_report_outcome(nmcp_uuid_v4)",
+	}
+	wantConfig := "search_path=" + schema + ", pg_catalog, pg_temp"
+	for _, signature := range signatures {
+		var owner, config string
+		var securityDefiner, exactACL bool
+		err := pool.QueryRow(ctx, `SELECT owner.rolname,p.prosecdef,array_to_string(p.proconfig,','),(
+			SELECT count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee=checker.oid AND NOT acl.is_grantable)=1
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee<>p.proowner)=1
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee NOT IN (p.proowner,checker.oid))=0
+			   AND count(*) FILTER (WHERE acl.privilege_type='EXECUTE' AND acl.grantee<>p.proowner AND acl.is_grantable)=0
+			   AND count(*) FILTER (WHERE acl.privilege_type<>'EXECUTE')=0
+			FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) AS acl
+			CROSS JOIN pg_catalog.pg_roles AS checker WHERE checker.rolname='nmcp_check_runtime')
+		FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_roles AS owner ON owner.oid=p.proowner
+		WHERE p.oid=pg_catalog.to_regprocedure($1)`, signature).Scan(&owner, &securityDefiner, &config, &exactACL)
+		if err != nil {
+			t.Fatalf("checker catalog %s: %v", signature, err)
+		}
+		if owner != "nmcp_check_function_owner" || !securityDefiner || config != wantConfig || !exactACL {
+			t.Fatalf("checker catalog %s owner/definer/config/exact-acl = %s/%t/%q/%t", signature, owner, securityDefiner, config, exactACL)
+		}
+	}
+}
+
+func assertCheckerTempShadowCannotIntercept(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE schema_migrations(version bigint,name text,checksum text,transactional boolean,idempotent boolean,dirty boolean); INSERT INTO schema_migrations VALUES(999,'shadow','shadow',true,false,false)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE nmcp_check_runtime`); err != nil {
+		t.Fatal(err)
+	}
+	reportID := newUUIDv4(t)
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `SELECT nmcp_begin_check_report($1,'all',1::smallint,$2,$2,$2,$2)`, reportID, now); err != nil {
+		t.Fatalf("temp shadow intercepted checker definer: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `RESET ROLE`); err != nil {
+		t.Fatal(err)
+	}
+	var version int64
+	if err := tx.QueryRow(ctx, `SELECT migration_version FROM reconciliation_check_reports WHERE id=$1`, reportID).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 19 {
+		t.Fatalf("checker definer used shadow migration history version %d", version)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func backendHasAdvisoryLocks(t *testing.T, ctx context.Context, verifier *pgxpool.Conn, pid int32) bool {
 	t.Helper()
 	if pid <= 0 || uint32(pid) == verifier.Conn().PgConn().PID() {
@@ -1637,6 +2867,32 @@ func integrationPool(t *testing.T, databaseURL string) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 	if err := pool.Ping(ctx); err != nil {
 		t.Fatalf("ping integration database: %v", err)
+	}
+	return pool
+}
+
+func integrationRolePool(t *testing.T, databaseURL, schema, role string) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = pgx.Identifier{schema}.Sanitize()
+	quotedRole := pgx.Identifier{role}.Sanitize()
+	config.AfterConnect = func(ctx context.Context, connection *pgx.Conn) error {
+		_, err := connection.Exec(ctx, `SET ROLE `+quotedRole)
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	return pool
 }

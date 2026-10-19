@@ -6,15 +6,20 @@ services:
     image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
     environment:
       POSTGRES_DB: nmcp
-      POSTGRES_USER: nmcp
-      POSTGRES_PASSWORD: nmcp-validation-only
+      POSTGRES_USER: nmcp_bootstrap
+      POSTGRES_PASSWORD: nmcp-bootstrap-validation-only
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nmcp -d nmcp"]
+      test: ["CMD-SHELL", "pg_isready -U nmcp_bootstrap -d nmcp"]
       interval: 2s
       timeout: 3s
       retries: 30
     volumes:
       - database:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-nmcp-roles.sql:ro
+      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+      - ../ubuntu/postgresql-roles.sql:/opt/nmcp-infra/ubuntu/postgresql-roles.sql:ro
+      - ../postgresql/verify-runtime-role-graph.sql:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
+      - ./verify-runtime-roles.sql:/opt/nmcp-infra/validation/verify-runtime-roles.sql:ro
     networks: [backend]
     labels: *validation-labels
 
@@ -23,7 +28,7 @@ services:
       context: ../..
       dockerfile: infra/validation/core.Dockerfile
     user: "0:0"
-    command: ["sh", "-eu", "-c", "mkdir -p /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/backups /var/lib/nmcp/media/quarantine /var/lib/nmcp/media/tmp && chown -R 10001:10001 /var/lib/nmcp/media && chmod 0700 /var/lib/nmcp/media /var/lib/nmcp/media/*"]
+    command: ["sh", "-eu", "-c", "if [ -e /var/lib/nmcp/media/quarantine ] || [ -L /var/lib/nmcp/media/quarantine ]; then echo 'legacy dotless quarantine requires reviewed migration' >&2; exit 1; fi; install -d -o 10001 -g 10001 -m 0700 /var/lib/nmcp/media /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/backups /var/lib/nmcp/media/tmp /var/lib/nmcp/media/.quarantine"]
     volumes:
       - media:/var/lib/nmcp/media
     network_mode: none
@@ -35,12 +40,58 @@ services:
       dockerfile: infra/validation/core.Dockerfile
     command: ["nmcp-admin", "migrate", "up", "--json"]
     environment: &common-environment
-      NMCP_DATABASE_URL: postgres://nmcp:nmcp-validation-only@postgres:5432/nmcp?sslmode=disable
+      NMCP_DATABASE_URL: postgres://nmcp_migrator:nmcp-migrator-validation-only@postgres:5432/nmcp?sslmode=disable
       NMCP_LOG_LEVEL: info
       NMCP_SHUTDOWN_TIMEOUT: 10s
     depends_on:
+      role-compatibility:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
+    networks: [backend]
+    labels: *validation-labels
+
+  role-compatibility:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    entrypoint: ["psql"]
+    command:
+      - --host=postgres
+      - --username=nmcp_bootstrap
+      - --dbname=nmcp
+      - --set=nmcp_migrator_role=nmcp_migrator
+      - --set=nmcp_api_role=nmcp_api
+      - --set=nmcp_worker_role=nmcp_worker
+      - --set=nmcp_migration_compatibility=TRUE
+      - --file=/opt/nmcp-infra/postgresql/runtime-roles.sql
+    environment:
+      PGPASSWORD: nmcp-bootstrap-validation-only
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+    networks: [backend]
+    labels: *validation-labels
+
+  role-harden:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    entrypoint: ["sh", "-eu", "-c"]
+    command:
+      - >-
+        psql --host=postgres --username=nmcp_bootstrap --dbname=nmcp
+        --set=nmcp_migrator_role=nmcp_migrator
+        --set=nmcp_api_role=nmcp_api --set=nmcp_worker_role=nmcp_worker
+        --file=/opt/nmcp-infra/postgresql/runtime-roles.sql &&
+        psql --host=postgres --username=nmcp_bootstrap --dbname=nmcp
+        --file=/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql
+    environment:
+      PGPASSWORD: nmcp-bootstrap-validation-only
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ../postgresql/runtime-roles.sql:/opt/nmcp-infra/postgresql/runtime-roles.sql:ro
+      - ../postgresql/verify-runtime-role-graph.sql:/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql:ro
     networks: [backend]
     labels: *validation-labels
 
@@ -51,12 +102,13 @@ services:
     command: ["core-api"]
     environment:
       <<: *common-environment
+      NMCP_DATABASE_URL: postgres://nmcp_api:nmcp-api-validation-only@postgres:5432/nmcp?sslmode=disable
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
       NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
       NMCP_CURSOR_HMAC_KEY: validation-only-cursor-key-32-bytes-minimum
       NMCP_API_ADDR: 0.0.0.0:8080
     depends_on:
-      migrate:
+      role-harden:
         condition: service_completed_successfully
       storage-init:
         condition: service_completed_successfully
@@ -80,6 +132,7 @@ services:
     command: ["core-worker"]
     environment:
       <<: *common-environment
+      NMCP_DATABASE_URL: postgres://nmcp_worker:nmcp-worker-validation-only@postgres:5432/nmcp?sslmode=disable
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
       NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
       NMCP_STILL_HELPER_PATH: /opt/nmcp/bin/nmcp-still-helper
@@ -89,7 +142,7 @@ services:
       NMCP_SRGB_ICC_PATH: /opt/nmcp/share/sRGB2014.icc
       NMCP_SRGB_ICC_SHA256: 384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
     depends_on:
-      migrate:
+      role-harden:
         condition: service_completed_successfully
       storage-init:
         condition: service_completed_successfully

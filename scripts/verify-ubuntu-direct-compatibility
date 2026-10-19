@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Finite compatibility acceptance on a disposable GitHub Ubuntu VM, as root."""
+import io
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+PHASES = (
+    'fresh-current', 'current-rerun', 'hostile-libpq', 'stale-compatibility',
+    'migration-failure', 'signal-int', 'signal-term', 'sigkill-recovery',
+    'graph-verifier-failure', 'upgrade-v18-v19', 'unfinished-v18-rejection',
+    'completed-v18-rejection', 'writer-drain',
+)
+V18 = '172583179d860619ae2c79505971e10ae7f394fc'
+UNIT = 'nmcp-direct-crash.service'
+ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': '/root', 'LC_ALL': 'C', 'GOTOOLCHAIN': 'local',
+       'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_CONFIG_NOSYSTEM': '1',
+       'GIT_CONFIG_GLOBAL': '/dev/null'}
+
+
+def run(*args, **kwargs):
+    print('+', *map(str, args), flush=True)
+    return subprocess.run(list(map(str, args)), check=True, env=ENV, timeout=600, **kwargs)
+
+
+def wait_for(predicate, description):
+    for _ in range(200):
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise RuntimeError('deadline: ' + description)
+
+
+def snapshot(repository, sha, destination):
+    destination.mkdir(mode=0o700)
+    archive = run('git', '-c', f'safe.directory={repository}', '-C', repository,
+                  'archive', '--format=tar', sha, stdout=subprocess.PIPE).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as stream:
+        stream.extractall(destination, filter='data')
+
+
+def install(source, target, mode=0o755):
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    target.chmod(mode)
+
+
+def psql(sql):
+    return run('runuser', '-u', 'postgres', '--', 'psql', '-X', '-h', '/var/run/postgresql',
+               '-p', '5432', '-U', 'postgres', '-d', 'nmcp', '-v', 'ON_ERROR_STOP=1',
+               '-At', '-c', sql, stdout=subprocess.PIPE, text=True).stdout.strip()
+
+
+def crash_recovery(phase_script, env, work):
+    # Separate observer outside the killed cgroup. An escaped setsid child must
+    # still die with the unit; PostgreSQL state must remain compatible until recovery.
+    run('systemd-run', '--quiet', '--unit=' + UNIT, '--property=Type=exec',
+        '--property=KillMode=control-group', '--property=SendSIGKILL=yes',
+        '--property=TimeoutStopSec=10s', '--property=RuntimeMaxSec=90s',
+        '/usr/bin/env', '-i', *(f'{k}={v}' for k, v in env.items()),
+        'NMCP_TEST_CGROUP_CRASH=1', '/bin/bash', phase_script, 'sigkill-recovery')
+    wait_for(lambda: (work / 'kill/supervisor-kill.ready').exists(), 'crash workload ready')
+    pids = [int((work / 'kill' / name).read_text())
+            for name in ('wrapper.pid', 'admin.pid', 'descendant.pid')]
+    cgroup = run('systemctl', 'show', '-p', 'ControlGroup', '--value', UNIT,
+                 stdout=subprocess.PIPE, text=True).stdout.strip()
+    if not cgroup.startswith('/system.slice/nmcp-direct-crash.service'):
+        raise RuntimeError('unexpected crash unit cgroup: ' + cgroup)
+    for pid in pids:
+        if ('0::' + cgroup) not in Path(f'/proc/{pid}/cgroup').read_text().splitlines():
+            raise RuntimeError(f'crash process outside unit cgroup: {pid}')
+    run('systemctl', 'kill', '--kill-whom=all', '--signal=SIGKILL', UNIT)
+    group = Path('/sys/fs/cgroup' + cgroup)
+    wait_for(lambda: not group.exists() or all(
+        not p.read_text().strip() for p in group.rglob('cgroup.procs')), 'empty crash cgroup')
+    wait_for(lambda: all(not Path(f'/proc/{p}').exists() for p in pids), 'crash processes gone')
+    state = run('systemctl', 'show', '-p', 'Result', '--value', UNIT,
+                stdout=subprocess.PIPE, text=True).stdout.strip()
+    if state != 'signal':
+        raise RuntimeError('crash was not a signal termination: ' + state)
+    if psql("SELECT count(*) FROM pg_auth_members WHERE member='nmcp_migrator'::regrole "
+            "AND roleid IN ('nmcp_purge_function_owner'::regrole,'nmcp_check_function_owner'::regrole,"
+            "'nmcp_repair_function_owner'::regrole) AND NOT admin_option AND inherit_option AND set_option") != '3':
+        raise RuntimeError('SIGKILL did not leave expected compatibility state')
+    run('/usr/bin/env', '-i', *(f'{k}={v}' for k, v in env.items()),
+        env['NMCP_WRAPPER'], env['NMCP_CURRENT_ADMIN'], 'migrate', 'up', '--json')
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 4:
+        raise SystemExit('usage (root, disposable VM only): direct-compatibility REPOSITORY SHA GO')
+    os.umask(0o022)
+    repository, sha, go = sys.argv[1:]
+    actual = run('git', '-c', f'safe.directory={repository}', '-C', repository,
+                 'rev-parse', '--verify', sha + '^{commit}', stdout=subprocess.PIPE, text=True).stdout.strip()
+    if actual != sha or len(sha) != 40 or not os.path.isabs(go):
+        raise RuntimeError('exact SHA and absolute Go binary required')
+    version = run(go, 'version', stdout=subprocess.PIPE, text=True).stdout.strip()
+    if ' go1.27.1 ' not in version:
+        raise RuntimeError('unexpected Go toolchain: ' + version)
+    print(f'candidate_sha={sha} historical_sha={V18} toolchain={version}', flush=True)
+    root = Path(tempfile.mkdtemp(prefix='nmcp-direct-', dir='/run'))
+    root.chmod(0o755)
+    try:
+        current, historical = root / 'source', root / 'v18-source'
+        snapshot(repository, sha, current)
+        snapshot(repository, V18, historical)
+        for source, name in ((current, 'current'), (historical, 'v18')):
+            binary = root / name / 'bin/nmcp-admin'
+            binary.parent.mkdir(parents=True)
+            run(go, 'build', '-trimpath', '-o', binary, './cmd/nmcp-admin', cwd=source)
+            binary.chmod(0o755)
+        run('systemctl', 'start', 'postgresql')
+        run('systemd-sysusers', current / 'infra/ubuntu/sysusers.d/nmcp.conf')
+        lib = Path('/usr/local/libexec/nmcp')
+        for source, target, mode in (
+            ('scripts/run-ubuntu-migration-compatibility', 'run-ubuntu-migration-compatibility', 0o755),
+            ('scripts/set-ubuntu-migration-role-mode', 'set-ubuntu-migration-role-mode', 0o755),
+            ('infra/postgresql/runtime-roles.sql', 'postgresql/runtime-roles.sql', 0o644),
+            ('infra/postgresql/verify-runtime-role-graph.sql', 'postgresql/verify-runtime-role-graph.sql', 0o644),
+        ):
+            install(current / source, lib / target, mode)
+        checksum_dir = Path('/var/lib/nmcp/deployment')
+        checksum_dir.mkdir(parents=True, exist_ok=True)
+        checksums = run('sha256sum', 'runtime-roles.sql', 'verify-runtime-role-graph.sql',
+                        cwd=lib / 'postgresql', stdout=subprocess.PIPE).stdout
+        checksum = checksum_dir / 'postgresql-role-bootstrap.sha256'
+        checksum.write_bytes(checksums)
+        checksum.chmod(0o600)
+        work = root / 'work'
+        work.mkdir(mode=0o755)
+        env = dict(ENV, NMCP_COMPAT_WORK=str(work),
+                   NMCP_WRAPPER=str(lib / 'run-ubuntu-migration-compatibility'),
+                   NMCP_ROLE_MODE=str(lib / 'set-ubuntu-migration-role-mode'),
+                   NMCP_CURRENT_ADMIN=str(root / 'current/bin/nmcp-admin'),
+                   NMCP_V18_ADMIN=str(root / 'v18/bin/nmcp-admin'),
+                   NMCP_POSTGRESQL_ROLES=str(current / 'infra/ubuntu/postgresql-roles.sql'),
+                   NMCP_RUNTIME_ROLES=str(lib / 'postgresql/runtime-roles.sql'),
+                   NMCP_VERIFY_ROLE_GRAPH=str(lib / 'postgresql/verify-runtime-role-graph.sql'),
+                   NMCP_DATABASE_URL='postgres://nmcp_migrator:nmcp-migrator-wrapper-test@127.0.0.1:5432/nmcp?sslmode=disable',
+                   NMCP_LOG_LEVEL='info', NMCP_SHUTDOWN_TIMEOUT='10s')
+        phase_script = current / 'scripts/verify-ubuntu-migration-role-compatibility'
+        for phase in PHASES:
+            print(f'candidate_sha={sha} phase={phase} state=started', flush=True)
+            if phase == 'sigkill-recovery':
+                crash_recovery(phase_script, env, work)
+            else:
+                subprocess.run(
+                    ['/bin/bash', str(phase_script), phase], env=env, check=True, timeout=120)
+            # Independent real PostgreSQL verifier, not a producer success label.
+            with (current / 'infra/validation/verify-runtime-roles.sql').open('rb') as sql:
+                run('runuser', '-u', 'postgres', '--', 'psql', '-X', '-h', '/var/run/postgresql',
+                    '-p', '5432', '-U', 'postgres', '-d', 'nmcp', '-v', 'ON_ERROR_STOP=1', stdin=sql)
+            print(f'candidate_sha={sha} phase={phase} state=passed', flush=True)
+    finally:
+        # Fixed unit is owned exclusively by this disposable job. Never report
+        # success if cleanup fails. GitHub discards the VM even on cancellation.
+        state = run('systemctl', 'show', '-p', 'LoadState', '--value', UNIT,
+                    stdout=subprocess.PIPE, text=True).stdout.strip()
+        if state != 'not-found':
+            run('systemctl', 'stop', UNIT)
+        subprocess.run(['systemctl', 'reset-failed', UNIT], env=ENV, check=False)
+        shutil.rmtree(root)
+
+
+if __name__ == '__main__':
+    main()

@@ -47,6 +47,7 @@ boundary.
 | `/etc/nmcp/tls-current` | root-owned atomic symlink | active certificate/key pair |
 | `/etc/nmcp-nginx/nginx.conf` | `root:root 0644` below 0755 parent | non-secret config readable by Nginx |
 | `/var/lib/nmcp/media` | `nmcp:nmcp 0700` | Core writable storage |
+| `/var/lib/nmcp/media/.quarantine` | `nmcp:nmcp 0700` | canonical same-filesystem repair quarantine; never served |
 | `/var/lib/nmcp/backups` | `nmcp:nmcp 0700` | reserved, never mounted into Nginx |
 | `/var/lib/nmcp/deployment` | `root:root 0700` | package and activation evidence |
 
@@ -58,12 +59,34 @@ It cannot see backup, temporary, quarantine, database, environment, or source
 TLS-key paths. systemd exposes the TLS files only in the Nginx service's private
 credential directory. Nginx receives only `CAP_NET_BIND_SERVICE` for low ports.
 
+`.quarantine` is a fixed child of `NMCP_STORAGE_ROOT`; there is no separate
+quarantine environment variable, caller-selected path, or mount. Operators must
+verify it has the same device ID as `/var/lib/nmcp/media` before repair is wired.
+The API and Worker currently share the `nmcp` Unix identity and a writable media
+root, so this layout prevents accidental serving but does not claim OS-level
+quarantine isolation from either Core process. Issue #20 owns any future
+administrative unit, credential, and sandbox boundary; none is installed here.
+
+Upgrades from a revision that created the legacy dotless
+`/var/lib/nmcp/media/quarantine` fail before host installation, whether that
+path is empty or populated. Stop NMCP, inspect the path without following
+symlinks, and preserve any unexpected contents before changing it. If it is
+empty, remove it with `sudo rmdir /var/lib/nmcp/media/quarantine`. If populated,
+record its owner/mode/content inventory, then either move the entire directory
+to reviewed operator-controlled storage outside `/var/lib/nmcp/media` (so the
+source path is absent), or move each reviewed entry through a controlled
+operator procedure and use `rmdir` after the source is empty. Do not recursively
+delete or blindly merge contents. Re-run host installation to create canonical `.quarantine`,
+then adjudicate preserved entries under the reconciliation manifest procedure
+when that application workflow lands. Installation also rejects a symlink,
+unsafe owner/mode, or separate filesystem mounted at canonical `.quarantine`.
+
 ## Host prerequisites
 
 1. Install Ubuntu 24.04 runtime packages listed in
    `infra/ubuntu/packages.txt`. Do not use `latest` as evidence: preserve
    `dpkg-query` package/version output with the deployment record.
-2. Provision PostgreSQL with a least-privilege application role and a database.
+2. Provision PostgreSQL with the documented role split and an `nmcp` database.
    Keep PostgreSQL on literal loopback; do not expose port 5432. Record the
    concrete Ubuntu cluster unit (for example `postgresql@16-main.service`); the
    `postgresql.service` meta-unit is not an acceptable dependency.
@@ -81,6 +104,66 @@ credential directory. Nginx receives only `CAP_NET_BIND_SERVICE` for low ports.
 
 ## Configuration and install
 
+Before the first migration, run the reviewed role bootstrap as the local
+PostgreSQL cluster administrator while connected to the empty `nmcp` database:
+
+```sh
+sudo -u postgres psql --dbname nmcp --file infra/ubuntu/postgresql-roles.sql
+sudo -u postgres psql --dbname nmcp
+# In the interactive psql session; passwords never enter shell history/argv:
+\password nmcp_migrator
+\password nmcp_api
+\password nmcp_worker
+```
+
+The script creates credential-free `nmcp_runtime`, `nmcp_worker_runtime`,
+`nmcp_purge_function_owner`, `nmcp_check_runtime`, `nmcp_repair_runtime`,
+`nmcp_check_function_owner`, and `nmcp_repair_function_owner` roles. The two
+reconciliation capability roles and two function owners are NOINHERIT and
+isolated from the common runtime graph. API and Worker receive only their
+reviewed existing memberships; no check/repair login or capability member is
+created. The migrator is a member of the three function-owner roles only so
+forward migrations can transfer narrowly scoped SECURITY DEFINER functions.
+The bootstrap treats every direct incoming or outgoing membership edge touching
+these stable roles or the three managed logins as a closed allowlist; this also
+blocks an external login from reaching the migrator or an owner transitively.
+Membership normalization and the final graph check run in one transaction, so
+an unsafe extra edge cannot leave a partially rewritten graph.
+
+Old embedded migrations transfer a function to its stable owner and then harden
+it in the same migration session. The production migration wrapper therefore
+uses a two-phase role transition while API and Worker are stopped. Its root-only
+pinned bootstrap first verifies the complete safe graph and role attributes,
+then transactionally changes only the three function-owner-to-`nmcp_migrator`
+edges from `INHERIT FALSE` to `INHERIT TRUE`; their `ADMIN FALSE` and `SET TRUE`
+options and every other edge remain exact. The three inheritance bits are one
+state: only all-FALSE hardened or all-TRUE interrupted compatibility is valid;
+every mixed combination fails without normalization. An EXIT/INT/TERM handler always runs
+the default bootstrap and an independent graph verifier to restore `INHERIT
+FALSE`, whether migration succeeds or fails. Temporary inheritance benefits
+only the isolated migration login: the exact bilateral graph forbids API,
+Worker, or a rogue role from reaching the migrator or function owners.
+
+The wrapper runs the checksum-verified SQL installed under
+`/usr/local/libexec/nmcp/postgresql` through local `postgres` peer
+authentication on the reviewed `/var/run/postgresql` socket, port 5432, and
+database/user identity. It starts libpq from an empty environment and pins those
+values on the command line, so caller `PGHOST`, service, password, and session
+variables cannot redirect or alter the privileged bootstrap. It does not use or pass the admin DSN to an application
+process. Release activation first invalidates any prior `nmcp-migrate.service`
+success. API and Worker require a fresh successful migration unit, so a failed
+hardening/verifier, normal signal, or interrupted compatibility phase prevents
+service start. A power loss or SIGKILL can leave the database in compatibility
+mode, but the next mandatory wrapper attempt accepts only that exact interrupted
+state, reruns migration idempotently, and hardens before reporting readiness.
+Issue #20 will provision future operational check/repair credentials after the
+CLI contract lands; the root migration credential must not be reused. The
+bootstrap transfers database/schema ownership to `nmcp_migrator` and removes
+PUBLIC schema creation. Embedded migrations own all application object grants;
+the bootstrap deliberately does not grant table or function access after the
+fact. Run it before migration 0017, which owns those future grants and must fail
+closed if stable roles are absent or unsafe.
+
 Create separate files from `infra/ubuntu/env/*.example`. Replace every marker,
 use a random HMAC value of at least 32 bytes, and keep the API address exactly
 `127.0.0.1:8080`. `NMCP_FILE_BASE_URL` must name the separate File Server TLS
@@ -88,8 +171,9 @@ listener and end in `/files/`.
 The three files and TLS inputs must be regular root-owned files below normalized,
 root-owned paths with no group/world-writable parent. The installer captures
 them through `O_NOFOLLOW` file descriptors before validation/copy, rejects
-duplicates or extra/missing environment keys, requires all DSNs to match and use
-literal loopback port 5432 and database `nmcp`, permits only `sslmode=disable`
+duplicates or extra/missing environment keys, requires the exact
+`nmcp_migrator`/`nmcp_api`/`nmcp_worker` identities with distinct passwords and
+the same literal-loopback port 5432 `nmcp` database, permits only `sslmode=disable`
 as a DSN option, and rejects query routing overrides, fragments, wildcard API
 binds, or a mismatched files-root URL. Environment values use a deliberately
 literal subset: quotes, backslashes, and whitespace are rejected so validation
@@ -296,7 +380,10 @@ sudo systemctl show "<CONCRETE_POSTGRESQL_UNIT>" nmcp-api.service nmcp-worker.se
 sudo ss -lntup
 sudo stat -c '%U:%G %a %n' /etc/nmcp /etc/nmcp/*.env /etc/nmcp-nginx \
   /etc/nmcp-nginx/nginx.conf /etc/nmcp/tls-current \
-  /etc/nmcp/tls-current/*.pem /var/lib/nmcp/media /var/lib/nmcp/backups
+  /etc/nmcp/tls-current/*.pem /var/lib/nmcp/media \
+  /var/lib/nmcp/media/.quarantine /var/lib/nmcp/backups
+test "$(stat -c %d /var/lib/nmcp/media)" = \
+  "$(stat -c %d /var/lib/nmcp/media/.quarantine)"
 curl --fail --show-error http://127.0.0.1:8080/readyz
 ```
 
