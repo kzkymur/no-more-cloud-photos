@@ -39,3 +39,43 @@ CREATE TRIGGER admin_batch_items_no_truncate BEFORE TRUNCATE ON admin_batch_item
     FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
 REVOKE ALL ON admin_batch_items FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime,nmcp_repair_runtime;
 REVOKE ALL ON FUNCTION nmcp_admin_batch_receipt_guard() FROM PUBLIC;
+
+-- Filesystem cleanup services own recoverable transactions. Administrative
+-- authorization must survive before invoking them; a receipt plus result audit
+-- can then be recovered from their exact native deletion journal after a crash.
+CREATE TABLE admin_cleanup_runs (
+    id nmcp_uuid_v4 PRIMARY KEY,
+    kind text NOT NULL CHECK (kind IN ('media','renditions')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    finished_at timestamptz
+);
+CREATE UNIQUE INDEX admin_cleanup_one_running_kind_idx ON admin_cleanup_runs(kind) WHERE finished_at IS NULL;
+CREATE TABLE admin_cleanup_items (
+    run_id nmcp_uuid_v4 NOT NULL REFERENCES admin_cleanup_runs(id) ON DELETE RESTRICT,
+    object_id nmcp_uuid_v4 NOT NULL,
+    media_id nmcp_uuid_v4 NOT NULL,
+    job_id nmcp_uuid_v4,
+    outcome text NOT NULL DEFAULT 'pending' CHECK (outcome IN ('pending','completed','skipped')),
+    completed_at timestamptz,
+    PRIMARY KEY(run_id,object_id),
+    CHECK ((outcome='pending' AND completed_at IS NULL) OR (outcome<>'pending' AND completed_at IS NOT NULL))
+);
+CREATE FUNCTION nmcp_admin_cleanup_receipt_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.run_id IS DISTINCT FROM OLD.run_id OR NEW.object_id IS DISTINCT FROM OLD.object_id
+       OR NEW.media_id IS DISTINCT FROM OLD.media_id OR OLD.outcome <> 'pending'
+       OR (OLD.job_id IS NOT NULL AND NEW.job_id IS DISTINCT FROM OLD.job_id) THEN
+        RAISE EXCEPTION 'cleanup authorization and completed receipts are immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER admin_cleanup_receipt_guard BEFORE UPDATE ON admin_cleanup_items
+    FOR EACH ROW EXECUTE FUNCTION nmcp_admin_cleanup_receipt_guard();
+CREATE TRIGGER admin_cleanup_items_no_delete BEFORE DELETE ON admin_cleanup_items
+    FOR EACH ROW EXECUTE FUNCTION nmcp_reject_mutation();
+CREATE TRIGGER admin_cleanup_items_no_truncate BEFORE TRUNCATE ON admin_cleanup_items
+    FOR EACH STATEMENT EXECUTE FUNCTION nmcp_reject_mutation();
+REVOKE ALL ON admin_cleanup_runs,admin_cleanup_items
+    FROM PUBLIC,nmcp_runtime,nmcp_worker_runtime,nmcp_check_runtime,nmcp_repair_runtime;
+REVOKE ALL ON FUNCTION nmcp_admin_cleanup_receipt_guard() FROM PUBLIC;

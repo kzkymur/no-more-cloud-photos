@@ -86,3 +86,30 @@ same-job/max-attempts/history, byte-identical successful target, real CLI->HTTP
 job visibility/no duplicates, maintenance fresh clean check versus missing-file
 rejection, finite media cleanup/dryrun and unsupported backup cleanup. These new
 tests are not yet executed pending successor normal CI.
+
+## Review durability fixes / formal early results
+- Formal PG17 Core39523920613 exactdeb2501 reached compile/runtime: frozen
+  membership/pin/crash, lock+audit, normal repair preview rejection, maintenance
+  fresh checks and finite media cleanup passed; CLI integration failed fixture
+  schema routing, retry fixture failed forbidden max decrease. Neither full
+  Core nor skipped downstream steps passed. eb24935 fixed exhaustion fixture;
+  Core39523992631 then only the2 CLI schema-routing tests failed.
+- Corrected CLI test URLs explicitly with search_path (pgx Config.ConnString
+  preserves original string, not RuntimeParams edits), including prior migrate
+  CLI test helper. No production error details exposed to make tests pass.
+- Fixed new independent MED1: rejected batch COMMIT returns pre-page committed
+  counters/checkpoint/status; uncertain network COMMIT returns unknown state,
+  never speculative terminal success. Added returned-state assertion.
+- Fixed MED2 design:0020 also journals bounded cleanup run membership and exact
+  affected-ID authorization BEFORE lifecycle effects. Each item receipt+result
+  audit commits together, and later invocations automatically recover unfinished
+  run from exact native cleanup/purge journals after result-audit failure/crash.
+  Added both media/rendition audit rejection/recovery causal tests. Repair keeps
+  durable report->run/manifest/result linkage; repeated same-report execution
+  adopts existing plan/results rather than losing effect identity.
+- Resume now holds REAL maintenance row FOR UPDATE throughout fresh checker
+  scan and audit/cutover commit; direct Repairer uses FOR SHARE and cannot cross
+  it even without the CLI session lock. Added actual direct-repair filesystem
+  rename barrier vs resume conflict and maintenance preview no-write test.
+All current new fixes/tests await successor normal CI. Mandatory formatting guard
+and prior full gates remain unchanged. No local Go workaround/bypass used.

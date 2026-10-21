@@ -8,9 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/reconciliation"
-	"github.com/kzkymur/no-more-cloud-photos/internal/renditioncleanup"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
@@ -107,44 +105,46 @@ func (s *Service) MaintenanceResume(ctx context.Context, store *storage.Store) (
 		return nil, err
 	}
 	defer unlock()
-	state, err := s.MaintenanceStatus(ctx)
+	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if state.Mode != "maintenance" {
-		return state, ErrConflict
+	defer rollback(tx)
+	// This is the REAL cross-process fence, not merely a CLI session lock.
+	// Hold it throughout the fresh check through normal-mode commit. Every
+	// direct Repairer apply/attempt takes FOR SHARE and cannot cross it.
+	var mode string
+	if err := tx.QueryRow(ctx, `SELECT mode FROM maintenance_state WHERE id=1 FOR UPDATE NOWAIT`).Scan(&mode); err != nil {
+		return nil, classified(err)
+	}
+	if mode != "maintenance" {
+		return nil, ErrConflict
 	}
 	check, err := s.Check(ctx, store, reconciliation.ScopeAll)
 	if err != nil {
 		return check, err
 	}
+	var valid bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM reconciliation_check_reports r
+		JOIN reconciliation_check_report_seals seal ON seal.report_id=r.id
+		WHERE r.id=$1 AND r.scope='all' AND seal.finding_count=0
+		AND (SELECT count(*) FROM reconciliation_check_source_results src WHERE src.report_id=r.id AND src.result='complete')=3)
+		AND NOT EXISTS(SELECT 1 FROM reconciliation_repair_runs run WHERE NOT EXISTS
+		(SELECT 1 FROM reconciliation_repair_results result WHERE result.run_id=run.id))`, check.ReportID).Scan(&valid); err != nil {
+		return check, err
+	}
+	if !valid {
+		return check, ErrConflict
+	}
 	encoded, _ := json.Marshal(check)
-	err = s.mutate(ctx, "maintenance_resume", "maintenance-state", map[string]any{"report_id": check.ReportID}, []string{check.ReportID}, func(tx pgx.Tx) error {
-		var eligible bool
-		if err := tx.QueryRow(ctx, `SELECT mode='maintenance' AND entered_at=$1 AND entered_at<=$2
-			FROM maintenance_state WHERE id=1 FOR UPDATE NOWAIT`, state.EnteredAt, check.StartedAt).Scan(&eligible); err != nil {
-			return err
-		}
-		if !eligible {
-			return ErrConflict
-		}
-		var valid bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM reconciliation_check_reports r
-			JOIN reconciliation_check_report_seals seal ON seal.report_id=r.id
-			WHERE r.id=$1 AND r.scope='all' AND seal.finding_count=0
-			AND (SELECT count(*) FROM reconciliation_check_source_results src WHERE src.report_id=r.id AND src.result='complete')=3)
-			AND NOT EXISTS(SELECT 1 FROM reconciliation_repair_runs run WHERE NOT EXISTS
-			(SELECT 1 FROM reconciliation_repair_results result WHERE result.run_id=run.id))`, check.ReportID).Scan(&valid); err != nil {
-			return err
-		}
-		if !valid {
-			return ErrConflict
-		}
-		_, err := tx.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL,
-			successful_check_report=$1,updated_at=clock_timestamp() WHERE id=1`, encoded)
-		return err
-	})
-	if err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE maintenance_state SET mode='normal',reason=NULL,owner=NULL,entered_at=NULL,
+		successful_check_report=$1,updated_at=clock_timestamp() WHERE id=1`, encoded); err != nil {
+		return check, err
+	}
+	if err := s.audit(ctx, tx, "maintenance_resume", map[string]any{"report_id": check.ReportID}, []string{check.ReportID}, "succeeded", time.Now()); err != nil {
+		return check, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return check, err
 	}
 	return s.MaintenanceStatus(ctx)
@@ -225,6 +225,8 @@ func (s *Service) Repair(ctx context.Context, store *storage.Store, report strin
 }
 
 type CleanupResult struct {
+	RunID        string   `json:"run_id,omitempty"`
+	Skipped      int      `json:"skipped"`
 	Kind         string   `json:"kind"`
 	DryRun       bool     `json:"dry_run"`
 	Eligible     int      `json:"eligible"`
@@ -232,116 +234,6 @@ type CleanupResult struct {
 	Failed       int      `json:"failed"`
 	MorePossible bool     `json:"more_possible"`
 	IDs          []string `json:"affected_ids"`
-}
-
-func (s *Service) Cleanup(ctx context.Context, store *storage.Store, kind string, dry bool) (CleanupResult, error) {
-	result := CleanupResult{Kind: kind, DryRun: dry, IDs: []string{}}
-	if kind == "all" || kind == "backups" {
-		return result, ErrUnsupported
-	}
-	unlock, err := s.sessionLock(ctx, "cleanup:"+kind)
-	if err != nil {
-		return result, err
-	}
-	defer unlock()
-	service, err := medialifecycle.NewService(s.Pool, os.Getenv("NMCP_FILE_BASE_URL"))
-	if err != nil {
-		return result, err
-	}
-	if kind == "renditions" {
-		if dry {
-			err = s.Pool.QueryRow(ctx, `SELECT count(*) FROM renditions WHERE NOT is_current AND purge_after<=clock_timestamp()`).Scan(&result.Eligible)
-			return result, err
-		}
-		if err := s.mutate(ctx, "cleanup_begin", "cleanup-audit:renditions", map[string]any{"kind": kind, "limit": 100}, nil, func(tx pgx.Tx) error { return normal(ctx, tx) }); err != nil {
-			return result, err
-		}
-		runner, err := renditioncleanup.New(service, store, renditioncleanup.Options{SweepLimit: 100}, nil)
-		if err != nil {
-			return result, err
-		}
-		sweep, err := runner.Sweep(ctx)
-		result.IDs, result.Completed, result.Failed, result.MorePossible = sweep.IDs, sweep.Completed, sweep.Failed, sweep.LimitReached
-		result.Eligible = result.Completed + result.Failed
-		if auditErr := s.cleanupAudit(ctx, result); auditErr != nil {
-			return result, auditErr
-		}
-		if err != nil || result.Failed > 0 {
-			return result, ErrPartial
-		}
-		return result, nil
-	}
-	if kind != "media" {
-		return result, ErrValidation
-	}
-	cutoff, err := service.DatabaseNow(ctx)
-	if err != nil {
-		return result, err
-	}
-	candidates, err := service.ScanDuePurges(ctx, cutoff, nil, 100)
-	if err != nil {
-		return result, err
-	}
-	result.Eligible, result.MorePossible = len(candidates), len(candidates) == 100
-	if dry {
-		return result, nil
-	}
-	if err := s.mutate(ctx, "cleanup_begin", "cleanup-audit:media", map[string]any{"kind": kind, "limit": 100}, nil, func(tx pgx.Tx) error { return normal(ctx, tx) }); err != nil {
-		return result, err
-	}
-	// One finite snapshot, no daemon Run loop. Existing purge manifests and
-	// per-file receipts converge a crash. We only execute these due media.
-	for _, candidate := range candidates {
-		enqueued, err := service.EnqueueDuePurge(ctx, candidate.MediaID)
-		if err != nil {
-			result.Failed++
-			continue
-		}
-		lease, err := service.StartPurge(ctx, enqueued.Job.ID)
-		if err != nil {
-			result.Failed++
-			continue
-		}
-		for {
-			if _, err = service.HeartbeatPurge(ctx, lease.JobID, lease.Token); err != nil {
-				break
-			}
-			var step medialifecycle.PurgeStepResult
-			step, err = service.RunPurgeFileStep(ctx, lease.JobID, lease.Token, medialifecycle.StoragePurgeFileAction(store))
-			if err != nil {
-				break
-			}
-			if step.Done {
-				err = service.FinalizePurge(ctx, lease.JobID, lease.Token)
-				break
-			}
-		}
-		if err != nil {
-			result.Failed++
-			// Leave durable manifests intact. Existing expiry/reclaim will
-			// recover an interrupted step; never erase failed job history.
-			continue
-		}
-		result.Completed++
-		result.IDs = append(result.IDs, candidate.MediaID)
-	}
-	if err := s.cleanupAudit(ctx, result); err != nil {
-		return result, err
-	}
-	if result.Failed > 0 {
-		return result, ErrPartial
-	}
-	return result, nil
-}
-
-func (s *Service) cleanupAudit(ctx context.Context, result CleanupResult) error {
-	outcome := "succeeded"
-	if result.Failed > 0 {
-		outcome = "partial"
-	}
-	return s.recordAudit(ctx, "cleanup_result", map[string]any{
-		"kind": result.Kind, "completed": result.Completed, "failed": result.Failed,
-		"more_possible": result.MorePossible}, result.IDs, outcome)
 }
 
 func (s *Service) recordAudit(ctx context.Context, command string, args any, ids []string, outcome string) error {

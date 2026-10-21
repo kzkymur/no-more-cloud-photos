@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 )
 
@@ -23,14 +24,15 @@ type BatchRequest struct {
 }
 
 type BatchResult struct {
-	Token      string          `json:"resume_token,omitempty"`
-	ProfileID  *string         `json:"profile_id,omitempty"`
-	Status     string          `json:"status"`
-	Total      int64           `json:"total"`
-	Succeeded  int64           `json:"succeeded"`
-	Failed     int64           `json:"failed"`
-	Checkpoint json.RawMessage `json:"checkpoint"`
-	DryRun     bool            `json:"dry_run"`
+	Token       string          `json:"resume_token,omitempty"`
+	ProfileID   *string         `json:"profile_id,omitempty"`
+	Status      string          `json:"status"`
+	Total       int64           `json:"total"`
+	Succeeded   int64           `json:"succeeded"`
+	Failed      int64           `json:"failed"`
+	Checkpoint  json.RawMessage `json:"checkpoint"`
+	DryRun      bool            `json:"dry_run"`
+	CommitState string          `json:"commit_state,omitempty"`
 }
 
 func (r BatchRequest) Validate() error {
@@ -199,6 +201,7 @@ func (s *Service) BatchPage(ctx context.Context, token string, limit int) (Batch
 		}
 		return result, nil
 	}
+	previous := result // Last durable state, never the speculative page below.
 	rows, err := tx.Query(ctx, `SELECT ordinal,media_id::text,source_job_id::text FROM admin_batch_items
 		WHERE batch_id=$1 AND outcome='pending' ORDER BY ordinal LIMIT $2`, token, limit)
 	if err != nil {
@@ -279,7 +282,15 @@ func (s *Service) BatchPage(ctx context.Context, token string, limit int) (Batch
 		return result, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return result, err
+		var serverRejection *pgconn.PgError
+		if errors.Is(err, pgx.ErrTxCommitRollback) || errors.As(err, &serverRejection) {
+			return previous, err
+		}
+		// Without positive commit evidence, never expose speculative terminal
+		// success. The token is safe to replay and receipts decide the truth.
+		previous.CommitState = "unknown"
+		previous.Status = "unknown"
+		return previous, err
 	}
 	if result.Failed > 0 && result.Status != "running" {
 		return result, ErrPartial

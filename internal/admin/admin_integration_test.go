@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,17 +22,18 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 	"github.com/kzkymur/no-more-cloud-photos/internal/readapi"
+	"github.com/kzkymur/no-more-cloud-photos/internal/reconciliation"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func integrationService(t *testing.T) *Service {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
 		t.Skip("TEST_DATABASE_URL not set: PostgreSQL integration NOT executed")
 	}
 	ctx := context.Background()
-	base, err := pgxpool.New(ctx, url)
+	base, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +48,7 @@ func integrationService(t *testing.T) *Service {
 		}
 		base.Close()
 	})
-	cfg, err := pgxpool.ParseConfig(url)
+	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +66,14 @@ func integrationService(t *testing.T) *Service {
 	if err := migrator.Up(ctx); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("NMCP_DATABASE_URL", cfg.ConnString())
+	parsedURL, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := parsedURL.Query()
+	query.Set("search_path", schema+",pg_catalog,pg_temp")
+	parsedURL.RawQuery = query.Encode()
+	t.Setenv("NMCP_DATABASE_URL", parsedURL.String())
 	t.Setenv("NMCP_FILE_BASE_URL", "https://files.example.test/files/")
 	return New(pool)
 }
@@ -197,8 +208,9 @@ func TestAdminIntegrationBatchFrozenMembershipPinResumeAndAtomicity(t *testing.T
 		FOR EACH ROW EXECUTE FUNCTION reject_admin_page()`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.BatchPage(ctx, batch.Token, 1); err == nil {
-		t.Fatal("expected injected commit rejection")
+	rejected, rejectErr := s.BatchPage(ctx, batch.Token, 1)
+	if rejectErr == nil || rejected.Succeeded != 1 || rejected.Status != "running" || !bytes.Equal(rejected.Checkpoint, batch.Checkpoint) {
+		t.Fatalf("speculative rejected result=%+v err=%v", rejected, rejectErr)
 	}
 	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM jobs`).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("effect/checkpoint crash gap jobs=%d err=%v", count, err)
@@ -514,5 +526,194 @@ func TestAdminIntegrationFiniteMediaCleanupDryRunAndExecution(t *testing.T) {
 	}
 	if _, err := s.Cleanup(ctx, store, "all", false); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("backup unsupported falsely succeeded: %v", err)
+	}
+}
+
+func dueHistoricalRendition(t *testing.T, s *Service) string {
+	t.Helper()
+	ctx := context.Background()
+	_, targetID, _ := failedMixedJob(t, s)
+	var renditionID, mediaID, originalID, profileID string
+	if err := s.Pool.QueryRow(ctx, `SELECT r.id::text,r.media_id::text,j.original_id::text,t.profile_id::text
+		FROM renditions r JOIN job_targets t ON t.id=r.job_target_id JOIN jobs j ON j.id=t.job_id WHERE t.id=$1`, targetID).Scan(&renditionID, &mediaID, &originalID, &profileID); err != nil {
+		t.Fatal(err)
+	}
+	jobID, newTarget, newRendition := newID(), newID(), newID()
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollback(tx)
+	statements := []struct {
+		sql string
+		args []any
+	}{
+		{`UPDATE renditions SET purge_after=clock_timestamp()-interval '1 hour' WHERE id=$1`, []any{renditionID}},
+		{`INSERT INTO jobs(id,type,original_id,media_id_snapshot,status,max_attempts) VALUES($1,'transform',$2,$3,'queued',3)`, []any{jobID, originalID, mediaID}},
+		{`INSERT INTO job_targets(id,job_id,profile_id,status) VALUES($1,$2,$3,'pending')`, []any{newTarget, jobID, profileID}},
+		{`UPDATE jobs SET status='running',attempts=1,started_at=clock_timestamp(),lease_token=$2,lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, []any{jobID, newID()}},
+		{`UPDATE job_targets SET status='succeeded',attempts=1 WHERE id=$1`, []any{newTarget}},
+		{`INSERT INTO renditions(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,width,height,size_bytes,sha256,processor_audit)
+		VALUES($1,$2,$3,'mixed',true,$4,'image/avif',1,1,1,$5,'{"fixture":"current"}')`, []any{newRendition, mediaID, newTarget,
+			"renditions/"+originalID[:2]+"/"+originalID+"/"+newTarget+"/"+newRendition+".avif", strings.Repeat("b", 64)}},
+		{`UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, []any{jobID}},
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(ctx, statement.sql, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return renditionID
+}
+
+func TestAdminIntegrationCleanupAuditFailureRecoversExactNativeReceipts(t *testing.T) {
+	for _, kind := range []string{"media", "renditions"} {
+		t.Run(kind, func(t *testing.T) {
+			s := integrationService(t)
+			ctx := context.Background()
+			store, err := storage.Open(t.TempDir(), storage.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			var objectID string
+			if kind == "renditions" {
+				objectID = dueHistoricalRendition(t, s)
+			} else {
+				objectID = insertMedia(t, s, 500)
+				if _, err := s.ConfigSet(ctx, "deleted_media_retention_days", "0"); err != nil {
+					t.Fatal(err)
+				}
+				lifecycle, err := medialifecycle.NewService(s.Pool, "https://files.example.test/files/")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := lifecycle.Delete(ctx, objectID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.Pool.Exec(ctx, `CREATE FUNCTION reject_cleanup_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+				IF NEW.command='cleanup_result' THEN RAISE EXCEPTION 'injected result audit rejection'; END IF; RETURN NEW; END $$;
+				CREATE TRIGGER reject_cleanup_audit BEFORE INSERT ON admin_audit FOR EACH ROW EXECUTE FUNCTION reject_cleanup_audit()`); err != nil {
+				t.Fatal(err)
+			}
+			first, err := s.Cleanup(ctx, store, kind, false)
+			if !errors.Is(err, ErrPartial) || first.Failed != 1 || first.Completed != 0 || first.RunID == "" {
+				t.Fatalf("failed-audit cleanup=%+v err=%v", first, err)
+			}
+			var authorized, pending, nativeDone bool
+			if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM admin_audit WHERE command='cleanup_begin' AND outcome='partial'
+				AND $1::uuid=ANY(affected_ids) AND sanitized_arguments->>'run_id'=$2),
+				EXISTS(SELECT 1 FROM admin_cleanup_items WHERE run_id=$2::uuid AND object_id=$1 AND outcome='pending')`, objectID, first.RunID).Scan(&authorized, &pending); err != nil {
+				t.Fatal(err)
+			}
+			nativeDone, err = s.cleanupProof(ctx, kind, cleanupItem{id: objectID, mediaID: objectID})
+			if kind == "renditions" {
+				var mediaID string
+				if err := s.Pool.QueryRow(ctx, `SELECT media_id::text FROM admin_cleanup_items WHERE run_id=$1`, first.RunID).Scan(&mediaID); err != nil {
+					t.Fatal(err)
+				}
+				nativeDone, err = s.cleanupProof(ctx, kind, cleanupItem{id: objectID, mediaID: mediaID})
+			}
+			if err != nil || !authorized || !pending || !nativeDone {
+				t.Fatalf("lost recoverable authorization authorized=%v pending=%v nativeDone=%v err=%v", authorized, pending, nativeDone, err)
+			}
+			if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_cleanup_audit ON admin_audit`); err != nil {
+				t.Fatal(err)
+			}
+			resumed, err := New(s.Pool).Cleanup(ctx, store, kind, false)
+			if err != nil || resumed.RunID != first.RunID || resumed.Completed != 1 || len(resumed.IDs) != 1 || resumed.IDs[0] != objectID {
+				t.Fatalf("resumed=%+v err=%v", resumed, err)
+			}
+			var receipts int
+			if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM admin_audit WHERE command='cleanup_result' AND $1::uuid=ANY(affected_ids)
+				AND sanitized_arguments->>'run_id'=$2 AND sanitized_arguments->>'outcome'='completed'`, objectID, first.RunID).Scan(&receipts); err != nil || receipts != 1 {
+				t.Fatalf("completion receipts=%d err=%v", receipts, err)
+			}
+		})
+	}
+}
+
+func TestAdminIntegrationDirectRepairFencesResumeAndDryRunHasNoEffects(t *testing.T) {
+	s := integrationService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	entered, release := make(chan struct{}), make(chan struct{})
+	store, err := storage.Open(root, storage.Options{Faults: storage.FaultInjectorFunc(func(ctx context.Context, event storage.FaultEvent) error {
+		if event.Boundary == storage.BoundaryRepairRename && event.Phase == storage.Before {
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	id := newID()
+	path := filepath.Join(root, "originals", id[:2], id, "original.jpg")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checked, err := s.Check(ctx, store, reconciliation.ScopeAll)
+	if !errors.Is(err, ErrConflict) || !checked.Sealed || checked.FindingCount != 1 {
+		t.Fatalf("check=%+v err=%v", checked, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='direct repair test',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := s.Repair(ctx, store, checked.ReportID, true)
+	if err != nil || preview == nil {
+		t.Fatalf("maintenance preview=%+v err=%v", preview, err)
+	}
+	var mutations int
+	if err := s.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM admin_audit)+(SELECT count(*) FROM reconciliation_repair_runs)`).Scan(&mutations); err != nil || mutations != 0 {
+		t.Fatalf("preview mutations=%d err=%v", mutations, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("preview moved source: %v", err)
+	}
+	repository, err := reconciliation.NewRepairPostgresRepository(s.Pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairer, err := reconciliation.NewRepairer(repository, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := repairer.Plan(ctx, reconciliation.RepairPlanRequest{ReportID: checked.ReportID, AuthorizationID: newID(), Actor: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() {
+		_, err := repairer.Execute(ctx, plan.Run.RunID)
+		finished <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	// Direct Repairer does NOT take CLI sessionLock. Its real maintenance
+	// FOR SHARE fence must still prevent resume across check/cutover.
+	_, resumeErr := s.MaintenanceResume(ctx, store)
+	close(release)
+	if !errors.Is(resumeErr, ErrConflict) {
+		t.Fatalf("resume crossed direct repair transaction: %v", resumeErr)
+	}
+	if err := <-finished; err != nil {
+		t.Fatal(err)
 	}
 }
