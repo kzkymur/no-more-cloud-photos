@@ -304,9 +304,16 @@ func failedMixedJob(t *testing.T, s *Service) (string, string, string) {
 	if _, err := s.Pool.Exec(ctx, `INSERT INTO job_targets(id,job_id,profile_id,status) VALUES($1,$2,$3,'pending')`, otherTarget, jobID, second.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=1,max_attempts=1,started_at=clock_timestamp(),
-		lease_token=$2,lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE id=$1`, jobID, newID()); err != nil {
-		t.Fatal(err)
+	for attempt := 1; attempt <= 3; attempt++ {
+		if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,clock_timestamp()),
+			lease_token=$2,lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE id=$1`, jobID, newID()); err != nil {
+			t.Fatal(err)
+		}
+		if attempt < 3 {
+			if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET status='queued',lease_token=NULL,lease_expires_at=NULL WHERE id=$1`, jobID); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -364,7 +371,7 @@ func TestAdminIntegrationRetryReceiptsAtomicCrashAndSuccessfulTargetImmutable(t 
 		FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts, &maximum, &retryAudits); err != nil {
 		t.Fatal(err)
 	}
-	if status != "failed" || attempts != 1 || maximum != 1 || retryAudits != 0 {
+	if status != "failed" || attempts != 3 || maximum != 3 || retryAudits != 0 {
 		t.Fatalf("retry crash gap status=%s attempts=%d max=%d audits=%d", status, attempts, maximum, retryAudits)
 	}
 	if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_retry_page ON admin_batches`); err != nil {
@@ -382,7 +389,7 @@ func TestAdminIntegrationRetryReceiptsAtomicCrashAndSuccessfulTargetImmutable(t 
 		FROM jobs WHERE id=$1`, jobID).Scan(&status, &attempts, &maximum, &retryAudits); err != nil {
 		t.Fatal(err)
 	}
-	if status != "queued" || attempts != 1 || maximum != 4 || retryAudits != 1 {
+	if status != "queued" || attempts != 3 || maximum != 6 || retryAudits != 1 {
 		t.Fatalf("replayed retry status=%s attempts=%d max=%d audits=%d", status, attempts, maximum, retryAudits)
 	}
 	var after []byte
