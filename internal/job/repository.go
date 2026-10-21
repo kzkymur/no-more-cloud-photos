@@ -485,22 +485,35 @@ func (r *Repository) ReclaimExpired(ctx context.Context) (int, error) {
 	return len(jobs), nil
 }
 
+// AdminRetryFailed preserves the standalone transaction and failure-audit contract.
 func (r *Repository) AdminRetryFailed(ctx context.Context, jobID string, additionalAttempts int, audit AdminAudit) error {
-	if additionalAttempts <= 0 || audit.ID == "" || audit.Actor == "" || audit.Host == "" || !jsonObject(audit.SanitizedArguments) {
-		return ErrInvalid
-	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return classifyDatabaseError(err)
 	}
 	defer rollback(tx)
+	err = AdminRetryFailedTx(ctx, tx, jobID, additionalAttempts, audit)
+	if err != nil && !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrConflict) {
+		return err
+	}
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		return classifyDatabaseError(commitErr)
+	}
+	return err
+}
+
+// AdminRetryFailedTx lets administrative batches commit the retry, its audit,
+// and their durable item receipt/checkpoint in ONE transaction. The caller must
+// commit semantic conflicts (which have an audit), or roll back database errors.
+func AdminRetryFailedTx(ctx context.Context, tx pgx.Tx, jobID string, additionalAttempts int, audit AdminAudit) error {
+	if additionalAttempts <= 0 || additionalAttempts > 1000000 || audit.ID == "" || audit.Actor == "" || audit.Host == "" || !jsonObject(audit.SanitizedArguments) {
+		return ErrInvalid
+	}
 	var status Status
-	if err := tx.QueryRow(ctx, `SELECT status FROM jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&status); errors.Is(err, pgx.ErrNoRows) {
+	var attempts int
+	if err := tx.QueryRow(ctx, `SELECT status,attempts FROM jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&status, &attempts); errors.Is(err, pgx.ErrNoRows) {
 		if err := insertAdminRetryAudit(ctx, tx, jobID, audit, "failed", "not_found", "job not found"); err != nil {
 			return err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return classifyDatabaseError(err)
 		}
 		return ErrNotFound
 	} else if err != nil {
@@ -510,10 +523,10 @@ func (r *Repository) AdminRetryFailed(ctx context.Context, jobID string, additio
 		if err := insertAdminRetryAudit(ctx, tx, jobID, audit, "failed", "conflict", "job is not failed"); err != nil {
 			return err
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return classifyDatabaseError(err)
-		}
 		return ErrConflict
+	}
+	if attempts > 2147483647-additionalAttempts {
+		return ErrInvalid
 	}
 	if _, err := tx.Exec(ctx, `UPDATE jobs SET status='queued',max_attempts=GREATEST(max_attempts,attempts+$2),
 		available_at=clock_timestamp(),finished_at=NULL,updated_at=clock_timestamp() WHERE id=$1`, jobID, additionalAttempts); err != nil {
@@ -523,10 +536,7 @@ func (r *Repository) AdminRetryFailed(ctx context.Context, jobID string, additio
 		WHERE job_id=$1 AND status='failed'`, jobID); err != nil {
 		return classifyDatabaseError(err)
 	}
-	if err := insertAdminRetryAudit(ctx, tx, jobID, audit, "succeeded", "", ""); err != nil {
-		return err
-	}
-	return classifyDatabaseError(tx.Commit(ctx))
+	return insertAdminRetryAudit(ctx, tx, jobID, audit, "succeeded", "", "")
 }
 
 func insertAdminRetryAudit(ctx context.Context, tx pgx.Tx, jobID string, audit AdminAudit, outcome, code, message string) error {

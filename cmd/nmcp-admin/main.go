@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/config"
+	"github.com/kzkymur/no-more-cloud-photos/internal/admin"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
 )
@@ -31,6 +32,9 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] != "migrate" {
+		return admin.Run(ctx, args, stdout, stderr)
+	}
 	if len(args) < 2 || args[0] != "migrate" || (args[1] != "status" && args[1] != "up") {
 		fmt.Fprintln(stderr, "usage: nmcp-admin migrate (status|up) [--json]")
 		return exitUsage
