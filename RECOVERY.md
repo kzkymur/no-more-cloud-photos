@@ -42,3 +42,36 @@ implement regenerate/retry transaction boundaries and CLI entry points. Push
 another coherent checkpoint before operational adapters/tests. No merge or
 APPROVE authorization; independent match-head review and distinct main gates
 required after future merge by reviewer.
+
+## Integrated successor checkpoint
+- Added 0020_admin_batch_receipts.sql exact durable membership + immutable
+  completed receipts. Begin freezes eligible snapshot, Media-ID order and
+  pinned profile ID; pages commit effects, audit, receipts and checkpoint in
+  one transaction. UUID-low insert after begin is excluded. Same-job retry uses
+  AdminRetryFailedTx, preserves succeeded targets/attempt history and raises max.
+- CLI now wires batch flags/dryrun/confirmation/resume and all operational
+  command forms. Unsupported Issue19 backup/all cleanup returns failure BEFORE
+  touching any cleanup; no success stubs.
+- Checker/Repairer reused; repair remains in maintenance. Leader decision:
+  existing preflight maintenance requirement MUST remain; normal-mode repair
+  dryrun returns conflict/no writes, maintenance dryrun uses existing preflight.
+  No 0021 preview authorization relaxation is present.
+- Finite rendition Sweep adapter and bounded100 media cleanup use existing
+  lifecycle locking/rechecks/storage journals; response explicitly more_possible.
+- Maintenance resume runs fresh full check in maintenance; only sealed zero-
+  finding, all-source-complete report permits explicit resume, with audit.
+- Fixed independent review MED findings: no raw flag errors (io.Discard), human
+  named/pretty JSON dereferences retention pointers as null/0/positive. Added
+  causal regression tests, typed validation/confirmation, PG17 CLI/audit,
+  activation/no-backfill/stale versions, frozen batch/pin/page commit rejection,
+  lock conflict/audit, normal-mode repair dryrun no-write tests.
+- Existing CI retains all steps; early explicit administrative CLI PG17 evidence
+  added after existing role setup; prints gofmt diff so unavailable local gofmt
+  can be corrected from authoritative runner output. No verifier changes.
+
+Tests at successor creation: git diff --check PASS only. Local Go remains
+unavailable; new tests/compile/format UNVALIDATED until normal CI runs. First
+356cb25 CI/Infra still running at last observation (native builds, no results).
+Next: inspect successor early PG17 compile/runtime/format evidence, fix actual
+failures, add retry crash/max-attempts/success-target tests and operational
+maintenance/cleanup/HTTP integration coverage; push normal fixups, open draft PR.
