@@ -13,24 +13,24 @@ import (
 // BatchRequest's identity is persisted verbatim. Resume cannot change a target,
 // retry allowance, or pinned profile; page size is only an execution parameter.
 type BatchRequest struct {
-	Operation string `json:"operation"`
-	ProfileKey string `json:"profile_key,omitempty"`
-	MediaID string `json:"media_id,omitempty"`
-	JobID string `json:"job_id,omitempty"`
-	JobType string `json:"job_type,omitempty"`
-	All bool `json:"all"`
-	AdditionalAttempts int `json:"additional_attempts,omitempty"`
+	Operation          string `json:"operation"`
+	ProfileKey         string `json:"profile_key,omitempty"`
+	MediaID            string `json:"media_id,omitempty"`
+	JobID              string `json:"job_id,omitempty"`
+	JobType            string `json:"job_type,omitempty"`
+	All                bool   `json:"all"`
+	AdditionalAttempts int    `json:"additional_attempts,omitempty"`
 }
 
 type BatchResult struct {
-	Token string `json:"resume_token,omitempty"`
-	ProfileID *string `json:"profile_id,omitempty"`
-	Status string `json:"status"`
-	Total int64 `json:"total"`
-	Succeeded int64 `json:"succeeded"`
-	Failed int64 `json:"failed"`
+	Token      string          `json:"resume_token,omitempty"`
+	ProfileID  *string         `json:"profile_id,omitempty"`
+	Status     string          `json:"status"`
+	Total      int64           `json:"total"`
+	Succeeded  int64           `json:"succeeded"`
+	Failed     int64           `json:"failed"`
 	Checkpoint json.RawMessage `json:"checkpoint"`
-	DryRun bool `json:"dry_run"`
+	DryRun     bool            `json:"dry_run"`
 }
 
 func (r BatchRequest) Validate() error {
@@ -158,7 +158,7 @@ func (s *Service) BeginBatch(ctx context.Context, request BatchRequest, resume s
 type batchItem struct {
 	ordinal int64
 	mediaID string
-	jobID *string
+	jobID   *string
 }
 
 // BatchPage is the crash boundary. A committed page can never apply twice,

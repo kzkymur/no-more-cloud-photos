@@ -15,26 +15,26 @@ import (
 )
 
 type options struct {
-	command string
-	json bool
-	dry bool
-	yes bool
-	name string
-	value string
-	file string
-	id string
-	profile string
-	mediaID string
-	all bool
-	jobID string
-	status string
-	jobType string
-	additional int
-	batchSize int
-	resume string
-	scope string
-	report string
-	kind string
+	command        string
+	json           bool
+	dry            bool
+	yes            bool
+	name           string
+	value          string
+	file           string
+	id             string
+	profile        string
+	mediaID        string
+	all            bool
+	jobID          string
+	status         string
+	jobType        string
+	additional     int
+	batchSize      int
+	resume         string
+	scope          string
+	report         string
+	kind           string
 	definitionData []byte
 }
 
@@ -50,7 +50,7 @@ func parse(args []string) (options, error) {
 		if len(args) < 2 {
 			return o, ErrValidation
 		}
-		o.command += " "+args[1]
+		o.command += " " + args[1]
 		start = 2
 	}
 	flags := flag.NewFlagSet(o.command, flag.ContinueOnError)

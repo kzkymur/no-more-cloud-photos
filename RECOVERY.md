@@ -75,3 +75,14 @@ unavailable; new tests/compile/format UNVALIDATED until normal CI runs. First
 Next: inspect successor early PG17 compile/runtime/format evidence, fix actual
 failures, add retry crash/max-attempts/success-target tests and operational
 maintenance/cleanup/HTTP integration coverage; push normal fixups, open draft PR.
+
+## Canonical formatting and expanded regression slice
+Normal Core CI39523633637 exact2bff0a8 FAILED at gofmt-d exit1 BEFORE Go tests.
+No compiler or PostgreSQL runtime results were produced; subsequent steps skipped
+are NOT passes. Applied runner-produced formatting patch after git apply--check
+against the same frozen source. Formatting gate remains mandatory/unchanged.
+Added tests for retry commit rejection/no allowance gap, restarted receipt replay,
+same-job/max-attempts/history, byte-identical successful target, real CLI->HTTP
+job visibility/no duplicates, maintenance fresh clean check versus missing-file
+rejection, finite media cleanup/dryrun and unsupported backup cleanup. These new
+tests are not yet executed pending successor normal CI.

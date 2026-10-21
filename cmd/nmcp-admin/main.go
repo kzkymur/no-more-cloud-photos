@@ -12,8 +12,8 @@ import (
 	"syscall"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/kzkymur/no-more-cloud-photos/internal/config"
 	"github.com/kzkymur/no-more-cloud-photos/internal/admin"
+	"github.com/kzkymur/no-more-cloud-photos/internal/config"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
 )

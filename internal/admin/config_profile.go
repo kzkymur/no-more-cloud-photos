@@ -15,11 +15,11 @@ import (
 )
 
 type Configuration struct {
-	DeletedMediaRetentionDays *int `json:"deleted_media_retention_days"`
-	SupersededRenditionRetentionDays *int `json:"superseded_rendition_retention_days"`
-	DefaultTimezone string `json:"default_timezone"`
-	DBBackupIntervalHours int `json:"db_backup_interval_hours"`
-	DBBackupRetentionDays int `json:"db_backup_retention_days"`
+	DeletedMediaRetentionDays        *int   `json:"deleted_media_retention_days"`
+	SupersededRenditionRetentionDays *int   `json:"superseded_rendition_retention_days"`
+	DefaultTimezone                  string `json:"default_timezone"`
+	DBBackupIntervalHours            int    `json:"db_backup_interval_hours"`
+	DBBackupRetentionDays            int    `json:"db_backup_retention_days"`
 }
 
 func ConfigValue(name, value string) (any, error) {
@@ -81,13 +81,13 @@ func (s *Service) ConfigSet(ctx context.Context, name, value string) (Configurat
 // ProfileDocument is the file format, deliberately distinct from internal
 // Definition so JSON names are stable and unknown fields cannot be ignored.
 type ProfileDocument struct {
-	ID string `json:"id,omitempty"`
-	Key string `json:"key"`
-	Version int `json:"version"`
-	InputMIMETypes []string `json:"input_mime_types"`
-	Processor string `json:"processor"`
-	ParametersSchemaVersion int `json:"parameters_schema_version"`
-	Parameters json.RawMessage `json:"parameters"`
+	ID                      string          `json:"id,omitempty"`
+	Key                     string          `json:"key"`
+	Version                 int             `json:"version"`
+	InputMIMETypes          []string        `json:"input_mime_types"`
+	Processor               string          `json:"processor"`
+	ParametersSchemaVersion int             `json:"parameters_schema_version"`
+	Parameters              json.RawMessage `json:"parameters"`
 }
 
 func DecodeProfile(data []byte) (profile.Definition, error) {
@@ -121,14 +121,14 @@ func (s *Service) ProfileCreate(ctx context.Context, definition profile.Definiti
 	}
 	return s.mutate(ctx, "profile_create", "profile:"+definition.Key,
 		map[string]any{"id": definition.ID, "key": definition.Key, "version": definition.Version}, []string{definition.ID}, func(tx pgx.Tx) error {
-		if err := normal(ctx, tx); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, `INSERT INTO profiles(id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
+			if err := normal(ctx, tx); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO profiles(id,key,version,status,input_mime_types,processor,parameters_schema_version,parameters)
 			VALUES($1,$2,$3,'draft',$4,$5,$6,$7)`, definition.ID, definition.Key, definition.Version,
-			definition.InputMIMETypes, definition.Processor, definition.ParametersSchemaVersion, definition.Parameters)
-		return err
-	})
+				definition.InputMIMETypes, definition.Processor, definition.ParametersSchemaVersion, definition.Parameters)
+			return err
+		})
 }
 
 func (s *Service) ProfileTransition(ctx context.Context, id string, activate bool) error {

@@ -12,7 +12,7 @@ import (
 
 func TestConfigValueValidation(t *testing.T) {
 	for _, test := range []struct {
-		name string
+		name  string
 		value string
 		valid bool
 	}{

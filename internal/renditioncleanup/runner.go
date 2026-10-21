@@ -288,9 +288,9 @@ func sleep(ctx context.Context, delay time.Duration) error {
 // the repository's durable cleanup journal. Never claim all candidates done
 // when the finite limit was reached.
 type SweepResult struct {
-	IDs []string
-	Completed int
-	Failed int
+	IDs          []string
+	Completed    int
+	Failed       int
 	LimitReached bool
 }
 

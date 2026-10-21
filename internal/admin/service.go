@@ -18,19 +18,19 @@ import (
 )
 
 var (
-	ErrValidation = errors.New("invalid administrative request")
-	ErrConflict = errors.New("conflict or nothing eligible")
-	ErrConfirmation = errors.New("confirmation required (--yes)")
-	ErrPartial = errors.New("partial batch failure; resume with the returned token")
-	ErrUnsupported = errors.New("backup operations belong to Issue19 and are not implemented")
+	ErrValidation     = errors.New("invalid administrative request")
+	ErrConflict       = errors.New("conflict or nothing eligible")
+	ErrConfirmation   = errors.New("confirmation required (--yes)")
+	ErrPartial        = errors.New("partial batch failure; resume with the returned token")
+	ErrUnsupported    = errors.New("backup operations belong to Issue19 and are not implemented")
 	profileKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
-	uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	uuidPattern       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
 
 type Service struct {
-	Pool *pgxpool.Pool
+	Pool  *pgxpool.Pool
 	Actor string
-	Host string
+	Host  string
 }
 
 func New(pool *pgxpool.Pool) *Service {
@@ -53,7 +53,7 @@ func newID() string {
 	raw[6] = raw[6]&15 | 64
 	raw[8] = raw[8]&63 | 128
 	encoded := hex.EncodeToString(raw[:])
-	return encoded[:8]+"-"+encoded[8:12]+"-"+encoded[12:16]+"-"+encoded[16:20]+"-"+encoded[20:]
+	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
 }
 
 func classified(err error) error {

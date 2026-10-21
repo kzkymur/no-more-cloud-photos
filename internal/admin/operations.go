@@ -87,10 +87,10 @@ func (s *Service) Check(ctx context.Context, store *storage.Store, scope reconci
 }
 
 type Maintenance struct {
-	Mode string `json:"mode"`
-	Reason *string `json:"reason"`
-	Owner *string `json:"owner"`
-	EnteredAt *time.Time `json:"entered_at"`
+	Mode            string          `json:"mode"`
+	Reason          *string         `json:"reason"`
+	Owner           *string         `json:"owner"`
+	EnteredAt       *time.Time      `json:"entered_at"`
 	SuccessfulCheck json.RawMessage `json:"successful_check_report"`
 }
 
@@ -225,13 +225,13 @@ func (s *Service) Repair(ctx context.Context, store *storage.Store, report strin
 }
 
 type CleanupResult struct {
-	Kind string `json:"kind"`
-	DryRun bool `json:"dry_run"`
-	Eligible int `json:"eligible"`
-	Completed int `json:"completed"`
-	Failed int `json:"failed"`
-	MorePossible bool `json:"more_possible"`
-	IDs []string `json:"affected_ids"`
+	Kind         string   `json:"kind"`
+	DryRun       bool     `json:"dry_run"`
+	Eligible     int      `json:"eligible"`
+	Completed    int      `json:"completed"`
+	Failed       int      `json:"failed"`
+	MorePossible bool     `json:"more_possible"`
+	IDs          []string `json:"affected_ids"`
 }
 
 func (s *Service) Cleanup(ctx context.Context, store *storage.Store, kind string, dry bool) (CleanupResult, error) {
@@ -262,7 +262,7 @@ func (s *Service) Cleanup(ctx context.Context, store *storage.Store, kind string
 		}
 		sweep, err := runner.Sweep(ctx)
 		result.IDs, result.Completed, result.Failed, result.MorePossible = sweep.IDs, sweep.Completed, sweep.Failed, sweep.LimitReached
-		result.Eligible = result.Completed+result.Failed
+		result.Eligible = result.Completed + result.Failed
 		if auditErr := s.cleanupAudit(ctx, result); auditErr != nil {
 			return result, auditErr
 		}
