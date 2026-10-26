@@ -247,3 +247,12 @@ Standalone purge exact reclaim, native token/backoff/ceiling, known-failure rele
 unknown-commit protection and successful reverse resume/preflight were already
 implemented and PG17 early-PASS on1dfa; do not reimplement the other findings.
 All full exact successor gates and independent six-finding review still mandatory.
+
+Reviewer7829 follow-up adds real native PG cleanup physical-uncertainty tests
+(not just helper classification or fake COMMIT): actual unlink then injected
+post-unlink or pre-directory-fsync fault; live token/native pending progress and
+authorization must survive, no early release or completion audit; a fresh standalone
+cleanup cannot steal it. After fixture-controlled expiry, the native exact reclaim
+honors backoff, retries missing-file progress, and completes the same job/run with
+attempt2, one physical purge event and one affected-ID completion receipt after replay.
+No independent worker, no product backoff override, no uncertainty guard weakening.

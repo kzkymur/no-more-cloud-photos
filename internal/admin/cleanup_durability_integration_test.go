@@ -321,3 +321,109 @@ func TestAdminIntegrationCleanupFrozenRenditionBecomesNativeIneligible(t *testin
 		t.Fatalf("native ownership bypassed: untouched=%v err=%v", untouched, err)
 	}
 }
+
+func TestAdminIntegrationCleanupPhysicalUncertaintyPreservesLiveTokenUntilExpiry(t *testing.T) {
+	for _, boundary := range []storage.Boundary{storage.BoundaryDelete, storage.BoundaryDeleteDirectorySync} {
+		t.Run(string(boundary), func(t *testing.T) {
+			s, lifecycle, _ := cleanupDurabilityFixture(t)
+			ctx := context.Background()
+			id := cleanupDurabilityDelete(t, s, lifecycle, 650)
+			var path string
+			if err := s.Pool.QueryRow(ctx, `SELECT relative_path FROM originals WHERE media_id=$1`, id).Scan(&path); err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			fullPath := filepath.Join(root, filepath.FromSlash(path))
+			if err := os.MkdirAll(filepath.Dir(fullPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(fullPath, []byte("0123456789"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			phase := storage.After
+			if boundary == storage.BoundaryDeleteDirectorySync {
+				phase = storage.Before
+			}
+			injected := false
+			faulted, err := storage.Open(root, storage.Options{Faults: storage.FaultInjectorFunc(func(_ context.Context, event storage.FaultEvent) error {
+				if event.Boundary == boundary && event.Phase == phase {
+					injected = true
+					// This known-failure marker is wrapped in physical uncertainty
+					// after unlink. Uncertainty must win: no early lease release.
+					return storage.ErrPermission
+				}
+				return nil
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer faulted.Close()
+			first, err := s.Cleanup(ctx, faulted, "media", false)
+			if !errors.Is(err, ErrPartial) || first.Failed != 1 || first.Completed != 0 || !injected {
+				t.Fatalf("uncertain cleanup=%+v injected=%v err=%v", first, injected, err)
+			}
+			if _, err := os.Stat(fullPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("fault was not after actual unlink: %v", err)
+			}
+			var jobID, token string
+			var before, after []byte
+			if err := s.Pool.QueryRow(ctx, `SELECT j.id::text,j.lease_token::text,to_jsonb(j)
+				FROM admin_cleanup_items i JOIN jobs j ON j.id=i.job_id
+				WHERE i.run_id=$1 AND i.outcome='pending' AND j.status='running' AND j.attempts=1
+				AND j.lease_token IS NOT NULL AND j.lease_expires_at>clock_timestamp()`, first.RunID).Scan(&jobID, &token, &before); err != nil {
+				t.Fatalf("physical uncertainty released live ownership: %v", err)
+			}
+			var recoverable bool
+			if err := s.Pool.QueryRow(ctx, `SELECT
+				EXISTS(SELECT 1 FROM media WHERE id=$1)
+				AND EXISTS(SELECT 1 FROM originals WHERE media_id=$1)
+				AND EXISTS(SELECT 1 FROM purge_file_progress WHERE job_id=$2 AND disposition='pending')
+				AND NOT EXISTS(SELECT 1 FROM purge_file_progress WHERE job_id=$2 AND disposition<>'pending')
+				AND NOT EXISTS(SELECT 1 FROM admin_audit WHERE command='cleanup_result' AND $1::uuid=ANY(affected_ids))`, id, jobID).Scan(&recoverable); err != nil || !recoverable {
+				t.Fatalf("lost uncertain native progress/authorization=%v err=%v", !recoverable, err)
+			}
+			clean, err := storage.Open(root, storage.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer clean.Close()
+			live, err := New(s.Pool).Cleanup(ctx, clean, "media", false)
+			if !errors.Is(err, ErrPartial) || live.RunID != first.RunID || live.Completed != 0 {
+				t.Fatalf("live uncertain lease was stolen=%+v err=%v", live, err)
+			}
+			if err := s.Pool.QueryRow(ctx, `SELECT to_jsonb(j) FROM jobs j WHERE id=$1`, jobID).Scan(&after); err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("live job mutated before expiry: before=%s after=%s err=%v", before, after, err)
+			}
+			cleanupDurabilityExec(t, s, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, jobID)
+			recovered, err := New(s.Pool).Cleanup(ctx, clean, "media", false)
+			if errors.Is(err, ErrPartial) {
+				var backoff bool
+				if err := s.Pool.QueryRow(ctx, `SELECT status='queued' AND attempts=1 AND lease_token IS NULL
+					AND lease_expires_at IS NULL AND error_code='lease_expired' FROM jobs WHERE id=$1`, jobID).Scan(&backoff); err != nil || !backoff {
+					t.Fatalf("exact expiry did not preserve native backoff: %v err=%v", backoff, err)
+				}
+				cleanupDurabilityExec(t, s, `UPDATE jobs SET available_at=clock_timestamp() WHERE id=$1`, jobID)
+				recovered, err = New(s.Pool).Cleanup(ctx, clean, "media", false)
+			}
+			if err != nil || recovered.RunID != first.RunID || recovered.Completed != 1 || len(recovered.IDs) != 1 || recovered.IDs[0] != id {
+				t.Fatalf("uncertain missing-file recovery=%+v err=%v", recovered, err)
+			}
+			if _, err := New(s.Pool).Cleanup(ctx, clean, "media", false); err != nil {
+				t.Fatal(err)
+			}
+			var completedOnce bool
+			if err := s.Pool.QueryRow(ctx, `SELECT status='succeeded' AND attempts=2 AND lease_token IS NULL
+				AND (SELECT count(*) FROM jobs WHERE type='purge' AND media_id_snapshot=$2)=1
+				AND EXISTS(SELECT 1 FROM purge_file_progress WHERE job_id=$1 AND object_kind='original' AND disposition='missing')
+				AND (SELECT count(*) FROM change_events WHERE media_id=$2 AND event_type='media_purged' AND reason='physical_purge')=1
+				AND (SELECT count(*) FROM admin_audit WHERE command='cleanup_result' AND $2::uuid=ANY(affected_ids)
+				     AND sanitized_arguments->>'outcome'='completed')=1
+				FROM jobs WHERE id=$1`, jobID, id).Scan(&completedOnce); err != nil || !completedOnce {
+				t.Fatalf("uncertain completion lost identity/exactly-once=%v err=%v", !completedOnce, err)
+			}
+			if err := lifecycle.FinishPurgeAttempt(ctx, jobID, token, "file_delete_failed"); err == nil {
+				t.Fatal("obsolete pre-expiry token released successor completion")
+			}
+		})
+	}
+}
