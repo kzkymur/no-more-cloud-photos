@@ -281,9 +281,3 @@ func sleep(ctx context.Context, delay time.Duration) error {
 		return ctx.Err()
 	}
 }
-
-// Sweep performs one bounded administrative sweep, not the daemon's infinite
-// Run loop. Every item retains the same lifecycle locking and storage checks.
-// On uncertainty the exact ID is returned; a later invocation converges using
-// the repository's durable cleanup journal. Never claim all candidates done
-// when the finite limit was reached.

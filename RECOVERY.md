@@ -237,3 +237,13 @@ inject a lost file-step COMMIT acknowledgement; assert exactly one step and no
 FinishPurgeAttempt/Finalize follow-on. Unknown heartbeat/finalize and known
 storage failure release are contrasted. This supplements native expired-lease
 restart PG17 tests, rather than calling a predicate a full control-flow proof.
+
+REV2 explicit reviewer follow-up adds isolated admission negatives: source-error
+sealed report and future-version-only22 with valid matching applied history,
+name/checksum/format/three clean sources/seal (only unsupported version differs).
+The prior999 case also had invalid name/checksum and was not sufficient alone.
+Remove the dangling comment after deleted Sweep adapter; no daemon semantics change.
+Standalone purge exact reclaim, native token/backoff/ceiling, known-failure release,
+unknown-commit protection and successful reverse resume/preflight were already
+implemented and PG17 early-PASS on1dfa; do not reimplement the other findings.
+All full exact successor gates and independent six-finding review still mandatory.

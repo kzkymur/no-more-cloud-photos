@@ -742,7 +742,7 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 	if err != nil || !checked.Sealed || checked.FindingCount != 0 {
 		t.Fatalf("clean check=%+v err=%v", checked, err)
 	}
-	checkAdmission := func(t *testing.T, version int64, badName, badChecksum, sealed, admitted bool) {
+	checkAdmission := func(t *testing.T, version int64, badName, badChecksum, sealed, sourceError, admitted bool) {
 		t.Helper()
 		id := newID()
 		_, err := s.Pool.Exec(ctx, `INSERT INTO reconciliation_check_reports
@@ -756,8 +756,10 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Pool.Exec(ctx, `INSERT INTO reconciliation_check_source_results(report_id,source,result)
-			SELECT $1,source,result FROM reconciliation_check_source_results WHERE report_id=$2`, id, checked.ReportID); err != nil {
+		if _, err := s.Pool.Exec(ctx, `INSERT INTO reconciliation_check_source_results(report_id,source,result,error_code)
+			SELECT $1,source,CASE WHEN $3 AND source='storage_scan' THEN 'error' ELSE result END,
+			CASE WHEN $3 AND source='storage_scan' THEN 'test_source_error' ELSE NULL END
+			FROM reconciliation_check_source_results WHERE report_id=$2`, id, checked.ReportID, sourceError); err != nil {
 			t.Fatal(err)
 		}
 		if sealed {
@@ -777,12 +779,22 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 			t.Fatalf("admitted=%v want=%v err=%v", err == nil, admitted, err)
 		}
 	}
-	t.Run("admin-receipts-20", func(t *testing.T) { checkAdmission(t, 20, false, false, true, true) })
-	t.Run("compatibility-21", func(t *testing.T) { checkAdmission(t, 21, false, false, true, true) })
-	t.Run("unknown-version", func(t *testing.T) { checkAdmission(t, 999, true, true, true, false) })
-	t.Run("wrong-name", func(t *testing.T) { checkAdmission(t, 21, true, false, true, false) })
-	t.Run("wrong-checksum", func(t *testing.T) { checkAdmission(t, 21, false, true, true, false) })
-	t.Run("unsealed", func(t *testing.T) { checkAdmission(t, 21, false, false, false, false) })
+	t.Run("admin-receipts-20", func(t *testing.T) { checkAdmission(t, 20, false, false, true, false, true) })
+	t.Run("compatibility-21", func(t *testing.T) { checkAdmission(t, 21, false, false, true, false, true) })
+	t.Run("unknown-version", func(t *testing.T) { checkAdmission(t, 999, true, true, true, false, false) })
+	t.Run("wrong-name", func(t *testing.T) { checkAdmission(t, 21, true, false, true, false, false) })
+	t.Run("wrong-checksum", func(t *testing.T) { checkAdmission(t, 21, false, true, true, false, false) })
+	t.Run("unsealed", func(t *testing.T) { checkAdmission(t, 21, false, false, false, false, false) })
+	t.Run("source-error", func(t *testing.T) { checkAdmission(t, 21, false, false, true, true, false) })
+	t.Run("future-version-only", func(t *testing.T) {
+		// Everything except the explicit supported-version whitelist matches:
+		// valid applied history/name/hash, sealed report, three clean sources.
+		if _, err := s.Pool.Exec(ctx, `INSERT INTO schema_migrations(version,name,checksum,transactional,idempotent,dirty)
+			VALUES(22,'future_compatibility_fixture',repeat('a',64),true,false,false)`); err != nil {
+			t.Fatal(err)
+		}
+		checkAdmission(t, 22, false, false, true, false, false)
+	})
 }
 
 func TestAdminIntegrationBeginCommitRejectionHasNoResumeToken(t *testing.T) {
