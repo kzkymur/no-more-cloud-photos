@@ -139,8 +139,11 @@ func (s *Service) cleanupSelection(ctx context.Context, kind string, dry bool) (
 	}
 	err = rows.Err()
 	rows.Close()
-	if err != nil || dry || len(items) == 0 {
+	if err != nil || dry {
 		return items, runID, err
+	}
+	if len(items) == 0 {
+		return items, runID, tx.Commit(ctx)
 	}
 	if runID == "" {
 		runID = newID()
@@ -215,6 +218,18 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 		done, err := s.cleanupProof(ctx, kind, item)
 		return done, false, err
 	}
+	// A bound authorization may execute only that exact native job. Restore
+	// can cancel an unstarted J1; a later J2 needs a new cleanup_begin run.
+	if item.jobID != nil {
+		var cancelled bool
+		if err := s.Pool.QueryRow(ctx, `SELECT status='cancelled' AND started_at IS NULL
+			FROM jobs WHERE id=$1 AND type='purge' AND media_id_snapshot=$2`, *item.jobID, item.mediaID).Scan(&cancelled); err != nil {
+			return false, false, err
+		}
+		if cancelled {
+			return false, true, nil
+		}
+	}
 	var eligible bool
 	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM media WHERE id=$1 AND deleted_at IS NOT NULL AND purge_after<=clock_timestamp())`, item.id).Scan(&eligible); err != nil {
 		return false, false, err
@@ -222,35 +237,30 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 	if !eligible {
 		return false, true, nil
 	}
-	if item.jobID != nil {
-		var cancelled bool
-		if err := s.Pool.QueryRow(ctx, `SELECT status='cancelled' FROM jobs WHERE id=$1`, *item.jobID).Scan(&cancelled); err != nil {
+	if item.jobID == nil {
+		enqueued, err := lifecycle.EnqueueDuePurge(ctx, item.mediaID)
+		if err != nil {
 			return false, false, err
 		}
-		if cancelled {
-			// Restore revoked this exact authorization. Close it as skipped;
-			// a later finite run must authorize any re-deleted Media afresh.
-			return false, true, nil
+		// Read back the authoritative immutable binding, not the speculative
+		// enqueue response or a zero-row UPDATE result.
+		var jobID string
+		if err := s.Pool.QueryRow(ctx, `UPDATE admin_cleanup_items SET job_id=COALESCE(job_id,$3)
+			WHERE run_id=$1 AND object_id=$2 AND outcome='pending' RETURNING job_id::text`, runID, item.id, enqueued.Job.ID).Scan(&jobID); err != nil {
+			return false, false, err
 		}
+		item.jobID = &jobID
 	}
-	enqueued, err := lifecycle.EnqueueDuePurge(ctx, item.mediaID)
+	repository, err := medialifecycle.NewPostgresRepository(s.Pool, os.Getenv("NMCP_FILE_BASE_URL"))
 	if err != nil {
 		return false, false, err
 	}
-	// Bind the exact job before its destructive first start. If the enqueue
-	// response was lost, the same lifecycle enqueue rediscovers that job.
-	if item.jobID != nil && *item.jobID != enqueued.Job.ID {
-		return false, true, nil
-	}
-	bound, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_items SET job_id=$3 WHERE run_id=$1 AND object_id=$2
-		AND outcome='pending' AND (job_id IS NULL OR job_id=$3)`, runID, item.id, enqueued.Job.ID)
-	if err != nil {
+	// Exact-job native Media-first reclaim never touches unrelated jobs or
+	// steals a live token. Native retry backoff and attempt ceilings remain.
+	if err := repository.ReclaimExpiredPurge(ctx, *item.jobID); err != nil {
 		return false, false, err
 	}
-	if bound.RowsAffected() != 1 {
-		return false, false, ErrConflict
-	}
-	lease, err := lifecycle.StartPurge(ctx, enqueued.Job.ID)
+	lease, err := lifecycle.StartPurge(ctx, *item.jobID)
 	if err != nil {
 		return false, false, err
 	}
@@ -260,6 +270,15 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 		}
 		step, err := lifecycle.RunPurgeFileStep(ctx, lease.JobID, lease.Token, medialifecycle.StoragePurgeFileAction(store))
 		if err != nil {
+			// Release only a positively known storage failure. Never release on
+			// lost COMMIT acknowledgement, database/lease loss, or finalization
+			// uncertainty: expiry and native journals decide those outcomes.
+			if cleanupCanReleaseAttempt(err) {
+				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				releaseErr := lifecycle.FinishPurgeAttempt(releaseCtx, lease.JobID, lease.Token, "file_delete_failed")
+				cancel()
+				err = errors.Join(err, releaseErr)
+			}
 			return false, false, err
 		}
 		if step.Done {
@@ -286,4 +305,15 @@ func (s *Service) cleanupReceipt(ctx context.Context, kind, runID string, item c
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// Physical uncertainty is not a known failure and must not shorten the lease.
+func cleanupCanReleaseAttempt(err error) bool {
+	var unknown *medialifecycle.CommitOutcomeUnknown
+	if errors.As(err, &unknown) || medialifecycle.IsKind(err, medialifecycle.KindDatabaseUnavailable) ||
+		errors.Is(err, medialifecycle.ErrPurgeLeaseLost) || errors.Is(err, storage.ErrOutcomeUncertain) || errors.Is(err, storage.ErrDurability) {
+		return false
+	}
+	return errors.Is(err, storage.ErrPermission) || errors.Is(err, storage.ErrNoSpace) || errors.Is(err, storage.ErrQuota) ||
+		errors.Is(err, storage.ErrReadOnly) || errors.Is(err, storage.ErrValidation) || errors.Is(err, storage.ErrSymlink) || errors.Is(err, storage.ErrUnexpectedType)
 }

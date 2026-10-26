@@ -191,3 +191,22 @@ lost-reply fault seam for Begin and Page, asserting unknown responses then exact
 restart/receipt replay and no duplicate retry allowance. Removed uncalled Sweep
 adapter. Additional exact-bound purge recovery and reverse maintenance fence
 causal tests remain in progress. No full-gate or reviewer approval inferred.
+
+## Explicit receiving owner KtVQ47SzhpMQKUpg
+Leader request44a90d52 explicitly reassigns this receiving runtime. Created
+unique worktree issue18-exclusive-kt-d6a6563f / branch
+engineer/issue18-exclusive-kt-d6a6563f from published PR46 exactbfdc77e.
+All older worktrees/branches and retired patches remain untouched.
+
+Reviewed preserved MuVs patch before adopting only the native exact-job reclaim
+state-machine factor: global scheduler behavior unchanged; exact ID required,
+Media-first locks/expiry recheck, attempts/ceiling/backoff and token reset remain
+native. Cleanup executes only its persisted immutable binding. Known storage
+failures release the owned attempt through token-fenced FinishPurgeAttempt;
+unknown COMMIT/database/lease/physical outcomes never trigger blind release.
+Inherited BeginBatch and real committed-response-loss tests, canonical0021,
+Ubuntu final-schema assertions and existing cleanup/provenance fixes are retained.
+Added preserved independently-authored cleanup durability tests after inspection:
+live/expired abandoned lease, unrelated lease untouched, standalone retry,
+file failure release, legacy exhausted run, replacement authorization/audit loss.
+Local Go is unavailable: no compile/runtime/full-gate acceptance claimed here.

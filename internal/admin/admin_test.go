@@ -8,6 +8,9 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 func TestConfigValueValidation(t *testing.T) {
@@ -128,5 +131,21 @@ func TestBeginCommitAmbiguityNeverClaimsMembership(t *testing.T) {
 	result := beginCommitFailure(BatchResult{Token: "identity", Status: "running", Total: 7}, io.ErrUnexpectedEOF)
 	if result.Token != "identity" || result.Status != "unknown" || result.CommitState != "unknown" || result.Total != 0 {
 		t.Fatalf("speculative ambiguous begin: %+v", result)
+	}
+}
+
+func TestCleanupAttemptReleaseRejectsUncertainOrLostOwnership(t *testing.T) {
+	for _, cause := range []error{storage.ErrPermission, storage.ErrNoSpace, storage.ErrQuota, storage.ErrReadOnly, storage.ErrValidation} {
+		if !cleanupCanReleaseAttempt(cause) {
+			t.Fatalf("known storage failure not releasable: %v", cause)
+		}
+	}
+	for _, cause := range []error{nil, io.ErrUnexpectedEOF, medialifecycle.ErrPurgeLeaseLost, storage.ErrOutcomeUncertain, storage.ErrDurability,
+		&medialifecycle.CommitOutcomeUnknown{Cause: storage.ErrPermission},
+		errors.Join(storage.ErrPermission, storage.ErrOutcomeUncertain),
+		errors.Join(storage.ErrPermission, medialifecycle.ErrPurgeLeaseLost)} {
+		if cleanupCanReleaseAttempt(cause) {
+			t.Fatalf("uncertain failure released ownership: %v", cause)
+		}
 	}
 }
