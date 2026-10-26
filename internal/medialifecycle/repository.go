@@ -637,6 +637,20 @@ func (r *PostgresRepository) DiscoverPurgeJobs(ctx context.Context, limit int) (
 }
 
 func (r *PostgresRepository) ReclaimExpiredPurges(ctx context.Context, limit int) ([]string, error) {
+	return r.reclaimExpiredPurges(ctx, limit, "")
+}
+
+// ReclaimExpiredPurge applies the native Media-first reclaim protocol to only
+// the administratively authorized job. Live leases are never taken over.
+func (r *PostgresRepository) ReclaimExpiredPurge(ctx context.Context, jobID string) error {
+	if !readapi.IsUUIDv4(jobID) {
+		return newInvalidID()
+	}
+	_, err := r.reclaimExpiredPurges(ctx, 1, jobID)
+	return err
+}
+
+func (r *PostgresRepository) reclaimExpiredPurges(ctx context.Context, limit int, onlyJobID string) ([]string, error) {
 	if limit <= 0 || limit > purgeSchedulerBatchMax || r.jitter == nil {
 		return nil, newInvariant(errors.New("invalid purge reclaim configuration"))
 	}
@@ -655,8 +669,8 @@ func (r *PostgresRepository) ReclaimExpiredPurges(ctx context.Context, limit int
 		err := tx.QueryRow(ctx, `SELECT j.id::text,m.id::text
 			FROM jobs AS j JOIN media AS m ON m.id=j.media_id_snapshot
 			WHERE j.type='purge' AND j.status='running' AND j.lease_expires_at<=clock_timestamp()
-			  AND NOT (j.id=ANY($1::uuid[]))
-			ORDER BY j.lease_expires_at,j.id FOR UPDATE OF m SKIP LOCKED LIMIT 1`, excludedJobIDs).Scan(&jobID, &mediaID)
+			  AND NOT (j.id=ANY($1::uuid[])) AND ($2='' OR j.id::text=$2)
+			ORDER BY j.lease_expires_at,j.id FOR UPDATE OF m SKIP LOCKED LIMIT 1`, excludedJobIDs, onlyJobID).Scan(&jobID, &mediaID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			break
 		}

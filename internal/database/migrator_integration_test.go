@@ -39,8 +39,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 19 || status.Ready() || !status.Pending {
-			t.Fatalf("Status() = %+v, want pending version nineteen", status)
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 21 || status.Ready() || !status.Pending {
+			t.Fatalf("Status() = %+v, want pending version twenty", status)
 		}
 		var historyExists bool
 		if err := pool.QueryRow(context.Background(), `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&historyExists); err != nil {
@@ -63,8 +63,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 19 || status.ExpectedVersion != 19 || !status.Ready() {
-			t.Fatalf("Status() after Up = %+v, want ready version nineteen", status)
+		if status.CurrentVersion != 21 || status.ExpectedVersion != 21 || !status.Ready() {
+			t.Fatalf("Status() after Up = %+v, want ready version twenty", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
 			t.Fatalf("second Up() error = %v", err)
@@ -221,8 +221,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(full.migrations) != 19 {
-			t.Fatalf("migration count = %d, want 19", len(full.migrations))
+		if len(full.migrations) != 21 {
+			t.Fatalf("migration count = %d, want 21", len(full.migrations))
 		}
 		migrationUnderTest := full.migrations[17]
 		if migrationUnderTest.version != 18 || migrationUnderTest.name != "reconciliation_checker_sources" ||
@@ -682,7 +682,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 19 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 21 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
@@ -2296,7 +2296,7 @@ func TestRepairMigrationCatalogFreshAndV18Upgrade(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(migrator.migrations) != 19 || migrator.migrations[18].version != 19 || migrator.migrations[18].name != "reconciliation_repair_execution" {
+			if len(migrator.migrations) != 21 || migrator.migrations[18].version != 19 || migrator.migrations[18].name != "reconciliation_repair_execution" {
 				t.Fatalf("migration 19 identity = %+v", migrator.migrations[18])
 			}
 			if mode == "v18_upgrade" {
@@ -2464,7 +2464,7 @@ func TestRepairMigrationDrainsExistingRepairWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	var version int64
-	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 19 {
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 21 {
 		t.Fatalf("migration version after writer drain = %d, %v", version, err)
 	}
 }
@@ -2707,7 +2707,7 @@ func assertCheckerTempShadowCannotIntercept(t *testing.T, ctx context.Context, p
 	if err := tx.QueryRow(ctx, `SELECT migration_version FROM reconciliation_check_reports WHERE id=$1`, reportID).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 19 {
+	if version != 21 {
 		t.Fatalf("checker definer used shadow migration history version %d", version)
 	}
 	if err := tx.Commit(ctx); err != nil {

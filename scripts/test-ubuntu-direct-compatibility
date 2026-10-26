@@ -2,6 +2,9 @@
 """Small unprivileged tests for direct runner failure propagation and snapshots."""
 import importlib.machinery
 import importlib.util
+import hashlib
+import os
+import sqlite3
 from pathlib import Path
 import subprocess
 import tempfile
@@ -42,6 +45,47 @@ class DirectTests(unittest.TestCase):
             direct.snapshot(str(repo), sha, destination)
             self.assertEqual((destination / 'asset').read_text(), 'committed')
             self.assertFalse((destination / 'untracked').exists())
+
+
+class CurrentMigrationAssertionTests(unittest.TestCase):
+    def test_exact_history_and_closed_current_boundary(self):
+        # Exercise the actual shell helper SQL against an isolated relational
+        # fixture; privileged PG17 full phases remain the formal authority.
+        root = Path(__file__).resolve().parent.parent
+        script = (root / 'scripts/verify-ubuntu-migration-role-compatibility').read_text()
+        helpers = script[script.index('assert_migration() {'):script.index('wait_for_path() {')]
+        migrations = []
+        for version, name in [(19, 'reconciliation_repair_execution'),
+                              (20, 'admin_batch_receipts'),
+                              (21, 'admin_repair_schema_compatibility')]:
+            sql = root / f'internal/database/migrations/{version:04d}_{name}.sql'
+            migrations.append((version, name, hashlib.sha256(sql.read_bytes()).hexdigest(), 0))
+        with tempfile.TemporaryDirectory() as temp:
+            db = Path(temp) / 'history.db'
+            driver = Path(temp) / 'query.py'
+            driver.write_text('import os,sqlite3,sys\n'
+                              'with sqlite3.connect(os.environ["HISTORY_DB"]) as c:\n'
+                              ' print(c.execute(sys.argv[-1]).fetchone()[0])\n')
+            with sqlite3.connect(db) as c:
+                c.execute('CREATE TABLE schema_migrations(version INTEGER,name TEXT,checksum TEXT,dirty INTEGER)')
+            cases = [([], True), (["UPDATE schema_migrations SET name='wrong' WHERE version=21"], False),
+                     (["UPDATE schema_migrations SET checksum='wrong' WHERE version=21"], False),
+                     (["UPDATE schema_migrations SET dirty=1 WHERE version=21"], False),
+                     (["UPDATE schema_migrations SET dirty=1 WHERE version=20"], False),
+                     (["UPDATE schema_migrations SET name='wrong' WHERE version=19"], False),
+                     (["UPDATE schema_migrations SET checksum='wrong' WHERE version=20"], False),
+                     (["INSERT INTO schema_migrations VALUES(22,'future','unknown',0)"], False)]
+            for changes, accepted in cases:
+                with self.subTest(changes=changes):
+                    with sqlite3.connect(db) as c:
+                        c.execute('DELETE FROM schema_migrations')
+                        c.executemany('INSERT INTO schema_migrations VALUES(?,?,?,?)', migrations)
+                        for query in changes:
+                            c.execute(query)
+                    result = subprocess.run(['bash', '-euc',
+                        'psql_root() { python3 "$QUERY_DRIVER" "$@"; }\n' + helpers + '\nassert_current_migration'],
+                        env={**os.environ, 'QUERY_DRIVER': str(driver), 'HISTORY_DB': str(db)}, capture_output=True)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr.decode())
 
 
 if __name__ == '__main__':

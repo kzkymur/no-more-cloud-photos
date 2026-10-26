@@ -45,6 +45,10 @@ jobs:
           psql "$TEST_DATABASE_URL" --set ON_ERROR_STOP=1
           --set nmcp_migrator_role=nmcp
           --file infra/postgresql/runtime-roles.sql
+      - name: Explicit administrative CLI PostgreSQL integration evidence
+        run: |
+          gofmt -d cmd/nmcp-admin internal/admin internal/job/repository.go internal/renditioncleanup/runner.go
+          go test -v -count=1 ./internal/admin ./cmd/nmcp-admin
       - name: Restore content-addressed fixture archive
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:

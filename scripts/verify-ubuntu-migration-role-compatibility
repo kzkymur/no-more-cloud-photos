@@ -57,6 +57,13 @@ assert_migration() {
   [[ $(psql_root --tuples-only --no-align --command \
     "SELECT count(*) FILTER (WHERE version=$version AND name='$name' AND checksum='$checksum' AND NOT dirty)||':'||count(*) FILTER (WHERE dirty OR version>$version)||':'||max(version) FROM schema_migrations") == "1:0:$version" ]]
 }
+assert_current_migration() {
+  assert_migration 21 admin_repair_schema_compatibility 42ed20866eaba31b0370352f8d011ae3faf16a4b4eca6bdac6a9432d6bd73558
+  # Retain exact historical evidence rather than replacing the old assertion
+  # with an unconstrained max(version) check. Future/dirty versions still fail.
+  [[ $(psql_root --tuples-only --no-align --command \
+    "SELECT count(*) FROM schema_migrations WHERE NOT dirty AND ((version=19 AND name='reconciliation_repair_execution' AND checksum='d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13') OR (version=20 AND name='admin_batch_receipts' AND checksum='31bf09939cd55366ef7486bde0bee42c9e0f255d20dece9a17b3139f81898acb'))") == 2 ]]
+}
 wait_for_path() {
   local path=$1 attempt
   for attempt in {1..100}; do
@@ -93,7 +100,7 @@ case $phase in
   fresh-current)
     reset_database
     run_wrapper "$current" migrate up --json
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_current_migration
     assert_hardened
     ;;
   current-rerun)
@@ -173,7 +180,7 @@ case $phase in
     run_wrapper "$v18" migrate up --json
     assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24
     run_wrapper "$current" migrate up --json
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_current_migration
     assert_hardened
     ;;
   unfinished-v18-rejection)
@@ -193,7 +200,7 @@ case $phase in
     # runtime catalog for the supervisor's independent phase boundary.
     reset_database
     run_wrapper "$current" migrate up --json
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_current_migration
     assert_hardened
     ;;
   completed-v18-rejection)
@@ -217,7 +224,7 @@ case $phase in
     # runtime catalog for the supervisor's independent phase boundary.
     reset_database
     run_wrapper "$current" migrate up --json
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_current_migration
     assert_hardened
     ;;
   writer-drain)
@@ -240,7 +247,7 @@ case $phase in
     writer_pid=
     wait "$migration_pid"
     migration_pid=
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_current_migration
     assert_hardened
     ;;
   *) printf 'unknown compatibility phase: %s\n' "$phase" >&2; exit 2 ;;

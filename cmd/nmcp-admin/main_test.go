@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -95,13 +96,12 @@ func isolatedDatabaseURL(t *testing.T, databaseURL string) string {
 		}
 	})
 
-	config, err := pgxpool.ParseConfig(databaseURL)
+	parsed, err := url.Parse(databaseURL)
 	if err != nil {
 		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
 	}
-	if config.ConnConfig.RuntimeParams == nil {
-		config.ConnConfig.RuntimeParams = make(map[string]string)
-	}
-	config.ConnConfig.RuntimeParams["search_path"] = identifier
-	return config.ConnString()
+	query := parsed.Query()
+	query.Set("search_path", schema+",pg_catalog,pg_temp")
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
