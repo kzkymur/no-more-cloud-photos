@@ -228,7 +228,7 @@ func TestAdminIntegrationCleanupRestoreRedeletePinsNewAuthorizationAndAudit(t *t
 	if err := s.Pool.QueryRow(ctx, `SELECT
 		(SELECT count(*) FROM admin_audit WHERE command='cleanup_result' AND sanitized_arguments->>'run_id'=$1::text
 		AND sanitized_arguments->>'outcome'='completed' AND $2::uuid=ANY(affected_ids)),
-		(SELECT attempts FROM jobs WHERE id=$3),finished_at IS NOT NULL FROM admin_cleanup_runs WHERE id=$1`, resumed.RunID, id, second.Job.ID).Scan(&receipts, &attempts, &finished); err != nil || receipts != 1 || attempts != 1 || !finished {
+		(SELECT attempts FROM jobs WHERE id=$3),finished_at IS NOT NULL FROM admin_cleanup_runs WHERE id=$1::uuid`, resumed.RunID, id, second.Job.ID).Scan(&receipts, &attempts, &finished); err != nil || receipts != 1 || attempts != 1 || !finished {
 		t.Fatalf("replay receipts=%d attempts=%d finished=%v err=%v", receipts, attempts, finished, err)
 	}
 }

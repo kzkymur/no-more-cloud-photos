@@ -210,3 +210,11 @@ Added preserved independently-authored cleanup durability tests after inspection
 live/expired abandoned lease, unrelated lease untouched, standalone retry,
 file failure release, legacy exhausted run, replacement authorization/audit loss.
 Local Go is unavailable: no compile/runtime/full-gate acceptance claimed here.
+
+Formal PG17 push Core40249692557 exact987c2fd reached all administrative tests.
+Only failure was supplemental J1/J2 final assertion SQL parameter inference:
+`nmcp_uuid_v4 = text` at cleanup_durability_integration_test.go:232. Force UUID
+for the run-ID comparison; do not alter production guards. Abandoned live/expired
+purge recovery, unrelated lease isolation, known file-failure release, legacy
+exhausted runs and stale rendition tests passed in that run. Full downstream
+Core steps skipped after early failure are not passes; successor gates required.
