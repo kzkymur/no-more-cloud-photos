@@ -673,6 +673,13 @@ func TestAdminIntegrationDirectRepairFencesResumeAndDryRunHasNoEffects(t *testin
 	if _, err := s.Pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='direct repair test',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
+	// The checker records the latest schema, not the older repair migration.
+	// Both the reader admission and persisted plan seal must support it.
+	var reportVersion, latestVersion int64
+	if err := s.Pool.QueryRow(ctx, `SELECT migration_version,(SELECT max(version) FROM schema_migrations)
+		FROM reconciliation_check_reports WHERE id=$1`, checked.ReportID).Scan(&reportVersion, &latestVersion); err != nil || reportVersion != latestVersion || reportVersion < 21 {
+		t.Fatalf("report version=%d latest=%d err=%v", reportVersion, latestVersion, err)
+	}
 	preview, err := s.Repair(ctx, store, checked.ReportID, true)
 	if err != nil || preview == nil {
 		t.Fatalf("maintenance preview=%+v err=%v", preview, err)
@@ -696,6 +703,10 @@ func TestAdminIntegrationDirectRepairFencesResumeAndDryRunHasNoEffects(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	var sealedVersion int64
+	if err := s.Pool.QueryRow(ctx, `SELECT report_migration_version FROM reconciliation_repair_plan_seals WHERE run_id=$1`, plan.Run.RunID).Scan(&sealedVersion); err != nil || sealedVersion != reportVersion {
+		t.Fatalf("sealed version=%d report=%d err=%v", sealedVersion, reportVersion, err)
+	}
 	finished := make(chan error, 1)
 	go func() {
 		_, err := repairer.Execute(ctx, plan.Run.RunID)
@@ -716,4 +727,63 @@ func TestAdminIntegrationDirectRepairFencesResumeAndDryRunHasNoEffects(t *testin
 	if err := <-finished; err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Compatibility is explicit, not a removal of sealed evidence admission.
+func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	checked, err := s.Check(ctx, store, reconciliation.ScopeAll)
+	if err != nil || !checked.Sealed || checked.FindingCount != 0 {
+		t.Fatalf("clean check=%+v err=%v", checked, err)
+	}
+	checkAdmission := func(t *testing.T, version int64, badName, badChecksum, sealed, sourceError, admitted bool) {
+		t.Helper()
+		id := newID()
+		_, err := s.Pool.Exec(ctx, `INSERT INTO reconciliation_check_reports
+			(id,format_version,classifier_version,scope,migration_version,migration_name,migration_checksum,
+			db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at)
+			SELECT $1,format_version,classifier_version,scope,$3,
+			CASE WHEN $4 THEN 'unknown_migration' ELSE (SELECT name FROM schema_migrations WHERE version=$3) END,
+			CASE WHEN $5 THEN repeat('0',64) ELSE (SELECT checksum FROM schema_migrations WHERE version=$3) END,
+			db_snapshot_started_at,db_cutoff_at,db_snapshot_ended_at,fs_scan_started_at,temp_cutoff_at
+			FROM reconciliation_check_reports WHERE id=$2`, id, checked.ReportID, version, badName, badChecksum)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Pool.Exec(ctx, `INSERT INTO reconciliation_check_source_results(report_id,source,result,error_code)
+			SELECT $1,source,CASE WHEN $3 AND source='storage_scan' THEN 'error' ELSE result END,
+			CASE WHEN $3 AND source='storage_scan' THEN 'test_source_failure' ELSE NULL END
+			FROM reconciliation_check_source_results WHERE report_id=$2`, id, checked.ReportID, sourceError); err != nil {
+			t.Fatal(err)
+		}
+		if sealed {
+			if _, err := s.Pool.Exec(ctx, `INSERT INTO reconciliation_check_report_seals(report_id,finding_count,fs_scan_ended_at,completed_at)
+				SELECT $1,finding_count,fs_scan_ended_at,completed_at FROM reconciliation_check_report_seals WHERE report_id=$2`, id, checked.ReportID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rows, err := s.Pool.Query(ctx, `SELECT * FROM nmcp_read_repairable_findings($1,0,1)`, id)
+		if err == nil {
+			for rows.Next() {
+			}
+			err = rows.Err()
+			rows.Close()
+		}
+		if (err == nil) != admitted {
+			t.Fatalf("admitted=%v want=%v err=%v", err == nil, admitted, err)
+		}
+	}
+	t.Run("admin-receipts-20", func(t *testing.T) { checkAdmission(t, 20, false, false, true, false, true) })
+	t.Run("compatibility-21", func(t *testing.T) { checkAdmission(t, 21, false, false, true, false, true) })
+	t.Run("unknown-version", func(t *testing.T) { checkAdmission(t, 999, true, true, true, false, false) })
+	t.Run("wrong-name", func(t *testing.T) { checkAdmission(t, 21, true, false, true, false, false) })
+	t.Run("wrong-checksum", func(t *testing.T) { checkAdmission(t, 21, false, true, true, false, false) })
+	t.Run("unsealed", func(t *testing.T) { checkAdmission(t, 21, false, false, false, false, false) })
+	t.Run("source-error", func(t *testing.T) { checkAdmission(t, 21, false, false, true, true, false) })
 }

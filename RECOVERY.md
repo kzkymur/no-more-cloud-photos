@@ -142,3 +142,14 @@ keeping the exact sealed/source/checksum admission predicate, definer owner,
 closed search path, ACL and maintenance authorization unchanged. Existing causal
 preview/plan/execute/fence test must now run on latest schema; downstream full
 Core gates remain unaccepted until a successful successor.
+
+## Isolated compatibility reconciliation
+Concurrent runtimes produced duplicate version0021 and altered0020. This
+isolated successor restores0020 byte-for-byte from1a79d2e, removes only the
+redundant0021_report_compatibility, and retains0021_schema_compatibility with
+explicit20/21 whitelist, owner/search_path and unchanged sealed/source/history
+checksum/format predicates. No older migration is changed versus1a79d2e.
+Latest-schema direct repair preview/plan/apply/resume barrier assertions and
+positive20/21 versus unknown/name/checksum/unsealed/source-error SQL admission
+regression tests are included. Local Go unavailable: tests NOT executed here.
+No full gate, lock-race acceptance, ready or merge claim before exact CI.
