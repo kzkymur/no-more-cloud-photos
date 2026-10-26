@@ -119,3 +119,15 @@ Exact ca4f9ec Core39524524362 failed at early gofmt, before tests (two test
 spacing differences); Infra39524524406 succeeded. Applied only the exact
 runner-produced formatting changes. No runtime/full-Core acceptance inferred.
 Next formal successor must execute PG17 early tests and every existing gate.
+
+## Formal 1a79d2e runtime result and repair compatibility fix
+Core40248198934 reached real PG17 tests: config/profile, frozen batches, retry
+receipts, HTTP visibility, fresh maintenance checks and both cleanup recovery
+cases passed. Direct repair causal test failed BEFORE filesystem barrier:
+0019 repair admission explicitly supported only migration17/18/19, while new
+reports correctly record migration20. Migration0020 now explicitly extends the
+read-only admission function and immutable plan-seal version check to20, keeping
+all source completeness/seal/schema-name/checksum/classifier guards unchanged.
+No change to maintenance authorization or evidence format. This is a production
+compatibility defect, not a fixture error; tests must run again on successor.
+Draft PR45 already exists with Closes18, not ready until full exact-head gates.
