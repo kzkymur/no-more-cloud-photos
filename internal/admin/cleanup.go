@@ -264,9 +264,21 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 	if err != nil {
 		return false, false, err
 	}
+	completed, err := executeCleanupPurge(ctx, lifecycle, store, lease)
+	return completed, false, err
+}
+
+type cleanupPurgeExecutor interface {
+	HeartbeatPurge(context.Context, string, string) (time.Time, error)
+	RunPurgeFileStep(context.Context, string, string, medialifecycle.PurgeFileAction) (medialifecycle.PurgeStepResult, error)
+	FinalizePurge(context.Context, string, string) error
+	FinishPurgeAttempt(context.Context, string, string, string) error
+}
+
+func executeCleanupPurge(ctx context.Context, lifecycle cleanupPurgeExecutor, store *storage.Store, lease medialifecycle.PurgeLease) (bool, error) {
 	for {
 		if _, err := lifecycle.HeartbeatPurge(ctx, lease.JobID, lease.Token); err != nil {
-			return false, false, err
+			return false, err
 		}
 		step, err := lifecycle.RunPurgeFileStep(ctx, lease.JobID, lease.Token, medialifecycle.StoragePurgeFileAction(store))
 		if err != nil {
@@ -279,11 +291,11 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 				cancel()
 				err = errors.Join(err, releaseErr)
 			}
-			return false, false, err
+			return false, err
 		}
 		if step.Done {
 			err := lifecycle.FinalizePurge(ctx, lease.JobID, lease.Token)
-			return err == nil, false, err
+			return err == nil, err
 		}
 	}
 }

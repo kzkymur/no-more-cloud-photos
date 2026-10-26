@@ -230,3 +230,10 @@ barrier is test-only and does not weaken authorization.
 Forward21 catalog owner/definer/closed search_path/ACL plus actual SET ROLE repair
 reader success and unauthorized runtime/check/worker denial tests are added.
 Their successor formal runtime evidence and every full gate remain pending.
+A narrow private purge-executor interface allows the real production loop to be
+exercised at uncertainty boundaries without exposing a new product option.
+Tests physically unlink a real original through StoragePurgeFileAction, then
+inject a lost file-step COMMIT acknowledgement; assert exactly one step and no
+FinishPurgeAttempt/Finalize follow-on. Unknown heartbeat/finalize and known
+storage failure release are contrasted. This supplements native expired-lease
+restart PG17 tests, rather than calling a predicate a full control-flow proof.
