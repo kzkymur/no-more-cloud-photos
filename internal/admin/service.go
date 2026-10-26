@@ -31,6 +31,8 @@ type Service struct {
 	Pool  *pgxpool.Pool
 	Actor string
 	Host  string
+
+	afterBatchCommit func(context.Context) error
 }
 
 func New(pool *pgxpool.Pool) *Service {
@@ -145,4 +147,16 @@ func (s *Service) mutate(ctx context.Context, command, lock string, args any, id
 		return commitErr
 	}
 	return classified(err)
+}
+
+// commitBatch permits a deterministic lost-reply seam only after a real durable
+// commit, matching lifecycle repository fault tests. Production has no hook.
+func (s *Service) commitBatch(ctx context.Context, tx pgx.Tx) error {
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if s.afterBatchCommit != nil {
+		return s.afterBatchCommit(ctx)
+	}
+	return nil
 }

@@ -287,32 +287,3 @@ func sleep(ctx context.Context, delay time.Duration) error {
 // On uncertainty the exact ID is returned; a later invocation converges using
 // the repository's durable cleanup journal. Never claim all candidates done
 // when the finite limit was reached.
-type SweepResult struct {
-	IDs          []string
-	Completed    int
-	Failed       int
-	LimitReached bool
-}
-
-func (r *Runner) Sweep(ctx context.Context) (SweepResult, error) {
-	result := SweepResult{IDs: []string{}}
-	for range r.options.SweepLimit {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		id, err := r.service.CleanupNextRendition(ctx, "", result.IDs, r.unlink)
-		if id == "" && err == nil {
-			return result, nil
-		}
-		if id != "" {
-			result.IDs = append(result.IDs, id)
-		}
-		if err != nil {
-			result.Failed++
-			return result, err
-		}
-		result.Completed++
-	}
-	result.LimitReached = true
-	return result, nil
-}

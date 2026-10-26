@@ -154,7 +154,7 @@ func (s *Service) BeginBatch(ctx context.Context, request BatchRequest, resume s
 	if err != nil {
 		return BatchResult{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitBatch(ctx, tx); err != nil {
 		return beginCommitFailure(result, err), classified(err)
 	}
 	return result, nil
@@ -294,7 +294,7 @@ func (s *Service) BatchPage(ctx context.Context, token string, limit int) (Batch
 	if err != nil {
 		return result, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitBatch(ctx, tx); err != nil {
 		var serverRejection *pgconn.PgError
 		if errors.Is(err, pgx.ErrTxCommitRollback) || errors.As(err, &serverRejection) {
 			return previous, err

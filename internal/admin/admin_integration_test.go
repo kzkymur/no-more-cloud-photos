@@ -961,3 +961,66 @@ func TestAdminIntegrationConcurrentActivatorsKeepGreatestSuccessfulVersion(t *te
 		}
 	}
 }
+
+func TestAdminIntegrationBatchRealCommittedReplyLossAndResume(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	jobID, _, _ := failedMixedJob(t, s)
+	request := BatchRequest{Operation: "jobs_retry", JobID: jobID, AdditionalAttempts: 3}
+	s.afterBatchCommit = func(context.Context) error { return errors.New("lost committed reply") }
+	begin, err := s.BeginBatch(ctx, request, "", false)
+	if err == nil || begin.Token == "" || begin.Status != "unknown" || begin.Total != 0 {
+		t.Fatalf("begin lost reply=%+v err=%v", begin, err)
+	}
+	resumed, err := New(s.Pool).BeginBatch(ctx, request, begin.Token, false)
+	if err != nil || resumed.Total != 1 || resumed.Status != "running" {
+		t.Fatalf("durable begin=%+v err=%v", resumed, err)
+	}
+	page, err := s.BatchPage(ctx, begin.Token, 1)
+	if err == nil || page.Status != "unknown" || page.Succeeded != 0 || !bytes.Equal(page.Checkpoint, resumed.Checkpoint) {
+		t.Fatalf("page lost reply=%+v err=%v", page, err)
+	}
+	completed, err := New(s.Pool).BatchPage(ctx, begin.Token, 1)
+	if err != nil || completed.Succeeded != 1 || completed.Status != "succeeded" {
+		t.Fatalf("durable page=%+v err=%v", completed, err)
+	}
+	var maximum, attempts, audits int
+	if err := s.Pool.QueryRow(ctx, `SELECT max_attempts,attempts,(SELECT count(*) FROM admin_audit WHERE command='jobs_retry') FROM jobs WHERE id=$1`, jobID).Scan(&maximum, &attempts, &audits); err != nil || maximum != 6 || attempts != 3 || audits != 1 {
+		t.Fatalf("duplicate allowance max=%d attempts=%d audits=%d err=%v", maximum, attempts, audits, err)
+	}
+}
+
+func TestAdminIntegrationRenditionStaleSnapshotDoesNotPoisonFutureWork(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	objectID := dueHistoricalRendition(t, s)
+	items, runID, err := s.cleanupSelection(ctx, "renditions", false)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("selected=%v err=%v", items, err)
+	}
+	// Native-ineligible state after authorization: no current replacement.
+	if _, err := s.Pool.Exec(ctx, `UPDATE renditions SET is_current=false WHERE is_current`); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := s.Cleanup(ctx, store, "renditions", false)
+	if err != nil || stale.RunID != runID || stale.Skipped != 1 || stale.Completed != 0 {
+		t.Fatalf("stale=%+v err=%v", stale, err)
+	}
+	var remains bool
+	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM renditions WHERE id=$1)`, objectID).Scan(&remains); err != nil || !remains {
+		t.Fatalf("ineligible deleted=%v err=%v", !remains, err)
+	}
+	// Restore the valid current replacement; a new run may now select it.
+	if _, err := s.Pool.Exec(ctx, `UPDATE renditions SET is_current=true WHERE id<>$1`, objectID); err != nil {
+		t.Fatal(err)
+	}
+	healthy, err := s.Cleanup(ctx, store, "renditions", false)
+	if err != nil || healthy.RunID == runID || healthy.Completed != 1 {
+		t.Fatalf("healthy=%+v err=%v", healthy, err)
+	}
+}

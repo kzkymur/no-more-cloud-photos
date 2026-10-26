@@ -107,8 +107,17 @@ func (s *Service) cleanupSelection(ctx context.Context, kind string, dry bool) (
 	selection := `SELECT id::text,id::text,NULL::text FROM media WHERE deleted_at IS NOT NULL AND purge_after<=clock_timestamp()
 		ORDER BY purge_after,id LIMIT 100`
 	if kind == "renditions" {
-		selection = `SELECT id::text,media_id::text,NULL::text FROM renditions WHERE NOT is_current AND purge_after<=clock_timestamp()
-			ORDER BY purge_after,media_id,id LIMIT 100`
+		selection = `SELECT r.id::text,r.media_id::text,NULL::text FROM renditions r
+			WHERE NOT r.is_current AND r.purge_after<=clock_timestamp()
+			AND EXISTS(SELECT 1 FROM job_targets candidate_target
+			JOIN jobs candidate_job ON candidate_job.id=candidate_target.job_id AND candidate_job.type='transform' AND candidate_job.media_id_snapshot=r.media_id
+			JOIN profiles candidate_profile ON candidate_profile.id=candidate_target.profile_id AND candidate_profile.key=r.profile_key
+			JOIN renditions current_rendition ON current_rendition.media_id=r.media_id AND current_rendition.profile_key=r.profile_key AND current_rendition.is_current
+			JOIN job_targets current_target ON current_target.id=current_rendition.job_target_id AND current_target.status='succeeded'
+			JOIN jobs current_job ON current_job.id=current_target.job_id AND current_job.type='transform' AND current_job.media_id_snapshot=r.media_id
+			JOIN profiles current_profile ON current_profile.id=current_target.profile_id AND current_profile.key=current_rendition.profile_key AND current_profile.version>=candidate_profile.version
+			WHERE candidate_target.id=r.job_target_id AND candidate_target.status='succeeded')
+			AND NOT EXISTS(SELECT 1 FROM jobs purge_job WHERE purge_job.type='purge' AND purge_job.media_id_snapshot=r.media_id AND purge_job.started_at IS NOT NULL) ORDER BY r.purge_after,r.media_id,r.id LIMIT 100`
 	}
 	var args []any
 	if runID != "" {
@@ -174,6 +183,24 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 		return done, false, err
 	}
 	if kind == "renditions" {
+		var eligible bool
+		if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM renditions r WHERE r.id=$1 AND NOT r.is_current AND r.purge_after<=clock_timestamp()
+			AND EXISTS(SELECT 1 FROM job_targets candidate_target
+			JOIN jobs candidate_job ON candidate_job.id=candidate_target.job_id AND candidate_job.type='transform' AND candidate_job.media_id_snapshot=r.media_id
+			JOIN profiles candidate_profile ON candidate_profile.id=candidate_target.profile_id AND candidate_profile.key=r.profile_key
+			JOIN renditions current_rendition ON current_rendition.media_id=r.media_id AND current_rendition.profile_key=r.profile_key AND current_rendition.is_current
+			JOIN job_targets current_target ON current_target.id=current_rendition.job_target_id AND current_target.status='succeeded'
+			JOIN jobs current_job ON current_job.id=current_target.job_id AND current_job.type='transform' AND current_job.media_id_snapshot=r.media_id
+			JOIN profiles current_profile ON current_profile.id=current_target.profile_id AND current_profile.key=current_rendition.profile_key AND current_profile.version>=candidate_profile.version
+			WHERE candidate_target.id=r.job_target_id AND candidate_target.status='succeeded')
+			AND NOT EXISTS(SELECT 1 FROM jobs purge_job WHERE purge_job.type='purge' AND purge_job.media_id_snapshot=r.media_id AND purge_job.started_at IS NOT NULL))`, item.id).Scan(&eligible); err != nil {
+			return false, false, err
+		}
+		if !eligible {
+			// Frozen membership is authorization, not permission to bypass the
+			// native current/provenance/version recheck. Stale work terminates.
+			return false, true, nil
+		}
 		_, err := lifecycle.CleanupNextRendition(ctx, item.id, nil, func(ctx context.Context, id, path string, size int64) (bool, error) {
 			key, err := storage.ParseRenditionKey(path)
 			if err != nil || key.RenditionID().String() != id {

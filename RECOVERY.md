@@ -179,3 +179,15 @@ journal tables to existing exact protected relation/column ACL inventory.
 Added simultaneous profile activators with greatest-successful-version and
 no implicit jobs assertions. Local Python verifier suite4tests PASS, shell
 syntax and diff-check PASS; all Go/full gates still require formal final head.
+
+## Expanded six-finding review acceptance
+Read full prior signed reviewer six-finding comment as leader-required scope.
+Additional purge interrupted-lease recovery and native-ineligible rendition
+progress are acceptance blockers, not covered by the earlier three MED closure.
+This checkpoint adds native-equivalent rendition candidate predicates and safe
+terminal skipped receipts when a frozen candidate becomes non-actionable;
+native revalidation still owns unlink. Real PostgreSQL COMMIT is followed by a
+lost-reply fault seam for Begin and Page, asserting unknown responses then exact
+restart/receipt replay and no duplicate retry allowance. Removed uncalled Sweep
+adapter. Additional exact-bound purge recovery and reverse maintenance fence
+causal tests remain in progress. No full-gate or reviewer approval inferred.
