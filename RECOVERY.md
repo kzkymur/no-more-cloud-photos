@@ -153,3 +153,19 @@ ca4f (avoid rewriting an already applied migration). Only forward0021 admits
 20/21 reports; negative report authority cases and latest report→plan seal
 assertions imported from the saved patch. Runtime still unvalidated. Three
 reviewer durability MEDs and Ubuntu verifier latest-version pin remain OPEN.
+
+## Isolated durability fixes (awaiting formal runtime)
+- M1 final cleanup receipt/audit and run finished_at now share one transaction;
+  selection converges historical exhausted runs before selecting new due work.
+- M2 canceled bound purge authorization is completed as skipped, not reassigned;
+  re-deleted Media requires a new finite run authorization. Never execute an
+  enqueued job differing from the immutable bound ID; binding requires one row.
+- M3 rejected Begin COMMIT clears token/membership, transport ambiguity reports
+  unknown identity without speculative counts/status. Added deferred rejection
+  plus CLI output test and unknown-result unit test.
+- Added causal old exhausted run→new due work/final-receipt rejection/recovery,
+  and real restore→redelete→new authorization→late audit rejection/recovery tests.
+- Ubuntu successful-current assertions now require exact21 plus retained exact
+  19/20 evidence; historical18/failure expectations and all phases unchanged.
+Local diff-check and shell syntax PASS; no local Go runtime claims. Formal
+successor must execute every test and retained mandatory gate before acceptance.

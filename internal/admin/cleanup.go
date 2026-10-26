@@ -92,6 +92,13 @@ func (s *Service) cleanupSelection(ctx context.Context, kind string, dry bool) (
 	}
 	var runID string
 	if !dry {
+		// Converge older runs stranded after their last durable receipt. New
+		// due work must not be hidden forever behind an exhausted snapshot.
+		if _, err := tx.Exec(ctx, `UPDATE admin_cleanup_runs r SET finished_at=clock_timestamp()
+			WHERE kind=$1 AND finished_at IS NULL AND NOT EXISTS
+			(SELECT 1 FROM admin_cleanup_items i WHERE i.run_id=r.id AND i.outcome='pending')`, kind); err != nil {
+			return nil, "", err
+		}
 		err = tx.QueryRow(ctx, `SELECT id::text FROM admin_cleanup_runs WHERE kind=$1 AND finished_at IS NULL FOR UPDATE`, kind).Scan(&runID)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return nil, "", err
@@ -188,14 +195,33 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 	if !eligible {
 		return false, true, nil
 	}
+	if item.jobID != nil {
+		var cancelled bool
+		if err := s.Pool.QueryRow(ctx, `SELECT status='cancelled' FROM jobs WHERE id=$1`, *item.jobID).Scan(&cancelled); err != nil {
+			return false, false, err
+		}
+		if cancelled {
+			// Restore revoked this exact authorization. Close it as skipped;
+			// a later finite run must authorize any re-deleted Media afresh.
+			return false, true, nil
+		}
+	}
 	enqueued, err := lifecycle.EnqueueDuePurge(ctx, item.mediaID)
 	if err != nil {
 		return false, false, err
 	}
 	// Bind the exact job before its destructive first start. If the enqueue
 	// response was lost, the same lifecycle enqueue rediscovers that job.
-	if _, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_items SET job_id=$3 WHERE run_id=$1 AND object_id=$2 AND job_id IS NULL`, runID, item.id, enqueued.Job.ID); err != nil {
+	if item.jobID != nil && *item.jobID != enqueued.Job.ID {
+		return false, true, nil
+	}
+	bound, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_items SET job_id=$3 WHERE run_id=$1 AND object_id=$2
+		AND outcome='pending' AND (job_id IS NULL OR job_id=$3)`, runID, item.id, enqueued.Job.ID)
+	if err != nil {
 		return false, false, err
+	}
+	if bound.RowsAffected() != 1 {
+		return false, false, ErrConflict
 	}
 	lease, err := lifecycle.StartPurge(ctx, enqueued.Job.ID)
 	if err != nil {
@@ -226,6 +252,10 @@ func (s *Service) cleanupReceipt(ctx context.Context, kind, runID string, item c
 		return err
 	}
 	if err := s.audit(ctx, tx, "cleanup_result", map[string]any{"run_id": runID, "kind": kind, "outcome": outcome, "native_journal": true}, []string{item.id}, "succeeded", time.Now()); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE admin_cleanup_runs SET finished_at=clock_timestamp() WHERE id=$1
+		AND NOT EXISTS(SELECT 1 FROM admin_cleanup_items WHERE run_id=$1 AND outcome='pending')`, runID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

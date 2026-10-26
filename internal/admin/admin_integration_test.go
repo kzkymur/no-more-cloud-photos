@@ -784,3 +784,136 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 	t.Run("wrong-checksum", func(t *testing.T) { checkAdmission(t, 21, false, true, true, false) })
 	t.Run("unsealed", func(t *testing.T) { checkAdmission(t, 21, false, false, false, false) })
 }
+
+func TestAdminIntegrationBeginCommitRejectionHasNoResumeToken(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	certifyJPEG(t, s)
+	definition := certifiedProfile(t, s, "test", 1)
+	if err := s.ProfileTransition(ctx, definition.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	insertMedia(t, s, 900)
+	if _, err := s.Pool.Exec(ctx, `CREATE FUNCTION reject_admin_begin() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+		RAISE EXCEPTION 'injected begin commit rejection'; END $$;
+		CREATE CONSTRAINT TRIGGER reject_admin_begin AFTER INSERT ON admin_batches DEFERRABLE INITIALLY DEFERRED
+		FOR EACH ROW EXECUTE FUNCTION reject_admin_begin()`); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.BeginBatch(ctx, BatchRequest{Operation: "regenerate", ProfileKey: "test", All: true}, "", false)
+	if err == nil || result.Token != "" || result.Status != "not_committed" || result.Total != 0 {
+		t.Fatalf("non-durable begin=%+v err=%v", result, err)
+	}
+	var out, diagnostics bytes.Buffer
+	if code := Run(ctx, []string{"regenerate", "--profile", "test", "--all", "--yes", "--json"}, &out, &diagnostics); code != 1 || strings.Contains(diagnostics.String(), "resume token:") || strings.Contains(out.String(), `"status":"running"`) {
+		t.Fatalf("CLI code=%d output=%s diagnostics=%s", code, &out, &diagnostics)
+	}
+	var count int
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM admin_batches`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rejected batches=%d err=%v", count, err)
+	}
+}
+
+func TestAdminIntegrationCleanupExhaustedRunConvergesAndFinishIsAtomic(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// Model an older process dying after its final receipt but before finish.
+	oldRun := newID()
+	if _, err := s.Pool.Exec(ctx, `INSERT INTO admin_cleanup_runs(id,kind) VALUES($1,'renditions')`, oldRun); err != nil {
+		t.Fatal(err)
+	}
+	objectID := dueHistoricalRendition(t, s)
+	if _, err := s.Pool.Exec(ctx, `CREATE FUNCTION reject_cleanup_finish() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+		IF NEW.finished_at IS NOT NULL AND OLD.finished_at IS NULL AND OLD.id<>'`+oldRun+`' THEN
+		RAISE EXCEPTION 'injected final receipt failure'; END IF; RETURN NEW; END $$;
+		CREATE TRIGGER reject_cleanup_finish BEFORE UPDATE ON admin_cleanup_runs FOR EACH ROW EXECUTE FUNCTION reject_cleanup_finish()`); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Cleanup(ctx, store, "renditions", false)
+	if !errors.Is(err, ErrPartial) || first.RunID == oldRun || first.Completed != 0 || first.Failed != 1 {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	var pending bool
+	if err := s.Pool.QueryRow(ctx, `SELECT outcome='pending' FROM admin_cleanup_items WHERE run_id=$1 AND object_id=$2`, first.RunID, objectID).Scan(&pending); err != nil || !pending {
+		t.Fatalf("last receipt escaped finish transaction pending=%v err=%v", pending, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_cleanup_finish ON admin_cleanup_runs`); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := s.Cleanup(ctx, store, "renditions", false)
+	if err != nil || resumed.Completed != 1 || resumed.RunID != first.RunID {
+		t.Fatalf("recovery=%+v err=%v", resumed, err)
+	}
+	var finished bool
+	if err := s.Pool.QueryRow(ctx, `SELECT finished_at IS NOT NULL FROM admin_cleanup_runs WHERE id=$1`, first.RunID).Scan(&finished); err != nil || !finished {
+		t.Fatalf("final receipt did not finish run: %v %v", finished, err)
+	}
+}
+
+func TestAdminIntegrationCleanupRestoreRedeleteNeedsNewAuthorization(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := s.ConfigSet(ctx, "deleted_media_retention_days", "0"); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := medialifecycle.NewService(s.Pool, "https://files.example.test/files/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mediaID := insertMedia(t, s, 901)
+	if _, err := lifecycle.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	items, oldRun, err := s.cleanupSelection(ctx, "media", false)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("selection=%v err=%v", items, err)
+	}
+	firstJob, err := lifecycle.EnqueueDuePurge(ctx, mediaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_items SET job_id=$2 WHERE run_id=$1`, oldRun, firstJob.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Crash before Start, then the real restore API revokes the bound job.
+	if _, err := lifecycle.Restore(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lifecycle.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := s.Cleanup(ctx, store, "media", false)
+	if err != nil || revoked.RunID != oldRun || revoked.Skipped != 1 || revoked.Completed != 0 {
+		t.Fatalf("revoked=%+v err=%v", revoked, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `CREATE FUNCTION reject_redelete_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+		IF NEW.command='cleanup_result' THEN RAISE EXCEPTION 'late result rejection'; END IF; RETURN NEW; END $$;
+		CREATE TRIGGER reject_redelete_audit BEFORE INSERT ON admin_audit FOR EACH ROW EXECUTE FUNCTION reject_redelete_audit()`); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Cleanup(ctx, store, "media", false)
+	if !errors.Is(err, ErrPartial) || second.RunID == oldRun || second.Failed != 1 {
+		t.Fatalf("second=%+v err=%v", second, err)
+	}
+	var boundJob string
+	if err := s.Pool.QueryRow(ctx, `SELECT job_id::text FROM admin_cleanup_items WHERE run_id=$1`, second.RunID).Scan(&boundJob); err != nil || boundJob == firstJob.Job.ID {
+		t.Fatalf("new authorization bound=%s old=%s err=%v", boundJob, firstJob.Job.ID, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_redelete_audit ON admin_audit`); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := s.Cleanup(ctx, store, "media", false)
+	if err != nil || recovered.RunID != second.RunID || recovered.Completed != 1 || recovered.Skipped != 0 {
+		t.Fatalf("recovered actual deletion=%+v err=%v", recovered, err)
+	}
+}

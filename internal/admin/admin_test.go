@@ -123,3 +123,10 @@ func TestFinishRedactsOperationalErrors(t *testing.T) {
 		t.Fatal("secret leak")
 	}
 }
+
+func TestBeginCommitAmbiguityNeverClaimsMembership(t *testing.T) {
+	result := beginCommitFailure(BatchResult{Token: "identity", Status: "running", Total: 7}, io.ErrUnexpectedEOF)
+	if result.Token != "identity" || result.Status != "unknown" || result.CommitState != "unknown" || result.Total != 0 {
+		t.Fatalf("speculative ambiguous begin: %+v", result)
+	}
+}

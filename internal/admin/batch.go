@@ -154,7 +154,20 @@ func (s *Service) BeginBatch(ctx context.Context, request BatchRequest, resume s
 	if err != nil {
 		return BatchResult{}, err
 	}
-	return result, classified(tx.Commit(ctx))
+	if err := tx.Commit(ctx); err != nil {
+		return beginCommitFailure(result, err), classified(err)
+	}
+	return result, nil
+}
+
+// A token is resumable only after durable creation. Transport ambiguity retains
+// the identity for reconciliation, but never claims committed membership.
+func beginCommitFailure(result BatchResult, err error) BatchResult {
+	var rejection *pgconn.PgError
+	if errors.Is(err, pgx.ErrTxCommitRollback) || errors.As(err, &rejection) {
+		return BatchResult{Status: "not_committed", CommitState: "rejected"}
+	}
+	return BatchResult{Token: result.Token, Status: "unknown", CommitState: "unknown"}
 }
 
 type batchItem struct {
