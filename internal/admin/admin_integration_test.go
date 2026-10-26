@@ -917,3 +917,47 @@ func TestAdminIntegrationCleanupRestoreRedeleteNeedsNewAuthorization(t *testing.
 		t.Fatalf("recovered actual deletion=%+v err=%v", recovered, err)
 	}
 }
+
+func TestAdminIntegrationConcurrentActivatorsKeepGreatestSuccessfulVersion(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	certifyJPEG(t, s)
+	second := certifiedProfile(t, s, "test", 2)
+	third := certifiedProfile(t, s, "test", 3)
+	insertMedia(t, s, 902)
+	type activation struct {
+		version int
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan activation, 2)
+	go func() {
+		<-start
+		results <- activation{2, New(s.Pool).ProfileTransition(ctx, second.ID, true)}
+	}()
+	go func() {
+		<-start
+		results <- activation{3, New(s.Pool).ProfileTransition(ctx, third.ID, true)}
+	}()
+	close(start)
+	greatest := 0
+	for i := 0; i < 2; i++ {
+		result := <-results
+		if result.err == nil {
+			if result.version > greatest {
+				greatest = result.version
+			}
+		} else if !errors.Is(result.err, ErrConflict) {
+			t.Fatal(result.err)
+		}
+	}
+	var active, jobs int
+	if err := s.Pool.QueryRow(ctx, `SELECT version,(SELECT count(*) FROM jobs) FROM profiles WHERE key='test' AND status='active'`).Scan(&active, &jobs); err != nil || greatest == 0 || active != greatest || jobs != 0 {
+		t.Fatalf("active=%d greatest successful=%d implicit jobs=%d err=%v", active, greatest, jobs, err)
+	}
+	if active == 3 {
+		if err := s.ProfileTransition(ctx, second.ID, true); !errors.Is(err, ErrConflict) {
+			t.Fatalf("stale activator accepted: %v", err)
+		}
+	}
+}

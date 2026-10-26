@@ -650,6 +650,7 @@ $$;
 CREATE TEMP TABLE expected_protected_relations(table_name text PRIMARY KEY);
 INSERT INTO expected_protected_relations(table_name) VALUES
     ('maintenance_state'),('admin_audit'),('admin_batches'),('change_events'),
+    ('admin_batch_items'),('admin_cleanup_runs'),('admin_cleanup_items'),
     ('reconciliation_reports'),('reconciliation_check_reports'),
     ('reconciliation_check_findings'),('reconciliation_check_source_results'),
     ('reconciliation_check_report_seals'),('reconciliation_repair_runs'),

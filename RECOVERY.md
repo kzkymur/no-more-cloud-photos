@@ -169,3 +169,13 @@ reviewer durability MEDs and Ubuntu verifier latest-version pin remain OPEN.
   19/20 evidence; historical18/failure expectations and all phases unchanged.
 Local diff-check and shell syntax PASS; no local Go runtime claims. Formal
 successor must execute every test and retained mandatory gate before acceptance.
+
+## Finite verifier and concurrency coverage
+Added unprivileged finite tests executing actual current-schema helper SQL on
+isolated relational fixtures: exact19+20+21 accepted; wrong current name/hash,
+dirty20/21, altered historical identity and future22 rejected. This is not a
+substitute for privileged PostgreSQL Ubuntu phases. Added the three new admin
+journal tables to existing exact protected relation/column ACL inventory.
+Added simultaneous profile activators with greatest-successful-version and
+no implicit jobs assertions. Local Python verifier suite4tests PASS, shell
+syntax and diff-check PASS; all Go/full gates still require formal final head.
