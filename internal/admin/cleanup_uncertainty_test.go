@@ -64,7 +64,7 @@ func TestCleanupPhysicalStepUnknownCommitDoesNotReleaseOrContinue(t *testing.T) 
 	defer store.Close()
 	unknown := &medialifecycle.CommitOutcomeUnknown{Cause: io.ErrUnexpectedEOF}
 	executor := &uncertainCleanupExecutor{
-		file: medialifecycle.PurgeFile{Kind: medialifecycle.PurgeFileOriginal, ObjectID: id, RelativePath: relative, SizeBytes: 3},
+		file:   medialifecycle.PurgeFile{Kind: medialifecycle.PurgeFileOriginal, ObjectID: id, RelativePath: relative, SizeBytes: 3},
 		action: true, stepErr: unknown,
 	}
 	done, err := executeCleanupPurge(context.Background(), executor, store, medialifecycle.PurgeLease{JobID: newID(), Token: newID()})
