@@ -218,3 +218,15 @@ for the run-ID comparison; do not alter production guards. Abandoned live/expire
 purge recovery, unrelated lease isolation, known file-failure release, legacy
 exhausted runs and stale rendition tests passed in that run. Full downstream
 Core steps skipped after early failure are not passes; successor gates required.
+
+4c3513b normal PR Core40249873854 administrative PG17 evidence passed after the
+assertion-only UUID correction. Added remaining finite evidence: actual
+MaintenanceResume holds its real row fence, native direct DryRun preflight is
+observed waiting on transactionid lock, fresh full check and normal cutover
+SUCCEED, then the waiter rejects SQL55000 without repair mutation. This is the
+reverse preflight direction, alongside the existing real Execute-first fence;
+not an Execute-after-completed-run false proof. A private afterResumeFence
+barrier is test-only and does not weaken authorization.
+Forward21 catalog owner/definer/closed search_path/ACL plus actual SET ROLE repair
+reader success and unauthorized runtime/check/worker denial tests are added.
+Their successor formal runtime evidence and every full gate remain pending.
