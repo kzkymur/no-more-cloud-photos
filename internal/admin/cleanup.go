@@ -17,6 +17,26 @@ type cleanupItem struct {
 	jobID   *string
 }
 
+// Match the native preferred-ID admission; the native transaction still owns
+// authoritative Media-first locking and revalidation before any unlink.
+const cleanupRenditionCandidates = `SELECT r.id::text,r.media_id::text,NULL::text
+	FROM renditions r
+	JOIN job_targets ct ON ct.id=r.job_target_id AND ct.status='succeeded'
+	JOIN jobs cj ON cj.id=ct.job_id AND cj.type='transform' AND cj.media_id_snapshot=r.media_id
+	JOIN profiles cp ON cp.id=ct.profile_id AND cp.key=r.profile_key
+	JOIN renditions n ON n.media_id=r.media_id AND n.profile_key=r.profile_key AND n.is_current
+	JOIN job_targets nt ON nt.id=n.job_target_id AND nt.status='succeeded'
+	JOIN jobs nj ON nj.id=nt.job_id AND nj.type='transform' AND nj.media_id_snapshot=r.media_id
+	JOIN profiles np ON np.id=nt.profile_id AND np.key=n.profile_key AND np.version>=cp.version
+	WHERE NOT r.is_current AND r.purge_after<=clock_timestamp()
+	AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.type='purge' AND j.media_id_snapshot=r.media_id AND j.started_at IS NOT NULL)`
+
+func (s *Service) cleanupRenditionEligible(ctx context.Context, id string) (bool, error) {
+	var eligible bool
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(`+cleanupRenditionCandidates+` AND r.id=$1)`, id).Scan(&eligible)
+	return eligible, err
+}
+
 // Cleanup automatically resumes an unfinished finite run of the same kind.
 // Its durable authorization fixes exact object IDs BEFORE any destructive call.
 // Native lifecycle journals prove effects after response loss or audit failure;
@@ -71,7 +91,7 @@ func (s *Service) Cleanup(ctx context.Context, store *storage.Store, kind string
 	// Finite run completion is independent of newly-due work. Do not claim
 	// all cleanup done; another full100 snapshot may exist after this run.
 	result.MorePossible = len(items) == 100 || result.Failed > 0
-	if _, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_runs SET finished_at=clock_timestamp() WHERE id=$1
+	if _, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_runs SET finished_at=clock_timestamp() WHERE id=$1 AND finished_at IS NULL
 		AND NOT EXISTS(SELECT 1 FROM admin_cleanup_items WHERE run_id=$1 AND outcome='pending')`, runID); err != nil {
 		return result, err
 	}
@@ -92,6 +112,13 @@ func (s *Service) cleanupSelection(ctx context.Context, kind string, dry bool) (
 	}
 	var runID string
 	if !dry {
+		// Recover legacy response-loss/crash state before taking a fresh
+		// snapshot. An exhausted authorization must never block future work.
+		if _, err := tx.Exec(ctx, `UPDATE admin_cleanup_runs r SET finished_at=clock_timestamp()
+			WHERE r.kind=$1 AND r.finished_at IS NULL AND NOT EXISTS
+			(SELECT 1 FROM admin_cleanup_items i WHERE i.run_id=r.id AND i.outcome='pending')`, kind); err != nil {
+			return nil, "", err
+		}
 		err = tx.QueryRow(ctx, `SELECT id::text FROM admin_cleanup_runs WHERE kind=$1 AND finished_at IS NULL FOR UPDATE`, kind).Scan(&runID)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return nil, "", err
@@ -100,8 +127,7 @@ func (s *Service) cleanupSelection(ctx context.Context, kind string, dry bool) (
 	selection := `SELECT id::text,id::text,NULL::text FROM media WHERE deleted_at IS NOT NULL AND purge_after<=clock_timestamp()
 		ORDER BY purge_after,id LIMIT 100`
 	if kind == "renditions" {
-		selection = `SELECT id::text,media_id::text,NULL::text FROM renditions WHERE NOT is_current AND purge_after<=clock_timestamp()
-			ORDER BY purge_after,media_id,id LIMIT 100`
+		selection = cleanupRenditionCandidates + ` ORDER BY r.purge_after,r.media_id,r.id LIMIT 100`
 	}
 	var args []any
 	if runID != "" {
@@ -123,8 +149,11 @@ func (s *Service) cleanupSelection(ctx context.Context, kind string, dry bool) (
 	}
 	err = rows.Err()
 	rows.Close()
-	if err != nil || dry || len(items) == 0 {
+	if err != nil || dry {
 		return items, runID, err
+	}
+	if len(items) == 0 {
+		return items, runID, tx.Commit(ctx)
 	}
 	if runID == "" {
 		runID = newID()
@@ -167,7 +196,11 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 		return done, false, err
 	}
 	if kind == "renditions" {
-		_, err := lifecycle.CleanupNextRendition(ctx, item.id, nil, func(ctx context.Context, id, path string, size int64) (bool, error) {
+		eligible, err := s.cleanupRenditionEligible(ctx, item.id)
+		if err != nil || !eligible {
+			return false, !eligible && err == nil, err
+		}
+		_, err = lifecycle.CleanupNextRendition(ctx, item.id, nil, func(ctx context.Context, id, path string, size int64) (bool, error) {
 			key, err := storage.ParseRenditionKey(path)
 			if err != nil || key.RenditionID().String() != id {
 				return false, storage.ErrValidation
@@ -179,7 +212,25 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 			return false, false, err
 		}
 		done, err := s.cleanupProof(ctx, kind, item)
-		return done, false, err
+		if done || err != nil {
+			return done, false, err
+		}
+		// A native recheck may legitimately decline a stale frozen item.
+		// Close that authorization without claiming an effect or deleting it.
+		eligible, err = s.cleanupRenditionEligible(ctx, item.id)
+		return false, !eligible && err == nil, err
+	}
+	// A bound authorization may execute only that exact native job. Restore
+	// can cancel an unstarted J1; a later J2 needs a new cleanup_begin run.
+	if item.jobID != nil {
+		var cancelled bool
+		if err := s.Pool.QueryRow(ctx, `SELECT status='cancelled' AND started_at IS NULL
+			FROM jobs WHERE id=$1 AND type='purge' AND media_id_snapshot=$2`, *item.jobID, item.mediaID).Scan(&cancelled); err != nil {
+			return false, false, err
+		}
+		if cancelled {
+			return false, true, nil
+		}
 	}
 	var eligible bool
 	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM media WHERE id=$1 AND deleted_at IS NOT NULL AND purge_after<=clock_timestamp())`, item.id).Scan(&eligible); err != nil {
@@ -188,16 +239,21 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 	if !eligible {
 		return false, true, nil
 	}
-	enqueued, err := lifecycle.EnqueueDuePurge(ctx, item.mediaID)
-	if err != nil {
-		return false, false, err
+	if item.jobID == nil {
+		enqueued, err := lifecycle.EnqueueDuePurge(ctx, item.mediaID)
+		if err != nil {
+			return false, false, err
+		}
+		// Read back the authoritative immutable binding, not the speculative
+		// enqueue response or a zero-row UPDATE result.
+		var jobID string
+		if err := s.Pool.QueryRow(ctx, `UPDATE admin_cleanup_items SET job_id=COALESCE(job_id,$3)
+			WHERE run_id=$1 AND object_id=$2 AND outcome='pending' RETURNING job_id::text`, runID, item.id, enqueued.Job.ID).Scan(&jobID); err != nil {
+			return false, false, err
+		}
+		item.jobID = &jobID
 	}
-	// Bind the exact job before its destructive first start. If the enqueue
-	// response was lost, the same lifecycle enqueue rediscovers that job.
-	if _, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_items SET job_id=$3 WHERE run_id=$1 AND object_id=$2 AND job_id IS NULL`, runID, item.id, enqueued.Job.ID); err != nil {
-		return false, false, err
-	}
-	lease, err := lifecycle.StartPurge(ctx, enqueued.Job.ID)
+	lease, err := lifecycle.StartPurge(ctx, *item.jobID)
 	if err != nil {
 		return false, false, err
 	}
@@ -222,10 +278,20 @@ func (s *Service) cleanupReceipt(ctx context.Context, kind, runID string, item c
 		return err
 	}
 	defer rollback(tx)
-	if _, err := tx.Exec(ctx, `UPDATE admin_cleanup_items SET outcome=$3,completed_at=clock_timestamp() WHERE run_id=$1 AND object_id=$2 AND outcome='pending'`, runID, item.id, outcome); err != nil {
+	receipt, err := tx.Exec(ctx, `UPDATE admin_cleanup_items SET outcome=$3,completed_at=clock_timestamp() WHERE run_id=$1 AND object_id=$2 AND outcome='pending'`, runID, item.id, outcome)
+	if err != nil {
 		return err
 	}
+	if receipt.RowsAffected() == 0 {
+		return tx.Commit(ctx)
+	}
 	if err := s.audit(ctx, tx, "cleanup_result", map[string]any{"run_id": runID, "kind": kind, "outcome": outcome, "native_journal": true}, []string{item.id}, "succeeded", time.Now()); err != nil {
+		return err
+	}
+	// Last receipt, its audit and run completion are one crash boundary.
+	if _, err := tx.Exec(ctx, `UPDATE admin_cleanup_runs SET finished_at=clock_timestamp()
+		WHERE id=$1 AND finished_at IS NULL AND NOT EXISTS
+		(SELECT 1 FROM admin_cleanup_items WHERE run_id=$1 AND outcome='pending')`, runID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

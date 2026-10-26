@@ -531,8 +531,13 @@ func TestAdminIntegrationFiniteMediaCleanupDryRunAndExecution(t *testing.T) {
 
 func dueHistoricalRendition(t *testing.T, s *Service) string {
 	t.Helper()
-	ctx := context.Background()
 	_, targetID, _ := failedMixedJob(t, s)
+	return historicalRenditionWithReplacement(t, s, targetID)
+}
+
+func historicalRenditionWithReplacement(t *testing.T, s *Service, targetID string) string {
+	t.Helper()
+	ctx := context.Background()
 	var renditionID, mediaID, originalID, profileID string
 	if err := s.Pool.QueryRow(ctx, `SELECT r.id::text,r.media_id::text,j.original_id::text,t.profile_id::text
 		FROM renditions r JOIN job_targets t ON t.id=r.job_target_id JOIN jobs j ON j.id=t.job_id WHERE t.id=$1`, targetID).Scan(&renditionID, &mediaID, &originalID, &profileID); err != nil {
@@ -837,5 +842,205 @@ func TestAdminIntegrationBeginBatchCommitRejectionHasNoResumeToken(t *testing.T)
 	committed, err := New(s.Pool).BeginBatch(ctx, request, "", false)
 	if err != nil || committed.Token == "" || committed.Status != "running" || committed.Total != 1 {
 		t.Fatalf("restart begin=%+v err=%v", committed, err)
+	}
+}
+
+func TestAdminIntegrationCleanupExhaustedRunDoesNotBlockFutureWork(t *testing.T) {
+	for _, boundary := range []string{"legacy-empty-run", "last-receipt-marker-failure"} {
+		t.Run(boundary, func(t *testing.T) {
+			s := integrationService(t)
+			ctx := context.Background()
+			store, err := storage.Open(t.TempDir(), storage.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if _, err := s.ConfigSet(ctx, "deleted_media_retention_days", "0"); err != nil {
+				t.Fatal(err)
+			}
+			lifecycle, err := medialifecycle.NewService(s.Pool, "https://files.example.test/files/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstID := insertMedia(t, s, 701)
+			if _, err := lifecycle.Delete(ctx, firstID); err != nil {
+				t.Fatal(err)
+			}
+			if boundary == "last-receipt-marker-failure" {
+				if _, err := s.Pool.Exec(ctx, `CREATE FUNCTION reject_cleanup_finish() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+					RAISE EXCEPTION 'injected finish marker failure'; END $$;
+					CREATE TRIGGER reject_cleanup_finish BEFORE UPDATE ON admin_cleanup_runs
+					FOR EACH ROW EXECUTE FUNCTION reject_cleanup_finish()`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			first, firstErr := s.Cleanup(ctx, store, "media", false)
+			if boundary == "last-receipt-marker-failure" {
+				if !errors.Is(firstErr, ErrPartial) || first.Completed != 0 {
+					t.Fatalf("failed finish=%+v err=%v", first, firstErr)
+				}
+				var pending bool
+				if err := s.Pool.QueryRow(ctx, `SELECT outcome='pending' FROM admin_cleanup_items WHERE run_id=$1`, first.RunID).Scan(&pending); err != nil || !pending {
+					t.Fatalf("non-atomic last receipt pending=%v err=%v", pending, err)
+				}
+				if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_cleanup_finish ON admin_cleanup_runs`); err != nil {
+					t.Fatal(err)
+				}
+				recovered, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+				if err != nil || recovered.RunID != first.RunID || recovered.Completed != 1 {
+					t.Fatalf("recovered=%+v err=%v", recovered, err)
+				}
+			} else {
+				if firstErr != nil || first.Completed != 1 {
+					t.Fatalf("first=%+v err=%v", first, firstErr)
+				}
+				// Reproduce an old process dying after its last receipt commit.
+				if _, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_runs SET finished_at=NULL WHERE id=$1`, first.RunID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			nextID := insertMedia(t, s, 702)
+			if _, err := lifecycle.Delete(ctx, nextID); err != nil {
+				t.Fatal(err)
+			}
+			next, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+			if err != nil || next.RunID == first.RunID || next.Completed != 1 || len(next.IDs) != 1 || next.IDs[0] != nextID {
+				t.Fatalf("new work blocked=%+v err=%v", next, err)
+			}
+			var unfinished, receipts int
+			if err := s.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM admin_cleanup_runs WHERE finished_at IS NULL),
+				(SELECT count(*) FROM admin_audit WHERE command='cleanup_result' AND $1::uuid=ANY(affected_ids))`, firstID).Scan(&unfinished, &receipts); err != nil || unfinished != 0 || receipts != 1 {
+				t.Fatalf("unfinished=%d first receipts=%d err=%v", unfinished, receipts, err)
+			}
+		})
+	}
+}
+
+func TestAdminIntegrationIneligibleRenditionDoesNotPoisonCleanup(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	_, targetID, _ := failedMixedJob(t, s)
+	var id, mediaID string
+	if err := s.Pool.QueryRow(ctx, `UPDATE renditions SET purge_after=clock_timestamp()-interval '1 hour'
+		WHERE job_target_id=$1 RETURNING id::text,media_id::text`, targetID).Scan(&id, &mediaID); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	preview, err := s.Cleanup(ctx, store, "renditions", true)
+	if err != nil || preview.Eligible != 0 {
+		t.Fatalf("native-ineligible selected=%+v err=%v", preview, err)
+	}
+	// Simulate an authorization frozen by the old over-broad selector.
+	runID := newID()
+	if _, err := s.Pool.Exec(ctx, `INSERT INTO admin_cleanup_runs(id,kind) VALUES($1,'renditions')`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `INSERT INTO admin_cleanup_items(run_id,object_id,media_id) VALUES($1,$2,$3)`, runID, id, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	skipped, err := s.Cleanup(ctx, store, "renditions", false)
+	if err != nil || skipped.RunID != runID || skipped.Skipped != 1 || skipped.Completed != 0 {
+		t.Fatalf("ineligible frozen item poisoned run=%+v err=%v", skipped, err)
+	}
+	var present bool
+	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM renditions WHERE id=$1)`, id).Scan(&present); err != nil || !present {
+		t.Fatalf("ineligible row deleted=%v err=%v", !present, err)
+	}
+	if got := historicalRenditionWithReplacement(t, s, targetID); got != id {
+		t.Fatalf("replacement changed candidate %s != %s", got, id)
+	}
+	healthy, err := New(s.Pool).Cleanup(ctx, store, "renditions", false)
+	if err != nil || healthy.RunID == runID || healthy.Completed != 1 || len(healthy.IDs) != 1 || healthy.IDs[0] != id {
+		t.Fatalf("later healthy work blocked=%+v err=%v", healthy, err)
+	}
+}
+
+func TestAdminIntegrationCleanupCancelledBindingRequiresNewAuthorization(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := s.ConfigSet(ctx, "deleted_media_retention_days", "0"); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := medialifecycle.NewService(s.Pool, "https://files.example.test/files/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := insertMedia(t, s, 703)
+	if _, err := lifecycle.Delete(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	_, oldRun, err := s.cleanupSelection(ctx, "media", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := lifecycle.EnqueueDuePurge(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_items SET job_id=$2 WHERE run_id=$1`, oldRun, first.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Crash after immutable binding, then restore/redelete creates J2.
+	if _, err := lifecycle.Restore(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lifecycle.Delete(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	second, err := lifecycle.EnqueueDuePurge(ctx, id)
+	if err != nil || second.Job.ID == first.Job.ID {
+		t.Fatalf("replacement job=%+v err=%v", second, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `CREATE FUNCTION reject_binding_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+		IF NEW.command='cleanup_result' THEN RAISE EXCEPTION 'injected receipt failure'; END IF; RETURN NEW; END $$;
+		CREATE TRIGGER reject_binding_receipt BEFORE INSERT ON admin_audit FOR EACH ROW EXECUTE FUNCTION reject_binding_receipt()`); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	if !errors.Is(err, ErrPartial) || failed.RunID != oldRun {
+		t.Fatalf("old authorization=%+v err=%v", failed, err)
+	}
+	var untouched bool
+	if err := s.Pool.QueryRow(ctx, `SELECT status='queued' AND attempts=0 AND started_at IS NULL FROM jobs WHERE id=$1`, second.Job.ID).Scan(&untouched); err != nil || !untouched {
+		t.Fatalf("old authorization executed J2=%v err=%v", !untouched, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_binding_receipt ON admin_audit`); err != nil {
+		t.Fatal(err)
+	}
+	old, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	if err != nil || old.RunID != oldRun || old.Skipped != 1 || old.Completed != 0 {
+		t.Fatalf("cancelled binding=%+v err=%v", old, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `CREATE TRIGGER reject_binding_receipt BEFORE INSERT ON admin_audit FOR EACH ROW EXECUTE FUNCTION reject_binding_receipt()`); err != nil {
+		t.Fatal(err)
+	}
+	next, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	if !errors.Is(err, ErrPartial) || next.RunID == oldRun {
+		t.Fatalf("new authorization=%+v err=%v", next, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_binding_receipt ON admin_audit`); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	if err != nil || recovered.RunID != next.RunID || recovered.Completed != 1 || len(recovered.IDs) != 1 || recovered.IDs[0] != id {
+		t.Fatalf("J2 completion lost=%+v err=%v", recovered, err)
+	}
+	var binding string
+	var receipts int
+	if err := s.Pool.QueryRow(ctx, `SELECT job_id::text FROM admin_cleanup_items WHERE run_id=$1`, oldRun).Scan(&binding); err != nil || binding != first.Job.ID {
+		t.Fatalf("old binding changed=%s err=%v", binding, err)
+	}
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM admin_audit WHERE command='cleanup_result' AND $1::uuid=ANY(affected_ids)
+		AND sanitized_arguments->>'outcome'='completed'`, id).Scan(&receipts); err != nil || receipts != 1 {
+		t.Fatalf("completed receipts=%d err=%v", receipts, err)
 	}
 }
