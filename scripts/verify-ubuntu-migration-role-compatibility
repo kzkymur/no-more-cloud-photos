@@ -93,7 +93,7 @@ case $phase in
   fresh-current)
     reset_database
     run_wrapper "$current" migrate up --json
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_migration 21 admin_repair_schema_compatibility 42ed20866eaba31b0370352f8d011ae3faf16a4b4eca6bdac6a9432d6bd73558
     assert_hardened
     ;;
   current-rerun)
@@ -173,7 +173,7 @@ case $phase in
     run_wrapper "$v18" migrate up --json
     assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24
     run_wrapper "$current" migrate up --json
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_migration 21 admin_repair_schema_compatibility 42ed20866eaba31b0370352f8d011ae3faf16a4b4eca6bdac6a9432d6bd73558
     assert_hardened
     ;;
   unfinished-v18-rejection)
@@ -189,11 +189,11 @@ case $phase in
     assert_migration 18 reconciliation_checker_sources 34dd8adfd1cbd9314491e597cd2711ee66cc428c272825986a1cad8ef6d4ba24
     [[ $(psql_root --tuples-only --no-align --command "SELECT (to_regclass('reconciliation_repair_plan_seals') IS NOT NULL)::text||':'||EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='reconciliation_repair_manifest_items'::regclass AND conname='reconciliation_repair_manifest_items_source_relative_key_key')::text") == false:true ]]
     assert_hardened
-    # Preserve the rejection assertions above, then establish a fresh v19
+    # Preserve the rejection assertions above, then establish a fresh v21
     # runtime catalog for the supervisor's independent phase boundary.
     reset_database
     run_wrapper "$current" migrate up --json
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_migration 21 admin_repair_schema_compatibility 42ed20866eaba31b0370352f8d011ae3faf16a4b4eca6bdac6a9432d6bd73558
     assert_hardened
     ;;
   completed-v18-rejection)
@@ -213,11 +213,11 @@ case $phase in
     [[ $(psql_root --tuples-only --no-align --command "SELECT r.authorized_actor||':'||result.result||':'||result.manifest_count FROM reconciliation_repair_runs AS r JOIN reconciliation_repair_results AS result ON result.run_id=r.id WHERE r.id='00000000-0000-4000-8000-000000000022'") == completed-v18:succeeded:0 ]]
     [[ $(psql_root --tuples-only --no-align --command "SELECT (to_regclass('reconciliation_repair_plan_seals') IS NOT NULL)::text||':'||EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='reconciliation_repair_manifest_items'::regclass AND conname='reconciliation_repair_manifest_items_source_relative_key_key')::text") == false:true ]]
     assert_hardened
-    # Preserve the rejection assertions above, then establish a fresh v19
+    # Preserve the rejection assertions above, then establish a fresh v21
     # runtime catalog for the supervisor's independent phase boundary.
     reset_database
     run_wrapper "$current" migrate up --json
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_migration 21 admin_repair_schema_compatibility 42ed20866eaba31b0370352f8d011ae3faf16a4b4eca6bdac6a9432d6bd73558
     assert_hardened
     ;;
   writer-drain)
@@ -240,7 +240,7 @@ case $phase in
     writer_pid=
     wait "$migration_pid"
     migration_pid=
-    assert_migration 19 reconciliation_repair_execution d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13
+    assert_migration 21 admin_repair_schema_compatibility 42ed20866eaba31b0370352f8d011ae3faf16a4b4eca6bdac6a9432d6bd73558
     assert_hardened
     ;;
   *) printf 'unknown compatibility phase: %s\n' "$phase" >&2; exit 2 ;;
