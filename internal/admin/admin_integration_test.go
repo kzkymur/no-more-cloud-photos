@@ -1252,3 +1252,64 @@ func TestAdminIntegrationResumeFirstFencesDirectRepair(t *testing.T) {
 		t.Fatalf("resume did not reject unresolved plan: %v", err)
 	}
 }
+
+func TestAdminIntegrationExactPurgeReclaimPreservesUnrelatedAndAttemptCeiling(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	if _, err := s.ConfigSet(ctx, "deleted_media_retention_days", "0"); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := medialifecycle.NewService(s.Pool, "https://files.example.test/files/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := func(number int) medialifecycle.PurgeLease {
+		t.Helper()
+		id := insertMedia(t, s, number)
+		if _, err := lifecycle.Delete(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+		enqueued, err := lifecycle.EnqueueDuePurge(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := lifecycle.StartPurge(ctx, enqueued.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return lease
+	}
+	bound, unrelated := start(905), start(906)
+	if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=ANY($1::uuid[])`, []string{bound.JobID, unrelated.JobID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.ReclaimExpiredPurge(ctx, bound.JobID); err != nil {
+		t.Fatal(err)
+	}
+	var status, token string
+	if err := s.Pool.QueryRow(ctx, `SELECT status,lease_token::text FROM jobs WHERE id=$1`, unrelated.JobID).Scan(&status, &token); err != nil || status != "running" || token != unrelated.Token {
+		t.Fatalf("unrelated reclaimed status=%s tokenchanged=%v err=%v", status, token != unrelated.Token, err)
+	}
+	for attempt := 2; attempt <= bound.MaxAttempts; attempt++ {
+		if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1`, bound.JobID); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := lifecycle.StartPurge(ctx, bound.JobID)
+		if err != nil || lease.Attempts != attempt || !lease.StartedAt.Equal(bound.StartedAt) || lease.Token == bound.Token {
+			t.Fatalf("reclaim claim=%+v err=%v", lease, err)
+		}
+		if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, bound.JobID); err != nil {
+			t.Fatal(err)
+		}
+		if err := lifecycle.ReclaimExpiredPurge(ctx, bound.JobID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var attempts, maximum int
+	if err := s.Pool.QueryRow(ctx, `SELECT status,attempts,max_attempts FROM jobs WHERE id=$1`, bound.JobID).Scan(&status, &attempts, &maximum); err != nil || status != "failed" || attempts != maximum || maximum != bound.MaxAttempts {
+		t.Fatalf("ceiling bypass status=%s attempts=%d maximum=%d err=%v", status, attempts, maximum, err)
+	}
+	if _, err := lifecycle.StartPurge(ctx, bound.JobID); !errors.Is(err, medialifecycle.ErrNoPurgeWork) {
+		t.Fatalf("exhausted automatically restarted: %v", err)
+	}
+}

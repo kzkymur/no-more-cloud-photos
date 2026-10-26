@@ -204,3 +204,7 @@ this release. Added real committed Start reply-loss/live lease/no-worker restart
 and real before/after-unlink fault recovery tests. Added resume-first SQL lock
 wait proof against direct Repairer (opposite existing repair-first barrier).
 All tests/format/compile await normal successor CI; no local Go claims.
+Added exact reclaim scope/ceiling regression: an unrelated expired running job
+retains its token/status; only the bound job reclaims, rotates tokens without
+resetting started_at/history, and fails at the existing attempt ceiling rather
+than enlarging retry allowance. Local diff-check only; formal tests pending.
