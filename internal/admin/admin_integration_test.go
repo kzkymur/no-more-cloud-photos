@@ -545,7 +545,7 @@ func dueHistoricalRendition(t *testing.T, s *Service) string {
 	}
 	defer rollback(tx)
 	statements := []struct {
-		sql string
+		sql  string
 		args []any
 	}{
 		{`UPDATE renditions SET purge_after=clock_timestamp()-interval '1 hour' WHERE id=$1`, []any{renditionID}},
@@ -555,7 +555,7 @@ func dueHistoricalRendition(t *testing.T, s *Service) string {
 		{`UPDATE job_targets SET status='succeeded',attempts=1 WHERE id=$1`, []any{newTarget}},
 		{`INSERT INTO renditions(id,media_id,job_target_id,profile_key,is_current,relative_path,mime_type,width,height,size_bytes,sha256,processor_audit)
 		VALUES($1,$2,$3,'mixed',true,$4,'image/avif',1,1,1,$5,'{"fixture":"current"}')`, []any{newRendition, mediaID, newTarget,
-			"renditions/"+originalID[:2]+"/"+originalID+"/"+newTarget+"/"+newRendition+".avif", strings.Repeat("b", 64)}},
+			"renditions/" + originalID[:2] + "/" + originalID + "/" + newTarget + "/" + newRendition + ".avif", strings.Repeat("b", 64)}},
 		{`UPDATE jobs SET status='succeeded',lease_token=NULL,lease_expires_at=NULL,finished_at=clock_timestamp() WHERE id=$1`, []any{jobID}},
 	}
 	for _, statement := range statements {

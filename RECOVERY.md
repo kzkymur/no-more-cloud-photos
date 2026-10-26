@@ -113,3 +113,9 @@ tests are not yet executed pending successor normal CI.
   rename barrier vs resume conflict and maintenance preview no-write test.
 All current new fixes/tests await successor normal CI. Mandatory formatting guard
 and prior full gates remain unchanged. No local Go workaround/bypass used.
+
+## Engineer ownership resumed
+Exact ca4f9ec Core39524524362 failed at early gofmt, before tests (two test
+spacing differences); Infra39524524406 succeeded. Applied only the exact
+runner-produced formatting changes. No runtime/full-Core acceptance inferred.
+Next formal successor must execute PG17 early tests and every existing gate.
