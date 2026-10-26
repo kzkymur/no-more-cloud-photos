@@ -109,11 +109,11 @@ func TestAdminIntegrationResumeCutoverRejectsWaitingDirectRepairPreflight(t *tes
 		}
 	}
 	unblock()
-	if err := <-resumed; err != nil {
+	if err := awaitRepairTestError(t, ctx, resumed); err != nil {
 		t.Fatalf("fresh clean resume failed instead of cutting over: %v", err)
 	}
 	var admission *pgconn.PgError
-	if err := <-direct; !errors.As(err, &admission) || admission.Code != "55000" {
+	if err := awaitRepairTestError(t, ctx, direct); !errors.As(err, &admission) || admission.Code != "55000" {
 		t.Fatalf("waiting direct preflight not rejected after normal cutover: %v", err)
 	}
 	var mode string
@@ -181,5 +181,17 @@ func TestAdminIntegrationForwardRepairCatalogAndActualRoles(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Bound every final receive independently of whether a native waiter returns.
+func awaitRepairTestError(t *testing.T, ctx context.Context, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+		return ctx.Err()
 	}
 }

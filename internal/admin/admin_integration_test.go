@@ -724,7 +724,7 @@ func TestAdminIntegrationDirectRepairFencesResumeAndDryRunHasNoEffects(t *testin
 	if !errors.Is(resumeErr, ErrConflict) {
 		t.Fatalf("resume crossed direct repair transaction: %v", resumeErr)
 	}
-	if err := <-finished; err != nil {
+	if err := awaitRepairTestError(t, ctx, finished); err != nil {
 		t.Fatal(err)
 	}
 }
