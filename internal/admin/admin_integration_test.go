@@ -787,3 +787,55 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 	t.Run("unsealed", func(t *testing.T) { checkAdmission(t, 21, false, false, false, false, false) })
 	t.Run("source-error", func(t *testing.T) { checkAdmission(t, 21, false, false, true, true, false) })
 }
+
+func TestAdminIntegrationBeginBatchCommitRejectionHasNoResumeToken(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	certifyJPEG(t, s)
+	definition := certifiedProfile(t, s, "begin_reject", 1)
+	if err := s.ProfileTransition(ctx, definition.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	mediaID := insertMedia(t, s, 600)
+	var auditBefore int
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM admin_audit`).Scan(&auditBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `CREATE FUNCTION reject_admin_begin() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+		RAISE EXCEPTION 'secret-marker deferred begin rejection'; END $$;
+		CREATE CONSTRAINT TRIGGER reject_admin_begin AFTER INSERT ON admin_batches DEFERRABLE INITIALLY DEFERRED
+		FOR EACH ROW EXECUTE FUNCTION reject_admin_begin()`); err != nil {
+		t.Fatal(err)
+	}
+	request := BatchRequest{Operation: "regenerate", ProfileKey: "begin_reject", MediaID: mediaID}
+	rejected, err := s.BeginBatch(ctx, request, "", false)
+	if err == nil || rejected.Token != "" || rejected.LookupToken != "" || rejected.Total != 0 || rejected.ProfileID != nil || rejected.Status != "not_committed" || rejected.CommitState != "not_committed" {
+		t.Fatalf("rejected begin=%+v err=%v", rejected, err)
+	}
+	var out, diagnostics bytes.Buffer
+	if code := Run(ctx, []string{"regenerate", "--profile", "begin_reject", "--media-id", mediaID, "--json"}, &out, &diagnostics); code != 1 {
+		t.Fatalf("CLI exit=%d stdout=%s stderr=%s", code, out.String(), diagnostics.String())
+	}
+	if strings.Contains(out.String()+diagnostics.String(), "secret-marker") || strings.Contains(out.String()+diagnostics.String(), "resume token") || strings.Contains(out.String(), "resume_token") {
+		t.Fatalf("speculative/unsafe CLI stdout=%s stderr=%s", out.String(), diagnostics.String())
+	}
+	var envelope struct {
+		Result   BatchResult `json:"result"`
+		ExitCode int         `json:"exit_code"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil || envelope.ExitCode != 1 || envelope.Result.CommitState != "not_committed" || envelope.Result.Total != 0 {
+		t.Fatalf("invalid CLI rejection=%+v err=%v", envelope, err)
+	}
+	var batches, items, audits, jobs int
+	if err := s.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM admin_batches),(SELECT count(*) FROM admin_batch_items),
+		(SELECT count(*) FROM admin_audit),(SELECT count(*) FROM jobs)`).Scan(&batches, &items, &audits, &jobs); err != nil || batches != 0 || items != 0 || jobs != 0 || audits != auditBefore {
+		t.Fatalf("rollback lost batches=%d items=%d jobs=%d auditDelta=%d err=%v", batches, items, jobs, audits-auditBefore, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_admin_begin ON admin_batches`); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := New(s.Pool).BeginBatch(ctx, request, "", false)
+	if err != nil || committed.Token == "" || committed.Status != "running" || committed.Total != 1 {
+		t.Fatalf("restart begin=%+v err=%v", committed, err)
+	}
+}

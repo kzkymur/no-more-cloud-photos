@@ -8,6 +8,9 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestConfigValueValidation(t *testing.T) {
@@ -121,5 +124,40 @@ func TestFinishRedactsOperationalErrors(t *testing.T) {
 	}
 	if strings.Contains(out.String()+diagnostics.String(), "secret-marker") {
 		t.Fatal("secret leak")
+	}
+}
+
+func TestBeginBatchCommitFailureNeverClaimsSpeculativeState(t *testing.T) {
+	id := "10000000-0000-4000-8000-000000000001"
+	for _, cause := range []error{pgx.ErrTxCommitRollback, &pgconn.PgError{Code: "P0001", Message: "secret-marker"}, io.ErrUnexpectedEOF} {
+		result := beginBatchCommitFailure(BatchResult{Token: id, ProfileID: &id, Status: "running", Total: 7}, cause)
+		unknown := errors.Is(cause, io.ErrUnexpectedEOF)
+		if result.Token != "" || result.ProfileID != nil || result.Total != 0 || result.Succeeded != 0 || result.Failed != 0 {
+			t.Fatalf("speculative state leaked: %+v", result)
+		}
+		if unknown && (result.Status != "unknown" || result.CommitState != "unknown" || result.LookupToken != id) {
+			t.Fatalf("uncertain commit presented as known: %+v", result)
+		}
+		if !unknown && (result.Status != "not_committed" || result.CommitState != "not_committed" || result.LookupToken != "") {
+			t.Fatalf("rejected commit presented as recoverable: %+v", result)
+		}
+		var out, diagnostics bytes.Buffer
+		if code := finish(&out, &diagnostics, true, result, classified(cause)); code != 1 {
+			t.Fatalf("failed commit exit=%d", code)
+		}
+		if strings.Contains(out.String()+diagnostics.String(), "secret-marker") || strings.Contains(out.String(), "resume_token") {
+			t.Fatalf("failed commit CLI output=%s diagnostics=%s", out.String(), diagnostics.String())
+		}
+		var envelope struct {
+			Result   BatchResult `json:"result"`
+			ExitCode int         `json:"exit_code"`
+		}
+		decoder := json.NewDecoder(&out)
+		if err := decoder.Decode(&envelope); err != nil || envelope.ExitCode != 1 || envelope.Result.CommitState != result.CommitState {
+			t.Fatalf("invalid error envelope=%+v err=%v", envelope, err)
+		}
+		if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+			t.Fatalf("stdout was not exactly one JSON: %v", err)
+		}
 	}
 }

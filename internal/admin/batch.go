@@ -25,6 +25,7 @@ type BatchRequest struct {
 
 type BatchResult struct {
 	Token       string          `json:"resume_token,omitempty"`
+	LookupToken string          `json:"lookup_token,omitempty"`
 	ProfileID   *string         `json:"profile_id,omitempty"`
 	Status      string          `json:"status"`
 	Total       int64           `json:"total"`
@@ -154,7 +155,26 @@ func (s *Service) BeginBatch(ctx context.Context, request BatchRequest, resume s
 	if err != nil {
 		return BatchResult{}, err
 	}
-	return result, classified(tx.Commit(ctx))
+	if err := tx.Commit(ctx); err != nil {
+		return beginBatchCommitFailure(result, err), classified(err)
+	}
+	return result, nil
+}
+
+// A new batch has no durable pre-commit state to return. In particular its
+// speculative counters and token cannot be advertised as resumable. On an
+// uncertain connection outcome retain only a lookup hint: the caller must
+// establish that this identity exists before considering it a resume token.
+func beginBatchCommitFailure(speculative BatchResult, err error) BatchResult {
+	result := BatchResult{Status: "not_committed", CommitState: "not_committed", Checkpoint: json.RawMessage(`{}`)}
+	var serverRejection *pgconn.PgError
+	if errors.Is(err, pgx.ErrTxCommitRollback) || errors.As(err, &serverRejection) {
+		return result
+	}
+	result.Status = "unknown"
+	result.CommitState = "unknown"
+	result.LookupToken = speculative.Token
+	return result
 }
 
 type batchItem struct {
