@@ -131,3 +131,14 @@ all source completeness/seal/schema-name/checksum/classifier guards unchanged.
 No change to maintenance authorization or evidence format. This is a production
 compatibility defect, not a fixture error; tests must run again on successor.
 Draft PR45 already exists with Closes18, not ready until full exact-head gates.
+
+## First resumed formal PG17 results and schema compatibility fix
+Core40248198934 exact1a79d2e passed formatting and ran early tests. All admin
+integration tests except direct repair vs resume passed, including both repaired
+CLI fixtures and media/rendition durable audit recovery. The remaining test
+failed before preview:0019's explicit supported migration allowlists rejected
+reports created after0020.0021 extends only those version lists (20 and21),
+keeping the exact sealed/source/checksum admission predicate, definer owner,
+closed search path, ACL and maintenance authorization unchanged. Existing causal
+preview/plan/execute/fence test must now run on latest schema; downstream full
+Core gates remain unaccepted until a successful successor.
