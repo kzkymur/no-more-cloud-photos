@@ -142,3 +142,14 @@ keeping the exact sealed/source/checksum admission predicate, definer owner,
 closed search path, ACL and maintenance authorization unchanged. Existing causal
 preview/plan/execute/fence test must now run on latest schema; downstream full
 Core gates remain unaccepted until a successful successor.
+
+## Isolated single-writer reconciliation
+Leader authorized a new UUID worktree/branch based on dfb4693 after concurrent
+same-role writers were detected on the old shared worktree. Old path and its
+uncommitted patch are preserved unchanged. This ordinary successor removes the
+duplicate0021 report_compatibility file, retaining schema_compatibility with its
+explicit original definer owner/search_path. Restores0020 byte-for-byte from
+ca4f (avoid rewriting an already applied migration). Only forward0021 admits
+20/21 reports; negative report authority cases and latest report→plan seal
+assertions imported from the saved patch. Runtime still unvalidated. Three
+reviewer durability MEDs and Ubuntu verifier latest-version pin remain OPEN.
