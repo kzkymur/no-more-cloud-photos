@@ -674,19 +674,9 @@ func (r *PostgresRepository) ReclaimExpiredPurges(ctx context.Context, limit int
 		if err != nil {
 			return nil, fmt.Errorf("lock expired purge job: %w", err)
 		}
-		delay, err := purgeRetryDelay(r.jitter, attempts)
+		tag, err := r.reclaimExpiredPurgeLocked(ctx, tx, jobID, attempts)
 		if err != nil {
 			return nil, err
-		}
-		tag, err := tx.Exec(ctx, `UPDATE jobs SET
-			status=CASE WHEN attempts<max_attempts THEN 'queued' ELSE 'failed' END,
-			available_at=CASE WHEN attempts<max_attempts THEN clock_timestamp()+$2::interval ELSE available_at END,
-			lease_token=NULL,lease_expires_at=NULL,error_code='lease_expired',error_message='job lease expired',
-			finished_at=CASE WHEN attempts<max_attempts THEN NULL ELSE clock_timestamp() END,
-			updated_at=clock_timestamp()
-			WHERE id=$1 AND type='purge' AND status='running' AND lease_expires_at<=clock_timestamp()`, jobID, intervalText(delay))
-		if err != nil {
-			return nil, fmt.Errorf("reclaim expired purge lease: %w", err)
 		}
 		if tag.RowsAffected() == 1 {
 			reclaimed = append(reclaimed, jobID)
@@ -703,6 +693,55 @@ func (r *PostgresRepository) ReclaimExpiredPurges(ctx context.Context, limit int
 		return nil, err
 	}
 	return reclaimed, nil
+}
+
+// ReclaimExpiredPurge is scoped to one already-authorized job. It never claims
+// unrelated work or discloses/reuses a live token. Lock order matches scheduler.
+func (r *PostgresRepository) ReclaimExpiredPurge(ctx context.Context, jobID string) error {
+	tx, err := r.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	if err := lockMaintenance(ctx, tx); err != nil {
+		return err
+	}
+	var mediaID string
+	err = tx.QueryRow(ctx, `SELECT m.id::text FROM jobs j JOIN media m ON m.id=j.media_id_snapshot
+		WHERE j.id=$1 AND j.type='purge' AND m.deleted_at IS NOT NULL FOR UPDATE OF m NOWAIT`, jobID).Scan(&mediaID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var attempts int
+	err = tx.QueryRow(ctx, `SELECT attempts FROM jobs WHERE id=$1 AND media_id_snapshot=$2
+		AND type='purge' AND status='running' AND lease_expires_at<=clock_timestamp() FOR UPDATE NOWAIT`, jobID, mediaID).Scan(&attempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := r.reclaimExpiredPurgeLocked(ctx, tx, jobID, attempts); err != nil {
+		return err
+	}
+	return r.commit(ctx, tx)
+}
+
+func (r *PostgresRepository) reclaimExpiredPurgeLocked(ctx context.Context, tx pgx.Tx, jobID string, attempts int) (pgconn.CommandTag, error) {
+	delay, err := purgeRetryDelay(r.jitter, attempts)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
+	return tx.Exec(ctx, `UPDATE jobs SET
+			status=CASE WHEN attempts<max_attempts THEN 'queued' ELSE 'failed' END,
+			available_at=CASE WHEN attempts<max_attempts THEN clock_timestamp()+$2::interval ELSE available_at END,
+			lease_token=NULL,lease_expires_at=NULL,error_code='lease_expired',error_message='job lease expired',
+			finished_at=CASE WHEN attempts<max_attempts THEN NULL ELSE clock_timestamp() END,
+			updated_at=clock_timestamp()
+			WHERE id=$1 AND type='purge' AND status='running' AND lease_expires_at<=clock_timestamp()`, jobID, intervalText(delay))
 }
 
 func (r *PostgresRepository) StartPurge(ctx context.Context, jobID string) (PurgeLease, error) {

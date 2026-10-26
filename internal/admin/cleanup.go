@@ -11,6 +11,17 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
+type cleanupLifecycle interface {
+	EnqueueDuePurge(context.Context, string) (medialifecycle.EnqueueResult, error)
+	ReclaimExpiredPurge(context.Context, string) error
+	StartPurge(context.Context, string) (medialifecycle.PurgeLease, error)
+	HeartbeatPurge(context.Context, string, string) (time.Time, error)
+	RunPurgeFileStep(context.Context, string, string, medialifecycle.PurgeFileAction) (medialifecycle.PurgeStepResult, error)
+	FinalizePurge(context.Context, string, string) error
+	FinishPurgeAttempt(context.Context, string, string, string) error
+	CleanupNextRendition(context.Context, string, []string, func(context.Context, string, string, int64) (bool, error)) (string, error)
+}
+
 type cleanupItem struct {
 	id      string
 	mediaID string
@@ -178,7 +189,7 @@ func (s *Service) cleanupProof(ctx context.Context, kind string, item cleanupIte
 	return done, err
 }
 
-func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Service, store *storage.Store, kind, runID string, item cleanupItem) (bool, bool, error) {
+func (s *Service) cleanupOne(ctx context.Context, lifecycle cleanupLifecycle, store *storage.Store, kind, runID string, item cleanupItem) (bool, bool, error) {
 	if done, err := s.cleanupProof(ctx, kind, item); done || err != nil {
 		return done, false, err
 	}
@@ -250,6 +261,9 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 	if bound.RowsAffected() != 1 {
 		return false, false, ErrConflict
 	}
+	if err := lifecycle.ReclaimExpiredPurge(ctx, enqueued.Job.ID); err != nil {
+		return false, false, err
+	}
 	lease, err := lifecycle.StartPurge(ctx, enqueued.Job.ID)
 	if err != nil {
 		return false, false, err
@@ -260,6 +274,12 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 		}
 		step, err := lifecycle.RunPurgeFileStep(ctx, lease.JobID, lease.Token, medialifecycle.StoragePurgeFileAction(store))
 		if err != nil {
+			var unknown *medialifecycle.CommitOutcomeUnknown
+			if !errors.As(err, &unknown) && !errors.Is(err, medialifecycle.ErrPurgeLeaseLost) && !medialifecycle.IsKind(err, medialifecycle.KindDatabaseUnavailable) {
+				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				_ = lifecycle.FinishPurgeAttempt(releaseCtx, lease.JobID, lease.Token, "process_failed")
+				cancel()
+			}
 			return false, false, err
 		}
 		if step.Done {

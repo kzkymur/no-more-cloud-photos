@@ -1024,3 +1024,231 @@ func TestAdminIntegrationRenditionStaleSnapshotDoesNotPoisonFutureWork(t *testin
 		t.Fatalf("healthy=%+v err=%v", healthy, err)
 	}
 }
+
+type lostPurgeStart struct {
+	*medialifecycle.Service
+}
+
+func (s lostPurgeStart) StartPurge(ctx context.Context, id string) (medialifecycle.PurgeLease, error) {
+	_, err := s.Service.StartPurge(ctx, id)
+	if err != nil {
+		return medialifecycle.PurgeLease{}, err
+	}
+	return medialifecycle.PurgeLease{}, &medialifecycle.CommitOutcomeUnknown{Cause: errors.New("lost committed start reply")}
+}
+
+func TestAdminIntegrationStandaloneCleanupRecoversExactLostPurgeStart(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	store, err := storage.Open(t.TempDir(), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := s.ConfigSet(ctx, "deleted_media_retention_days", "0"); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := medialifecycle.NewService(s.Pool, "https://files.example.test/files/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mediaID := insertMedia(t, s, 903)
+	if _, err := lifecycle.Delete(ctx, mediaID); err != nil {
+		t.Fatal(err)
+	}
+	items, runID, err := s.cleanupSelection(ctx, "media", false)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("selection=%v err=%v", items, err)
+	}
+	_, _, err = s.cleanupOne(ctx, lostPurgeStart{lifecycle}, store, "media", runID, items[0])
+	var unknown *medialifecycle.CommitOutcomeUnknown
+	if !errors.As(err, &unknown) {
+		t.Fatalf("start response loss=%v", err)
+	}
+	var jobID, token string
+	if err := s.Pool.QueryRow(ctx, `SELECT j.id::text,j.lease_token::text FROM admin_cleanup_items i JOIN jobs j ON j.id=i.job_id WHERE i.run_id=$1`, runID).Scan(&jobID, &token); err != nil {
+		t.Fatal(err)
+	}
+	live, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	if !errors.Is(err, ErrPartial) || live.Completed != 0 {
+		t.Fatalf("live lease stolen=%+v err=%v", live, err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	// Exact recovery preserves normal backoff; no worker or global sweep.
+	if err := lifecycle.ReclaimExpiredPurge(ctx, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	if err != nil || completed.RunID != runID || completed.Completed != 1 {
+		t.Fatalf("standalone recovery=%+v err=%v", completed, err)
+	}
+	if _, err := lifecycle.HeartbeatPurge(ctx, jobID, token); !errors.Is(err, medialifecycle.ErrPurgeLeaseLost) {
+		t.Fatalf("old token accepted: %v", err)
+	}
+	var attempts, events, audits int
+	if err := s.Pool.QueryRow(ctx, `SELECT attempts,(SELECT count(*) FROM change_events WHERE media_id=$2 AND event_type='media_purged'),
+		(SELECT count(*) FROM admin_audit WHERE command='cleanup_result' AND $2::uuid=ANY(affected_ids)) FROM jobs WHERE id=$1`, jobID, mediaID).Scan(&attempts, &events, &audits); err != nil || attempts != 2 || events != 1 || audits != 1 {
+		t.Fatalf("attempts=%d events=%d audits=%d err=%v", attempts, events, audits, err)
+	}
+}
+
+func TestAdminIntegrationStandaloneCleanupFileFailureReleasesOwnedAttempt(t *testing.T) {
+	for _, phase := range []storage.Phase{storage.Before, storage.After} {
+		t.Run(string(phase), func(t *testing.T) {
+			s := integrationService(t)
+			ctx := context.Background()
+			root := t.TempDir()
+			fail := true
+			store, err := storage.Open(root, storage.Options{Faults: storage.FaultInjectorFunc(func(ctx context.Context, event storage.FaultEvent) error {
+				if fail && event.Boundary == storage.BoundaryDelete && event.Phase == phase {
+					fail = false
+					return errors.New("one-shot actual unlink failure")
+				}
+				return nil
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			mediaID := insertMedia(t, s, 904)
+			var relative string
+			if err := s.Pool.QueryRow(ctx, `SELECT relative_path FROM originals WHERE media_id=$1`, mediaID).Scan(&relative); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, relative)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.ConfigSet(ctx, "deleted_media_retention_days", "0"); err != nil {
+				t.Fatal(err)
+			}
+			lifecycle, err := medialifecycle.NewService(s.Pool, "https://files.example.test/files/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := lifecycle.Delete(ctx, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			first, err := s.Cleanup(ctx, store, "media", false)
+			if !errors.Is(err, ErrPartial) || first.Failed != 1 || fail {
+				t.Fatalf("fault=%+v err=%v not reached=%v", first, err, fail)
+			}
+			var status string
+			var released bool
+			if err := s.Pool.QueryRow(ctx, `SELECT status,lease_token IS NULL FROM jobs WHERE type='purge' AND media_id_snapshot=$1`, mediaID).Scan(&status, &released); err != nil || status != "queued" || !released {
+				t.Fatalf("owned failure not released status=%s released=%v err=%v", status, released, err)
+			}
+			if _, err := s.Pool.Exec(ctx, `UPDATE jobs SET available_at=clock_timestamp()-interval '1 second' WHERE type='purge' AND media_id_snapshot=$1`, mediaID); err != nil {
+				t.Fatal(err)
+			}
+			resumed, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+			if err != nil || resumed.RunID != first.RunID || resumed.Completed != 1 {
+				t.Fatalf("file recovery=%+v err=%v", resumed, err)
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("file survived: %v", err)
+			}
+		})
+	}
+}
+
+func TestAdminIntegrationResumeFirstFencesDirectRepair(t *testing.T) {
+	s := integrationService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	store, err := storage.Open(root, storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	id := newID()
+	path := filepath.Join(root, "originals", id[:2], id, "original.jpg")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checked, err := s.Check(ctx, store, reconciliation.ScopeAll)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='reverse fence',owner='test',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := reconciliation.NewRepairPostgresRepository(s.Pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairer, err := reconciliation.NewRepairer(repository, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := repairer.Plan(ctx, reconciliation.RepairPlanRequest{ReportID: checked.ReportID, AuthorizationID: newID(), Actor: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	s.afterMaintenanceLock = func(ctx context.Context) error {
+		close(entered)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	resumeDone := make(chan error, 1)
+	go func() {
+		_, err := s.MaintenanceResume(ctx, store)
+		resumeDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	directCtx, stopDirect := context.WithCancel(ctx)
+	directDone := make(chan error, 1)
+	go func() {
+		_, err := repairer.Execute(directCtx, plan.Run.RunID)
+		directDone <- err
+	}()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks wait JOIN pg_locks rel ON rel.pid=wait.pid
+			WHERE NOT wait.granted AND rel.relation='maintenance_state'::regclass)`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-directDone:
+			t.Fatalf("direct repair crossed resume fence: %v", err)
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("blocked repair moved source: %v", err)
+	}
+	stopDirect()
+	<-directDone
+	close(release)
+	if err := <-resumeDone; !errors.Is(err, ErrConflict) {
+		t.Fatalf("resume did not reject unresolved plan: %v", err)
+	}
+}

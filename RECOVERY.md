@@ -191,3 +191,16 @@ lost-reply fault seam for Begin and Page, asserting unknown responses then exact
 restart/receipt replay and no duplicate retry allowance. Removed uncalled Sweep
 adapter. Additional exact-bound purge recovery and reverse maintenance fence
 causal tests remain in progress. No full-gate or reviewer approval inferred.
+
+## Exact standalone purge recovery checkpoint
+Factored the existing scheduler expired-purge transition into a shared helper;
+new lifecycle ReclaimExpiredPurge targets ONLY the durably bound job, with the
+same maintenance→Media→Job lock order, DB expiry predicate, backoff, attempt
+ceiling, token clearing and manifest retention. No global discovery, live-token
+adoption or implicit retry allowance. Admin calls it before exact StartPurge.
+Known owned file failure releases the attempt with the existing token-checked
+FinishPurgeAttempt; unknown DB commit/lease-loss/unavailability never triggers
+this release. Added real committed Start reply-loss/live lease/no-worker restart
+and real before/after-unlink fault recovery tests. Added resume-first SQL lock
+wait proof against direct Repairer (opposite existing repair-first barrier).
+All tests/format/compile await normal successor CI; no local Go claims.

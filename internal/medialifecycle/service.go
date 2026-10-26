@@ -130,6 +130,21 @@ func (s *Service) DatabaseNow(ctx context.Context) (time.Time, error) {
 	return result, classifyError(err)
 }
 
+func (s *Service) ReclaimExpiredPurge(ctx context.Context, jobID string) error {
+	if !readapi.IsUUIDv4(jobID) {
+		return newInvalidID()
+	}
+	repository, ok := s.repository.(interface {
+		ReclaimExpiredPurge(context.Context, string) error
+	})
+	if !ok {
+		return newInvariant(errors.New("exact purge reclaim unavailable"))
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, s.dbBudget)
+	defer cancel()
+	return classifyError(repository.ReclaimExpiredPurge(dbCtx, jobID))
+}
+
 func (s *Service) StartNextPurge(ctx context.Context, limit int) (PurgeLease, error) {
 	if limit <= 0 || limit > purgeSchedulerBatchMax {
 		return PurgeLease{}, newInvariant(errors.New("invalid purge scheduler limit"))

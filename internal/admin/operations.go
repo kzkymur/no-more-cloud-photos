@@ -120,6 +120,11 @@ func (s *Service) MaintenanceResume(ctx context.Context, store *storage.Store) (
 	if mode != "maintenance" {
 		return nil, ErrConflict
 	}
+	if s.afterMaintenanceLock != nil {
+		if err := s.afterMaintenanceLock(ctx); err != nil {
+			return nil, err
+		}
+	}
 	check, err := s.Check(ctx, store, reconciliation.ScopeAll)
 	if err != nil {
 		return check, err

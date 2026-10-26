@@ -33,6 +33,8 @@ type Service struct {
 	Host  string
 
 	afterBatchCommit func(context.Context) error
+
+	afterMaintenanceLock func(context.Context) error
 }
 
 func New(pool *pgxpool.Pool) *Service {
