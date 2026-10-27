@@ -364,6 +364,28 @@ BEGIN
         RAISE EXCEPTION 'unsafe backup delegation/default privileges';
     END IF;
     FOREACH login IN ARRAY ARRAY['nmcp_backup_dump','nmcp_backup_control'] LOOP
+        -- No backup role may invoke an application capability. In particular,
+        -- table ACLs alone do not contain SECURITY DEFINER mutations. Include
+        -- effective PUBLIC grants, not just direct ACL entries. Invoker trigger
+        -- functions cannot be called as ordinary routines; immutable/stable
+        -- invoker validators remain usable by CHECK constraints.
+        IF EXISTS (
+            SELECT 1 FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+            WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+              AND (p.prosecdef OR p.prokind='p' OR
+                   (p.provolatile='v' AND p.prorettype NOT IN
+                       ('pg_catalog.trigger'::regtype,'pg_catalog.event_trigger'::regtype)))
+              AND has_function_privilege(login,p.oid,'EXECUTE')
+        ) OR EXISTS (
+            SELECT 1 FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) a
+            WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+              AND a.grantee=login::regrole
+        ) THEN
+            RAISE EXCEPTION 'unsafe backup application function EXECUTE: %',login;
+        END IF;
         IF has_database_privilege(login,current_database(),'CREATE')
            OR has_database_privilege(login,current_database(),'TEMP') THEN
             RAISE EXCEPTION 'unsafe backup database privileges: %',login;
