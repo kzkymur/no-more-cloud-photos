@@ -41,6 +41,8 @@ done
   /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf \
   /etc/systemd/system/nmcp-backup.service.d/10-postgresql.conf
 "$script_dir/validate-backup-install" --installed
+# Explicit root operator source-only binding, before any first wake or timer.
+"$script_dir/configure-backup-source-hba"
 /usr/bin/systemctl daemon-reload
 # No backup is reported here: the next wake independently evaluates DB policy.
 /usr/bin/systemctl start nmcp-backup.service

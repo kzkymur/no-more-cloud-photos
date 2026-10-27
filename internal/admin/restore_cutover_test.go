@@ -491,3 +491,16 @@ func TestOfflineTargetHBADoesNotFenceUnrelatedTargetDatabase(t *testing.T) {
 		t.Fatal("offline target HBA changed authority outside candidate")
 	}
 }
+
+func TestBackupSourceOnlyPolicyRetargetPreservesSingleBlock(t *testing.T) {
+	old := []byte(backupSourceHBABlock("source") + "local all all peer\n")
+	next, err := retargetBackupHBAPolicy(old, "candidate")
+	if err != nil || strings.Count(string(next), "# BEGIN nmcp backup source-only") != 1 || !strings.Contains(string(next), `local "candidate" nmcp_backup_dump,nmcp_backup_control scram-sha-256`) {
+		t.Fatal("source-only policy not retargeted")
+	}
+	for _, bad := range [][]byte{append(old, old...), []byte(strings.Replace(string(old), "local all nmcp_backup_dump,nmcp_backup_control reject", "local all all trust", 1))} {
+		if _, err := retargetBackupHBAPolicy(bad, "candidate"); err == nil {
+			t.Fatal("mutated source-only policy accepted")
+		}
+	}
+}

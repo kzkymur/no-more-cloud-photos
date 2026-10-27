@@ -291,6 +291,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	if e != nil || op.Phase != "cutover_verified" {
 		t.Fatalf("real system cutover failed at sanitized phase %s", op.FailedPhase)
 	}
+	pg17AssertBackupOtherDBHBA(t, ctx, f.passwords, g.socket, 5544, op.Candidate.DatabaseName)
 	durable, e := LoadRestoreOperation(settings.LedgerRoot, op.ID)
 	if e != nil || durable.Phase != "cutover_verified" || durable.Receipt != receipt || durable.BackupID != backupID || len(durable.DumpSHA256) != 64 {
 		t.Fatal("external authorization ledger lost pinned identity/receipt/digest")

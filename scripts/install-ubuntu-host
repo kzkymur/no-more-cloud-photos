@@ -200,7 +200,7 @@ done
 for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
   acquire-ubuntu-deployment-locks capture-trusted-inputs handoff-ubuntu-migration-lock \
   run-ubuntu-migration run-ubuntu-migration-compatibility set-ubuntu-migration-role-mode \
-  validate-ubuntu-config validate-backup-install install-backup-config \
+  validate-ubuntu-config validate-backup-install install-backup-config configure-backup-source-hba \
   verify-ubuntu-firewall verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done

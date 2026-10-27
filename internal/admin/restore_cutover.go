@@ -765,7 +765,11 @@ func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) erro
 			return errCutover
 		}
 	}
-	a.hba.after = cutoverHBA(a.hba.before, op)
+	policy, policyErr := retargetBackupHBAPolicy(a.hba.before, op.Candidate.DatabaseName)
+	if policyErr != nil {
+		return errCutover
+	}
+	a.hba.after = cutoverHBA(policy, op)
 	return nil
 }
 
@@ -1133,4 +1137,33 @@ func (a *systemCutover) originEndpoint() (string, uint16) {
 	}
 	p := a.source.Config().ConnConfig
 	return p.Host, p.Port
+}
+
+func backupSourceHBABlock(database string) string {
+	db := `"` + database + `"`
+	roles := "nmcp_backup_dump,nmcp_backup_control"
+	return "# BEGIN nmcp backup source-only v1\nlocal " + db + " " + roles + " scram-sha-256\nhost " + db + " " + roles + " 127.0.0.1/32 scram-sha-256\nhost " + db + " " + roles + " ::1/128 scram-sha-256\nlocal all " + roles + " reject\nhost all " + roles + " 0.0.0.0/0 reject\nhost all " + roles + " ::/0 reject\n# END nmcp backup source-only v1\n"
+}
+func retargetBackupHBAPolicy(raw []byte, database string) ([]byte, error) {
+	if !regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`).MatchString(database) {
+		return nil, errCutover
+	}
+	text := string(raw)
+	const begin = "# BEGIN nmcp backup source-only v1\n"
+	const end = "# END nmcp backup source-only v1\n"
+	if !strings.Contains(text, "nmcp backup source-only") {
+		return []byte(backupSourceHBABlock(database) + text), nil
+	}
+	if strings.Count(text, begin) != 1 || strings.Count(text, end) != 1 {
+		return nil, errCutover
+	}
+	a, b := strings.Index(text, begin), strings.Index(text, end)+len(end)
+	if b <= a {
+		return nil, errCutover
+	}
+	matched := regexp.MustCompile(`\nlocal "([a-z][a-z0-9_]{0,62})" nmcp_backup_dump,nmcp_backup_control scram-sha-256\n`).FindStringSubmatch(text[a:b])
+	if len(matched) != 2 || text[a:b] != backupSourceHBABlock(matched[1]) {
+		return nil, errCutover
+	}
+	return []byte(text[:a] + backupSourceHBABlock(database) + text[b:]), nil
 }

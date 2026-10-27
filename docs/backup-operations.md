@@ -245,3 +245,23 @@ authority; retain it for explicit operator investigation rather than inventing
 success history. Candidate PUBLIC CONNECT remains revoked. Explicit cutover
 opens CONNECT only for the five fixed intended logins, behind the maintenance
 and HBA fences; it never grants CREATEDB, role membership or PUBLIC access.
+
+## Source-only database login boundary
+
+`install-backup-config` invokes the reviewed root operator
+`configure-backup-source-hba` while holding the existing deployment locks,
+before its first wake or timer activation. It discovers the actual migrated
+PG17 source/HBA through a scrubbed local PostgreSQL administrator connection,
+pins the active unit/postmaster/database identity, and atomically installs an
+owned block allowing the two backup logins only to the configured source DB.
+All other databases are rejected for those logins over local/IPv4/IPv6 routes;
+no other database's PUBLIC ACL or unrelated role is changed. Includes, mutated
+owned blocks, identity drift and stale reload evidence fail closed. Promotion
+retargets this exact policy to the new source. Ordinary runtime users never
+receive the administrator credential or permission to invoke this installer.
+
+Actual authentication evidence is separate from file/hash/reload checks. The
+mandatory PG17 test proves real source authentication and explicit HBA `28000`
+rejection for `postgres`/`template1` despite PUBLIC CONNECT, using correct
+credentials over Unix/IPv4/IPv6. Root promotion fixtures independently repeat
+the other-database denial on their new target.
