@@ -45,8 +45,11 @@ var liveUnits = []string{"nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.s
 
 type liveCutoverFixture struct {
 	*pg17Fixture
-	owned      map[string]os.FileInfo
-	postmaster int
+	owned          map[string]os.FileInfo
+	postmaster     int
+	hbaPath        string
+	managedUnits   []string
+	managedServers []*liveCutoverFixture
 }
 
 func liveRequired(t *testing.T, key string, executable bool) string {
@@ -137,7 +140,19 @@ func (f *liveCutoverFixture) bootstrapLive(after bool) {
 	f.command("psql", nil, append(args, "--set=nmcp_migration_compatibility=1", file)...)
 }
 
-func newLiveCutoverFixture(t *testing.T, bin string) *liveCutoverFixture {
+func newLiveCutoverFixture(t *testing.T, bin string, clusters ...string) *liveCutoverFixture {
+	cluster := "backup-ci"
+	if len(clusters) > 0 {
+		if len(clusters) != 1 || clusters[0] != "nmcp-offline-fixture" {
+			t.Fatal("unsupported fixture cluster")
+		}
+		cluster = clusters[0]
+	}
+	hbaPath := "/etc/postgresql/17/" + cluster + "/pg_hba.conf"
+	socketPath := "/run/nmcp-" + cluster
+	if cluster == "nmcp-offline-fixture" {
+		socketPath = "/run/nmcp-offline-fixture"
+	}
 	t.Helper()
 	// No host process may be reused, even if its SQL happens to look suitable.
 	processes, err := os.ReadDir("/proc")
@@ -176,7 +191,7 @@ func newLiveCutoverFixture(t *testing.T, bin string) *liveCutoverFixture {
 			}
 		}
 	}
-	fixed := []string{"/run/nmcp-backup-cutover.owner", "/var/lib/systemd/timers/stamp-nmcp-backup.timer", "/etc/systemd/system/timers.target.wants/nmcp-backup.timer", "/etc/nmcp", "/var/lib/nmcp", "/var/lib/nmcp-backup", "/var/lib/nmcp-restore", "/etc/postgresql/17/backup-ci", "/opt/nmcp", "/run/nmcp-backup-ci"}
+	fixed := []string{"/run/nmcp-backup-cutover.owner", "/var/lib/systemd/timers/stamp-nmcp-backup.timer", "/etc/systemd/system/timers.target.wants/nmcp-backup.timer", "/etc/nmcp", "/var/lib/nmcp", "/var/lib/nmcp-backup", "/var/lib/nmcp-restore", filepath.Dir(hbaPath), "/opt/nmcp", socketPath}
 	for _, p := range fixed {
 		if _, e := os.Lstat(p); !os.IsNotExist(e) {
 			t.Fatalf("refuse preexisting/uninspectable fixed path %s", p)
@@ -202,6 +217,7 @@ func newLiveCutoverFixture(t *testing.T, bin string) *liveCutoverFixture {
 	t.Cleanup(cancel)
 	// Cleanup is registered before the first mutation, and only removes exact
 	// roots whose directory identity still matches the fixture's exclusive mkdir.
+	f.hbaPath = hbaPath
 	t.Cleanup(f.cleanupLive)
 	// A timeout cleanup may touch fixed units only after this exclusive root
 	// receipt proves that this exact-head fixture, not another host owner, began.
@@ -233,7 +249,7 @@ func newLiveCutoverFixture(t *testing.T, bin string) *liveCutoverFixture {
 			t.Fatal("inspect HBA parent")
 		}
 	}
-	for _, p := range []string{"/etc/nmcp", "/var/lib/nmcp", "/var/lib/nmcp-restore", "/etc/postgresql/17/backup-ci", "/opt/nmcp", "/run/nmcp-backup-ci"} {
+	for _, p := range []string{"/etc/nmcp", "/var/lib/nmcp", "/var/lib/nmcp-restore", filepath.Dir(hbaPath), "/opt/nmcp", socketPath} {
 		f.ownDir(p, 0755, "")
 	}
 	if os.Chmod("/etc/nmcp", 0700) != nil {
@@ -246,7 +262,7 @@ func newLiveCutoverFixture(t *testing.T, bin string) *liveCutoverFixture {
 	pgSocketOwner, _ := user.Lookup("postgres")
 	socketUID, _ := strconv.Atoi(pgSocketOwner.Uid)
 	socketGID, _ := strconv.Atoi(pgSocketOwner.Gid)
-	if os.Chown("/run/nmcp-backup-ci", socketUID, socketGID) != nil {
+	if os.Chown(socketPath, socketUID, socketGID) != nil {
 		t.Fatal("socket directory owner")
 	}
 	runtimeUser, _ := user.Lookup("nmcp")
@@ -267,7 +283,7 @@ func newLiveCutoverFixture(t *testing.T, bin string) *liveCutoverFixture {
 	}
 	f.owned[root] = st
 	f.root = root
-	f.socket = "/run/nmcp-backup-ci"
+	f.socket = socketPath
 	f.data = filepath.Join(root, "data")
 	pg, _ := user.Lookup("postgres")
 	uid, _ := strconv.Atoi(pg.Uid)
@@ -289,8 +305,8 @@ func newLiveCutoverFixture(t *testing.T, bin string) *liveCutoverFixture {
 	}
 	f.command("initdb", nil, "-D", f.data, "--username=operator", "--pwfile="+pw, "--auth-local=scram-sha-256", "--auth-host=reject", "--encoding=UTF8", "--locale=C")
 	hba := "local all all scram-sha-256\nhost source all 127.0.0.1/32 scram-sha-256\nhost all all 0.0.0.0/0 reject\nhost all all ::/0 reject\n"
-	f.write("/etc/postgresql/17/backup-ci/pg_hba.conf", hba, 0644)
-	conf := fmt.Sprintf("listen_addresses='127.0.0.1'\nport=5432\nunix_socket_directories='%s'\nhba_file='/etc/postgresql/17/backup-ci/pg_hba.conf'\n", f.socket)
+	f.write(hbaPath, hba, 0644)
+	conf := fmt.Sprintf("listen_addresses='127.0.0.1'\nport=5432\nunix_socket_directories='%s'\nhba_file='%s'\n", f.socket, hbaPath)
 	f.write(filepath.Join(f.data, "postgresql.auto.conf"), conf, 0600)
 	if os.Chown(filepath.Join(f.data, "postgresql.auto.conf"), uid, gid) != nil {
 		t.Fatal("PG config owner")
@@ -313,7 +329,7 @@ func (f *liveCutoverFixture) cleanupLive() {
 	defer cancel()
 	safe := true
 	// Stop only units whose files this fixture created (never another host's).
-	for _, u := range liveUnits {
+	for _, u := range append(append([]string{}, liveUnits...), f.managedUnits...) {
 		path := filepath.Join("/etc/systemd/system", u)
 		if _, ok := f.owned[path]; !ok {
 			continue
@@ -338,31 +354,33 @@ func (f *liveCutoverFixture) cleanupLive() {
 			safe = false
 		}
 	}
-	if f.data != "" {
-		c := f.process(ctx, "pg_ctl", "-D", f.data, "-m", "immediate", "-w", "stop")
-		c.Stdout = io.Discard
-		c.Stderr = io.Discard
-		if e := c.Run(); e != nil && f.postmaster != 0 {
-			t.Error("cleanup own PG stop failed")
-			safe = false
-		}
-	}
-	if f.data != "" {
-		raw, e := os.ReadFile(filepath.Join(f.data, "postmaster.pid"))
-		if e == nil {
-			pid, e := strconv.Atoi(strings.SplitN(string(raw), "\n", 2)[0])
-			if e != nil || pid <= 0 || syscall.Kill(pid, 0) != syscall.ESRCH {
-				t.Error("cleanup cannot prove postmaster.pid process absence")
+	for _, server := range append([]*liveCutoverFixture{f}, f.managedServers...) {
+		if _, statErr := os.Stat(filepath.Join(server.data, "postmaster.pid")); server.data != "" && !os.IsNotExist(statErr) {
+			c := server.process(ctx, "pg_ctl", "-D", server.data, "-m", "immediate", "-w", "stop")
+			c.Stdout = io.Discard
+			c.Stderr = io.Discard
+			if e := c.Run(); e != nil && server.postmaster != 0 {
+				t.Error("cleanup own PG stop failed")
 				safe = false
 			}
-		} else if !os.IsNotExist(e) {
-			t.Error("cleanup cannot inspect owned postmaster.pid")
+		}
+		if server.data != "" {
+			raw, e := os.ReadFile(filepath.Join(server.data, "postmaster.pid"))
+			if e == nil {
+				pid, e := strconv.Atoi(strings.SplitN(string(raw), "\n", 2)[0])
+				if e != nil || pid <= 0 || syscall.Kill(pid, 0) != syscall.ESRCH {
+					t.Error("cleanup cannot prove postmaster.pid process absence")
+					safe = false
+				}
+			} else if !os.IsNotExist(e) {
+				t.Error("cleanup cannot inspect owned postmaster.pid")
+				safe = false
+			}
+		}
+		if server.postmaster > 0 && syscall.Kill(server.postmaster, 0) != syscall.ESRCH {
+			t.Error("cleanup owned postmaster still exists")
 			safe = false
 		}
-	}
-	if f.postmaster > 0 && syscall.Kill(f.postmaster, 0) != syscall.ESRCH {
-		t.Error("cleanup owned postmaster still exists")
-		safe = false
 	}
 	if !safe {
 		t.Error("preserving fixture paths because process absence is unproven")

@@ -211,7 +211,7 @@ func TestCutoverHBAPrependsPermanentSourceFence(t *testing.T) {
 	op := cutoverTestOperation()
 	old := "local all all peer\nhost all all 0.0.0.0/0 trust\n"
 	b := string(cutoverHBA([]byte(old), op))
-	for _, line := range []string{`local "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control 0.0.0.0/0 reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control ::/0 reject`, `host "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control 127.0.0.1/32 scram-sha-256`, `local "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control scram-sha-256`} {
+	for _, line := range []string{`local "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator 0.0.0.0/0 reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator ::/0 reject`, `host "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator 127.0.0.1/32 scram-sha-256`, `local "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator scram-sha-256`} {
 		if !strings.Contains(b, line) {
 			t.Fatal("missing gate", line)
 		}
@@ -219,8 +219,8 @@ func TestCutoverHBAPrependsPermanentSourceFence(t *testing.T) {
 	if !strings.HasSuffix(b, old) || strings.Index(b, `local "source"`) > strings.Index(b, "local all") {
 		t.Fatal("old permissive rule precedes fence")
 	}
-	if strings.Contains(b[:strings.Index(b, old)], " trust") || strings.Contains(b[:strings.Index(b, old)], "nmcp_migrator") {
-		t.Fatal("unrelated privilege modified")
+	if strings.Contains(b[:strings.Index(b, old)], " trust") {
+		t.Fatal("trust bypass introduced")
 	}
 	for _, path := range []string{"/tmp/pg_hba.conf", "/etc/postgresql/../pg_hba.conf", "/etc/postgresql/17/main/other.conf"} {
 		if cutoverHBAPath.MatchString(path) {
@@ -454,5 +454,40 @@ func TestCutoverProducedServicesAdmitIndependentNextOperation(t *testing.T) {
 	bad := strings.ReplaceAll(string(produced), "_backup_dump", "_wrong_role")
 	if _, _, err := rewriteCutoverServices([]byte(bad), second, "/var/run/postgresql", 5432); err == nil {
 		t.Fatal("unbound prior application witness accepted")
+	}
+}
+
+func TestOfflineCutoverRetargetsEveryConnectionCoordinate(t *testing.T) {
+	op := cutoverTestOperation()
+	raw := []byte("NMCP_DATABASE_URL=postgres://nmcp_api:secret@127.0.0.1:5432/source?sslmode=disable\n")
+	out, cfg, err := rewriteCutoverEnv(raw, "source", "candidate", "nmcp_api", cutoverApp(op.ID, "api"), 5544)
+	if err != nil || cfg.Port != 5544 || cfg.Host != "127.0.0.1" || cfg.Database != "candidate" || !strings.Contains(string(out), "127.0.0.1:5544/candidate") {
+		t.Fatal("offline API retarget did not change serialized endpoint")
+	}
+	target := OfflineRestoreEndpoint{SocketDirectory: "/run/nmcp-target", Port: 5544, LoopbackHosts: []string{}}
+	services, probes, err := rewriteCutoverServices([]byte(cutoverServiceFixture()), op, "/var/run/postgresql", 5432, target)
+	if err != nil || len(probes) != 2 || strings.Count(string(services), "host=/run/nmcp-target") != 2 || strings.Count(string(services), "port=5544") != 2 {
+		t.Fatal("offline control/dump endpoint retarget incomplete")
+	}
+	for _, p := range probes {
+		if p.config.Host != target.SocketDirectory || p.config.Port != target.Port || p.config.Database != op.Candidate.DatabaseName {
+			t.Fatal("probe differs from actual service endpoint")
+		}
+	}
+	pass := []byte("localhost:5432:source:nmcp_backup_dump:secret\n/var/run/postgresql:5432:source:nmcp_backup_dump:secret\n")
+	changed, err := rewriteCutoverPassTo(pass, "source", "candidate", "nmcp_backup_dump", "localhost", 5432, &target, "/var/run/postgresql")
+	if err != nil || strings.Contains(string(changed), ":5432:") || !strings.Contains(string(changed), "/run/nmcp-target:5544:candidate:nmcp_backup_dump:secret") {
+		t.Fatal("offline passfile aliases did not follow same target")
+	}
+}
+
+func TestOfflineTargetHBADoesNotFenceUnrelatedTargetDatabase(t *testing.T) {
+	op := cutoverTestOperation()
+	op.SourceOffline = true
+	old := "local all all peer\n"
+	actual := string(cutoverHBA([]byte(old), op))
+	prefix := strings.TrimSuffix(actual, old)
+	if strings.Contains(prefix, `"source"`) || !strings.Contains(prefix, `"candidate"`) || !strings.HasSuffix(actual, old) {
+		t.Fatal("offline target HBA changed authority outside candidate")
 	}
 }

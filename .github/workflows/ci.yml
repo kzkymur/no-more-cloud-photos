@@ -73,7 +73,9 @@ jobs:
           .tools/ffmpeg-6.0.1-amd64-static/ffprobe -version
           prlimit --version
       - name: Validate inherited video toolchain rejection checks
-        run: timeout 1m internal/videoprocessor/helper/validate-inherited-toolchain_test.sh
+        run: |
+          timeout 1m internal/videoprocessor/helper/validate-inherited-toolchain_test.sh
+          timeout 1m bash internal/videoprocessor/helper/acquisition_test.sh
       - name: Build native still-image helper smoke target
         run: |
           sudo apt-get install -y --no-install-recommends \
@@ -558,6 +560,112 @@ jobs:
             -test.run '^TestBackupPG17LiveCutover$' | tee "$RUNNER_TEMP/backup-live-cutover.log"
           grep -F -- '--- PASS: TestBackupPG17LiveCutover ' "$RUNNER_TEMP/backup-live-cutover.log"
           ! grep -F -- '--- SKIP: TestBackupPG17LiveCutover' "$RUNNER_TEMP/backup-live-cutover.log"
+      - name: Always stop only receipt-owned live cutover units
+        if: always()
+        shell: bash
+        run: |
+          sudo env NMCP_EXPECTED_HEAD="${{ github.sha }}" python3 - <<'PY'
+          import os, pathlib, stat, subprocess
+          receipt = pathlib.Path('/run/nmcp-backup-cutover.owner')
+          try:
+              st = receipt.lstat()
+          except FileNotFoundError:
+              print('No surviving fixture owner receipt; no unowned units touched')
+              raise SystemExit(0)
+          assert stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1 and stat.S_IMODE(st.st_mode) == 0o600
+          assert receipt.read_text() == os.environ['NMCP_EXPECTED_HEAD'] + '\n'
+          units = ['nmcp-backup.timer', 'nmcp-backup.service', 'nmcp-api.service', 'nmcp-worker.service']
+          subprocess.run(['/usr/bin/systemctl', 'stop', *units], check=False)
+          for unit in units:
+              active = subprocess.check_output(['/usr/bin/systemctl', 'show', '-p', 'ActiveState', '--value', unit], text=True).strip()
+              assert active in ('inactive', 'failed'), unit + ' still active'
+          print('Only exact-head receipt-owned units stopped; failed fixture data preserved for diagnosis')
+          PY
+
+  backup-offline-recovery:
+    name: Backup / offline two-cluster source-stop recovery and separate resume
+    needs: [test, backup-postgresql17]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Install real service runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            postgresql-common util-linux libimage-exiftool-perl ffmpeg \
+            libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev libde265-dev
+          workspace=$(realpath -e -- "${GITHUB_WORKSPACE:?}")
+          config=$(realpath -e -- "$workspace/infra/ubuntu/sysusers.d/nmcp.conf")
+          test "$config" = "$workspace/infra/ubuntu/sysusers.d/nmcp.conf"
+          test -f "$config" && test ! -L "$config"
+          sudo systemd-sysusers "$config"
+          python3 - <<'PYUID'
+          import grp, os, pwd
+          runtime, backup, postgres = [pwd.getpwnam(name) for name in ('nmcp', 'nmcp-backup', 'postgres')]
+          assert len({runtime.pw_uid, backup.pw_uid, postgres.pw_uid, 0}) == 4
+          assert len({runtime.pw_gid, backup.pw_gid, postgres.pw_gid, 0}) == 4
+          for user in (runtime, backup):
+              assert user.pw_gid != 0 and grp.getgrgid(user.pw_gid).gr_name == user.pw_name
+              assert user.pw_dir == '/var/lib/' + user.pw_name
+              assert user.pw_shell == '/usr/sbin/nologin'
+              assert set(os.getgrouplist(user.pw_name, user.pw_gid)) == {user.pw_gid}
+              print(f'Isolated UID verified: {user.pw_name} uid={user.pw_uid} gid={user.pw_gid}')
+          PYUID
+      - name: Receive exact-head native closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-native-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Receive exact-head PostgreSQL17 closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-postgresql17-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Restore authenticated current-run build products
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
+          test ! -e /opt/nmcp-pg17-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
+          test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
+          /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
+          sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -r /opt/nmcp-pg17-ci/bin/initdb
+          sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -x /opt/nmcp-pg17-ci/bin/postgres
+          go test -c -o "$RUNNER_TEMP/backup-offline.test" ./internal/admin
+          "$RUNNER_TEMP/backup-offline.test" -test.list '^TestRestoreOfflineRootTwoClusters$' | grep -Fx TestRestoreOfflineRootTwoClusters
+      - name: Actual source-stop offline recovery crosscluster cutover and resume proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            TEST_BACKUP_OFFLINE_SYSTEMD=1 \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
+            TEST_BACKUP_NATIVE_PREFIX="$RUNNER_TEMP/still-toolchain" \
+            TEST_BACKUP_STILL_HELPER="$RUNNER_TEMP/still-helper-build/bin/nmcp-still-helper" \
+            TEST_BACKUP_ANIMATION_HELPER="$RUNNER_TEMP/animation-helper-build/bin/nmcp-animation-helper" \
+            TEST_BACKUP_ICC_PATH="$RUNNER_TEMP/sRGB2014.icc" \
+            TEST_BACKUP_MEDIA_FIXTURE="$RUNNER_TEMP/orientation-6.jpg" \
+            TEST_BACKUP_CORE_API="$RUNNER_TEMP/backup-live-binaries/core-api" \
+            TEST_BACKUP_CORE_WORKER="$RUNNER_TEMP/backup-live-binaries/core-worker" \
+            TEST_BACKUP_ADMIN_BINARY="$RUNNER_TEMP/backup-live-binaries/nmcp-admin" \
+            "$RUNNER_TEMP/backup-offline.test" -test.v -test.count=1 -test.timeout=18m \
+            -test.run '^TestRestoreOfflineRootTwoClusters$' | tee "$RUNNER_TEMP/backup-offline-recovery.log"
+          grep -F -- '--- PASS: TestRestoreOfflineRootTwoClusters ' "$RUNNER_TEMP/backup-offline-recovery.log"
+          ! grep -F -- '--- SKIP: TestRestoreOfflineRootTwoClusters' "$RUNNER_TEMP/backup-offline-recovery.log"
       - name: Always stop only receipt-owned live cutover units
         if: always()
         shell: bash

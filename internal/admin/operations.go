@@ -135,6 +135,9 @@ func (s *Service) MaintenanceResume(ctx context.Context, store *storage.Store) (
 		if err != nil || identity != op.Candidate {
 			return nil, ErrConflict
 		}
+		if op.SourceOffline && VerifyOfflineSourceFence(ctx, op) != nil {
+			return nil, ErrConflict
+		}
 	}
 	if s.afterResumeFence != nil {
 		if err := s.afterResumeFence(ctx); err != nil {
