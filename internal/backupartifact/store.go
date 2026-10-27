@@ -39,6 +39,8 @@ const DeleteDirSync Boundary = "delete-dir-sync"
 var ErrLocked = errors.New("backup root has another active operation")
 
 type Options struct {
+	// BeforePublish revalidates live authority immediately before atomic rename.
+	BeforePublish func(context.Context) error
 	// Lock coordinates production operations even if a DB lock session is lost.
 	Lock  bool
 	Fault func(Boundary) error
@@ -362,6 +364,14 @@ func (s *Store) Publish(ctx context.Context, meta Metadata, write, validate func
 	}
 	if err = s.boundary(StageSync, dir.Sync); err != nil {
 		return Manifest{}, err
+	}
+	if err = ctx.Err(); err != nil {
+		return Manifest{}, err
+	}
+	if s.opts.BeforePublish != nil {
+		if err = s.opts.BeforePublish(ctx); err != nil {
+			return Manifest{}, err
+		}
 	}
 	if err = ctx.Err(); err != nil {
 		return Manifest{}, err

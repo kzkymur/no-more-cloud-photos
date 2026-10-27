@@ -740,3 +740,24 @@ func TestOperationLockExcludesReadersAndWriters(t *testing.T) {
 		t.Fatalf("shared readers did not fence destructive operation: %v", err)
 	}
 }
+
+func TestPublishAuthorityGuardPrecedesRename(t *testing.T) {
+	renamed := false
+	checked := false
+	s, root := store(t, Options{BeforePublish: func(context.Context) error { checked = true; return errors.New("authority lost") }, Fault: func(b Boundary) error {
+		if b == Rename {
+			renamed = true
+		}
+		return nil
+	}})
+	meta := metadata(t)
+	if _, err := s.Publish(context.Background(), meta, writer, validator); err == nil {
+		t.Fatal("lost authority published")
+	}
+	if !checked || renamed {
+		t.Fatal("authority guard did not fence atomic rename")
+	}
+	if _, err := os.Lstat(filepath.Join(root, meta.ID)); !os.IsNotExist(err) {
+		t.Fatal("lost authority exposed final artifact")
+	}
+}

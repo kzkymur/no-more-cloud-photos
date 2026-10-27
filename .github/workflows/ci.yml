@@ -451,10 +451,14 @@ jobs:
           sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
             TEST_BACKUP_PG17_BINDIR="$RUNNER_TEMP/backup-pg17/install/bin" \
             "$RUNNER_TEMP/backup17.test" -test.v -test.count=1 -test.timeout=10m \
-            -test.run '^TestBackupPG17(ProductionRoles|OperatorRestore|LifecycleMigration)$' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
+            -test.run '^(TestBackupPG17(ProductionRoles|OperatorRestore|LifecycleMigration|AuthorityLossDuringRealDump|RetentionPolicySerialization)|TestRestoreConnectionPG17Pinned)$' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
           grep -F -- '--- PASS: TestBackupPG17ProductionRoles ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
           grep -F -- '--- PASS: TestBackupPG17OperatorRestore ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
           ! grep -F -- '--- SKIP: TestBackupPG17' "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          for name in TestBackupPG17AuthorityLossDuringRealDump TestBackupPG17RetentionPolicySerialization TestRestoreConnectionPG17Pinned; do
+            grep -F -- "--- PASS: $name " "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          done
+          ! grep -F -- '--- SKIP: TestRestoreConnectionPG17Pinned' "$RUNNER_TEMP/backup-pg17-acceptance.log"
       - name: Preserve exact-head PostgreSQL17 closure
         run: tar -czf "$RUNNER_TEMP/backup-pg17-closure.tar.gz" -C "$RUNNER_TEMP" backup-pg17/install
       - name: Publish exact-head PostgreSQL17 closure

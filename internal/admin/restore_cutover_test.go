@@ -431,3 +431,28 @@ func TestCutoverPassEquivalentSocketAliasesOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestCutoverProducedServicesAdmitIndependentNextOperation(t *testing.T) {
+	first := cutoverTestOperation()
+	produced, _, err := rewriteCutoverServices([]byte(cutoverServiceFixture()), first, "/var/run/postgresql", 5432)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ID = newID()
+	second.Source = first.Candidate
+	second.Candidate.DatabaseName = "next_candidate"
+	twice, probes, err := rewriteCutoverServices(produced, second, "/var/run/postgresql", 5432)
+	if err != nil || len(probes) != 2 || strings.Count(string(twice), "dbname=next_candidate") != 2 {
+		t.Fatal("self-produced config rejected by independent next cutover")
+	}
+	for _, p := range probes {
+		if p.config.RuntimeParams["application_name"] != cutoverApp(second.ID, strings.TrimPrefix(p.role, "nmcp_")) {
+			t.Fatal("second operation reused old witness identity")
+		}
+	}
+	bad := strings.ReplaceAll(string(produced), "_backup_dump", "_wrong_role")
+	if _, _, err := rewriteCutoverServices([]byte(bad), second, "/var/run/postgresql", 5432); err == nil {
+		t.Fatal("unbound prior application witness accepted")
+	}
+}

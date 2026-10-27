@@ -152,3 +152,79 @@ func TestRestoreSettingsBoundaries(t *testing.T) {
 		t.Fatal("empty settings admitted")
 	}
 }
+
+func TestRestoreExplicitConnectionResolution(t *testing.T) {
+	dir := privateTestDir(t)
+	c := RestoreSettings{Service: "operator", APIService: "api", ServiceFile: filepath.Join(dir, "services"), PassFile: filepath.Join(dir, "pass")}
+	base := "[operator]\nhost=/private/socket\nport=6543\ndbname=candidate\nuser=operator\nsslmode=disable\n[api]\nhost=/private/socket\nport=6543\ndbname=candidate\nuser=nmcp_api\nsslmode=disable\n"
+	write := func(path, data string) {
+		t.Helper()
+		if e := os.WriteFile(path, []byte(data), 0600); e != nil {
+			t.Fatal(e)
+		}
+	}
+	write(c.PassFile, "/private/socket:6543:candidate:operator:opsecret\n/private/socket:6543:candidate:nmcp_api:apisecret\n")
+	write(c.ServiceFile, base)
+	// These two ambient paths must never be consulted.
+	t.Setenv("PGSERVICEFILE", "/does/not/exist")
+	t.Setenv("PGPASSFILE", "/does/not/exist")
+	r, e := resolveRestoreConnections(c)
+	if e != nil {
+		t.Fatal("explicit connection rejected")
+	}
+	defer r.Close()
+	if _, e := r.service.WriteAt([]byte("retarget"), 0); e == nil {
+		t.Fatal("service snapshot not sealed")
+	}
+	if _, e := r.pass.WriteAt([]byte("borrow"), 0); e == nil {
+		t.Fatal("password snapshot not sealed")
+	}
+	cmd := r.command(context.Background(), c)
+	if strings.Join(cmd.Args[1:], " ") != "--no-password --single-transaction --exit-on-error --dbname=service=operator" {
+		t.Fatal("tool argv leaked or changed connection contract")
+	}
+	if r.operator.ConnConfig.Password != "opsecret" || r.api.ConnConfig.Password != "apisecret" {
+		t.Fatal("credentials not pinned")
+	}
+	for _, key := range []string{"PGDATABASE", "PGUSER", "PGHOST", "PGPORT", "PGPASSWORD", "PGSERVICE", "PGOPTIONS", "PGSSLMODE", "PGCONNECT_TIMEOUT", "PGBOGUS"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "")
+			if r, e := resolveRestoreConnections(c); e == nil {
+				r.Close()
+				t.Fatal("ambient PG accepted")
+			}
+		})
+	}
+	for name, bad := range map[string]string{
+		"partial":   strings.Replace(base, "dbname=candidate\n", "", 1),
+		"remote":    strings.ReplaceAll(base, "/private/socket", "example.test"),
+		"fallback":  strings.ReplaceAll(base, "/private/socket", "/one,/two"),
+		"tls":       strings.ReplaceAll(base, "sslmode=disable", "sslmode=require"),
+		"options":   base + "options=-c role=operator\n",
+		"role":      base + "role=operator\n",
+		"password":  base + "password=borrowed\n",
+		"include":   base + "service=operator\n",
+		"duplicate": base + "user=operator\n",
+		"default":   base + "[default]\ndbname=other\n",
+		"mismatch":  strings.Replace(base, "[api]\nhost=/private/socket", "[api]\nhost=/different", 1),
+		"api-login": strings.ReplaceAll(base, "user=nmcp_api", "user=operator"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			write(c.ServiceFile, bad)
+			if r, e := resolveRestoreConnections(c); e == nil {
+				r.Close()
+				t.Fatal("unsafe service accepted")
+			}
+		})
+	}
+	write(c.ServiceFile, base)
+	write(c.PassFile, "")
+	empty, e := resolveRestoreConnections(c)
+	if e != nil {
+		t.Fatal("private peer-only passfile rejected")
+	}
+	defer empty.Close()
+	if empty.operator.ConnConfig.Password != "" || empty.api.ConnConfig.Password != "" {
+		t.Fatal("peer-only config borrowed credentials")
+	}
+}

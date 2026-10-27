@@ -33,9 +33,11 @@ type Service struct {
 
 	afterBatchCommit func(context.Context) error
 	// Test-only lost acknowledgement seam, invoked only AFTER real success commit.
-	afterBackupCommit        func(context.Context) error
-	afterBackupRunningCommit func(context.Context) error
-	afterResumeFence         func(context.Context) error
+	afterBackupCommit           func(context.Context) error
+	afterBackupRunningCommit    func(context.Context) error
+	afterResumeFence            func(context.Context) error
+	afterBackupCleanupSelection func(context.Context) error
+	beforeBackupArtifactDelete  func(context.Context) error
 }
 
 func New(pool *pgxpool.Pool) *Service {

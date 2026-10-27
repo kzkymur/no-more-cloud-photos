@@ -498,6 +498,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	f.bootstrapLive(true)
 	source := f.poolLive("operator", "source")
 	f.sql(admin, `CREATE DATABASE candidate TEMPLATE template0 OWNER nmcp_migrator`)
+	f.sql(admin, `REVOKE ALL ON DATABASE candidate FROM PUBLIC; GRANT CONNECT ON DATABASE candidate TO nmcp_api`)
 	// Candidate root-only peer gate. Source remains usable by actual core units.
 	f.write(filepath.Join(f.data, "pg_ident.conf"), "live_operator root operator\nlive_operator root nmcp_api\n", 0600)
 	pg, _ := user.Lookup("postgres")
@@ -728,6 +729,22 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		t.Fatal("separate actual candidate MaintenanceResume failed")
 	}
 	liveUploadAfterResume(t, ctx)
+	// Stabilize the positive fixture before its next DB-only snapshot. This does
+	// not waive production reconciliation when files change after a backup.
+	for {
+		var pending int
+		if candidate.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status IN ('queued','running')`).Scan(&pending) != nil {
+			t.Fatal("postresume job completion observation")
+		}
+		if pending == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("actual resumed native job did not finish")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM media`) != "2" || pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM media`) != "1" {
 		t.Fatal("resumed real API write did not exclusively mutate candidate")
 	}

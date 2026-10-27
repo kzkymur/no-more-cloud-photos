@@ -13,6 +13,7 @@ import (
 type BackupCleanupResult struct {
 	Deleted           []string `json:"deleted"`
 	Eligible          []string `json:"eligible"`
+	SkippedIDs        []string `json:"skipped_ids"`
 	DryRun            bool     `json:"dry_run"`
 	StagingReconciled []string `json:"staging_reconciled"`
 	StagingEligible   []string `json:"staging_eligible"`
@@ -22,7 +23,7 @@ type BackupCleanupResult struct {
 // committed intent uses the artifact's reserved .deleting namespace, never a
 // wildcard or an unvalidated temp directory. Successful run history is retained.
 func (s *Service) CleanupBackups(ctx context.Context, b BackupSettings, dry bool) (BackupCleanupResult, error) {
-	result := BackupCleanupResult{Deleted: []string{}, Eligible: []string{}, DryRun: dry}
+	result := BackupCleanupResult{Deleted: []string{}, Eligible: []string{}, DryRun: dry, SkippedIDs: []string{}}
 	conn, err := s.Pool.Acquire(ctx)
 	if err != nil {
 		return result, errBackup
@@ -69,7 +70,7 @@ func (s *Service) CleanupBackups(ctx context.Context, b BackupSettings, dry bool
 	rows, err := tx.Query(ctx, `SELECT b.id::text,(b.retention_deleting_at IS NOT NULL) FROM backup_runs b,system_config c
  WHERE c.id=1 AND b.status='succeeded' AND b.retention_deleted_at IS NULL
  AND b.id<>(SELECT id FROM backup_runs WHERE status='succeeded' ORDER BY started_at DESC,id DESC LIMIT 1)
- AND (b.started_at<clock_timestamp()-make_interval(days=>c.db_backup_retention_days) OR b.retention_deleting_at IS NOT NULL)
+ AND b.started_at<clock_timestamp()-make_interval(days=>c.db_backup_retention_days)
  ORDER BY b.started_at,b.id`)
 	if err != nil {
 		return result, errBackup
@@ -96,6 +97,11 @@ func (s *Service) CleanupBackups(ctx context.Context, b BackupSettings, dry bool
 	if err = tx.Commit(ctx); err != nil {
 		return result, errBackup
 	}
+	if s.afterBackupCleanupSelection != nil {
+		if err = s.afterBackupCleanupSelection(ctx); err != nil {
+			return result, err
+		}
+	}
 	// A history row is not proof of a usable keeper. Never delete an older
 	// verified artifact when the newest recorded success is missing/corrupt.
 	var keeper string
@@ -121,10 +127,27 @@ func (s *Service) CleanupBackups(ctx context.Context, b BackupSettings, dry bool
 		if dry {
 			continue
 		}
-		// Hold the maintenance fence and newest-success recheck through filesystem
-		// removal and final audit. Intent commits independently to recover crashes.
-		intent, err := conn.Exec(ctx, `UPDATE backup_runs SET retention_deleting_at=COALESCE(retention_deleting_at,clock_timestamp()) WHERE id=$1 AND status='succeeded' AND retention_deleted_at IS NULL AND id<>(SELECT id FROM backup_runs WHERE status='succeeded' ORDER BY started_at DESC,id DESC LIMIT 1)`, v.id)
-		if err != nil || intent.RowsAffected() != 1 {
+		// Intent is durable crash recovery metadata, not permission to ignore a
+		// later retention extension. Serialize both decisions with ConfigSet.
+		intent, err := conn.Begin(ctx)
+		if err != nil {
+			return result, errBackup
+		}
+		if err = backupNormal(ctx, intent); err != nil {
+			rollback(intent)
+			return result, err
+		}
+		change, err := intent.Exec(ctx, `UPDATE backup_runs b SET retention_deleting_at=COALESCE(b.retention_deleting_at,clock_timestamp()) FROM system_config c WHERE c.id=1 AND b.id=$1 AND b.status='succeeded' AND b.retention_deleted_at IS NULL AND b.started_at<clock_timestamp()-make_interval(days=>c.db_backup_retention_days) AND b.id<>(SELECT id FROM backup_runs WHERE status='succeeded' ORDER BY started_at DESC,id DESC LIMIT 1)`, v.id)
+		if err != nil {
+			rollback(intent)
+			return result, errBackup
+		}
+		if change.RowsAffected() != 1 {
+			rollback(intent)
+			result.SkippedIDs = append(result.SkippedIDs, v.id)
+			continue
+		}
+		if err = intent.Commit(ctx); err != nil {
 			return result, errBackup
 		}
 		fence, err := conn.Begin(ctx)
@@ -135,10 +158,23 @@ func (s *Service) CleanupBackups(ctx context.Context, b BackupSettings, dry bool
 			rollback(fence)
 			return result, err
 		}
-		var newest string
-		if err = fence.QueryRow(ctx, `SELECT id::text FROM backup_runs WHERE status='succeeded' ORDER BY started_at DESC,id DESC LIMIT 1 FOR SHARE`).Scan(&newest); err != nil || newest == v.id {
+		var eligible bool
+		if err = fence.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM backup_runs b,system_config c WHERE c.id=1 AND b.id=$1 AND b.status='succeeded' AND b.retention_deleted_at IS NULL AND b.started_at<clock_timestamp()-make_interval(days=>c.db_backup_retention_days) AND b.id<>(SELECT id FROM backup_runs WHERE status='succeeded' ORDER BY started_at DESC,id DESC LIMIT 1))`, v.id).Scan(&eligible); err != nil {
 			rollback(fence)
-			return result, ErrConflict
+			return result, errBackup
+		}
+		if !eligible {
+			rollback(fence)
+			result.SkippedIDs = append(result.SkippedIDs, v.id)
+			continue
+		}
+		// The closed fence holds config SHARE through byte removal and audit
+		// commit. An actual ConfigSet cannot change the policy mid-delete.
+		if s.beforeBackupArtifactDelete != nil {
+			if err = s.beforeBackupArtifactDelete(ctx); err != nil {
+				rollback(fence)
+				return result, err
+			}
 		}
 		if err = store.ResumeDelete(v.id); err != nil {
 			rollback(fence)

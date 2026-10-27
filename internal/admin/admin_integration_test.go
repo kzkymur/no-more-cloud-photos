@@ -791,10 +791,10 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 		// Everything except the explicit supported-version whitelist matches:
 		// valid applied history/name/hash, sealed report, three clean sources.
 		if _, err := s.Pool.Exec(ctx, `INSERT INTO schema_migrations(version,name,checksum,transactional,idempotent,dirty)
-			VALUES(22,'future_compatibility_fixture',repeat('a',64),true,false,false)`); err != nil {
+			VALUES(24,'future_compatibility_fixture',repeat('a',64),true,false,false)`); err != nil {
 			t.Fatal(err)
 		}
-		checkAdmission(t, 22, false, false, true, false, false)
+		checkAdmission(t, 24, false, false, true, false, false)
 	})
 }
 

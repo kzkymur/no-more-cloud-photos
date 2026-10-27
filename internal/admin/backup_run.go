@@ -15,6 +15,11 @@ import (
 
 func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (result BackupRun, err error) {
 	result = BackupRun{Outcome: "failed"}
+	// One pinned lock session plus an independent failure journal connection
+	// are mandatory. Reject a one-slot pool before any history or lock mutation.
+	if s.Pool == nil || s.Pool.Config().MaxConns < 2 {
+		return result, ErrValidation
+	}
 	// This precise acquired session must still own the lock at the final commit.
 	conn, err := s.Pool.Acquire(ctx)
 	if err != nil {
@@ -39,7 +44,9 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 	}()
 	// Both locks are required before recovery or history mutation. A surviving
 	// dumper with a lost DB backend must never be declared abandoned by a rival.
-	store, err := backupartifact.Open(b.Root, backupartifact.Options{Lock: true})
+	authority := newBackupAuthority(ctx, conn)
+	defer authority.cancel()
+	store, err := backupartifact.Open(b.Root, backupartifact.Options{Lock: true, BeforePublish: authority.Check})
 	if err != nil {
 		if errors.Is(err, backupartifact.ErrLocked) {
 			result.Outcome = "overlap_conflict"
@@ -147,6 +154,13 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 	if identityErr != nil || dumpIdentityErr != nil || sourceIdentity != dumpIdentity {
 		return result, errBackup
 	}
+	// Main stops using the pinned session until Stop joins this monitor.
+	authority.Start()
+	defer func() { _ = authority.Stop(); authority.cancel() }()
+	ctx = authority.ctx
+	if err = authority.Check(ctx); err != nil {
+		return result, errBackup
+	}
 	server, err := backupInventory(ctx, dump)
 	if err != nil {
 		return result, errBackup
@@ -196,6 +210,10 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 		if errors.As(err, &uncertain) {
 			phase = "publication_uncertain"
 		}
+		return result, errBackup
+	}
+	if err = authority.Stop(); err != nil {
+		phase = "authority_lost_after_publish"
 		return result, errBackup
 	}
 	phase = "history"

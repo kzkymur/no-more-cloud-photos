@@ -213,7 +213,25 @@ func (f *pg17Fixture) command(tool string, env []string, args ...string) {
 	cmd.Stdout = io.Discard
 	var diagnostic bytes.Buffer
 	cmd.Stderr = &diagnostic
-	if cmd.Run() != nil {
+	if runErr := cmd.Run(); runErr != nil {
+		// Preserve useful initdb/start diagnostics without exposing SQL/credentials.
+		if tool == "initdb" || tool == "pg_ctl" {
+			safe := diagnostic.String()
+			for _, secret := range f.passwords {
+				if secret != "" {
+					safe = strings.ReplaceAll(safe, secret, "[REDACTED]")
+				}
+			}
+			if len(safe) > 4096 {
+				safe = safe[:4096] + " [truncated]"
+			}
+			exit := -1
+			var failed *exec.ExitError
+			if errors.As(runErr, &failed) {
+				exit = failed.ExitCode()
+			}
+			f.t.Fatalf("PG17 %s failed exit=%d: %s", tool, exit, safe)
+		}
 		state := regexp.MustCompile(`ERROR:\s+([0-9A-Z]{5}):`).FindStringSubmatch(diagnostic.String())
 		if len(state) == 2 {
 			f.t.Fatalf("PG17 %s failed SQLSTATE=%s (raw output suppressed)", tool, state[1])
@@ -383,6 +401,7 @@ func TestBackupPG17ProductionRoles(t *testing.T) {
 	// Fresh template0 restore preserves multiowner objects, ACLs, definer code,
 	// schema, sequence state and application rows; no --no-owner/--no-acl shortcut.
 	f.sql(operator, `CREATE DATABASE candidate TEMPLATE template0 OWNER nmcp_migrator`)
+	f.sql(operator, `REVOKE ALL ON DATABASE candidate FROM PUBLIC; GRANT CONNECT ON DATABASE candidate TO nmcp_api`)
 	candidate := f.pool("operator", "candidate")
 	restoreStart := time.Now()
 	if e = store.WithDump(run.ID, func(file *os.File) error {
@@ -461,6 +480,7 @@ func TestBackupPG17ProductionRoles(t *testing.T) {
 	}
 
 	pg17RestoreAttestationBoundary(t, f, source, operator, service, b, run.ID)
+	pg17ServiceLockLossDuringDump(t, f, source, service, b)
 	pg17InterruptedRealDump(t, f, source, service, b)
 	pg17FailureJournalOracles(t, f, source, service, b)
 	pg17LockLossNoRivalHistory(t, f, source, service, b)
@@ -496,6 +516,7 @@ func pg17RestoreAttestationBoundary(t *testing.T, f *pg17Fixture, source, operat
 	t.Helper()
 	ctx := f.ctx
 	f.sql(operator, `CREATE DATABASE gated TEMPLATE template0 OWNER nmcp_migrator`)
+	f.sql(operator, `REVOKE ALL ON DATABASE gated FROM PUBLIC; GRANT CONNECT ON DATABASE gated TO nmcp_api`)
 	// Actual ordered local SCRAM gate denies all routine SQL logins except the
 	// explicit API proof identity. No TCP listener exists at all.
 	hba := "local gated operator scram-sha-256\nlocal gated nmcp_api scram-sha-256\nlocal gated all reject\nlocal all all scram-sha-256\nhost all all 0.0.0.0/0 reject\nhost all all ::0/0 reject\n"
@@ -635,6 +656,7 @@ func TestBackupPG17OperatorRestore(t *testing.T) {
 		t.Fatal("root gate real restricted Backup failed")
 	}
 	f.sql(operator, `CREATE DATABASE gated TEMPLATE template0 OWNER nmcp_migrator`)
+	f.sql(operator, `REVOKE ALL ON DATABASE gated FROM PUBLIC; GRANT CONNECT ON DATABASE gated TO nmcp_api`)
 	// Only the operator UID root maps to these two SQL logins. No routine UID
 	// map entry exists; explicit rejects precede the source SCRAM rule.
 	f.write(filepath.Join(f.data, "pg_ident.conf"), "operator_test root operator\noperator_test root nmcp_api\n", 0600)
@@ -880,7 +902,7 @@ func TestBackupPG17LifecycleMigration(t *testing.T) {
 		t.Fatalf("actual PG17 latest migration failed: %v", err)
 	}
 	status, err := m.Status(f.ctx)
-	if err != nil || !status.Ready() || status.CurrentVersion != 22 {
+	if err != nil || !status.Ready() || status.CurrentVersion != 23 {
 		t.Fatal("actual PG17 lifecycle migration not ready")
 	}
 	tx, err := migrator.Begin(f.ctx)
@@ -896,7 +918,7 @@ func TestBackupPG17LifecycleMigration(t *testing.T) {
 	if _, err = api.Exec(f.ctx, `SELECT nmcp_backup_normal_fence()`); err == nil {
 		t.Fatal("PUBLIC/API may invoke backup-only fence")
 	}
-	t.Log("actual PostgreSQL17 migration22 and closed normal-fence capability passed; no backup-role substitute grants")
+	t.Log("actual PostgreSQL17 latest migration23 and closed normal-fence capability passed; no backup-role substitute grants")
 }
 
 func pg17FailureJournalOracles(t *testing.T, f *pg17Fixture, source *pgxpool.Pool, service *Service, b BackupSettings) {

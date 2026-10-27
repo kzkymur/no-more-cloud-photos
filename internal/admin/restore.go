@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgpassfile"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/backupartifact"
@@ -285,27 +286,202 @@ func restoreIdentity(ctx context.Context, p *pgxpool.Pool) (RestoreIdentity, err
 	e := p.QueryRow(ctx, `SELECT (pg_control_system()).system_identifier::text,d.oid,d.datname,pg_get_userbyid(d.datdba) FROM pg_database d WHERE d.datname=current_database()`).Scan(&i.ClusterID, &i.DatabaseOID, &i.DatabaseName, &i.Owner)
 	return i, e
 }
+
+// restoreConnections is a single immutable resolution used by every probe and
+// the tool. Neither libpq nor pgx gets to fill missing fields from ambient state.
+type restoreConnections struct {
+	operator, api *pgxpool.Config
+	service, pass *os.File
+}
+
+func (r *restoreConnections) Close() { r.service.Close(); r.pass.Close() }
+func restoreSnapshot(name string, data []byte) (*os.File, error) {
+	fd, e := unix.MemfdCreate(name, unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	if e != nil {
+		return nil, errRestore
+	}
+	f := os.NewFile(uintptr(fd), name)
+	if unix.Fchmod(fd, 0600) != nil {
+		f.Close()
+		return nil, errRestore
+	}
+	if _, e = f.Write(data); e != nil {
+		f.Close()
+		return nil, errRestore
+	}
+	if _, e = unix.FcntlInt(f.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); e != nil {
+		f.Close()
+		return nil, errRestore
+	}
+	return f, nil
+}
+func resolveRestoreConnections(c RestoreSettings) (*restoreConnections, error) {
+	for _, entry := range os.Environ() {
+		key := strings.SplitN(entry, "=", 2)[0]
+		if strings.HasPrefix(key, "PG") && key != "PGSERVICEFILE" && key != "PGPASSFILE" {
+			return nil, errRestore
+		}
+	}
+	// Pin the parent directory without following any symlink. Input files
+	// themselves must be private/current-UID, but the directory may be traversable
+	// by the server UID (the distinct-UID peer-auth operator fixture needs this).
+	read := func(path string) ([]byte, error) {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+			return nil, errRestore
+		}
+		fd, e := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		if e != nil {
+			return nil, errRestore
+		}
+		for _, part := range strings.Split(strings.TrimPrefix(filepath.Dir(path), "/"), "/") {
+			if part == "" {
+				continue
+			}
+			next, e := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			unix.Close(fd)
+			if e != nil {
+				return nil, errRestore
+			}
+			fd = next
+		}
+		d := os.NewFile(uintptr(fd), filepath.Dir(path))
+		defer d.Close()
+		return privateRead(d, filepath.Base(path))
+	}
+	data, e := read(c.ServiceFile)
+	if e != nil {
+		return nil, errRestore
+	}
+	passwords, e := read(c.PassFile)
+	if e != nil {
+		return nil, errRestore
+	}
+	pass, e := pgpassfile.ParsePassfile(bytes.NewReader(passwords))
+	if e != nil {
+		return nil, errRestore
+	}
+	sections := map[string]map[string]string{}
+	var fields map[string]string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			name := line[1 : len(line)-1]
+			if !serviceName.MatchString(name) || strings.EqualFold(name, "default") || sections[name] != nil {
+				return nil, errRestore
+			}
+			fields = map[string]string{}
+			sections[name] = fields
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if !ok || fields == nil || value == "" || fields[key] != "" {
+			return nil, errRestore
+		}
+		// A closed vocabulary excludes options, role, password, includes, TLS and
+		// service/default indirection. Even unused sections must be unambiguous.
+		switch key {
+		case "host", "port", "dbname", "user", "sslmode":
+		default:
+			return nil, errRestore
+		}
+		fields[key] = value
+	}
+	var service, pinnedPass strings.Builder
+	escapePass := func(v string) string { return strings.NewReplacer("\\", "\\\\", ":", "\\:").Replace(v) }
+	parse := func(name string) (*pgxpool.Config, error) {
+		f := sections[name]
+		if len(f) != 5 {
+			return nil, errRestore
+		}
+		port, e := strconv.ParseUint(f["port"], 10, 16)
+		if e != nil || port == 0 || !filepath.IsAbs(f["host"]) || filepath.Clean(f["host"]) != f["host"] || strings.ContainsAny(f["host"], ",\n\r") || f["sslmode"] != "disable" {
+			return nil, errRestore
+		}
+		f["port"] = strconv.FormatUint(port, 10)
+		var dsn strings.Builder
+		fmt.Fprintf(&service, "[%s]\n", name)
+		for _, key := range []string{"host", "port", "dbname", "user", "sslmode"} {
+			v := f[key]
+			if v == "" || strings.ContainsAny(v, "\n\r\x00") {
+				return nil, errRestore
+			}
+			fmt.Fprintf(&service, "%s=%s\n", key, v)
+			fmt.Fprintf(&dsn, "%s=%s ", key, quoteConnValue(v))
+		}
+		// Empty password plus explicit null passfile suppress pgx default credentials.
+		cfg, e := pgxpool.ParseConfig(dsn.String() + "password='' passfile='/dev/null'")
+		if e != nil {
+			return nil, errRestore
+		}
+		cfg.ConnConfig.Password = pass.FindPassword(f["host"], f["port"], f["dbname"], f["user"])
+		if cfg.ConnConfig.Password == "" {
+			cfg.ConnConfig.Password = pass.FindPassword("localhost", f["port"], f["dbname"], f["user"])
+		}
+		if strings.ContainsAny(cfg.ConnConfig.Password, "\r\n\x00") || len(cfg.ConnConfig.Fallbacks) != 0 || len(cfg.ConnConfig.RuntimeParams) != 0 {
+			return nil, errRestore
+		}
+		// An empty private passfile deliberately supports peer authentication.
+		// It cannot fall back to environment or the operator home directory.
+		// Canonical exact entries ensure libpq socket/default-directory password
+		// matching cannot choose a different credential than the pgx probe.
+		for _, host := range []string{f["host"], "localhost"} {
+			fmt.Fprintf(&pinnedPass, "%s:%s:%s:%s:%s\n", escapePass(host), f["port"], escapePass(f["dbname"]), escapePass(f["user"]), escapePass(cfg.ConnConfig.Password))
+		}
+		cfg.MaxConns = 3
+		return cfg, nil
+	}
+	operator, e := parse(c.Service)
+	if e != nil {
+		return nil, e
+	}
+	api, e := parse(c.APIService)
+	if e != nil {
+		return nil, e
+	}
+	a, b := operator.ConnConfig, api.ConnConfig
+	if a.Host != b.Host || a.Port != b.Port || a.Database != b.Database || b.User != "nmcp_api" {
+		return nil, errRestore
+	}
+	r := &restoreConnections{operator: operator, api: api}
+	r.service, e = restoreSnapshot("restore-service", []byte(service.String()))
+	if e != nil {
+		return nil, e
+	}
+	r.pass, e = restoreSnapshot("restore-pass", []byte(pinnedPass.String()))
+	if e != nil {
+		r.service.Close()
+		return nil, e
+	}
+	return r, nil
+}
+func (r *restoreConnections) command(ctx context.Context, c RestoreSettings) *exec.Cmd {
+	tool := c.RestoreTool
+	if tool == "" {
+		tool = "/usr/bin/pg_restore"
+	}
+	cmd := exec.CommandContext(ctx, tool, "--no-password", "--single-transaction", "--exit-on-error", "--dbname=service="+c.Service)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "PGSERVICE=" + c.Service, "PGSERVICEFILE=/proc/self/fd/3", "PGPASSFILE=/proc/self/fd/4"}
+	cmd.ExtraFiles = []*os.File{r.service, r.pass}
+	return cmd
+}
 func restorePool(ctx context.Context, c RestoreSettings, service string) (*pgxpool.Pool, error) {
-	quote := func(s string) string {
-		return "'" + strings.ReplaceAll(strings.ReplaceAll(s, "\\", "\\\\"), "'", "\\'") + "'"
-	}
-	cfg, e := pgxpool.ParseConfig("service=" + quote(service) + " servicefile=" + quote(c.ServiceFile) + " passfile=" + quote(c.PassFile))
+	r, e := resolveRestoreConnections(c)
 	if e != nil {
+		return nil, e
+	}
+	defer r.Close()
+	cfg := r.operator
+	if service == c.APIService {
+		cfg = r.api
+	} else if service != c.Service {
 		return nil, errRestore
 	}
-	// All probes and the restore endpoint are operator-only Unix socket routes.
-	if !filepath.IsAbs(cfg.ConnConfig.Host) || len(cfg.ConnConfig.Fallbacks) > 0 {
-		return nil, errRestore
-	}
-	if _, ok := cfg.ConnConfig.RuntimeParams["role"]; ok {
-		return nil, errRestore
-	}
-	cfg.MaxConns = 3
-	p, e := pgxpool.NewWithConfig(ctx, cfg)
-	if e != nil {
-		return nil, errRestore
-	}
-	return p, nil
+	return pgxpool.NewWithConfig(ctx, cfg)
 }
 func restoreRoleGraph(ctx context.Context, p *pgxpool.Pool) (string, error) {
 	var roles, members []byte
@@ -383,6 +559,11 @@ func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSetting
 			retErr = errRestore
 		}
 	}()
+	connections, e := resolveRestoreConnections(c)
+	if e != nil {
+		return op, e
+	}
+	defer connections.Close()
 	var receipt RestoreReceipt
 	if decodePrivate(c.ReceiptFile, &receipt) != nil || !validReceipt(receipt, time.Now()) {
 		return op, errRestore
@@ -435,7 +616,7 @@ func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSetting
 	if marshalErr != nil || historyHash != manifest.DumpSHA256 || historySize != manifest.DumpSize || !backupJSONEqual(manifestJSON, historyManifest) {
 		return op, errRestore
 	}
-	candidate, e := restorePool(ctx, c, c.Service)
+	candidate, e := pgxpool.NewWithConfig(ctx, connections.operator)
 	if e != nil {
 		return op, e
 	}
@@ -481,12 +662,7 @@ func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSetting
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			return errRestore
 		}
-		tool := c.RestoreTool
-		if tool == "" {
-			tool = "/usr/bin/pg_restore"
-		}
-		cmd := exec.CommandContext(ctx, tool, "--single-transaction", "--exit-on-error", "--dbname=service="+c.Service)
-		cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "PGSERVICE=" + c.Service, "PGSERVICEFILE=" + c.ServiceFile, "PGPASSFILE=" + c.PassFile}
+		cmd := connections.command(ctx, c)
 		cmd.Stdin = f
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
@@ -556,7 +732,7 @@ func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSetting
 	if _, e = target.Check(ctx, files, reconciliation.ScopeAll); e != nil {
 		return op, e
 	}
-	if e = restoreAPIProof(ctx, c, candidate, identity); e != nil {
+	if e = restoreAPIProofResolved(ctx, c, connections, candidate, identity); e != nil {
 		return op, e
 	}
 	if verifyGate(ctx, candidate, receipt) != nil {
@@ -572,7 +748,15 @@ func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSetting
 	return op, nil
 }
 func restoreAPIProof(ctx context.Context, c RestoreSettings, operator *pgxpool.Pool, want RestoreIdentity) error {
-	api, e := restorePool(ctx, c, c.APIService)
+	connections, e := resolveRestoreConnections(c)
+	if e != nil {
+		return e
+	}
+	defer connections.Close()
+	return restoreAPIProofResolved(ctx, c, connections, operator, want)
+}
+func restoreAPIProofResolved(ctx context.Context, c RestoreSettings, connections *restoreConnections, operator *pgxpool.Pool, want RestoreIdentity) error {
+	api, e := pgxpool.NewWithConfig(ctx, connections.api)
 	if e != nil {
 		return e
 	}

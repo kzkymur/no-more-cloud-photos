@@ -423,6 +423,12 @@ func rewriteCutoverServices(b []byte, op RestoreOperation, host string, port uin
 			return nil, nil, errCutover
 		}
 		for k := range s.Settings {
+			if k == "application_name" {
+				if !validPriorCutoverApp(s.Settings[k], strings.TrimPrefix(role, "nmcp_")) {
+					return nil, nil, errCutover
+				}
+				continue
+			}
 			if k != "host" && k != "port" && k != "dbname" && k != "user" && k != "sslmode" {
 				return nil, nil, errCutover
 			}
@@ -993,4 +999,18 @@ func cutoverRuntimeStorage(raw []byte, c RestoreSettings) error {
 		return errCutover
 	}
 	return nil
+}
+
+func validPriorCutoverApp(value, suffix string) bool {
+	const prefix = "nmcp_restore_"
+	tail := "_" + suffix
+	if !strings.HasPrefix(value, prefix) || !strings.HasSuffix(value, tail) {
+		return false
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(value, prefix), tail)
+	if len(id) != 32 {
+		return false
+	}
+	expanded := id[:8] + "-" + id[8:12] + "-" + id[12:16] + "-" + id[16:20] + "-" + id[20:]
+	return uuidPattern.MatchString(expanded)
 }
