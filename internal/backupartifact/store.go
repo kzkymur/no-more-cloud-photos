@@ -36,10 +36,15 @@ const (
 const DeleteDirSync Boundary = "delete-dir-sync"
 
 // Options supplies a fault injection hook called before each durability boundary.
+var ErrLocked = errors.New("backup root has another active operation")
+
 type Options struct {
+	// Lock coordinates production operations even if a DB lock session is lost.
+	Lock  bool
 	Fault func(Boundary) error
-	// OwnerUID permits root to verify artifacts belonging to a fixed backup UID.
-	// It requires ReadOnly and is rejected for non-root callers.
+	// OwnerUID permits root to verify or delete artifacts belonging to a fixed
+	// backup UID. Non-root overrides are rejected. Publication always requires
+	// the expected owner to equal the effective UID; it never creates foreign-owned artifacts.
 	OwnerUID *uint32
 	ReadOnly bool
 }
@@ -80,12 +85,13 @@ type Store struct {
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // Open requires an existing absolute root with no symlink path components. The
-// root must be owned by the effective UID and inaccessible to group and others.
+// root must be owned by the effective UID (or root-authorized OwnerUID) and
+// inaccessible to group and others.
 func Open(path string, opts Options) (*Store, error) {
 	ownerUID := uint32(os.Geteuid())
 	if opts.OwnerUID != nil {
-		if os.Geteuid() != 0 || !opts.ReadOnly {
-			return nil, errors.New("owner override requires root read-only access")
+		if os.Geteuid() != 0 {
+			return nil, errors.New("owner override requires root access")
 		}
 		ownerUID = *opts.OwnerUID
 	}
@@ -112,6 +118,19 @@ func Open(path string, opts Options) (*Store, error) {
 		root.Close()
 		return nil, err
 	}
+	if opts.Lock {
+		mode := unix.LOCK_EX | unix.LOCK_NB
+		if opts.ReadOnly {
+			mode = unix.LOCK_SH | unix.LOCK_NB
+		}
+		if err = unix.Flock(int(root.Fd()), mode); err != nil {
+			root.Close()
+			if errors.Is(err, unix.EWOULDBLOCK) {
+				return nil, ErrLocked
+			}
+			return nil, err
+		}
+	}
 	return &Store{root: root, opts: opts, ownerUID: ownerUID}, nil
 }
 func (s *Store) Close() error { s.mu.Lock(); defer s.mu.Unlock(); return s.root.Close() }
@@ -121,7 +140,7 @@ func privateDir(f *os.File, ownerUID uint32) error {
 		return err
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFDIR || st.Uid != ownerUID || st.Mode&0077 != 0 {
-		return errors.New("directory must be private and owned by current UID")
+		return errors.New("directory must be private and owned by expected UID")
 	}
 	return nil
 }
@@ -192,7 +211,7 @@ func checkFile(f *os.File, ownerUID uint32) error {
 		return err
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Uid != ownerUID || st.Mode&0077 != 0 {
-		return errors.New("artifact file must be private, regular, singly linked and owned by current UID")
+		return errors.New("artifact file must be private, regular, singly linked and owned by expected UID")
 	}
 	return nil
 }
@@ -228,6 +247,9 @@ func (s *Store) Publish(ctx context.Context, meta Metadata, write, validate func
 	var m Manifest
 	if s.opts.ReadOnly {
 		return m, errors.New("store is read-only")
+	}
+	if s.ownerUID != uint32(os.Geteuid()) {
+		return m, errors.New("publication requires effective UID to match backup owner")
 	}
 	if err := privateDir(s.root, s.ownerUID); err != nil {
 		return m, err
@@ -608,6 +630,107 @@ func (s *Store) finishDelete(tomb string, d *os.File) error {
 		return err
 	}
 	return s.boundary(DeleteSync, s.root.Sync)
+}
+
+const (
+	StagingRemoveDump     Boundary = "staging-remove-dump"
+	StagingRemoveManifest Boundary = "staging-remove-manifest"
+	StagingRemoveDirSync  Boundary = "staging-remove-dir-sync"
+	StagingRemoveRootSync Boundary = "staging-remove-root-sync"
+)
+
+// RemoveStaging removes only .tmp-ID beneath the pinned root. The caller must
+// first establish durable failed backup history, an age of at least 48 hours,
+// and exclusive ownership of the same PostgreSQL backup advisory lock.
+// No root enumeration or published/deletion namespace access is performed.
+// Missing staging directories are idempotent under this explicit authorization.
+// Partial cleanup is resumable, but all remaining entries must still be safe.
+func (s *Store) RemoveStaging(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.opts.ReadOnly {
+		return errors.New("store is read-only")
+	}
+	if !uuidPattern.MatchString(id) {
+		return errors.New("invalid UUIDv4 backup ID")
+	}
+	if err := privateDir(s.root, s.ownerUID); err != nil {
+		return err
+	}
+	name := ".tmp-" + id
+	d, err := openDir(s.root, name, s.ownerUID)
+	if errors.Is(err, unix.ENOENT) {
+		return s.boundary(StagingRemoveRootSync, s.root.Sync)
+	}
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	// Only this exact staging directory is inspected, bounded to three entries:
+	// the third entry is sufficient to reject any unexpected contents.
+	entries, err := d.ReadDir(3)
+	if err != nil && err != io.EOF {
+		return err
+	}
+	if len(entries) > 2 {
+		return errors.New("unknown staging artifact entries")
+	}
+	type pinned struct {
+		name string
+		file *os.File
+	}
+	files := make([]pinned, 0, 2)
+	defer func() {
+		for _, f := range files {
+			f.file.Close()
+		}
+	}()
+	for _, e := range entries {
+		if e.Name() != "dump" && e.Name() != "manifest.json" {
+			return errors.New("unknown staging artifact entry")
+		}
+		f, err := openFile(d, e.Name(), s.ownerUID)
+		if err != nil {
+			return err
+		}
+		files = append(files, pinned{e.Name(), f})
+		if err = sameEntry(d, e.Name(), f); err != nil {
+			return err
+		}
+	}
+	if err = sameEntry(s.root, name, d); err != nil {
+		return err
+	}
+	for _, f := range files {
+		boundary := StagingRemoveDump
+		if f.name == "manifest.json" {
+			boundary = StagingRemoveManifest
+		}
+		if err = s.boundary(boundary, func() error {
+			if err := sameEntry(s.root, name, d); err != nil {
+				return err
+			}
+			if err := checkFile(f.file, s.ownerUID); err != nil {
+				return err
+			}
+			if err := sameEntry(d, f.name, f.file); err != nil {
+				return err
+			}
+			return unix.Unlinkat(int(d.Fd()), f.name, 0)
+		}); err != nil {
+			return err
+		}
+	}
+	if err = s.boundary(StagingRemoveDirSync, d.Sync); err != nil {
+		return err
+	}
+	if err = sameEntry(s.root, name, d); err != nil {
+		return err
+	}
+	if err = unix.Unlinkat(int(s.root.Fd()), name, unix.AT_REMOVEDIR); err != nil {
+		return err
+	}
+	return s.boundary(StagingRemoveRootSync, s.root.Sync)
 }
 
 // encoding/json accepts duplicate object keys; manifests deliberately do not.

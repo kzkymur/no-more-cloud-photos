@@ -186,7 +186,7 @@ tls_link=/etc/nmcp/tls-current.new.$$
 /usr/bin/install -d -o root -g root -m 0700 /var/lib/nmcp/deployment
 
 for unit in nmcp.slice nmcp-migrate.service nmcp-api.service nmcp-worker.service \
-  nmcp-files.service nmcp-tls-expiry.service nmcp-tls-expiry.timer nmcp.target; do
+  nmcp-files.service nmcp-tls-expiry.service nmcp-tls-expiry.timer nmcp-backup.service nmcp-backup.timer nmcp.target; do
   /usr/bin/install -o root -g root -m 0644 "$repo_root/infra/ubuntu/systemd/$unit" "/etc/systemd/system/$unit"
 done
 /usr/bin/install -d -o root -g root -m 0755 /etc/systemd/system/nmcp-migrate.service.d
@@ -200,7 +200,7 @@ done
 for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
   acquire-ubuntu-deployment-locks capture-trusted-inputs handoff-ubuntu-migration-lock \
   run-ubuntu-migration run-ubuntu-migration-compatibility set-ubuntu-migration-role-mode \
-  validate-ubuntu-config \
+  validate-ubuntu-config validate-backup-install install-backup-config \
   verify-ubuntu-firewall verify-ubuntu-tls-certificate; do
   /usr/bin/install -o root -g root -m 0755 "$repo_root/scripts/$script" "/usr/local/libexec/nmcp/$script"
 done
@@ -221,6 +221,7 @@ bootstrap_checksums=$(/usr/bin/mktemp /var/lib/nmcp/deployment/postgresql-role-b
 /usr/bin/mv -f "$bootstrap_checksums" \
   /var/lib/nmcp/deployment/postgresql-role-bootstrap.sha256
 /usr/bin/install -o root -g root -m 0644 "$repo_root/docs/ubuntu-deployment.md" /usr/share/doc/nmcp/ubuntu-deployment.md
+/usr/bin/install -o root -g root -m 0644 "$repo_root/docs/backup-operations.md" /usr/share/doc/nmcp/backup-operations.md
 
 /usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' \
   ca-certificates curl ffmpeg libimage-exiftool-perl nginx-core postgresql tzdata ufw util-linux \

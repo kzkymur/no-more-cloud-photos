@@ -1,0 +1,14 @@
+[Unit]
+Description=Wake No More Cloud Photos backup eligibility check
+Documentation=file:/usr/share/doc/nmcp/backup-operations.md
+PartOf=nmcp.target
+
+[Timer]
+# Wake cadence only; current typed database config and last success decide due.
+OnCalendar=hourly
+Persistent=yes
+RandomizedDelaySec=5m
+Unit=nmcp-backup.service
+
+[Install]
+WantedBy=timers.target

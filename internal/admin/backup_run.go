@@ -14,7 +14,7 @@ import (
 )
 
 func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (result BackupRun, err error) {
-	result = BackupRun{Outcome: "overlap_conflict"}
+	result = BackupRun{Outcome: "failed"}
 	// This precise acquired session must still own the lock at the final commit.
 	conn, err := s.Pool.Acquire(ctx)
 	if err != nil {
@@ -26,6 +26,7 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 		return result, errBackup
 	}
 	if !locked {
+		result.Outcome = "overlap_conflict"
 		return result, ErrConflict
 	}
 	defer func() {
@@ -36,8 +37,19 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 			_ = conn.Hijack().Close(cleanup)
 		}
 	}()
+	// Both locks are required before recovery or history mutation. A surviving
+	// dumper with a lost DB backend must never be declared abandoned by a rival.
+	store, err := backupartifact.Open(b.Root, backupartifact.Options{Lock: true})
+	if err != nil {
+		if errors.Is(err, backupartifact.ErrLocked) {
+			result.Outcome = "overlap_conflict"
+			return result, ErrConflict
+		}
+		return result, errBackup
+	}
+	defer store.Close()
 	// A previous holder cannot still be running after we obtain the same lock.
-	abandoned, err := s.Pool.Query(ctx, `SELECT id::text FROM backup_runs WHERE status='running' OR (status='failed' AND notification_status='pending') ORDER BY started_at`)
+	abandoned, err := s.Pool.Query(ctx, `SELECT id::text FROM backup_runs WHERE status='running' OR (status='failed' AND (notification_status='pending' OR failure_audit_pending)) ORDER BY started_at`)
 	if err != nil {
 		return result, errBackup
 	}
@@ -65,6 +77,7 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 		} else {
 			_ = s.backupNotify(ctx, id, "abandoned", b)
 		}
+		_ = s.retryBackupFailureAudit(ctx, id)
 		if s.Pool.QueryRow(ctx, `SELECT status FROM backup_runs WHERE id=$1`, id).Scan(&status) != nil || status == "running" {
 			return result, errBackup
 		}
@@ -74,7 +87,7 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 		return result, errBackup
 	}
 	defer rollback(tx)
-	if err = normal(ctx, tx); err != nil {
+	if err = backupNormal(ctx, tx); err != nil {
 		return result, err
 	}
 	cfg, cutoff, due, err := backupDue(ctx, tx, ifDue)
@@ -94,10 +107,7 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 	if err != nil {
 		return result, errBackup
 	}
-	if err = tx.Commit(ctx); err != nil {
-		return result, errBackup
-	}
-	phase := "prepare"
+	phase := "running_commit"
 	defer func() {
 		if err != nil {
 			if s.backupFailure(result.ID, phase, b) == nil {
@@ -110,13 +120,23 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 				result.Outcome = "failed"
 				err = errBackup
 			}
+			cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if persisted, readErr := s.backupResult(cleanup, result.ID); readErr == nil {
+				result = persisted
+			}
+			cancel()
 		}
 	}()
-	store, err := backupartifact.Open(b.Root, backupartifact.Options{})
+
+	err = tx.Commit(ctx)
+	if err == nil && s.afterBackupRunningCommit != nil {
+		err = s.afterBackupRunningCommit(ctx)
+	}
 	if err != nil {
+		rollback(tx)
 		return result, errBackup
 	}
-	defer store.Close()
+	phase = "prepare"
 	dump, err := b.dumpConnect(ctx)
 	if err != nil {
 		return result, errBackup
@@ -148,6 +168,7 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 	if err = snapshotTx.QueryRow(ctx, `SELECT pg_export_snapshot(),transaction_timestamp()`).Scan(&snapshot, &cutoff); err != nil {
 		return result, errBackup
 	}
+	result.StartedAt = cutoff
 	var snapshotConfig []byte
 	if err = snapshotTx.QueryRow(ctx, `SELECT to_jsonb(system_config)-'id' FROM system_config WHERE id=1`).Scan(&snapshotConfig); err != nil {
 		return result, errBackup
@@ -185,7 +206,7 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 		return result, errBackup
 	}
 	defer rollback(final)
-	if err = normal(ctx, final); err != nil {
+	if err = backupNormal(ctx, final); err != nil {
 		return result, errBackup
 	}
 	encoded, err := json.Marshal(manifest)
@@ -199,7 +220,11 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 	if err = s.audit(ctx, final, "backup_run", map[string]any{"if_due": ifDue}, []string{result.ID}, "succeeded", cutoff); err != nil {
 		return result, errBackup
 	}
-	if err = final.Commit(ctx); err != nil {
+	err = final.Commit(ctx)
+	if err == nil && s.afterBackupCommit != nil {
+		err = s.afterBackupCommit(ctx)
+	}
+	if err != nil {
 		return result, errBackup
 	}
 	result.Status = "succeeded"

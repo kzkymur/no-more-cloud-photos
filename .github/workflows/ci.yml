@@ -360,3 +360,59 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
+  backup-postgresql17:
+    name: Backup / PostgreSQL 17 production roles and operator restore
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Build pinned PostgreSQL 17 server and clients
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bison flex make gcc zlib1g-dev postgresql-common util-linux
+          mkdir -p "$RUNNER_TEMP/backup-pg17"
+          curl --fail --location --silent --show-error \
+            https://ftp.postgresql.org/pub/source/v17.7/postgresql-17.7.tar.bz2 \
+            --output "$RUNNER_TEMP/backup-pg17/source.tar.bz2"
+          printf '%s  %s\n' \
+            ef9e343302eccd33112f1b2f0247be493cb5768313adeb558b02de8797a2e9b5 \
+            "$RUNNER_TEMP/backup-pg17/source.tar.bz2" | sha256sum --check
+          tar -xjf "$RUNNER_TEMP/backup-pg17/source.tar.bz2" -C "$RUNNER_TEMP/backup-pg17"
+          cd "$RUNNER_TEMP/backup-pg17/postgresql-17.7"
+          ./configure --prefix="$RUNNER_TEMP/backup-pg17/install" --without-readline --without-icu
+          make -j2
+          make -j2 install
+          "$RUNNER_TEMP/backup-pg17/install/bin/postgres" --version | grep -F '17.7'
+          "$RUNNER_TEMP/backup-pg17/install/bin/pg_dump" --version | grep -F '17.7'
+          "$RUNNER_TEMP/backup-pg17/install/bin/pg_restore" --version | grep -F '17.7'
+          # Disposable server runs as postgres, never as root. No secrets live here.
+          chmod a+rx "$RUNNER_TEMP" "$RUNNER_TEMP/backup-pg17"
+      - name: Provision isolated runtime and backup UIDs
+        run: sudo systemd-sysusers infra/ubuntu/sysusers.d/nmcp.conf
+      - name: Build exact candidate backup acceptance test binary
+        run: |
+          go test -c -o "$RUNNER_TEMP/backup17.test" ./internal/admin
+          "$RUNNER_TEMP/backup17.test" -test.list '^TestBackupPG17' | grep -Fx TestBackupPG17ProductionRoles
+          "$RUNNER_TEMP/backup17.test" -test.list '^TestBackupPG17' | grep -Fx TestBackupPG17OperatorRestore
+      - name: Actual multiowner dump and operator restore acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            TEST_BACKUP_PG17_BINDIR="$RUNNER_TEMP/backup-pg17/install/bin" \
+            "$RUNNER_TEMP/backup17.test" -test.v -test.count=1 -test.timeout=10m \
+            -test.run '^TestBackupPG17' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          grep -F -- '--- PASS: TestBackupPG17ProductionRoles ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          grep -F -- '--- PASS: TestBackupPG17OperatorRestore ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          ! grep -F -- '--- SKIP: TestBackupPG17' "$RUNNER_TEMP/backup-pg17-acceptance.log"

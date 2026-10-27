@@ -35,6 +35,8 @@ type options struct {
 	scope          string
 	report         string
 	kind           string
+	operationID    string
+	cutover        bool
 	ifDue          bool
 	definitionData []byte
 }
@@ -87,6 +89,8 @@ func parse(args []string) (options, error) {
 	case "maintenance resume":
 	case "restore":
 		flags.StringVar(&o.id, "backup-id", "", "backup UUIDv4")
+		flags.StringVar(&o.operationID, "operation-id", "", "validated restore operation UUIDv4")
+		flags.BoolVar(&o.cutover, "cutover", false, "explicit operator cutover; never resumes maintenance")
 	default:
 		return o, ErrValidation
 	}
@@ -125,7 +129,15 @@ func parse(args []string) (options, error) {
 		if _, err := DecodeProfile(o.definitionData); err != nil {
 			return o, err
 		}
-	case "profile activate", "profile retire", "restore":
+	case "restore":
+		if o.cutover {
+			if !uuidPattern.MatchString(o.operationID) || o.id != "" {
+				return o, ErrValidation
+			}
+		} else if !uuidPattern.MatchString(o.id) || o.operationID != "" {
+			return o, ErrValidation
+		}
+	case "profile activate", "profile retire":
 		if !uuidPattern.MatchString(o.id) {
 			return o, ErrValidation
 		}
@@ -182,10 +194,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: nmcp-admin config|profile|regenerate|jobs|check|repair|cleanup|maintenance [options]")
 		return finish(stdout, stderr, o.json, nil, err)
 	}
-	if o.command == "cleanup" && o.kind == "all" {
-		fmt.Fprintln(stderr, "combined cleanup is not configured; no cleanup performed")
-		return finish(stdout, stderr, o.json, nil, ErrUnsupported)
-	}
+
 	cfg, err := config.LoadAdmin()
 	if err != nil {
 		return finish(stdout, stderr, o.json, nil, err)
@@ -213,7 +222,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		var settings RestoreSettings
 		settings, err = restoreSettings()
 		if err == nil {
-			result, err = service.Restore(ctx, o.id, settings)
+			if o.cutover {
+				result, err = service.RestoreCutover(ctx, o.operationID, settings)
+			} else {
+				result, err = service.Restore(ctx, o.id, settings)
+			}
 		}
 	case "cleanup":
 		if o.kind == "backups" {

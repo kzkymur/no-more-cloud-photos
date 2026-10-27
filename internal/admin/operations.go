@@ -114,11 +114,27 @@ func (s *Service) MaintenanceResume(ctx context.Context, store *storage.Store) (
 	// Hold it throughout the fresh check through normal-mode commit. Every
 	// direct Repairer apply/attempt takes FOR SHARE and cannot cross it.
 	var mode string
-	if err := tx.QueryRow(ctx, `SELECT mode FROM maintenance_state WHERE id=1 FOR UPDATE NOWAIT`).Scan(&mode); err != nil {
+	var reason, owner *string
+	if err := tx.QueryRow(ctx, `SELECT mode,reason,owner FROM maintenance_state WHERE id=1 FOR UPDATE NOWAIT`).Scan(&mode, &reason, &owner); err != nil {
 		return nil, classified(err)
 	}
 	if mode != "maintenance" {
 		return nil, ErrConflict
+	}
+	// Imported database state cannot authorize resume. Restore maintenance
+	// requires the external cutover ledger and exact live candidate identity.
+	if reason != nil && *reason == "operator restore" {
+		if owner == nil {
+			return nil, ErrConflict
+		}
+		op, err := LoadRestoreOperation(os.Getenv("NMCP_RESTORE_LEDGER_ROOT"), *owner)
+		if err != nil || op.Phase != "cutover_verified" {
+			return nil, ErrConflict
+		}
+		identity, err := restoreIdentity(ctx, s.Pool)
+		if err != nil || identity != op.Candidate {
+			return nil, ErrConflict
+		}
 	}
 	if s.afterResumeFence != nil {
 		if err := s.afterResumeFence(ctx); err != nil {

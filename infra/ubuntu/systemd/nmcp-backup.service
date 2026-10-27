@@ -1,0 +1,47 @@
+[Unit]
+Description=No More Cloud Photos database backup (database policy decides eligibility)
+Documentation=file:/usr/share/doc/nmcp/backup-operations.md
+After=nmcp-migrate.service
+PartOf=nmcp.target
+RequiresMountsFor=/var/lib/nmcp-backup
+
+[Service]
+Type=oneshot
+User=nmcp-backup
+Group=nmcp-backup
+Slice=nmcp.slice
+EnvironmentFile=/etc/nmcp/backup.env
+LoadCredential=dump.pgpass:/etc/nmcp/credentials/backup-dump.pgpass
+LoadCredential=control.pgpass:/etc/nmcp/credentials/backup-control.pgpass
+LoadCredential=pg_service.conf:/etc/nmcp/backup.pg_service.conf
+# %d is expanded by systemd. EnvironmentFile does NOT expand shell variables.
+Environment=PGPASSFILE=%d/control.pgpass
+Environment=PGSERVICEFILE=%d/pg_service.conf
+Environment=NMCP_BACKUP_DUMP_PASSFILE=%d/dump.pgpass
+ExecStart=/opt/nmcp/current/bin/nmcp-admin backup run --if-due --json
+# 4 is a structured not_due/overlap_conflict, never a successful backup.
+SuccessExitStatus=4
+TimeoutStartSec=6h
+TimeoutStopSec=60s
+KillMode=control-group
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/nmcp-backup
+UMask=0077

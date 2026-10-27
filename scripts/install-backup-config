@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Explicit operator configuration installation, not a routine privileged helper.
+set -euo pipefail
+umask 0077
+[[ $EUID -eq 0 && $# -eq 2 && $1 == --config-dir && $2 == /* ]] || {
+  printf 'usage (root): install-backup-config --config-dir /root/TRUSTED_DIR\n' >&2
+  exit 2
+}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+config_dir=$2
+# Serialize against deploy/migrate and never change config under a running dump.
+if [[ ${NMCP_LOCK_MODE:-} != direct ]]; then
+  exec "$script_dir/acquire-ubuntu-deployment-locks" both -- "$0" "$@"
+fi
+"$script_dir/acquire-ubuntu-deployment-locks" verify direct
+/usr/bin/systemctl stop nmcp-backup.timer nmcp-backup.service
+capture=$(/usr/bin/mktemp -d /run/nmcp-backup-input.XXXXXX)
+# mktemp returned this exact absolute path; cleanup never uses an unchecked input.
+[[ $capture == /run/nmcp-backup-input.* && -d $capture && ! -L $capture ]] || exit 1
+cleanup() { /usr/bin/rm -rf -- "${capture:?}"; }
+trap cleanup EXIT
+"$script_dir/capture-trusted-inputs" "$capture" \
+  "$config_dir/backup.env" backup.env \
+  "$config_dir/backup.pg_service.conf" backup.pg_service.conf \
+  "$config_dir/backup-dump.pgpass" backup-dump.pgpass \
+  "$config_dir/backup-control.pgpass" backup-control.pgpass
+/usr/bin/install -d -o root -g root -m 0700 /etc/nmcp/credentials
+for name in backup.env backup.pg_service.conf; do
+  /usr/bin/install -o root -g root -m 0600 "$capture/$name" "/etc/nmcp/$name"
+done
+for name in backup-dump.pgpass backup-control.pgpass; do
+  /usr/bin/install -o root -g root -m 0600 "$capture/$name" "/etc/nmcp/credentials/$name"
+done
+# A concrete cluster drop-in is copied from the already validated migrate edge.
+# It contains no executable or user input and backup never starts migrations.
+[[ -f /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf \
+  && ! -L /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf \
+  && $(/usr/bin/stat -c '%U:%G:%a' /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf) == root:root:644 ]] || exit 1
+/usr/bin/install -d -o root -g root -m 0755 /etc/systemd/system/nmcp-backup.service.d
+/usr/bin/install -o root -g root -m 0644 \
+  /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf \
+  /etc/systemd/system/nmcp-backup.service.d/10-postgresql.conf
+"$script_dir/validate-backup-install" --installed
+/usr/bin/systemctl daemon-reload
+# No backup is reported here: the next wake independently evaluates DB policy.
+/usr/bin/systemctl start nmcp-backup.service
+/usr/bin/systemctl enable --now nmcp-backup.timer
+printf 'Backup configuration installed; wake timer enabled. No backup success claimed.\n'

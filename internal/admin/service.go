@@ -22,7 +22,6 @@ var (
 	ErrConflict       = errors.New("conflict or nothing eligible")
 	ErrConfirmation   = errors.New("confirmation required (--yes)")
 	ErrPartial        = errors.New("partial batch failure; resume with the returned token")
-	ErrUnsupported    = errors.New("backup operations belong to Issue19 and are not implemented")
 	profileKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 	uuidPattern       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
@@ -33,7 +32,10 @@ type Service struct {
 	Host  string
 
 	afterBatchCommit func(context.Context) error
-	afterResumeFence func(context.Context) error
+	// Test-only lost acknowledgement seam, invoked only AFTER real success commit.
+	afterBackupCommit        func(context.Context) error
+	afterBackupRunningCommit func(context.Context) error
+	afterResumeFence         func(context.Context) error
 }
 
 func New(pool *pgxpool.Pool) *Service {

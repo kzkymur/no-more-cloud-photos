@@ -442,18 +442,301 @@ func TestOwnerOverrideAuthorization(t *testing.T) {
 	if err := os.Chmod(root, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if s, err := Open(root, Options{OwnerUID: &uid}); err == nil {
-		s.Close()
-		t.Fatal("owner override allowed writable")
+	for _, readonly := range []bool{false, true} {
+		s, err := Open(root, Options{OwnerUID: &uid, ReadOnly: readonly})
+		if os.Geteuid() == 0 {
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.Close()
+		} else if err == nil {
+			s.Close()
+			t.Fatal("non-root owner override accepted")
+		}
 	}
-	s, err := Open(root, Options{OwnerUID: &uid, ReadOnly: true})
-	if os.Geteuid() == 0 {
-		if err != nil {
+}
+
+// Exercise the independent publication guard on every UID without requiring
+// privileges, a real foreign-owned directory, or a successful Open override.
+func TestPublicationRequiresEffectiveOwner(t *testing.T) {
+	s, root := store(t, Options{})
+	s.ownerUID = uint32(os.Geteuid()) + 1
+	called := false
+	write := func(context.Context, *os.File) error { called = true; return nil }
+	_, err := s.Publish(context.Background(), metadata(t), write, validator)
+	if err == nil || err.Error() != "publication requires effective UID to match backup owner" || called {
+		t.Fatalf("foreign owner publication guard: %v callback=%v", err, called)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("publication mutated root: %v %v", entries, err)
+	}
+}
+func TestRootForeignOwnerCleanup(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to create genuinely foreign-owned fixture")
+	}
+	s, root := store(t, Options{})
+	m, err := s.Publish(context.Background(), metadata(t), writer, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const foreignUID = uint32(65534)
+	for _, path := range []string{filepath.Join(root, m.ID, "dump"), filepath.Join(root, m.ID, "manifest.json"), filepath.Join(root, m.ID), root} {
+		if err = os.Chown(path, int(foreignUID), -1); err != nil {
 			t.Fatal(err)
 		}
-		s.Close()
-	} else if err == nil {
-		s.Close()
-		t.Fatal("non-root owner override accepted")
+	}
+	owner := foreignUID
+	operator, err := Open(root, Options{OwnerUID: &owner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operator.Close()
+	if _, err = operator.Verify(m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = operator.Publish(context.Background(), metadata(t), writer, validator); err == nil {
+		t.Fatal("root published as backup UID")
+	}
+	if err = operator.Delete(m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = operator.ResumeDelete(m.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func stagingFixture(t *testing.T, root, id string, names ...string) string {
+	t.Helper()
+	dir := filepath.Join(root, ".tmp-"+id)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+func TestRemoveStagingResumesPartialAndMissing(t *testing.T) {
+	for _, names := range [][]string{nil, {"dump"}, {"manifest.json"}, {"dump", "manifest.json"}} {
+		s, root := store(t, Options{})
+		id := metadata(t).ID
+		dir := stagingFixture(t, root, id, names...)
+		if err := s.RemoveStaging(id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("stage remains: %v", err)
+		}
+		if err := s.RemoveStaging(id); err != nil {
+			t.Fatal("missing stage not idempotent", err)
+		}
+	}
+}
+func TestRemoveStagingRejectsUnsafe(t *testing.T) {
+	for _, kind := range []string{"unknown", "too-many", "symlink", "hardlink", "directory", "public", "public-dir", "symlink-dir"} {
+		t.Run(kind, func(t *testing.T) {
+			s, root := store(t, Options{})
+			id := metadata(t).ID
+			dir := stagingFixture(t, root, id, "dump", "manifest.json")
+			dump := filepath.Join(dir, "dump")
+			var err error
+			switch kind {
+			case "unknown":
+				err = os.Rename(dump, filepath.Join(dir, "unknown"))
+			case "too-many":
+				err = os.WriteFile(filepath.Join(dir, "extra"), nil, 0600)
+			case "symlink":
+				if err = os.Remove(dump); err == nil {
+					err = os.Symlink("/etc/passwd", dump)
+				}
+			case "hardlink":
+				err = os.Link(dump, filepath.Join(root, "linked"))
+			case "directory":
+				if err = os.Remove(dump); err == nil {
+					err = os.Mkdir(dump, 0700)
+				}
+			case "public":
+				err = os.Chmod(dump, 0644)
+			case "public-dir":
+				err = os.Chmod(dir, 0755)
+			case "symlink-dir":
+				target := filepath.Join(root, "target")
+				if err = os.Rename(dir, target); err == nil {
+					err = os.Symlink(target, dir)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = s.RemoveStaging(id); err == nil {
+				t.Fatal("unsafe stage accepted")
+			}
+			if _, err = os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
+				t.Fatal("removed before validating all entries", err)
+			}
+		})
+	}
+}
+func TestRemoveStagingPreservesOtherNamespaces(t *testing.T) {
+	s, root := store(t, Options{})
+	m, err := s.Publish(context.Background(), metadata(t), writer, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tomb := filepath.Join(root, ".deleting-"+m.ID)
+	if err = os.Mkdir(tomb, 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(tomb, "dump")
+	if err = os.WriteFile(marker, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stagingFixture(t, root, m.ID, "dump")
+	if err = s.RemoveStaging(m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Verify(m.ID); err != nil {
+		t.Fatal("published artifact changed", err)
+	}
+	if b, e := os.ReadFile(marker); e != nil || string(b) != "keep" {
+		t.Fatal("deletion namespace changed", e)
+	}
+	for _, id := range []string{"../escape", ".tmp-" + m.ID, ".deleting-" + m.ID, "00000000-0000-0000-0000-000000000000"} {
+		if err = s.RemoveStaging(id); err == nil {
+			t.Fatalf("invalid id accepted %q", id)
+		}
+	}
+}
+func TestRemoveStagingReadOnly(t *testing.T) {
+	_, root := store(t, Options{})
+	id := metadata(t).ID
+	dir := stagingFixture(t, root, id, "dump")
+	ro, err := Open(root, Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if err = ro.RemoveStaging(id); err == nil {
+		t.Fatal("read-only cleanup accepted")
+	}
+	if _, err = os.Stat(filepath.Join(dir, "dump")); err != nil {
+		t.Fatal("read-only cleanup mutated stage", err)
+	}
+}
+func TestRemoveStagingDurabilityFailureResume(t *testing.T) {
+	for _, boundary := range []Boundary{StagingRemoveDump, StagingRemoveManifest, StagingRemoveDirSync, StagingRemoveRootSync} {
+		t.Run(string(boundary), func(t *testing.T) {
+			fail := true
+			s, root := store(t, Options{Fault: func(b Boundary) error {
+				if fail && b == boundary {
+					return errors.New("staging fault")
+				}
+				return nil
+			}})
+			id := metadata(t).ID
+			dir := stagingFixture(t, root, id, "dump", "manifest.json")
+			if err := s.RemoveStaging(id); err == nil {
+				t.Fatal("ignored fault")
+			}
+			fail = false
+			if err := s.RemoveStaging(id); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(dir); !os.IsNotExist(err) {
+				t.Fatal("stage remains", err)
+			}
+		})
+	}
+}
+func TestRemoveStagingRejectsFileSwapBeforeUnlink(t *testing.T) {
+	var swap func() error
+	s, root := store(t, Options{Fault: func(b Boundary) error {
+		if b == StagingRemoveDump && swap != nil {
+			return swap()
+		}
+		return nil
+	}})
+	id := metadata(t).ID
+	dir := stagingFixture(t, root, id, "dump")
+	p := filepath.Join(dir, "dump")
+	swap = func() error {
+		if err := os.Rename(p, p+"-old"); err != nil {
+			return err
+		}
+		return os.WriteFile(p, []byte("replacement"), 0600)
+	}
+	if err := s.RemoveStaging(id); err == nil {
+		t.Fatal("accepted swapped file")
+	}
+	if b, err := os.ReadFile(p); err != nil || string(b) != "replacement" {
+		t.Fatal("removed replacement", err)
+	}
+}
+func TestRemoveStagingRejectsDirectorySwapBeforeUnlink(t *testing.T) {
+	var swap func() error
+	s, root := store(t, Options{Fault: func(b Boundary) error {
+		if b == StagingRemoveDump && swap != nil {
+			return swap()
+		}
+		return nil
+	}})
+	id := metadata(t).ID
+	dir := stagingFixture(t, root, id, "dump")
+	moved := dir + "-moved"
+	swap = func() error {
+		if err := os.Rename(dir, moved); err != nil {
+			return err
+		}
+		return os.Symlink(moved, dir)
+	}
+	if err := s.RemoveStaging(id); err == nil {
+		t.Fatal("accepted swapped stage directory")
+	}
+	if _, err := os.Stat(filepath.Join(moved, "dump")); err != nil {
+		t.Fatal("mutated detached stage directory", err)
+	}
+}
+
+func TestOperationLockExcludesReadersAndWriters(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writerStore, err := Open(root, Options{Lock: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []Options{{Lock: true}, {Lock: true, ReadOnly: true}} {
+		competing, err := Open(root, opts)
+		if competing != nil {
+			competing.Close()
+		}
+		if !errors.Is(err, ErrLocked) {
+			t.Fatalf("exclusive holder did not reject a competing operation: %v", err)
+		}
+	}
+	if err = writerStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Open(root, Options{Lock: true, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(root, Options{Lock: true, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	competing, err := Open(root, Options{Lock: true})
+	if competing != nil {
+		competing.Close()
+	}
+	if !errors.Is(err, ErrLocked) {
+		t.Fatalf("shared readers did not fence destructive operation: %v", err)
 	}
 }

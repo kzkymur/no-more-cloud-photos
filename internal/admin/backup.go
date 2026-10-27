@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jackc/pgservicefile"
+	"github.com/kzkymur/no-more-cloud-photos/internal/backupartifact"
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -76,10 +79,11 @@ type BackupRun struct {
 	Outcome      string     `json:"outcome,omitempty"`
 	Notification string     `json:"notification_status"`
 	ErrorCode    *string    `json:"error_code,omitempty"`
+	AuditPending bool       `json:"audit_pending,omitempty"`
 }
 
 func (s *Service) BackupList(ctx context.Context) ([]BackupRun, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id::text,status,started_at,finished_at,notification_status,error_code FROM backup_runs ORDER BY started_at DESC,id DESC LIMIT 1000`)
+	rows, err := s.Pool.Query(ctx, `SELECT id::text,status,started_at,finished_at,notification_status,error_code,failure_audit_pending FROM backup_runs ORDER BY started_at DESC,id DESC LIMIT 1000`)
 	if err != nil {
 		return nil, errBackup
 	}
@@ -87,7 +91,7 @@ func (s *Service) BackupList(ctx context.Context) ([]BackupRun, error) {
 	result := []BackupRun{}
 	for rows.Next() {
 		var r BackupRun
-		if err := rows.Scan(&r.ID, &r.Status, &r.StartedAt, &r.FinishedAt, &r.Notification, &r.ErrorCode); err != nil {
+		if err := rows.Scan(&r.ID, &r.Status, &r.StartedAt, &r.FinishedAt, &r.Notification, &r.ErrorCode, &r.AuditPending); err != nil {
 			return nil, errBackup
 		}
 		result = append(result, r)
@@ -118,11 +122,9 @@ func (s *Service) backupFailure(id, phase string, b BackupSettings) error {
 		return errBackup
 	}
 	defer rollback(tx)
-	tag, err := tx.Exec(ctx, `UPDATE backup_runs SET status='failed',finished_at=clock_timestamp(),error_code=$2,error_message='backup failed; inspect sanitized phase',notification_status='pending',notification_error=NULL WHERE id=$1 AND status='running'`, id, phase)
-	if err != nil {
-		return errBackup
-	}
-	if tag.RowsAffected() == 0 {
+	var started time.Time
+	err = tx.QueryRow(ctx, `UPDATE backup_runs SET status='failed',finished_at=clock_timestamp(),error_code=$2,error_message='backup failed; inspect sanitized phase',notification_status='pending',notification_error=NULL WHERE id=$1 AND status='running' RETURNING started_at`, id, phase).Scan(&started)
+	if errors.Is(err, pgx.ErrNoRows) {
 		rollback(tx)
 		var status string
 		if s.Pool.QueryRow(ctx, `SELECT status FROM backup_runs WHERE id=$1`, id).Scan(&status) == nil && status == "succeeded" {
@@ -130,7 +132,24 @@ func (s *Service) backupFailure(id, phase string, b BackupSettings) error {
 		}
 		return errBackup
 	}
-	if err = s.audit(ctx, tx, "backup_run", map[string]string{"phase": phase}, []string{id}, "failed", time.Now()); err != nil {
+	if err != nil {
+		return errBackup
+	}
+	// A rejected audit must not roll back the mandatory failure journal or skip
+	// notification. The retry flag is durable in the same mandatory transaction.
+	if _, err = tx.Exec(ctx, `SAVEPOINT backup_failure_audit`); err != nil {
+		return errBackup
+	}
+	auditErr := s.audit(ctx, tx, "backup_run", map[string]string{"phase": phase}, []string{id}, "failed", started)
+	if auditErr != nil {
+		if _, err = tx.Exec(ctx, `ROLLBACK TO SAVEPOINT backup_failure_audit`); err != nil {
+			return errBackup
+		}
+		if _, err = tx.Exec(ctx, `UPDATE backup_runs SET failure_audit_pending=true WHERE id=$1`, id); err != nil {
+			return errBackup
+		}
+	}
+	if _, err = tx.Exec(ctx, `RELEASE SAVEPOINT backup_failure_audit`); err != nil {
 		return errBackup
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -289,4 +308,80 @@ func backupIdentity(ctx context.Context, q interface {
 
 func quoteConnValue(s string) string {
 	return "'" + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `'`, `\'`) + "'"
+}
+
+// Root administrative cleanup may delete only the fixed dedicated backup UID's
+// files. It still cannot publish on that UID's behalf. Routine runs use euid.
+func backupArtifactOptions(root string, readOnly bool) (backupartifact.Options, error) {
+	opts := backupartifact.Options{ReadOnly: readOnly, Lock: true}
+	if os.Geteuid() != 0 {
+		return opts, nil
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return opts, ErrValidation
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return opts, ErrValidation
+	}
+	if stat.Uid == 0 {
+		return opts, nil
+	}
+	u, err := user.Lookup("nmcp-backup")
+	if err != nil {
+		return opts, ErrValidation
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return opts, ErrValidation
+	}
+	owner := uint32(uid)
+	opts.OwnerUID = &owner
+	return opts, nil
+}
+
+func backupNormal(ctx context.Context, tx pgx.Tx) error {
+	var ok bool
+	if err := tx.QueryRow(ctx, `SELECT nmcp_backup_normal_fence()`).Scan(&ok); err != nil {
+		return classified(err)
+	}
+	if !ok {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (s *Service) retryBackupFailureAudit(ctx context.Context, id string) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return errBackup
+	}
+	defer rollback(tx)
+	var pending bool
+	var phase string
+	var started time.Time
+	if err = tx.QueryRow(ctx, `SELECT failure_audit_pending,COALESCE(error_code,'failed'),started_at FROM backup_runs WHERE id=$1 AND status='failed' FOR UPDATE`, id).Scan(&pending, &phase, &started); err != nil {
+		return errBackup
+	}
+	if !pending {
+		return nil
+	}
+	if err = s.audit(ctx, tx, "backup_run", map[string]string{"phase": phase}, []string{id}, "failed", started); err != nil {
+		return errBackup
+	}
+	if _, err = tx.Exec(ctx, `UPDATE backup_runs SET failure_audit_pending=false WHERE id=$1`, id); err != nil {
+		return errBackup
+	}
+	if tx.Commit(ctx) != nil {
+		return errBackup
+	}
+	return nil
+}
+
+func (s *Service) backupResult(ctx context.Context, id string) (BackupRun, error) {
+	var r BackupRun
+	err := s.Pool.QueryRow(ctx, `SELECT id::text,status,started_at,finished_at,notification_status,error_code,failure_audit_pending FROM backup_runs WHERE id=$1`, id).Scan(&r.ID, &r.Status, &r.StartedAt, &r.FinishedAt, &r.Notification, &r.ErrorCode, &r.AuditPending)
+	r.Outcome = r.Status
+	return r, err
 }

@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Read-only: never creates directories, contacts PostgreSQL, or starts units.
+set -euo pipefail
+exec python3 - --source-root "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")" "$@" <<'PY'
+import configparser
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+ROOT = Path.cwd()
+# Explicit --source-root avoids depending on stdin Python's __file__.
+args = sys.argv[1:]
+if '--help' in args:
+    print('Usage: scripts/validate-backup-install [--source-root REPO] [--installed]')
+    print('Default: static source checks only. --installed additionally inspects local fixed host paths.')
+    sys.exit(0)
+installed = False
+while args:
+    arg = args.pop(0)
+    if arg == '--installed':
+        installed = True
+    elif arg == '--source-root' and args:
+        ROOT = Path(args.pop(0)).resolve()
+    else:
+        sys.exit('invalid arguments; see --help')
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+def parse_unit(path):
+    result = {}
+    section = None
+    for line in path.read_text().splitlines():
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1]
+            continue
+        require(section is not None and '=' in line, 'invalid unit syntax')
+        key, value = line.split('=', 1)
+        result.setdefault((section, key), []).append(value)
+    return result
+
+def units(base):
+    service = parse_unit(base / 'nmcp-backup.service')
+    expected = {
+        'Type': 'oneshot', 'User': 'nmcp-backup', 'Group': 'nmcp-backup',
+        'Slice': 'nmcp.slice', 'EnvironmentFile': '/etc/nmcp/backup.env',
+        'ExecStart': '/opt/nmcp/current/bin/nmcp-admin backup run --if-due --json',
+        'SuccessExitStatus': '4', 'UMask': '0077', 'NoNewPrivileges': 'yes',
+        'ProtectSystem': 'strict', 'ProtectHome': 'yes', 'PrivateTmp': 'yes',
+        'PrivateDevices': 'yes', 'CapabilityBoundingSet': '', 'AmbientCapabilities': '',
+        'ReadWritePaths': '/var/lib/nmcp-backup',
+        'RestrictAddressFamilies': 'AF_UNIX AF_INET AF_INET6',
+    }
+    for key, value in expected.items():
+        require(service.get(('Service', key)) == [value], 'unsafe service setting: ' + key)
+    require(service.get(('Service', 'LoadCredential')) == [
+        'dump.pgpass:/etc/nmcp/credentials/backup-dump.pgpass',
+        'control.pgpass:/etc/nmcp/credentials/backup-control.pgpass',
+        'pg_service.conf:/etc/nmcp/backup.pg_service.conf'], 'credential mapping differs')
+    require(service.get(('Service', 'Environment')) == [
+        'PGPASSFILE=%d/control.pgpass', 'PGSERVICEFILE=%d/pg_service.conf', 'NMCP_BACKUP_DUMP_PASSFILE=%d/dump.pgpass'],
+        'credential paths must use systemd specifiers')
+    require(not any(k in ('ExecStartPre', 'ExecStartPost', 'ExecStopPost', 'EnvironmentFile')
+                    and (k != 'EnvironmentFile' or v != ['/etc/nmcp/backup.env'])
+                    for (s, k), v in service.items() if s == 'Service'), 'unexpected service execution')
+    timer = parse_unit(base / 'nmcp-backup.timer')
+    require(timer.get(('Timer', 'OnCalendar')) == ['hourly'], 'timer must only wake hourly')
+    require(timer.get(('Timer', 'Unit')) == ['nmcp-backup.service'], 'wrong timer target')
+    require(timer.get(('Timer', 'Persistent')) == ['yes'], 'wake persistence missing')
+    require(set(k for s, k in timer if s == 'Timer') ==
+            {'OnCalendar', 'Persistent', 'RandomizedDelaySec', 'Unit'}, 'extra timer schedule')
+
+def env(path, example=False):
+    values = {}
+    for line in path.read_text().splitlines():
+        if not line or line.startswith('#'):
+            continue
+        require('=' in line, 'invalid backup environment')
+        key, value = line.split('=', 1)
+        require(key not in values and re.fullmatch(r'[A-Z_]+', key), 'duplicate/invalid environment key')
+        require(value and not any(c.isspace() or c in "'\"\\$%" for c in value),
+                'environment must contain literal values')
+        values[key] = value
+    expected = {
+        'NMCP_DATABASE_URL': 'service=nmcp_backup_control',
+        'NMCP_BACKUP_ROOT': '/var/lib/nmcp-backup',
+        'NMCP_BACKUP_DUMP_SERVICE': 'nmcp_backup_dump',
+        'NMCP_BACKUP_PG_DUMP': '/usr/bin/pg_dump',
+        'NMCP_BACKUP_PG_RESTORE': '/usr/bin/pg_restore',
+        'NMCP_LOG_LEVEL': 'info', 'NMCP_SHUTDOWN_TIMEOUT': '30s',
+    }
+    for key, value in expected.items():
+        require(values.get(key) == value, 'unexpected backup environment: ' + key)
+    require(set(values) <= set(expected) | {'NMCP_BACKUP_NOTIFY_HOOK'}, 'extra backup environment key')
+    hook = values.get('NMCP_BACKUP_NOTIFY_HOOK')
+    if not example:
+        require(hook == '/usr/local/libexec/nmcp/backup-notify', 'reviewed notification hook missing')
+    return hook
+
+def safe(path, uid=0, mode=None, directory=False):
+    path = Path(path)
+    for parent in reversed(path.parents):
+        st = parent.lstat()
+        require(stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and
+                not st.st_mode & 0o022, 'unsafe parent directory')
+    st = path.lstat()
+    require((stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)) and
+            st.st_uid == uid and (directory or st.st_nlink == 1), 'unsafe file type/owner/link count')
+    require(mode is None or stat.S_IMODE(st.st_mode) == mode, 'unsafe file permissions')
+    return st
+
+def host():
+    user = pwd.getpwnam('nmcp-backup')
+    require(user.pw_uid != 0 and user.pw_shell in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false'),
+            'backup UID must be dedicated and non-login')
+    require(user.pw_uid != pwd.getpwnam('nmcp').pw_uid, 'backup and runtime UID must differ')
+    backup = safe('/var/lib/nmcp-backup', user.pw_uid, 0o700, True)
+    require(backup.st_gid == user.pw_gid, 'backup group mismatch')
+    binary = safe(Path('/opt/nmcp/current/bin/nmcp-admin').resolve(), 0, 0o755)
+    for name in ('backup-dump.pgpass', 'backup-control.pgpass'):
+        safe('/etc/nmcp/credentials/' + name, 0, 0o600)
+    safe('/etc/nmcp/credentials', 0, 0o700, True)
+    safe('/etc/nmcp/backup.env', 0, 0o600)
+    hook = env(Path('/etc/nmcp/backup.env'))
+    safe(hook, 0, 0o755)
+    safe('/etc/nmcp/backup.pg_service.conf', 0, 0o600)
+    cfg = configparser.ConfigParser(interpolation=None, strict=True)
+    cfg.read('/etc/nmcp/backup.pg_service.conf')
+    require(not cfg.defaults() and set(cfg.sections()) == {'nmcp_backup_control', 'nmcp_backup_dump'},
+            'unexpected service definitions')
+    for section, role in [('nmcp_backup_control', 'nmcp_backup_control'),
+                          ('nmcp_backup_dump', 'nmcp_backup_dump')]:
+        values = dict(cfg[section])
+        require(set(values) == {'host', 'port', 'dbname', 'user', 'sslmode'}
+                and values['host'] == '/var/run/postgresql' and values['port'] == '5432'
+                and values['user'] == role and values['sslmode'] == 'disable'
+                and re.fullmatch(r'[a-z][a-z0-9_]{0,62}', values['dbname']),
+                'service must pin local source and dedicated identity without secrets')
+    require(cfg['nmcp_backup_control']['dbname'] == cfg['nmcp_backup_dump']['dbname'], 'dump and control database must match')
+    for name in ('nmcp-backup.service', 'nmcp-backup.timer'):
+        safe('/etc/systemd/system/' + name, 0, 0o644)
+
+    units(Path('/etc/systemd/system'))
+    versions = []
+    for tool in ('/usr/bin/pg_dump', '/usr/bin/pg_restore'):
+        # Ubuntu pg_wrapper may be a package-owned symlink; inspect canonical target.
+        safe(Path(tool).resolve(), 0)
+        result = subprocess.run([tool, '--version'], check=True, capture_output=True, text=True, timeout=10)
+        match = re.fullmatch(r'pg_(?:dump|restore) \(PostgreSQL\) (\d+)(?:\.[^\n]+)?\n?', result.stdout)
+        require(match is not None and match[1] == '17', 'PostgreSQL 17 client required')
+        versions.append(match[1])
+    require(len(set(versions)) == 1, 'client versions differ')
+    print('PASS local install metadata/client checks; DB roles, HBA, mounts, enabled timer and runtime NOT proven')
+
+try:
+    if installed:
+        host()
+    else:
+        units(ROOT / 'infra/ubuntu/systemd')
+        env(ROOT / 'infra/ubuntu/env/backup.env.example', example=True)
+        print('PASS static backup unit/timer/environment contract')
+except (OSError, ValueError, KeyError, configparser.Error, subprocess.SubprocessError):
+    # Do not echo parsed config, file contents or subprocess stderr (may contain secrets).
+    sys.exit('FAIL backup install validation; inspect fixed path ownership/configuration and reviewed contract')
+PY

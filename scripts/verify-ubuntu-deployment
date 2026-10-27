@@ -10341,7 +10341,13 @@ def main() -> int:
     require("NMCP_API_ADDR=127.0.0.1:8080" in text(UBUNTU / "env" / "api.env.example"), "API example is not loopback-only")
     require((units / "postgresql@.service.d" / "10-nmcp-slice.conf").is_file(), "PostgreSQL instance slice drop-in missing")
     timers = {path.name for path in UBUNTU.rglob("*.timer")}
-    require(timers == {"nmcp-tls-expiry.timer"}, "only independent TLS expiry monitoring may have a timer")
+    require(timers == {"nmcp-tls-expiry.timer", "nmcp-backup.timer"}, "only TLS monitoring and DB-policy backup wake timers are allowed")
+    backup_unit = text(units / "nmcp-backup.service")
+    require("User=nmcp-backup" in backup_unit and "backup run --if-due --json" in backup_unit
+            and "LoadCredential=pg_service.conf:" in backup_unit
+            and "ReadWritePaths=/var/lib/nmcp-backup" in backup_unit
+            and "SuccessExitStatus=4" in backup_unit, "backup credential/UID/due boundaries missing")
+    require("OnCalendar=hourly" in text(units / "nmcp-backup.timer"), "backup timer must only wake policy evaluation")
     migrate_unit = text(units / "nmcp-migrate.service")
     require("postgresql.service" not in migrate_unit, "migration still depends on PostgreSQL meta-unit")
     require(

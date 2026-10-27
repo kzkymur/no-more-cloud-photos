@@ -383,7 +383,7 @@ func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSetting
 	if decodePrivate(c.ReceiptFile, &receipt) != nil || !validReceipt(receipt, time.Now()) {
 		return op, errRestore
 	}
-	artifactOptions := backupartifact.Options{ReadOnly: true}
+	artifactOptions := backupartifact.Options{ReadOnly: true, Lock: true}
 	var artifactStat unix.Stat_t
 	if unix.Lstat(c.Root, &artifactStat) != nil {
 		return op, errRestore

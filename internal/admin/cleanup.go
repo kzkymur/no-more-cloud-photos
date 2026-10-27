@@ -24,7 +24,33 @@ type cleanupItem struct {
 func (s *Service) Cleanup(ctx context.Context, store *storage.Store, kind string, dry bool) (CleanupResult, error) {
 	result := CleanupResult{Kind: kind, DryRun: dry, IDs: []string{}}
 	if kind == "all" || kind == "backups" {
-		return result, ErrUnsupported
+		root := os.Getenv("NMCP_BACKUP_ROOT")
+		if root == "" {
+			return result, ErrValidation
+		}
+		backups, err := s.CleanupBackups(ctx, BackupSettings{Root: root}, dry)
+		result.Eligible = len(backups.Eligible)
+		result.Completed = len(backups.Deleted)
+		result.IDs = append(result.IDs, backups.Deleted...)
+		if err != nil {
+			return result, err
+		}
+		if kind == "backups" {
+			return result, nil
+		}
+		for _, part := range []string{"media", "renditions"} {
+			child, childErr := s.Cleanup(ctx, store, part, dry)
+			result.Eligible += child.Eligible
+			result.Completed += child.Completed
+			result.Failed += child.Failed
+			result.Skipped += child.Skipped
+			result.IDs = append(result.IDs, child.IDs...)
+			result.MorePossible = result.MorePossible || child.MorePossible
+			if childErr != nil {
+				return result, childErr
+			}
+		}
+		return result, nil
 	}
 	if kind != "media" && kind != "renditions" {
 		return result, ErrValidation

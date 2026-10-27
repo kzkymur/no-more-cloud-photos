@@ -524,8 +524,9 @@ func TestAdminIntegrationFiniteMediaCleanupDryRunAndExecution(t *testing.T) {
 	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM media WHERE id=$1)`, mediaID).Scan(&exists); err != nil || exists {
 		t.Fatalf("cleanup did not converge exists=%v err=%v", exists, err)
 	}
-	if _, err := s.Cleanup(ctx, store, "all", false); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("backup unsupported falsely succeeded: %v", err)
+	t.Setenv("NMCP_BACKUP_ROOT", "")
+	if _, err := s.Cleanup(ctx, store, "all", false); !errors.Is(err, ErrValidation) {
+		t.Fatalf("missing backup configuration falsely succeeded: %v", err)
 	}
 }
 
