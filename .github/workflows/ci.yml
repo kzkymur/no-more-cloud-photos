@@ -419,7 +419,26 @@ jobs:
           # Disposable server runs as postgres, never as root. No secrets live here.
           chmod a+rx "$RUNNER_TEMP" "$RUNNER_TEMP/backup-pg17"
       - name: Provision isolated runtime and backup UIDs
-        run: sudo systemd-sysusers infra/ubuntu/sysusers.d/nmcp.conf
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace=$(realpath -e -- "${GITHUB_WORKSPACE:?}")
+          config=$(realpath -e -- "$workspace/infra/ubuntu/sysusers.d/nmcp.conf")
+          test "$config" = "$workspace/infra/ubuntu/sysusers.d/nmcp.conf"
+          test -f "$config" && test ! -L "$config"
+          sudo systemd-sysusers "$config"
+          python3 - <<'PYUID'
+          import grp, os, pwd
+          runtime, backup, postgres = [pwd.getpwnam(name) for name in ('nmcp', 'nmcp-backup', 'postgres')]
+          assert len({runtime.pw_uid, backup.pw_uid, postgres.pw_uid, 0}) == 4
+          assert len({runtime.pw_gid, backup.pw_gid, postgres.pw_gid, 0}) == 4
+          for user in (runtime, backup):
+              assert user.pw_gid != 0 and grp.getgrgid(user.pw_gid).gr_name == user.pw_name
+              assert user.pw_dir == '/var/lib/' + user.pw_name
+              assert user.pw_shell == '/usr/sbin/nologin'
+              assert set(os.getgrouplist(user.pw_name, user.pw_gid)) == {user.pw_gid}
+              print(f'Isolated UID verified: {user.pw_name} uid={user.pw_uid} gid={user.pw_gid}')
+          PYUID
       - name: Build exact candidate backup acceptance test binary
         run: |
           go test -c -o "$RUNNER_TEMP/backup17.test" ./internal/admin
@@ -461,12 +480,30 @@ jobs:
           go-version: 1.27.1
           cache: true
       - name: Install real service runtime dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             postgresql-common util-linux libimage-exiftool-perl ffmpeg \
             libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev libde265-dev
-          sudo systemd-sysusers infra/ubuntu/sysusers.d/nmcp.conf
+          workspace=$(realpath -e -- "${GITHUB_WORKSPACE:?}")
+          config=$(realpath -e -- "$workspace/infra/ubuntu/sysusers.d/nmcp.conf")
+          test "$config" = "$workspace/infra/ubuntu/sysusers.d/nmcp.conf"
+          test -f "$config" && test ! -L "$config"
+          sudo systemd-sysusers "$config"
+          python3 - <<'PYUID'
+          import grp, os, pwd
+          runtime, backup, postgres = [pwd.getpwnam(name) for name in ('nmcp', 'nmcp-backup', 'postgres')]
+          assert len({runtime.pw_uid, backup.pw_uid, postgres.pw_uid, 0}) == 4
+          assert len({runtime.pw_gid, backup.pw_gid, postgres.pw_gid, 0}) == 4
+          for user in (runtime, backup):
+              assert user.pw_gid != 0 and grp.getgrgid(user.pw_gid).gr_name == user.pw_name
+              assert user.pw_dir == '/var/lib/' + user.pw_name
+              assert user.pw_shell == '/usr/sbin/nologin'
+              assert set(os.getgrouplist(user.pw_name, user.pw_gid)) == {user.pw_gid}
+              print(f'Isolated UID verified: {user.pw_name} uid={user.pw_uid} gid={user.pw_gid}')
+          PYUID
       - name: Receive exact-head native closure
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
