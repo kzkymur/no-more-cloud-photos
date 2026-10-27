@@ -35,6 +35,7 @@ type options struct {
 	scope          string
 	report         string
 	kind           string
+	ifDue          bool
 	definitionData []byte
 }
 
@@ -58,7 +59,9 @@ func parse(args []string) (options, error) {
 	flags.SetOutput(io.Discard)
 	flags.BoolVar(&o.json, "json", false, "write one JSON value")
 	switch o.command {
-	case "config show", "maintenance status", "backup run", "backup list":
+	case "config show", "maintenance status", "backup list":
+	case "backup run":
+		flags.BoolVar(&o.ifDue, "if-due", false, "run only when current database configuration is due")
 	case "config set":
 		flags.StringVar(&o.name, "name", "", "typed setting name")
 		flags.StringVar(&o.value, "value", "", "non-secret setting value")
@@ -179,8 +182,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: nmcp-admin config|profile|regenerate|jobs|check|repair|cleanup|maintenance [options]")
 		return finish(stdout, stderr, o.json, nil, err)
 	}
-	if o.command == "backup run" || o.command == "backup list" || o.command == "restore" || o.command == "cleanup" && (o.kind == "backups" || o.kind == "all") {
-		fmt.Fprintln(stderr, "backup operations are not supported until Issue19; no cleanup performed")
+	if o.command == "cleanup" && o.kind == "all" {
+		fmt.Fprintln(stderr, "combined cleanup is not configured; no cleanup performed")
 		return finish(stdout, stderr, o.json, nil, ErrUnsupported)
 	}
 	cfg, err := config.LoadAdmin()
@@ -206,6 +209,31 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	service := New(pool)
 	var result any
 	switch o.command {
+	case "restore":
+		var settings RestoreSettings
+		settings, err = restoreSettings()
+		if err == nil {
+			result, err = service.Restore(ctx, o.id, settings)
+		}
+	case "cleanup":
+		if o.kind == "backups" {
+			root := os.Getenv("NMCP_BACKUP_ROOT")
+			if root == "" {
+				err = ErrValidation
+			} else {
+				result, err = service.CleanupBackups(ctx, BackupSettings{Root: root}, o.dry)
+			}
+		} else {
+			result, err = service.Operational(ctx, o)
+		}
+	case "backup list":
+		result, err = service.BackupList(ctx)
+	case "backup run":
+		var settings BackupSettings
+		settings, err = backupSettings()
+		if err == nil {
+			result, err = service.Backup(ctx, settings, o.ifDue)
+		}
 	case "config show":
 		result, err = service.ConfigShow(ctx)
 	case "config set":
