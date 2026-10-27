@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Timeout fallback: stop only exact-head, inode/hash-attested acceptance units."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+
+PG = {
+ 'postgresql@17-nmcp-offline-fixture.service': '/run/nmcp-offline-fixture',
+ 'postgresql@17-nmcp-offline-candidate.service': '/run/nmcp-offline-candidate',
+}
+APPS = ['nmcp-backup.timer','nmcp-backup.service','nmcp-api.service','nmcp-worker.service']
+
+def private_file(path):
+    st=path.lstat()
+    assert stat.S_ISREG(st.st_mode) and st.st_uid==0 and st.st_nlink==1 and stat.S_IMODE(st.st_mode)==0o600
+    assert st.st_size<=65536
+    return path.read_text()
+
+def validate_pg(record,head,unit,st,body,data_stat):
+    assert set(record)=={'head','unit','device','inode','sha256','data','data_device','data_inode','socket','port','postgres'}
+    assert unit in PG and record['unit']==unit and record['head']==head
+    assert stat.S_ISREG(st.st_mode) and st.st_uid==0 and st.st_nlink==1 and stat.S_IMODE(st.st_mode)==0o644
+    assert (st.st_dev,st.st_ino)==(record['device'],record['inode'])
+    assert hashlib.sha256(body).hexdigest()==record['sha256']
+    data=Path(record['data'])
+    assert data.is_absolute() and data.name=='data' and data.parent.parent==Path('/tmp')
+    assert data.parent.name.startswith(('nmcp-live-pg17-','nmcp-offline-candidate-pg17-'))
+    assert stat.S_ISDIR(data_stat.st_mode) and (data_stat.st_dev,data_stat.st_ino)==(record['data_device'],record['data_inode'])
+    assert record['socket']==PG[unit] and record['port']==(5432 if unit.endswith('fixture.service') else 5544)
+    assert record['postgres']=='/opt/nmcp-pg17-ci/bin/postgres'
+    assert b'Type=forking\n' in body and ('PIDFile='+str(data)+'/postmaster.pid\n').encode() in body
+
+def proc_running(pid):
+    try: raw=Path('/proc')/str(pid)/'stat'; value=raw.read_text()
+    except FileNotFoundError: return False
+    return value[value.rfind(')')+2:value.rfind(')')+3]!='Z'
+
+def cleanup(head):
+    owner=Path('/run/nmcp-backup-cutover.owner')
+    try: owner.lstat()
+    except FileNotFoundError:
+        assert not any((Path('/etc/systemd/system')/unit).exists() for unit in PG), 'PG units present without owner authority'
+        print('No surviving owner receipt or owned PG unit files; no unowned units touched')
+        return
+    assert private_file(owner)==head+'\n'
+    plans=[]
+    # Verify the COMPLETE plan before stopping anything. A substituted service
+    # or stale receipt never authorizes even a partially valid stop batch.
+    for unit in PG:
+        receipt=Path('/run')/('nmcp-backup-cutover.'+unit+'.owner')
+        path=Path('/etc/systemd/system')/unit
+        try: receipt.lstat()
+        except FileNotFoundError:
+            assert not path.exists(), 'PG unit exists without exact ownership receipt'
+            continue
+        record=json.loads(private_file(receipt))
+        st=path.lstat();body=path.read_bytes();data=Path(record['data'])
+        assert not data.is_symlink() and not data.parent.is_symlink()
+        validate_pg(record,head,unit,st,body,data.lstat())
+        fragment=subprocess.check_output(['/usr/bin/systemctl','show','-p','FragmentPath','--value',unit],text=True).strip()
+        assert fragment==str(path)
+        pid=int(subprocess.check_output(['/usr/bin/systemctl','show','-p','MainPID','--value',unit],text=True).strip())
+        if pid:
+            assert os.readlink('/proc/'+str(pid)+'/exe')==record['postgres']
+            cmd=(Path('/proc')/str(pid)/'cmdline').read_bytes().split(b'\0')
+            assert b'-D' in cmd and cmd[cmd.index(b'-D')+1]==record['data'].encode()
+        plans.append((unit,record,pid))
+    subprocess.run(['/usr/bin/systemctl','stop',*APPS,*[p[0] for p in plans]],check=False,timeout=150)
+    for unit in APPS+[p[0] for p in plans]:
+        active=subprocess.check_output(['/usr/bin/systemctl','show','-p','ActiveState','--value',unit],text=True).strip()
+        assert active in ('inactive','failed'),unit+' still active'
+        if unit.endswith('.service'):
+            assert subprocess.check_output(['/usr/bin/systemctl','show','-p','MainPID','--value',unit],text=True).strip()=='0'
+    for unit,r,pid in plans:
+        assert not pid or not proc_running(pid), 'owned postmaster still running'
+        assert not (Path(r['data'])/'postmaster.pid').exists()
+        assert not (Path(r['socket'])/('.s.PGSQL.'+str(r['port']))).exists()
+    print('Exact-head owned app and PG units stopped; MainPID/process/socket absence verified')
+
+if __name__=='__main__':
+    if not __debug__:
+        sys.exit('FAIL fixture cleanup: optimized authority checks forbidden')
+    try:
+        assert os.geteuid()==0
+        head=os.environ['NMCP_EXPECTED_HEAD']
+        assert len(head)==40 and all(c in '0123456789abcdef' for c in head)
+        cleanup(head)
+    except Exception as exc:
+        sys.exit('FAIL exact-head fixture cleanup: '+type(exc).__name__)

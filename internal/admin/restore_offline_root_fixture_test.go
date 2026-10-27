@@ -401,6 +401,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 		t.Fatal("timer wake/if-due created a false backup")
 	}
 	t.Logf("actual two-cluster PG17 offline restore+cutover+separate resume+real API write passed; backup=%s operation=%s rpo_ms=%d rto_ms=%d", backupID, op.ID, op.RPO.Milliseconds(), op.RTO.Milliseconds())
+	offlineActualTimeoutCleanup(t, f, g)
 }
 
 const offlineSourcePGUnit = "postgresql@17-nmcp-offline-fixture.service"
@@ -471,6 +472,43 @@ func (f *liveCutoverFixture) manageOfflinePG(unit string) {
 		f.t.Fatal("durable PG unit")
 	}
 	f.managedUnits = append(f.managedUnits, unit)
+	// Persist exact unit+data identities BEFORE startup: Go's timeout does not
+	// execute t.Cleanup, so the workflow must independently own both PG stops.
+	dataInfo, dataErr := os.Lstat(f.data)
+	if dataErr != nil {
+		f.t.Fatal("owned PG data receipt")
+	}
+	unitStat, unitOK := st.Sys().(*syscall.Stat_t)
+	dataStat, dataOK := dataInfo.Sys().(*syscall.Stat_t)
+	if !unitOK || !dataOK {
+		f.t.Fatal("PG receipt inode identity")
+	}
+	port := 5432
+	if unit == offlineCandidatePGUnit {
+		port = 5544
+	}
+	receipt := map[string]any{"head": os.Getenv("TEST_BACKUP_CANDIDATE_SHA"), "unit": unit, "device": unitStat.Dev, "inode": unitStat.Ino, "sha256": fmt.Sprintf("%x", sha256.Sum256([]byte(body))), "data": f.data, "data_device": dataStat.Dev, "data_inode": dataStat.Ino, "socket": f.socket, "port": port, "postgres": filepath.Join(f.bin, "postgres")}
+	encoded, encodeErr := json.Marshal(receipt)
+	if encodeErr != nil {
+		f.t.Fatal("PG ownership receipt")
+	}
+	receiptPath := "/run/nmcp-backup-cutover." + unit + ".owner"
+	receiptFile, receiptErr := os.OpenFile(receiptPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if receiptErr != nil {
+		f.t.Fatal("exclusive PG owner receipt")
+	}
+	if _, receiptErr = receiptFile.Write(encoded); receiptErr == nil {
+		receiptErr = receiptFile.Sync()
+	}
+	closeErr := receiptFile.Close()
+	if receiptErr != nil || closeErr != nil {
+		f.t.Fatal("durable PG ownership receipt")
+	}
+	receiptInfo, receiptErr := os.Lstat(receiptPath)
+	if receiptErr != nil {
+		f.t.Fatal("PG receipt identity")
+	}
+	f.owned[receiptPath] = receiptInfo
 	f.run("/usr/bin/systemctl", "daemon-reload")
 	f.run("/usr/bin/systemctl", "start", unit)
 	raw, err := os.ReadFile(filepath.Join(f.data, "postmaster.pid"))
@@ -707,4 +745,92 @@ func offlineRetargetProof(t *testing.T, ctx context.Context, f *liveCutoverFixtu
 			t.Fatal("fresh MainPID kernel TCP socket lacks actual target backend identity")
 		}
 	}
+}
+
+// A real Go test timeout skips t.Cleanup. Inject that failure only AFTER the
+// positive recovery proof; the old source HBA remains deny-all while its unit
+// is deliberately restarted to prove the fallback stops BOTH postmasters.
+func offlineActualTimeoutCleanup(t *testing.T, f, g *liveCutoverFixture) {
+	t.Helper()
+	unrelated := "nmcp-offline-unrelated.service"
+	path := "/etc/systemd/system/" + unrelated
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		t.Fatal("exclusive unrelated cleanup negative unit")
+	}
+	_, err = file.WriteString("[Service]\nType=simple\nUser=nobody\nExecStart=/usr/bin/sleep 120\n")
+	closeErr := file.Close()
+	if err != nil || closeErr != nil {
+		t.Fatal("unrelated cleanup negative unit")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.owned[path] = info
+	f.managedUnits = append(f.managedUnits, unrelated)
+	f.run("/usr/bin/systemctl", "daemon-reload")
+	f.run("/usr/bin/systemctl", "start", unrelated, offlineSourcePGUnit)
+	otherPID, err := unitPID(f.ctx, unrelated)
+	if err != nil || otherPID <= 0 {
+		t.Fatal("unrelated negative PID")
+	}
+	pids := []int{}
+	for _, unit := range []string{offlineSourcePGUnit, offlineCandidatePGUnit} {
+		pid, err := unitPID(f.ctx, unit)
+		if err != nil || pid <= 0 {
+			t.Fatal("two real PG units before timeout")
+		}
+		pids = append(pids, pid)
+	}
+	marker := "/run/nmcp-offline-timeout-child-cleanup"
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		t.Fatal("timeout marker preexists")
+	}
+	child := exec.CommandContext(f.ctx, os.Args[0], "-test.run=^TestOfflineTimeoutChild$", "-test.timeout=200ms")
+	child.Env = append(os.Environ(), "NMCP_OFFLINE_TIMEOUT_CHILD=1", "NMCP_OFFLINE_TIMEOUT_CLEANUP_MARKER="+marker)
+	output, err := child.CombinedOutput()
+	if err == nil || !bytes.Contains(output, []byte("test timed out")) {
+		t.Fatal("real Go timeout not observed")
+	}
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		t.Fatal("timeout unexpectedly ran child Cleanup")
+	}
+	script := filepath.Join(pg17Repository(t), "scripts/cleanup-backup-root-fixture")
+	f.run("/usr/bin/env", "NMCP_EXPECTED_HEAD="+os.Getenv("TEST_BACKUP_CANDIDATE_SHA"), "/usr/bin/python3", script)
+	for _, pid := range pids {
+		if syscall.Kill(pid, 0) != syscall.ESRCH {
+			t.Fatal("owned PG PID survived timeout fallback")
+		}
+	}
+	for _, server := range []*liveCutoverFixture{f, g} {
+		if _, err := os.Lstat(filepath.Join(server.data, "postmaster.pid")); !os.IsNotExist(err) {
+			t.Fatal("PG PID file survived fallback")
+		}
+		port := "5432"
+		if server == g {
+			port = "5544"
+		}
+		if _, err := os.Lstat(filepath.Join(server.socket, ".s.PGSQL."+port)); !os.IsNotExist(err) {
+			t.Fatal("PG socket survived fallback")
+		}
+	}
+	if current, err := unitPID(f.ctx, unrelated); err != nil || current != otherPID {
+		t.Fatal("timeout cleanup touched unrelated unit")
+	}
+	t.Log("actual child Go timeout skipped Cleanup; exact owned fallback stopped both real PG postmasters, sockets absent, unrelated unit PID unchanged")
+}
+func TestOfflineTimeoutChild(t *testing.T) {
+	if os.Getenv("NMCP_OFFLINE_TIMEOUT_CHILD") != "1" {
+		t.Skip("controlled root timeout child not requested")
+	}
+	if os.Geteuid() != 0 {
+		t.Fatal("timeout child requires root fixture")
+	}
+	marker := os.Getenv("NMCP_OFFLINE_TIMEOUT_CLEANUP_MARKER")
+	if marker != "/run/nmcp-offline-timeout-child-cleanup" {
+		t.Fatal("wrong timeout marker")
+	}
+	t.Cleanup(func() { _ = os.WriteFile(marker, []byte("unexpected cleanup"), 0600) })
+	select {}
 }
