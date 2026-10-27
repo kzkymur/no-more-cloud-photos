@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,7 +76,7 @@ func TestBackupPG17AuthorityLossDuringRealDump(t *testing.T) {
 		}, func(context.Context, *os.File) error { return nil })
 		result <- err
 	}()
-	pg17AwaitProducer(t, f, marker, result)
+	producerPID := pg17AwaitProducer(t, f, marker, result)
 	var killed bool
 	if source.QueryRow(f.ctx, `SELECT pg_terminate_backend($1)`, pid).Scan(&killed) != nil || !killed {
 		t.Fatal("actual lock backend kill")
@@ -88,6 +90,7 @@ func TestBackupPG17AuthorityLossDuringRealDump(t *testing.T) {
 		authority.cancel()
 		t.Fatal("real tool did not stop promptly after backend loss")
 	}
+	pg17AwaitProducerStopped(t, f, producerPID)
 	if authority.Stop() == nil {
 		t.Fatal("lost authority not reported")
 	}
@@ -112,7 +115,7 @@ try:
         raise RuntimeError('real producer not blocked on custom stream')
     os.write(1, prefix)
     with open(%q, 'x') as receipt:
-        receipt.write('real-PGDMP-producer-blocked')
+        receipt.write('real-PGDMP-producer-blocked:'+str(p.pid))
     time.sleep(60)
 finally:
     p.terminate()
@@ -124,15 +127,19 @@ sys.exit(24)
 `, real, marker), 0700)
 	return path
 }
-func pg17AwaitProducer(t *testing.T, f *pg17Fixture, marker string, early <-chan error) {
+func pg17AwaitProducer(t *testing.T, f *pg17Fixture, marker string, early <-chan error) int {
 	t.Helper()
 	deadline := time.NewTimer(20 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if raw, err := os.ReadFile(marker); err == nil && string(raw) == "real-PGDMP-producer-blocked" {
-			return
+		if raw, err := os.ReadFile(marker); err == nil && strings.HasPrefix(string(raw), "real-PGDMP-producer-blocked:") {
+			pid, parseErr := strconv.Atoi(strings.TrimPrefix(string(raw), "real-PGDMP-producer-blocked:"))
+			if parseErr != nil || pid <= 0 {
+				t.Fatal("invalid real producer PID")
+			}
+			return pid
 		}
 		select {
 		case <-early:
@@ -158,7 +165,7 @@ func pg17ServiceLockLossDuringDump(t *testing.T, f *pg17Fixture, source *pgxpool
 	done := make(chan outcome, 1)
 	early := make(chan error, 1)
 	go func() { r, e := service.Backup(f.ctx, blocked, false); done <- outcome{r, e}; early <- e }()
-	pg17AwaitProducer(t, f, marker, early)
+	producerPID := pg17AwaitProducer(t, f, marker, early)
 	var pid int
 	if source.QueryRow(f.ctx, `SELECT pid FROM pg_locks WHERE locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database())`).Scan(&pid) != nil {
 		t.Fatal("service lock backend")
@@ -178,5 +185,37 @@ func pg17ServiceLockLossDuringDump(t *testing.T, f *pg17Fixture, source *pgxpool
 	case <-time.After(8 * time.Second):
 		t.Fatal("service real dump was not canceled on lock loss")
 	}
+	pg17AwaitProducerStopped(t, f, producerPID)
 	t.Log("restricted-role Service real blocked pg_dump canceled after actual advisory backend kill; failed notification durable and no rename")
+}
+
+func pg17AwaitProducerStopped(t *testing.T, f *pg17Fixture, pid int) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if os.IsNotExist(err) {
+			return
+		}
+		if err != nil {
+			t.Fatal("cannot inspect actual producer termination")
+		}
+		// A reparented zombie is exited and cannot execute/write; do not confuse it
+		// with a live producer, or falsely claim that its PID was already reaped.
+		at := strings.LastIndexByte(string(raw), ')')
+		if at >= 0 && len(raw) > at+2 && raw[at+2] == 'Z' {
+			t.Log("actual producer exited (zombie awaiting host reaper)")
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("actual pg_dump producer still executing after tool cancellation")
+		case <-f.ctx.Done():
+			t.Fatal("producer termination observation canceled")
+		}
+	}
 }

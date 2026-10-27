@@ -410,14 +410,20 @@ jobs:
             "$RUNNER_TEMP/backup-pg17/source.tar.bz2" | sha256sum --check
           tar -xjf "$RUNNER_TEMP/backup-pg17/source.tar.bz2" -C "$RUNNER_TEMP/backup-pg17"
           cd "$RUNNER_TEMP/backup-pg17/postgresql-17.7"
-          ./configure --prefix="$RUNNER_TEMP/backup-pg17/install" --without-readline --without-icu
+          test ! -e /opt/nmcp-pg17-ci
+          ./configure --prefix=/opt/nmcp-pg17-ci --without-readline --without-icu
           make -j2
-          make -j2 install
-          "$RUNNER_TEMP/backup-pg17/install/bin/postgres" --version | grep -F '17.7'
-          "$RUNNER_TEMP/backup-pg17/install/bin/pg_dump" --version | grep -F '17.7'
-          "$RUNNER_TEMP/backup-pg17/install/bin/pg_restore" --version | grep -F '17.7'
-          # Disposable server runs as postgres, never as root. No secrets live here.
-          chmod a+rx "$RUNNER_TEMP" "$RUNNER_TEMP/backup-pg17"
+          sudo make -j2 install
+          /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
+          /opt/nmcp-pg17-ci/bin/pg_dump --version | grep -F '17.7'
+          /opt/nmcp-pg17-ci/bin/pg_restore --version | grep -F '17.7'
+          # Fresh standard root-owned tool installation, not permissions relaxed
+          # on runner homes. initdb validates read+execute access after setpriv.
+          namei -l /opt/nmcp-pg17-ci/bin/initdb
+          for tool in postgres initdb pg_ctl psql pg_dump pg_restore; do
+            sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -r "/opt/nmcp-pg17-ci/bin/$tool"
+            sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -x "/opt/nmcp-pg17-ci/bin/$tool"
+          done
       - name: Provision isolated runtime and backup UIDs
         shell: bash
         run: |
@@ -449,7 +455,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
-            TEST_BACKUP_PG17_BINDIR="$RUNNER_TEMP/backup-pg17/install/bin" \
+            TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
             "$RUNNER_TEMP/backup17.test" -test.v -test.count=1 -test.timeout=10m \
             -test.run '^(TestBackupPG17(ProductionRoles|OperatorRestore|LifecycleMigration|AuthorityLossDuringRealDump|RetentionPolicySerialization)|TestRestoreConnectionPG17Pinned)$' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
           grep -F -- '--- PASS: TestBackupPG17ProductionRoles ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
@@ -460,7 +466,7 @@ jobs:
           done
           ! grep -F -- '--- SKIP: TestRestoreConnectionPG17Pinned' "$RUNNER_TEMP/backup-pg17-acceptance.log"
       - name: Preserve exact-head PostgreSQL17 closure
-        run: tar -czf "$RUNNER_TEMP/backup-pg17-closure.tar.gz" -C "$RUNNER_TEMP" backup-pg17/install
+        run: tar -czf "$RUNNER_TEMP/backup-pg17-closure.tar.gz" -C /opt nmcp-pg17-ci
       - name: Publish exact-head PostgreSQL17 closure
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -523,10 +529,12 @@ jobs:
         run: |
           set -euo pipefail
           tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
-          tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C "$RUNNER_TEMP"
+          test ! -e /opt/nmcp-pg17-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
-          "$RUNNER_TEMP/backup-pg17/install/bin/postgres" --version | grep -F '17.7'
-          chmod a+rx "$RUNNER_TEMP" "$RUNNER_TEMP/backup-pg17" "$RUNNER_TEMP/backup-pg17/install"
+          /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
+          sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -r /opt/nmcp-pg17-ci/bin/initdb
+          sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -x /opt/nmcp-pg17-ci/bin/postgres
           go test -c -o "$RUNNER_TEMP/backup-live.test" ./internal/admin
           "$RUNNER_TEMP/backup-live.test" -test.list '^TestBackupPG17LiveCutover$' | grep -Fx TestBackupPG17LiveCutover
       - name: Actual backup restore cutover live-pool and resume proof
@@ -537,7 +545,7 @@ jobs:
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
             TEST_BACKUP_LIVE_SYSTEMD=1 \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
-            TEST_BACKUP_PG17_BINDIR="$RUNNER_TEMP/backup-pg17/install/bin" \
+            TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
             TEST_BACKUP_NATIVE_PREFIX="$RUNNER_TEMP/still-toolchain" \
             TEST_BACKUP_STILL_HELPER="$RUNNER_TEMP/still-helper-build/bin/nmcp-still-helper" \
             TEST_BACKUP_ANIMATION_HELPER="$RUNNER_TEMP/animation-helper-build/bin/nmcp-animation-helper" \
