@@ -337,8 +337,56 @@ GRANT SELECT ON public.system_config,public.maintenance_state,public.schema_migr
     TO nmcp_backup_control;
 GRANT SELECT,INSERT,UPDATE ON public.backup_runs TO nmcp_backup_control;
 GRANT INSERT ON public.admin_audit TO nmcp_backup_control;
--- No control defaults, DELETE, sequence privileges, owner memberships, or
--- function grants. Existing PUBLIC builtin functions suffice.
+-- No control defaults, DELETE, sequence privileges, or owner memberships.
+
+-- Sole audited application capability exception, pinned to migration0022 at
+-- author c48a11f5af0a9843348e2fd69b214ef1d9b453b4. A matching name is NOT enough.
+CREATE TEMPORARY TABLE nmcp_backup_fence(oid oid PRIMARY KEY) ON COMMIT DROP;
+INSERT INTO nmcp_backup_fence
+SELECT p.oid FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+WHERE n.nspname='public' AND p.proname='nmcp_backup_normal_fence'
+  AND p.pronargs=0;
+SELECT 1 / ((NOT EXISTS (SELECT 1 FROM nmcp_backup_fence) OR EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc p
+    JOIN nmcp_backup_fence f ON f.oid=p.oid
+    WHERE p.proowner=:'nmcp_migrator_role'::regrole
+      AND p.prolang=(SELECT oid FROM pg_catalog.pg_language WHERE lanname='plpgsql')
+      AND p.prokind='f' AND p.prorettype='pg_catalog.bool'::regtype
+      AND p.proargtypes=''::oidvector AND p.proallargtypes IS NULL
+      AND p.proargnames IS NULL AND p.pronargdefaults=0 AND p.proargdefaults IS NULL
+      AND p.prosecdef AND NOT p.proretset AND NOT p.proisstrict
+      AND NOT p.proleakproof AND p.provolatile='v' AND p.proparallel='u'
+      AND p.proconfig=ARRAY['search_path=pg_catalog']::text[]
+      AND p.prosrc=$fencebody$
+        DECLARE current_mode text;
+        BEGIN
+            SELECT mode INTO current_mode FROM public.maintenance_state
+                WHERE id=1 FOR SHARE NOWAIT;
+            RETURN COALESCE(current_mode='normal', false);
+        END;
+        $fencebody$
+      AND (SELECT count(*) FROM pg_catalog.pg_proc q
+           JOIN pg_catalog.pg_namespace n ON n.oid=q.pronamespace
+           WHERE n.nspname='public' AND q.proname='nmcp_backup_normal_fence')=1
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.aclexplode(COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))) a
+          WHERE a.grantee NOT IN (p.proowner,'nmcp_backup_control'::regrole)
+             OR a.grantor<>p.proowner OR a.privilege_type<>'EXECUTE' OR a.is_grantable
+      )
+)))::integer AS nmcp_exact_backup_normal_fence;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM nmcp_backup_fence)
+       AND EXISTS (SELECT 1 FROM public.schema_migrations WHERE version>=22) THEN
+        RAISE EXCEPTION 'migration22 requires exact backup normal fence';
+    END IF;
+END;
+$$;
+SELECT 'GRANT EXECUTE ON FUNCTION public.nmcp_backup_normal_fence() TO nmcp_backup_control'
+FROM nmcp_backup_fence
+\gexec
+
 
 DO $$
 DECLARE obj record; login text; priv text; expected boolean;
@@ -377,12 +425,14 @@ BEGIN
                    (p.provolatile='v' AND p.prorettype NOT IN
                        ('pg_catalog.trigger'::regtype,'pg_catalog.event_trigger'::regtype)))
               AND has_function_privilege(login,p.oid,'EXECUTE')
+              AND NOT (login='nmcp_backup_control' AND p.oid IN (SELECT oid FROM nmcp_backup_fence))
         ) OR EXISTS (
             SELECT 1 FROM pg_catalog.pg_proc p
             JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
             CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) a
             WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
               AND a.grantee=login::regrole
+              AND NOT (login='nmcp_backup_control' AND p.oid IN (SELECT oid FROM nmcp_backup_fence))
         ) THEN
             RAISE EXCEPTION 'unsafe backup application function EXECUTE: %',login;
         END IF;
