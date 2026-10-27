@@ -15,30 +15,32 @@ import (
 )
 
 type options struct {
-	command        string
-	json           bool
-	dry            bool
-	yes            bool
-	name           string
-	value          string
-	file           string
-	id             string
-	profile        string
-	mediaID        string
-	all            bool
-	jobID          string
-	status         string
-	jobType        string
-	additional     int
-	batchSize      int
-	resume         string
-	scope          string
-	report         string
-	kind           string
-	operationID    string
-	cutover        bool
-	ifDue          bool
-	definitionData []byte
+	command          string
+	json             bool
+	dry              bool
+	yes              bool
+	name             string
+	value            string
+	file             string
+	id               string
+	profile          string
+	mediaID          string
+	all              bool
+	jobID            string
+	status           string
+	jobType          string
+	additional       int
+	batchSize        int
+	resume           string
+	scope            string
+	report           string
+	kind             string
+	operationID      string
+	offlineSource    bool
+	offlineAuthority string
+	cutover          bool
+	ifDue            bool
+	definitionData   []byte
 }
 
 func parse(args []string) (options, error) {
@@ -91,6 +93,8 @@ func parse(args []string) (options, error) {
 		flags.StringVar(&o.id, "backup-id", "", "backup UUIDv4")
 		flags.StringVar(&o.operationID, "operation-id", "", "validated restore operation UUIDv4")
 		flags.BoolVar(&o.cutover, "cutover", false, "explicit operator cutover; never resumes maintenance")
+		flags.BoolVar(&o.offlineSource, "offline-source", false, "explicit root/operator recovery without source SQL")
+		flags.StringVar(&o.offlineAuthority, "offline-authority", "", "root-private external offline authorization file")
 	default:
 		return o, ErrValidation
 	}
@@ -130,6 +134,9 @@ func parse(args []string) (options, error) {
 			return o, err
 		}
 	case "restore":
+		if o.offlineAuthority != "" && !o.offlineSource {
+			return o, ErrValidation
+		}
 		if o.cutover {
 			if !uuidPattern.MatchString(o.operationID) || o.id != "" {
 				return o, ErrValidation
@@ -195,6 +202,28 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return finish(stdout, stderr, o.json, nil, err)
 	}
 
+	// Offline recovery must not establish a source connection or run source
+	// migration status before the explicit operator boundary can fence it.
+	if o.command == "restore" && o.offlineSource {
+		if os.Geteuid() != 0 {
+			return finish(stdout, stderr, o.json, nil, ErrValidation)
+		}
+		settings, settingsErr := restoreSettings()
+		settings.OfflineSource = true
+		settings.OfflineAuthorityFile = o.offlineAuthority
+		if settings.OfflineAuthorityFile == "" {
+			settings.OfflineAuthorityFile = os.Getenv("NMCP_RESTORE_OFFLINE_AUTHORITY")
+		}
+		var result any
+		if settingsErr == nil {
+			if o.cutover {
+				result, settingsErr = New(nil).RestoreCutover(ctx, o.operationID, settings)
+			} else {
+				result, settingsErr = New(nil).Restore(ctx, o.id, settings)
+			}
+		}
+		return finish(stdout, stderr, o.json, result, settingsErr)
+	}
 	cfg, err := config.LoadAdmin()
 	if err != nil {
 		return finish(stdout, stderr, o.json, nil, err)

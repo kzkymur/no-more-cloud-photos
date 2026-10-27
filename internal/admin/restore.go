@@ -38,6 +38,9 @@ import (
 var errRestore = errors.New("restore preparation failed; source remains fenced after maintenance entry")
 
 type RestoreSettings struct {
+	// Offline is an explicit operator API request, never an ambient fallback.
+	OfflineSource                              bool
+	OfflineAuthorityFile                       string
 	RestoreTool                                string
 	Root, LedgerRoot, ReceiptFile              string
 	Service, APIService, ServiceFile, PassFile string
@@ -53,6 +56,13 @@ func restoreSettings() (RestoreSettings, error) {
 	return c, c.validate()
 }
 func (c RestoreSettings) validate() error {
+	if c.OfflineSource {
+		if !filepath.IsAbs(c.OfflineAuthorityFile) || filepath.Clean(c.OfflineAuthorityFile) != c.OfflineAuthorityFile || pathWithin(c.OfflineAuthorityFile, c.Root) || pathWithin(c.OfflineAuthorityFile, c.StorageRoot) {
+			return ErrValidation
+		}
+	} else if c.OfflineAuthorityFile != "" {
+		return ErrValidation
+	}
 	if _, err := config.NormalizeFileBaseURL(c.FileBaseURL); err != nil {
 		return ErrValidation
 	}
@@ -99,20 +109,22 @@ type RestoreReceipt struct {
 	IssuedAt           time.Time       `json:"issued_at"`
 }
 type RestoreOperation struct {
-	FailedPhase     string          `json:"failed_phase,omitempty"`
-	RoleGraphSHA256 string          `json:"role_graph_sha256"`
-	ID              string          `json:"id"`
-	BackupID        string          `json:"backup_id"`
-	DumpSHA256      string          `json:"dump_sha256"`
-	Source          RestoreIdentity `json:"source"`
-	Candidate       RestoreIdentity `json:"candidate"`
-	Receipt         RestoreReceipt  `json:"receipt"`
-	Phase           string          `json:"phase"`
-	StartedAt       time.Time       `json:"started_at"`
-	UpdatedAt       time.Time       `json:"updated_at"`
-	SnapshotCutoff  time.Time       `json:"snapshot_cutoff"`
-	RPO             time.Duration   `json:"rpo_ns"`
-	RTO             time.Duration   `json:"rto_ns"`
+	SourceOffline    bool                     `json:"source_offline,omitempty"`
+	OfflineAuthority *OfflineRestoreAuthority `json:"offline_authority,omitempty"`
+	FailedPhase      string                   `json:"failed_phase,omitempty"`
+	RoleGraphSHA256  string                   `json:"role_graph_sha256"`
+	ID               string                   `json:"id"`
+	BackupID         string                   `json:"backup_id"`
+	DumpSHA256       string                   `json:"dump_sha256"`
+	Source           RestoreIdentity          `json:"source"`
+	Candidate        RestoreIdentity          `json:"candidate"`
+	Receipt          RestoreReceipt           `json:"receipt"`
+	Phase            string                   `json:"phase"`
+	StartedAt        time.Time                `json:"started_at"`
+	UpdatedAt        time.Time                `json:"updated_at"`
+	SnapshotCutoff   time.Time                `json:"snapshot_cutoff"`
+	RPO              time.Duration            `json:"rpo_ns"`
+	RTO              time.Duration            `json:"rto_ns"`
 }
 
 func validIdentity(i RestoreIdentity) bool {
@@ -188,6 +200,9 @@ func decodeRestore(b []byte, v any) error {
 // Journal snapshots are append-only O_EXCL files. Earlier evidence survives a
 // failed write or fsync. A phase cannot be silently overwritten/re-executed.
 func SaveRestoreOperation(root string, op RestoreOperation) error {
+	if !validOfflineOperation(op) {
+		return ErrValidation
+	}
 	if !uuidPattern.MatchString(op.ID) || !uuidPattern.MatchString(op.BackupID) || !serviceName.MatchString(op.Phase) || !validIdentity(op.Source) || !validIdentity(op.Candidate) {
 		return ErrValidation
 	}
@@ -242,10 +257,10 @@ func LoadRestoreOperation(root, id string) (RestoreOperation, error) {
 		if decodeRestore(b, &next) != nil || next.ID != id {
 			return op, errRestore
 		}
-		if op.ID != "" && (next.BackupID != op.BackupID || next.DumpSHA256 != op.DumpSHA256 || next.Source != op.Source || next.Candidate != op.Candidate || next.Receipt != op.Receipt || !next.StartedAt.Equal(op.StartedAt) || !next.SnapshotCutoff.Equal(op.SnapshotCutoff)) {
+		if op.ID != "" && (next.BackupID != op.BackupID || next.DumpSHA256 != op.DumpSHA256 || next.Source != op.Source || next.Candidate != op.Candidate || next.Receipt != op.Receipt || next.SourceOffline != op.SourceOffline || !sameOfflineAuthority(next.OfflineAuthority, op.OfflineAuthority) || !next.StartedAt.Equal(op.StartedAt) || !next.SnapshotCutoff.Equal(op.SnapshotCutoff)) {
 			return RestoreOperation{}, errRestore
 		}
-		if next.Phase == "" || !serviceName.MatchString(next.Phase) || !validIdentity(next.Source) || !validIdentity(next.Candidate) || next.UpdatedAt.IsZero() {
+		if !validOfflineOperation(next) || next.Phase == "" || !serviceName.MatchString(next.Phase) || !validIdentity(next.Source) || !validIdentity(next.Candidate) || next.UpdatedAt.IsZero() {
 			return RestoreOperation{}, errRestore
 		}
 		if op.ID == "" || next.UpdatedAt.After(op.UpdatedAt) {
@@ -543,6 +558,9 @@ func (s *Service) RestoreMaintenanceEnter(ctx context.Context, id string) error 
 // new operator-provisioned DB and receipt; neither arbitrary reuse nor retry of
 // a possibly committed pg_restore is authorized.
 func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSettings) (op RestoreOperation, retErr error) {
+	if c.OfflineSource {
+		return s.RestoreOffline(ctx, backupID, c)
+	}
 	started := time.Now()
 	if c.validate() != nil || !uuidPattern.MatchString(backupID) || s.Pool == nil {
 		return op, ErrValidation

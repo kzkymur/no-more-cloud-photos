@@ -50,9 +50,15 @@ func TestBackupPG17RetentionPolicySerialization(t *testing.T) {
 		t.Fatal("actual current migration count not ready")
 	}
 	source := f.pool("operator", "source")
-	// Migration service is intentional until the independently owned role SQL's
-	// strict function-body pin is republished. No substitute grants are made.
-	service := New(migrator)
+	// Exercise the integrated exact postphase and actual restricted control
+	// login; ConfigSet remains the separate migration/admin principal.
+	f.bootstrap(true)
+	f.sql(operator, "ALTER ROLE nmcp_backup_control PASSWORD '"+f.passwords["nmcp_backup_control"]+"'")
+	control := f.pool("nmcp_backup_control", "source")
+	if pg17Scalar(t, ctx, control, `SELECT session_user||'/'||current_user`) != "nmcp_backup_control/nmcp_backup_control" {
+		t.Fatal("restricted control login proof")
+	}
+	service := New(control)
 	config := New(migrator)
 	root := filepath.Join(f.root, "retention")
 	if err = os.Mkdir(root, 0700); err != nil {
@@ -221,5 +227,5 @@ func TestBackupPG17RetentionPolicySerialization(t *testing.T) {
 		t.Fatal("cleanup failed to converge", err)
 	}
 	verify(anchor)
-	t.Log("real PG17 + actual dump/list/FS: selection -> ConfigSet90 -> skip; committed intent obeys current retention; reset30 deletes old only; actual ConfigSet lock wait released by delete/audit commit; aged last-one preserved. Migration-service role, NOT restricted control-role acceptance.")
+	t.Log("real PG17 + actual dump/list/FS: selection -> ConfigSet90 -> skip; committed intent obeys current retention; reset30 deletes old only; actual ConfigSet lock wait released by delete/audit commit; aged last-one preserved. Actual restricted control session_user/current_user; independent migration principal ConfigSet.")
 }
