@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/backupartifact"
+	"github.com/kzkymur/no-more-cloud-photos/internal/config"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/httpapi"
 	"github.com/kzkymur/no-more-cloud-photos/internal/readapi"
@@ -51,6 +52,9 @@ func restoreSettings() (RestoreSettings, error) {
 	return c, c.validate()
 }
 func (c RestoreSettings) validate() error {
+	if _, err := config.NormalizeFileBaseURL(c.FileBaseURL); err != nil {
+		return ErrValidation
+	}
 	if c.RestoreTool != "" && (!filepath.IsAbs(c.RestoreTool) || filepath.Clean(c.RestoreTool) != c.RestoreTool) {
 		return ErrValidation
 	}
@@ -419,6 +423,18 @@ func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSetting
 	if e != nil || source != receipt.Source {
 		return op, errRestore
 	}
+	// Bind the private artifact to a committed success in the pinned SOURCE,
+	// not just a same-named file copied from another database/cluster.
+	var historyHash string
+	var historySize int64
+	var historyManifest []byte
+	if e = s.Pool.QueryRow(ctx, `SELECT sha256,size_bytes,manifest FROM backup_runs WHERE id=$1 AND status='succeeded' AND retention_deleted_at IS NULL`, backupID).Scan(&historyHash, &historySize, &historyManifest); e != nil {
+		return op, errRestore
+	}
+	manifestJSON, marshalErr := json.Marshal(manifest)
+	if marshalErr != nil || historyHash != manifest.DumpSHA256 || historySize != manifest.DumpSize || !backupJSONEqual(manifestJSON, historyManifest) {
+		return op, errRestore
+	}
 	candidate, e := restorePool(ctx, c, c.Service)
 	if e != nil {
 		return op, e
@@ -429,7 +445,7 @@ func (s *Service) Restore(ctx context.Context, backupID string, c RestoreSetting
 		return op, errRestore
 	}
 	var empty bool
-	if candidate.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname NOT IN ('public','pg_catalog','information_schema') AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%') AND NOT EXISTS(SELECT 1 FROM pg_extension WHERE extname<>'plpgsql') AND NOT EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public') AND NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%') AND NOT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema')) AND NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND pid<>pg_backend_pid())`).Scan(&empty) != nil || !empty {
+	if candidate.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM pg_database d, LATERAL aclexplode(COALESCE(d.datacl,acldefault('d',d.datdba))) acl WHERE d.datname=current_database() AND acl.grantee=0 AND acl.privilege_type='CONNECT') AND NOT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname NOT IN ('public','pg_catalog','information_schema') AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%') AND NOT EXISTS(SELECT 1 FROM pg_extension WHERE extname<>'plpgsql') AND NOT EXISTS(SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public') AND NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT LIKE 'pg_temp%') AND NOT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema')) AND NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND pid<>pg_backend_pid())`).Scan(&empty) != nil || !empty {
 		return op, errRestore
 	}
 	roleGraph, e := restoreRoleGraph(ctx, s.Pool)

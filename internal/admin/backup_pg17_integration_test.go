@@ -461,6 +461,7 @@ func TestBackupPG17ProductionRoles(t *testing.T) {
 	}
 
 	pg17RestoreAttestationBoundary(t, f, source, operator, service, b, run.ID)
+	pg17InterruptedRealDump(t, f, source, service, b)
 	pg17FailureJournalOracles(t, f, source, service, b)
 	pg17LockLossNoRivalHistory(t, f, source, service, b)
 	pg17CommitUnknownAndRetention(t, f, source, service, b, run.ID)
@@ -782,6 +783,58 @@ func pg17CommitUnknownAndRetention(t *testing.T, f *pg17Fixture, source *pgxpool
 	f.sql(source, `UPDATE backup_runs SET started_at=clock_timestamp()-interval '40 days' WHERE id=$1`, oldID)
 	f.sql(source, `UPDATE backup_runs SET started_at=clock_timestamp()-interval '31 days' WHERE id=$1`, latest.ID)
 	beforeSnapshot := pg17Scalar(t, f.ctx, source, `SELECT config_snapshot::text||manifest::text FROM backup_runs WHERE id=$1`, latest.ID)
+	// Corrupt or remove the newest dump while an older verified artifact is
+	// expired. A succeeded history ID alone must never justify deleting it.
+	newestDump := filepath.Join(b.Root, latest.ID, "dump")
+	original, readErr := os.ReadFile(newestDump)
+	if readErr != nil || len(original) == 0 {
+		t.Fatal("read real keeper bytes")
+	}
+	for _, fault := range []string{"corrupt", "missing"} {
+		if fault == "corrupt" {
+			file, openErr := os.OpenFile(newestDump, os.O_WRONLY, 0)
+			if openErr != nil {
+				t.Fatal("inject keeper corruption")
+			}
+			_, writeErr := file.WriteAt([]byte{original[0] ^ 0xff}, 0)
+			syncErr := file.Sync()
+			closeErr := file.Close()
+			if writeErr != nil || syncErr != nil || closeErr != nil {
+				t.Fatal("persist keeper corruption")
+			}
+		} else if os.Rename(newestDump, newestDump+".missing") != nil {
+			t.Fatal("inject missing keeper")
+		}
+		refused, cleanupErr := service.CleanupBackups(f.ctx, b, false)
+		if cleanupErr == nil || len(refused.Deleted) != 0 {
+			t.Fatal("cleanup deleted older good backup with an unusable newest keeper")
+		}
+		oldStore, openErr := backupartifact.Open(b.Root, backupartifact.Options{ReadOnly: true})
+		if openErr != nil {
+			t.Fatal("verify old keeper protection")
+		}
+		_, verifyErr := oldStore.Verify(oldID)
+		oldStore.Close()
+		if verifyErr != nil {
+			t.Fatal("older usable artifact lost on invalid newest keeper")
+		}
+		if fault == "missing" {
+			if os.Rename(newestDump+".missing", newestDump) != nil {
+				t.Fatal("restore keeper path")
+			}
+		} else {
+			file, openErr := os.OpenFile(newestDump, os.O_WRONLY, 0)
+			if openErr != nil {
+				t.Fatal("restore keeper bytes")
+			}
+			_, writeErr := file.WriteAt(original, 0)
+			syncErr := file.Sync()
+			closeErr := file.Close()
+			if writeErr != nil || syncErr != nil || closeErr != nil {
+				t.Fatal("persist restored keeper bytes")
+			}
+		}
+	}
 	cleanup, err := service.CleanupBackups(f.ctx, b, false)
 	if err != nil || len(cleanup.Deleted) != 1 || cleanup.Deleted[0] != oldID {
 		t.Fatal("retention did not remove exactly the old success")
@@ -938,4 +991,50 @@ func pg17LockLossNoRivalHistory(t *testing.T, f *pg17Fixture, source *pgxpool.Po
 		t.Fatal("lost lock left running history")
 	}
 	t.Log("actual PG advisory backend terminated; independent root lock blocked rival history/recovery until failure reconciliation")
+}
+
+func pg17InterruptedRealDump(t *testing.T, f *pg17Fixture, source *pgxpool.Pool, service *Service, b BackupSettings) {
+	t.Helper()
+	marker := filepath.Join(f.root, "real-dump-prefix-observed")
+	faultTool := filepath.Join(f.root, "interrupt-real-pg_dump")
+	script := fmt.Sprintf(`#!/usr/bin/python3
+import os, subprocess, sys
+real = %q
+if sys.argv[1:] == ['--version']:
+    os.execve(real, [real, '--version'], os.environ)
+p = subprocess.Popen([real, *sys.argv[1:]], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=os.environ)
+try:
+    prefix = p.stdout.read(4096)
+    if len(prefix) != 4096 or prefix[:5] != b'PGDMP':
+        raise RuntimeError('real custom dump prefix not observed')
+    os.write(1, prefix)
+    with open(%q, 'x') as receipt:
+        receipt.write('PGDMP:4096')
+finally:
+    p.terminate()
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait(timeout=5)
+sys.exit(24)
+`, b.DumpTool, marker)
+	f.write(faultTool, script, 0700)
+	broken := b
+	broken.DumpTool = faultTool
+	before := pg17Scalar(t, f.ctx, source, `SELECT max(started_at)::text FROM backup_runs WHERE status='succeeded'`)
+	failed, err := service.Backup(f.ctx, broken, false)
+	observed, readErr := os.ReadFile(marker)
+	if err == nil || failed.Status != "failed" || failed.Notification != "succeeded" || readErr != nil || string(observed) != "PGDMP:4096" {
+		t.Fatal("real pg_dump stream interruption did not preserve failed history and notification")
+	}
+	if pg17Scalar(t, f.ctx, source, `SELECT max(started_at)::text FROM backup_runs WHERE status='succeeded'`) != before {
+		t.Fatal("interrupted dump advanced last success")
+	}
+	for _, path := range []string{filepath.Join(b.Root, failed.ID), filepath.Join(b.Root, ".tmp-"+failed.ID)} {
+		if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+			t.Fatal("interrupted real dump exposed successful or abandoned staging bytes")
+		}
+	}
+	t.Log("actual restricted pg_dump emitted 4096-byte custom stream then was terminated; no success publish/history and durable failure notification")
 }

@@ -15,6 +15,40 @@ activation. This runbook does not assert that the restore CLI/cutover workflow
 is complete. Follow the released CLI help and accepted restore evidence; do not
 substitute a manual `pg_restore` for missing application validation.
 
+## Role lifecycle: bootstrap, migrate, then exact object grants
+
+Role creation runs before tables exist. It is **not** evidence that dump/control
+object access is ready. As the cluster administrator, on the pinned intended DB:
+
+```sh
+# Fresh bootstrap establishes the closed hardened graph first.
+psql -X --dbname=nmcp --set=ON_ERROR_STOP=1 \
+  --set=nmcp_migration_compatibility=0 \
+  --file=infra/ubuntu/postgresql-roles.sql
+# Provision distinct login passwords interactively (\password), never in argv.
+# Execute the existing reviewed release migration compatibility protocol.
+# Once the exact release migrations are current, re-harden and grant objects:
+psql -X --dbname=nmcp --set=ON_ERROR_STOP=1 \
+  --set=nmcp_migration_compatibility=0 \
+  --set=nmcp_backup_grants_after_migration=1 \
+  --file=infra/ubuntu/postgresql-roles.sql
+```
+
+Use the trusted release's SQL files, not a stale downloaded bootstrap. On a
+fresh DB, do not start in compatibility mode: its guard correctly requires an
+already established closed graph. The reviewed migration wrapper temporarily
+enables only its exact migration-owner inheritance, then re-hardens it.
+
+The post-migration phase grants dump SELECT/schema USAGE and owner-specific
+default privileges across **all** owners; inventory must reject gaps. Control
+gets SELECT on `system_config`, `maintenance_state`, `schema_migrations`,
+SELECT/INSERT/UPDATE on `backup_runs`, INSERT on `admin_audit`, and EXECUTE on
+`nmcp_backup_normal_fence()`. It receives **no** direct UPDATE on maintenance.
+That closed schema-qualified function only holds a short shared maintenance
+fence. No routine credential gains owner membership, CREATEDB, SUPERUSER or
+restore authority. Repeat the postphase after an accepted migration adds objects.
+Only then install backup credentials/configuration and activate the wake unit.
+
 ## Local installation prerequisites
 
 Provision a dedicated non-login `nmcp-backup` Unix user/group, no supplementary
@@ -70,7 +104,10 @@ isolation with real PostgreSQL 17 tests.
 
 Create root:root 0700 `/etc/nmcp/credentials`; securely provision separate
 `backup-dump.pgpass` and `backup-control.pgpass`, root:root 0600, each containing
-only its matching source database/login password entry. Never pass passwords
+only its matching source database/login password entry. For a non-default UNIX
+socket, libpq and pgx may require two exact host aliases (`localhost` and that
+same absolute socket directory); both must use the identical port/DB/login/password.
+No wildcard, duplicate alias, other socket, database or login is permitted. Never pass passwords
 in argv, shell history, reports or logs. `LoadCredential=` snapshots them into
 the service credential namespace. The unit expands `%d/control.pgpass` into
 `PGPASSFILE` and `%d/dump.pgpass` into `NMCP_BACKUP_DUMP_PASSFILE`. Do not put
@@ -200,3 +237,11 @@ credentials. Imported DB state alone cannot authorize resume: the external
 `cutover_verified` ledger and exact candidate cluster/database identity are
 required. The old source is never eligible. Re-enable `nmcp-backup.timer` only
 after this command succeeds; it was deliberately stopped during cutover.
+
+Restore additionally requires the chosen artifact's digest, size and complete
+manifest to match committed success history in the pinned source database.
+A valid-looking orphan or an artifact from another DB is not implicit restore
+authority; retain it for explicit operator investigation rather than inventing
+success history. Candidate PUBLIC CONNECT remains revoked. Explicit cutover
+opens CONNECT only for the five fixed intended logins, behind the maintenance
+and HBA fences; it never grants CREATEDB, role membership or PUBLIC access.

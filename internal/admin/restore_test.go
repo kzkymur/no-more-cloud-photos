@@ -133,7 +133,7 @@ func TestRestorePrivateReceiptStrict(t *testing.T) {
 	}
 }
 func TestRestoreSettingsBoundaries(t *testing.T) {
-	c := RestoreSettings{Root: "/private/backups", LedgerRoot: "/private/restore", ReceiptFile: "/private/receipt", Service: "operator", APIService: "api", ServiceFile: "/private/service", PassFile: "/private/pass", StorageRoot: "/private/storage"}
+	c := RestoreSettings{Root: "/private/backups", LedgerRoot: "/private/restore", ReceiptFile: "/private/receipt", Service: "operator", APIService: "api", ServiceFile: "/private/service", PassFile: "/private/pass", StorageRoot: "/private/storage", FileBaseURL: "https://files.example.test/files/"}
 	if c.validate() != nil {
 		t.Fatal("valid config rejected")
 	}

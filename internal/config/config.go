@@ -342,3 +342,7 @@ func validLogLevel(level string) bool {
 		return false
 	}
 }
+
+// NormalizeFileBaseURL applies the same HTTPS namespace contract for operator
+// restore validation and actual long-lived API/Worker configuration.
+func NormalizeFileBaseURL(raw string) (string, error) { return normalizeFileBaseURL(raw) }

@@ -351,6 +351,26 @@ jobs:
         run: go test -v -count=1 -run '^TestLifecycleRepositoryIntegration' ./internal/medialifecycle
       - name: Explicit lifecycle HTTP and PostgreSQL integration evidence
         run: go test -v -count=1 -run '^TestLifecycleHTTPPostgreSQLIntegration$' ./internal/httpapi
+      - name: Preserve exact-head native closure for live backup cutover
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/backup-live-binaries"
+          go build -o "$RUNNER_TEMP/backup-live-binaries/core-api" ./cmd/core-api
+          go build -o "$RUNNER_TEMP/backup-live-binaries/core-worker" ./cmd/core-worker
+          go build -o "$RUNNER_TEMP/backup-live-binaries/nmcp-admin" ./cmd/nmcp-admin
+          printf '%s\n' "$RUNNER_TEMP" > "$RUNNER_TEMP/native-build-prefix.txt"
+          tar -czf "$RUNNER_TEMP/backup-native-closure.tar.gz" -C "$RUNNER_TEMP" \
+            still-toolchain still-helper-build/bin/nmcp-still-helper \
+            animation-helper-build/bin/nmcp-animation-helper sRGB2014.icc \
+            orientation-6.jpg backup-live-binaries native-build-prefix.txt
+      - name: Publish exact-head native closure
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: backup-native-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-native-closure.tar.gz
+          if-no-files-found: error
+          retention-days: 1
       - name: Preserve failed probe acquisition identity
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -412,7 +432,101 @@ jobs:
           sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
             TEST_BACKUP_PG17_BINDIR="$RUNNER_TEMP/backup-pg17/install/bin" \
             "$RUNNER_TEMP/backup17.test" -test.v -test.count=1 -test.timeout=10m \
-            -test.run '^TestBackupPG17' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
+            -test.run '^TestBackupPG17(ProductionRoles|OperatorRestore|LifecycleMigration)$' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
           grep -F -- '--- PASS: TestBackupPG17ProductionRoles ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
           grep -F -- '--- PASS: TestBackupPG17OperatorRestore ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
           ! grep -F -- '--- SKIP: TestBackupPG17' "$RUNNER_TEMP/backup-pg17-acceptance.log"
+      - name: Preserve exact-head PostgreSQL17 closure
+        run: tar -czf "$RUNNER_TEMP/backup-pg17-closure.tar.gz" -C "$RUNNER_TEMP" backup-pg17/install
+      - name: Publish exact-head PostgreSQL17 closure
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: backup-postgresql17-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-pg17-closure.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+  backup-live-cutover:
+    name: Backup / actual systemd all-pool cutover and separate resume
+    needs: [test, backup-postgresql17]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Install real service runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            postgresql-common util-linux libimage-exiftool-perl ffmpeg \
+            libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev libde265-dev
+          sudo systemd-sysusers infra/ubuntu/sysusers.d/nmcp.conf
+      - name: Receive exact-head native closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-native-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Receive exact-head PostgreSQL17 closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-postgresql17-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Restore authenticated current-run build products
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
+          tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C "$RUNNER_TEMP"
+          test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
+          "$RUNNER_TEMP/backup-pg17/install/bin/postgres" --version | grep -F '17.7'
+          chmod a+rx "$RUNNER_TEMP" "$RUNNER_TEMP/backup-pg17" "$RUNNER_TEMP/backup-pg17/install"
+          go test -c -o "$RUNNER_TEMP/backup-live.test" ./internal/admin
+          "$RUNNER_TEMP/backup-live.test" -test.list '^TestBackupPG17LiveCutover$' | grep -Fx TestBackupPG17LiveCutover
+      - name: Actual backup restore cutover live-pool and resume proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            TEST_BACKUP_LIVE_SYSTEMD=1 \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            TEST_BACKUP_PG17_BINDIR="$RUNNER_TEMP/backup-pg17/install/bin" \
+            TEST_BACKUP_NATIVE_PREFIX="$RUNNER_TEMP/still-toolchain" \
+            TEST_BACKUP_STILL_HELPER="$RUNNER_TEMP/still-helper-build/bin/nmcp-still-helper" \
+            TEST_BACKUP_ANIMATION_HELPER="$RUNNER_TEMP/animation-helper-build/bin/nmcp-animation-helper" \
+            TEST_BACKUP_ICC_PATH="$RUNNER_TEMP/sRGB2014.icc" \
+            TEST_BACKUP_MEDIA_FIXTURE="$RUNNER_TEMP/orientation-6.jpg" \
+            TEST_BACKUP_CORE_API="$RUNNER_TEMP/backup-live-binaries/core-api" \
+            TEST_BACKUP_CORE_WORKER="$RUNNER_TEMP/backup-live-binaries/core-worker" \
+            TEST_BACKUP_ADMIN_BINARY="$RUNNER_TEMP/backup-live-binaries/nmcp-admin" \
+            "$RUNNER_TEMP/backup-live.test" -test.v -test.count=1 -test.timeout=18m \
+            -test.run '^TestBackupPG17LiveCutover$' | tee "$RUNNER_TEMP/backup-live-cutover.log"
+          grep -F -- '--- PASS: TestBackupPG17LiveCutover ' "$RUNNER_TEMP/backup-live-cutover.log"
+          ! grep -F -- '--- SKIP: TestBackupPG17LiveCutover' "$RUNNER_TEMP/backup-live-cutover.log"
+      - name: Always stop only receipt-owned live cutover units
+        if: always()
+        shell: bash
+        run: |
+          sudo env NMCP_EXPECTED_HEAD="${{ github.sha }}" python3 - <<'PY'
+          import os, pathlib, stat, subprocess
+          receipt = pathlib.Path('/run/nmcp-backup-cutover.owner')
+          try:
+              st = receipt.lstat()
+          except FileNotFoundError:
+              print('No surviving fixture owner receipt; no unowned units touched')
+              raise SystemExit(0)
+          assert stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1 and stat.S_IMODE(st.st_mode) == 0o600
+          assert receipt.read_text() == os.environ['NMCP_EXPECTED_HEAD'] + '\n'
+          units = ['nmcp-backup.timer', 'nmcp-backup.service', 'nmcp-api.service', 'nmcp-worker.service']
+          subprocess.run(['/usr/bin/systemctl', 'stop', *units], check=False)
+          for unit in units:
+              active = subprocess.check_output(['/usr/bin/systemctl', 'show', '-p', 'ActiveState', '--value', unit], text=True).strip()
+              assert active in ('inactive', 'failed'), unit + ' still active'
+          print('Only exact-head receipt-owned units stopped; failed fixture data preserved for diagnosis')
+          PY

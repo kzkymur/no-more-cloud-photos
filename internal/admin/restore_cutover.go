@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/config"
 	"golang.org/x/sys/unix"
 )
 
@@ -459,11 +460,24 @@ func cutoverQuote(s string) string {
 	return "'" + strings.ReplaceAll(strings.ReplaceAll(s, "\\", "\\\\"), "'", "\\'") + "'"
 }
 
-// Only one exact credential record per file is accepted; wildcard/multiple
-// records are not authority to retarget another database or login.
-func rewriteCutoverPass(b []byte, source, candidate, role, host string, port uint16) ([]byte, error) {
+// One exact credential is accepted, optionally repeated for the two equivalent
+// Unix socket lookup aliases. Wildcards, other identities and duplicate aliases
+// are never authority to retarget another database or login.
+func rewriteCutoverPass(b []byte, source, candidate, role, host string, port uint16, aliases ...string) ([]byte, error) {
 	lines := strings.Split(string(b), "\n")
 	count := 0
+	permitted := map[string]bool{host: true}
+	seenHosts := map[string]bool{}
+	if len(aliases) > 1 {
+		return nil, errCutover
+	}
+	for _, alias := range aliases {
+		if host != "localhost" || !filepath.IsAbs(alias) || filepath.Clean(alias) != alias {
+			return nil, errCutover
+		}
+		permitted[alias] = true
+	}
+	password := ""
 	for n, l := range lines {
 		if l == "" || strings.HasPrefix(l, "#") {
 			continue
@@ -488,9 +502,14 @@ func rewriteCutoverPass(b []byte, source, candidate, role, host string, port uin
 			return nil, errCutover
 		}
 		fields = append(fields, s.String())
-		if len(fields) != 5 || fields[0] != host || fields[1] != strconv.Itoa(int(port)) || fields[2] != source || fields[3] != role || fields[4] == "" {
+		if len(fields) != 5 || (!permitted[fields[0]] || seenHosts[fields[0]]) || fields[1] != strconv.Itoa(int(port)) || fields[2] != source || fields[3] != role || fields[4] == "" {
 			return nil, errCutover
 		}
+		if count > 0 && fields[4] != password {
+			return nil, errCutover
+		}
+		password = fields[4]
+		seenHosts[fields[0]] = true
 		count++
 		fields[2] = candidate
 		for i := range fields {
@@ -498,7 +517,7 @@ func rewriteCutoverPass(b []byte, source, candidate, role, host string, port uin
 		}
 		lines[n] = strings.Join(fields, ":")
 	}
-	if count != 1 {
+	if count < 1 || count > len(permitted) {
 		return nil, errCutover
 	}
 	return []byte(strings.Join(lines, "\n")), nil
@@ -574,6 +593,9 @@ func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) erro
 		if e != nil {
 			return e
 		}
+		if item.suffix != "admin" && cutoverRuntimeStorage(f.before, a.settings) != nil {
+			return errCutover
+		}
 		b, cfg, e := rewriteCutoverEnv(f.before, op.Source.DatabaseName, op.Candidate.DatabaseName, item.role, cutoverApp(op.ID, item.suffix))
 		if e != nil {
 			return e
@@ -643,10 +665,12 @@ func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) erro
 		}
 		// libpq uses localhost for the default Unix socket passfile lookup.
 		host := p.config.Host
-		if strings.HasPrefix(host, "/") {
+		var aliases []string
+		if filepath.IsAbs(host) {
+			aliases = []string{host}
 			host = "localhost"
 		}
-		f.after, e = rewriteCutoverPass(f.before, op.Source.DatabaseName, op.Candidate.DatabaseName, p.role, host, p.config.Port)
+		f.after, e = rewriteCutoverPass(f.before, op.Source.DatabaseName, op.Candidate.DatabaseName, p.role, host, p.config.Port, aliases...)
 		if e != nil {
 			return e
 		}
@@ -690,6 +714,17 @@ func (a *systemCutover) Stop(ctx context.Context) error {
 	return nil
 }
 func (a *systemCutover) Switch(ctx context.Context, op RestoreOperation) error {
+	// The preprovisioned candidate deliberately denied routine DB access. A
+	// database dump does not recreate database-level CONNECT ACLs. Grant only
+	// the intended fixed logins while the old HBA gate still denies them; this
+	// is part of the explicit operator cutover, never routine provisioning.
+	grants, grantErr := cutoverTargetGrants(op.Candidate.DatabaseName)
+	if grantErr != nil {
+		return grantErr
+	}
+	if _, grantErr = a.target.Exec(ctx, grants); grantErr != nil {
+		return errCutover
+	}
 	if replaceCutoverFile(a.hba) != nil {
 		return errCutover
 	}
@@ -907,6 +942,55 @@ func (a *systemCutover) verifyProcessSockets(ctx context.Context, pid int, role,
 		if a.source.QueryRow(ctx, `SELECT count(*)=1 AND bool_and(datid=$1 AND usename=$2 AND application_name=$3 AND client_addr='127.0.0.1'::inet) FROM pg_stat_activity WHERE client_port=$4`, oid, role, app, port).Scan(&valid) != nil || !valid {
 			return errCutover
 		}
+	}
+	return nil
+}
+
+func cutoverTargetGrants(database string) (string, error) {
+	if !cutoverName.MatchString(database) || len(database) > 63 {
+		return "", errCutover
+	}
+	name := pgx.Identifier{database}.Sanitize()
+	return "REVOKE CONNECT,TEMPORARY ON DATABASE " + name + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + name + " TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump", nil
+}
+
+// Runtime processes must use the same FS namespace that Restore actually
+// checked, not an unrelated valid copy selected only by the operator probe.
+func cutoverRuntimeStorage(raw []byte, c RestoreSettings) error {
+	expected := map[string]string{"NMCP_STORAGE_ROOT": c.StorageRoot, "NMCP_FILE_BASE_URL": c.FileBaseURL}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, ok := strings.Cut(line, "=")
+		want, required := expected[name]
+		if !required {
+			continue
+		}
+		if name == "NMCP_FILE_BASE_URL" {
+			normalized, err := config.NormalizeFileBaseURL(value)
+			if err != nil {
+				return errCutover
+			}
+			expectedURL, err := config.NormalizeFileBaseURL(want)
+			if err != nil {
+				return errCutover
+			}
+			value, want = normalized, expectedURL
+		} else if !filepath.IsAbs(value) {
+			return errCutover
+		} else {
+			value = filepath.Clean(value)
+		}
+		if !ok || seen[name] || value != want {
+			return errCutover
+		}
+		seen[name] = true
+	}
+	if len(seen) != len(expected) {
+		return errCutover
 	}
 	return nil
 }

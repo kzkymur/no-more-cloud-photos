@@ -393,3 +393,41 @@ func TestCutoverRejectsAmbientRoleAndOperatorPassword(t *testing.T) {
 		}
 	}
 }
+
+func TestCutoverCandidateGrantsAreClosedAndQuoted(t *testing.T) {
+	sql, err := cutoverTargetGrants("all")
+	if err != nil || !strings.Contains(sql, `DATABASE "all"`) || !strings.Contains(sql, "FROM PUBLIC") || !strings.Contains(sql, "TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump") {
+		t.Fatal("candidate CONNECT grant is not closed and quoted")
+	}
+	for _, name := range []string{"", "x;DROP DATABASE source", "other db", strings.Repeat("x", 64)} {
+		if _, err := cutoverTargetGrants(name); err == nil {
+			t.Fatal("unsafe candidate name accepted")
+		}
+	}
+}
+
+func TestCutoverRuntimeUsesValidatedStorageNamespace(t *testing.T) {
+	c := RestoreSettings{StorageRoot: "/var/lib/nmcp/media", FileBaseURL: "https://files.example.test/files/"}
+	valid := "NMCP_STORAGE_ROOT=" + c.StorageRoot + "\nNMCP_FILE_BASE_URL=" + c.FileBaseURL + "\n"
+	if cutoverRuntimeStorage([]byte(valid), c) != nil {
+		t.Fatal("valid runtime namespace rejected")
+	}
+	for _, bad := range []string{strings.ReplaceAll(valid, c.StorageRoot, "/unrelated/validated-copy"), strings.ReplaceAll(valid, c.FileBaseURL, "https://different.example/files/"), valid + "NMCP_STORAGE_ROOT=" + c.StorageRoot + "\n", "NMCP_STORAGE_ROOT=" + c.StorageRoot + "\n"} {
+		if cutoverRuntimeStorage([]byte(bad), c) == nil {
+			t.Fatal("unproven or ambiguous runtime FS namespace accepted")
+		}
+	}
+}
+
+func TestCutoverPassEquivalentSocketAliasesOnly(t *testing.T) {
+	good := "localhost:5432:source:nmcp_backup_dump:secret\n/run/pg-private:5432:source:nmcp_backup_dump:secret\n"
+	out, err := rewriteCutoverPass([]byte(good), "source", "candidate", "nmcp_backup_dump", "localhost", 5432, "/run/pg-private")
+	if err != nil || strings.Count(string(out), ":candidate:") != 2 {
+		t.Fatal("equivalent exact Unix socket aliases did not preserve one credential")
+	}
+	for _, bad := range []string{strings.Replace(good, "/run/pg-private", "/run/other-cluster", 1), strings.Replace(good, "secret\n", "different\n", 1), good + "localhost:5432:source:nmcp_backup_dump:secret\n", strings.Replace(good, "/run/pg-private", "*", 1)} {
+		if _, err := rewriteCutoverPass([]byte(bad), "source", "candidate", "nmcp_backup_dump", "localhost", 5432, "/run/pg-private"); err == nil {
+			t.Fatal("unbound alias or credential accepted")
+		}
+	}
+}
