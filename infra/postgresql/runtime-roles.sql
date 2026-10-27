@@ -340,7 +340,7 @@ GRANT INSERT ON public.admin_audit TO nmcp_backup_control;
 -- No control defaults, DELETE, sequence privileges, or owner memberships.
 
 -- Sole audited application capability exception, pinned to migration0022 at
--- author c48a11f5af0a9843348e2fd69b214ef1d9b453b4. A matching name is NOT enough.
+-- author 32d80eceafd85b07fb72838a5836d246a87b8cd2. A matching name is NOT enough.
 CREATE TEMPORARY TABLE nmcp_backup_fence(oid oid PRIMARY KEY) ON COMMIT DROP;
 INSERT INTO nmcp_backup_fence
 SELECT p.oid FROM pg_catalog.pg_proc p
@@ -363,6 +363,8 @@ SELECT 1 / ((NOT EXISTS (SELECT 1 FROM nmcp_backup_fence) OR EXISTS (
         BEGIN
             SELECT mode INTO current_mode FROM public.maintenance_state
                 WHERE id=1 FOR SHARE NOWAIT;
+            PERFORM id FROM public.system_config WHERE id=1 FOR SHARE;
+            IF NOT FOUND THEN RETURN false; END IF;
             RETURN COALESCE(current_mode='normal', false);
         END;
         $fencebody$
