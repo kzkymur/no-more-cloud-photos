@@ -14,7 +14,7 @@ ALTER TABLE backup_runs
     );
 
 -- SELECT FOR SHARE itself requires UPDATE privileges. Do not grant the control
--- login any ability to update maintenance_state. This closed, schema-qualified
+-- login any ability to update maintenance_state or system_config. This closed, schema-qualified
 -- capability borrows only the migration owner's short row-locking authority.
 DO $migration$
 DECLARE app_schema text := current_schema();
@@ -27,6 +27,8 @@ BEGIN
         BEGIN
             SELECT mode INTO current_mode FROM %1$I.maintenance_state
                 WHERE id=1 FOR SHARE NOWAIT;
+            PERFORM id FROM %1$I.system_config WHERE id=1 FOR SHARE;
+            IF NOT FOUND THEN RETURN false; END IF;
             RETURN COALESCE(current_mode='normal', false);
         END;
         $function$
