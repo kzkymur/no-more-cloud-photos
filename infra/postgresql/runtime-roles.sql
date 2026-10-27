@@ -3,7 +3,8 @@
 -- Run as a cluster administrator after the migration login exists. These
 -- cluster-global NOLOGIN roles are stable migration targets and have no
 -- credentials. Application object privileges are granted transactionally by
--- the embedded migrations, never by this bootstrap file.
+-- the embedded migrations. Backup-only ACLs require the explicit post-migration
+-- phase below; default bootstrap remains independent of application objects.
 --
 -- Callers that already opened a transaction set nmcp_roles_in_transaction.
 -- Production callers also set nmcp_api_role and nmcp_worker_role so this one
@@ -70,6 +71,25 @@ BEGIN
 END;
 $$;
 
+-- Dedicated routine credentials have no role memberships, not even runtime
+-- membership. Passwords/HBA provisioning remain an operator responsibility.
+SELECT format('CREATE ROLE %I LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS', role_name)
+FROM (VALUES ('nmcp_backup_dump'),('nmcp_backup_control')) AS required(role_name)
+WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname=role_name)
+\gexec
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles
+        WHERE rolname IN ('nmcp_backup_dump','nmcp_backup_control')
+          AND (NOT rolcanlogin OR rolinherit OR rolsuper OR rolcreatedb
+               OR rolcreaterole OR rolreplication OR rolbypassrls)
+    ) THEN
+        RAISE EXCEPTION 'unsafe backup login attributes';
+    END IF;
+END;
+$$;
+
 CREATE TEMPORARY TABLE nmcp_managed_role(roleid oid PRIMARY KEY) ON COMMIT DROP;
 CREATE TEMPORARY TABLE nmcp_allowed_membership(
     roleid oid NOT NULL,
@@ -83,6 +103,8 @@ CREATE TEMPORARY TABLE nmcp_allowed_membership(
 INSERT INTO nmcp_managed_role(roleid)
 SELECT role_oid
 FROM (VALUES
+    ('nmcp_backup_dump'::pg_catalog.regrole::oid),
+    ('nmcp_backup_control'::pg_catalog.regrole::oid),
     ('nmcp_runtime'::pg_catalog.regrole::oid),
     ('nmcp_worker_runtime'::pg_catalog.regrole::oid),
     ('nmcp_purge_function_owner'::pg_catalog.regrole::oid),
@@ -233,6 +255,171 @@ SELECT 1 / ((
         )
     )
 ))::integer AS nmcp_safe_managed_role_graph;
+
+
+-- This phase MUST be explicitly invoked after migrations by the local cluster
+-- administrator. Never silently accept a partially migrated application.
+\if :{?nmcp_backup_grants_after_migration}
+\else
+\set nmcp_backup_grants_after_migration FALSE
+\endif
+\if :nmcp_backup_grants_after_migration
+CREATE TEMPORARY TABLE nmcp_backup_owner(roleid oid PRIMARY KEY) ON COMMIT DROP;
+INSERT INTO nmcp_backup_owner VALUES
+    (:'nmcp_migrator_role'::pg_catalog.regrole),
+    ('nmcp_purge_function_owner'::pg_catalog.regrole),
+    ('nmcp_check_function_owner'::pg_catalog.regrole),
+    ('nmcp_repair_function_owner'::pg_catalog.regrole);
+
+DO $$
+BEGIN
+    -- No unreviewed schema/owner, row-security, foreign source, or large-object
+    -- omission may turn a partial dump into apparent success.
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_namespace n
+        WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+          AND n.nspowner NOT IN (SELECT roleid FROM nmcp_backup_owner)
+    ) OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+          AND (c.relowner NOT IN (SELECT roleid FROM nmcp_backup_owner)
+               OR c.relrowsecurity OR c.relforcerowsecurity OR c.relkind='f')
+    ) OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+          AND p.proowner NOT IN (SELECT roleid FROM nmcp_backup_owner)
+    ) OR EXISTS (SELECT 1 FROM pg_catalog.pg_largeobject_metadata) THEN
+        RAISE EXCEPTION 'unsupported backup schema/owner/RLS/foreign table/large object inventory';
+    END IF;
+    IF to_regclass('public.schema_migrations') IS NULL
+       OR to_regclass('public.system_config') IS NULL
+       OR to_regclass('public.maintenance_state') IS NULL
+       OR to_regclass('public.backup_runs') IS NULL
+       OR to_regclass('public.admin_audit') IS NULL THEN
+        RAISE EXCEPTION 'backup grants require completed application migrations';
+    END IF;
+END;
+$$;
+
+SELECT format('GRANT CONNECT ON DATABASE %I TO nmcp_backup_dump,nmcp_backup_control', current_database())
+\gexec
+SELECT format('GRANT USAGE ON SCHEMA %I TO nmcp_backup_dump', nspname)
+FROM pg_catalog.pg_namespace
+WHERE nspname <> 'information_schema' AND nspname !~ '^pg_'
+ORDER BY nspname
+\gexec
+-- Explicit catalog inventory across ALL supported owners, including private
+-- checker/repair/admin/progress relations and sequence state.
+SELECT format('GRANT SELECT ON %s %I.%I TO nmcp_backup_dump',
+              CASE WHEN c.relkind='S' THEN 'SEQUENCE' ELSE 'TABLE' END,
+              n.nspname,c.relname)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+  AND c.relkind IN ('r','p','v','m','S')
+ORDER BY n.nspname,c.relname
+\gexec
+-- Default privileges are creator-specific, NOT inherited from the migrator.
+-- Include all three definer owners even when they currently own only functions.
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I GRANT SELECT ON %s TO nmcp_backup_dump',
+              r.rolname,n.nspname,kind)
+FROM nmcp_backup_owner o
+JOIN pg_catalog.pg_roles r ON r.oid=o.roleid
+CROSS JOIN pg_catalog.pg_namespace n
+CROSS JOIN (VALUES ('TABLES'),('SEQUENCES')) AS kinds(kind)
+WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+ORDER BY r.rolname,n.nspname,kind
+\gexec
+GRANT USAGE ON SCHEMA public TO nmcp_backup_control;
+GRANT SELECT ON public.system_config,public.maintenance_state,public.schema_migrations
+    TO nmcp_backup_control;
+GRANT SELECT,INSERT,UPDATE ON public.backup_runs TO nmcp_backup_control;
+GRANT INSERT ON public.admin_audit TO nmcp_backup_control;
+-- No control defaults, DELETE, sequence privileges, owner memberships, or
+-- function grants. Existing PUBLIC builtin functions suffice.
+
+DO $$
+DECLARE obj record; login text; priv text; expected boolean;
+BEGIN
+    -- Effective privilege predicates do not detect delegation authority.
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_class c
+        CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a
+        WHERE a.grantee IN ('nmcp_backup_dump'::regrole,'nmcp_backup_control'::regrole)
+          AND a.is_grantable
+    ) OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_attribute c
+        CROSS JOIN LATERAL pg_catalog.aclexplode(c.attacl) a
+        WHERE a.grantee IN ('nmcp_backup_dump'::regrole,'nmcp_backup_control'::regrole)
+          AND a.is_grantable
+    ) OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_default_acl d
+        CROSS JOIN LATERAL pg_catalog.aclexplode(d.defaclacl) a
+        WHERE a.grantee IN ('nmcp_backup_dump'::regrole,'nmcp_backup_control'::regrole)
+          AND (a.is_grantable OR a.privilege_type <> 'SELECT'
+               OR a.grantee='nmcp_backup_control'::regrole)
+    ) THEN
+        RAISE EXCEPTION 'unsafe backup delegation/default privileges';
+    END IF;
+    FOREACH login IN ARRAY ARRAY['nmcp_backup_dump','nmcp_backup_control'] LOOP
+        IF has_database_privilege(login,current_database(),'CREATE')
+           OR has_database_privilege(login,current_database(),'TEMP') THEN
+            RAISE EXCEPTION 'unsafe backup database privileges: %',login;
+        END IF;
+        FOR obj IN
+            SELECT oid,nspname FROM pg_catalog.pg_namespace
+            WHERE nspname <> 'information_schema' AND nspname !~ '^pg_'
+        LOOP
+            IF has_schema_privilege(login,obj.oid,'CREATE') THEN
+                RAISE EXCEPTION 'unsafe backup schema CREATE: %',login;
+            END IF;
+        END LOOP;
+        FOR obj IN
+            SELECT c.oid,c.relkind,n.nspname,c.relname
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+              AND c.relkind IN ('r','p','v','m','S')
+        LOOP
+            IF obj.relkind='S' THEN
+                FOREACH priv IN ARRAY ARRAY['SELECT','USAGE','UPDATE'] LOOP
+                    expected := login='nmcp_backup_dump' AND priv='SELECT';
+                    IF has_sequence_privilege(login,obj.oid,priv) IS DISTINCT FROM expected THEN
+                        RAISE EXCEPTION 'backup sequence privilege mismatch: % %.% %',login,obj.nspname,obj.relname,priv;
+                    END IF;
+                END LOOP;
+            ELSE
+                FOREACH priv IN ARRAY ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER','MAINTAIN'] LOOP
+                    expected := (login='nmcp_backup_dump' AND priv='SELECT') OR
+                        (login='nmcp_backup_control' AND obj.nspname='public' AND (
+                            (obj.relname IN ('system_config','maintenance_state','schema_migrations') AND priv='SELECT') OR
+                            (obj.relname='backup_runs' AND priv IN ('SELECT','INSERT','UPDATE')) OR
+                            (obj.relname='admin_audit' AND priv='INSERT')));
+                    IF has_table_privilege(login,obj.oid,priv) IS DISTINCT FROM expected THEN
+                        RAISE EXCEPTION 'backup table privilege mismatch: % %.% %',login,obj.nspname,obj.relname,priv;
+                    END IF;
+                    IF priv IN ('SELECT','INSERT','UPDATE','REFERENCES') AND NOT expected
+                       AND has_any_column_privilege(login,obj.oid,priv) THEN
+                        RAISE EXCEPTION 'unexpected backup column privilege: % %.% %',login,obj.nspname,obj.relname,priv;
+                    END IF;
+                END LOOP;
+            END IF;
+        END LOOP;
+    END LOOP;
+END;
+$$;
+-- Stable, reviewable receipt: relation owner, kind, raw ACL and default ACLs.
+SELECT n.nspname,c.relname,c.relkind,pg_catalog.pg_get_userbyid(c.relowner) AS owner,c.relacl
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+  AND c.relkind IN ('r','p','v','m','S') ORDER BY n.nspname,c.relname;
+SELECT pg_catalog.pg_get_userbyid(d.defaclrole) AS owner,n.nspname,d.defaclobjtype,d.defaclacl
+FROM pg_catalog.pg_default_acl d JOIN pg_catalog.pg_namespace n ON n.oid=d.defaclnamespace
+WHERE d.defaclrole IN (SELECT roleid FROM nmcp_backup_owner)
+ORDER BY owner,n.nspname,d.defaclobjtype;
+\endif
 
 \if :{?nmcp_roles_in_transaction}
 \else
