@@ -168,3 +168,11 @@ mandatory supported-runner executions. An interrupted unregistered launch or
 already-dead guest can prevent verified in-guest cleanup; that is a failed
 acceptance condition, not a successful cleanup receipt. Hosted VM disposal is
 only the final containment boundary, not product acceptance evidence.
+
+The transient test services are also named and recorded before launch. A timed
+out or cancelled `systemd-run` **client** is not treated as a stopped test.
+Finalization first attests and stops only those guest test units, verifies
+inactive/MainPID zero/empty cgroups, and only then invokes PG cleanup. Required
+in-machine probes interrupt a real waiting client while its signal-resistant
+service remains active, then exercise this same drain path. Their code and pure
+mock tests are not substitutes for the supported-runner timeout/cancel results.

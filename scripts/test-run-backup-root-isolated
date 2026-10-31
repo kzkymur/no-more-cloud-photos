@@ -14,6 +14,45 @@ exec(compile(SOURCE, str(SCRIPT), 'exec'), MODULE.__dict__)
 
 
 class Isolation(unittest.TestCase):
+    def test_guest_nonzero_exact_propagation(self):
+        MODULE.verify_guest_exit(Mock(side_effect=MODULE.sp.CalledProcessError(17, 'guest')))
+        for guest in (Mock(), Mock(side_effect=MODULE.sp.CalledProcessError(1, 'guest'))):
+            with self.assertRaises(RuntimeError):
+                MODULE.verify_guest_exit(guest)
+
+    def test_guest_target_never_host(self):
+        for machine in ('', '.host', 'host', 'nmcp-backup-', 'other'):
+            with self.assertRaises(RuntimeError):
+                MODULE.guest_command(machine, '/repo', ['/binary'])
+
+    def test_test_unit_drain_is_before_pg_cleanup(self):
+        r = dict(machine='nmcp-backup-'+'a'*32, repo='/repo', head='a'*40, launcher=123)
+        with patch.object(MODULE, 'attest'), patch.object(MODULE, 'save_receipt'), \
+                patch.object(MODULE, 'stop_owned_tests', side_effect=RuntimeError('still running')), \
+                patch.object(MODULE, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'still running'):
+                MODULE.teardown_guest(r, pathlib.Path('/not-written'))
+            run.assert_not_called()
+
+    def test_test_unit_scope_and_stop_script(self):
+        r = dict(machine='nmcp-backup-'+'a'*32, repo='/repo', head='a'*40)
+        r['test_units'] = [MODULE.test_unit(r,k) for k in ('timeout','cancel','actual')]
+        cmd = MODULE.owned_test_command(r,'actual',['/binary'])
+        self.assertIn('--unit='+r['test_units'][-1],cmd)
+        self.assertIn('--property=KillMode=control-group',cmd)
+        with patch.object(MODULE,'run') as run:
+            MODULE.stop_owned_tests(r)
+            args=run.call_args.args[0]
+            script=args[args.index('-c')+1]
+            ast.parse(script)
+            for token in ('Transient','FragmentPath','MainPID','populated 0'):
+                self.assertIn(token,script)
+        r['test_units']=['unrelated.service']
+        with patch.object(MODULE,'run') as run:
+            with self.assertRaises(RuntimeError):
+                MODULE.stop_owned_tests(r)
+            run.assert_not_called()
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 
@@ -22,8 +61,8 @@ class Isolation(unittest.TestCase):
         self.assertNotIn('TEST_BACKUP_UNKNOWN', MODULE.KEYS)
         self.assertIn('TEST_BACKUP_CANDIDATE_SHA', MODULE.KEYS)
         self.assertNotIn('os.environ.copy', SOURCE)
-        cmd = MODULE.guest_command('unique', '/repo with space', ['/binary', 'two words'])
-        self.assertIn('--machine=unique', cmd)
+        cmd = MODULE.guest_command('nmcp-backup-' + 'a'*32, '/repo with space', ['/binary', 'two words'])
+        self.assertIn('--machine=nmcp-backup-' + 'a'*32, cmd)
         self.assertIn('--property=WorkingDirectory=/repo with space', cmd)
         self.assertEqual(cmd[-2:], ['/binary', 'two words'])
         self.assertIn('-i', cmd)
@@ -36,11 +75,11 @@ class Isolation(unittest.TestCase):
             with patch.object(MODULE, 'process_identity', return_value='new'), \
                     patch.object(MODULE, 'output') as output:
                 with self.assertRaises(RuntimeError):
-                    MODULE.attest(dict(machine='unique', **record))
+                    MODULE.attest(dict(machine='nmcp-backup-' + 'a'*32, **record))
                 output.assert_not_called()
 
     def test_ownership_rejects_wrong_root_or_leader(self):
-        r = dict(machine='unique', launcher=123, launcher_start='old', root='/private',
+        r = dict(machine='nmcp-backup-' + 'a'*32, launcher=123, launcher_start='old', root='/private',
                  leader=456, leader_start='old')
         for values in (['/wrong'], ['/private', '789']):
             with patch.object(MODULE, 'process_identity', return_value='old'), \
@@ -51,7 +90,7 @@ class Isolation(unittest.TestCase):
     def test_cleanup_precedes_shutdown_and_failure_not_masked(self):
         for fail in (False, True):
             events = []
-            r = dict(machine='unique', repo='/repo', head='a'*40, launcher=123,
+            r = dict(machine='nmcp-backup-' + 'a'*32, repo='/repo', head='a'*40, launcher=123,
                      leader=456, leader_start='old')
             def run(cmd, **kwargs):
                 events.append(cmd)
@@ -66,7 +105,7 @@ class Isolation(unittest.TestCase):
             self.assertEqual(result, int(fail))
             self.assertEqual(attest.call_count, 2)
             self.assertIn('/repo/scripts/cleanup-backup-root-fixture', events[0])
-            self.assertEqual(events[1], ['/usr/bin/machinectl', 'terminate', 'unique'])
+            self.assertEqual(events[1], ['/usr/bin/machinectl', 'terminate', 'nmcp-backup-' + 'a'*32])
             self.assertTrue(r['stopped'])
 
     def test_unowned_machine_never_stopped(self):
@@ -77,7 +116,7 @@ class Isolation(unittest.TestCase):
             run.assert_not_called()
 
     def test_second_attestation_failure_never_stops(self):
-        r = dict(machine='unique', repo='/repo', head='a'*40, launcher=123)
+        r = dict(machine='nmcp-backup-' + 'a'*32, repo='/repo', head='a'*40, launcher=123)
         with patch.object(MODULE, 'attest', side_effect=[None, RuntimeError('changed')]), \
                 patch.object(MODULE, 'save_receipt'), patch.object(MODULE, 'run') as run:
             with self.assertRaises(RuntimeError):
@@ -126,7 +165,7 @@ class Isolation(unittest.TestCase):
     def test_recovery_rejects_foreign_root(self):
         with patch.object(MODULE, 'output', return_value='/foreign'):
             with self.assertRaisesRegex(RuntimeError, 'recovery root mismatch'):
-                MODULE.recover_launcher(dict(phase='launching', root='/private', machine='unique'))
+                MODULE.recover_launcher(dict(phase='launching', root='/private', machine='nmcp-backup-' + 'a'*32))
 
     def test_receipt_directory_must_be_root_private(self):
         for uid, mode in ((1000, 0o40700), (0, 0o40755), (0, 0o120700)):

@@ -122,10 +122,99 @@ def attest(r):
                 'guest did not isolate ' + ns)
     r['leader'], r['leader_start'] = leader, start
 
+def verify_guest_exit(guest):
+    try:
+        guest(['/bin/sh', '-c', 'exit 17'])
+    except sp.CalledProcessError as exc:
+        require(exc.returncode == 17, 'guest nonzero exit was not propagated exactly')
+    else:
+        raise RuntimeError('guest nonzero exit was incorrectly reported successful')
+
 def guest_command(machine, repo, args):
+    require(re.fullmatch(r'nmcp-backup-[0-9a-f]{32}', machine), 'unsafe guest machine target')
     return ['/usr/bin/systemd-run', '--machine=' + machine, '--wait', '--pipe', '--quiet',
             '--collect', '--service-type=exec', '--property=WorkingDirectory=' + str(repo),
             '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'HOME=/root', 'LC_ALL=C'] + args
+
+def test_unit(r, kind):
+    require(kind in ('timeout', 'cancel', 'actual'), 'unexpected test unit kind')
+    require(re.fullmatch(r'nmcp-backup-[0-9a-f]{32}', r['machine']), 'unsafe test machine')
+    return 'nmcp-root-' + kind + '-' + r['machine'][12:] + '.service'
+
+def owned_test_command(r, kind, args):
+    cmd = guest_command(r['machine'], r['repo'], args)
+    at = cmd.index('/usr/bin/env')
+    cmd[at:at] = ['--unit=' + test_unit(r, kind),
+                  '--property=Description=nmcp-root-test-' + r['head'],
+                  '--property=KillMode=control-group', '--property=TimeoutStopSec=10s']
+    return cmd
+
+def stop_owned_tests(r):
+    if not r.get('test_units'):
+        return
+    expected = [test_unit(r, kind) for kind in ('timeout', 'cancel', 'actual')]
+    require(r['test_units'] == expected, 'test unit receipt mismatch')
+    # Run inside the attested machine. Never query or stop host service units.
+    script = r"""
+import pathlib, subprocess, sys
+head, *units = sys.argv[1:]
+for unit in units:
+    raw = subprocess.check_output(['/usr/bin/systemctl','show',unit,
+        '-p','LoadState','-p','Transient','-p','Description','-p','FragmentPath'],text=True)
+    fields = dict(line.split('=',1) for line in raw.splitlines() if '=' in line)
+    if fields['LoadState'] == 'not-found':
+        continue
+    assert fields['Transient']=='yes' and fields['Description']=='nmcp-root-test-'+head
+    assert fields['FragmentPath']=='/run/systemd/transient/'+unit
+    subprocess.run(['/usr/bin/systemctl','stop',unit],check=True,timeout=30)
+    raw = subprocess.check_output(['/usr/bin/systemctl','show',unit,
+        '-p','ActiveState','-p','MainPID','-p','ControlGroup'],text=True)
+    fields = dict(line.split('=',1) for line in raw.splitlines() if '=' in line)
+    assert fields['ActiveState'] in ('inactive','failed') and fields['MainPID']=='0'
+    group=fields['ControlGroup']
+    if group:
+        events=pathlib.Path('/sys/fs/cgroup'+group+'/cgroup.events')
+        assert not events.exists() or 'populated 0' in events.read_text().splitlines()
+print('Owned test services inactive, MainPID zero and cgroups empty before PG cleanup',flush=True)
+"""
+    run(guest_command(r['machine'], r['repo'],
+        ['/usr/bin/python3', '-c', script, r['head'], *expected]), timeout=120)
+
+def prove_client_interrupts(r):
+    # A client timeout/cancel MUST leave the service running for this oracle;
+    # stopping the attested service must then eliminate it before PG cleanup.
+    for kind in ('timeout', 'cancel'):
+        cmd = owned_test_command(r, kind, ['/bin/sh', '-c', "trap '' TERM HUP INT; exec /bin/sleep 90"])
+        if kind == 'timeout':
+            try:
+                run(cmd, timeout=5)
+            except sp.TimeoutExpired:
+                pass
+            else:
+                raise RuntimeError('real systemd-run client timeout not observed')
+        else:
+            client = sp.Popen(cmd, env=HOST_ENV)
+            try:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    status = run(guest_command(r['machine'], r['repo'],
+                        ['/usr/bin/systemctl', 'show', test_unit(r, kind), '-p', 'ActiveState', '--value']),
+                        stdout=sp.PIPE, text=True, timeout=15).stdout.strip()
+                    if status == 'active':
+                        break
+                    time.sleep(.1)
+                require(status == 'active', 'cancel oracle never became active')
+            finally:
+                if client.poll() is None:
+                    client.terminate()  # ONLY our child client, not a discovered PID.
+                client.wait(timeout=15)
+        status = run(guest_command(r['machine'], r['repo'],
+            ['/usr/bin/systemctl', 'show', test_unit(r, kind), '-p', 'ActiveState', '--value']),
+            stdout=sp.PIPE, text=True, timeout=15).stdout.strip()
+        require(status == 'active', 'client interruption did not preserve causal live service')
+        attest(r)
+        stop_owned_tests(r)
+        print('Real ' + kind + ' client interrupted; surviving owned service stopped before cleanup', flush=True)
 
 def recover_launcher(r):
     # The durable pre-launch receipt reserves this random machine/root inode.
@@ -167,6 +256,7 @@ def teardown_guest(r, receipt):
     attest(r)
     save_receipt(receipt, r)
     result = 0
+    stop_owned_tests(r)  # Fail closed before any PG cleanup if test drain is unproven.
     try:
         run(guest_command(r['machine'], r['repo'],
             ['NMCP_EXPECTED_HEAD=' + r['head'], '/usr/bin/python3',
@@ -211,6 +301,9 @@ def main():
     require(binary.parent == temp and binary.name in ('backup-live.test', 'backup-offline.test'),
             'unexpected root test binary')
     require((repo / 'scripts/cleanup-backup-root-fixture').is_file(), 'cleanup helper missing')
+    require(Path('/proc/1/comm').read_text().strip() == 'systemd', 'host systemd PID1 required')
+    print('Host systemd: ' + output(['/usr/bin/systemctl', '--version']), flush=True)
+    output(['/usr/bin/machinectl', 'list', '--no-legend', '--no-pager'])  # real machined/D-Bus
     env = {key: os.environ[key] for key in KEYS}
     require(re.fullmatch('[0-9a-f]{40}', env['TEST_BACKUP_CANDIDATE_SHA']), 'exact SHA required')
     mode = 'TEST_BACKUP_OFFLINE_SYSTEMD' if binary.name == 'backup-offline.test' else 'TEST_BACKUP_LIVE_SYSTEMD'
@@ -328,7 +421,16 @@ def main():
         print('Guest scope resource/delegation: ' + output(['/usr/bin/systemctl', 'show', scope,
             '--property=ControlGroup', '--property=Delegate', '--property=MemoryMax',
             '--property=CPUQuotaPerSecUSec', '--property=TasksMax']), flush=True)
+        require(output(['/usr/bin/systemctl', 'show', scope, '--property=Delegate', '--value']) == 'yes',
+                'machine scope lacks cgroup delegation')
+        record['scope'] = scope
+        save_receipt(receipt, record)
         guest(['/usr/bin/cat', '/proc/self/cgroup'])
+        guest_id = guest(['/usr/bin/cat', '/etc/machine-id'], capture=True).stdout.strip()
+        require(re.fullmatch('[0-9a-f]{32}', guest_id) and
+                guest_id != Path('/etc/machine-id').read_text().strip(), 'guest machine-id is not distinct')
+        verify_guest_exit(guest)
+        print('Guest distinct machine-id and exact exit17 propagation verified', flush=True)
         # Verify real namespace separation, not just a plausible manager name.
         require(Path('/proc', str(leader), 'comm').read_text().strip() == 'systemd', 'guest PID1 mismatch')
         for ns in ('mnt', 'pid', 'net'):
@@ -344,6 +446,7 @@ for u in users:
     assert grp.getgrgid(u.pw_gid).gr_name == u.pw_name
     assert set(os.getgrouplist(u.pw_name,u.pw_gid)) == {u.pw_gid}
     assert u.pw_shell == '/usr/sbin/nologin'
+    print('Guest actual account: %s uid=%d gid=%d' % (u.pw_name,u.pw_uid,u.pw_gid),flush=True)
 for p in ('/etc/postgresql','/etc/postgresql/17'):
     s = os.lstat(p)
     assert s.st_uid == 0 and s.st_gid == 0 and s.st_mode & 0o777 == 0o755
@@ -372,7 +475,11 @@ for p in sys.argv[1:]:
     assert 'not found' not in r.stdout, p
     assert r.returncode == 0 or 'not a dynamic executable' in r.stdout or 'statically linked' in r.stdout, p
 ''', *map(str, executables)])
-        guest([key + '=' + value for key, value in env.items()] + sys.argv[1:], timeout=1200)
+        record['test_units'] = [test_unit(record, kind) for kind in ('timeout', 'cancel', 'actual')]
+        save_receipt(receipt, record)  # Durable BEFORE any test service can start.
+        prove_client_interrupts(record)
+        run(owned_test_command(record, 'actual',
+            [key + '=' + value for key, value in env.items()] + sys.argv[1:]), timeout=1200)
         result = 0
     except Exception as exc:
         print('FAIL isolated fixture: ' + str(exc), file=sys.stderr, flush=True)
