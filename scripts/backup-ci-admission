@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Reported GitHub job budget admission; never operates on test resources.
+
+Caller must exclusively persist acquire stdout as a private receipt BEFORE any
+resource starts. Never overwrite an existing receipt by invoking acquire without
+--previous. check consumes that same receipt; it does not reset any deadline.
+The receipt is NOT a signature: its owner and trusted workflow are the security
+boundary. Keep tokens out of guest environments. Only actions:read is needed for
+API reads. Job duration/reserves must match the audited workflow configuration.
+
+Reported started_at + workflow duration is an estimate, NOT an API-guaranteed
+cancellation deadline. Clock uncertainty, external cancellation, SIGKILL and VM
+loss remain outside this utility's guarantees. All callers must bound their own
+blocking work and share the cleanup deadline, including always() fallback.
+"""
+import argparse
+import datetime as dt
+import email.utils
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import sys
+import time
+import urllib.request
+
+MAX_BYTES = 2 * 1024 * 1024
+MAX_PAGES = 20
+MAX_SKEW = 30.0
+PRECISION = 2.0
+MAX_RTT = 15.0
+
+
+class Refused(Exception):
+    pass
+
+
+def need(ok, code):
+    if not ok:
+        raise Refused(code)
+
+
+def number(value, low=0, high=86400):
+    need(type(value) in (int, float) and math.isfinite(value) and low <= value <= high,
+         'invalid_number')
+    return value
+
+
+def positive_id(value):
+    need(type(value) is int and value > 0, 'invalid_identity')
+    return value
+
+
+def utc(value):
+    need(isinstance(value, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', value),
+         'invalid_timestamp')
+    try:
+        return dt.datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        raise Refused('invalid_timestamp') from None
+
+
+def boot_id():
+    value = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    need(re.fullmatch(r'[0-9a-f-]{36}', value), 'invalid_boot')
+    return value
+
+
+def validate_expected(e):
+    need(set(e) == {'repo', 'run_id', 'attempt', 'sha', 'job_name', 'runner_name', 'runner_id'},
+         'invalid_identity')
+    need(isinstance(e['repo'], str) and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', e['repo']),
+         'invalid_identity')
+    for key in ('run_id', 'attempt'):
+        positive_id(e[key])
+    need(isinstance(e['sha'], str) and re.fullmatch('[0-9a-f]{40}', e['sha']), 'invalid_identity')
+    for key in ('job_name', 'runner_name'):
+        need(isinstance(e[key], str) and 0 < len(e[key]) <= 256 and
+             all(ord(c) >= 32 and ord(c) != 127 for c in e[key]), 'invalid_identity')
+    if e['runner_id'] is not None:
+        positive_id(e['runner_id'])
+
+
+def validate_policy(p):
+    need(set(p) == {'job_seconds', 'cleanup_seconds', 'margin_seconds'}, 'invalid_policy')
+    number(p['job_seconds'], 1, 21600)
+    number(p['cleanup_seconds'], 1, 21600)
+    number(p['margin_seconds'], 1, 21600)
+    need(p['cleanup_seconds'] + p['margin_seconds'] < p['job_seconds'], 'invalid_policy')
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        raise Refused('api_redirect')
+
+
+class API:
+    """Fixed HTTPS origin, no redirects/retries/proxy/token diagnostics.
+
+    CLI's 60s alarm bounds the entire acquisition (including DNS/slow reads).
+    Library users must provide the same outer bound when using this transport.
+    """
+    def __init__(self, token):
+        need(isinstance(token, str) and token and '\n' not in token and '\r' not in token,
+             'missing_token')
+        self.token = token
+        self.samples = []
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+    def get(self, path):
+        start, wall = time.monotonic(), time.time()
+        req = urllib.request.Request('https://api.github.com' + path, headers={
+            'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'backup-ci-admission'})
+        try:
+            with self.opener.open(req, timeout=10) as response:
+                need(response.status == 200, 'api_status')
+                dates = response.headers.get_all('Date', [])
+                need(len(dates) == 1, 'api_date')
+                date = email.utils.parsedate_to_datetime(dates[0])
+                need(date is not None and date.utcoffset() == dt.timedelta(0), 'api_date')
+                server = date.timestamp()
+                data = response.read(MAX_BYTES + 1)
+                need(len(data) <= MAX_BYTES, 'api_size')
+            finish, wall_end = time.monotonic(), time.time()
+            validate_sample((start, finish, wall, wall_end, server))
+            self.samples.append((start, finish, wall, wall_end, server))
+            return json.loads(data)
+        except Refused:
+            raise
+        except Exception:
+            raise Refused('api_failure') from None
+
+
+def validate_sample(s):
+    start, finish, wall, wall_end, server = s
+    for v in s:
+        number(v, 0, 1e12)
+    need(0 <= finish - start <= MAX_RTT, 'api_elapsed')
+    need(abs((wall_end - wall) - (finish - start)) <= PRECISION, 'clock_jump')
+    need(wall - MAX_SKEW <= server <= wall_end + MAX_SKEW, 'clock_skew')
+
+
+def validate_receipt(r, now, boot):
+    need(isinstance(r, dict) and r.get('version') == 1, 'invalid_receipt')
+    validate_expected(r['expected'])
+    validate_policy(r['policy'])
+    need(r['boot_id'] == boot, 'wrong_boot')
+    positive_id(r['job_id']); positive_id(r['runner_id'])
+    utc(r['started_at'])
+    for k in ('issued_mono', 'active_deadline', 'cleanup_deadline'):
+        number(r[k], 0, 1e12)
+    need(r['issued_mono'] <= now, 'future_receipt')
+    need(r['issued_mono'] < r['active_deadline'] < r['cleanup_deadline'], 'invalid_receipt')
+    need(r['cleanup_deadline'] - r['active_deadline'] <= r['policy']['cleanup_seconds'] + .001,
+         'invalid_receipt')
+    need(r['cleanup_deadline'] - r['issued_mono'] <= r['policy']['job_seconds'], 'invalid_receipt')
+
+
+def acquire(e, policy, required, api, now=time.monotonic, boot=None, previous=None):
+    validate_expected(e); validate_policy(policy); number(required, 1, 21600)
+    boot = boot or boot_id()
+    base = '/repos/' + e['repo'] + '/actions'
+    run = api.get(base + '/runs/' + str(e['run_id']) + '/attempts/' + str(e['attempt']))
+    need(run['id'] == e['run_id'] and run['run_attempt'] == e['attempt'] and
+         run['head_sha'] == e['sha'] and run['status'] == 'in_progress' and
+         run['repository']['full_name'].lower() == e['repo'].lower(), 'run_mismatch')
+    rows, total = [], None
+    for page in range(1, MAX_PAGES + 1):
+        data = api.get(base + '/runs/' + str(e['run_id']) + '/attempts/' + str(e['attempt']) +
+                       '/jobs?per_page=100&page=' + str(page))
+        count = data['total_count']
+        need(type(count) is int and 1 <= count <= MAX_PAGES * 100, 'pagination_count')
+        need(total is None or total == count, 'pagination_changed')
+        total = count
+        jobs = data['jobs']
+        need(isinstance(jobs, list) and len(jobs) == min(100, total - len(rows)), 'pagination_size')
+        rows.extend(jobs)
+        if len(rows) == total:
+            break
+    need(len(rows) == total and len({positive_id(j['id']) for j in rows}) == total,
+         'pagination_duplicate')
+    candidates = [j for j in rows if j['name'] == e['job_name'] and j['runner_name'] == e['runner_name']]
+    need(len(candidates) == 1, 'ambiguous_job')
+    listed = candidates[0]
+    detail = api.get(base + '/jobs/' + str(positive_id(listed['id'])))
+    for key in ('id', 'run_id', 'run_attempt', 'head_sha', 'name', 'runner_id', 'runner_name', 'started_at'):
+        need(detail[key] == listed[key], 'job_changed')
+    need(detail['run_id'] == e['run_id'] and detail['run_attempt'] == e['attempt'] and
+         detail['head_sha'] == e['sha'] and detail['status'] == 'in_progress' and
+         detail['conclusion'] is None and listed['status'] == 'in_progress', 'job_mismatch')
+    runner = positive_id(detail['runner_id'])
+    need(e['runner_id'] is None or e['runner_id'] == runner, 'runner_mismatch')
+    started = utc(detail['started_at'])
+    need(api.samples, 'no_clock_samples')
+    deadlines = []
+    first = api.samples[0]
+    for sample in api.samples:
+        validate_sample(sample)
+        need(abs((sample[2] - first[2]) - (sample[0] - first[0])) <= PRECISION, 'clock_jump')
+        m0, _, _, _, server = sample
+        need(started <= server + PRECISION, 'future_job')
+        # Anchor to request START (not response receipt). Deduct full allowed
+        # clock uncertainty plus Date precision; never add transport duration.
+        deadlines.append(m0 + started + policy['job_seconds'] - server - MAX_SKEW - PRECISION)
+    cleanup = min(deadlines) - policy['margin_seconds']
+    active = cleanup - policy['cleanup_seconds']
+    issued = now()
+    r = dict(version=1, expected=e, policy=policy, boot_id=boot, job_id=detail['id'],
+             runner_id=runner, started_at=detail['started_at'], issued_mono=issued,
+             active_deadline=active, cleanup_deadline=cleanup)
+    if previous is not None:
+        validate_receipt(previous, issued, boot)
+        for k in ('expected', 'policy', 'boot_id', 'job_id', 'runner_id', 'started_at'):
+            need(previous[k] == r[k], 'previous_mismatch')
+        r['active_deadline'] = min(previous['active_deadline'], active)
+        r['cleanup_deadline'] = min(previous['cleanup_deadline'], cleanup)
+    need(r['active_deadline'] - issued >= required, 'insufficient_budget')
+    validate_receipt(r, issued, boot)
+    return r
+
+
+def load_receipt(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        s = os.fstat(fd)
+        need(stat.S_ISREG(s.st_mode) and s.st_uid in (0, os.geteuid()) and
+             s.st_mode & 0o077 == 0 and s.st_nlink == 1 and s.st_size <= 16384, 'unsafe_receipt')
+        data = os.read(fd, 16385)
+        need(len(data) <= 16384, 'unsafe_receipt')
+        return json.loads(data)
+    finally:
+        os.close(fd)
+
+
+def check(r, phase, cap, required, *, expected, policy, now=None, boot=None):
+    now = time.monotonic() if now is None else now
+    validate_receipt(r, now, boot or boot_id())
+    validate_expected(expected); validate_policy(policy)
+    need(r['expected'] == expected and r['policy'] == policy, 'current_context_mismatch')
+    need(phase in ('active', 'cleanup'), 'invalid_phase')
+    number(cap, 1, 21600); number(required, 1, 21600)
+    available = min(cap, r[phase + '_deadline'] - now)
+    need(math.floor(available) >= required, 'insufficient_budget')
+    # Floor so caller conversion cannot grant fractional extra time.
+    return {'timeout_seconds': math.floor(available), 'phase': phase,
+            'deadline_mono': r[phase + '_deadline'], 'job_id': r['job_id']}
+
+
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse normally echoes invalid values, including misplaced secrets.
+        raise Refused('invalid_arguments')
+
+
+def add_context(parser):
+    for key in ('repo', 'sha', 'job-name', 'runner-name'):
+        parser.add_argument('--' + key, required=True)
+    for key in ('run-id', 'attempt', 'job-seconds', 'cleanup-seconds', 'margin-seconds'):
+        parser.add_argument('--' + key, type=int, required=True)
+    parser.add_argument('--runner-id', type=int)
+
+
+def context(args):
+    return ({k: getattr(args, k) for k in ('repo', 'run_id', 'attempt', 'sha', 'job_name', 'runner_name', 'runner_id')},
+            {k: getattr(args, k) for k in ('job_seconds', 'cleanup_seconds', 'margin_seconds')})
+
+
+def main():
+    p = SafeParser(description=__doc__)
+    sub = p.add_subparsers(dest='mode', required=True)
+    a = sub.add_parser('acquire')
+    add_context(a)
+    a.add_argument('--required-seconds', type=int, required=True)
+    a.add_argument('--previous')
+    c = sub.add_parser('check')
+    add_context(c)
+    c.add_argument('--receipt', required=True)
+    c.add_argument('--phase', choices=('active', 'cleanup'), required=True)
+    c.add_argument('--cap-seconds', type=int, required=True)
+    c.add_argument('--required-seconds', type=int, required=True)
+    def expired(signum, frame):
+        raise Refused('utility_deadline')
+    signal.signal(signal.SIGALRM, expired)
+    signal.alarm(60)
+    try:
+        args = p.parse_args()
+        e, policy = context(args)
+        if args.mode == 'acquire':
+            result = acquire(e, policy, args.required_seconds, API(os.environ.get('GITHUB_TOKEN')),
+                             previous=load_receipt(args.previous) if args.previous else None)
+        else:
+            result = check(load_receipt(args.receipt), args.phase, args.cap_seconds, args.required_seconds,
+                           expected=e, policy=policy)
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 0
+    except Refused as exc:
+        print('admission_refused:' + str(exc), file=sys.stderr)
+        return 1
+    except Exception:
+        print('admission_refused:invalid_input_or_api', file=sys.stderr)
+        return 1
+    finally:
+        signal.alarm(0)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
