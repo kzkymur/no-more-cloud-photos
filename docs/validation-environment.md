@@ -159,6 +159,17 @@ and helper subprocesses intentionally do not inherit `LD_LIBRARY_PATH`. No
 production sandbox directive, helper environment allowlist, or RPATH verifier
 is relaxed to accommodate build artifacts.
 
+The live workloads do not assume seeded draft profiles create transform jobs.
+Before worker startup, a fixture-only JPEG/PNG thumbnail profile is created
+through the administrative boundary and its uncertified activation must fail.
+Both exact pinned native transformations (edge 640, quality 50) and independent
+bounded AVIF probes must then succeed before the corresponding two narrow
+fixture evidence rows may be recorded. Only then does normal administrative
+activation run. Broad bundled profiles remain drafts, and no production
+certification validator is bypassed. Upload responses must contain the expected
+native transform target; subsequent actual production-worker completion and
+positive renditions remain separate mandatory assertions.
+
 The launcher retains a root-only exact-head ownership receipt and diagnostic
 root filesystem below `RUNNER_TEMP`. Normal finalization and the workflow's
 outer `always()` step both run receipt-scoped cleanup **inside that machine**,

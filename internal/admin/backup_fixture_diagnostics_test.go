@@ -47,7 +47,9 @@ func logLiveNativeReadiness(t *testing.T, parent context.Context, pool *pgxpool.
 			t.Logf("native readiness %s query sqlstate=%s", table, fixtureSQLState(err))
 			continue
 		}
+		groups := 0
 		for rows.Next() {
+			groups++
 			var status, code string
 			var count, first, last int64
 			if err := rows.Scan(&status, &code, &count, &first, &last); err != nil {
@@ -60,6 +62,7 @@ func logLiveNativeReadiness(t *testing.T, parent context.Context, pool *pgxpool.
 			t.Logf("native readiness metadata sqlstate=%s", fixtureSQLState(rows.Err()))
 		}
 		rows.Close()
+		t.Logf("native readiness %s: groups=%d", table, groups)
 	}
 	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service"} {
 		properties, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", "--all", "--property=Id,MainPID,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts", unit).Output()

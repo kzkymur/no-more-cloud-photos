@@ -561,6 +561,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	f.assertCandidateGate("candidate")
 	f.assertCandidateGate("candidate2")
 	f.installLiveUnits(artifacts, prefix, video, icc)
+	f.prepareLiveNativeProfile(migrator, mediaBytes)
 	// Real API and worker must be running on source *before* Restore; actual
 	// unit files retain production sandboxing and fixed executable paths.
 	f.run("/usr/bin/systemctl", "daemon-reload")
@@ -711,8 +712,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if e != nil {
 		t.Fatal("live restored media detail failed")
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatal("live restored media detail non-200")
 	}
@@ -1185,10 +1185,12 @@ func livePostMedia(t *testing.T, ctx context.Context, data []byte, name, key str
 	if e != nil {
 		t.Fatal("actual media API write failed")
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		t.Fatalf("actual media API write status=%d", resp.StatusCode)
+	}
+	if !fixtureUploadHasNativeJob(resp.Body) {
+		t.Fatal("actual upload lacks exactly one evidence-backed native transform target")
 	}
 }
 func liveUploadAfterResume(t *testing.T, ctx context.Context, cycles ...int) {

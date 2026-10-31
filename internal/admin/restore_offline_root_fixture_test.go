@@ -153,6 +153,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	}
 	offlineCandidateRoleProof(t, g, peer)
 	f.installLiveUnits(artifacts, prefix, video, icc)
+	f.prepareLiveNativeProfile(migrator, mediaBytes)
 	// Real API and worker must be running on source *before* Restore; actual
 	// unit files retain production sandboxing and fixed executable paths.
 	f.run("/usr/bin/systemctl", "daemon-reload")
