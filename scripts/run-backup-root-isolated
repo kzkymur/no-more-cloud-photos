@@ -301,6 +301,17 @@ def emit_fixture_diagnostics(work, root):
         finally:
             os.close(fd)
 
+def prepare_guest_config_dirs(root):
+    # A minbase image need not contain site-local sysusers configuration.
+    # These fixed paths live only beneath our newly-created guest rootfs.
+    for rel in ('etc/sysusers.d', 'etc/postgresql/17', 'var/lib/systemd/timers'):
+        target = root / rel
+        require(not target.is_symlink() and target.resolve().is_relative_to(root.resolve(strict=True)),
+                'guest config path escapes root or is symlinked')
+        target.mkdir(mode=0o755, parents=True, exist_ok=True)
+        require(target.is_dir() and not target.is_symlink(), 'unsafe guest config directory')
+        require(target.resolve().is_relative_to(root.resolve()), 'guest config path escapes root')
+
 def main():
     require(os.geteuid() == 0, 'root required')
     require(os.environ.get('GITHUB_ACTIONS') == 'true' and
@@ -399,8 +410,7 @@ def main():
                 stdout=log, stderr=sp.STDOUT, timeout=900)
         require(not any(root.glob('usr/lib/systemd/system/postgresql*')), 'unexpected PG vendor units')
         require(not (root / 'etc/postgresql-common').exists(), 'postgresql-common must not be installed')
-        for rel in ('etc/postgresql/17', 'var/lib/systemd/timers'):
-            (root / rel).mkdir(parents=True, exist_ok=True)
+        prepare_guest_config_dirs(root)
         for rel in ('etc/postgresql', 'etc/postgresql/17'):
             os.chown(root / rel, 0, 0)
             os.chmod(root / rel, 0o755)

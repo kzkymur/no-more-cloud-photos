@@ -3,6 +3,7 @@
 import ast
 import pathlib
 import types
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -83,6 +84,34 @@ class Isolation(unittest.TestCase):
         self.assertNotIn('libcdio19',packages)
         self.assertNotIn('force-depends',SOURCE)
         self.assertNotIn('--no-check-gpg',SOURCE)
+
+    def test_fresh_minbase_config_directories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=pathlib.Path(temp)/'rootfs'
+            root.mkdir()
+            MODULE.prepare_guest_config_dirs(root)
+            config=root/'etc/sysusers.d/nmcp-ci.conf'
+            config.write_text('u postgres - - /var/lib/postgresql /usr/sbin/nologin\n')
+            self.assertTrue(config.is_file())
+            for rel in ('etc/sysusers.d','etc/postgresql/17','var/lib/systemd/timers'):
+                self.assertTrue((root/rel).is_dir())
+            MODULE.prepare_guest_config_dirs(root)
+        with tempfile.TemporaryDirectory() as temp:
+            root=pathlib.Path(temp)/'rootfs';root.mkdir()
+            outside=pathlib.Path(temp)/'outside';outside.mkdir()
+            (root/'etc').mkdir();(root/'etc/sysusers.d').symlink_to(outside)
+            with self.assertRaises(RuntimeError):
+                MODULE.prepare_guest_config_dirs(root)
+            self.assertEqual(list(outside.iterdir()),[])
+
+    def test_guest_config_symlink_parent_never_creates_external_leaf(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=pathlib.Path(temp)/'rootfs';root.mkdir()
+            outside=pathlib.Path(temp)/'outside';outside.mkdir()
+            (root/'etc').symlink_to(outside)
+            with self.assertRaises(RuntimeError):
+                MODULE.prepare_guest_config_dirs(root)
+            self.assertEqual(list(outside.iterdir()),[])
 
     def test_python_syntax(self):
         ast.parse(SOURCE)
