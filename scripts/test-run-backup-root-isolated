@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Pure mocks and structure checks: no root, provisioning, units or boot."""
+import ast
+import pathlib
+import types
+import unittest
+from unittest.mock import Mock, patch
+
+SCRIPT = pathlib.Path(__file__).with_name('run-backup-root-isolated')
+TEXT = SCRIPT.read_text()
+SOURCE = TEXT.split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+MODULE = types.ModuleType('isolated_wrapper_tests')
+exec(compile(SOURCE, str(SCRIPT), 'exec'), MODULE.__dict__)
+
+
+class Isolation(unittest.TestCase):
+    def test_python_syntax(self):
+        ast.parse(SOURCE)
+
+    def test_environment_allowlist(self):
+        self.assertNotIn('LD_PRELOAD', MODULE.KEYS)
+        self.assertNotIn('TEST_BACKUP_UNKNOWN', MODULE.KEYS)
+        self.assertIn('TEST_BACKUP_CANDIDATE_SHA', MODULE.KEYS)
+        self.assertNotIn('os.environ.copy', SOURCE)
+        cmd = MODULE.guest_command('unique', '/repo with space', ['/binary', 'two words'])
+        self.assertIn('--machine=unique', cmd)
+        self.assertIn('--property=WorkingDirectory=/repo with space', cmd)
+        self.assertEqual(cmd[-2:], ['/binary', 'two words'])
+        self.assertIn('-i', cmd)
+        with patch.object(MODULE.sp, 'run') as run:
+            MODULE.run(['mock'])
+            self.assertEqual(run.call_args.kwargs['env'], MODULE.HOST_ENV)
+
+    def test_ownership_rejects_missing_recycled_launcher(self):
+        for record in ({}, {'launcher': 123, 'launcher_start': 'old'}):
+            with patch.object(MODULE, 'process_identity', return_value='new'), \
+                    patch.object(MODULE, 'output') as output:
+                with self.assertRaises(RuntimeError):
+                    MODULE.attest(dict(machine='unique', **record))
+                output.assert_not_called()
+
+    def test_ownership_rejects_wrong_root_or_leader(self):
+        r = dict(machine='unique', launcher=123, launcher_start='old', root='/private',
+                 leader=456, leader_start='old')
+        for values in (['/wrong'], ['/private', '789']):
+            with patch.object(MODULE, 'process_identity', return_value='old'), \
+                    patch.object(MODULE, 'output', side_effect=values):
+                with self.assertRaises(RuntimeError):
+                    MODULE.attest(r.copy())
+
+    def test_cleanup_precedes_shutdown_and_failure_not_masked(self):
+        for fail in (False, True):
+            events = []
+            r = dict(machine='unique', repo='/repo', head='a'*40, launcher=123,
+                     leader=456, leader_start='old')
+            def run(cmd, **kwargs):
+                events.append(cmd)
+                if fail and cmd[0] == '/usr/bin/systemd-run':
+                    raise RuntimeError('cleanup failed')
+            with patch.object(MODULE, 'attest') as attest, \
+                    patch.object(MODULE, 'save_receipt'), \
+                    patch.object(MODULE, 'run', side_effect=run), \
+                    patch.object(MODULE, 'output', return_value=''), \
+                    patch.object(MODULE, 'process_identity', return_value=None):
+                result = MODULE.teardown(r, pathlib.Path('/not-written'))
+            self.assertEqual(result, int(fail))
+            self.assertEqual(attest.call_count, 2)
+            self.assertIn('/repo/scripts/cleanup-backup-root-fixture', events[0])
+            self.assertEqual(events[1], ['/usr/bin/machinectl', 'terminate', 'unique'])
+            self.assertTrue(r['stopped'])
+
+    def test_unowned_machine_never_stopped(self):
+        with patch.object(MODULE, 'attest', side_effect=RuntimeError('unowned')), \
+                patch.object(MODULE, 'run') as run:
+            with self.assertRaises(RuntimeError):
+                MODULE.teardown({'launcher': 123}, pathlib.Path('/not-written'))
+            run.assert_not_called()
+
+    def test_second_attestation_failure_never_stops(self):
+        r = dict(machine='unique', repo='/repo', head='a'*40, launcher=123)
+        with patch.object(MODULE, 'attest', side_effect=[None, RuntimeError('changed')]), \
+                patch.object(MODULE, 'save_receipt'), patch.object(MODULE, 'run') as run:
+            with self.assertRaises(RuntimeError):
+                MODULE.teardown(r, pathlib.Path('/not-written'))
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][0], '/usr/bin/systemd-run')
+
+    def test_prelaunch_noop_but_interrupted_launch_fails_closed(self):
+        with patch.object(MODULE, 'run') as run, \
+                patch.object(MODULE, 'recover_launcher', side_effect=RuntimeError('not registered')):
+            self.assertEqual(MODULE.teardown({'phase': 'provisioning'}, None), 0)
+            with self.assertRaises(RuntimeError):
+                MODULE.teardown({'phase': 'launching'}, None)
+            run.assert_not_called()
+
+    def test_missing_cleanup_receipt_noop(self):
+        env = dict(GITHUB_ACTIONS='true', RUNNER_ENVIRONMENT='github-hosted',
+                   GITHUB_WORKSPACE='/repo', RUNNER_TEMP='/temp', TEST_BACKUP_CANDIDATE_SHA='a'*40)
+        with patch.dict(MODULE.os.environ, env, clear=True), \
+                patch.object(MODULE.os, 'geteuid', return_value=0), \
+                patch.object(MODULE, 'canonical', side_effect=pathlib.Path), \
+                patch.object(MODULE.sys, 'argv', ['wrapper', '--cleanup', 'live']), \
+                patch.object(pathlib.Path, 'exists', return_value=False), \
+                patch.object(pathlib.Path, 'is_symlink', return_value=False), \
+                patch.object(MODULE, 'run') as run:
+            self.assertEqual(MODULE.main(), 0)
+            run.assert_not_called()
+
+    def test_nonroot_and_nonci_rejected(self):
+        with patch.object(MODULE.os, 'geteuid', return_value=1000):
+            with self.assertRaisesRegex(RuntimeError, 'root required'):
+                MODULE.main()
+        with patch.object(MODULE.os, 'geteuid', return_value=0), \
+                patch.dict(MODULE.os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, 'hosted CI only'):
+                MODULE.main()
+
+    def test_host_snapshot_change_fails_without_repair(self):
+        with patch.object(MODULE, 'teardown_guest', return_value=0), \
+                patch.object(MODULE, 'host_snapshot', return_value={'new': 2}), \
+                patch.object(MODULE, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'unrelated host units'):
+                MODULE.teardown({'host_snapshot': {'old': 1}}, None)
+            run.assert_not_called()
+
+    def test_recovery_rejects_foreign_root(self):
+        with patch.object(MODULE, 'output', return_value='/foreign'):
+            with self.assertRaisesRegex(RuntimeError, 'recovery root mismatch'):
+                MODULE.recover_launcher(dict(phase='launching', root='/private', machine='unique'))
+
+    def test_receipt_directory_must_be_root_private(self):
+        for uid, mode in ((1000, 0o40700), (0, 0o40755), (0, 0o120700)):
+            path = Mock()
+            path.lstat.return_value = types.SimpleNamespace(st_uid=uid, st_mode=mode)
+            with self.assertRaisesRegex(RuntimeError, 'unsafe receipt directory'):
+                MODULE.private_directory(path)
+
+    def test_structural_isolation_and_receipt_contract(self):
+        for required in ('--private-network', '--boot', '--settings=no', '--register=yes',
+                         ':norbind', '--bind-ro=', 'https://archive.ubuntu.com/ubuntu',
+                         '--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg',
+                         'systemd-sysusers', '0o755', 'O_NOFOLLOW', '0o600', '0o700',
+                         'os.fsync', 'root_inode', 'leader_start', 'launcher_start',
+                         "('mnt', 'pid', 'net')", "record.get('stopped')"):
+            self.assertIn(required, SOURCE)
+        for forbidden in ('--bind=', 'systemctl stop', 'shutil.rmtree', 'no-check-gpg',
+                          "'--bind-ro=' + str(temp)"):
+            self.assertNotIn(forbidden, SOURCE)
+        self.assertNotIn('postgresql-common', MODULE.PACKAGES)
+        for package in ('libssl3t64', 'libreadline8t64', 'libimage-exiftool-perl',
+                        'libglib2.0-dev', 'libjpeg-turbo8-dev', 'libpng-dev', 'libwebp-dev',
+                        'libexif-dev', 'libde265-dev', 'ffmpeg'):
+            self.assertIn(package, MODULE.PACKAGES.split(','))
+
+
+if __name__ == '__main__':
+    unittest.main()

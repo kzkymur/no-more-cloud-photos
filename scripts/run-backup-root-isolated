@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+# Root CI only. No host PostgreSQL/nmcp unit or configuration is ever modified.
+set -euo pipefail
+exec /usr/bin/python3 - "$@" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess as sp
+import sys
+import tempfile
+import time
+import uuid
+
+HOST_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LC_ALL': 'C'}
+KEYS = ('GITHUB_ACTIONS', 'RUNNER_ENVIRONMENT', 'TEST_BACKUP_CANDIDATE_SHA',
+        'TEST_BACKUP_PG17_BINDIR', 'TEST_BACKUP_NATIVE_PREFIX',
+        'TEST_BACKUP_STILL_HELPER', 'TEST_BACKUP_ANIMATION_HELPER',
+        'TEST_BACKUP_ICC_PATH', 'TEST_BACKUP_MEDIA_FIXTURE', 'TEST_BACKUP_CORE_API',
+        'TEST_BACKUP_CORE_WORKER', 'TEST_BACKUP_ADMIN_BINARY')
+PACKAGES = ('systemd-sysv,dbus,util-linux,python3,libimage-exiftool-perl,ffmpeg,'
+            'libglib2.0-dev,libjpeg-turbo8-dev,libpng-dev,libwebp-dev,libexif-dev,'
+            'libde265-dev,libicu74,libssl3t64,libreadline8t64,libzstd1,liblz4-1,zlib1g')
+
+def require(ok, message):
+    if not ok:
+        raise RuntimeError(message)
+
+def canonical(value):
+    path = Path(value)
+    require(path.is_absolute() and str(path.resolve(strict=True)) == value,
+            'noncanonical or missing input: ' + value)
+    require(not any(c in value for c in ':\n\r'), 'unsafe bind path')
+    return path
+
+def run(argv, **kw):
+    return sp.run(argv, env=HOST_ENV, check=True, **kw)
+
+def output(argv):
+    return run(argv, stdout=sp.PIPE, stderr=sp.PIPE, text=True, timeout=15).stdout.strip()
+
+def process_identity(pid):
+    try:
+        text = Path('/proc', str(pid), 'stat').read_text()
+        return text[text.rfind(')') + 2:].split()[19]  # field 22: starttime
+    except FileNotFoundError:
+        return None
+
+def host_snapshot():
+    # Read-only evidence for unrelated host services. A natural transition is
+    # conservatively a failure too; never try to restore or stop these units.
+    rows = output(['/usr/bin/systemctl', 'list-units', '--all', '--plain', '--no-legend',
+                   '--no-pager', 'postgresql*', 'nmcp*'])
+    units = sorted(line.split()[0] for line in rows.splitlines() if line.split())
+    result = {'units': {}}
+    for unit in units:
+        result['units'][unit] = output(['/usr/bin/systemctl', 'show', unit,
+            '--property=MainPID', '--property=FragmentPath', '--property=ActiveState'])
+    try:
+        st = Path('/etc/postgresql').lstat()
+        result['postgresql_directory'] = [st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_mode]
+    except FileNotFoundError:
+        result['postgresql_directory'] = None
+    return result
+
+def private_directory(path):
+    st = path.lstat()
+    require(stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and
+            stat.S_IMODE(st.st_mode) == 0o700, 'unsafe receipt directory')
+
+def save_receipt(path, record):
+    # Replace only our own receipt in a root-only directory, with durable sync.
+    pending = path.with_suffix('.pending')
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(record, f); f.flush(); os.fsync(f.fileno())
+    os.replace(pending, path)
+    fd = os.open(path.parent, os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+def load_receipt(path, repo, temp, head, slot):
+    private_directory(path.parent)
+    st = path.lstat()
+    require(stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1 and
+            stat.S_IMODE(st.st_mode) == 0o600 and st.st_size < 16384, 'unsafe receipt')
+    r = json.loads(path.read_text())
+    require(r['head'] == head and r['repo'] == str(repo) and r['slot'] == slot,
+            'receipt identity mismatch')
+    work = canonical(r['work'])
+    require(work.parent == temp and work.name.startswith('nmcp-root-isolated-'), 'unsafe work root')
+    private_directory(work)
+    require(r['root'] == str(work / 'rootfs'), 'unsafe guest root')
+    require(re.fullmatch(r'nmcp-backup-[0-9a-f]{32}', r['machine']), 'unsafe machine name')
+    require('host_snapshot' in r, 'missing host isolation evidence')
+    return r
+
+def attest(r):
+    machine = r['machine']
+    require(r.get('launcher') and r.get('launcher_start') and
+            process_identity(r['launcher']) == r['launcher_start'], 'launcher identity changed')
+    require(output(['/usr/bin/machinectl', 'show', machine, '--property=RootDirectory', '--value']) == r['root'],
+            'machine root mismatch')
+    raw = output(['/usr/bin/machinectl', 'show', machine, '--property=Leader', '--value'])
+    require(raw.isdecimal() and int(raw) > 1, 'invalid leader')
+    leader = int(raw)
+    start = process_identity(leader)
+    require(start is not None, 'leader disappeared')
+    if r.get('leader'):
+        require(leader == r['leader'] and start == r['leader_start'], 'leader identity changed')
+    root = os.stat(r['root'])
+    require([root.st_dev, root.st_ino] == r['root_inode'], 'root inode changed')
+    actual = os.stat('/proc/' + raw + '/root')
+    require((root.st_dev, root.st_ino) == (actual.st_dev, actual.st_ino), 'process root mismatch')
+    text = Path('/proc', raw, 'stat').read_text()
+    require(text[text.rfind(')') + 2:].split()[1] == str(r['launcher']), 'leader is not launcher child')
+    require(Path('/proc', raw, 'comm').read_text().strip() == 'systemd', 'guest PID1 mismatch')
+    for ns in ('mnt', 'pid', 'net'):
+        require(os.readlink('/proc/self/ns/' + ns) != os.readlink('/proc/' + raw + '/ns/' + ns),
+                'guest did not isolate ' + ns)
+    r['leader'], r['leader_start'] = leader, start
+
+def guest_command(machine, repo, args):
+    return ['/usr/bin/systemd-run', '--machine=' + machine, '--wait', '--pipe', '--quiet',
+            '--collect', '--service-type=exec', '--property=WorkingDirectory=' + str(repo),
+            '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin', 'HOME=/root', 'LC_ALL=C'] + args
+
+def recover_launcher(r):
+    # The durable pre-launch receipt reserves this random machine/root inode.
+    # Recovery is allowed only for an actual nspawn parent using those exact
+    # arguments, never merely a matching machine name or discovered PID.
+    require(r.get('phase') == 'launching', 'unexpected receipt lifecycle')
+    require(output(['/usr/bin/machinectl', 'show', r['machine'], '--property=RootDirectory', '--value']) == r['root'],
+            'recovery root mismatch')
+    raw = output(['/usr/bin/machinectl', 'show', r['machine'], '--property=Leader', '--value'])
+    require(raw.isdecimal() and int(raw) > 1, 'recovery leader unavailable')
+    text = Path('/proc', raw, 'stat').read_text()
+    parent = int(text[text.rfind(')') + 2:].split()[1])
+    require(parent > 1, 'recovery launcher unavailable')
+    proc = Path('/proc', str(parent))
+    require((proc / 'exe').resolve(strict=True) == Path('/usr/bin/systemd-nspawn').resolve(strict=True),
+            'recovery parent is not nspawn')
+    args = (proc / 'cmdline').read_bytes().split(b'\0')
+    for arg in ('--directory=' + r['root'], '--machine=' + r['machine'], '--boot', '--private-network'):
+        require(arg.encode() in args, 'recovery launcher arguments mismatch')
+    r['launcher'], r['launcher_start'] = parent, process_identity(parent)
+    attest(r)
+
+def teardown(r, receipt):
+    try:
+        return teardown_guest(r, receipt)
+    finally:
+        if 'host_snapshot' in r:
+            current = host_snapshot()
+            print('Host isolation after: ' + json.dumps(current, sort_keys=True), flush=True)
+            require(current == r['host_snapshot'], 'unrelated host units or PG directory changed')
+
+def teardown_guest(r, receipt):
+    if r.get('stopped'):
+        return r.get('cleanup_result', 0)
+    if not r.get('launcher'):
+        if r.get('phase') == 'provisioning':
+            return 0  # No launch was attempted.
+        recover_launcher(r)
+    attest(r)
+    save_receipt(receipt, r)
+    result = 0
+    try:
+        run(guest_command(r['machine'], r['repo'],
+            ['NMCP_EXPECTED_HEAD=' + r['head'], '/usr/bin/python3',
+             r['repo'] + '/scripts/cleanup-backup-root-fixture']), timeout=210)
+    except Exception as exc:
+        print('FAIL in-machine cleanup: ' + str(exc), file=sys.stderr)
+        result = 1
+    attest(r)  # A cleanup failure never grants name-only shutdown authority.
+    run(['/usr/bin/machinectl', 'terminate', r['machine']], timeout=30)
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        names = output(['/usr/bin/machinectl', 'list', '--no-legend', '--no-pager'])
+        present = any(line.split()[0] == r['machine'] for line in names.splitlines() if line.split())
+        if not present and process_identity(r['leader']) != r['leader_start']:
+            r['stopped'] = True
+            r['cleanup_result'] = result
+            save_receipt(receipt, r)
+            return result
+        time.sleep(1)
+    raise RuntimeError('guest machine or original PID survived termination')
+
+def main():
+    require(os.geteuid() == 0, 'root required')
+    require(os.environ.get('GITHUB_ACTIONS') == 'true' and
+            os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'hosted CI only')
+    require(len(sys.argv) > 1, 'test executable and arguments required')
+    repo = canonical(os.environ['GITHUB_WORKSPACE'])
+    temp = canonical(os.environ['RUNNER_TEMP'])
+    head = os.environ['TEST_BACKUP_CANDIDATE_SHA']
+    require(re.fullmatch('[0-9a-f]{40}', head), 'exact SHA required')
+    require(repo != temp and repo not in temp.parents and temp not in repo.parents, 'overlapping binds')
+    if sys.argv[1] == '--cleanup':
+        require(len(sys.argv) == 3 and sys.argv[2] in ('live', 'offline'), 'cleanup requires live or offline')
+        slot = sys.argv[2]
+        receipt_dir = temp / ('.nmcp-root-isolated-' + slot)
+        if not receipt_dir.exists() and not receipt_dir.is_symlink():
+            print('No isolated receipt; no machine touched')
+            return 0
+        receipt = receipt_dir / 'owner.json'
+        return teardown(load_receipt(receipt, repo, temp, head, slot), receipt)
+    binary = canonical(sys.argv[1])
+    require(binary.parent == temp and binary.name in ('backup-live.test', 'backup-offline.test'),
+            'unexpected root test binary')
+    require((repo / 'scripts/cleanup-backup-root-fixture').is_file(), 'cleanup helper missing')
+    env = {key: os.environ[key] for key in KEYS}
+    require(re.fullmatch('[0-9a-f]{40}', env['TEST_BACKUP_CANDIDATE_SHA']), 'exact SHA required')
+    mode = 'TEST_BACKUP_OFFLINE_SYSTEMD' if binary.name == 'backup-offline.test' else 'TEST_BACKUP_LIVE_SYSTEMD'
+    require(os.environ.get(mode) == '1', 'explicit fixture opt-in required')
+    env[mode] = '1'
+    env['GITHUB_WORKSPACE'], env['RUNNER_TEMP'] = str(repo), str(temp)
+    slot = 'offline' if binary.name == 'backup-offline.test' else 'live'
+    regex = '^TestRestoreOfflineRootTwoClusters$' if slot == 'offline' else '^TestBackupPG17LiveCutover$'
+    require(sys.argv[2:] == ['-test.v', '-test.count=1', '-test.timeout=18m', '-test.run', regex],
+            'unexpected test arguments')
+    require(env['TEST_BACKUP_PG17_BINDIR'] == '/opt/nmcp-pg17-ci/bin', 'unexpected PG prefix')
+    pg = canonical('/opt/nmcp-pg17-ci')
+    expected = {
+        'TEST_BACKUP_NATIVE_PREFIX': 'still-toolchain',
+        'TEST_BACKUP_STILL_HELPER': 'still-helper-build/bin/nmcp-still-helper',
+        'TEST_BACKUP_ANIMATION_HELPER': 'animation-helper-build/bin/nmcp-animation-helper',
+        'TEST_BACKUP_ICC_PATH': 'sRGB2014.icc',
+        'TEST_BACKUP_MEDIA_FIXTURE': 'orientation-6.jpg',
+        'TEST_BACKUP_CORE_API': 'backup-live-binaries/core-api',
+        'TEST_BACKUP_CORE_WORKER': 'backup-live-binaries/core-worker',
+        'TEST_BACKUP_ADMIN_BINARY': 'backup-live-binaries/nmcp-admin',
+    }
+    for key, suffix in expected.items():
+        require(env[key] == str(temp / suffix), 'unexpected artifact path: ' + key)
+        canonical(env[key])
+    require((temp / 'native-build-prefix.txt').read_text().strip() == str(temp),
+            'native absolute build prefix mismatch')
+    # Do not bind RUNNER_TEMP itself: it contains the guest rootfs. All binds
+    # below are immutable inputs, never host runtime state or control sockets.
+    binds = [repo, pg, binary] + [temp / name for name in (
+        'still-toolchain', 'still-helper-build', 'animation-helper-build',
+        'backup-live-binaries', 'sRGB2014.icc', 'orientation-6.jpg')]
+    for path in binds:
+        canonical(str(path))
+    receipt_dir = temp / ('.nmcp-root-isolated-' + slot)
+    receipt_dir.mkdir(mode=0o700)  # Exclusive: never reuse an earlier lifecycle.
+    private_directory(receipt_dir)
+    receipt = receipt_dir / 'owner.json'
+    work = Path(tempfile.mkdtemp(prefix='nmcp-root-isolated-', dir=temp))
+    root = work / 'rootfs'
+    machine = 'nmcp-backup-' + uuid.uuid4().hex
+    print('Isolated fixture evidence: ' + str(work), flush=True)
+    record = dict(machine=machine, head=head, repo=str(repo), slot=slot,
+                  work=str(work), root=str(root), phase='provisioning', host_snapshot=host_snapshot())
+    print('Host isolation before: ' + json.dumps(record['host_snapshot'], sort_keys=True), flush=True)
+    save_receipt(receipt, record)
+    proc = None
+    leader = None
+    leader_start = None
+    ready = False
+    result = 1
+
+    def guest(args, timeout=120, capture=False):
+        cmd = guest_command(machine, repo, [])
+        return run(cmd + args, timeout=timeout,
+                   stdout=sp.PIPE if capture else None, text=True)
+
+    def interrupted(signum, frame):
+        raise RuntimeError('interrupted by signal ' + str(signum))
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    try:
+        # debootstrap runs only against this new root. Its standard policy-rc.d
+        # prevents package maintainer scripts starting services on the host.
+        with (work / 'provision.log').open('w') as log:
+            run(['/usr/sbin/debootstrap', '--variant=minbase', '--components=main,universe',
+                 '--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg',
+                 '--include=' + PACKAGES, 'noble', str(root), 'https://archive.ubuntu.com/ubuntu'],
+                stdout=log, stderr=sp.STDOUT, timeout=900)
+        require(not any(root.glob('usr/lib/systemd/system/postgresql*')), 'unexpected PG vendor units')
+        require(not (root / 'etc/postgresql-common').exists(), 'postgresql-common must not be installed')
+        for rel in ('etc/postgresql/17', 'var/lib/systemd/timers'):
+            (root / rel).mkdir(parents=True, exist_ok=True)
+        for rel in ('etc/postgresql', 'etc/postgresql/17'):
+            os.chown(root / rel, 0, 0)
+            os.chmod(root / rel, 0o755)
+        users = (repo / 'infra/ubuntu/sysusers.d/nmcp.conf').read_text()
+        users += '\nu postgres - "Private PostgreSQL fixture" /var/lib/postgresql /usr/sbin/nologin\n'
+        (root / 'etc/sysusers.d/nmcp-ci.conf').write_text(users)
+        run(['/usr/bin/systemd-sysusers', '--root=' + str(root)])
+        boot = ['/usr/bin/systemd-nspawn', '--quiet', '--boot', '--settings=no',
+                '--directory=' + str(root), '--machine=' + machine,
+                '--private-network', '--register=yes', '--link-journal=no',
+                '--resolv-conf=off', '--timezone=off']
+        boot += ['--bind-ro=' + str(path) + ':' + str(path) + ':norbind' for path in binds]
+        root_stat = root.stat()
+        record.update(root_inode=[root_stat.st_dev, root_stat.st_ino], phase='launching')
+        save_receipt(receipt, record)
+        with (work / 'boot.log').open('w') as log:
+            proc = sp.Popen(boot, env=HOST_ENV, stdout=log, stderr=sp.STDOUT)
+        record.update(launcher=proc.pid, launcher_start=process_identity(proc.pid))
+        save_receipt(receipt, record)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            require(proc.poll() is None, 'private systemd boot exited; see boot.log')
+            try:
+                raw = output(['/usr/bin/machinectl', 'show', machine, '--property=Leader', '--value'])
+                if raw.isdecimal() and int(raw) > 1:
+                    leader = int(raw)
+                    leader_start = process_identity(leader)
+                    attest(record)
+                    save_receipt(receipt, record)
+                    state = guest(['/usr/bin/systemctl', 'is-system-running'], timeout=15, capture=True).stdout.strip()
+                    if state == 'running':
+                        ready = True
+                        break
+            except (sp.CalledProcessError, sp.TimeoutExpired, RuntimeError):
+                pass
+            time.sleep(1)
+        require(ready and leader_start, 'private systemd did not become ready')
+        print('Guest leader cgroup: ' + Path('/proc', str(leader), 'cgroup').read_text(), flush=True)
+        scope = output(['/usr/bin/machinectl', 'show', machine, '--property=Scope', '--value'])
+        require(scope.startswith('machine-') and scope.endswith('.scope'), 'unexpected machine scope')
+        print('Guest scope resource/delegation: ' + output(['/usr/bin/systemctl', 'show', scope,
+            '--property=ControlGroup', '--property=Delegate', '--property=MemoryMax',
+            '--property=CPUQuotaPerSecUSec', '--property=TasksMax']), flush=True)
+        guest(['/usr/bin/cat', '/proc/self/cgroup'])
+        # Verify real namespace separation, not just a plausible manager name.
+        require(Path('/proc', str(leader), 'comm').read_text().strip() == 'systemd', 'guest PID1 mismatch')
+        for ns in ('mnt', 'pid', 'net'):
+            require(os.readlink('/proc/1/ns/' + ns) != os.readlink('/proc/' + str(leader) + '/ns/' + ns),
+                    'guest did not isolate ' + ns)
+        preflight = r'''
+import grp, os, pwd, pathlib, subprocess
+assert pathlib.Path('/proc/1/comm').read_text().strip() == 'systemd'
+users = [pwd.getpwnam(n) for n in ('nmcp','nmcp-backup','postgres')]
+assert len({0, *[u.pw_uid for u in users]}) == 4
+assert len({0, *[u.pw_gid for u in users]}) == 4
+for u in users:
+    assert grp.getgrgid(u.pw_gid).gr_name == u.pw_name
+    assert set(os.getgrouplist(u.pw_name,u.pw_gid)) == {u.pw_gid}
+    assert u.pw_shell == '/usr/sbin/nologin'
+for p in ('/etc/postgresql','/etc/postgresql/17'):
+    s = os.lstat(p)
+    assert s.st_uid == 0 and s.st_gid == 0 and s.st_mode & 0o777 == 0o755
+for unit in ('postgresql@17-nmcp-offline-fixture.service','postgresql@17-nmcp-offline-candidate.service'):
+    assert subprocess.check_output(['/usr/bin/systemctl','show','-p','LoadState','--value',unit],text=True).strip() == 'not-found'
+assert not list(pathlib.Path('/etc/postgresql/17').iterdir())
+for tool in ('postgres','initdb','pg_ctl','pg_dump','pg_restore','psql'):
+    p = '/opt/nmcp-pg17-ci/bin/' + tool
+    assert pathlib.Path(p).read_bytes()[:4] == b'\x7fELF'
+    subprocess.run(['/usr/bin/setpriv','--reuid=postgres','--regid=postgres','--init-groups','/usr/bin/test','-x',p],check=True)
+    assert '(PostgreSQL) 17.' in subprocess.check_output([p,'--version'],text=True)
+'''
+        guest(['/usr/bin/python3', '-c', preflight])
+        # ldd is diagnostic plus a strict missing-library guard on the exact
+        # received executables. Runtime tests remain the authoritative oracle.
+        executables = [binary, pg / 'bin/postgres', pg / 'bin/pg_dump',
+                       Path(env['TEST_BACKUP_NATIVE_PREFIX']) / 'bin/nmcp-video-helper']
+        executables += [Path(env[k]) for k in ('TEST_BACKUP_STILL_HELPER', 'TEST_BACKUP_ANIMATION_HELPER',
+                                               'TEST_BACKUP_CORE_API', 'TEST_BACKUP_CORE_WORKER', 'TEST_BACKUP_ADMIN_BINARY')]
+        guest(['/usr/bin/python3', '-c', r'''
+import pathlib, subprocess, sys
+for p in sys.argv[1:]:
+    assert pathlib.Path(p).read_bytes()[:4] == b'\x7fELF', p
+    r = subprocess.run(['/usr/bin/ldd',p],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    print(p + '\n' + r.stdout,flush=True)
+    assert 'not found' not in r.stdout, p
+    assert r.returncode == 0 or 'not a dynamic executable' in r.stdout or 'statically linked' in r.stdout, p
+''', *map(str, executables)])
+        guest([key + '=' + value for key, value in env.items()] + sys.argv[1:], timeout=1200)
+        result = 0
+    except Exception as exc:
+        print('FAIL isolated fixture: ' + str(exc), file=sys.stderr, flush=True)
+    finally:
+        # Signals cannot interrupt the bounded finalizer a second time. SIGKILL
+        # is outside any trap's guarantee; the disposable hosted VM is the last
+        # containment boundary in that case.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            result = max(result, teardown(record, receipt))
+        except Exception as exc:
+            print('FAIL owned teardown (preserved evidence): ' + str(exc), file=sys.stderr)
+            result = 1
+        if proc is not None and record.get('stopped'):
+            try: proc.wait(timeout=15)
+            except sp.TimeoutExpired:
+                print('FAIL launcher survived guest teardown', file=sys.stderr)
+                result = 1
+        # No recursive deletion: preserve the unique rootfs and all logs on
+        # success or failure; hosted runner disposal owns their final removal.
+        print('Preserved isolated root evidence: ' + str(work), flush=True)
+    return result
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        sys.exit('FAIL isolated fixture setup: ' + str(exc))
+PY

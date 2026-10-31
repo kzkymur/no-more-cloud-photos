@@ -480,7 +480,7 @@ jobs:
     name: Backup / actual systemd all-pool cutover and separate resume
     needs: [test, backup-postgresql17]
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       GOTOOLCHAIN: local
     steps:
@@ -491,31 +491,14 @@ jobs:
         with:
           go-version: 1.27.1
           cache: true
-      - name: Install real service runtime dependencies
+      - name: Install isolated systemd machine provisioner
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            postgresql-common util-linux libimage-exiftool-perl ffmpeg \
-            libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev libde265-dev
-          workspace=$(realpath -e -- "${GITHUB_WORKSPACE:?}")
-          config=$(realpath -e -- "$workspace/infra/ubuntu/sysusers.d/nmcp.conf")
-          test "$config" = "$workspace/infra/ubuntu/sysusers.d/nmcp.conf"
-          test -f "$config" && test ! -L "$config"
-          sudo systemd-sysusers "$config"
-          python3 - <<'PYUID'
-          import grp, os, pwd
-          runtime, backup, postgres = [pwd.getpwnam(name) for name in ('nmcp', 'nmcp-backup', 'postgres')]
-          assert len({runtime.pw_uid, backup.pw_uid, postgres.pw_uid, 0}) == 4
-          assert len({runtime.pw_gid, backup.pw_gid, postgres.pw_gid, 0}) == 4
-          for user in (runtime, backup):
-              assert user.pw_gid != 0 and grp.getgrgid(user.pw_gid).gr_name == user.pw_name
-              assert user.pw_dir == '/var/lib/' + user.pw_name
-              assert user.pw_shell == '/usr/sbin/nologin'
-              assert set(os.getgrouplist(user.pw_name, user.pw_gid)) == {user.pw_gid}
-              print(f'Isolated UID verified: {user.pw_name} uid={user.pw_uid} gid={user.pw_gid}')
-          PYUID
+          sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
+          bash -n scripts/run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
       - name: Receive exact-head native closure
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -535,8 +518,6 @@ jobs:
           sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
           /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
-          sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -r /opt/nmcp-pg17-ci/bin/initdb
-          sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -x /opt/nmcp-pg17-ci/bin/postgres
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-root-cleanup
           go test -c -o "$RUNNER_TEMP/backup-live.test" ./internal/admin
           "$RUNNER_TEMP/backup-live.test" -test.list '^TestBackupPG17LiveCutover$' | grep -Fx TestBackupPG17LiveCutover
@@ -546,6 +527,7 @@ jobs:
           set -euo pipefail
           sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
             TEST_BACKUP_LIVE_SYSTEMD=1 \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
             TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
@@ -557,21 +539,25 @@ jobs:
             TEST_BACKUP_CORE_API="$RUNNER_TEMP/backup-live-binaries/core-api" \
             TEST_BACKUP_CORE_WORKER="$RUNNER_TEMP/backup-live-binaries/core-worker" \
             TEST_BACKUP_ADMIN_BINARY="$RUNNER_TEMP/backup-live-binaries/nmcp-admin" \
-            "$RUNNER_TEMP/backup-live.test" -test.v -test.count=1 -test.timeout=18m \
+            bash scripts/run-backup-root-isolated "$RUNNER_TEMP/backup-live.test" -test.v -test.count=1 -test.timeout=18m \
             -test.run '^TestBackupPG17LiveCutover$' | tee "$RUNNER_TEMP/backup-live-cutover.log"
           grep -F -- '--- PASS: TestBackupPG17LiveCutover ' "$RUNNER_TEMP/backup-live-cutover.log"
           ! grep -F -- '--- SKIP: TestBackupPG17LiveCutover' "$RUNNER_TEMP/backup-live-cutover.log"
-      - name: Always stop only receipt-owned live cutover units
+      - name: Always stop only receipt-owned isolated machine
         if: always()
         shell: bash
         run: |
-          sudo env NMCP_EXPECTED_HEAD="${{ github.sha }}" python3 scripts/cleanup-backup-root-fixture
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            bash scripts/run-backup-root-isolated --cleanup live
 
   backup-offline-recovery:
     name: Backup / offline two-cluster source-stop recovery and separate resume
     needs: [test, backup-postgresql17]
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       GOTOOLCHAIN: local
     steps:
@@ -582,31 +568,14 @@ jobs:
         with:
           go-version: 1.27.1
           cache: true
-      - name: Install real service runtime dependencies
+      - name: Install isolated systemd machine provisioner
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            postgresql-common util-linux libimage-exiftool-perl ffmpeg \
-            libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev libde265-dev
-          workspace=$(realpath -e -- "${GITHUB_WORKSPACE:?}")
-          config=$(realpath -e -- "$workspace/infra/ubuntu/sysusers.d/nmcp.conf")
-          test "$config" = "$workspace/infra/ubuntu/sysusers.d/nmcp.conf"
-          test -f "$config" && test ! -L "$config"
-          sudo systemd-sysusers "$config"
-          python3 - <<'PYUID'
-          import grp, os, pwd
-          runtime, backup, postgres = [pwd.getpwnam(name) for name in ('nmcp', 'nmcp-backup', 'postgres')]
-          assert len({runtime.pw_uid, backup.pw_uid, postgres.pw_uid, 0}) == 4
-          assert len({runtime.pw_gid, backup.pw_gid, postgres.pw_gid, 0}) == 4
-          for user in (runtime, backup):
-              assert user.pw_gid != 0 and grp.getgrgid(user.pw_gid).gr_name == user.pw_name
-              assert user.pw_dir == '/var/lib/' + user.pw_name
-              assert user.pw_shell == '/usr/sbin/nologin'
-              assert set(os.getgrouplist(user.pw_name, user.pw_gid)) == {user.pw_gid}
-              print(f'Isolated UID verified: {user.pw_name} uid={user.pw_uid} gid={user.pw_gid}')
-          PYUID
+          sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
+          bash -n scripts/run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
       - name: Receive exact-head native closure
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -626,8 +595,6 @@ jobs:
           sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
           /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
-          sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -r /opt/nmcp-pg17-ci/bin/initdb
-          sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -x /opt/nmcp-pg17-ci/bin/postgres
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-root-cleanup
           go test -c -o "$RUNNER_TEMP/backup-offline.test" ./internal/admin
           "$RUNNER_TEMP/backup-offline.test" -test.list '^TestRestoreOfflineRootTwoClusters$' | grep -Fx TestRestoreOfflineRootTwoClusters
@@ -637,6 +604,7 @@ jobs:
           set -euo pipefail
           sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
             TEST_BACKUP_OFFLINE_SYSTEMD=1 \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
             TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
@@ -648,12 +616,16 @@ jobs:
             TEST_BACKUP_CORE_API="$RUNNER_TEMP/backup-live-binaries/core-api" \
             TEST_BACKUP_CORE_WORKER="$RUNNER_TEMP/backup-live-binaries/core-worker" \
             TEST_BACKUP_ADMIN_BINARY="$RUNNER_TEMP/backup-live-binaries/nmcp-admin" \
-            "$RUNNER_TEMP/backup-offline.test" -test.v -test.count=1 -test.timeout=18m \
+            bash scripts/run-backup-root-isolated "$RUNNER_TEMP/backup-offline.test" -test.v -test.count=1 -test.timeout=18m \
             -test.run '^TestRestoreOfflineRootTwoClusters$' | tee "$RUNNER_TEMP/backup-offline-recovery.log"
           grep -F -- '--- PASS: TestRestoreOfflineRootTwoClusters ' "$RUNNER_TEMP/backup-offline-recovery.log"
           ! grep -F -- '--- SKIP: TestRestoreOfflineRootTwoClusters' "$RUNNER_TEMP/backup-offline-recovery.log"
-      - name: Always stop only receipt-owned live cutover units
+      - name: Always stop only receipt-owned isolated machine
         if: always()
         shell: bash
         run: |
-          sudo env NMCP_EXPECTED_HEAD="${{ github.sha }}" python3 scripts/cleanup-backup-root-fixture
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            bash scripts/run-backup-root-isolated --cleanup offline

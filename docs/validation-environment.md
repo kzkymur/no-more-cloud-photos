@@ -138,3 +138,33 @@ and unrelated untracked files are not sent to the builder.
   that full budget independently to every unit. Worker concurrency starts at
   one. Timer wakeups invoke the application; database configuration determines
   backup/cleanup eligibility.
+
+### Backup root fixtures: isolated systemd machine
+
+The two Issue19 root lanes use `scripts/run-backup-root-isolated` on a disposable
+GitHub-hosted Ubuntu runner. They do not adopt the runner's PostgreSQL units or
+change `/etc/postgresql` ownership. A fresh signed Ubuntu 24.04 root filesystem
+omits `postgresql-common` (whose configuration ownership and service template
+conflict with the deliberately strict empty-fixture preflight). It boots its own
+systemd PID1 and private network, mount, process, `/run`, and `/tmp` namespaces.
+The exact-run repository, PG17 binaries, and native build artifacts are bound
+read-only at their original absolute paths. The existing fixture and production
+identity/permission/HBA checks remain mandatory and unchanged.
+
+The launcher retains a root-only exact-head ownership receipt and diagnostic
+root filesystem below `RUNNER_TEMP`. Normal finalization and the workflow's
+outer `always()` step both run receipt-scoped cleanup **inside that machine**,
+then stop only its identity-checked machine and verify process absence. Use
+`--cleanup live` or `--cleanup offline` with the same explicit CI/head/path
+environment; never run the inner cleanup helper against the host manager.
+A missing receipt is a no-op; a stale or unverifiable receipt fails closed.
+Unexpected boot, runtime-library, identity, cleanup, or machine-shutdown errors
+fail the lane rather than become skipped success. Logs and rootfs are preserved
+for runner diagnostics, not installed on a customer machine.
+
+Pure launcher tests do not prove actual boot, service sandboxing, resource
+limits, restore/cutover, timeout cleanup, or HBA behavior. Those remain separate
+mandatory supported-runner executions. An interrupted unregistered launch or
+already-dead guest can prevent verified in-guest cleanup; that is a failed
+acceptance condition, not a successful cleanup receipt. Hosted VM disposal is
+only the final containment boundary, not product acceptance evidence.
