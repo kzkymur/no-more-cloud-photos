@@ -264,7 +264,7 @@ func (f *pg17Fixture) pool(role, db string) *pgxpool.Pool {
 func (f *pg17Fixture) sql(p *pgxpool.Pool, sql string, args ...any) {
 	f.t.Helper()
 	if _, e := p.Exec(f.ctx, sql, args...); e != nil {
-		f.t.Fatal("PG17 SQL phase failed (raw error suppressed)")
+		f.t.Fatalf("PG17 SQL phase failed: sqlstate=%s (query/raw error suppressed)", fixtureSQLState(e))
 	}
 }
 func (f *pg17Fixture) bootstrap(after bool) {

@@ -3,6 +3,7 @@
 set -euo pipefail
 exec /usr/bin/python3 - "$@" <<'PY'
 import json
+import ctypes
 import os
 from pathlib import Path
 import re
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import time
 import uuid
+
+NATIVE_PREFIX = Path('/opt/nmcp-native-ci')
 
 HOST_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': '/root', 'LC_ALL': 'C'}
 KEYS = ('GITHUB_ACTIONS', 'RUNNER_ENVIRONMENT', 'TEST_BACKUP_CANDIDATE_SHA',
@@ -310,27 +313,66 @@ def bootstrap_environment(work):
                   'tries = 3\nwaitretry = 1\ncheck_certificate = on\n')
     return dict(HOST_ENV, WGETRC=str(config))
 
-def run_bootstrap(argv, env, log):
-    # A timeout of subprocess.run kills only debootstrap, not its downloader.
-    # Own a fresh session/group, and attest its live leader before stopping it.
-    proc = sp.Popen(argv, env=env, stdout=log, stderr=sp.STDOUT, start_new_session=True)
-    started = process_identity(proc.pid)
+def child_subreaper(value=None):
+    # Per-process Linux setting, not a host manager/global configuration.
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    if libc.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'read child subreaper')
+    if value is not None and libc.prctl(36, int(value), 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), 'set child subreaper')
+    return previous.value
+
+def reap_bootstrap_group(pgid):
+    deadline = time.monotonic() + 10
+    while True:
+        # Only adopted children in the exact newly-created acquisition group.
+        try:
+            while os.waitpid(-pgid, os.WNOHANG)[0]:
+                pass
+        except ChildProcessError:
+            pass
+        try:
+            os.killpg(pgid, 0)  # Existence check only, never a termination signal.
+        except ProcessLookupError:
+            print('Owned bootstrap process group absent and children reaped', flush=True)
+            return
+        require(time.monotonic() < deadline, 'bootstrap process group did not drain')
+        time.sleep(0.02)
+
+def run_bootstrap(argv, env, log, timeout=900):
+    # Subreaping lets us wait for descendants rather than equating launcher
+    # exit with their absence. Restore the previous setting on every path.
+    previous = child_subreaper(True)
     try:
-        require(started is not None, 'bootstrap launcher identity unavailable')
-        code = proc.wait(timeout=900)
-        if code:
-            raise sp.CalledProcessError(code, argv)
-    except BaseException:
-        if proc.returncode is None:
+        proc = sp.Popen(argv, env=env, stdout=log, stderr=sp.STDOUT, start_new_session=True)
+        started = process_identity(proc.pid)
+        try:
+            require(started is not None, 'bootstrap launcher identity unavailable')
+            code = proc.wait(timeout=timeout)
+            if code:
+                raise sp.CalledProcessError(code, argv)
+            reap_bootstrap_group(proc.pid)
+        except BaseException:
             try:
-                require(started is not None and process_identity(proc.pid) == started and
-                        os.getsid(proc.pid) == proc.pid and os.getpgid(proc.pid) == proc.pid,
-                        'refuse unattested bootstrap process group')
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=30)
+                if proc.returncode is None:
+                    require(started is not None and process_identity(proc.pid) == started and
+                            os.getsid(proc.pid) == proc.pid and os.getpgid(proc.pid) == proc.pid,
+                            'refuse unattested bootstrap process group')
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=30)
+                reap_bootstrap_group(proc.pid)
             except Exception as cleanup_error:
                 print('FAIL bootstrap group cleanup: ' + str(cleanup_error), file=sys.stderr, flush=True)
+            raise
+    except BaseException:
+        try:
+            child_subreaper(previous)
+        except Exception as restore_error:
+            print('FAIL restore child subreaper: ' + str(restore_error), file=sys.stderr, flush=True)
         raise
+    else:
+        child_subreaper(previous)
 
 def machine_scope(machine):
     require(re.fullmatch(r'nmcp-backup-[0-9a-f]{32}', machine), 'invalid owned machine')
@@ -390,8 +432,9 @@ def main():
             'unexpected test arguments')
     require(env['TEST_BACKUP_PG17_BINDIR'] == '/opt/nmcp-pg17-ci/bin', 'unexpected PG prefix')
     pg = canonical('/opt/nmcp-pg17-ci')
+    require(env['TEST_BACKUP_NATIVE_PREFIX'] == str(NATIVE_PREFIX), 'unexpected native prefix')
+    native = canonical(str(NATIVE_PREFIX))
     expected = {
-        'TEST_BACKUP_NATIVE_PREFIX': 'still-toolchain',
         'TEST_BACKUP_STILL_HELPER': 'still-helper-build/bin/nmcp-still-helper',
         'TEST_BACKUP_ANIMATION_HELPER': 'animation-helper-build/bin/nmcp-animation-helper',
         'TEST_BACKUP_ICC_PATH': 'sRGB2014.icc',
@@ -407,8 +450,8 @@ def main():
             'native absolute build prefix mismatch')
     # Do not bind RUNNER_TEMP itself: it contains the guest rootfs. All binds
     # below are immutable inputs, never host runtime state or control sockets.
-    binds = [repo, pg, binary] + [temp / name for name in (
-        'still-toolchain', 'still-helper-build', 'animation-helper-build',
+    binds = [repo, pg, native, binary] + [temp / name for name in (
+        'still-helper-build', 'animation-helper-build',
         'backup-live-binaries', 'sRGB2014.icc', 'orientation-6.jpg')]
     for path in binds:
         canonical(str(path))

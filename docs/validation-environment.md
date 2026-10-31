@@ -151,6 +151,14 @@ The exact-run repository, PG17 binaries, and native build artifacts are bound
 read-only at their original absolute paths. The existing fixture and production
 identity/permission/HBA checks remain mandatory and unchanged.
 
+Native CI dependencies are built and received at the same fixed
+`/opt/nmcp-native-ci` prefix. Their ELF search paths and the video helper's
+strict sibling/manifest/RPATH checks therefore remain valid beneath production
+`ProtectHome=yes`. Same-path mounts beneath `/home` cannot bypass that setting,
+and helper subprocesses intentionally do not inherit `LD_LIBRARY_PATH`. No
+production sandbox directive, helper environment allowlist, or RPATH verifier
+is relaxed to accommodate build artifacts.
+
 The launcher retains a root-only exact-head ownership receipt and diagnostic
 root filesystem below `RUNNER_TEMP`. Normal finalization and the workflow's
 outer `always()` step both run receipt-scoped cleanup **inside that machine**,
@@ -168,9 +176,13 @@ provisioning deadline. HTTPS certificate checks, archive signatures, and package
 verification remain mandatory. This configuration is passed only to bootstrap,
 not to guest tests. On a caught timeout or interruption, the launcher signals
 only its freshly created, live PID/start-time/session/group-attested bootstrap
-process group and reaps its launcher. An unattestable leader or abrupt outer
-termination still fails closed; descendant absence after such interruption is
-not established merely by a no-machine cleanup result.
+process group. A process-local child-subreaper setting lets it reap adopted
+children only in that group and require group absence; the prior setting is
+restored on return or failure. Controlled unprivileged timeout/cancel probes
+exercise this path with a real signal-resistant descendant and an unaffected
+separate session. These are not live PostgreSQL outer-interruption proofs. An
+unattestable leader or abrupt outer termination still fails closed; descendant
+absence after such interruption is not established by a no-machine cleanup.
 
 Pure launcher tests do not prove actual boot, service sandboxing, resource
 limits, restore/cutover, timeout cleanup, or HBA behavior. Those remain separate

@@ -201,6 +201,9 @@ func newLiveCutoverFixture(t *testing.T, bin string, clusters ...string) *liveCu
 		c := exec.Command("/usr/bin/systemctl", "show", "--property=LoadState", "--value", u)
 		b, e := c.Output()
 		load := strings.TrimSpace(string(b))
+		if u == "nmcp.slice" {
+			t.Logf("fixture slice load inspection before branching: unit=%s inspection_error=%t load_state=%.256q", u, e != nil, load)
+		}
 		if e == nil && u == "nmcp.slice" && load == "loaded" {
 			// systemd synthesizes inactive slices without any unit fragment.
 			// Accept only this exact pristine manager object, never an active,
@@ -468,7 +471,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		}
 	}
 	prefix := os.Getenv("TEST_BACKUP_NATIVE_PREFIX")
-	if !filepath.IsAbs(prefix) || filepath.Clean(prefix) != prefix {
+	if prefix != "/opt/nmcp-native-ci" {
 		t.Fatal("TEST_BACKUP_NATIVE_PREFIX absolute closure required")
 	}
 	st, e := os.Stat(prefix)
@@ -580,6 +583,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
+			logLiveNativeReadiness(t, ctx, source)
 			t.Fatal("actual pinned native helper job did not finish before backup")
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -1074,7 +1078,7 @@ func (f *liveCutoverFixture) installLiveUnits(artifacts map[string]string, prefi
 			env += "NMCP_API_ADDR=127.0.0.1:8080\nNMCP_CURSOR_HMAC_KEY=live-cutover-isolated-fixture-key-32bytes\n"
 		}
 		if item.file == "worker.env" {
-			env += "NMCP_STILL_HELPER_PATH=/opt/nmcp/current/bin/nmcp-still-helper\nNMCP_ANIMATION_HELPER_PATH=/opt/nmcp/current/bin/nmcp-animation-helper\nNMCP_VIDEO_HELPER_PATH=" + video + "\nNMCP_PRLIMIT_PATH=/usr/bin/prlimit\nNMCP_SRGB_ICC_PATH=/opt/nmcp/current/sRGB.icc\nNMCP_SRGB_ICC_SHA256=" + config.RequiredSRGBICCSHA256 + "\nLD_LIBRARY_PATH=" + prefix + "/lib:" + prefix + "/lib64\n"
+			env += "NMCP_STILL_HELPER_PATH=/opt/nmcp/current/bin/nmcp-still-helper\nNMCP_ANIMATION_HELPER_PATH=/opt/nmcp/current/bin/nmcp-animation-helper\nNMCP_VIDEO_HELPER_PATH=" + video + "\nNMCP_PRLIMIT_PATH=/usr/bin/prlimit\nNMCP_SRGB_ICC_PATH=/opt/nmcp/current/sRGB.icc\nNMCP_SRGB_ICC_SHA256=" + config.RequiredSRGBICCSHA256 + "\n"
 		}
 		f.write("/etc/nmcp/"+item.file, env, 0600)
 	}
@@ -1120,7 +1124,7 @@ func (f *liveCutoverFixture) installLiveUnits(artifacts map[string]string, prefi
 		f.owned[path] = st
 	}
 	// Preserve all production hardening. Narrow read-only mounts expose only
-	// trusted artifact prefixes needed by embedded native rpaths under /home.
+	// trusted fixed /opt prefixes needed by embedded native rpaths.
 	// No sandbox directive is reset or weakened. Unit source bytes remain exact.
 	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service", "nmcp-backup.service"} {
 		dir := "/etc/systemd/system/" + unit + ".d"

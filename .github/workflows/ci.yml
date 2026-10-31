@@ -106,19 +106,23 @@ jobs:
           printf '%s  %s\n' \
             f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38 \
             "${RUNNER_TEMP}/canon-a410.dng" | sha256sum --check
+          # The production sandbox hides /home; native ELF paths must be /opt.
+          test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
+          sudo mkdir -m 0755 /opt/nmcp-native-ci
+          sudo chown "$(id -u):$(id -g)" /opt/nmcp-native-ci
           chmod +x internal/stillprocessor/helper/build-pinned-toolchain.sh
           internal/stillprocessor/helper/build-pinned-toolchain.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/still-toolchain-work"
+            "/opt/nmcp-native-ci" "${RUNNER_TEMP}/still-toolchain-work"
           heic_fixture="${RUNNER_TEMP}/still-toolchain-work/source/libheif-1.23.5/examples/example.heic"
           printf '%s  %s\n' \
             7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2 \
             "${heic_fixture}" | sha256sum --check
-          export PKG_CONFIG_PATH="${RUNNER_TEMP}/still-toolchain/lib/pkgconfig:${RUNNER_TEMP}/still-toolchain/lib64/pkgconfig"
-          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
+          export PKG_CONFIG_PATH="/opt/nmcp-native-ci/lib/pkgconfig:/opt/nmcp-native-ci/lib64/pkgconfig"
+          export LD_LIBRARY_PATH="/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64"
           cmake -S internal/stillprocessor/helper \
             -B "${RUNNER_TEMP}/still-helper-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/still-toolchain"
+            -DCMAKE_PREFIX_PATH="/opt/nmcp-native-ci"
           cmake --build "${RUNNER_TEMP}/still-helper-build" --parallel 2
           ctest --test-dir "${RUNNER_TEMP}/still-helper-build" --output-on-failure
           "${RUNNER_TEMP}/still-helper-build/bin/nmcp-heif-fixture-generator" \
@@ -144,18 +148,18 @@ jobs:
             "${RUNNER_TEMP}/generated-heif-fixtures/invalid-icc.avif" \
             "${RUNNER_TEMP}/generated-heif-fixtures/collection-primary-second.avif" >> "${GITHUB_ENV}"
           printf 'LD_LIBRARY_PATH=%s\n' \
-            "${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64" >> "${GITHUB_ENV}"
+            "/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64" >> "${GITHUB_ENV}"
       - name: Build pinned native animation helper and fixtures
         run: |
           chmod +x internal/animationprocessor/helper/build-pinned-codecs.sh
           internal/animationprocessor/helper/build-pinned-codecs.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/animation-toolchain-work"
-          export PKG_CONFIG_PATH="${RUNNER_TEMP}/still-toolchain/lib/pkgconfig:${RUNNER_TEMP}/still-toolchain/lib64/pkgconfig"
-          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
+            "/opt/nmcp-native-ci" "${RUNNER_TEMP}/animation-toolchain-work"
+          export PKG_CONFIG_PATH="/opt/nmcp-native-ci/lib/pkgconfig:/opt/nmcp-native-ci/lib64/pkgconfig"
+          export LD_LIBRARY_PATH="/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64"
           cmake -S internal/animationprocessor/helper \
             -B "${RUNNER_TEMP}/animation-helper-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DNMCP_PINNED_PREFIX="${RUNNER_TEMP}/still-toolchain"
+            -DNMCP_PINNED_PREFIX="/opt/nmcp-native-ci"
           cmake --build "${RUNNER_TEMP}/animation-helper-build" --parallel 2
           ctest --test-dir "${RUNNER_TEMP}/animation-helper-build" --output-on-failure
           "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-animation-fixture-generator" \
@@ -179,18 +183,18 @@ jobs:
       - name: Build isolated pinned video toolchain and fixtures
         run: |
           timeout 20m internal/videoprocessor/helper/build-pinned-toolchain.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/video-toolchain-work"
-          timeout 2m go build -o "${RUNNER_TEMP}/still-toolchain/bin/nmcp-video-helper" \
+            "/opt/nmcp-native-ci" "${RUNNER_TEMP}/video-toolchain-work"
+          timeout 2m go build -o "/opt/nmcp-native-ci/bin/nmcp-video-helper" \
             ./cmd/nmcp-video-helper
-          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
-          video_helper="${RUNNER_TEMP}/still-toolchain/bin/nmcp-video-helper"
+          export LD_LIBRARY_PATH="/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64"
+          video_helper="/opt/nmcp-native-ci/bin/nmcp-video-helper"
           capabilities=$(timeout 1m "${video_helper}" capabilities --protocol 1 --threads 1 \
             --srgb-icc /proc/self/fd/3 3<"${RUNNER_TEMP}/sRGB2014.icc")
           printf '%s\n' "${capabilities}"
           CAPABILITIES="${capabilities}" python3 -c \
             'import json,os; r=json.loads(os.environ["CAPABILITIES"])["result"]; v=r["library_versions"]; assert v=={"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libaom":"v3.8.2"} and r["video_encoder"]=="libsvtav1" and r["audio_encoder"]=="aac-lc" and r["tone_map"]=="zscale+hable" and r["build_manifest"]=="ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1", r'
-          ldd "${RUNNER_TEMP}/still-toolchain/bin/ffmpeg" | tee "${RUNNER_TEMP}/video-ffmpeg-ldd.txt"
-          python3 - "${RUNNER_TEMP}/video-ffmpeg-ldd.txt" "${RUNNER_TEMP}/still-toolchain" <<'PY'
+          ldd "/opt/nmcp-native-ci/bin/ffmpeg" | tee "${RUNNER_TEMP}/video-ffmpeg-ldd.txt"
+          python3 - "${RUNNER_TEMP}/video-ffmpeg-ldd.txt" "/opt/nmcp-native-ci" <<'PY'
           import pathlib,sys
           text=pathlib.Path(sys.argv[1]).read_text()
           prefix=sys.argv[2]
@@ -363,14 +367,17 @@ jobs:
           go build -o "$RUNNER_TEMP/backup-live-binaries/nmcp-admin" ./cmd/nmcp-admin
           printf '%s\n' "$RUNNER_TEMP" > "$RUNNER_TEMP/native-build-prefix.txt"
           tar -czf "$RUNNER_TEMP/backup-native-closure.tar.gz" -C "$RUNNER_TEMP" \
-            still-toolchain still-helper-build/bin/nmcp-still-helper \
+            still-helper-build/bin/nmcp-still-helper \
             animation-helper-build/bin/nmcp-animation-helper sRGB2014.icc \
             orientation-6.jpg backup-live-binaries native-build-prefix.txt
+          tar -czf "$RUNNER_TEMP/backup-native-toolchain.tar.gz" -C /opt nmcp-native-ci
       - name: Publish exact-head native closure
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: backup-native-${{ github.sha }}
-          path: ${{ runner.temp }}/backup-native-closure.tar.gz
+          path: |
+            ${{ runner.temp }}/backup-native-closure.tar.gz
+            ${{ runner.temp }}/backup-native-toolchain.tar.gz
           if-no-files-found: error
           retention-days: 1
       - name: Preserve failed probe acquisition identity
@@ -459,11 +466,11 @@ jobs:
           sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
             TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
             "$RUNNER_TEMP/backup17.test" -test.v -test.count=1 -test.timeout=10m \
-            -test.run '^(TestBackupPG17(ProductionRoles|OperatorRestore|LifecycleMigration|AuthorityLossDuringRealDump|RetentionPolicySerialization|SourceOnlyHBA)|TestRestoreConnectionPG17Pinned)$' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
+            -test.run '^(TestBackupPG17(ProductionRoles|OperatorRestore|LifecycleMigration|AuthorityLossDuringRealDump|RetentionPolicySerialization|SourceOnlyHBA|FixtureMembershipDDL)|TestRestoreConnectionPG17Pinned)$' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
           grep -F -- '--- PASS: TestBackupPG17ProductionRoles ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
           grep -F -- '--- PASS: TestBackupPG17OperatorRestore ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
           ! grep -F -- '--- SKIP: TestBackupPG17' "$RUNNER_TEMP/backup-pg17-acceptance.log"
-          for name in TestBackupPG17AuthorityLossDuringRealDump TestBackupPG17RetentionPolicySerialization TestBackupPG17SourceOnlyHBA TestRestoreConnectionPG17Pinned; do
+          for name in TestBackupPG17AuthorityLossDuringRealDump TestBackupPG17RetentionPolicySerialization TestBackupPG17SourceOnlyHBA TestBackupPG17FixtureMembershipDDL TestRestoreConnectionPG17Pinned; do
             grep -F -- "--- PASS: $name " "$RUNNER_TEMP/backup-pg17-acceptance.log"
           done
           ! grep -F -- '--- SKIP: TestRestoreConnectionPG17Pinned' "$RUNNER_TEMP/backup-pg17-acceptance.log"
@@ -514,6 +521,8 @@ jobs:
         run: |
           set -euo pipefail
           tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
+          test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-toolchain.tar.gz" -C /opt
           test ! -e /opt/nmcp-pg17-ci
           sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
@@ -531,7 +540,7 @@ jobs:
             TEST_BACKUP_LIVE_SYSTEMD=1 \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
             TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
-            TEST_BACKUP_NATIVE_PREFIX="$RUNNER_TEMP/still-toolchain" \
+            TEST_BACKUP_NATIVE_PREFIX="/opt/nmcp-native-ci" \
             TEST_BACKUP_STILL_HELPER="$RUNNER_TEMP/still-helper-build/bin/nmcp-still-helper" \
             TEST_BACKUP_ANIMATION_HELPER="$RUNNER_TEMP/animation-helper-build/bin/nmcp-animation-helper" \
             TEST_BACKUP_ICC_PATH="$RUNNER_TEMP/sRGB2014.icc" \
@@ -591,6 +600,8 @@ jobs:
         run: |
           set -euo pipefail
           tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
+          test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-toolchain.tar.gz" -C /opt
           test ! -e /opt/nmcp-pg17-ci
           sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
@@ -608,7 +619,7 @@ jobs:
             TEST_BACKUP_OFFLINE_SYSTEMD=1 \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
             TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
-            TEST_BACKUP_NATIVE_PREFIX="$RUNNER_TEMP/still-toolchain" \
+            TEST_BACKUP_NATIVE_PREFIX="/opt/nmcp-native-ci" \
             TEST_BACKUP_STILL_HELPER="$RUNNER_TEMP/still-helper-build/bin/nmcp-still-helper" \
             TEST_BACKUP_ANIMATION_HELPER="$RUNNER_TEMP/animation-helper-build/bin/nmcp-animation-helper" \
             TEST_BACKUP_ICC_PATH="$RUNNER_TEMP/sRGB2014.icc" \

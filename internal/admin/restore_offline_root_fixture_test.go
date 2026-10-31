@@ -34,6 +34,10 @@ import (
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
+// PostgreSQL bool output is t/f, which is not legal unquoted GRANT syntax.
+// Preserve all three options and the exact grantor using Boolean keywords.
+const offlineMembershipDDLQuery = `SELECT format('GRANT %I TO %I WITH ADMIN %s, INHERIT %s, SET %s GRANTED BY %I',r.rolname,m.rolname,CASE WHEN a.admin_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.inherit_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.set_option THEN 'TRUE' ELSE 'FALSE' END,g.rolname) FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE starts_with(r.rolname,'nmcp_') OR starts_with(m.rolname,'nmcp_') ORDER BY r.rolname,m.rolname,g.rolname`
+
 func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	if os.Getenv("TEST_BACKUP_OFFLINE_SYSTEMD") != "1" {
 		t.Skip("TEST_BACKUP_OFFLINE_SYSTEMD=1 absent: real fixed-path systemd cutover NOT executed")
@@ -69,7 +73,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 		}
 	}
 	prefix := os.Getenv("TEST_BACKUP_NATIVE_PREFIX")
-	if !filepath.IsAbs(prefix) || filepath.Clean(prefix) != prefix {
+	if prefix != "/opt/nmcp-native-ci" {
 		t.Fatal("TEST_BACKUP_NATIVE_PREFIX absolute closure required")
 	}
 	st, e := os.Stat(prefix)
@@ -173,6 +177,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
+			logLiveNativeReadiness(t, ctx, source)
 			t.Fatal("actual pinned native helper job did not finish before backup")
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -604,7 +609,7 @@ func (f *liveCutoverFixture) newOfflineCandidate(source *pgxpool.Pool) (*liveCut
 			g.sql(admin, "ALTER ROLE "+pgx.Identifier{role}.Sanitize()+" PASSWORD '"+password+"'")
 		}
 	}
-	rows, err = source.Query(g.ctx, `SELECT format('GRANT %I TO %I WITH ADMIN %s, INHERIT %s, SET %s GRANTED BY %I',r.rolname,m.rolname,a.admin_option,a.inherit_option,a.set_option,g.rolname) FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE starts_with(r.rolname,'nmcp_') OR starts_with(m.rolname,'nmcp_') ORDER BY r.rolname,m.rolname,g.rolname`)
+	rows, err = source.Query(g.ctx, offlineMembershipDDLQuery)
 	if err != nil {
 		t.Fatal("source membership inventory")
 	}

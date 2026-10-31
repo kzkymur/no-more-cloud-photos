@@ -187,7 +187,7 @@ class Isolation(unittest.TestCase):
             with patch.object(MODULE.sp,'Popen',return_value=proc) as popen, \
                     patch.object(MODULE,'process_identity',side_effect=['start','start' if same_identity else 'reused']), \
                     patch.object(MODULE.os,'getsid',return_value=sid),patch.object(MODULE.os,'getpgid',return_value=pgid), \
-                    patch.object(MODULE.os,'killpg') as kill,patch('builtins.print'):
+                    patch.object(MODULE.os,'killpg') as kill,patch.object(MODULE,'reap_bootstrap_group'),patch('builtins.print'):
                 with self.assertRaises(MODULE.sp.TimeoutExpired) as raised:
                     MODULE.run_bootstrap(['debootstrap'],{'WGETRC':'/private/wgetrc'},None)
                 self.assertIs(raised.exception,timeout)
@@ -197,6 +197,68 @@ class Isolation(unittest.TestCase):
                     self.assertEqual(proc.wait.call_args_list,[unittest.mock.call(timeout=900),unittest.mock.call(timeout=30)])
                 else:
                     kill.assert_not_called()
+
+    def test_actual_bootstrap_timeout_reaps_own_descendant(self):
+        before=MODULE.child_subreaper()
+        with tempfile.TemporaryDirectory() as temp:
+            child=pathlib.Path(temp)/'child.pid'
+            program="import os,signal,time,pathlib,sys; p=os.fork(); signal.signal(signal.SIGTERM,signal.SIG_IGN); (pathlib.Path(sys.argv[1]).write_text(str(os.getpid())),pathlib.Path(sys.argv[1]+'.ready').touch()) if p==0 else None; time.sleep(90)"
+            unrelated=MODULE.sp.Popen(['/usr/bin/python3','-c','import time; time.sleep(30)'],start_new_session=True)
+            try:
+                with self.assertRaises(MODULE.sp.TimeoutExpired):
+                    MODULE.run_bootstrap(['/usr/bin/python3','-c',program,str(child)],MODULE.HOST_ENV,None,timeout=1)
+                pid=int(child.read_text())
+                self.assertIsNone(MODULE.process_identity(pid))
+                self.assertIsNone(unrelated.poll(),'another session was affected')
+                self.assertEqual(MODULE.child_subreaper(),before)
+            finally:
+                unrelated.terminate()
+                unrelated.wait(timeout=5)
+
+    def test_actual_bootstrap_cancel_reaps_own_descendant(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child=pathlib.Path(temp)/'child.pid'
+            program="import os,signal,time,pathlib,sys; p=os.fork(); signal.signal(signal.SIGTERM,signal.SIG_IGN); (pathlib.Path(sys.argv[1]).write_text(str(os.getpid())),pathlib.Path(sys.argv[1]+'.ready').touch()) if p==0 else None; time.sleep(90)"
+            worker="""import runpy,signal,sys
+m=runpy.run_path(sys.argv[1])['MODULE']
+before=m.child_subreaper()
+def cancel(*args): raise RuntimeError('controlled cancel')
+signal.signal(signal.SIGTERM,cancel)
+try: m.run_bootstrap(['/usr/bin/python3','-c',sys.argv[2],sys.argv[3]],m.HOST_ENV,None,timeout=15)
+except RuntimeError:
+    assert m.child_subreaper()==before
+    sys.exit(37)
+sys.exit(1)
+"""
+            proc=MODULE.sp.Popen(['/usr/bin/python3','-c',worker,str(pathlib.Path(__file__).resolve()),program,str(child)],
+                                 stdout=MODULE.sp.PIPE,stderr=MODULE.sp.STDOUT,text=True)
+            try:
+                deadline=MODULE.time.monotonic()+5
+                ready=pathlib.Path(str(child)+'.ready')
+                while not ready.exists() and proc.poll() is None and MODULE.time.monotonic()<deadline:
+                    MODULE.time.sleep(0.02)
+                self.assertTrue(ready.exists(),'controlled descendant failed to start')
+                pid=int(child.read_text())
+                proc.send_signal(MODULE.signal.SIGTERM)
+                output=proc.communicate(timeout=20)[0]
+                self.assertEqual(proc.returncode,37,output)
+                self.assertIn('Owned bootstrap process group absent and children reaped',output)
+                self.assertIsNone(MODULE.process_identity(pid))
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.communicate(timeout=20)
+
+    def test_native_runtime_prefix_preserves_production_sandbox(self):
+        repo=SCRIPT.resolve().parent.parent
+        workflow=(repo/'.github/workflows/ci.yml').read_text()
+        self.assertEqual(str(MODULE.NATIVE_PREFIX),'/opt/nmcp-native-ci')
+        self.assertIn('binds = [repo, pg, native, binary]',SOURCE)
+        self.assertNotIn('"${RUNNER_TEMP}/still-toolchain"',workflow)
+        self.assertNotIn('"${RUNNER_TEMP}/still-toolchain/',workflow)
+        self.assertIn('-C /opt nmcp-native-ci',workflow)
+        self.assertEqual(workflow.count('backup-live-inputs/backup-native-toolchain.tar.gz'),2)
+        self.assertIn('ProtectHome=yes',(repo/'infra/ubuntu/systemd/nmcp-worker.service').read_text())
 
     def test_python_syntax(self):
         ast.parse(SOURCE)
