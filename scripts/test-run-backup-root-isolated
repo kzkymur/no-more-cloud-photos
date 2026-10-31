@@ -180,23 +180,248 @@ class Isolation(unittest.TestCase):
                 MODULE.bootstrap_environment(work)
 
     def test_bootstrap_timeout_group_identity_and_reaping(self):
-        for same_identity,sid,pgid in ((True,99,99),(False,99,99),(True,98,99),(True,99,98)):
+        parent=MODULE.os.getpid()
+        initial=(parent,99,99,'start')
+        for current in (initial,(parent,99,99,'reused'),(parent,98,99,'start'),(parent,99,98,'start'),(parent+1,99,99,'start'),None):
             proc=Mock(pid=99,returncode=None)
             timeout=MODULE.sp.TimeoutExpired(['debootstrap'],900)
-            proc.wait.side_effect=[timeout, -9]
             with patch.object(MODULE.sp,'Popen',return_value=proc) as popen, \
-                    patch.object(MODULE,'process_identity',side_effect=['start','start' if same_identity else 'reused']), \
-                    patch.object(MODULE.os,'getsid',return_value=sid),patch.object(MODULE.os,'getpgid',return_value=pgid), \
+                    patch.object(MODULE,'bootstrap_identity',side_effect=[initial,current]), \
+                    patch.object(MODULE,'observe_bootstrap_exit',side_effect=timeout), \
                     patch.object(MODULE.os,'killpg') as kill,patch.object(MODULE,'reap_bootstrap_group'),patch('builtins.print'):
                 with self.assertRaises(MODULE.sp.TimeoutExpired) as raised:
                     MODULE.run_bootstrap(['debootstrap'],{'WGETRC':'/private/wgetrc'},None)
                 self.assertIs(raised.exception,timeout)
                 self.assertTrue(popen.call_args.kwargs['start_new_session'])
-                if same_identity and sid==99 and pgid==99:
+                if current==initial:
                     kill.assert_called_once_with(99,MODULE.signal.SIGKILL)
-                    self.assertEqual(proc.wait.call_args_list,[unittest.mock.call(timeout=900),unittest.mock.call(timeout=30)])
+                    proc.wait.assert_called_once_with(timeout=30)
                 else:
                     kill.assert_not_called()
+                    proc.wait.assert_not_called()
+
+    def test_bootstrap_lost_wait_ownership_never_signals(self):
+        proc=Mock(pid=99,returncode=None)
+        with patch.object(MODULE.sp,'Popen',return_value=proc), \
+                patch.object(MODULE,'bootstrap_identity',return_value=(MODULE.os.getpid(),99,99,'start')), \
+                patch.object(MODULE,'observe_bootstrap_exit',side_effect=ChildProcessError), \
+                patch.object(MODULE.os,'killpg') as kill,patch('builtins.print'):
+            with self.assertRaises(ChildProcessError): MODULE.run_bootstrap(['fake'],{},None)
+            kill.assert_not_called()
+            proc.wait.assert_not_called()
+        with patch.object(MODULE.signal,'getsignal',return_value=MODULE.signal.SIG_IGN),patch.object(MODULE.sp,'Popen') as launch:
+            with self.assertRaises(RuntimeError): MODULE.run_bootstrap(['fake'],{},None)
+            launch.assert_not_called()
+        with patch.object(MODULE.Path,'iterdir',return_value=iter([1,2])),patch.object(MODULE.sp,'Popen') as launch:
+            with self.assertRaises(RuntimeError): MODULE.run_bootstrap(['fake'],{},None)
+            launch.assert_not_called()
+
+    def test_actual_exited_bootstrap_leader_retains_cleanup_authority(self):
+        before=MODULE.child_subreaper()
+        program="""import os,signal,time,pathlib,sys
+r,w=os.pipe()
+p=os.fork()
+if p==0:
+ os.close(r)
+ signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+ os.write(w,b'1');os.close(w)
+ time.sleep(90)
+else:
+ os.close(w);os.read(r,1);os.close(r)
+ code=int(sys.argv[2])
+ if code<0: os.kill(os.getpid(),-code)
+ os._exit(code)
+"""
+        for code in (0,23,-15):
+            with self.subTest(exit_code=code),tempfile.TemporaryDirectory() as temp:
+                child=pathlib.Path(temp)/'child.pid'
+                unrelated=MODULE.sp.Popen(['/usr/bin/python3','-c','import time;time.sleep(30)'],start_new_session=True)
+                sentinel=MODULE.process_identity(unrelated.pid)
+                real_kill=MODULE.os.killpg
+                pins=[]
+                def checked_kill(pgid,sig):
+                    if sig==MODULE.signal.SIGKILL:
+                        # This is a real zombie/direct child, deliberately not reaped.
+                        identity=MODULE.bootstrap_identity(pgid)
+                        self.assertEqual(identity[:3],(MODULE.os.getpid(),pgid,pgid))
+                        status=MODULE.os.waitid(MODULE.os.P_PID,pgid,MODULE.os.WEXITED|MODULE.os.WNOHANG|MODULE.os.WNOWAIT)
+                        self.assertEqual(status.si_status,abs(code))
+                        self.assertEqual(status.si_code,MODULE.os.CLD_EXITED if code>=0 else MODULE.os.CLD_KILLED)
+                        pins.append(pgid)
+                    return real_kill(pgid,sig)
+                try:
+                    with patch.object(MODULE.os,'killpg',side_effect=checked_kill):
+                        if code:
+                            with self.assertRaises(MODULE.sp.CalledProcessError) as raised:
+                                MODULE.run_bootstrap(['/usr/bin/python3','-c',program,str(child),str(code)],MODULE.HOST_ENV,None,timeout=5)
+                            self.assertEqual(raised.exception.returncode,code)
+                        else:
+                            MODULE.run_bootstrap(['/usr/bin/python3','-c',program,str(child),str(code)],MODULE.HOST_ENV,None,timeout=5)
+                    self.assertEqual(len(pins),1)
+                    self.assertIsNone(MODULE.process_identity(pins[0]))
+                    self.assertIsNone(MODULE.process_identity(int(child.read_text())))
+                    self.assertEqual(MODULE.process_identity(unrelated.pid),sentinel)
+                    self.assertIsNone(unrelated.poll())
+                    self.assertEqual(MODULE.child_subreaper(),before)
+                finally:
+                    unrelated.terminate();unrelated.wait(timeout=5)
+
+    def test_bootstrap_deferred_default_and_returning_handlers_cancel(self):
+        previous=MODULE.signal.getsignal(MODULE.signal.SIGTERM)
+        for handler in (MODULE.signal.SIG_DFL,lambda *_: None,MODULE.signal.SIG_IGN):
+            injected=False
+            def identity(pid):
+                nonlocal injected
+                if not injected:
+                    injected=True
+                    MODULE.signal.raise_signal(MODULE.signal.SIGTERM)
+                return (MODULE.os.getpid(),99,99,'start')
+            try:
+                MODULE.signal.signal(MODULE.signal.SIGTERM,handler)
+                with patch.object(MODULE.sp,'Popen',return_value=Mock(pid=99,returncode=None)), \
+                        patch.object(MODULE,'bootstrap_identity',side_effect=identity), \
+                        patch.object(MODULE,'observe_bootstrap_exit',return_value=0), \
+                        patch.object(MODULE,'stop_bootstrap_group') as stop:
+                    if handler==MODULE.signal.SIG_IGN:
+                        MODULE.run_bootstrap(['fake'],{},None)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError,'interrupted during acquisition'):
+                            MODULE.run_bootstrap(['fake'],{},None)
+                    stop.assert_called_once()
+                self.assertEqual(MODULE.signal.getsignal(MODULE.signal.SIGTERM),handler)
+            finally:
+                MODULE.signal.signal(MODULE.signal.SIGTERM,previous)
+
+    def test_bootstrap_partial_handler_install_restores(self):
+        saved={sig:MODULE.signal.getsignal(sig) for sig in (MODULE.signal.SIGTERM,MODULE.signal.SIGINT)}
+        real_signal=MODULE.signal.signal
+        def install(sig,handler):
+            if sig==MODULE.signal.SIGINT and getattr(handler,'__name__','')=='defer_cancel':
+                raise RuntimeError('install refused')
+            return real_signal(sig,handler)
+        with patch.object(MODULE.signal,'signal',side_effect=install),patch.object(MODULE.sp,'Popen') as launch:
+            with self.assertRaisesRegex(RuntimeError,'install refused'): MODULE.run_bootstrap(['fake'],{},None)
+            launch.assert_not_called()
+        for sig,handler in saved.items(): self.assertEqual(MODULE.signal.getsignal(sig),handler)
+
+    def test_bootstrap_cancel_during_final_restore_cannot_succeed(self):
+        saved=MODULE.signal.getsignal(MODULE.signal.SIGTERM)
+        def reaper(value=None):
+            if value==0:
+                MODULE.signal.raise_signal(MODULE.signal.SIGTERM)
+            return 0
+        try:
+            MODULE.signal.signal(MODULE.signal.SIGTERM,MODULE.signal.SIG_DFL)
+            with patch.object(MODULE,'child_subreaper',side_effect=reaper), \
+                    patch.object(MODULE.sp,'Popen',return_value=Mock(pid=99,returncode=None)), \
+                    patch.object(MODULE,'bootstrap_identity',return_value=(MODULE.os.getpid(),99,99,'start')), \
+                    patch.object(MODULE,'observe_bootstrap_exit',return_value=0), \
+                    patch.object(MODULE,'stop_bootstrap_group') as stop:
+                with self.assertRaisesRegex(RuntimeError,'interrupted during acquisition'):
+                    MODULE.run_bootstrap(['fake'],{},None)
+                stop.assert_called_once()
+            self.assertEqual(MODULE.signal.getsignal(MODULE.signal.SIGTERM),MODULE.signal.SIG_DFL)
+        finally:
+            MODULE.signal.signal(MODULE.signal.SIGTERM,saved)
+
+    def test_actual_bootstrap_capture_cancel_reaps_own_descendant(self):
+        self.actual_bootstrap_cancel_at_phase('capture')
+
+    def test_actual_bootstrap_cleanup_cancel_reaps_own_descendant(self):
+        self.actual_bootstrap_cancel_at_phase('cleanup')
+
+    def actual_bootstrap_cancel_at_phase(self,phase):
+        previous=MODULE.child_subreaper(True)
+        saved=MODULE.signal.getsignal(MODULE.signal.SIGTERM)
+        replayed=False
+        injected=False
+        created=[]
+        real_popen=MODULE.sp.Popen
+        real_identity=MODULE.bootstrap_identity
+        child_pid=None
+        child_start=None
+        initial=None
+        captured=False
+        real_kill=MODULE.os.killpg
+        def cancel(*_):
+            nonlocal replayed
+            if phase=='cleanup':
+                self.assertIsNone(MODULE.process_identity(created[0].pid))
+                self.assertIsNone(MODULE.process_identity(child_pid))
+            replayed=True
+            raise RuntimeError('controlled acquisition cancel')
+        def checked_kill(pgid,sig):
+            nonlocal injected
+            if phase=='cleanup' and sig==MODULE.signal.SIGKILL and not injected:
+                injected=True
+                MODULE.signal.raise_signal(MODULE.signal.SIGTERM)
+                self.assertFalse(replayed,'cancellation unwound owned cleanup')
+            return real_kill(pgid,sig)
+        def launch(*args,**kwargs):
+            proc=real_popen(*args,**kwargs)
+            created.append(proc)
+            return proc
+        with tempfile.TemporaryDirectory() as temp:
+            child=pathlib.Path(temp)/'child.pid'
+            program="""import os,signal,time,pathlib,sys
+r,w=os.pipe();p=os.fork()
+if p==0:
+ os.close(r);signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));pathlib.Path(sys.argv[1]+'.ready').touch()
+ os.write(w,b'1');os.close(w);time.sleep(90)
+else:
+ os.close(w);os.read(r,1);os.close(r)
+ if sys.argv[2]=='cleanup': os._exit(0)
+ time.sleep(90)
+"""
+            unrelated=real_popen(['/usr/bin/python3','-c','import time;time.sleep(30)'],start_new_session=True)
+            sentinel=MODULE.process_identity(unrelated.pid)
+            def identity(pid):
+                nonlocal injected,child_pid,child_start,initial,captured
+                result=real_identity(pid)
+                if not captured:
+                    captured=True
+                    initial=result
+                    deadline=MODULE.time.monotonic()+5
+                    while not pathlib.Path(str(child)+'.ready').exists() and MODULE.time.monotonic()<deadline:
+                        MODULE.time.sleep(0.02)
+                    self.assertTrue(pathlib.Path(str(child)+'.ready').exists())
+                    child_pid=int(child.read_text())
+                    child_start=MODULE.process_identity(child_pid)
+                    if phase=='capture':
+                        injected=True
+                        MODULE.signal.raise_signal(MODULE.signal.SIGTERM)
+                        self.assertFalse(replayed,'cancellation unwound ownership capture')
+                return result
+            try:
+                MODULE.signal.signal(MODULE.signal.SIGTERM,cancel)
+                with patch.object(MODULE.sp,'Popen',side_effect=launch),patch.object(MODULE,'bootstrap_identity',side_effect=identity),patch.object(MODULE.os,'killpg',side_effect=checked_kill):
+                    with self.assertRaisesRegex(RuntimeError,'controlled acquisition cancel'):
+                        MODULE.run_bootstrap(['/usr/bin/python3','-c',program,str(child),phase],MODULE.HOST_ENV,None,timeout=5)
+                self.assertTrue(replayed)
+                self.assertIsNone(MODULE.process_identity(created[0].pid))
+                self.assertIsNone(MODULE.process_identity(child_pid))
+                self.assertEqual(MODULE.process_identity(unrelated.pid),sentinel)
+                self.assertIsNone(unrelated.poll())
+                self.assertEqual(MODULE.signal.getsignal(MODULE.signal.SIGTERM),cancel)
+                self.assertEqual(MODULE.child_subreaper(),1)
+            finally:
+                MODULE.signal.signal(MODULE.signal.SIGTERM,saved)
+                # Failure hygiene is limited to this test's retained direct
+                # session leader, or its individually attested adopted child.
+                for proc in created:
+                    if proc.returncode is None and initial is not None and real_identity(proc.pid)==initial:
+                        MODULE.os.killpg(proc.pid,MODULE.signal.SIGKILL)
+                        proc.wait(timeout=5)
+                        MODULE.reap_bootstrap_group(proc.pid)
+                if child_pid is not None and MODULE.process_identity(child_pid)==child_start:
+                    identity_now=real_identity(child_pid)
+                    if identity_now is not None and identity_now[0]==MODULE.os.getpid():
+                        MODULE.os.kill(child_pid,MODULE.signal.SIGKILL)
+                        MODULE.os.waitpid(child_pid,0)
+                unrelated.terminate();unrelated.wait(timeout=5)
+                MODULE.child_subreaper(previous)
 
     def test_actual_bootstrap_timeout_reaps_own_descendant(self):
         before=MODULE.child_subreaper()

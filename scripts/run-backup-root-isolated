@@ -340,39 +340,119 @@ def reap_bootstrap_group(pgid):
         require(time.monotonic() < deadline, 'bootstrap process group did not drain')
         time.sleep(0.02)
 
-def run_bootstrap(argv, env, log, timeout=900):
-    # Subreaping lets us wait for descendants rather than equating launcher
-    # exit with their absence. Restore the previous setting on every path.
-    previous = child_subreaper(True)
+def bootstrap_identity(pid):
     try:
-        proc = sp.Popen(argv, env=env, stdout=log, stderr=sp.STDOUT, start_new_session=True)
-        started = process_identity(proc.pid)
+        text = Path('/proc', str(pid), 'stat').read_text()
+        fields = text[text.rfind(')') + 2:].split()
+        return (int(fields[1]), int(fields[2]), int(fields[3]), fields[19])
+    except FileNotFoundError:
+        return None
+
+def observe_bootstrap_exit(pid, argv, timeout, cancelled=None):
+    deadline = time.monotonic() + timeout
+    while True:
+        if cancelled is not None:
+            cancelled()
+        # WNOWAIT retains the original session leader even after it exits.
+        # Never use Popen.poll/wait or group waitpid before the final signal.
+        status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if status is not None:
+            require(status.si_pid == pid and status.si_code in
+                    (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED),
+                    'unexpected bootstrap wait status')
+            return status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+        if time.monotonic() >= deadline:
+            raise sp.TimeoutExpired(argv, timeout)
+        time.sleep(0.02)
+
+def stop_bootstrap_group(proc, started):
+    # An unreaped direct-child SESSION LEADER cannot change SID/PGID or have
+    # its PID reused. A live adopted descendant would not provide this pin.
+    require(proc.returncode is None and started is not None and
+            started[:3] == (os.getpid(), proc.pid, proc.pid) and
+            bootstrap_identity(proc.pid) == started,
+            'refuse unattested waitable bootstrap session leader')
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=30)
+    # No more destructive signals after releasing the original leader pin.
+    reap_bootstrap_group(proc.pid)
+
+def run_bootstrap(argv, env, log, timeout=900):
+    require(len(list(Path('/proc/self/task').iterdir())) == 1 and
+            signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL,
+            'bootstrap requires sole wait ownership and default SIGCHLD')
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # Clear SA_NOCLDWAIT before spawn.
+    previous = child_subreaper()
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    pending = None
+    original = None
+    def defer_cancel(sig, frame):
+        nonlocal pending
+        if pending is None:
+            pending = sig
+    def check_cancelled():
+        if pending is not None:
+            handler = handlers[pending]
+            if callable(handler):
+                handler(pending, None)
+            raise RuntimeError('bootstrap interrupted during acquisition')
+    def restore_handlers():
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+    try:
+        # Defer (do not mask) our cancellation signals. Observation checks them
+        # every 20ms; capture and bounded cleanup cannot be unwound by them.
+        # Caught dispositions reset on exec; ignored dispositions stay ignored.
+        for sig, handler in handlers.items():
+            if handler != signal.SIG_IGN:
+                signal.signal(sig, defer_cancel)
+        child_subreaper(True)
+        proc = None
+        started = None
         try:
-            require(started is not None, 'bootstrap launcher identity unavailable')
-            code = proc.wait(timeout=timeout)
+            proc = sp.Popen(argv, env=env, stdout=log, stderr=sp.STDOUT, start_new_session=True)
+            started = bootstrap_identity(proc.pid)
+            require(started is not None and started[:3] == (os.getpid(), proc.pid, proc.pid),
+                    'bootstrap launcher identity unavailable')
+            check_cancelled()
+            code = observe_bootstrap_exit(proc.pid, argv, timeout, check_cancelled)
             if code:
                 raise sp.CalledProcessError(code, argv)
-            reap_bootstrap_group(proc.pid)
-        except BaseException:
-            try:
-                if proc.returncode is None:
-                    require(started is not None and process_identity(proc.pid) == started and
-                            os.getsid(proc.pid) == proc.pid and os.getpgid(proc.pid) == proc.pid,
-                            'refuse unattested bootstrap process group')
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait(timeout=30)
-                reap_bootstrap_group(proc.pid)
-            except Exception as cleanup_error:
-                print('FAIL bootstrap group cleanup: ' + str(cleanup_error), file=sys.stderr, flush=True)
+        except BaseException as cause:
+            if proc is not None:
+                try:
+                    require(not isinstance(cause, ChildProcessError),
+                            'bootstrap wait ownership lost; no signal permitted')
+                    stop_bootstrap_group(proc, started)
+                except Exception as cleanup_error:
+                    print('FAIL bootstrap group cleanup: ' + str(cleanup_error), file=sys.stderr, flush=True)
             raise
-    except BaseException:
-        try:
-            child_subreaper(previous)
-        except Exception as restore_error:
-            print('FAIL restore child subreaper: ' + str(restore_error), file=sys.stderr, flush=True)
+        else:
+            stop_bootstrap_group(proc, started)
+            check_cancelled()  # Cancellation during cleanup aborts only after drain.
+    except BaseException as cause:
+        original = cause
         raise
-    else:
-        child_subreaper(previous)
+    finally:
+        try:
+            try:
+                child_subreaper(previous)
+            except BaseException as restore_error:
+                if original is None:
+                    raise
+                print('FAIL restore child subreaper: ' + str(restore_error), file=sys.stderr, flush=True)
+        finally:
+            try:
+                restore_handlers()
+            except BaseException as restore_error:
+                if original is None:
+                    raise
+                print('FAIL restore cancellation handlers: ' + str(restore_error), file=sys.stderr, flush=True)
+    # Cancellation recorded during restoration must not become successful boot.
+    check_cancelled()
 
 def machine_scope(machine):
     require(re.fullmatch(r'nmcp-backup-[0-9a-f]{32}', machine), 'invalid owned machine')

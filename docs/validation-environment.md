@@ -170,6 +170,29 @@ certification validator is bypassed. Upload responses must contain the expected
 native transform target; subsequent actual production-worker completion and
 positive renditions remain separate mandatory assertions.
 
+Acquisition exit is observed with `waitid(WNOWAIT)`: the original direct-child
+session leader remains unreaped until the last owned-group signal, including
+when it has already exited. The single-threaded launcher requires default
+SIGCHLD and explicitly clears auto-reap flags before spawning. PPID, starttime,
+SID and PGID must still match; lost wait ownership never authorizes a signal.
+Only after group termination does it reap the launcher and adopted group
+children. A live adopted child is not substituted as an identity pin, because
+it could change groups. Controlled real probes cover timeout, caught cancel,
+and launcher exit 0, 23 and SIGTERM with an unaffected separate-session control.
+TERM/INT handlers defer cancellation without changing inherited signal masks;
+the observer checks the bounded pending signal every 20ms. Original callbacks
+run inside the owned cleanup boundary, and bounded cleanup completes before
+handlers are restored. Deterministic pre-capture and pre-kill cancellation
+probes cover both windows. These are not proofs of unhandled signals,
+outer-wrapper hardkill, arbitrary identity-read failures, or descendants
+escaping process groups or sessions.
+
+Offline membership replay resolves the complete direct ADMIN-option dependency
+graph before executing grants. It preserves each original grantor and all three
+options; missing authority dependencies fail closed. The PG17 regression uses
+reverse-name, two-level grantors, all eight option tuples, and an independent raw
+catalog oracle rather than comparing the DDL generator with itself.
+
 The launcher retains a root-only exact-head ownership receipt and diagnostic
 root filesystem below `RUNNER_TEMP`. Normal finalization and the workflow's
 outer `always()` step both run receipt-scoped cleanup **inside that machine**,

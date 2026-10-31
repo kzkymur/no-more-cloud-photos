@@ -8,8 +8,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/jackc/pgx/v5"
 )
 
 func TestBackupPG17FixtureMembershipDDL(t *testing.T) {
@@ -26,46 +24,80 @@ func TestBackupPG17FixtureMembershipDDL(t *testing.T) {
 	}
 	f := newPG17Fixture(t, bin)
 	admin := f.pool("operator", "postgres")
-	f.sql(admin, `CREATE ROLE nmcp_root; CREATE ROLE nmcp_a_grantor; GRANT nmcp_root TO nmcp_a_grantor WITH ADMIN TRUE, INHERIT FALSE, SET TRUE GRANTED BY operator`)
+
+	f.sql(admin, `CREATE ROLE nmcp_root; CREATE ROLE nmcp_z_grantor; CREATE ROLE nmcp_y_mid;
+ GRANT nmcp_root TO nmcp_z_grantor WITH ADMIN TRUE, INHERIT FALSE, SET TRUE GRANTED BY operator;
+ GRANT nmcp_root TO nmcp_y_mid WITH ADMIN TRUE, INHERIT TRUE, SET FALSE GRANTED BY nmcp_z_grantor`)
+	type tuple struct {
+		Role, Member, Grantor string
+		Admin, Inherit, Set   bool
+	}
+	expected := []tuple{{"nmcp_root", "nmcp_y_mid", "nmcp_z_grantor", true, true, false}, {"nmcp_root", "nmcp_z_grantor", "operator", true, false, true}}
+	var members []tuple
 	for a := 0; a < 2; a++ {
 		for i := 0; i < 2; i++ {
 			for s := 0; s < 2; s++ {
-				name := fmt.Sprintf("nmcp_m%d%d%d", a, i, s)
-				f.sql(admin, fmt.Sprintf("CREATE ROLE %s; GRANT nmcp_root TO %s WITH ADMIN %t, INHERIT %t, SET %t GRANTED BY nmcp_a_grantor", name, name, a == 1, i == 1, s == 1))
+				name := fmt.Sprintf("nmcp_a%d%d%d", a, i, s)
+				f.sql(admin, fmt.Sprintf("CREATE ROLE %s; GRANT nmcp_root TO %s WITH ADMIN %t, INHERIT %t, SET %t GRANTED BY nmcp_y_mid", name, name, a == 1, i == 1, s == 1))
+				members = append(members, tuple{"nmcp_root", name, "nmcp_y_mid", a == 1, i == 1, s == 1})
 			}
 		}
 	}
-	inventory := func() []string {
-		rows, err := admin.Query(f.ctx, offlineMembershipDDLQuery)
+	expected = append(members, expected...)
+	// Independent raw catalog oracle: no generated DDL/format/CASE is involved.
+	inventory := func() []tuple {
+		rows, err := admin.Query(f.ctx, `SELECT r.rolname,m.rolname,g.rolname,a.admin_option,a.inherit_option,a.set_option FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE r.rolname='nmcp_root' ORDER BY m.rolname,g.rolname`)
 		if err != nil {
-			t.Fatal("membership query")
+			t.Fatal("raw membership query")
 		}
-		result, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
-			t.Fatal("membership scan")
+		defer rows.Close()
+		var tuples []tuple
+		for rows.Next() {
+			var row tuple
+			if rows.Scan(&row.Role, &row.Member, &row.Grantor, &row.Admin, &row.Inherit, &row.Set) != nil {
+				t.Fatal("raw membership scan")
+			}
+			tuples = append(tuples, row)
 		}
-		return result
+		if rows.Err() != nil {
+			t.Fatal("raw membership rows")
+		}
+		return tuples
 	}
 	before := inventory()
-	if len(before) != 9 {
-		t.Fatal("fixture must cover grantor and all eight option tuples")
+	if !reflect.DeepEqual(expected, before) {
+		t.Fatal("initial raw graph differs from independently constructed option tuples")
 	}
-	f.sql(admin, `REVOKE nmcp_root FROM nmcp_a_grantor CASCADE`)
+	rows, err := readFixtureMemberships(f.ctx, admin)
+	if err != nil || len(rows) != 10 {
+		t.Fatal("fixture must cover two-level grantors and all eight options")
+	}
+	ordered, err := orderFixtureMemberships(rows)
+	if err != nil {
+		t.Fatal("valid dependency graph refused")
+	}
+	f.sql(admin, `REVOKE nmcp_root FROM nmcp_z_grantor CASCADE`)
 	if len(inventory()) != 0 {
 		t.Fatal("dependent memberships remain after revoke")
 	}
-	for _, stmt := range before {
-		invalid := strings.NewReplacer(" TRUE", " t", " FALSE", " f").Replace(stmt)
+	for _, row := range rows {
+		invalid := strings.NewReplacer(" TRUE", " t", " FALSE", " f").Replace(row.DDL)
 		_, err := admin.Exec(f.ctx, invalid)
 		if fixtureSQLState(err) != "42601" {
-			t.Fatal("original unquoted t/f must fail PG17 syntax")
+			t.Fatal("original t/f must fail PG17 syntax")
 		}
 	}
-	for _, stmt := range before {
+	if _, err := admin.Exec(f.ctx, rows[0].DDL); fixtureSQLState(err) != "42501" {
+		t.Fatal("lexical member-first replay must fail missing grantor ADMIN")
+	}
+	if len(inventory()) != 0 {
+		t.Fatal("rejected lexical replay changed graph")
+	}
+	for _, stmt := range ordered {
 		f.sql(admin, stmt)
 	}
-	if !reflect.DeepEqual(before, inventory()) {
-		t.Fatal("replayed role/member/grantor/options changed")
+	if !reflect.DeepEqual(expected, inventory()) {
+		t.Fatal("dependency replay changed raw role/member/grantor/option tuples")
 	}
-	t.Log("Actual PG17: all eight membership tuples and non-operator grantor preserved; original t/f refused")
+	t.Log("Actual PG17: reversed two-level grantors and all eight raw option tuples preserved; lexical ADMIN and original t/f replay refused")
 }

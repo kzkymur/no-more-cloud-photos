@@ -589,7 +589,8 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	f.run("/usr/bin/systemctl", "start", "nmcp-backup.service")
+	t.Log("actual production API/worker native job succeeded with positive rendition and no unfinished/failed jobs")
+	f.startBackup(source)
 	runs, e := New(source).BackupList(ctx)
 	if e != nil || len(runs) != 1 || runs[0].Status != "succeeded" {
 		t.Fatal("actual backup UID/LoadCredential CLI did not produce successful archive")
@@ -760,7 +761,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	// Snapshot contains the originating run as running, correctly converted to
 	// failed by Restore. A real first candidate backup is therefore due, not a
 	// false timer wake. Establish it with the actual production unit first.
-	f.run("/usr/bin/systemctl", "start", "nmcp-backup.service")
+	f.startBackup(candidate)
 	postRuns, e := New(candidate).BackupList(ctx)
 	if e != nil || len(postRuns) < 2 || postRuns[0].Status != "succeeded" {
 		t.Fatal("first real resumed candidate backup did not succeed")
@@ -783,7 +784,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if enabled, e := systemctl(ctx, "is-enabled", "nmcp-backup.timer"); e != nil || enabled != "enabled" {
 		t.Fatal("timer enable not persistent")
 	}
-	f.run("/usr/bin/systemctl", "start", "nmcp-backup.service")
+	f.startBackup(candidate)
 	if active, e := systemctl(ctx, "is-active", "nmcp-backup.timer"); e != nil || active != "active" {
 		t.Fatal("timer not enabled after successful resume")
 	}

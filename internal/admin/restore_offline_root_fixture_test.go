@@ -36,7 +36,7 @@ import (
 
 // PostgreSQL bool output is t/f, which is not legal unquoted GRANT syntax.
 // Preserve all three options and the exact grantor using Boolean keywords.
-const offlineMembershipDDLQuery = `SELECT format('GRANT %I TO %I WITH ADMIN %s, INHERIT %s, SET %s GRANTED BY %I',r.rolname,m.rolname,CASE WHEN a.admin_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.inherit_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.set_option THEN 'TRUE' ELSE 'FALSE' END,g.rolname) FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE starts_with(r.rolname,'nmcp_') OR starts_with(m.rolname,'nmcp_') ORDER BY r.rolname,m.rolname,g.rolname`
+const offlineMembershipDDLQuery = `SELECT r.rolname,m.rolname,g.rolname,a.admin_option,a.inherit_option,a.set_option,g.rolsuper,format('GRANT %I TO %I WITH ADMIN %s, INHERIT %s, SET %s GRANTED BY %I',r.rolname,m.rolname,CASE WHEN a.admin_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.inherit_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.set_option THEN 'TRUE' ELSE 'FALSE' END,g.rolname) FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE starts_with(r.rolname,'nmcp_') OR starts_with(m.rolname,'nmcp_') ORDER BY r.rolname,m.rolname,g.rolname`
 
 func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	if os.Getenv("TEST_BACKUP_OFFLINE_SYSTEMD") != "1" {
@@ -183,7 +183,8 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	f.run("/usr/bin/systemctl", "start", "nmcp-backup.service")
+	t.Log("actual production API/worker native job succeeded with positive rendition and no unfinished/failed jobs")
+	f.startBackup(source)
 	runs, e := New(source).BackupList(ctx)
 	if e != nil || len(runs) != 1 || runs[0].Status != "succeeded" {
 		t.Fatal("actual backup UID/LoadCredential CLI did not produce successful archive")
@@ -374,7 +375,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	// Snapshot contains the originating run as running, correctly converted to
 	// failed by Restore. A real first candidate backup is therefore due, not a
 	// false timer wake. Establish it with the actual production unit first.
-	f.run("/usr/bin/systemctl", "start", "nmcp-backup.service")
+	f.startBackup(candidate)
 	postRuns, e := New(candidate).BackupList(ctx)
 	if e != nil || len(postRuns) < 2 || postRuns[0].Status != "succeeded" {
 		t.Fatal("first real resumed candidate backup did not succeed")
@@ -397,7 +398,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	if enabled, e := systemctl(ctx, "is-enabled", "nmcp-backup.timer"); e != nil || enabled != "enabled" {
 		t.Fatal("timer enable not persistent")
 	}
-	f.run("/usr/bin/systemctl", "start", "nmcp-backup.service")
+	f.startBackup(candidate)
 	if active, e := systemctl(ctx, "is-active", "nmcp-backup.timer"); e != nil || active != "active" {
 		t.Fatal("timer not enabled after successful resume")
 	}
@@ -610,22 +611,14 @@ func (f *liveCutoverFixture) newOfflineCandidate(source *pgxpool.Pool) (*liveCut
 			g.sql(admin, "ALTER ROLE "+pgx.Identifier{role}.Sanitize()+" PASSWORD '"+password+"'")
 		}
 	}
-	rows, err = source.Query(g.ctx, offlineMembershipDDLQuery)
+	memberships, err := readFixtureMemberships(g.ctx, source)
 	if err != nil {
 		t.Fatal("source membership inventory")
 	}
-	ddl = nil
-	for rows.Next() {
-		var q string
-		if rows.Scan(&q) != nil {
-			t.Fatal("membership scan")
-		}
-		ddl = append(ddl, q)
+	ddl, err = orderFixtureMemberships(memberships)
+	if err != nil {
+		t.Fatal("source membership grant dependencies unresolved")
 	}
-	if rows.Err() != nil {
-		t.Fatal("membership inventory read")
-	}
-	rows.Close()
 	for _, q := range ddl {
 		g.sql(admin, q)
 	}
