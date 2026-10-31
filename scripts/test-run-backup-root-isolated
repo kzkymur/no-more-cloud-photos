@@ -75,6 +75,15 @@ class Isolation(unittest.TestCase):
                     MODULE.emit_fixture_diagnostics(pathlib.Path('/owned'),pathlib.Path('/owned/rootfs'))
                 read.assert_not_called()
 
+    def test_noble_concrete_virtual_dependency_providers(self):
+        packages=MODULE.PACKAGES.split(',')
+        for actual in ('libpgm-5.3-0t64','libcdio19t64'):
+            self.assertEqual(packages.count(actual),1)
+        self.assertNotIn('libpgm-5.3-0',packages)
+        self.assertNotIn('libcdio19',packages)
+        self.assertNotIn('force-depends',SOURCE)
+        self.assertNotIn('--no-check-gpg',SOURCE)
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 

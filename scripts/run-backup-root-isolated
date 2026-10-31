@@ -20,9 +20,13 @@ KEYS = ('GITHUB_ACTIONS', 'RUNNER_ENVIRONMENT', 'TEST_BACKUP_CANDIDATE_SHA',
         'TEST_BACKUP_STILL_HELPER', 'TEST_BACKUP_ANIMATION_HELPER',
         'TEST_BACKUP_ICC_PATH', 'TEST_BACKUP_MEDIA_FIXTURE', 'TEST_BACKUP_CORE_API',
         'TEST_BACKUP_CORE_WORKER', 'TEST_BACKUP_ADMIN_BINARY')
+# Noble retains pre-t64 dependency names in libzmq5/libcdio consumers.
+# debootstrap does not select these versioned virtual providers implicitly;
+# name the real archive packages rather than bypassing dpkg dependency checks.
 PACKAGES = ('systemd-sysv,dbus,util-linux,python3,libimage-exiftool-perl,ffmpeg,'
             'libglib2.0-dev,libjpeg-turbo8-dev,libpng-dev,libwebp-dev,libexif-dev,'
-            'libde265-dev,libicu74,libssl3t64,libreadline8t64,libzstd1,liblz4-1,zlib1g')
+            'libde265-dev,libicu74,libssl3t64,libreadline8t64,libzstd1,liblz4-1,zlib1g,'
+            'libpgm-5.3-0t64,libcdio19t64')
 
 def require(ok, message):
     if not ok:
