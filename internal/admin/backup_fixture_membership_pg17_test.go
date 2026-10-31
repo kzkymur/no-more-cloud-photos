@@ -25,9 +25,12 @@ func TestBackupPG17FixtureMembershipDDL(t *testing.T) {
 	f := newPG17Fixture(t, bin)
 	admin := f.pool("operator", "postgres")
 
-	f.sql(admin, `CREATE ROLE nmcp_root; CREATE ROLE nmcp_z_grantor; CREATE ROLE nmcp_y_mid;
+	f.sql(admin, `CREATE ROLE nmcp_root; CREATE ROLE nmcp_z_grantor SUPERUSER; CREATE ROLE nmcp_y_mid;
  GRANT nmcp_root TO nmcp_z_grantor WITH ADMIN TRUE, INHERIT FALSE, SET TRUE GRANTED BY operator;
  GRANT nmcp_root TO nmcp_y_mid WITH ADMIN TRUE, INHERIT TRUE, SET FALSE GRANTED BY nmcp_z_grantor`)
+	if pg17Scalar(t, f.ctx, admin, `SELECT oid::text FROM pg_roles WHERE rolname=current_user`) != "10" || pg17Scalar(t, f.ctx, admin, `SELECT (rolsuper AND oid<>10)::text FROM pg_roles WHERE rolname='nmcp_z_grantor'`) != "true" {
+		t.Fatal("regression requires bootstrap operator and distinct non-bootstrap superuser")
+	}
 	type tuple struct {
 		Role, Member, Grantor string
 		Admin, Inherit, Set   bool
@@ -90,8 +93,23 @@ func TestBackupPG17FixtureMembershipDDL(t *testing.T) {
 	if _, err := admin.Exec(f.ctx, rows[0].DDL); fixtureSQLState(err) != "42501" {
 		t.Fatal("lexical member-first replay must fail missing grantor ADMIN")
 	}
+	checkedSuper := false
+	for _, row := range rows {
+		if row.Grantor == "nmcp_z_grantor" {
+			checkedSuper = true
+			if row.GrantorBootstrap {
+				t.Fatal("non-bootstrap superuser admitted as dependency anchor")
+			}
+			if _, err := admin.Exec(f.ctx, row.DDL); fixtureSQLState(err) != "42501" {
+				t.Fatal("non-bootstrap superuser must need direct recorded-grantor ADMIN")
+			}
+		}
+	}
+	if !checkedSuper {
+		t.Fatal("non-bootstrap grantor negative was not exercised")
+	}
 	if len(inventory()) != 0 {
-		t.Fatal("rejected lexical replay changed graph")
+		t.Fatal("rejected lexical or superuser-root replay changed graph")
 	}
 	for _, stmt := range ordered {
 		f.sql(admin, stmt)
@@ -99,5 +117,5 @@ func TestBackupPG17FixtureMembershipDDL(t *testing.T) {
 	if !reflect.DeepEqual(expected, inventory()) {
 		t.Fatal("dependency replay changed raw role/member/grantor/option tuples")
 	}
-	t.Log("Actual PG17: reversed two-level grantors and all eight raw option tuples preserved; lexical ADMIN and original t/f replay refused")
+	t.Log("Actual PG17: non-bootstrap SUPERUSER ADMIN negative, reversed two-level grantors and all eight raw option tuples preserved; lexical ADMIN and original t/f replay refused")
 }

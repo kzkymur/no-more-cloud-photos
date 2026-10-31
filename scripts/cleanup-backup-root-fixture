@@ -34,6 +34,13 @@ def validate_pg(record,head,unit,st,body,data_stat):
     assert record['postgres']=='/opt/nmcp-pg17-ci/bin/postgres'
     assert b'Type=forking\n' in body and ('PIDFile='+str(data)+'/postmaster.pid\n').encode() in body
 
+def require_runtime_credentials_absent(path=Path('/run/nmcp-backup')):
+    # Only inspect: manager cleanup must remove the private runtime directory.
+    # A surviving directory or dangling symlink is never deletion authority.
+    try: path.lstat()
+    except FileNotFoundError: return
+    raise AssertionError('backup runtime credentials remain after owned service stop')
+
 def proc_running(pid):
     try: raw=Path('/proc')/str(pid)/'stat'; value=raw.read_text()
     except FileNotFoundError: return False
@@ -75,6 +82,7 @@ def cleanup(head):
         assert active in ('inactive','failed'),unit+' still active'
         if unit.endswith('.service'):
             assert subprocess.check_output(['/usr/bin/systemctl','show','-p','MainPID','--value',unit],text=True).strip()=='0'
+    require_runtime_credentials_absent()
     for unit,r,pid in plans:
         assert not pid or not proc_running(pid), 'owned postmaster still running'
         assert not (Path(r['data'])/'postmaster.pid').exists()

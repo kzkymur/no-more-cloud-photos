@@ -36,7 +36,9 @@ import (
 
 // PostgreSQL bool output is t/f, which is not legal unquoted GRANT syntax.
 // Preserve all three options and the exact grantor using Boolean keywords.
-const offlineMembershipDDLQuery = `SELECT r.rolname,m.rolname,g.rolname,a.admin_option,a.inherit_option,a.set_option,g.rolsuper,format('GRANT %I TO %I WITH ADMIN %s, INHERIT %s, SET %s GRANTED BY %I',r.rolname,m.rolname,CASE WHEN a.admin_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.inherit_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.set_option THEN 'TRUE' ELSE 'FALSE' END,g.rolname) FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE starts_with(r.rolname,'nmcp_') OR starts_with(m.rolname,'nmcp_') ORDER BY r.rolname,m.rolname,g.rolname`
+// PG17 reserves OID 10 (BOOTSTRAP_SUPERUSERID) as the implicit grantor root.
+// rolsuper alone does not authorize a non-bootstrap recorded GRANTED BY.
+const offlineMembershipDDLQuery = `SELECT r.rolname,m.rolname,g.rolname,a.admin_option,a.inherit_option,a.set_option,(g.oid=10),format('GRANT %I TO %I WITH ADMIN %s, INHERIT %s, SET %s GRANTED BY %I',r.rolname,m.rolname,CASE WHEN a.admin_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.inherit_option THEN 'TRUE' ELSE 'FALSE' END,CASE WHEN a.set_option THEN 'TRUE' ELSE 'FALSE' END,g.rolname) FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE starts_with(r.rolname,'nmcp_') OR starts_with(m.rolname,'nmcp_') ORDER BY r.rolname,m.rolname,g.rolname`
 
 func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	if os.Getenv("TEST_BACKUP_OFFLINE_SYSTEMD") != "1" {

@@ -191,7 +191,7 @@ func newLiveCutoverFixture(t *testing.T, bin string, clusters ...string) *liveCu
 			}
 		}
 	}
-	fixed := []string{"/run/nmcp-backup-cutover.owner", "/var/lib/systemd/timers/stamp-nmcp-backup.timer", "/etc/systemd/system/timers.target.wants/nmcp-backup.timer", "/etc/nmcp", "/var/lib/nmcp", "/var/lib/nmcp-backup", "/var/lib/nmcp-restore", filepath.Dir(hbaPath), "/opt/nmcp", socketPath}
+	fixed := []string{"/run/nmcp-backup", "/run/nmcp-backup-cutover.owner", "/var/lib/systemd/timers/stamp-nmcp-backup.timer", "/etc/systemd/system/timers.target.wants/nmcp-backup.timer", "/etc/nmcp", "/var/lib/nmcp", "/var/lib/nmcp-backup", "/var/lib/nmcp-restore", filepath.Dir(hbaPath), "/opt/nmcp", socketPath}
 	for _, p := range fixed {
 		if _, e := os.Lstat(p); !os.IsNotExist(e) {
 			t.Fatalf("refuse preexisting/uninspectable fixed path %s", p)
@@ -366,6 +366,12 @@ func (f *liveCutoverFixture) cleanupLive() {
 	if _, ok := f.owned["/etc/systemd/system/nmcp-backup.timer"]; ok {
 		if active, _ := systemctl(ctx, "is-active", "nmcp-backup.timer"); active == "active" {
 			t.Error("cleanup timer still active")
+			safe = false
+		}
+	}
+	if _, owned := f.owned["/etc/systemd/system/nmcp-backup.service"]; owned {
+		if _, err := os.Lstat("/run/nmcp-backup"); !os.IsNotExist(err) {
+			t.Error("owned backup runtime credentials not removed by manager; preserve paths")
 			safe = false
 		}
 	}

@@ -14,10 +14,18 @@ EnvironmentFile=/etc/nmcp/backup.env
 LoadCredential=dump.pgpass:/etc/nmcp/credentials/backup-dump.pgpass
 LoadCredential=control.pgpass:/etc/nmcp/credentials/backup-control.pgpass
 LoadCredential=pg_service.conf:/etc/nmcp/backup.pg_service.conf
+# ACL-backed LoadCredential files may be root-owned 0440. libpq rejects that
+# mode even when the named-user ACL is private. Copy as the service UID into
+# its manager-cleaned runtime directory; never weaken passfile validation.
+RuntimeDirectory=nmcp-backup
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+ExecStartPre=/usr/bin/install -m 0600 %d/control.pgpass /run/nmcp-backup/control.pgpass
+ExecStartPre=/usr/bin/install -m 0600 %d/dump.pgpass /run/nmcp-backup/dump.pgpass
 # %d is expanded by systemd. EnvironmentFile does NOT expand shell variables.
-Environment=PGPASSFILE=%d/control.pgpass
+Environment=PGPASSFILE=/run/nmcp-backup/control.pgpass
 Environment=PGSERVICEFILE=%d/pg_service.conf
-Environment=NMCP_BACKUP_DUMP_PASSFILE=%d/dump.pgpass
+Environment=NMCP_BACKUP_DUMP_PASSFILE=/run/nmcp-backup/dump.pgpass
 ExecStart=/opt/nmcp/current/bin/nmcp-admin backup run --if-due --json
 # 4 is a structured not_due/overlap_conflict, never a successful backup.
 SuccessExitStatus=4

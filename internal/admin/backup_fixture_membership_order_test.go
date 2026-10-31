@@ -10,9 +10,9 @@ import (
 )
 
 type fixtureMembership struct {
-	Role, Member, Grantor             string
-	Admin, Inherit, Set, GrantorSuper bool
-	DDL                               string
+	Role, Member, Grantor                 string
+	Admin, Inherit, Set, GrantorBootstrap bool
+	DDL                                   string
 }
 
 func readFixtureMemberships(ctx context.Context, pool *pgxpool.Pool) ([]fixtureMembership, error) {
@@ -24,7 +24,7 @@ func readFixtureMemberships(ctx context.Context, pool *pgxpool.Pool) ([]fixtureM
 	var result []fixtureMembership
 	for rows.Next() {
 		var row fixtureMembership
-		if err = rows.Scan(&row.Role, &row.Member, &row.Grantor, &row.Admin, &row.Inherit, &row.Set, &row.GrantorSuper, &row.DDL); err != nil {
+		if err = rows.Scan(&row.Role, &row.Member, &row.Grantor, &row.Admin, &row.Inherit, &row.Set, &row.GrantorBootstrap, &row.DDL); err != nil {
 			return nil, err
 		}
 		result = append(result, row)
@@ -33,6 +33,8 @@ func readFixtureMemberships(ctx context.Context, pool *pgxpool.Pool) ([]fixtureM
 }
 
 // ADMIN OPTION is role-specific and is not inherited through other roles.
+// Only the PG17 bootstrap superuser is an implicit recorded-grantor anchor;
+// other superusers still require direct ADMIN for explicit GRANTED BY.
 // Resolve the entire graph before executing any GRANT; unresolved dependencies
 // are a refusal, never a reason to change a grantor or grant extra authority.
 func orderFixtureMemberships(rows []fixtureMembership) ([]string, error) {
@@ -42,7 +44,7 @@ func orderFixtureMemberships(rows []fixtureMembership) ([]string, error) {
 	for len(pending) > 0 {
 		var next []fixtureMembership
 		for _, row := range pending {
-			if !row.GrantorSuper && !authorized[[2]string{row.Role, row.Grantor}] {
+			if !row.GrantorBootstrap && !authorized[[2]string{row.Role, row.Grantor}] {
 				next = append(next, row)
 				continue
 			}
@@ -63,13 +65,13 @@ func TestBackupFixtureMembershipDependencyOrder(t *testing.T) {
 	rows := []fixtureMembership{
 		{Role: "r", Member: "a", Grantor: "y", DDL: "third"},
 		{Role: "r", Member: "y", Grantor: "z", Admin: true, DDL: "second"},
-		{Role: "r", Member: "z", Grantor: "operator", GrantorSuper: true, Admin: true, DDL: "first"},
+		{Role: "r", Member: "z", Grantor: "operator", GrantorBootstrap: true, Admin: true, DDL: "first"},
 	}
 	ordered, err := orderFixtureMemberships(rows)
 	if err != nil || !reflect.DeepEqual(ordered, []string{"first", "second", "third"}) {
 		t.Fatal("grantor dependencies not honored")
 	}
-	for _, invalid := range [][]fixtureMembership{rows[:2], {rows[0], {Role: "r", Member: "y", Grantor: "operator", GrantorSuper: true, Admin: false}}, {rows[0], {Role: "other", Member: "y", Grantor: "operator", GrantorSuper: true, Admin: true}}} {
+	for _, invalid := range [][]fixtureMembership{rows[:2], {rows[0], {Role: "r", Member: "y", Grantor: "operator", GrantorBootstrap: true, Admin: false}}, {rows[0], {Role: "other", Member: "y", Grantor: "operator", GrantorBootstrap: true, Admin: true}}} {
 		if ordered, err := orderFixtureMemberships(invalid); err == nil || ordered != nil {
 			t.Fatal("unresolved graph partially admitted")
 		}

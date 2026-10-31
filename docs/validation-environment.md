@@ -189,9 +189,25 @@ escaping process groups or sessions.
 
 Offline membership replay resolves the complete direct ADMIN-option dependency
 graph before executing grants. It preserves each original grantor and all three
-options; missing authority dependencies fail closed. The PG17 regression uses
-reverse-name, two-level grantors, all eight option tuples, and an independent raw
-catalog oracle rather than comparing the DDL generator with itself.
+options; missing authority dependencies fail closed. In these PG17 fixtures,
+only the reserved bootstrap identity (OID 10, initialized as `operator` in both
+clusters) anchors the graph. A non-bootstrap superuser still needs direct ADMIN
+for its explicitly recorded `GRANTED BY`. The actual PG17 regression covers that
+negative case, reverse-name two-level grantors, all eight option tuples, and an
+independent raw catalog oracle rather than comparing the DDL generator with itself.
+
+The explicit PG17 private-passfile regression creates an actual self-only POSIX
+ACL (0440 group-class mask) in a private test directory. It proves pgx can
+authenticate while the unchanged Go dump guard and libpq reject that file;
+ordinary `install -m 0600` creates byte-identical, current-UID, single-link copies
+that pass the strict Go identity check, real `pg_dump`, and `pg_restore --list`.
+It also rejects weak/stale copies and covers owner-private 0400 input. This is
+credential-format portability evidence, not actual systemd delivery, distinct-UID
+isolation, or a claim about the precise attributes in earlier failed root runs.
+Actual live/offline tests exercise the production runtime-directory lifecycle,
+refuse a preexisting `/run/nmcp-backup` before mutation, and require manager removal
+after each oneshot and owned-unit cleanup. Leftovers are preserved and fail;
+neither normal nor fallback cleanup manually deletes that runtime path.
 
 The launcher retains a root-only exact-head ownership receipt and diagnostic
 root filesystem below `RUNNER_TEMP`. Normal finalization and the workflow's

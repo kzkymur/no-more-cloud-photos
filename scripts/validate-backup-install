@@ -56,6 +56,8 @@ def units(base):
         'ProtectSystem': 'strict', 'ProtectHome': 'yes', 'PrivateTmp': 'yes',
         'PrivateDevices': 'yes', 'CapabilityBoundingSet': '', 'AmbientCapabilities': '',
         'ReadWritePaths': '/var/lib/nmcp-backup',
+        'RuntimeDirectory': 'nmcp-backup', 'RuntimeDirectoryMode': '0700',
+        'RuntimeDirectoryPreserve': 'no',
         'RestrictAddressFamilies': 'AF_UNIX AF_INET AF_INET6',
     }
     for key, value in expected.items():
@@ -65,9 +67,13 @@ def units(base):
         'control.pgpass:/etc/nmcp/credentials/backup-control.pgpass',
         'pg_service.conf:/etc/nmcp/backup.pg_service.conf'], 'credential mapping differs')
     require(service.get(('Service', 'Environment')) == [
-        'PGPASSFILE=%d/control.pgpass', 'PGSERVICEFILE=%d/pg_service.conf', 'NMCP_BACKUP_DUMP_PASSFILE=%d/dump.pgpass'],
-        'credential paths must use systemd specifiers')
-    require(not any(k in ('ExecStartPre', 'ExecStartPost', 'ExecStopPost', 'EnvironmentFile')
+        'PGPASSFILE=/run/nmcp-backup/control.pgpass', 'PGSERVICEFILE=%d/pg_service.conf', 'NMCP_BACKUP_DUMP_PASSFILE=/run/nmcp-backup/dump.pgpass'],
+        'credential paths must use exact private runtime copies and service specifier')
+    require(service.get(('Service', 'ExecStartPre')) == [
+        '/usr/bin/install -m 0600 %d/control.pgpass /run/nmcp-backup/control.pgpass',
+        '/usr/bin/install -m 0600 %d/dump.pgpass /run/nmcp-backup/dump.pgpass'],
+        'only exact service-UID private credential copies are allowed')
+    require(not any(k in ('ExecStartPost', 'ExecStopPost', 'EnvironmentFile')
                     and (k != 'EnvironmentFile' or v != ['/etc/nmcp/backup.env'])
                     for (s, k), v in service.items() if s == 'Service'), 'unexpected service execution')
     timer = parse_unit(base / 'nmcp-backup.timer')

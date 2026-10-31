@@ -109,8 +109,17 @@ socket, libpq and pgx may require two exact host aliases (`localhost` and that
 same absolute socket directory); both must use the identical port/DB/login/password.
 No wildcard, duplicate alias, other socket, database or login is permitted. Never pass passwords
 in argv, shell history, reports or logs. `LoadCredential=` snapshots them into
-the service credential namespace. The unit expands `%d/control.pgpass` into
-`PGPASSFILE` and `%d/dump.pgpass` into `NMCP_BACKUP_DUMP_PASSFILE`. Do not put
+the service credential namespace. ACL-backed systemd credentials may be
+root-owned 0440: libpq rejects those group-class bits even for a private named-user
+ACL. Two exact ordinary `ExecStartPre` commands run as `nmcp-backup` and copy the
+control/dump credentials to manager-created `/run/nmcp-backup` (0700), producing
+service-owned 0600 single-link files. `PGPASSFILE` and
+`NMCP_BACKUP_DUMP_PASSFILE` point only to those private copies; `PGSERVICEFILE`
+still uses `%d/pg_service.conf`. `RuntimeDirectoryPreserve=no` removes the copies
+on stop/failure, and every activation recreates them from current credentials.
+The original LoadCredential files, backup UID, namespace hardening and strict
+passfile validation are unchanged. Never broaden `/run` write access, preserve
+this directory, add root execution prefixes, or chmod the source ACL. Do not put
 `${CREDENTIALS_DIRECTORY}` in an EnvironmentFile: systemd does not perform shell
 interpolation there. The dump child must receive only dump credentials, not the
 control password or routine process environment. Neither credential authorizes
