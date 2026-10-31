@@ -4,6 +4,7 @@ import ast
 import pathlib
 import types
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import Mock, patch
 
@@ -112,6 +113,56 @@ class Isolation(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 MODULE.prepare_guest_config_dirs(root)
             self.assertEqual(list(outside.iterdir()),[])
+
+    def test_entire_preboot_setup_on_fresh_root(self):
+        # Execute the real preboot preparation block on a fresh filesystem.
+        # Only chown and the privileged sysusers command are mocked; this is
+        # prerequisite coverage, not proof of root ownership or guest boot.
+        start=SOURCE.index("        require(not any(root.glob('usr/lib/systemd/system/postgresql*'))")
+        end=SOURCE.index("        boot = [",start)
+        setup=compile(textwrap.dedent(SOURCE[start:end]),str(SCRIPT),'exec')
+        with tempfile.TemporaryDirectory() as temp:
+            root=pathlib.Path(temp)/'rootfs';root.mkdir()
+            repo=SCRIPT.resolve().parent.parent
+            def sysusers(command):
+                self.assertEqual(command,['/usr/bin/systemd-sysusers','--root='+str(root)])
+                config=root/'etc/sysusers.d/nmcp-ci.conf'
+                self.assertEqual(config.read_text(),(repo/'infra/ubuntu/sysusers.d/nmcp.conf').read_text()+
+                    '\nu postgres - "Private PostgreSQL fixture" /var/lib/postgresql /usr/sbin/nologin\n')
+                for rel in ('etc/sysusers.d','etc/postgresql','etc/postgresql/17','var/lib/systemd/timers'):
+                    self.assertTrue((root/rel).is_dir())
+                for rel in ('etc/postgresql','etc/postgresql/17'):
+                    self.assertEqual((root/rel).stat().st_mode & 0o777,0o755)
+            with patch.object(MODULE.os,'chown') as chown:
+                run=Mock(side_effect=sysusers)
+                env=dict(MODULE.__dict__,root=root,repo=repo,run=run)
+                exec(setup,env)
+                self.assertEqual(chown.call_args_list,[unittest.mock.call(root/'etc/postgresql',0,0),
+                    unittest.mock.call(root/'etc/postgresql/17',0,0)])
+                run.assert_called_once()
+                # Absence of the required checked-out sysusers input fails
+                # before any system command, rather than silently omitting UIDs.
+                env['repo']=root/'missing-repo';run.reset_mock()
+                with self.assertRaises(FileNotFoundError):
+                    exec(setup,env)
+                run.assert_not_called()
+
+    def test_machine_scope_public_property_and_exact_identity(self):
+        machine='nmcp-backup-'+'a'*32
+        expected=r'machine-nmcp\x2dbackup\x2d'+'a'*32+'.scope'
+        with patch.object(MODULE,'output',return_value=expected) as output:
+            self.assertEqual(MODULE.machine_scope(machine),expected)
+            output.assert_called_once_with(['/usr/bin/machinectl','show',machine,'--property=Unit','--value'])
+        for scope in ('','machine-other.scope',expected.replace('a'*32,'b'*32),
+                      expected.replace('.scope','.service'),'machine-'+machine+'.scope'):
+            with patch.object(MODULE,'output',return_value=scope):
+                with self.assertRaises(RuntimeError):
+                    MODULE.machine_scope(machine)
+        for machine in ('','.host','host','nmcp-backup-not-a-uuid'):
+            with patch.object(MODULE,'output') as output:
+                with self.assertRaises(RuntimeError):
+                    MODULE.machine_scope(machine)
+                output.assert_not_called()
 
     def test_python_syntax(self):
         ast.parse(SOURCE)

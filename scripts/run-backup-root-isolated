@@ -301,6 +301,15 @@ def emit_fixture_diagnostics(work, root):
         finally:
             os.close(fd)
 
+def machine_scope(machine):
+    require(re.fullmatch(r'nmcp-backup-[0-9a-f]{32}', machine), 'invalid owned machine')
+    # systemd 255 exposes Unit; Scope is a hidden compatibility alias omitted
+    # from GetAll, which is what machinectl show uses.
+    scope = output(['/usr/bin/machinectl', 'show', machine, '--property=Unit', '--value'])
+    expected = 'machine-' + machine.replace('-', r'\x2d') + '.scope'
+    require(scope == expected, 'unexpected machine unit: ' + repr(scope))
+    return scope
+
 def prepare_guest_config_dirs(root):
     # A minbase image need not contain site-local sysusers configuration.
     # These fixed paths live only beneath our newly-created guest rootfs.
@@ -449,8 +458,7 @@ def main():
             time.sleep(1)
         require(ready and leader_start, 'private systemd did not become ready')
         print('Guest leader cgroup: ' + Path('/proc', str(leader), 'cgroup').read_text(), flush=True)
-        scope = output(['/usr/bin/machinectl', 'show', machine, '--property=Scope', '--value'])
-        require(scope.startswith('machine-') and scope.endswith('.scope'), 'unexpected machine scope')
+        scope = machine_scope(machine)
         print('Guest scope resource/delegation: ' + output(['/usr/bin/systemctl', 'show', scope,
             '--property=ControlGroup', '--property=Delegate', '--property=MemoryMax',
             '--property=CPUQuotaPerSecUSec', '--property=TasksMax']), flush=True)
