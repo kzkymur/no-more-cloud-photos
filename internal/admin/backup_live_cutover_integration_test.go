@@ -200,8 +200,19 @@ func newLiveCutoverFixture(t *testing.T, bin string, clusters ...string) *liveCu
 	for _, u := range append(append([]string{}, liveUnits...), "nmcp.target") {
 		c := exec.Command("/usr/bin/systemctl", "show", "--property=LoadState", "--value", u)
 		b, e := c.Output()
-		if e != nil || strings.TrimSpace(string(b)) != "not-found" {
-			t.Fatalf("refuse existing/uninspectable runtime unit %s", u)
+		load := strings.TrimSpace(string(b))
+		if e == nil && u == "nmcp.slice" && load == "loaded" {
+			// systemd synthesizes inactive slices without any unit fragment.
+			// Accept only this exact pristine manager object, never an active,
+			// configured, transient, previously invoked or queued unit. The
+			// independent disk-path and exclusive-create guards below remain.
+			properties, inspectErr := exec.Command("/usr/bin/systemctl", "show", "--all",
+				"--property="+strings.Join(fixtureSliceProperties, ","), u).Output()
+			if inspectErr != nil || !pristineFixtureSlice(u, string(properties)) {
+				t.Fatalf("refuse non-pristine/uninspectable fixture slice %s: inspection_error=%t properties=%.4096q", u, inspectErr != nil, properties)
+			}
+		} else if e != nil || load != "not-found" {
+			t.Fatalf("refuse existing/uninspectable runtime unit %s: inspection_error=%t load_state=%.256q", u, e != nil, load)
 		}
 		for _, dir := range []string{"/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"} {
 			if _, e := os.Lstat(filepath.Join(dir, u)); !os.IsNotExist(e) {
