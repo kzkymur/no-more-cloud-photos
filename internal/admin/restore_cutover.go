@@ -588,38 +588,37 @@ func cutoverHBA(b []byte, op RestoreOperation) []byte {
 	return []byte(out.String())
 }
 
-func validateCutoverBackupUnit(env, credentials string) error {
+func validateCutoverBackupUnit(env []string, credentials [][]string) error {
 	expected := map[string]string{"PGSERVICEFILE": "pg_service.conf", "PGPASSFILE": "control.pgpass", "NMCP_BACKUP_DUMP_PASSFILE": "dump.pgpass"}
+	if len(env) != len(expected) || len(credentials) != 3 {
+		return errCutover
+	}
 	seen := map[string]bool{}
-	for _, token := range strings.Fields(env) {
-		pair := strings.SplitN(strings.Trim(token, "\""), "=", 2)
+	for _, token := range env {
+		pair := strings.SplitN(token, "=", 2)
 		if len(pair) != 2 {
 			return errCutover
 		}
-		if leaf, ok := expected[pair[0]]; ok {
-			if seen[pair[0]] || (pair[1] != "%d/"+leaf && pair[1] != "/run/credentials/nmcp-backup.service/"+leaf) {
-				return errCutover
-			}
-			seen[pair[0]] = true
-		} else if strings.HasPrefix(pair[0], "PG") {
+		leaf, ok := expected[pair[0]]
+		if !ok || seen[pair[0]] {
 			return errCutover
 		}
-	}
-	if len(seen) != len(expected) {
-		return errCutover
-	}
-	want := map[string]bool{"pg_service.conf:/etc/nmcp/backup.pg_service.conf": false, "dump.pgpass:/etc/nmcp/credentials/backup-dump.pgpass": false, "control.pgpass:/etc/nmcp/credentials/backup-control.pgpass": false}
-	for _, token := range strings.Fields(credentials) {
-		token = strings.Trim(token, "\"")
-		if found, ok := want[token]; !ok || found {
+		valid := pair[1] == "/run/nmcp-backup/"+leaf
+		if pair[0] == "PGSERVICEFILE" {
+			valid = pair[1] == "%d/"+leaf || pair[1] == "/run/credentials/nmcp-backup.service/"+leaf
+		}
+		if !valid {
 			return errCutover
 		}
-		want[token] = true
+		seen[pair[0]] = true
 	}
-	for _, found := range want {
-		if !found {
+	want := map[string]string{"pg_service.conf": "/etc/nmcp/backup.pg_service.conf", "dump.pgpass": "/etc/nmcp/credentials/backup-dump.pgpass", "control.pgpass": "/etc/nmcp/credentials/backup-control.pgpass"}
+	seen = map[string]bool{}
+	for _, pair := range credentials {
+		if len(pair) != 2 || seen[pair[0]] || want[pair[0]] == "" || want[pair[0]] != pair[1] {
 			return errCutover
 		}
+		seen[pair[0]] = true
 	}
 	return nil
 }
@@ -673,36 +672,11 @@ func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) erro
 	if e != nil {
 		return e
 	}
-	required := map[string]string{"NMCP_DATABASE_URL": "service=nmcp_backup_control", "NMCP_BACKUP_DUMP_SERVICE": "nmcp_backup_dump"}
-	seen := map[string]bool{}
-	for _, line := range strings.Split(string(f.before), "\n") {
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			return errCutover
-		}
-		if v, ok := required[parts[0]]; ok {
-			if seen[parts[0]] || parts[1] != v {
-				return errCutover
-			}
-			seen[parts[0]] = true
-		}
-		if strings.HasPrefix(strings.TrimSpace(parts[0]), "PG") {
-			return errCutover
-		}
-	}
-	if len(seen) != len(required) {
+	if validateCutoverBackupEnvironment(f.before) != nil {
 		return errCutover
 	}
-	env, e := systemctl(ctx, "show", "--property=Environment", "--value", "nmcp-backup.service")
-	if e != nil {
-		return errCutover
-	}
-	credentials, e := systemctl(ctx, "show", "--property=LoadCredential", "--value", "nmcp-backup.service")
-	if e != nil || validateCutoverBackupUnit(env, credentials) != nil {
-		return errCutover
+	if e = validateLoadedBackupUnit(ctx); e != nil {
+		return e
 	}
 	f, e = safeCutoverFile("/etc/nmcp/backup.pg_service.conf", false)
 	if e != nil {
@@ -774,8 +748,16 @@ func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) erro
 }
 
 func (a *systemCutover) Stop(ctx context.Context) error {
+	// Recheck before any destructive transition; privileged concurrent unit
+	// edits remain an operator coordination boundary, never auto-reloaded here.
+	if e := validateLoadedBackupUnit(ctx); e != nil {
+		return e
+	}
 	if _, e := systemctl(ctx, "stop", "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service"); e != nil {
 		return e
+	}
+	if e := waitBackupRuntimeCredentialsAbsent(ctx); e != nil {
+		return errCutover
 	}
 	if a.offline != nil {
 		if _, e := systemctl(ctx, "stop", a.offline.OfflineAuthority.SourceUnit); e != nil {

@@ -37,10 +37,10 @@ class RuntimeCredentials(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    p=Path(d)/'runtime';m.require_runtime_credentials_absent(p)
    p.mkdir()
-   with self.assertRaises(AssertionError):m.require_runtime_credentials_absent(p)
+   with self.assertRaises(AssertionError):m.require_runtime_credentials_absent(p,timeout=0)
    self.assertTrue(p.is_dir())
    link=Path(d)/'dangling';link.symlink_to(Path(d)/'missing')
-   with self.assertRaises(AssertionError):m.require_runtime_credentials_absent(link)
+   with self.assertRaises(AssertionError):m.require_runtime_credentials_absent(link,timeout=0)
    self.assertTrue(link.is_symlink())
  def test_exact_private_copy_contract(self):
   root=Path(__file__).resolve().parent.parent
@@ -57,6 +57,14 @@ class RuntimeCredentials(unittest.TestCase):
    service.replace('-m 0600','-m 0640',1),
    service.replace('/run/nmcp-backup/dump.pgpass','/tmp/dump.pgpass',1),
    service+'\nExecStartPre=/usr/bin/true\n',
+   service+'\nExecCondition=+/bin/sh -c true\n',
+   service.replace('[Service]', 'OnFailure=unreviewed.service\n[Service]'),
+   service+'\n[Install]\nWantedBy=unreviewed.target\n',
+   service+'\nExecStop=/usr/bin/true\n',
+   service+'\nExecReload=/usr/bin/true\n',
+   service+'\nPermissionsStartOnly=yes\n',
+   service+'\nPassEnvironment=PGPASSWORD\n',
+   service.replace('/usr/bin/install -T -m', '/usr/bin/install -m', 1),
    service+'\nReadWritePaths=/run\n',
    service.replace('Environment=PGPASSFILE=/run/nmcp-backup/control.pgpass','Environment=PGPASSFILE=%d/control.pgpass'),
   ]

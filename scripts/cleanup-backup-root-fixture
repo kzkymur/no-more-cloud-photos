@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import time
 
 PG = {
  'postgresql@17-nmcp-offline-fixture.service': '/run/nmcp-offline-fixture',
@@ -34,12 +35,16 @@ def validate_pg(record,head,unit,st,body,data_stat):
     assert record['postgres']=='/opt/nmcp-pg17-ci/bin/postgres'
     assert b'Type=forking\n' in body and ('PIDFile='+str(data)+'/postmaster.pid\n').encode() in body
 
-def require_runtime_credentials_absent(path=Path('/run/nmcp-backup')):
-    # Only inspect: manager cleanup must remove the private runtime directory.
-    # A surviving directory or dangling symlink is never deletion authority.
-    try: path.lstat()
-    except FileNotFoundError: return
-    raise AssertionError('backup runtime credentials remain after owned service stop')
+def require_runtime_credentials_absent(path=Path('/run/nmcp-backup'), timeout=5.0):
+    # Job completion precedes systemd255 runtime-data removal. Only observe;
+    # a surviving directory/dangling symlink is never deletion authority.
+    deadline = time.monotonic() + timeout
+    while True:
+        try: path.lstat()
+        except FileNotFoundError: return
+        if time.monotonic() >= deadline:
+            raise AssertionError('backup runtime credentials remain after owned service stop')
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
 
 def proc_running(pid):
     try: raw=Path('/proc')/str(pid)/'stat'; value=raw.read_text()

@@ -99,7 +99,7 @@ func TestBackupPG17PrivatePassfileMaterialization(t *testing.T) {
 	copyAndVerify := func(label string) {
 		t.Helper()
 		// Same argv as the ordinary (non-root-prefixed) production ExecStartPre.
-		if exec.CommandContext(f.ctx, "/usr/bin/install", "-m", "0600", source, materialized).Run() != nil {
+		if exec.CommandContext(f.ctx, "/usr/bin/install", "-T", "-m", "0600", source, materialized).Run() != nil {
 			t.Fatal("service-owned private materialization")
 		}
 		copied, e := os.ReadFile(materialized)

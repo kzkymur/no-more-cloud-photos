@@ -48,6 +48,14 @@ def parse_unit(path):
 
 def units(base):
     service = parse_unit(base / 'nmcp-backup.service')
+    require({section for section, key in service} == {'Unit', 'Service'},
+            'unexpected backup unit section')
+    require({key for section, key in service if section == 'Unit'} ==
+            {'Description', 'Documentation', 'After', 'PartOf', 'RequiresMountsFor'},
+            'unexpected backup unit dependency or trigger')
+    for key, value in {'After': 'nmcp-migrate.service', 'PartOf': 'nmcp.target',
+                       'RequiresMountsFor': '/var/lib/nmcp-backup'}.items():
+        require(service.get(('Unit', key)) == [value], 'unexpected backup unit dependency')
     expected = {
         'Type': 'oneshot', 'User': 'nmcp-backup', 'Group': 'nmcp-backup',
         'Slice': 'nmcp.slice', 'EnvironmentFile': '/etc/nmcp/backup.env',
@@ -58,6 +66,12 @@ def units(base):
         'ReadWritePaths': '/var/lib/nmcp-backup',
         'RuntimeDirectory': 'nmcp-backup', 'RuntimeDirectoryMode': '0700',
         'RuntimeDirectoryPreserve': 'no',
+        'TimeoutStartSec': '6h', 'TimeoutStopSec': '60s', 'KillMode': 'control-group',
+        'ProtectKernelTunables': 'yes', 'ProtectKernelModules': 'yes',
+        'ProtectControlGroups': 'yes', 'ProtectClock': 'yes', 'ProtectHostname': 'yes',
+        'ProtectProc': 'invisible', 'ProcSubset': 'pid', 'RestrictSUIDSGID': 'yes',
+        'LockPersonality': 'yes', 'MemoryDenyWriteExecute': 'yes',
+        'SystemCallArchitectures': 'native',
         'RestrictAddressFamilies': 'AF_UNIX AF_INET AF_INET6',
     }
     for key, value in expected.items():
@@ -70,12 +84,14 @@ def units(base):
         'PGPASSFILE=/run/nmcp-backup/control.pgpass', 'PGSERVICEFILE=%d/pg_service.conf', 'NMCP_BACKUP_DUMP_PASSFILE=/run/nmcp-backup/dump.pgpass'],
         'credential paths must use exact private runtime copies and service specifier')
     require(service.get(('Service', 'ExecStartPre')) == [
-        '/usr/bin/install -m 0600 %d/control.pgpass /run/nmcp-backup/control.pgpass',
-        '/usr/bin/install -m 0600 %d/dump.pgpass /run/nmcp-backup/dump.pgpass'],
+        '/usr/bin/install -T -m 0600 %d/control.pgpass /run/nmcp-backup/control.pgpass',
+        '/usr/bin/install -T -m 0600 %d/dump.pgpass /run/nmcp-backup/dump.pgpass'],
         'only exact service-UID private credential copies are allowed')
-    require(not any(k in ('ExecStartPost', 'ExecStopPost', 'EnvironmentFile')
-                    and (k != 'EnvironmentFile' or v != ['/etc/nmcp/backup.env'])
-                    for (s, k), v in service.items() if s == 'Service'), 'unexpected service execution')
+    # Reject ALL unreviewed execution/environment/privilege/mount directives,
+    # including ExecCondition, ExecStop and deprecated PermissionsStartOnly.
+    require({k for s, k in service if s == 'Service'} ==
+            set(expected) | {'LoadCredential', 'Environment', 'ExecStartPre'},
+            'unexpected service directive')
     timer = parse_unit(base / 'nmcp-backup.timer')
     require(timer.get(('Timer', 'OnCalendar')) == ['hourly'], 'timer must only wake hourly')
     require(timer.get(('Timer', 'Unit')) == ['nmcp-backup.service'], 'wrong timer target')

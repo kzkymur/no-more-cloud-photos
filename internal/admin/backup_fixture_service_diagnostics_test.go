@@ -3,7 +3,6 @@ package admin
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -59,12 +58,12 @@ func (f *liveCutoverFixture) startBackup(pool *pgxpool.Pool) {
 	cmd := exec.CommandContext(f.ctx, "/usr/bin/systemctl", "start", "nmcp-backup.service")
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
 	err := cmd.Run()
-	_, statErr := os.Lstat("/run/nmcp-backup")
-	runtimeAbsent := os.IsNotExist(statErr)
+	runtimeAbsent := waitBackupRuntimeCredentialsAbsent(f.ctx) == nil
 	if err != nil || !runtimeAbsent {
 		logLiveBackupFailure(f.t, f.ctx, pool)
 		f.t.Fatalf("actual production backup unit failed or runtime credentials survived: runtime_absent=%t; raw output suppressed, no manual runtime removal", runtimeAbsent)
 	}
+	f.t.Log("actual manager runtime credential teardown observed after oneshot; no explicit stop or manual removal")
 }
 
 func logLiveBackupFailure(t *testing.T, parent context.Context, pool *pgxpool.Pool) {

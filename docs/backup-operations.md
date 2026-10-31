@@ -111,12 +111,19 @@ No wildcard, duplicate alias, other socket, database or login is permitted. Neve
 in argv, shell history, reports or logs. `LoadCredential=` snapshots them into
 the service credential namespace. ACL-backed systemd credentials may be
 root-owned 0440: libpq rejects those group-class bits even for a private named-user
-ACL. Two exact ordinary `ExecStartPre` commands run as `nmcp-backup` and copy the
+ACL. Two exact `ExecStartPre=/usr/bin/install -T -m 0600 ...` commands run as
+`nmcp-backup` and copy the
 control/dump credentials to manager-created `/run/nmcp-backup` (0700), producing
 service-owned 0600 single-link files. `PGPASSFILE` and
 `NMCP_BACKUP_DUMP_PASSFILE` point only to those private copies; `PGSERVICEFILE`
-still uses `%d/pg_service.conf`. `RuntimeDirectoryPreserve=no` removes the copies
-on stop/failure, and every activation recreates them from current credentials.
+still uses `%d/pg_service.conf`. `-T` prevents an existing destination directory
+or directory symlink from redirecting the copy. Source authenticity comes from
+the manager credential namespace and root-private provisioning, not `install`.
+`RuntimeDirectoryPreserve=no` requests removal on stop/failure, and every
+activation recreates copies from current credentials. Job completion precedes
+manager teardown: acceptance observes absence for at most five seconds without
+issuing another stop or deleting anything; a remaining directory, dangling link
+or inspection error fails closed. This is not hostile same-UID race isolation.
 The original LoadCredential files, backup UID, namespace hardening and strict
 passfile validation are unchanged. Never broaden `/run` write access, preserve
 this directory, add root execution prefixes, or chmod the source ACL. Do not put
@@ -124,6 +131,16 @@ this directory, add root execution prefixes, or chmod the source ACL. Do not put
 interpolation there. The dump child must receive only dump credentials, not the
 control password or routine process environment. Neither credential authorizes
 restore, role creation, candidate provisioning or cutover.
+
+Cutover reads typed effective systemd properties, including all execution hooks
+and flags, runtime mode/lifetime, credential providers, environment precedence,
+capabilities and namespace remaps. It rejects pending daemon reloads and
+unreviewed drop-ins, rechecks before stopping units, and never auto-reloads to
+conceal a configuration change. The sole optional fixture drop-in exposes only
+the two authenticated `/opt/nmcp-native-ci` and `/opt/nmcp-pg17-ci` prefixes as
+same-path recursive read-only binds; exact root-owned file bytes and effective
+bind tuples must agree. Privileged concurrent edits remain an operator
+coordination boundary. Environment files cannot override credential routes.
 
 ## Wake timer, manual runs and results
 

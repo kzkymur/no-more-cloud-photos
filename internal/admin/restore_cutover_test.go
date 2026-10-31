@@ -342,22 +342,24 @@ func TestCutoverFileRejectsSymlinkHardlinkAndConcurrentEdit(t *testing.T) {
 }
 
 func TestCutoverBackupUnitCredentialNamespace(t *testing.T) {
-	env := "PGSERVICEFILE=%d/pg_service.conf PGPASSFILE=%d/control.pgpass NMCP_BACKUP_DUMP_PASSFILE=%d/dump.pgpass"
-	credentials := "pg_service.conf:/etc/nmcp/backup.pg_service.conf dump.pgpass:/etc/nmcp/credentials/backup-dump.pgpass control.pgpass:/etc/nmcp/credentials/backup-control.pgpass"
-	if validateCutoverBackupUnit(env, credentials) != nil {
+	env := []string{"PGSERVICEFILE=%d/pg_service.conf", "PGPASSFILE=/run/nmcp-backup/control.pgpass", "NMCP_BACKUP_DUMP_PASSFILE=/run/nmcp-backup/dump.pgpass"}
+	creds := [][]string{{"pg_service.conf", "/etc/nmcp/backup.pg_service.conf"}, {"dump.pgpass", "/etc/nmcp/credentials/backup-dump.pgpass"}, {"control.pgpass", "/etc/nmcp/credentials/backup-control.pgpass"}}
+	if validateCutoverBackupUnit(env, creds) != nil {
 		t.Fatal("canonical unit rejected")
 	}
-	if validateCutoverBackupUnit(strings.ReplaceAll(env, "%d/", "/run/credentials/nmcp-backup.service/"), credentials) != nil {
+	expanded := append([]string(nil), env...)
+	expanded[0] = "PGSERVICEFILE=/run/credentials/nmcp-backup.service/pg_service.conf"
+	if validateCutoverBackupUnit(expanded, creds) != nil {
 		t.Fatal("expanded canonical namespace rejected")
 	}
-	for _, bad := range []string{env + " PGHOST=evil", env + " PGSERVICEFILE=%d/other", strings.ReplaceAll(env, "%d/pg_service.conf", "/tmp/config"), ""} {
-		if validateCutoverBackupUnit(bad, credentials) == nil {
-			t.Fatal("untrusted environment route accepted")
+	for _, bad := range [][]string{append(append([]string(nil), env...), "PGHOST=evil"), {env[0] + " " + env[1], env[2]}, {env[0], "PGPASSFILE=%d/control.pgpass", env[2]}, {env[0], "\"" + env[1] + "\"", env[2]}, {env[0], env[1], env[1]}, nil} {
+		if validateCutoverBackupUnit(bad, creds) == nil {
+			t.Fatal("untrusted environment route/boundary accepted")
 		}
 	}
-	for _, bad := range []string{credentials + " extra:/tmp/other", strings.ReplaceAll(credentials, "/etc/nmcp/backup.pg_service.conf", "/tmp/other"), ""} {
+	for _, bad := range [][][]string{{creds[0], creds[1]}, {creds[0], creds[1], {"control.pgpass", "/tmp/other"}}, {creds[0], {"dump.pgpass", creds[1][1] + " control.pgpass:" + creds[2][1]}}, {creds[0], creds[1], creds[1]}} {
 		if validateCutoverBackupUnit(env, bad) == nil {
-			t.Fatal("untrusted credential source accepted")
+			t.Fatal("untrusted credential source/boundary accepted")
 		}
 	}
 }

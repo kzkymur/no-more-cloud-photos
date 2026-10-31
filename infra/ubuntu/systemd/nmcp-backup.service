@@ -20,8 +20,8 @@ LoadCredential=pg_service.conf:/etc/nmcp/backup.pg_service.conf
 RuntimeDirectory=nmcp-backup
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=no
-ExecStartPre=/usr/bin/install -m 0600 %d/control.pgpass /run/nmcp-backup/control.pgpass
-ExecStartPre=/usr/bin/install -m 0600 %d/dump.pgpass /run/nmcp-backup/dump.pgpass
+ExecStartPre=/usr/bin/install -T -m 0600 %d/control.pgpass /run/nmcp-backup/control.pgpass
+ExecStartPre=/usr/bin/install -T -m 0600 %d/dump.pgpass /run/nmcp-backup/dump.pgpass
 # %d is expanded by systemd. EnvironmentFile does NOT expand shell variables.
 Environment=PGPASSFILE=/run/nmcp-backup/control.pgpass
 Environment=PGSERVICEFILE=%d/pg_service.conf

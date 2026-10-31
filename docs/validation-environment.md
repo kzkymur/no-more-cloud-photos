@@ -199,15 +199,29 @@ independent raw catalog oracle rather than comparing the DDL generator with itse
 The explicit PG17 private-passfile regression creates an actual self-only POSIX
 ACL (0440 group-class mask) in a private test directory. It proves pgx can
 authenticate while the unchanged Go dump guard and libpq reject that file;
-ordinary `install -m 0600` creates byte-identical, current-UID, single-link copies
+ordinary `install -T -m 0600` creates byte-identical, current-UID, single-link copies
 that pass the strict Go identity check, real `pg_dump`, and `pg_restore --list`.
 It also rejects weak/stale copies and covers owner-private 0400 input. This is
 credential-format portability evidence, not actual systemd delivery, distinct-UID
 isolation, or a claim about the precise attributes in earlier failed root runs.
 Actual live/offline tests exercise the production runtime-directory lifecycle,
 refuse a preexisting `/run/nmcp-backup` before mutation, and require manager removal
-after each oneshot and owned-unit cleanup. Leftovers are preserved and fail;
+after each oneshot and owned-unit cleanup, with a five-second read-only wait.
+In [systemd 255](https://github.com/systemd/systemd/blob/v255/src/core/service.c),
+job completion is emitted before synchronous runtime-data destruction; a single
+immediate absence sample is insufficient. Leftovers are preserved and fail;
 neither normal nor fallback cleanup manually deletes that runtime path.
+
+`TestBackupInstallExactLeaf` separately requires actual GNU coreutils 9.4:
+no-`-T` directory-symlink redirection is the negative control; `-T` refuses a real
+directory and replaces symlink, dangling, hardlink and stale regular leaves with
+private current copies without changing victim contents. Unsupported local
+install implementations explicitly skip; CI requires a non-skipped PASS. These
+are filesystem semantics, not authenticated-source or systemd-lifecycle proof.
+Typed effective-unit decoder tests cover malformed/duplicate/trailing JSON,
+command flags and argv boundaries; the root fixture must separately prove the
+actual manager contract. Automatic failure/interruption cleanup and complete
+online/offline restore/resume remain actual acceptance gates, not mock claims.
 
 The launcher retains a root-only exact-head ownership receipt and diagnostic
 root filesystem below `RUNNER_TEMP`. Normal finalization and the workflow's

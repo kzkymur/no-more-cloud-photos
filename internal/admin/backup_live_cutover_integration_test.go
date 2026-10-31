@@ -370,7 +370,7 @@ func (f *liveCutoverFixture) cleanupLive() {
 		}
 	}
 	if _, owned := f.owned["/etc/systemd/system/nmcp-backup.service"]; owned {
-		if _, err := os.Lstat("/run/nmcp-backup"); !os.IsNotExist(err) {
+		if err := waitBackupRuntimeCredentialsAbsent(ctx); err != nil {
 			t.Error("owned backup runtime credentials not removed by manager; preserve paths")
 			safe = false
 		}
@@ -571,6 +571,10 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	// Real API and worker must be running on source *before* Restore; actual
 	// unit files retain production sandboxing and fixed executable paths.
 	f.run("/usr/bin/systemctl", "daemon-reload")
+	if err := validateLoadedBackupUnit(ctx); err != nil {
+		t.Fatalf("actual effective backup unit contract: %v", err)
+	}
+	t.Log("actual systemd effective backup credential/runtime/command contract validated")
 	f.run("/usr/bin/systemctl", "start", "nmcp-migrate.service", "nmcp-api.service", "nmcp-worker.service")
 	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service"} {
 		pid, e := unitPID(ctx, unit)
