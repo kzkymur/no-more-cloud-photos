@@ -162,6 +162,16 @@ Unexpected boot, runtime-library, identity, cleanup, or machine-shutdown errors
 fail the lane rather than become skipped success. Logs and rootfs are preserved
 for runner diagnostics, not installed on a customer machine.
 
+Bootstrap downloads use a root-private Wget configuration (10-second DNS and
+connect limits, 30-second read limit, three tries) within the existing 900-second
+provisioning deadline. HTTPS certificate checks, archive signatures, and package
+verification remain mandatory. This configuration is passed only to bootstrap,
+not to guest tests. On a caught timeout or interruption, the launcher signals
+only its freshly created, live PID/start-time/session/group-attested bootstrap
+process group and reaps its launcher. An unattestable leader or abrupt outer
+termination still fails closed; descendant absence after such interruption is
+not established merely by a no-machine cleanup result.
+
 Pure launcher tests do not prove actual boot, service sandboxing, resource
 limits, restore/cutover, timeout cleanup, or HBA behavior. Those remain separate
 mandatory supported-runner executions. An interrupted unregistered launch or

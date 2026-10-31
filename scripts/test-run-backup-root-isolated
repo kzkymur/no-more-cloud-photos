@@ -164,6 +164,40 @@ class Isolation(unittest.TestCase):
                     MODULE.machine_scope(machine)
                 output.assert_not_called()
 
+    def test_private_bootstrap_transport_configuration(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(MODULE,'private_directory') as private:
+            work=pathlib.Path(temp)
+            env=MODULE.bootstrap_environment(work)
+            private.assert_called_once_with(work)
+            config=work/'wgetrc'
+            self.assertEqual(config.stat().st_mode & 0o777,0o600)
+            self.assertEqual(config.read_text(),'dns_timeout = 10\nconnect_timeout = 10\nread_timeout = 30\n'
+                             'tries = 3\nwaitretry = 1\ncheck_certificate = on\n')
+            self.assertEqual(env,dict(MODULE.HOST_ENV,WGETRC=str(config)))
+            self.assertNotIn('WGETRC',MODULE.HOST_ENV)
+            self.assertNotIn('WGETRC',MODULE.KEYS)
+            with self.assertRaises(FileExistsError):
+                MODULE.bootstrap_environment(work)
+
+    def test_bootstrap_timeout_group_identity_and_reaping(self):
+        for same_identity,sid,pgid in ((True,99,99),(False,99,99),(True,98,99),(True,99,98)):
+            proc=Mock(pid=99,returncode=None)
+            timeout=MODULE.sp.TimeoutExpired(['debootstrap'],900)
+            proc.wait.side_effect=[timeout, -9]
+            with patch.object(MODULE.sp,'Popen',return_value=proc) as popen, \
+                    patch.object(MODULE,'process_identity',side_effect=['start','start' if same_identity else 'reused']), \
+                    patch.object(MODULE.os,'getsid',return_value=sid),patch.object(MODULE.os,'getpgid',return_value=pgid), \
+                    patch.object(MODULE.os,'killpg') as kill,patch('builtins.print'):
+                with self.assertRaises(MODULE.sp.TimeoutExpired) as raised:
+                    MODULE.run_bootstrap(['debootstrap'],{'WGETRC':'/private/wgetrc'},None)
+                self.assertIs(raised.exception,timeout)
+                self.assertTrue(popen.call_args.kwargs['start_new_session'])
+                if same_identity and sid==99 and pgid==99:
+                    kill.assert_called_once_with(99,MODULE.signal.SIGKILL)
+                    self.assertEqual(proc.wait.call_args_list,[unittest.mock.call(timeout=900),unittest.mock.call(timeout=30)])
+                else:
+                    kill.assert_not_called()
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 

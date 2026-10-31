@@ -208,6 +208,7 @@ func newLiveCutoverFixture(t *testing.T, bin string, clusters ...string) *liveCu
 			// independent disk-path and exclusive-create guards below remain.
 			properties, inspectErr := exec.Command("/usr/bin/systemctl", "show", "--all",
 				"--property="+strings.Join(fixtureSliceProperties, ","), u).Output()
+			t.Logf("fixture implicit-slice inspection before classification: unit=%s inspection_error=%t properties=%.4096q", u, inspectErr != nil, properties)
 			if inspectErr != nil || !pristineFixtureSlice(u, string(properties)) {
 				t.Fatalf("refuse non-pristine/uninspectable fixture slice %s: inspection_error=%t properties=%.4096q", u, inspectErr != nil, properties)
 			}

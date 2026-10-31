@@ -301,6 +301,37 @@ def emit_fixture_diagnostics(work, root):
         finally:
             os.close(fd)
 
+def bootstrap_environment(work):
+    private_directory(work)
+    config = work / 'wgetrc'
+    fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as out:
+        out.write('dns_timeout = 10\nconnect_timeout = 10\nread_timeout = 30\n'
+                  'tries = 3\nwaitretry = 1\ncheck_certificate = on\n')
+    return dict(HOST_ENV, WGETRC=str(config))
+
+def run_bootstrap(argv, env, log):
+    # A timeout of subprocess.run kills only debootstrap, not its downloader.
+    # Own a fresh session/group, and attest its live leader before stopping it.
+    proc = sp.Popen(argv, env=env, stdout=log, stderr=sp.STDOUT, start_new_session=True)
+    started = process_identity(proc.pid)
+    try:
+        require(started is not None, 'bootstrap launcher identity unavailable')
+        code = proc.wait(timeout=900)
+        if code:
+            raise sp.CalledProcessError(code, argv)
+    except BaseException:
+        if proc.returncode is None:
+            try:
+                require(started is not None and process_identity(proc.pid) == started and
+                        os.getsid(proc.pid) == proc.pid and os.getpgid(proc.pid) == proc.pid,
+                        'refuse unattested bootstrap process group')
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=30)
+            except Exception as cleanup_error:
+                print('FAIL bootstrap group cleanup: ' + str(cleanup_error), file=sys.stderr, flush=True)
+        raise
+
 def machine_scope(machine):
     require(re.fullmatch(r'nmcp-backup-[0-9a-f]{32}', machine), 'invalid owned machine')
     # systemd 255 exposes Unit; Scope is a hidden compatibility alias omitted
@@ -413,10 +444,10 @@ def main():
         # debootstrap runs only against this new root. Its standard policy-rc.d
         # prevents package maintainer scripts starting services on the host.
         with (work / 'provision.log').open('w') as log:
-            run(['/usr/sbin/debootstrap', '--variant=minbase', '--components=main,universe',
+            run_bootstrap(['/usr/sbin/debootstrap', '--variant=minbase', '--components=main,universe',
                  '--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg',
                  '--include=' + PACKAGES, 'noble', str(root), 'https://archive.ubuntu.com/ubuntu'],
-                stdout=log, stderr=sp.STDOUT, timeout=900)
+                bootstrap_environment(work), log)
         require(not any(root.glob('usr/lib/systemd/system/postgresql*')), 'unexpected PG vendor units')
         require(not (root / 'etc/postgresql-common').exists(), 'postgresql-common must not be installed')
         prepare_guest_config_dirs(root)
