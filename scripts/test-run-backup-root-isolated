@@ -53,6 +53,28 @@ class Isolation(unittest.TestCase):
                 MODULE.stop_owned_tests(r)
             run.assert_not_called()
 
+    def test_diagnostics_are_bounded_and_missing_is_safe(self):
+        with patch.object(MODULE.os, 'open', side_effect=FileNotFoundError) as opened:
+            MODULE.emit_fixture_diagnostics(pathlib.Path('/owned'), pathlib.Path('/owned/rootfs'))
+            self.assertEqual(opened.call_count,3)
+            self.assertTrue(all(c.args[1] & MODULE.os.O_NOFOLLOW for c in opened.call_args_list))
+        st=types.SimpleNamespace(st_mode=MODULE.stat.S_IFREG,st_uid=0,st_nlink=1,st_size=999999)
+        with patch.object(MODULE.os,'open',return_value=20), patch.object(MODULE.os,'fstat',return_value=st), \
+                patch.object(MODULE.os,'lseek') as seek, patch.object(MODULE.os,'read',return_value=b'diagnostic') as read, \
+                patch.object(MODULE.os,'close') as close, patch('builtins.print'):
+            MODULE.emit_fixture_diagnostics(pathlib.Path('/owned'),pathlib.Path('/owned/rootfs'))
+            self.assertEqual(read.call_count,3)
+            self.assertTrue(all(c.args==(20,65536) for c in read.call_args_list))
+            seek.assert_called_with(20,999999-65536,MODULE.os.SEEK_SET)
+            self.assertEqual(close.call_count,3)
+        for uid,mode,links in ((1000,MODULE.stat.S_IFREG,1),(0,MODULE.stat.S_IFIFO,1),(0,MODULE.stat.S_IFREG,2)):
+            st=types.SimpleNamespace(st_mode=mode,st_uid=uid,st_nlink=links,st_size=1)
+            with patch.object(MODULE.os,'open',return_value=20),patch.object(MODULE.os,'fstat',return_value=st), \
+                    patch.object(MODULE.os,'read') as read,patch.object(MODULE.os,'close'):
+                with self.assertRaises(RuntimeError):
+                    MODULE.emit_fixture_diagnostics(pathlib.Path('/owned'),pathlib.Path('/owned/rootfs'))
+                read.assert_not_called()
+
     def test_python_syntax(self):
         ast.parse(SOURCE)
 

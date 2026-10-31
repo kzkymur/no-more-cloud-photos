@@ -278,6 +278,25 @@ def teardown_guest(r, receipt):
         time.sleep(1)
     raise RuntimeError('guest machine or original PID survived termination')
 
+def emit_fixture_diagnostics(work, root):
+    # Explicit non-secret provisioning/boot logs only. Never recurse over the
+    # guest, credentials, arbitrary receipt paths, or /run contents.
+    for path in (work / 'provision.log', root / 'debootstrap/debootstrap.log', work / 'boot.log'):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        try:
+            st = os.fstat(fd)
+            require(stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1,
+                    'unsafe diagnostic file')
+            os.lseek(fd, max(0, st.st_size - 65536), os.SEEK_SET)
+            text = os.read(fd, 65536).decode('utf-8', errors='replace')
+            print('=== bounded fixture diagnostic: ' + str(path) + ' ===', flush=True)
+            print(text, flush=True)
+        finally:
+            os.close(fd)
+
 def main():
     require(os.geteuid() == 0, 'root required')
     require(os.environ.get('GITHUB_ACTIONS') == 'true' and
@@ -483,6 +502,10 @@ for p in sys.argv[1:]:
         result = 0
     except Exception as exc:
         print('FAIL isolated fixture: ' + str(exc), file=sys.stderr, flush=True)
+        try:
+            emit_fixture_diagnostics(work, root)
+        except Exception as diagnostic_error:
+            print('FAIL safe diagnostic capture: ' + str(diagnostic_error), file=sys.stderr, flush=True)
     finally:
         # Signals cannot interrupt the bounded finalizer a second time. SIGKILL
         # is outside any trap's guarantee; the disposable hosted VM is the last

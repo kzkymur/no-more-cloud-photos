@@ -517,6 +517,8 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	source := f.poolLive("operator", "source")
 	f.sql(admin, `CREATE DATABASE candidate TEMPLATE template0 OWNER nmcp_migrator`)
 	f.sql(admin, `REVOKE ALL ON DATABASE candidate FROM PUBLIC; GRANT CONNECT ON DATABASE candidate TO nmcp_api`)
+	f.sql(admin, `CREATE DATABASE candidate2 TEMPLATE template0 OWNER nmcp_migrator`)
+	f.sql(admin, `REVOKE ALL ON DATABASE candidate2 FROM PUBLIC; GRANT CONNECT ON DATABASE candidate2 TO nmcp_api`)
 	// Candidate root-only peer gate. Source remains usable by actual core units.
 	f.write(filepath.Join(f.data, "pg_ident.conf"), "live_operator root operator\nlive_operator root nmcp_api\n", 0600)
 	pg, _ := user.Lookup("postgres")
@@ -525,7 +527,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if os.Chown(filepath.Join(f.data, "pg_ident.conf"), uid, gid) != nil {
 		t.Fatal("peer map owner")
 	}
-	hba := "local candidate operator peer map=live_operator\nlocal candidate nmcp_api peer map=live_operator\nlocal candidate all reject\nhost candidate all 0.0.0.0/0 reject\nhost candidate all ::/0 reject\nlocal all all scram-sha-256\nhost source all 127.0.0.1/32 scram-sha-256\nhost all all 0.0.0.0/0 reject\nhost all all ::/0 reject\n"
+	hba := "local candidate2 operator peer map=live_operator\nlocal candidate2 nmcp_api peer map=live_operator\nlocal candidate2 all reject\nhost candidate2 all 0.0.0.0/0 reject\nhost candidate2 all ::/0 reject\nlocal candidate operator peer map=live_operator\nlocal candidate nmcp_api peer map=live_operator\nlocal candidate all reject\nhost candidate all 0.0.0.0/0 reject\nhost candidate all ::/0 reject\nlocal all all scram-sha-256\nhost source all 127.0.0.1/32 scram-sha-256\nhost all all 0.0.0.0/0 reject\nhost all all ::/0 reject\n"
 	f.write("/etc/postgresql/17/backup-ci/pg_hba.conf", hba, 0644)
 	f.command("pg_ctl", nil, "-D", f.data, "reload")
 	peer := fmt.Sprintf("host=%s port=5432 dbname=candidate user=operator sslmode=disable", quoteConnValue(f.socket))
@@ -541,43 +543,8 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	// Every routine OS identity is denied every login over local and TCP routes.
-	// Require PostgreSQL causal diagnostics, not exec/permission/network failures.
-	for _, osRole := range []string{"nmcp", "nmcp-backup"} {
-		for _, role := range []string{"operator", "nmcp_api", "nmcp_worker", "nmcp_migrator", "nmcp_backup_control", "nmcp_backup_dump"} {
-			for _, host := range []string{f.socket, "127.0.0.1"} {
-				args := []string{"--reuid=" + osRole, "--regid=" + osRole, "--init-groups", filepath.Join(bin, "psql"), "-X", "--no-password", "--host=" + host, "--port=5432", "--dbname=candidate", "--username=" + role, "--command=SELECT 1"}
-				c := exec.CommandContext(ctx, "/usr/bin/setpriv", args...)
-				c.Env = []string{"PATH=/usr/bin:/bin", "LANG=C"}
-				var diagnostic bytes.Buffer
-				c.Stderr = &diagnostic
-				c.Stdout = io.Discard
-				if c.Run() == nil || (!strings.Contains(diagnostic.String(), "pg_hba.conf rejects connection") && !strings.Contains(diagnostic.String(), "Peer authentication failed")) {
-					t.Fatal("routine UID denial lacks real HBA/peer causality")
-				}
-			}
-		}
-	}
-	// Root may use operator/api only via the private peer socket, never TCP.
-	for _, role := range []string{"operator", "nmcp_api"} {
-		c, e := pgx.Connect(ctx, strings.Replace(peer, "user=operator", "user="+role, 1))
-		if e != nil {
-			t.Fatal("root peer login unavailable")
-		}
-		c.Close(ctx)
-		cfg, e := pgx.ParseConfig(peer)
-		if e != nil {
-			t.Fatal(e)
-		}
-		cfg.Host = "127.0.0.1"
-		cfg.User = role
-		cfg.ConnectTimeout = time.Second
-		c, e = pgx.ConnectConfig(ctx, cfg)
-		if e == nil {
-			c.Close(ctx)
-			t.Fatal("candidate root TCP unexpectedly allowed")
-		}
-	}
+	f.assertCandidateGate("candidate")
+	f.assertCandidateGate("candidate2")
 	f.installLiveUnits(artifacts, prefix, video, icc)
 	// Real API and worker must be running on source *before* Restore; actual
 	// unit files retain production sandboxing and fixed executable paths.
@@ -646,7 +613,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		t.Fatal("candidate identity")
 	}
 	hash := sha256.Sum256([]byte(hba))
-	receipt := RestoreReceipt{Source: si, Candidate: ci, Template0: true, Empty: true, RoutineLoginDenied: true, OperatorSocketOnly: true, HBASHA256: hex.EncodeToString(hash[:]), IssuedAt: time.Now()}
+	receipt := RestoreReceipt{Source: si, Candidate: ci, Template0: true, Empty: true, RoutineLoginDenied: true, OperatorSocketOnly: true, HBASHA256: hex.EncodeToString(hash[:]), IssuedAt: time.Now().UTC()}
 	raw, e := json.Marshal(receipt)
 	if e != nil {
 		t.Fatal(e)
@@ -674,6 +641,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if e != nil || op.Phase != "cutover_verified" {
 		t.Fatalf("real system cutover failed at sanitized phase %s", op.FailedPhase)
 	}
+	generated := f.liveGeneratedConfig(op)
 	pg17AssertBackupOtherDBHBA(t, ctx, f.passwords, f.socket, 5432, op.Candidate.DatabaseName)
 	durable, e := LoadRestoreOperation(settings.LedgerRoot, op.ID)
 	if e != nil || durable.Phase != "cutover_verified" || durable.Receipt != receipt || durable.BackupID != backupID || len(durable.DumpSHA256) != 64 {
@@ -685,7 +653,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if e != nil || e2 != nil || strings.TrimSpace(string(pinned)) != hex.EncodeToString(h[:]) {
 		t.Fatal("cutover HBA digest not durably pinned")
 	}
-	for _, role := range []string{"nmcp_api", "nmcp_worker", "nmcp_backup_control", "nmcp_backup_dump"} {
+	for _, role := range []string{"nmcp_api", "nmcp_worker", "nmcp_migrator", "nmcp_backup_control", "nmcp_backup_dump"} {
 		for _, host := range []string{f.socket, "127.0.0.1"} {
 			cfg, e := pgx.ParseConfig(f.dsnLive(role, "source"))
 			if e != nil {
@@ -747,7 +715,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if _, e := New(candidate).MaintenanceResume(ctx, store); e != nil {
 		t.Fatal("separate actual candidate MaintenanceResume failed")
 	}
-	liveUploadAfterResume(t, ctx)
+	liveUploadAfterResume(t, ctx, 1)
 	// Stabilize the positive fixture before its next DB-only snapshot. This does
 	// not waive production reconciliation when files change after a backup.
 	for {
@@ -756,6 +724,9 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 			t.Fatal("postresume job completion observation")
 		}
 		if pending == 0 {
+			if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM jobs WHERE status='failed'`) != "0" {
+				t.Fatal("first resumed native job failed before second snapshot")
+			}
 			break
 		}
 		select {
@@ -803,7 +774,272 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM backup_runs`) != before {
 		t.Fatal("timer wake/if-due created a false backup")
 	}
+	f.secondLiveCycle(source, candidate, store, op, postRuns[0].ID, settings, generated)
 	t.Logf("actual PG17 live cutover+separate resume+real API write passed; backup=%s operation=%s rpo_ms=%d rto_ms=%d", backupID, op.ID, op.RPO.Milliseconds(), op.RTO.Milliseconds())
+}
+
+// Read the actual production outputs, never substitute freshly generated inputs.
+// Production VerifyTargets connects all five roles; VerifyLive additionally
+// binds the real API/worker sockets to their new MainPIDs and application names.
+func (f *liveCutoverFixture) liveGeneratedConfig(op RestoreOperation) map[string][]byte {
+	f.t.Helper()
+	out := map[string][]byte{}
+	read := func(name string) []byte {
+		b, err := os.ReadFile("/etc/nmcp/" + name)
+		if err != nil {
+			f.t.Fatal("read generated live configuration")
+		}
+		out[name] = b
+		return b
+	}
+	for _, item := range []struct{ file, role, suffix string }{{"api.env", "nmcp_api", "api"}, {"worker.env", "nmcp_worker", "worker"}, {"admin.env", "nmcp_migrator", "admin"}} {
+		found := 0
+		for _, line := range strings.Split(string(read(item.file)), "\n") {
+			if !strings.HasPrefix(line, "NMCP_DATABASE_URL=") {
+				continue
+			}
+			found++
+			raw := strings.TrimPrefix(line, "NMCP_DATABASE_URL=")
+			u, err := url.Parse(raw)
+			if err != nil {
+				f.t.Fatal("generated URL syntax")
+			}
+			cfg, err := pgx.ParseConfig(raw)
+			if err != nil || cfg.Database != op.Candidate.DatabaseName || cfg.Host != "127.0.0.1" || cfg.Port != 5432 || cfg.User != item.role || cfg.Password != f.passwords[item.role] || len(cfg.RuntimeParams) != 1 || cfg.RuntimeParams["application_name"] != cutoverApp(op.ID, item.suffix) || len(u.Query()["application_name"]) != 1 {
+				f.t.Fatal("generated core endpoint/witness is not canonical for this operation")
+			}
+		}
+		if found != 1 {
+			f.t.Fatal("generated core URL multiplicity")
+		}
+	}
+	var services strings.Builder
+	for _, role := range []string{"nmcp_backup_control", "nmcp_backup_dump"} {
+		fmt.Fprintf(&services, "[%s]\napplication_name=%s\ndbname=%s\nhost=%s\nport=5432\nsslmode=disable\nuser=%s\n\n", role, cutoverApp(op.ID, strings.TrimPrefix(role, "nmcp_")), op.Candidate.DatabaseName, f.socket, role)
+		leaf := "credentials/backup-" + strings.TrimPrefix(role, "nmcp_backup_") + ".pgpass"
+		want := fmt.Sprintf("localhost:5432:%s:%s:%s\n%s:5432:%s:%s:%s\n", op.Candidate.DatabaseName, role, f.passwords[role], f.socket, op.Candidate.DatabaseName, role, f.passwords[role])
+		if string(read(leaf)) != want {
+			f.t.Fatal("generated backup credential aliases not exact target-only entries")
+		}
+	}
+	if string(read("backup.pg_service.conf")) != services.String() {
+		f.t.Fatal("generated backup services not canonical operation-bound outputs")
+	}
+	read("backup.env")
+	return out
+}
+
+func (f *liveCutoverFixture) secondLiveCycle(original, source *pgxpool.Pool, store *storage.Store, first RestoreOperation, backupID string, settings RestoreSettings, generated map[string][]byte) {
+	t, ctx := f.t, f.ctx
+	t.Helper()
+	if backupID == first.BackupID {
+		t.Fatal("second cycle requires independent actual source backup")
+	}
+	if pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM admin_audit WHERE command='backup_run' AND outcome='succeeded' AND $1::uuid=ANY(affected_ids)`, backupID) != "1" {
+		t.Fatal("second source backup success audit absent")
+	}
+	// No HBA edit is necessary: candidate2 was preprovisioned, and both production
+	// cutovers retain prior fences. Re-prove the gate under the FIRST output HBA.
+	f.assertCandidateGate("candidate2")
+	peer := fmt.Sprintf("host=%s port=5432 dbname=candidate2 user=operator sslmode=disable", quoteConnValue(f.socket))
+	probe, err := pgxpool.New(ctx, peer)
+	if err != nil {
+		t.Fatal("second candidate identity pool")
+	}
+	identity, identityErr := restoreIdentity(ctx, probe)
+	probe.Close() // Restore requires no other candidate sessions, even operator.
+	sourceIdentity, err := restoreIdentity(ctx, source)
+	if err != nil || identityErr != nil || sourceIdentity != first.Candidate || identity.DatabaseOID == sourceIdentity.DatabaseOID || identity.ClusterID != sourceIdentity.ClusterID {
+		t.Fatal("second independent source/candidate identities")
+	}
+	hba, err := os.ReadFile(f.hbaPath)
+	if err != nil {
+		t.Fatal("read current second receipt HBA")
+	}
+	hash := sha256.Sum256(hba)
+	pinned, err := os.ReadFile(filepath.Join(settings.LedgerRoot, first.ID+".cutover-hba-sha256"))
+	if err != nil || strings.TrimSpace(string(pinned)) != hex.EncodeToString(hash[:]) {
+		t.Fatal("first generated HBA changed before independent second restore")
+	}
+	receipt := RestoreReceipt{Source: sourceIdentity, Candidate: identity, Template0: true, Empty: true, RoutineLoginDenied: true, OperatorSocketOnly: true, HBASHA256: hex.EncodeToString(hash[:]), IssuedAt: time.Now().UTC()}
+	if verifyGate(ctx, source, receipt) != nil {
+		t.Fatal("second receipt HBA is not applied")
+	}
+	raw, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.ReceiptFile = filepath.Join(settings.LedgerRoot, "receipt2.json")
+	settings.ServiceFile = filepath.Join(settings.LedgerRoot, "services2.conf")
+	settings.PassFile = filepath.Join(settings.LedgerRoot, "peer2.pgpass")
+	f.write(settings.ReceiptFile, string(raw), 0600)
+	f.write(settings.ServiceFile, fmt.Sprintf("[restore_operator]\nhost=%s\nport=5432\ndbname=candidate2\nuser=operator\nsslmode=disable\n[restore_api]\nhost=%s\nport=5432\ndbname=candidate2\nuser=nmcp_api\nsslmode=disable\n", f.socket, f.socket), 0600)
+	f.write(settings.PassFile, "# root-only peer, no reusable candidate credential\n", 0600)
+	op, err := New(source).Restore(ctx, backupID, settings)
+	if err != nil || op.Phase != "validated" {
+		t.Fatalf("second actual Restore failed at sanitized phase %s", op.FailedPhase)
+	}
+	if op.ID == first.ID || op.BackupID != backupID || op.Source != first.Candidate || op.Candidate != identity {
+		t.Fatal("second operation did not preserve independent identity chain")
+	}
+	target, err := pgxpool.New(ctx, peer)
+	if err != nil {
+		t.Fatal("second restored target pool")
+	}
+	defer target.Close()
+	for _, query := range pg17CatalogProofQueries {
+		if pg17Scalar(t, ctx, source, query) != pg17Scalar(t, ctx, target, query) {
+			t.Fatal("second actual Restore catalog/ACL/data mismatch")
+		}
+	}
+	if pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM media`) != "2" {
+		t.Fatal("second backup did not include first resumed API write")
+	}
+	// Bytes produced by operation1 MUST be the inputs consumed by operation2.
+	// In particular, do not strip application_name to bypass the acceptance gate.
+	for path, before := range generated {
+		now, err := os.ReadFile("/etc/nmcp/" + path)
+		if err != nil || !bytes.Equal(before, now) {
+			t.Fatal("first generated live config was modified before second cutover")
+		}
+	}
+	op, err = New(source).RestoreCutover(ctx, op.ID, settings)
+	if err != nil || op.Phase != "cutover_verified" {
+		t.Fatalf("second actual cutover failed at sanitized phase %s", op.FailedPhase)
+	}
+	f.liveGeneratedConfig(op)
+	durable, err := LoadRestoreOperation(settings.LedgerRoot, op.ID)
+	if err != nil || durable.Phase != "cutover_verified" || durable.Receipt != receipt || durable.BackupID != backupID || len(durable.DumpSHA256) != 64 {
+		t.Fatal("second external ledger lost pinned authorization")
+	}
+	prior, err := LoadRestoreOperation(settings.LedgerRoot, first.ID)
+	priorJSON, priorErr := json.Marshal(prior)
+	firstJSON, firstErr := json.Marshal(first)
+	if err != nil || priorErr != nil || firstErr != nil || !bytes.Equal(priorJSON, firstJSON) {
+		t.Fatal("second operation modified first external ledger")
+	}
+	current, err := os.ReadFile(f.hbaPath)
+	if err != nil {
+		t.Fatal("read second generated HBA")
+	}
+	currentHash := sha256.Sum256(current)
+	secondPin, err := os.ReadFile(filepath.Join(settings.LedgerRoot, op.ID+".cutover-hba-sha256"))
+	if err != nil || strings.TrimSpace(string(secondPin)) != hex.EncodeToString(currentHash[:]) {
+		t.Fatal("second HBA digest not durably pinned")
+	}
+	firstPin, err := os.ReadFile(filepath.Join(settings.LedgerRoot, first.ID+".cutover-hba-sha256"))
+	if err != nil || !bytes.Equal(firstPin, pinned) {
+		t.Fatal("second cutover rewrote first HBA receipt")
+	}
+	pg17AssertBackupOtherDBHBA(t, ctx, f.passwords, f.socket, 5432, op.Candidate.DatabaseName)
+	for _, db := range []string{first.Source.DatabaseName, op.Source.DatabaseName} {
+		for _, role := range []string{"nmcp_api", "nmcp_worker", "nmcp_migrator", "nmcp_backup_control", "nmcp_backup_dump"} {
+			for _, host := range []string{f.socket, "127.0.0.1"} {
+				cfg, err := pgx.ParseConfig(f.dsnLive(role, db))
+				if err != nil {
+					t.Fatal("old source denial config")
+				}
+				cfg.Host, cfg.ConnectTimeout = host, time.Second
+				conn, err := pgx.ConnectConfig(ctx, cfg)
+				if conn != nil {
+					conn.Close(ctx)
+				}
+				var rejected *pgconn.PgError
+				if !errors.As(err, &rejected) || rejected.Code != "28000" || !strings.Contains(rejected.Message, "pg_hba.conf rejects connection") {
+					t.Fatal("second cutover weakened a permanent source HBA fence")
+				}
+			}
+		}
+	}
+	for _, item := range []struct {
+		pool  *pgxpool.Pool
+		owner string
+	}{{original, first.ID}, {source, op.ID}, {target, op.ID}} {
+		state, err := New(item.pool).MaintenanceStatus(ctx)
+		if err != nil || state.Mode != "maintenance" || state.Owner == nil || *state.Owner != item.owner {
+			t.Fatal("second cutover maintenance ownership mismatch")
+		}
+	}
+	if active, _ := systemctl(ctx, "is-active", "nmcp-backup.timer"); active == "active" {
+		t.Fatal("second cutover resumed timer without separate resume")
+	}
+	for _, old := range []*pgxpool.Pool{original, source} {
+		if _, err := New(old).MaintenanceResume(ctx, store); err == nil {
+			t.Fatal("an old source permanent fence was resumable")
+		}
+	}
+	if _, err := New(target).MaintenanceResume(ctx, store); err != nil {
+		t.Fatal("second separate actual MaintenanceResume failed")
+	}
+	state, err := New(target).MaintenanceStatus(ctx)
+	if err != nil || state.Mode != "normal" || state.Owner != nil {
+		t.Fatal("second separate resume did not restore normal mode")
+	}
+	liveUploadAfterResume(t, ctx, 2)
+	for {
+		var pending int
+		if target.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE status IN ('queued','running')`).Scan(&pending) != nil {
+			t.Fatal("second resumed job observation")
+		}
+		if pending == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("second resumed native job timeout")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM media`) != "3" || pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM media`) != "2" || pg17Scalar(t, ctx, original, `SELECT count(*)::text FROM media`) != "1" {
+		t.Fatal("second distinct API write did not exclusively mutate second candidate")
+	}
+	if pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM jobs WHERE status='failed'`) != "0" || pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM admin_audit WHERE command='maintenance_resume' AND outcome='succeeded'`) != "2" {
+		t.Fatal("second native work/resume audit missing")
+	}
+	t.Logf("second independent actual Restore+Cutover+separate resume+distinct API write passed; backup=%s operation=%s source=%s candidate=%s rpo_ms=%d rto_ms=%d", backupID, op.ID, op.Source.DatabaseName, op.Candidate.DatabaseName, op.RPO.Milliseconds(), op.RTO.Milliseconds())
+}
+
+func (f *liveCutoverFixture) assertCandidateGate(database string) {
+	t, ctx, bin := f.t, f.ctx, f.bin
+	t.Helper()
+	peer := fmt.Sprintf("host=%s port=5432 dbname=%s user=operator sslmode=disable", quoteConnValue(f.socket), database)
+	// Every routine OS identity is denied every login over local and TCP routes.
+	// Require PostgreSQL causal diagnostics, not exec/permission/network failures.
+	for _, osRole := range []string{"nmcp", "nmcp-backup"} {
+		for _, role := range []string{"operator", "nmcp_api", "nmcp_worker", "nmcp_migrator", "nmcp_backup_control", "nmcp_backup_dump"} {
+			for _, host := range []string{f.socket, "127.0.0.1"} {
+				args := []string{"--reuid=" + osRole, "--regid=" + osRole, "--init-groups", filepath.Join(bin, "psql"), "-X", "--no-password", "--host=" + host, "--port=5432", "--dbname=" + database, "--username=" + role, "--command=SELECT 1"}
+				c := exec.CommandContext(ctx, "/usr/bin/setpriv", args...)
+				c.Env = []string{"PATH=/usr/bin:/bin", "LANG=C"}
+				var diagnostic bytes.Buffer
+				c.Stderr = &diagnostic
+				c.Stdout = io.Discard
+				if c.Run() == nil || (!strings.Contains(diagnostic.String(), "pg_hba.conf rejects connection") && !strings.Contains(diagnostic.String(), "Peer authentication failed")) {
+					t.Fatal("routine UID denial lacks real HBA/peer causality")
+				}
+			}
+		}
+	}
+	// Root may use operator/api only via the private peer socket, never TCP.
+	for _, role := range []string{"operator", "nmcp_api"} {
+		c, e := pgx.Connect(ctx, strings.Replace(peer, "user=operator", "user="+role, 1))
+		if e != nil {
+			t.Fatal("root peer login unavailable")
+		}
+		c.Close(ctx)
+		cfg, e := pgx.ParseConfig(peer)
+		if e != nil {
+			t.Fatal(e)
+		}
+		cfg.Host = "127.0.0.1"
+		cfg.User = role
+		cfg.ConnectTimeout = time.Second
+		c, e = pgx.ConnectConfig(ctx, cfg)
+		if e == nil {
+			c.Close(ctx)
+			t.Fatal("candidate root TCP unexpectedly allowed")
+		}
+	}
 }
 
 func (f *liveCutoverFixture) installLiveUnits(artifacts map[string]string, prefix, video, icc string) {
@@ -939,17 +1175,23 @@ func livePostMedia(t *testing.T, ctx context.Context, data []byte, name, key str
 		t.Fatalf("actual media API write status=%d", resp.StatusCode)
 	}
 }
-func liveUploadAfterResume(t *testing.T, ctx context.Context) {
+func liveUploadAfterResume(t *testing.T, ctx context.Context, cycles ...int) {
+	cycle := 0 // Preserve the independent offline fixture caller.
+	if len(cycles) == 1 {
+		cycle = cycles[0]
+	} else if len(cycles) > 1 {
+		t.Fatal("one upload cycle required")
+	}
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, 32, 32))
 	for y := 0; y < 32; y++ {
 		for x := 0; x < 32; x++ {
-			img.SetRGBA(x, y, color.RGBA{R: uint8(x * 8), G: uint8(y * 8), B: 91, A: 255})
+			img.SetRGBA(x, y, color.RGBA{R: uint8(x * 8), G: uint8(y * 8), B: uint8(91 + cycle), A: 255})
 		}
 	}
 	var b bytes.Buffer
 	if e := png.Encode(&b, img); e != nil {
 		t.Fatal(e)
 	}
-	livePostMedia(t, ctx, b.Bytes(), "live-resumed.png", "live-cutover-explicit-resume")
+	livePostMedia(t, ctx, b.Bytes(), fmt.Sprintf("live-resumed-%d.png", cycle), fmt.Sprintf("live-cutover-explicit-resume-%d", cycle))
 }
