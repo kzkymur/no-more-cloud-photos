@@ -172,3 +172,104 @@ func TestCutoverBackupEnvironmentCannotOverrideCredentialRoute(t *testing.T) {
 		t.Fatal("control role changed")
 	}
 }
+
+func TestBackupPGDependencyAuthority(t *testing.T) {
+	const expected = "postgresql@17-main.service"
+	body, err := backupPGDependencyBody(expected)
+	if err != nil || body != "[Unit]\nRequires=postgresql@17-main.service\nAfter=postgresql@17-main.service\n" {
+		t.Fatal("valid production dependency refused")
+	}
+	if unit, err := backupPGUnitFromHBA("/etc/postgresql/17/main/pg_hba.conf"); err != nil || unit != expected {
+		t.Fatal("authenticated HBA authority refused")
+	}
+	for _, cluster := range []string{"a", "_", "Main_1-2", strings.Repeat("a", 63)} {
+		unit := "postgresql@17-" + cluster + ".service"
+		if _, err := backupPGDependencyBody(unit); err != nil {
+			t.Fatal("bounded valid cluster refused")
+		}
+		if got, err := backupPGUnitFromHBA("/etc/postgresql/17/" + cluster + "/pg_hba.conf"); err != nil || got != unit {
+			t.Fatal("valid cluster path refused")
+		}
+	}
+	for _, unit := range []string{"", "postgresql.service", "postgresql@16-main.service", "postgresql@17-.service", "postgresql@17--main.service", "postgresql@17-main.service.extra", "postgresql@17-main.service\n", "postgresql@17-a/b.service", "postgresql@17-a.b.service", "postgresql@17-a\\x2db.service", "postgresql@17-" + strings.Repeat("a", 64) + ".service"} {
+		if _, err := backupPGDependencyBody(unit); err == nil {
+			t.Fatal("untrusted unit accepted")
+		}
+	}
+	for _, path := range []string{"", "/etc/postgresql/16/main/pg_hba.conf", "/etc/postgresql/17/main/../main/pg_hba.conf", "/etc/postgresql/17//main/pg_hba.conf", "/etc/postgresql/17/-main/pg_hba.conf", "/etc/postgresql/17/main/pg_hba.conf/", "/tmp/etc/postgresql/17/main/pg_hba.conf", "/etc/postgresql/17/main/pg_hba.conf\n", "/etc/postgresql/17/" + strings.Repeat("a", 64) + "/pg_hba.conf"} {
+		if _, err := backupPGUnitFromHBA(path); err == nil {
+			t.Fatal("unsafe HBA authority accepted")
+		}
+	}
+	candidate, _ := backupPGDependencyBody("postgresql@17-candidate.service")
+	if validateBackupPGDependencyBodies([]byte(body), []byte(body), expected) != nil {
+		t.Fatal("exact source pair refused")
+	}
+	if validateBackupPGDependencyBodies([]byte(candidate), []byte(candidate), "postgresql@17-candidate.service") != nil {
+		t.Fatal("exact candidate pair refused")
+	}
+	for _, pair := range [][2]string{{body, candidate}, {candidate, body}, {candidate, candidate}, {"", body}, {body, ""}, {body + "# extra\n", body}, {strings.Replace(body, "After=", "Wants=", 1), body}, {body, strings.Replace(body, "\n", "\r\n", -1)}, {body, strings.TrimSuffix(body, "\n")}, {"[Unit]\nRequires=" + expected + "\nAfter=" + expected + " other.service\n", body}} {
+		if validateBackupPGDependencyBodies([]byte(pair[0]), []byte(pair[1]), expected) == nil {
+			t.Fatal("unexpected dependency body accepted")
+		}
+	}
+}
+
+func TestBackupPGDependencyDropinSet(t *testing.T) {
+	for _, tc := range []struct {
+		paths           []string
+		valid, artifact bool
+	}{
+		{[]string{backupPGDependencyDropin}, true, false},
+		{[]string{backupPGDependencyDropin, backupArtifactDropin}, true, true},
+		{[]string{backupArtifactDropin, backupPGDependencyDropin}, true, true},
+		{[]string{}, false, false}, {[]string{backupArtifactDropin}, false, false},
+		{[]string{backupPGDependencyDropin, backupPGDependencyDropin}, false, false},
+		{[]string{backupPGDependencyDropin, backupArtifactDropin, backupArtifactDropin}, false, false},
+		{[]string{backupPGDependencyDropin, "/etc/systemd/system/nmcp-backup.service.d/extra.conf"}, false, false},
+		{[]string{migratePGDependencyDropin}, false, false},
+	} {
+		artifact, err := backupUnitDropins(backupContractJSON(t, tc.paths))
+		if (err == nil) != tc.valid || err == nil && artifact != tc.artifact {
+			t.Fatal("drop-in exact set mismatch")
+		}
+	}
+	for _, raw := range []string{`null`, `{}`, `[null]`, `["` + backupPGDependencyDropin + `",null]`} {
+		if _, err := backupUnitDropins(json.RawMessage(raw)); err == nil {
+			t.Fatal("malformed drop-in set admitted")
+		}
+	}
+}
+
+func TestBackupPGDependencyEffectiveTargets(t *testing.T) {
+	const expected = "postgresql@17-main.service"
+	for _, tc := range []struct {
+		units []string
+		valid bool
+	}{
+		{[]string{expected}, true}, {[]string{"sysinit.target", expected, "nmcp-migrate.service"}, true},
+		{[]string{}, false}, {[]string{"sysinit.target"}, false}, {[]string{expected, expected}, false},
+		{[]string{expected, "postgresql@17-candidate.service"}, false}, {[]string{expected, "postgresql@16-main.service"}, false},
+		{[]string{expected, "postgresql.service"}, false}, {[]string{expected, "postgresql@17-main.service.evil"}, false},
+		{[]string{expected, ""}, false},
+	} {
+		if validateBackupUnitDependencySet(backupContractJSON(t, tc.units), expected) != tc.valid {
+			t.Fatal("effective PG dependency mismatch")
+		}
+	}
+	for _, raw := range []string{`null`, `{}`, `[null]`, `[123]`, `["` + expected + `",null]`} {
+		if validateBackupUnitDependencySet(json.RawMessage(raw), expected) {
+			t.Fatal("malformed dependency accepted")
+		}
+	}
+	if validateBackupUnitDependencySet(backupContractJSON(t, []string{expected}), "postgresql@17-untrusted.service") {
+		t.Fatal("file-derived authority substituted")
+	}
+	found := map[string]string{}
+	for _, p := range backupUnitIdentityProperties() {
+		found[p.name] = p.signature
+	}
+	if found["Requires"] != "as" || found["After"] != "as" {
+		t.Fatal("typed dependency queries missing")
+	}
+}

@@ -112,6 +112,7 @@ type RestoreOperation struct {
 	SourceOffline    bool                     `json:"source_offline,omitempty"`
 	OfflineAuthority *OfflineRestoreAuthority `json:"offline_authority,omitempty"`
 	FailedPhase      string                   `json:"failed_phase,omitempty"`
+	DrainErrors      []string                 `json:"drain_errors,omitempty"`
 	RoleGraphSHA256  string                   `json:"role_graph_sha256"`
 	ID               string                   `json:"id"`
 	BackupID         string                   `json:"backup_id"`

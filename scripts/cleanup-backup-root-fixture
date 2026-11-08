@@ -10,6 +10,7 @@ import sys
 import time
 
 PG = {
+ 'postgresql@17-backup-ci.service': '/run/nmcp-backup-ci',
  'postgresql@17-nmcp-offline-fixture.service': '/run/nmcp-offline-fixture',
  'postgresql@17-nmcp-offline-candidate.service': '/run/nmcp-offline-candidate',
 }
@@ -31,7 +32,7 @@ def validate_pg(record,head,unit,st,body,data_stat):
     assert data.is_absolute() and data.name=='data' and data.parent.parent==Path('/tmp')
     assert data.parent.name.startswith(('nmcp-live-pg17-','nmcp-offline-candidate-pg17-'))
     assert stat.S_ISDIR(data_stat.st_mode) and (data_stat.st_dev,data_stat.st_ino)==(record['data_device'],record['data_inode'])
-    assert record['socket']==PG[unit] and record['port']==(5432 if unit.endswith('fixture.service') else 5544)
+    assert record['socket']==PG[unit] and record['port']==(5544 if unit == 'postgresql@17-nmcp-offline-candidate.service' else 5432)
     assert record['postgres']=='/opt/nmcp-pg17-ci/bin/postgres'
     assert b'Type=forking\n' in body and ('PIDFile='+str(data)+'/postmaster.pid\n').encode() in body
 

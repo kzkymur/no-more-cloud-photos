@@ -22,6 +22,13 @@ class Ownership(unittest.TestCase):
   self.record=dict(head=self.head,unit=self.unit,device=1,inode=2,sha256=hashlib.sha256(self.body).hexdigest(),data='/tmp/nmcp-live-pg17-owned/data',data_device=1,data_inode=3,socket='/run/nmcp-offline-fixture',port=5432,postgres='/opt/nmcp-pg17-ci/bin/postgres')
  def check(self,r=None,f=None,b=None,d=None):m.validate_pg(r or self.record,self.head,self.unit,f or self.file,b or self.body,d or self.data)
  def test_owned(self):self.check()
+ def test_live_pg_receipt_exact_unit_socket_port(self):
+  r=dict(self.record,unit='postgresql@17-backup-ci.service',socket='/run/nmcp-backup-ci')
+  m.validate_pg(r,self.head,r['unit'],self.file,self.body,self.data)
+  for change in ({'port':5544},{'socket':'/run/nmcp-offline-fixture'},{'unit':'postgresql@17-unknown.service'}):
+   bad=dict(r,**change)
+   with self.assertRaises(AssertionError):m.validate_pg(bad,self.head,bad['unit'],self.file,self.body,self.data)
+
  def test_identity_and_scope(self):
   for key,value in [('head','b'*40),('unit','postgresql@17-other.service'),('device',9),('inode',9),('sha256','0'*64),('data','/var/lib/postgresql/17/main'),('data_inode',99),('socket','/run/other'),('port',1),('postgres','/bin/other')]:
    r=copy.deepcopy(self.record);r[key]=value

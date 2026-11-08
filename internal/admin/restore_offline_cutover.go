@@ -2,8 +2,8 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -64,31 +64,41 @@ func (a *systemCutover) offlineDependencies(ctx context.Context) error {
 		return nil
 	}
 	auth := a.offline.OfflineAuthority
-	for _, unit := range []string{"nmcp-migrate.service", "nmcp-backup.service"} {
-		requires, err := systemctl(ctx, "show", "--property=Requires", "--value", unit)
-		if err != nil {
+	if auth == nil || a.backupPGUnit != auth.SourceUnit || auth.SourceUnit == auth.CandidateUnit {
+		return errCutover
+	}
+	sourceBody, err := backupPGDependencyBody(auth.SourceUnit)
+	if err != nil {
+		return err
+	}
+	candidateBody, err := backupPGDependencyBody(auth.CandidateUnit)
+	if err != nil {
+		return err
+	}
+	staged := []cutoverFile{}
+	for _, item := range []struct{ unit, path string }{{"nmcp-migrate.service", migratePGDependencyDropin}, {"nmcp-backup.service", backupPGDependencyDropin}} {
+		reload, err := systemctl(ctx, "show", "--property=NeedDaemonReload", "--value", item.unit)
+		if err != nil || reload != "no" {
 			return errCutover
 		}
-		if !containsUnit(requires, auth.SourceUnit) {
-			continue
-		}
-		path := filepath.Join("/etc/systemd/system", unit+".d", "10-postgresql.conf")
-		file, err := safeCutoverFile(path, false, true)
-		if err != nil {
-			return errCutover
-		}
-		raw := string(file.before)
-		if strings.Count(raw, auth.SourceUnit) < 1 || strings.Contains(raw, auth.CandidateUnit) {
-			return errCutover
-		}
-		for _, line := range strings.Split(raw, "\n") {
-			if strings.Contains(line, auth.SourceUnit) && !strings.HasPrefix(line, "Requires=") && !strings.HasPrefix(line, "After=") {
+		for _, property := range []string{"Requires", "After"} {
+			value, err := systemctl(ctx, "show", "--property="+property, "--value", item.unit)
+			if err != nil {
+				return errCutover
+			}
+			raw, err := json.Marshal(strings.Fields(value))
+			if err != nil || !validateBackupUnitDependencySet(raw, auth.SourceUnit) {
 				return errCutover
 			}
 		}
-		file.after = []byte(strings.ReplaceAll(raw, auth.SourceUnit, auth.CandidateUnit))
-		a.files = append(a.files, file)
+		file, err := safeCutoverFile(item.path, false, true)
+		if err != nil || string(file.before) != sourceBody {
+			return errCutover
+		}
+		file.after = []byte(candidateBody)
+		staged = append(staged, file)
 	}
+	a.files = append(a.files, staged...)
 	return nil
 }
 func containsUnit(value, unit string) bool {
