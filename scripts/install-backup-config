@@ -44,6 +44,9 @@ done
 # Explicit root operator source-only binding, before any first wake or timer.
 "$script_dir/configure-backup-source-hba"
 /usr/bin/systemctl daemon-reload
+# Recheck freshly loaded identities and on-disk metadata before any wake.
+# This does not prove effective execution, source authentication, or runtime.
+"$script_dir/validate-backup-install" --installed --fresh-manager
 # No backup is reported here: the next wake independently evaluates DB policy.
 /usr/bin/systemctl start nmcp-backup.service
 /usr/bin/systemctl enable --now nmcp-backup.timer

@@ -220,7 +220,18 @@ install implementations explicitly skip; CI requires a non-skipped PASS. These
 are filesystem semantics, not authenticated-source or systemd-lifecycle proof.
 Typed effective-unit decoder tests cover malformed/duplicate/trailing JSON,
 command flags and argv boundaries; the root fixture must separately prove the
-actual manager contract. Automatic failure/interruption cleanup and complete
+actual manager contract. Both root fixtures now require production-shaped PG
+dependency files and a real receipt-owned PostgreSQL unit (including the live
+`postgresql@17-backup-ci.service`, exact socket and port). Before adding the known
+artifact-only bind drop-ins, they exercise the installed metadata gate against
+the real manager: positive, an exclusively owned unsafe execution drop-in
+rejected without explicit reload/activation, then restored positive. The probe
+checks that neither its execution sentinel nor runtime credentials appeared;
+it removes only its inode-checked unit input, never `/run/nmcp-backup`. This is
+not a full installer/HBA proof, and metadata reads may lazily refresh definitions.
+Pure fake-manager tests separately cover stale-cache prospective changes.
+These are required probes, not claims of actual success before CI completes.
+Automatic failure/interruption cleanup and complete
 online/offline restore/resume remain actual acceptance gates, not mock claims.
 
 The launcher retains a root-only exact-head ownership receipt and diagnostic
@@ -235,9 +246,28 @@ fail the lane rather than become skipped success. Logs and rootfs are preserved
 for runner diagnostics, not installed on a customer machine.
 
 Bootstrap downloads use a root-private Wget configuration (10-second DNS and
-connect limits, 30-second read limit, three tries) within the existing 900-second
-provisioning deadline. HTTPS certificate checks, archive signatures, and package
-verification remain mandatory. This configuration is passed only to bootstrap,
+connect limits, 30-second read limit, three tries) within a single absolute
+provisioning deadline of at most 900 seconds. HTTPS certificate checks, archive
+signatures, and package verification remain mandatory.
+
+The guest `--include` set is the runtime closure the guest actually executes:
+systemd/D-Bus, util-linux, Python, ExifTool and exactly the shared libraries that
+guest `ldd` resolves for the bound test, API, Worker, admin, PG17 and native
+helper artifacts (including the native prefix's own `ffmpeg`/`ffprobe`, now
+also covered by the strict guest `ldd` guard). Ubuntu's `ffmpeg` and all `-dev`
+packages were never executed in the guest; dropping them reduced the measured
+noble closure from about 367 packages / 183 MiB to about 142 packages / 65 MiB.
+
+A `.deb` byte cache keyed on suite, components, architecture, variant, include
+set, debootstrap version and the SHA-256 of the gpgv-verified signed
+`binary-amd64` Packages indices may be restored by `actions/cache`. Restored
+bytes are untrusted: the launcher copies only regular, single-link, bounded,
+canonically named `.deb` files into a fresh root-private directory (any shape
+violation rejects the whole cache), and `debootstrap --cache-dir` then fetches a
+fresh signed InRelease (never cached), verifies the Packages index against it and
+verifies each cached file's size and SHA-256 before use, deleting and
+re-downloading any mismatch. A rootfs is never cached or reused. Only a cache
+miss followed by a successful bootstrap exports a candidate for the next run. This configuration is passed only to bootstrap,
 not to guest tests. On a caught timeout or interruption, the launcher signals
 only its freshly created, live PID/start-time/session/group-attested bootstrap
 process group. A process-local child-subreaper setting lets it reap adopted
@@ -247,6 +277,29 @@ exercise this path with a real signal-resistant descendant and an unaffected
 separate session. These are not live PostgreSQL outer-interruption proofs. An
 unattestable leader or abrupt outer termination still fails closed; descendant
 absence after such interruption is not established by a no-machine cleanup.
+
+Bootstrap success and failure emit a closed, exact-head/run/attempt/slot diagnostic
+with observed phase/error-class enums and monotonic elapsed time. Only two known
+private log tails (64 KiB each) are inspected through root-owned, no-symlink file
+descriptors; raw lines, URLs, arguments and environment values are not emitted.
+Missing/unsafe logs are unavailable, and last-progress age remains unknown rather
+than being inferred from modification time. A timeout reports the deadline, not
+its underlying cause. No heartbeat or cache hit resets the absolute bound.
+
+Both root jobs share one monotonic job budget. Before any owned root resource
+exists, the workflow obtains an identity-bound admission receipt
+(`scripts/backup-ci-admission`: this run/attempt/head/job/runner's reported
+`started_at` plus the 3000-second job timeout, minus clock uncertainty, a
+60-second margin and a 300-second cleanup reserve). The launcher grants each
+active phase `min(configured cap, remaining active budget − later phases'
+minimums)`: bootstrap ≤ 900 s, guest boot ≤ 120 s, and the guest test client ≤
+1140 s but never less than 1110 s, so Go's own `-test.timeout=18m` fires first.
+Insufficient budget fails before provisioning, with a closed refusal code. The
+static worst case (180 s setup allowance + 900 + 120 + 240 guest setup + 1140 +
+32 s skew + 300 cleanup + 60 margin = 2972 s) fits the 3000-second job, and
+teardown's fixed bounds (210 + 30 + 45 + 15 s) fit the cleanup reserve. The
+receipt is an estimate from the reported job start, not a guarantee against
+external cancellation, SIGKILL or VM loss.
 
 Pure launcher tests do not prove actual boot, service sandboxing, resource
 limits, restore/cutover, timeout cleanup, or HBA behavior. Those remain separate

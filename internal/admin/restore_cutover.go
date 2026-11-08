@@ -44,6 +44,65 @@ type cutoverActions interface {
 	VerifyTargets(context.Context, RestoreOperation) error
 	Start(context.Context) error
 	VerifyLive(context.Context, RestoreOperation) error
+	// EmergencyDrain is the failure-path stop: no validation precondition, every
+	// fixed unit attempted independently, all errors aggregated. It never
+	// resumes, unfences or restarts anything.
+	EmergencyDrain(context.Context) error
+}
+
+// cutoverDrainTimeout bounds the drain's wait for every unit to become
+// inactive. API/worker TimeoutStopSec=330s plus the final SIGKILL margin.
+const cutoverDrainTimeout = 6 * time.Minute
+
+// drainCutover runs the emergency drain in an independent bounded context
+// (the caller's context may already be cancelled) and returns sanitized errors.
+func drainCutover(a cutoverActions) error {
+	ctx, cancel := context.WithTimeout(context.Background(), cutoverDrainTimeout)
+	defer cancel()
+	return a.EmergencyDrain(ctx)
+}
+// cutoverDrainError carries only a fixed step label and a fixed or
+// pattern-validated unit name; raw systemctl/D-Bus output never enters it.
+type cutoverDrainError struct{ step, unit string }
+
+func (e *cutoverDrainError) Error() string {
+	if e.unit == "" {
+		return "emergency drain: " + e.step
+	}
+	return "emergency drain: " + e.step + " " + e.unit
+}
+func newCutoverDrainError(step, unit string) *cutoverDrainError {
+	switch unit {
+	case "", "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service":
+	default:
+		if !offlinePGUnit.MatchString(unit) || len(unit) > 128 {
+			unit = "offline-source-unit"
+		}
+	}
+	return &cutoverDrainError{step: step, unit: unit}
+}
+
+// cutoverFailure records drain evidence in the operation (persisted with the
+// failed phase when that save is still possible) and returns a wrapped error.
+// Errors of any other type are reduced to a fixed label at this boundary.
+func cutoverFailure(op *RestoreOperation, drainErr error) error {
+	if drainErr == nil {
+		return errCutover
+	}
+	parts := []error{drainErr}
+	if joined, ok := drainErr.(interface{ Unwrap() []error }); ok {
+		parts = joined.Unwrap()
+	}
+	out := []error{errCutover}
+	for _, e := range parts {
+		var typed *cutoverDrainError
+		if !errors.As(e, &typed) {
+			typed = newCutoverDrainError("unclassified failure", "")
+		}
+		op.DrainErrors = append(op.DrainErrors, typed.Error())
+		out = append(out, typed)
+	}
+	return errors.Join(out...)
 }
 
 type cutoverSave func(string, RestoreOperation) error
@@ -77,19 +136,16 @@ func runCutover(ctx context.Context, root string, op RestoreOperation, a cutover
 	for _, step := range steps {
 		if e := step.run(); e != nil {
 			// In particular, a partial Start/verification must not leave a worker or
-			// timer running. Use an independent bounded context even after cancellation.
-			stopCtx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
-			_ = a.Stop(stopCtx)
-			cancel()
+			// timer running. The drain has no validation precondition (the validating
+			// Stop may itself be what failed) and never short-circuits. The old-source
+			// fence and maintenance state are left exactly as they are.
+			err := cutoverFailure(&op, drainCutover(a))
 			op.FailedPhase = step.phase
 			_ = phase("cutover_failed")
-			return op, errCutover
+			return op, err
 		}
 		if phase(step.phase) != nil {
-			stopCtx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
-			_ = a.Stop(stopCtx)
-			cancel()
-			return op, errCutover
+			return op, cutoverFailure(&op, drainCutover(a))
 		}
 	}
 	return op, nil
@@ -175,6 +231,12 @@ type systemCutover struct {
 	probes         []cutoverProbe
 	hba            cutoverFile
 	oldPIDs        map[string]int
+	backupPGUnit   string
+	// Test seams for the emergency drain only; nil selects the fixed production
+	// /usr/bin/systemctl argv runner and the manager runtime-removal wait.
+	drainSystemctl     func(context.Context, ...string) (string, error)
+	drainRuntimeAbsent func(context.Context) error
+	drainPoll          time.Duration
 }
 
 func systemctl(ctx context.Context, args ...string) (string, error) {
@@ -270,7 +332,7 @@ func safeCutoverFile(path string, hba bool, metadata ...bool) (cutoverFile, erro
 // parent directory is descriptor-pinned and revalidated; all target files are
 // fixed production paths. A post-rename failure is not rolled back silently.
 func replaceCutoverFile(f cutoverFile) error {
-	now, e := safeCutoverFile(f.path, cutoverHBAPath.MatchString(f.path))
+	now, e := safeCutoverFile(f.path, cutoverHBAPath.MatchString(f.path), f.path == backupPGDependencyDropin || f.path == migratePGDependencyDropin)
 	if e != nil || string(now.before) != string(f.before) || now.uid != f.uid || now.gid != f.gid || now.mode != f.mode {
 		return errCutover
 	}
@@ -624,6 +686,31 @@ func validateCutoverBackupUnit(env []string, credentials [][]string) error {
 }
 
 func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) error {
+	a.backupPGUnit = ""
+	var expectedPGUnit string
+	if a.offline != nil {
+		if op.OfflineAuthority == nil {
+			return errCutover
+		}
+		expectedPGUnit = op.OfflineAuthority.SourceUnit
+		if _, err := backupPGDependencyBody(expectedPGUnit); err != nil {
+			return err
+		}
+		if _, err := backupPGDependencyBody(op.OfflineAuthority.CandidateUnit); err != nil {
+			return err
+		}
+	} else {
+		var sourceHBA string
+		if a.source == nil || a.source.QueryRow(ctx, `SELECT current_setting('hba_file')`).Scan(&sourceHBA) != nil {
+			return errCutover
+		}
+		var err error
+		expectedPGUnit, err = backupPGUnitFromHBA(sourceHBA)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Migration must not be triggered against the old admin.env on restart.
 	state, e := systemctl(ctx, "is-active", "nmcp-migrate.service")
 	if (e != nil || state != "active") && a.offline == nil {
@@ -675,9 +762,10 @@ func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) erro
 	if validateCutoverBackupEnvironment(f.before) != nil {
 		return errCutover
 	}
-	if e = validateLoadedBackupUnit(ctx); e != nil {
+	if e = validateLoadedBackupUnit(ctx, expectedPGUnit); e != nil {
 		return e
 	}
+	a.backupPGUnit = expectedPGUnit
 	f, e = safeCutoverFile("/etc/nmcp/backup.pg_service.conf", false)
 	if e != nil {
 		return e
@@ -750,7 +838,7 @@ func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) erro
 func (a *systemCutover) Stop(ctx context.Context) error {
 	// Recheck before any destructive transition; privileged concurrent unit
 	// edits remain an operator coordination boundary, never auto-reloaded here.
-	if e := validateLoadedBackupUnit(ctx); e != nil {
+	if e := validateLoadedBackupUnit(ctx, a.backupPGUnit); e != nil {
 		return e
 	}
 	if _, e := systemctl(ctx, "stop", "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service"); e != nil {
@@ -784,7 +872,93 @@ func (a *systemCutover) Stop(ctx context.Context) error {
 	}
 	return nil
 }
+// EmergencyDrain is the unconditional failure-path stop. Unlike Stop it has no
+// backup-unit validation precondition: after a partial Start, or when the
+// loaded unit no longer validates, every fixed unit must still be stopped.
+// Each systemctl invocation gets its own bound derived from a non-cancelable
+// copy of ctx, so one hung or failed unit never prevents an attempt on the
+// rest. Only stop/show are issued: nothing is started, resumed or unfenced,
+// and the offline candidate cluster is never a drain target.
+func (a *systemCutover) EmergencyDrain(ctx context.Context) error {
+	run := a.drainSystemctl
+	if run == nil {
+		run = systemctl
+	}
+	call := func(bound time.Duration, args ...string) (string, error) {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), bound)
+		defer cancel()
+		return run(c, args...)
+	}
+	var errs []error
+	// The timer first and synchronously, so it cannot start a fresh backup run
+	// after the service stop below has been queued.
+	const timer = "nmcp-backup.timer"
+	if _, err := call(30*time.Second, "stop", timer); err != nil {
+		errs = append(errs, newCutoverDrainError("stop", timer))
+	}
+	units := []string{"nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service"}
+	if a.offline != nil {
+		auth := a.offline.OfflineAuthority
+		if auth != nil && offlinePGUnit.MatchString(auth.SourceUnit) && auth.SourceUnit != auth.CandidateUnit {
+			units = append(units, auth.SourceUnit)
+		} else {
+			errs = append(errs, newCutoverDrainError("offline source authority unavailable", ""))
+		}
+	}
+	// Queue every stop job without waiting on any single unit (API/worker may
+	// take TimeoutStopSec=330s); the manager then runs them concurrently.
+	for _, unit := range units {
+		if _, err := call(15*time.Second, "stop", "--no-block", unit); err != nil {
+			errs = append(errs, newCutoverDrainError("stop", unit))
+		}
+	}
+	poll := a.drainPoll
+	if poll <= 0 {
+		poll = 250 * time.Millisecond
+	}
+	pending := append([]string{timer}, units...)
+	for len(pending) > 0 {
+		var next []string
+		for _, unit := range pending {
+			state, err := call(10*time.Second, "show", "--property=ActiveState", "--value", unit)
+			if err != nil || (state != "inactive" && state != "failed") {
+				next = append(next, unit)
+			}
+		}
+		pending = next
+		if len(pending) == 0 {
+			break
+		}
+		wait := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+			for _, unit := range pending {
+				errs = append(errs, newCutoverDrainError("still active", unit))
+			}
+			pending = nil
+		case <-wait.C:
+		}
+	}
+	// Checked last, so the runtime wait can never delay any stop above.
+	absent := a.drainRuntimeAbsent
+	if absent == nil {
+		absent = waitBackupRuntimeCredentialsAbsent
+	}
+	if absent(context.WithoutCancel(ctx)) != nil {
+		errs = append(errs, newCutoverDrainError("backup runtime directory still present", ""))
+	}
+	return errors.Join(errs...)
+}
 func (a *systemCutover) Switch(ctx context.Context, op RestoreOperation) error {
+	if a.offline != nil {
+		if op.OfflineAuthority == nil || a.backupPGUnit != op.OfflineAuthority.SourceUnit {
+			return errCutover
+		}
+		// No valid dependency authority survives a partially applied offline switch.
+		a.backupPGUnit = ""
+	}
+
 	// The preprovisioned candidate deliberately denied routine DB access. A
 	// database dump does not recreate database-level CONNECT ACLs. Grant only
 	// the intended fixed logins while the old HBA gate still denies them; this
@@ -855,6 +1029,10 @@ func (a *systemCutover) Switch(ctx context.Context, op RestoreOperation) error {
 		if VerifyOfflineSourceFence(ctx, op) != nil {
 			return errCutover
 		}
+		if validateLoadedBackupUnit(ctx, op.OfflineAuthority.CandidateUnit) != nil {
+			return errCutover
+		}
+		a.backupPGUnit = op.OfflineAuthority.CandidateUnit
 	}
 	return nil
 }
@@ -909,6 +1087,10 @@ func (a *systemCutover) VerifyTargets(ctx context.Context, op RestoreOperation) 
 	return nil
 }
 func (a *systemCutover) Start(ctx context.Context) error {
+	if err := validateLoadedBackupUnit(ctx, a.backupPGUnit); err != nil {
+		return err
+	}
+
 	// Timer remains stopped until a separate successful maintenance resume.
 	if a.offline != nil {
 		if a.verifyNoSourceDependencies(ctx) != nil {

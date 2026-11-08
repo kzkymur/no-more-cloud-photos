@@ -34,6 +34,13 @@ func (f *fakeCutover) VerifyTargets(context.Context, RestoreOperation) error {
 }
 func (f *fakeCutover) Start(context.Context) error                        { return f.call("start") }
 func (f *fakeCutover) VerifyLive(context.Context, RestoreOperation) error { return f.call("live") }
+func (f *fakeCutover) EmergencyDrain(ctx context.Context) error {
+	// The drain context must be live and bounded even after caller cancellation.
+	if _, ok := ctx.Deadline(); !ok || ctx.Err() != nil {
+		return f.call("drain-without-independent-context")
+	}
+	return f.call("drain")
+}
 func cutoverTestOperation() RestoreOperation {
 	op := restoreTestOperation()
 	op.Source.DatabaseName = "source"
@@ -78,8 +85,9 @@ func TestCutoverEveryActionFailureStopsAndPersists(t *testing.T) {
 			if !errors.Is(e, errCutover) || out.Phase != "cutover_failed" || out.FailedPhase == "" {
 				t.Fatalf("phase=%s failed=%s error=%v", out.Phase, out.FailedPhase, e)
 			}
-			if f.calls[len(f.calls)-1] != "stop" {
-				t.Fatal("failure didn't stop services")
+			// The fallback is the unconditional drain, never the validating Stop.
+			if f.calls[len(f.calls)-1] != "drain" || strings.Count(strings.Join(f.calls, ","), "drain") != 1 {
+				t.Fatal("failure didn't drain services", f.calls)
 			}
 			if strings.Contains(e.Error(), "credential") {
 				t.Fatal("raw callback error leaked")
@@ -116,8 +124,8 @@ func TestCutoverEveryLedgerBoundaryFailure(t *testing.T) {
 				if len(f.calls) != 0 {
 					t.Fatal("action before durable authorization")
 				}
-			} else if f.calls[len(f.calls)-1] != "stop" {
-				t.Fatal("failed durable transition left service running")
+			} else if f.calls[len(f.calls)-1] != "drain" {
+				t.Fatal("failed durable transition left service running", f.calls)
 			}
 			if len(recorded) == 0 {
 				t.Fatal("no journal attempt")

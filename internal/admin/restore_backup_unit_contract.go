@@ -5,10 +5,13 @@ package admin
 // administrative provenance; install itself does not authenticate its source.
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -21,15 +24,202 @@ type backupUnitProperty struct {
 
 const backupUnitFragment = "/etc/systemd/system/nmcp-backup.service"
 const backupArtifactDropin = backupUnitFragment + ".d/artifact-paths.conf"
+const backupPGDependencyDropin = backupUnitFragment + ".d/10-postgresql.conf"
+const migratePGDependencyDropin = "/etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf"
+
+var backupPGUnitPattern = regexp.MustCompile(`^postgresql@17-([A-Za-z0-9_][A-Za-z0-9_-]{0,62})\.service$`)
+var backupPGHBAPathPattern = regexp.MustCompile(`^/etc/postgresql/17/([A-Za-z0-9_][A-Za-z0-9_-]{0,62})/pg_hba\.conf$`)
+
 const backupArtifactDropinBody = "[Service]\nBindReadOnlyPaths=/opt/nmcp-native-ci /opt/nmcp-pg17-ci\n"
 
+// SHA-256 of the exact canonical infra/ubuntu/systemd/nmcp-backup.service
+// bytes, which install-ubuntu-host and the root fixtures install verbatim. This
+// is an additional guard to the root-owned metadata walk and typed properties.
+const backupUnitFragmentSHA256 = "c15204d42d996bec8f7011d2181fc18e25501bf85beb9ad11d56286e0d2e22b4"
+
+// Every activation, ordering, propagation and namespace edge exposed by the
+// systemd v255 org.freedesktop.systemd1.Unit interface (dbus-unit.c), plus the
+// reverse lists, so an edge injected from any unit file is visible here.
+var backupUnitEdgeProperties = []string{
+	"Requires", "Requisite", "Wants", "BindsTo", "PartOf", "Upholds",
+	"RequiredBy", "RequisiteOf", "WantedBy", "BoundBy", "UpheldBy", "ConsistsOf",
+	"Conflicts", "ConflictedBy", "Before", "After",
+	"OnSuccess", "OnSuccessOf", "OnFailure", "OnFailureOf", "Triggers", "TriggeredBy",
+	"PropagatesReloadTo", "ReloadPropagatedFrom", "PropagatesStopTo", "StopPropagatedFrom", "JoinsNamespaceOf",
+}
+
+// The canonical unit's RequiresMountsFor set in systemd v255: the explicit
+// RequiresMountsFor=/var/lib/nmcp-backup, /var/tmp from PrivateTmp=yes and
+// /run/nmcp-backup from RuntimeDirectory= (unit_add_exec_dependencies).
+var backupUnitMountPaths = []string{"/var/lib/nmcp-backup", "/var/tmp", "/run/nmcp-backup"}
+
 func backupUnitIdentityProperties() []backupUnitProperty {
-	return []backupUnitProperty{
+	p := []backupUnitProperty{
 		{"Id", "s", "nmcp-backup.service"}, {"LoadState", "s", "loaded"},
-		{"FragmentPath", "s", backupUnitFragment}, {"Transient", "b", false},
-		{"NeedDaemonReload", "b", false}, {"DropInPaths", "as", nil},
-		{"OnFailure", "as", []string{}}, {"OnSuccess", "as", []string{}}, {"PropagatesStopTo", "as", []string{}},
+		{"FragmentPath", "s", backupUnitFragment}, {"SourcePath", "s", ""}, {"Transient", "b", false},
+		{"NeedDaemonReload", "b", false}, {"DropInPaths", "as", nil}, {"DefaultDependencies", "b", true},
+		{"RequiresMountsFor", "as", nil},
+		{"Conditions", "a(sbbsi)", []any{}}, {"Asserts", "a(sbbsi)", []any{}},
 	}
+	for _, name := range backupUnitEdgeProperties {
+		// Edges whose canonical set is empty are also rejected at the wire layer.
+		var want any = []string{}
+		switch name {
+		case "Requires", "Wants", "After", "Before", "Conflicts", "PartOf", "TriggeredBy":
+			want = nil
+		}
+		p = append(p, backupUnitProperty{name, "as", want})
+	}
+	return p
+}
+
+// unit_name_from_path(path, ".mount") for the fixed ASCII paths above:
+// path_simplify, "/" -> "-", root -> "-", unit_name_escape for everything
+// outside [A-Za-z0-9:_.] (and a leading ".").
+func backupMountUnitName(path string) string {
+	p := strings.Trim(path, "/")
+	if p == "" {
+		return "-.mount"
+	}
+	var b strings.Builder
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c == '/':
+			b.WriteByte('-')
+		case c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == ':' || c == '_' || c == '.' && i > 0:
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, `\x%02x`, c)
+		}
+	}
+	return b.String() + ".mount"
+}
+
+// Mount units for every prefix (PATH_FOREACH_PREFIX_MORE) of every required
+// path. systemd v255 unit_add_mount_dependencies/mount_add_mount_dependencies
+// add After= only for a loaded mount unit and Requires= only when it also has
+// a fragment, so these are host-dependent: exact names, any subset.
+func backupUnitPathMounts() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, path := range backupUnitMountPaths {
+		for prefix := path; ; prefix = filepath.Dir(prefix) {
+			name := backupMountUnitName(prefix)
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, name)
+			}
+			if prefix == "/" {
+				break
+			}
+		}
+	}
+	return out
+}
+
+type backupUnitEdges struct{ required, optional []string }
+
+// Exact allow-sets derived from the canonical fragment, its 10-postgresql.conf
+// drop-in and systemd v255 implicit dependencies (see the report rationale):
+//   - service_add_default_dependencies: Requires/After sysinit.target,
+//     After basic.target, Before/Conflicts shutdown.target;
+//   - unit_add_slice_dependencies: Requires/After Slice=nmcp.slice;
+//   - unit_add_exec_dependencies: PrivateTmp Wants/After tmp.mount and After
+//     systemd-tmpfiles-setup.service; journal stdout After
+//     systemd-journald.socket; LoadCredential= After the credential mount;
+//   - fragment: After=nmcp-migrate.service, PartOf=nmcp.target;
+//   - nmcp-backup.timer Unit= adds Before+Triggers on the timer, i.e. After
+//     and TriggeredBy here whenever the timer is loaded.
+func backupUnitDependencyContract(pgUnit string) (map[string]backupUnitEdges, error) {
+	if !backupPGUnitPattern.MatchString(pgUnit) {
+		return nil, errCutover
+	}
+	mounts := func(extra ...string) []string { return append(backupUnitPathMounts(), extra...) }
+	c := map[string]backupUnitEdges{}
+	for _, name := range backupUnitEdgeProperties {
+		c[name] = backupUnitEdges{}
+	}
+	c["Requires"] = backupUnitEdges{[]string{"sysinit.target", "nmcp.slice", pgUnit}, mounts()}
+	c["Wants"] = backupUnitEdges{[]string{"tmp.mount"}, nil}
+	c["After"] = backupUnitEdges{[]string{"sysinit.target", "basic.target", "nmcp.slice", "nmcp-migrate.service", pgUnit, "tmp.mount", "systemd-tmpfiles-setup.service", "systemd-journald.socket", `run-credentials-nmcp\x2dbackup.service.mount`}, mounts("nmcp-backup.timer")}
+	c["Before"] = backupUnitEdges{[]string{"shutdown.target"}, nil}
+	c["Conflicts"] = backupUnitEdges{[]string{"shutdown.target"}, nil}
+	c["PartOf"] = backupUnitEdges{[]string{"nmcp.target"}, nil}
+	c["TriggeredBy"] = backupUnitEdges{nil, []string{"nmcp-backup.timer"}}
+	return c, nil
+}
+func backupUnitEdgeSet(raw json.RawMessage, e backupUnitEdges) (map[string]bool, bool) {
+	var got []string
+	if !backupUnitArray(raw, &got) {
+		return nil, false
+	}
+	allowed := map[string]bool{}
+	for _, s := range e.optional {
+		allowed[s] = true
+	}
+	for _, s := range e.required {
+		allowed[s] = true
+	}
+	seen := map[string]bool{}
+	for _, s := range got {
+		if s == "" || seen[s] || !allowed[s] {
+			return nil, false
+		}
+		seen[s] = true
+	}
+	for _, s := range e.required {
+		if !seen[s] {
+			return nil, false
+		}
+	}
+	return seen, true
+}
+
+// validateBackupUnitDependencies is the backup-only effective edge contract.
+// The loose migrate/offline helper validateBackupUnitDependencySet is unchanged.
+func validateBackupUnitDependencies(p map[string]json.RawMessage, pgUnit string) error {
+	bad := func(name string) error { return fmt.Errorf("backup unit %s contract: %w", name, errCutover) }
+	contract, err := backupUnitDependencyContract(pgUnit)
+	if err != nil {
+		return bad("dependency authority")
+	}
+	sets := map[string]map[string]bool{}
+	for _, name := range backupUnitEdgeProperties {
+		set, ok := backupUnitEdgeSet(p[name], contract[name])
+		if !ok {
+			return bad(name)
+		}
+		sets[name] = set
+	}
+	// A required mount is always also ordered; the timer adds both edges at once.
+	for unit := range sets["Requires"] {
+		if !sets["After"][unit] {
+			return bad("Requires")
+		}
+	}
+	if sets["After"]["nmcp-backup.timer"] != sets["TriggeredBy"]["nmcp-backup.timer"] {
+		return bad("TriggeredBy")
+	}
+	if !backupUnitStringSet(p["RequiresMountsFor"], backupUnitMountPaths) {
+		return bad("RequiresMountsFor")
+	}
+	for _, name := range []string{"Conditions", "Asserts"} {
+		if !equalBackupUnitJSON(p[name], []any{}) {
+			return bad(name)
+		}
+	}
+	if !equalBackupUnitJSON(p["DefaultDependencies"], true) {
+		return bad("DefaultDependencies")
+	}
+	return nil
+}
+func validateBackupUnitFragment(body []byte) error {
+	sum := sha256.Sum256(body)
+	if hex.EncodeToString(sum[:]) != backupUnitFragmentSHA256 {
+		return fmt.Errorf("backup unit fragment content: %w", errCutover)
+	}
+	return nil
 }
 func backupUnitServiceProperties() []backupUnitProperty {
 	p := []backupUnitProperty{
@@ -152,33 +342,103 @@ func validateBackupUnitEffective(p map[string]json.RawMessage, artifactBind bool
 	return nil
 }
 
-func validateLoadedBackupUnit(parent context.Context) error {
+// Authority is supplied by the authenticated source cluster or externally
+// attested offline receipt. Never learn an allowed PG unit from a drop-in.
+func backupPGDependencyBody(expected string) (string, error) {
+	if !backupPGUnitPattern.MatchString(expected) {
+		return "", errCutover
+	}
+	return "[Unit]\nRequires=" + expected + "\nAfter=" + expected + "\n", nil
+}
+func backupPGUnitFromHBA(path string) (string, error) {
+	match := backupPGHBAPathPattern.FindStringSubmatch(path)
+	if match == nil {
+		return "", errCutover
+	}
+	return "postgresql@17-" + match[1] + ".service", nil
+}
+func validateBackupUnitDependencySet(raw json.RawMessage, expected string) bool {
+	if !backupPGUnitPattern.MatchString(expected) {
+		return false
+	}
+	var dependencies []string
+	if !backupUnitArray(raw, &dependencies) {
+		return false
+	}
+	found := false
+	seen := map[string]bool{}
+	for _, unit := range dependencies {
+		if unit == "" || seen[unit] {
+			return false
+		}
+		seen[unit] = true
+		if unit == expected {
+			found = true
+		} else if strings.HasPrefix(unit, "postgresql") {
+			return false
+		}
+	}
+	return found
+}
+func backupUnitDropins(raw json.RawMessage) (bool, error) {
+	if backupUnitStringSet(raw, []string{backupPGDependencyDropin}) {
+		return false, nil
+	}
+	if backupUnitStringSet(raw, []string{backupPGDependencyDropin, backupArtifactDropin}) {
+		return true, nil
+	}
+	return false, errCutover
+}
+func validateBackupPGDependencyBodies(backup, migrate []byte, expected string) error {
+	body, err := backupPGDependencyBody(expected)
+	if err != nil || string(backup) != body || string(migrate) != body {
+		return errCutover
+	}
+	return nil
+}
+func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) error {
+	if _, err := backupPGDependencyBody(expectedPGUnit); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	before, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
 	if err != nil {
 		return err
 	}
-	var drops []string
-	if !backupUnitArray(before["DropInPaths"], &drops) || (len(drops) != 0 && !reflect.DeepEqual(drops, []string{backupArtifactDropin})) {
+	artifactBind, err := backupUnitDropins(before["DropInPaths"])
+	if err != nil {
 		return errCutover
 	}
-	fragment, err := safeCutoverFile(backupUnitFragment, false, true)
-	if err != nil {
+	if err = validateBackupUnitDependencies(before, expectedPGUnit); err != nil {
 		return err
 	}
-	var drop cutoverFile
-	if len(drops) == 1 {
-		drop, err = safeCutoverFile(backupArtifactDropin, false, true)
-		if err != nil || string(drop.before) != backupArtifactDropinBody {
+	snapshots := []cutoverFile{}
+	for _, path := range []string{backupUnitFragment, backupPGDependencyDropin, migratePGDependencyDropin} {
+		file, err := safeCutoverFile(path, false, true)
+		if err != nil {
+			return err
+		}
+		snapshots = append(snapshots, file)
+	}
+	if err = validateBackupUnitFragment(snapshots[0].before); err != nil {
+		return err
+	}
+	if validateBackupPGDependencyBodies(snapshots[1].before, snapshots[2].before, expectedPGUnit) != nil {
+		return errCutover
+	}
+	if artifactBind {
+		file, err := safeCutoverFile(backupArtifactDropin, false, true)
+		if err != nil || string(file.before) != backupArtifactDropinBody {
 			return errCutover
 		}
+		snapshots = append(snapshots, file)
 	}
 	props, err := queryBackupUnitProperties(ctx, "Service", backupUnitServiceProperties())
 	if err != nil {
 		return err
 	}
-	if err = validateBackupUnitEffective(props, len(drops) == 1); err != nil {
+	if err = validateBackupUnitEffective(props, artifactBind); err != nil {
 		return err
 	}
 	after, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
@@ -188,13 +448,9 @@ func validateLoadedBackupUnit(parent context.Context) error {
 	if !reflect.DeepEqual(before, after) {
 		return errCutover
 	}
-	again, err := safeCutoverFile(backupUnitFragment, false, true)
-	if err != nil || !sameBackupUnitFile(fragment, again) {
-		return errCutover
-	}
-	if len(drops) == 1 {
-		again, err = safeCutoverFile(backupArtifactDropin, false, true)
-		if err != nil || !sameBackupUnitFile(drop, again) {
+	for _, file := range snapshots {
+		again, err := safeCutoverFile(file.path, false, true)
+		if err != nil || !sameBackupUnitFile(file, again) {
 			return errCutover
 		}
 	}

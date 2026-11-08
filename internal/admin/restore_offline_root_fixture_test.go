@@ -123,7 +123,6 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	}
 	offlineFixedPreflight(t)
 	f := newLiveCutoverFixture(t, bin, "nmcp-offline-fixture")
-	f.manageOfflinePG("postgresql@17-nmcp-offline-fixture.service")
 	ctx := f.ctx
 	admin := f.poolLive("operator", "postgres")
 	f.sql(admin, `CREATE DATABASE source TEMPLATE template0 OWNER operator`)
@@ -159,6 +158,10 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	// Real API and worker must be running on source *before* Restore; actual
 	// unit files retain production sandboxing and fixed executable paths.
 	f.run("/usr/bin/systemctl", "daemon-reload")
+	if err := validateLoadedBackupUnit(ctx, offlineSourcePGUnit); err != nil {
+		t.Fatalf("actual offline production-shaped backup unit contract: %v", err)
+	}
+	t.Log("actual offline manager contract includes source-bound production PG dependency")
 	f.run("/usr/bin/systemctl", "start", "nmcp-migrate.service", "nmcp-api.service", "nmcp-worker.service")
 	oldPIDs := map[string]int{}
 	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service"} {
@@ -414,6 +417,8 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	offlineActualTimeoutCleanup(t, f, g)
 }
 
+const liveSourcePGUnit = "postgresql@17-backup-ci.service"
+
 const offlineSourcePGUnit = "postgresql@17-nmcp-offline-fixture.service"
 const offlineCandidatePGUnit = "postgresql@17-nmcp-offline-candidate.service"
 
@@ -451,7 +456,7 @@ func offlineFixedPreflight(t *testing.T) {
 // rather than a no-op unit whose MainPID never represented PostgreSQL.
 func (f *liveCutoverFixture) manageOfflinePG(unit string) {
 	f.t.Helper()
-	if unit != offlineSourcePGUnit && unit != offlineCandidatePGUnit {
+	if unit != liveSourcePGUnit && unit != offlineSourcePGUnit && unit != offlineCandidatePGUnit {
 		f.t.Fatal("unsupported fixture unit")
 	}
 	if f.postmaster > 0 {

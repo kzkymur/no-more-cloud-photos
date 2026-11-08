@@ -149,6 +149,7 @@ func newLiveCutoverFixture(t *testing.T, bin string, clusters ...string) *liveCu
 		cluster = clusters[0]
 	}
 	hbaPath := "/etc/postgresql/17/" + cluster + "/pg_hba.conf"
+	pgUnit := "postgresql@17-" + cluster + ".service"
 	socketPath := "/run/nmcp-" + cluster
 	if cluster == "nmcp-offline-fixture" {
 		socketPath = "/run/nmcp-offline-fixture"
@@ -192,12 +193,13 @@ func newLiveCutoverFixture(t *testing.T, bin string, clusters ...string) *liveCu
 		}
 	}
 	fixed := []string{"/run/nmcp-backup", "/run/nmcp-backup-cutover.owner", "/var/lib/systemd/timers/stamp-nmcp-backup.timer", "/etc/systemd/system/timers.target.wants/nmcp-backup.timer", "/etc/nmcp", "/var/lib/nmcp", "/var/lib/nmcp-backup", "/var/lib/nmcp-restore", filepath.Dir(hbaPath), "/opt/nmcp", socketPath}
+	fixed = append(fixed, "/run/nmcp-backup-cutover."+pgUnit+".owner")
 	for _, p := range fixed {
 		if _, e := os.Lstat(p); !os.IsNotExist(e) {
 			t.Fatalf("refuse preexisting/uninspectable fixed path %s", p)
 		}
 	}
-	for _, u := range append(append([]string{}, liveUnits...), "nmcp.target") {
+	for _, u := range append(append([]string{}, liveUnits...), "nmcp.target", pgUnit) {
 		c := exec.Command("/usr/bin/systemctl", "show", "--property=LoadState", "--value", u)
 		b, e := c.Output()
 		load := strings.TrimSpace(string(b))
@@ -335,6 +337,9 @@ func newLiveCutoverFixture(t *testing.T, bin string, clusters ...string) *liveCu
 	if err != nil || f.postmaster <= 0 {
 		t.Fatal("invalid postmaster PID")
 	}
+	// Stop the exclusively owned bootstrap process and restart it under its
+	// receipt-attested real unit; never fake/adopt an unrelated MainPID.
+	f.manageOfflinePG(pgUnit)
 	return f
 }
 
@@ -571,7 +576,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	// Real API and worker must be running on source *before* Restore; actual
 	// unit files retain production sandboxing and fixed executable paths.
 	f.run("/usr/bin/systemctl", "daemon-reload")
-	if err := validateLoadedBackupUnit(ctx); err != nil {
+	if err := validateLoadedBackupUnit(ctx, liveSourcePGUnit); err != nil {
 		t.Fatalf("actual effective backup unit contract: %v", err)
 	}
 	t.Log("actual systemd effective backup credential/runtime/command contract validated")
@@ -1134,19 +1139,104 @@ func (f *liveCutoverFixture) installLiveUnits(artifacts map[string]string, prefi
 		}
 		f.owned[path] = st
 	}
-	// Preserve all production hardening. Narrow read-only mounts expose only
-	// trusted fixed /opt prefixes needed by embedded native rpaths.
-	// No sandbox directive is reset or weakened. Unit source bytes remain exact.
-	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service", "nmcp-backup.service"} {
+	// Install the exact production dependency first. The real installed metadata
+	// guard does not accept fixture-only artifact mounts as production settings.
+	pgUnit, err := backupPGUnitFromHBA(f.hbaPath)
+	if err != nil {
+		f.t.Fatal("fixture PG dependency identity")
+	}
+	body, err := backupPGDependencyBody(pgUnit)
+	if err != nil {
+		f.t.Fatal("fixture PG dependency body")
+	}
+	for _, unit := range []string{"nmcp-migrate.service", "nmcp-backup.service"} {
 		dir := "/etc/systemd/system/" + unit + ".d"
 		f.ownDir(dir, 0755, "")
+		f.write(dir+"/10-postgresql.conf", body, 0644)
+	}
+	f.proveInstalledMetadataGate(repo)
+	// Preserve every production hardening directive. Add only the known two
+	// read-only artifact prefixes after the production-shaped metadata proof.
+	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service", "nmcp-backup.service"} {
+		dir := "/etc/systemd/system/" + unit + ".d"
+		if unit != "nmcp-backup.service" {
+			f.ownDir(dir, 0755, "")
+		}
 		for _, p := range []string{prefix, f.bin} {
 			if strings.ContainsAny(p, " \n\t:%") {
-				f.t.Fatal("native/PG prefix cannot contain systemd metacharacters")
+				f.t.Fatal("artifact prefix contains systemd metacharacters")
 			}
 		}
 		f.write(dir+"/artifact-paths.conf", "[Service]\nBindReadOnlyPaths="+prefix+" "+filepath.Dir(f.bin)+"\n", 0644)
 	}
+
+}
+
+// This executes only the installed unit metadata/drop-in gate, not host config,
+// HBA binding or a production install. The default pure tests remain separate.
+func (f *liveCutoverFixture) proveInstalledMetadataGate(repo string) {
+	f.t.Helper()
+	script := filepath.Join(repo, "scripts/test-backup-installed-contract")
+	inspect := func(fresh bool) error {
+		args := []string{script, "--actual-manager"}
+		if fresh {
+			args = append(args, "--fresh")
+		}
+		ctx, cancel := context.WithTimeout(f.ctx, 45*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "/usr/bin/python3", args...)
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "PYTHONDONTWRITEBYTECODE=1"}
+		cmd.WaitDelay = time.Second
+		return cmd.Run() // no raw file contents or manager errors enter the test log
+	}
+	f.run("/usr/bin/systemctl", "daemon-reload")
+	if inspect(true) != nil {
+		f.t.Fatal("actual installed unit metadata positive rejected")
+	}
+	const badPath = "/etc/systemd/system/nmcp-backup.service.d/99-contract-negative.conf"
+	const marker = "/etc/nmcp/forbidden-contract-exec"
+	if _, e := os.Lstat(marker); !os.IsNotExist(e) {
+		f.t.Fatal("unexpected metadata execution marker")
+	}
+	bad, e := os.OpenFile(badPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if e != nil {
+		f.t.Fatal("exclusive owned negative drop-in creation")
+	}
+	info, e := bad.Stat()
+	if e != nil {
+		bad.Close()
+		f.t.Fatal("owned negative drop-in identity")
+	}
+	_, writeErr := bad.WriteString("[Service]\nExecStartPre=+/usr/bin/touch " + marker + "\n")
+	closeErr := bad.Close()
+	if writeErr != nil || closeErr != nil {
+		f.t.Fatal("owned negative drop-in write")
+	}
+	// No explicit reload or activation occurs with this unsafe file present.
+	// Property reads may lazily reload metadata; do not claim a frozen cache.
+	if inspect(false) == nil {
+		f.t.Fatal("actual manager/disk drop-in override accepted")
+	}
+	if _, e := os.Lstat(marker); !os.IsNotExist(e) {
+		f.t.Fatal("metadata gate executed injected command")
+	}
+	if _, e := os.Lstat("/run/nmcp-backup"); !os.IsNotExist(e) {
+		f.t.Fatal("metadata gate activated credential lifecycle")
+	}
+	now, e := os.Lstat(badPath)
+	if e != nil || !now.Mode().IsRegular() || !os.SameFile(info, now) {
+		f.t.Fatal("negative drop-in substituted; preserve")
+	}
+	// Only this exclusively-created, fixed absolute unit input is removed.
+	// This is never authority to create/delete /run/nmcp-backup.
+	if os.Remove(badPath) != nil {
+		f.t.Fatal("remove identity-checked owned negative drop-in")
+	}
+	f.run("/usr/bin/systemctl", "daemon-reload")
+	if inspect(true) != nil {
+		f.t.Fatal("actual installed metadata restored positive rejected")
+	}
+	f.t.Log("actual manager production-shaped metadata gate: positive/unsafe drop-in negative/restored positive; no injected command or runtime credential activation; full install not claimed")
 }
 
 func liveWaitHTTP(t *testing.T, ctx context.Context) {

@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Pure temporary-file/fake-manager tests, NOT actual systemd255/runtime proof.
+
+Extract the installed validator's embedded Python without executing its CLI.
+Production has no root/uid/query override. Only internal function arguments are
+injected here; fixture ownership is the invoking user, never root impersonation.
+"""
+import copy
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+REPO = Path(__file__).resolve().parent.parent
+source = (REPO / 'scripts/validate-backup-install').read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+# Definitions only; exclude argument parsing and the host/CLI entry point.
+imports = source[:source.index('ROOT = Path.cwd()')]
+definitions = source[source.index('def require('):source.index('def host():')]
+N = {}
+exec(compile(imports + definitions, 'validate-backup-install:definitions', 'exec'), N)
+
+BODY = b'[Unit]\nRequires=postgresql@17-main.service\nAfter=postgresql@17-main.service\n'
+ROOTS = ['/etc/systemd/system.control', '/run/systemd/system.control',
+         '/run/systemd/transient', '/run/systemd/generator.early',
+         '/etc/systemd/system', '/run/systemd/system', '/run/systemd/generator',
+         '/usr/local/lib/systemd/system', '/usr/lib/systemd/system',
+         '/run/systemd/generator.late', '/custom/manager/path']
+
+
+class Fixture:
+    def __init__(self, tmp):
+        self.root = Path(tmp)
+        self.roots = list(ROOTS)
+        for root in self.roots:
+            self.path(root).mkdir(parents=True)
+        self.write(N['MIGRATE_DEPENDENCY'], BODY)
+        self.write(N['DEPENDENCY'], BODY)
+        self.path(N['DEPENDENCY']).parent.chmod(0o755)
+        self.props = {}
+        for name in N['BACKUP_NAMES']:
+            self.write('/etc/systemd/system/' + name, b'fixture base parsed separately\n')
+            self.props[name] = dict(Id=name, Names=[name], FragmentPath='/etc/systemd/system/' + name,
+                                    DropInPaths=[N['DEPENDENCY']] if name.endswith('.service') else [],
+                                    LoadState='loaded', Transient=False, SourcePath='', NeedDaemonReload=False)
+
+    def path(self, path):
+        return self.root / str(path).lstrip('/')
+
+    def write(self, path, data=b'[Service]\nRuntimeDirectoryPreserve=yes\n'):
+        p = self.path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        p.chmod(0o644)
+        return p
+
+    def query(self, name=None):
+        return copy.deepcopy({'UnitPath': self.roots} if name is None else self.props[name])
+
+    def check(self, p, uid=0, mode=None, directory=False):
+        # Fixture metadata equivalent except uid is deliberately the test user.
+        # Stop at temporary root rather than claiming host root ancestry proof.
+        p = Path(p)
+        for parent in p.parents:
+            if parent == self.root.parent:
+                break
+            st = parent.lstat()
+            N['require'](stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and
+                         not st.st_mode & 0o022, 'fixture parent metadata')
+        st = p.lstat()
+        N['require']((stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode))
+                     and st.st_uid == os.getuid() and (directory or st.st_nlink == 1), 'fixture metadata')
+        N['require'](mode is None or stat.S_IMODE(st.st_mode) == mode, 'fixture mode')
+        return st
+
+    def run(self, fresh=False):
+        return N['installed_unit_contract'](fresh, self.query, self.path, self.check)
+
+
+class InstalledContract(unittest.TestCase):
+    def fixture(self):
+        tmp = tempfile.TemporaryDirectory(prefix='nmcp-installed-contract-')
+        self.addCleanup(tmp.cleanup)
+        fixture = Fixture(tmp.name)
+        fixture.run()  # Every negative starts from an independently passing fixture.
+        return fixture
+
+    def rejected(self, f, fresh=False):
+        with self.assertRaises((ValueError, OSError)):
+            f.run(fresh)
+
+    def test_pristine_and_pending_known_update(self):
+        f = self.fixture()
+        f.run()
+        f.run(True)
+        f.props['nmcp-backup.service']['NeedDaemonReload'] = True
+        f.props['nmcp-backup.service']['DropInPaths'] = []
+        f.run()  # Prospective metadata only, not cached execution equivalence.
+        self.rejected(f, True)
+
+    def test_every_root_canonical_prefix_type_service_timer(self):
+        for root in ROOTS:
+            for directory in ['nmcp-backup.service.d', 'nmcp-.service.d', 'service.d',
+                              'nmcp-backup.timer.d', 'nmcp-.timer.d', 'timer.d']:
+                with self.subTest(root=root, directory=directory):
+                    f = self.fixture()
+                    f.props['nmcp-backup.service']['DropInPaths'] = []
+                    # Deliberately stale false manager report: disk guard must fail.
+                    f.write(root + '/' + directory + '/90-unsafe.conf')
+                    self.rejected(f)
+
+    def test_payloads_are_not_parsed_or_whitelisted(self):
+        for body in [b'[Service]\nExecStartPre=\nExecStartPre=+/bin/evil\n',
+                     b'[Service]\nRuntimeDirectoryPreserve=yes\n',
+                     b'[Service]\nPermissionsStartOnly=true\n',
+                     b'[Timer]\nUnit=evil.service\n', b'', b'# harmless but unreviewed\n']:
+            with self.subTest(body=body):
+                f = self.fixture()
+                f.write('/run/systemd/system/nmcp-backup.service.d/override.conf', body)
+                self.rejected(f)
+
+    def test_unreviewed_empty_dangling_mask_fifo_and_ignored_suffix(self):
+        for kind in ['empty', 'dangling', 'mask', 'fifo', 'ignored']:
+            with self.subTest(kind=kind):
+                f = self.fixture()
+                p = f.path('/run/systemd/system/nmcp-.service.d')
+                if kind == 'empty':
+                    p.mkdir()
+                elif kind == 'dangling':
+                    p.symlink_to('does-not-exist')
+                elif kind == 'mask':
+                    p.symlink_to('/dev/null')
+                elif kind == 'fifo':
+                    os.mkfifo(p)
+                else:
+                    f.write(str(p.relative_to(f.root)) + '/ignored.txt')
+                self.rejected(f)
+
+    def test_aliases_including_dangling_shadowed_unrelated_and_template(self):
+        for name, target, drop in [
+                ('old-backup.service', '/missing/vendor/nmcp-backup.service', 'old-backup.service.d'),
+                ('old-backup.service', 'intermediate.service', 'old-.service.d'),
+                ('unrelated.service', '/dev/null', 'unrelated.service.d'),
+                ('alias-backup.timer', 'nmcp-backup.timer', 'alias-.timer.d'),
+                ('alias-backup@one.service', 'something@one.service', 'alias-@.service.d')]:
+            with self.subTest(name=name, drop=drop):
+                f = self.fixture()
+                f.path('/usr/lib/systemd/system/' + name).symlink_to(target)
+                f.write('/etc/systemd/system/' + name, b'shadowing regular unit\n')
+                f.write('/run/systemd/system/' + drop + '/90-unsafe.conf')
+                self.rejected(f)
+
+    def test_new_higher_priority_fragment(self):
+        for name in N['BACKUP_NAMES']:
+            for kind in ['file', 'mask', 'dangling']:
+                with self.subTest(name=name, kind=kind):
+                    f = self.fixture()
+                    p = f.path('/run/systemd/system.control/' + name)
+                    if kind == 'file':
+                        f.write('/run/systemd/system.control/' + name, b'new fragment')
+                    else:
+                        p.symlink_to('/dev/null' if kind == 'mask' else 'missing')
+                    self.rejected(f)
+
+    def test_dependency_must_match_trusted_source_and_exact_body(self):
+        for body in [BODY.replace(b'17-main', b'17-other'), BODY + b'[Service]\nExecStartPre=+/bin/evil\n',
+                     BODY + b'# extra\n', BODY.replace(b'17-main', b'18-main'),
+                     BODY.replace(b'After=postgresql@17-main', b'After=postgresql@17-other'), b'']:
+            with self.subTest(body=body):
+                f = self.fixture()
+                f.write(N['DEPENDENCY'], body)
+                self.rejected(f)
+        f = self.fixture()
+        f.write(N['MIGRATE_DEPENDENCY'], BODY + b'Wants=unreviewed.service\n')
+        self.rejected(f)
+
+    def test_dependency_metadata_and_extra_entries(self):
+        for kind in ['mode', 'directory-mode', 'symlink', 'hardlink', 'extra', 'missing']:
+            with self.subTest(kind=kind):
+                f = self.fixture()
+                p = f.path(N['DEPENDENCY'])
+                if kind == 'mode':
+                    p.chmod(0o666)
+                elif kind == 'directory-mode':
+                    p.parent.chmod(0o777)
+                elif kind == 'hardlink':
+                    os.link(p, f.root / 'second-link')
+                elif kind == 'extra':
+                    f.write('/etc/systemd/system/nmcp-backup.service.d/artifact-paths.conf', b'')
+                else:
+                    # Exact checked fixture leaf only, never a production path.
+                    self.assertTrue(p.is_relative_to(f.root))
+                    p.unlink()
+                    if kind == 'symlink':
+                        p.symlink_to(f.path(N['MIGRATE_DEPENDENCY']))
+                self.rejected(f)
+
+    def test_loaded_identity_and_dropin_drift(self):
+        for key, value in [('Id', 'alias.service'), ('Names', ['nmcp-backup.service', 'alias.service']),
+                           ('FragmentPath', '/run/systemd/system/nmcp-backup.service'),
+                           ('DropInPaths', ['/gone/unsafe.conf']), ('Transient', True),
+                           ('LoadState', 'not-found'), ('SourcePath', '/generated/source')]:
+            with self.subTest(key=key):
+                f = self.fixture()
+                f.props['nmcp-backup.service'][key] = value
+                self.rejected(f)
+
+    def test_manager_path_and_query_errors(self):
+        for roots in [[], ['relative'], ROOTS + ROOTS, ['/abs/../bad'], ROOTS * 20]:
+            f = self.fixture()
+            f.roots = roots
+            self.rejected(f)
+        f = self.fixture()
+        def denied(name=None):
+            raise PermissionError('fake unavailable manager')
+        f.query = denied
+        self.rejected(f)
+        f = self.fixture()
+        f.path('/run/systemd/generator').chmod(0o777)
+        self.rejected(f)
+
+    def test_missing_lookup_roots_and_directory_symlink_policy(self):
+        f = self.fixture()
+        f.roots.append('/not-yet-created/systemd/path')
+        f.run()  # Missing lookup roots are normal, with trusted ancestry.
+        f.roots.append('/compat/systemd')
+        alias = f.path('/compat/systemd')
+        alias.parent.mkdir()
+        alias.symlink_to(f.path('/usr/lib/systemd/system'))
+        f.run()  # Distro lookup-root symlinks differ from forbidden .d symlinks.
+        alias_drop = f.path('/etc/systemd/system/nmcp-.service.d')
+        alias_drop.symlink_to(f.path('/usr/lib/systemd/system'))
+        self.rejected(f)
+
+    def test_unreadable_lookup_directory_is_not_absent(self):
+        f = self.fixture()
+        original = f.check
+        def denied(p, *args, **kwargs):
+            if p == f.path('/run/systemd/system'):
+                raise PermissionError('simulated unreadable lookup root')
+            return original(p, *args, **kwargs)
+        f.check = denied
+        self.rejected(f)
+
+    def test_stable_snapshot_required(self):
+        f = self.fixture()
+        original = f.query
+        calls = 0
+        def changing(name=None):
+            nonlocal calls
+            calls += 1
+            data = original(name)
+            if calls > 3 and name is None:
+                data['UnitPath'] = ROOTS[:-1]
+            return data
+        f.query = changing
+        self.rejected(f)
+
+    def test_wire_types_duplicates_missing_trailing_and_bounds(self):
+        decode = N['decode_properties']
+        self.assertEqual(decode('{"type":"as","data":["/etc/systemd/system"]}', [('UnitPath', 'as')]),
+                         {'UnitPath': ['/etc/systemd/system']})
+        self.assertEqual(decode('{"type":"b","data":false}', [('NeedDaemonReload', 'b')]),
+                         {'NeedDaemonReload': False})
+        for raw in ['', '{"type":"s","data":[]}', '{"type":"as","data":null}',
+                    '{"type":"as","data":[1]}', '{"type":"as","data":[],"data":[]}',
+                    '{"type":"as"}', '{"type":"as","data":[]} {}', ' ' * (N['WIRE_LIMIT'] + 1)]:
+            with self.subTest(raw=raw[:80]), self.assertRaises(ValueError):
+                decode(raw, [('UnitPath', 'as')])
+
+    def test_bounded_query_failure_timeout_overflow_and_scrubbed_command(self):
+        class Pipe:
+            def fileno(self):
+                return 123
+        class Proc:
+            stdout = Pipe()
+            killed = False
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def poll(self):
+                return 0 if self.killed else None
+            def wait(self, timeout=None):
+                return 0
+            def kill(self):
+                self.killed = True
+        class Poll:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def register(self, *args):
+                pass
+            def select(self, timeout):
+                return [True]
+        for scenario in ['success', 'overflow', 'timeout', 'nonzero']:
+            with self.subTest(scenario=scenario):
+                proc, poll = Proc(), Poll()
+                chunks = [b'{}', b'']
+                if scenario == 'overflow':
+                    chunks = [b'x' * (N['WIRE_LIMIT'] + 1)]
+                elif scenario == 'timeout':
+                    poll.select = lambda timeout: []
+                elif scenario == 'nonzero':
+                    proc.wait = lambda timeout=None: 1
+                with patch.object(N['subprocess'], 'Popen', return_value=proc) as popen, \
+                     patch.object(N['selectors'], 'DefaultSelector', return_value=poll), \
+                     patch.object(N['os'], 'read', side_effect=chunks):
+                    if scenario == 'success':
+                        self.assertEqual(N['bounded_bus'](['get-property']), '{}')
+                    else:
+                        with self.assertRaises(ValueError):
+                            N['bounded_bus'](['get-property'])
+                        self.assertTrue(proc.killed)
+                args, kwargs = popen.call_args
+                self.assertEqual(args[0], ['/usr/bin/busctl', '--system', '--json=short',
+                                           '--auto-start=no', 'get-property'])
+                self.assertEqual(kwargs['env'], {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'})
+                self.assertEqual(kwargs['stderr'], N['subprocess'].DEVNULL)
+
+    def test_installer_ordering_and_no_validator_mutators(self):
+        installer = (REPO / 'scripts/install-backup-config').read_text()
+        tokens = ['"$script_dir/validate-backup-install" --installed\n',
+                  '"$script_dir/configure-backup-source-hba"',
+                  '/usr/bin/systemctl daemon-reload',
+                  '"$script_dir/validate-backup-install" --installed --fresh-manager',
+                  '/usr/bin/systemctl start nmcp-backup.service',
+                  '/usr/bin/systemctl enable --now nmcp-backup.timer']
+        positions = [installer.index(t) for t in tokens]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('set -euo pipefail', installer)
+        self.assertNotIn('/usr/bin/systemctl', source)
+        self.assertIn("'--auto-start=no'", source)
+
+
+if __name__ == '__main__':
+    if '--actual-manager' in sys.argv[1:]:
+        # Explicit isolated-host integration entry point, not part of pure tests.
+        # Default production query/path/check only: no fixture path/uid injection.
+        # Property reads can lazily load metadata, but never activate the unit.
+        try:
+            N['require'](sys.argv[1:] in (['--actual-manager'],
+                                         ['--actual-manager', '--fresh']) and
+                         os.geteuid() == 0, 'actual manager mode requires root')
+            N['installed_unit_contract'](fresh='--fresh' in sys.argv[1:])
+        except Exception:
+            # Deliberately omit exception details, command output and tracebacks.
+            sys.exit('FAIL actual installed unit metadata/drop-in gate')
+        print('PASS actual installed unit metadata/drop-in gate; full install/runtime NOT proven')
+    else:
+        unittest.main()

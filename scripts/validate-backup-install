@@ -3,6 +3,9 @@
 set -euo pipefail
 exec python3 - --source-root "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")" "$@" <<'PY'
 import configparser
+import json
+import selectors
+import time
 import os
 from pathlib import Path
 import pwd
@@ -15,14 +18,18 @@ ROOT = Path.cwd()
 # Explicit --source-root avoids depending on stdin Python's __file__.
 args = sys.argv[1:]
 if '--help' in args:
-    print('Usage: scripts/validate-backup-install [--source-root REPO] [--installed]')
+    print('Usage: scripts/validate-backup-install [--source-root REPO] [--installed [--fresh-manager]]')
     print('Default: static source checks only. --installed additionally inspects local fixed host paths.')
+    print('--fresh-manager requires --installed and a prior explicit operator reload; never reloads itself.')
     sys.exit(0)
 installed = False
+fresh_manager = False
 while args:
     arg = args.pop(0)
     if arg == '--installed':
         installed = True
+    elif arg == '--fresh-manager':
+        fresh_manager = True
     elif arg == '--source-root' and args:
         ROOT = Path(args.pop(0)).resolve()
     else:
@@ -138,6 +145,217 @@ def safe(path, uid=0, mode=None, directory=False):
     require(mode is None or stat.S_IMODE(st.st_mode) == mode, 'unsafe file permissions')
     return st
 
+# v255 lookup contract: src/shared/dropin.c, src/basic/unit-file.c and
+# src/core/dbus-manager.c. This is a conservative installed metadata policy,
+# NOT an effective execution/runtime inspector. Never reload or start a unit.
+# v255 fixed-object property reads may lazily load unit metadata (dbus.c find_unit);
+# --auto-start=no prevents bus-name activation, NOT that metadata loading.
+BUS_ENV = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}
+WIRE_LIMIT = 256 * 1024
+UNIT_PROPERTIES = [('Id', 's'), ('Names', 'as'), ('FragmentPath', 's'),
+                   ('DropInPaths', 'as'), ('LoadState', 's'), ('Transient', 'b'),
+                   ('SourcePath', 's'), ('NeedDaemonReload', 'b')]
+BACKUP_NAMES = ('nmcp-backup.service', 'nmcp-backup.timer')
+DEPENDENCY = '/etc/systemd/system/nmcp-backup.service.d/10-postgresql.conf'
+MIGRATE_DEPENDENCY = '/etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf'
+
+
+def bounded_bus(argv):
+    # capture_output is not a memory bound. Read a pipe incrementally and kill
+    # on overflow/deadline; stderr is deliberately never exposed or retained.
+    with subprocess.Popen(['/usr/bin/busctl', '--system', '--json=short',
+                           '--auto-start=no'] + argv, env=BUS_ENV,
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as proc:
+        try:
+            data = bytearray()
+            deadline = time.monotonic() + 5
+            with selectors.DefaultSelector() as poll:
+                poll.register(proc.stdout, selectors.EVENT_READ)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    require(remaining > 0, 'manager query timeout')
+                    require(poll.select(remaining), 'manager query timeout')
+                    part = os.read(proc.stdout.fileno(), 8192)
+                    if not part:
+                        break
+                    data.extend(part)
+                    require(len(data) <= WIRE_LIMIT, 'manager query size')
+            require(proc.wait(timeout=max(0.001, deadline - time.monotonic())) == 0,
+                    'manager query failed')
+            return data.decode('utf-8')
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def decode_properties(raw, properties):
+    require(len(raw.encode('utf-8')) <= WIRE_LIMIT, 'manager query size')
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, 'duplicate JSON key')
+            result[key] = value
+        return result
+    decoder = json.JSONDecoder(object_pairs_hook=unique)
+    result = {}
+    for name, signature in properties:
+        value, end = decoder.raw_decode(raw.lstrip())
+        raw = raw.lstrip()[end:]
+        require(isinstance(value, dict) and set(value) == {'type', 'data'}
+                and value['type'] == signature, 'manager property signature')
+        data = value['data']
+        require((signature == 's' and type(data) is str)
+                or (signature == 'b' and type(data) is bool)
+                or (signature == 'as' and type(data) is list and
+                    all(type(item) is str for item in data)), 'manager property type')
+        result[name] = data
+    require(not raw.strip(), 'extra manager properties')
+    return result
+
+
+def manager_query(name=None):
+    if name is None:
+        obj, iface, properties = '/org/freedesktop/systemd1', 'Manager', [('UnitPath', 'as')]
+    else:
+        require(name in BACKUP_NAMES, 'unexpected unit')
+        obj = '/org/freedesktop/systemd1/unit/' + name.replace('-', '_2d').replace('.', '_2e')
+        iface, properties = 'Unit', UNIT_PROPERTIES
+    return decode_properties(bounded_bus(['get-property', 'org.freedesktop.systemd1',
+                             obj, 'org.freedesktop.systemd1.' + iface] +
+                             [key for key, signature in properties]), properties)
+
+
+def dropin_names(name):
+    # Include instance/template forms too for the deliberately overinclusive
+    # symlink-name scan. Production canonical units themselves are non-template.
+    stem, kind = name.rsplit('.', 1)
+    prefix, sep, instance = stem.partition('@')
+    forms = {name}
+    if sep:
+        forms.add(prefix + '@.' + kind)
+    for i, c in enumerate(prefix):
+        if c == '-' and i > 0:
+            part = prefix[:i + 1]
+            forms.add(part + (('@' + instance) if sep else '') + '.' + kind)
+            if sep:
+                forms.add(part + '@.' + kind)
+    return {n + '.d' for n in forms}
+
+
+def installed_unit_contract(fresh=False, query=manager_query, path=Path, check=safe):
+    # path/check/query injection is INTERNAL solely for pure fixture tests.
+    # No production CLI/environment root, uid, or query override exists.
+    manager = query()
+    require(set(manager) == {'UnitPath'}, 'unexpected manager properties')
+    roots = manager['UnitPath']
+    require(type(roots) is list and 0 < len(roots) <= 64 and
+            all(type(r) is str and len(r) <= 4096 and r.startswith('/') and
+                str(Path(r)) == r and '..' not in Path(r).parts for r in roots)
+            and len(set(roots)) == len(roots), 'invalid manager lookup paths')
+    require('/etc/systemd/system' in roots, 'fixed fragment outside lookup path')
+    before = {n: query(n) for n in BACKUP_NAMES}
+    for name, props in before.items():
+        require(set(props) == {key for key, signature in UNIT_PROPERTIES}, 'unit property set')
+        require(props['Id'] == name and props['Names'] == [name] and
+                props['FragmentPath'] == '/etc/systemd/system/' + name and
+                props['LoadState'] == 'loaded' and props['Transient'] is False and
+                props['SourcePath'] == '' and type(props['NeedDaemonReload']) is bool,
+                'unexpected loaded unit identity')
+        allowed = [DEPENDENCY] if name.endswith('.service') else []
+        require(props['DropInPaths'] == allowed or (not fresh and props['DropInPaths'] == []),
+                'unreviewed loaded dropins')
+        require(not fresh or props['NeedDaemonReload'] is False, 'manager requires reload')
+
+    def entry(p):
+        try:
+            return p.lstat()
+        except FileNotFoundError:
+            return None
+
+    def trusted_directory(p):
+        # UnitPath may contain distro directory symlinks (/lib -> /usr/lib).
+        # Inspect the resolved ancestry; applicable .d symlinks are NEVER allowed.
+        resolved = p.resolve(strict=True)
+        st = check(resolved, directory=True)
+        require(not st.st_mode & 0o022, 'writable lookup directory')
+
+    def read_dependency(p):
+        before = check(p, 0, 0o644)
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            st = os.fstat(stream.fileno())
+            require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and
+                    (st.st_dev, st.st_ino, st.st_uid, st.st_mode) ==
+                    (before.st_dev, before.st_ino, before.st_uid, before.st_mode), 'unsafe dependency')
+            data = stream.read(4097)
+        require(len(data) <= 4096, 'dependency size')
+        require(re.fullmatch(rb'\[Unit\]\nRequires=(postgresql@17-([A-Za-z0-9_][A-Za-z0-9_-]{0,62})\.service)\nAfter=\1\n', data),
+                'unexpected PostgreSQL dependency')
+        return data
+
+    # The trusted migrate edge is existing deployment authority, not arbitrary
+    # regex-matching Requires input. Actual PID/DB/HBA source binding remains in
+    # configure-backup-source-hba, which the installer MUST run before wake.
+    expected = read_dependency(path(MIGRATE_DEPENDENCY))
+    require(read_dependency(path(DEPENDENCY)) == expected, 'backup/migrate dependency mismatch')
+    candidates = {'service.d', 'timer.d'}
+    for name in BACKUP_NAMES:
+        candidates.update(dropin_names(name))
+    entries = 0
+    for root in roots:
+        p = path(root)
+        st = entry(p)
+        if st is None:
+            # Check nearest existing ancestor; do not treat inaccessible/dangling
+            # parents as empty. This is a snapshot, not protection from root races.
+            parent = p.parent
+            while entry(parent) is None:
+                require(parent != parent.parent, 'lookup ancestry unavailable')
+                parent = parent.parent
+            trusted_directory(parent)
+            continue
+        trusted_directory(p)
+        with os.scandir(p) as listing:
+            for item in listing:
+                entries += 1
+                require(entries <= 32768, 'lookup entry bound')
+                # Intentionally OVERINCLUSIVE: every top-level service/timer
+                # symlink name is a potential alias, even masked, dangling or
+                # shadowed ones unrelated to backup. Avoid pretending to fully
+                # reproduce systemd alias resolution/precedence before reload.
+                if item.is_symlink() and item.name.endswith(('.service', '.timer')):
+                    require(len(item.name) <= 255, 'unit name bound')
+                    candidates.update(dropin_names(item.name))
+                    require(len(candidates) <= 2048, 'dropin name bound')
+        for name in BACKUP_NAMES:
+            if roots.index(root) < roots.index('/etc/systemd/system'):
+                require(entry(p / name) is None, 'prospective higher priority fragment')
+    require(len(candidates) * len(roots) <= 65536, 'dropin probe bound')
+    for root in roots:
+        for name in candidates:
+            p = path(root + '/' + name)
+            st = entry(p)
+            if st is None:
+                continue
+            if root == '/etc/systemd/system' and name == 'nmcp-backup.service.d':
+                check(p, 0, 0o755, True)
+                # Only one entry is allowed, including ignored suffixes/masks.
+                with os.scandir(p) as listing:
+                    first = next(listing, None)
+                    require(first is not None and first.name == '10-postgresql.conf'
+                            and next(listing, None) is None, 'extra production dropin entry')
+            else:
+                # Reject ALL applicable directory entries, even empty directories,
+                # dangling links, /dev/null masks, and non-.conf files.
+                require(False, 'unreviewed dropin directory entry')
+    require(query() == manager and all(query(n) == before[n] for n in BACKUP_NAMES),
+            'manager identity changed during validation')
+    # NeedDaemonReload=true is allowed ONLY for pre-reload disk metadata checks:
+    # pending known file updates are legitimate, cached execution is NOT proven.
+
+
 def host():
     user = pwd.getpwnam('nmcp-backup')
     require(user.pw_uid != 0 and user.pw_shell in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false'),
@@ -170,6 +388,7 @@ def host():
         safe('/etc/systemd/system/' + name, 0, 0o644)
 
     units(Path('/etc/systemd/system'))
+    installed_unit_contract(fresh_manager)
     versions = []
     for tool in ('/usr/bin/pg_dump', '/usr/bin/pg_restore'):
         # Ubuntu pg_wrapper may be a package-owned symlink; inspect canonical target.
@@ -182,13 +401,14 @@ def host():
     print('PASS local install metadata/client checks; DB roles, HBA, mounts, enabled timer and runtime NOT proven')
 
 try:
+    require(not fresh_manager or installed, '--fresh-manager requires --installed')
     if installed:
         host()
     else:
         units(ROOT / 'infra/ubuntu/systemd')
         env(ROOT / 'infra/ubuntu/env/backup.env.example', example=True)
         print('PASS static backup unit/timer/environment contract')
-except (OSError, ValueError, KeyError, configparser.Error, subprocess.SubprocessError):
+except (OSError, ValueError, KeyError, configparser.Error, subprocess.SubprocessError, UnicodeError, RecursionError):
     # Do not echo parsed config, file contents or subprocess stderr (may contain secrets).
     sys.exit('FAIL backup install validation; inspect fixed path ownership/configuration and reviewed contract')
 PY

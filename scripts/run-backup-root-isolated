@@ -23,13 +23,38 @@ KEYS = ('GITHUB_ACTIONS', 'RUNNER_ENVIRONMENT', 'TEST_BACKUP_CANDIDATE_SHA',
         'TEST_BACKUP_STILL_HELPER', 'TEST_BACKUP_ANIMATION_HELPER',
         'TEST_BACKUP_ICC_PATH', 'TEST_BACKUP_MEDIA_FIXTURE', 'TEST_BACKUP_CORE_API',
         'TEST_BACKUP_CORE_WORKER', 'TEST_BACKUP_ADMIN_BINARY')
-# Noble retains pre-t64 dependency names in libzmq5/libcdio consumers.
-# debootstrap does not select these versioned virtual providers implicitly;
-# name the real archive packages rather than bypassing dpkg dependency checks.
-PACKAGES = ('systemd-sysv,dbus,util-linux,python3,libimage-exiftool-perl,ffmpeg,'
-            'libglib2.0-dev,libjpeg-turbo8-dev,libpng-dev,libwebp-dev,libexif-dev,'
-            'libde265-dev,libicu74,libssl3t64,libreadline8t64,libzstd1,liblz4-1,zlib1g,'
-            'libpgm-5.3-0t64,libcdio19t64')
+# Exact guest runtime closure. The guest executes only bound host artifacts
+# (Go test/API/worker/admin, PG17 prefix, native prefix helpers incl. its own
+# ffmpeg/ffprobe), /usr/bin/exiftool and /usr/bin/prlimit. Shared objects below
+# are exactly those resolved by guest ldd of those artifacts; compilers, -dev
+# headers and Ubuntu's ffmpeg (whose closure was ~60% of all bootstrap bytes)
+# are never executed in the guest. The strict guest ldd guard below remains
+# authoritative: a missing library fails before any test starts.
+PACKAGES = ('systemd-sysv,dbus,util-linux,python3,libimage-exiftool-perl,'
+            'libglib2.0-0t64,libjpeg-turbo8,libpng16-16t64,libwebp7,libwebpmux3,'
+            'libwebpdemux2,libsharpyuv0,libexif12,libde265-0,libexpat1,libffi8,'
+            'libicu74,libssl3t64,libreadline8t64,libzstd1,liblz4-1,zlib1g')
+SUITE, COMPONENTS, ARCH = 'noble', 'main,universe', 'amd64'
+MIRROR = 'https://archive.ubuntu.com/ubuntu'
+KEYRING = '/usr/share/keyrings/ubuntu-archive-keyring.gpg'
+# Untrusted cached .deb bytes: shape-checked here, then debootstrap --cache-dir
+# verifies each file's size and SHA256 against the Packages index whose own
+# checksum is bound by the freshly fetched gpgv-verified InRelease (nocache).
+# A mismatching file is deleted and re-downloaded, never installed.
+DEB_NAME = re.compile(r'[a-z0-9][a-z0-9+.-]*_[A-Za-z0-9.+~%-]+_(amd64|all)\.deb')
+DEB_MAX_FILES, DEB_MAX_FILE, DEB_MAX_TOTAL = 1024, 256 << 20, 1 << 30
+# One monotonic job budget (scripts/backup-ci-admission receipt). Every active
+# phase is capped by min(configured cap, remaining active budget); the cleanup
+# reserve and margin are never consumed by active phases.
+JOB_NAMES = {'live': 'Backup / actual systemd all-pool cutover and separate resume',
+             'offline': 'Backup / offline two-cluster source-stop recovery and separate resume'}
+# job_seconds MUST equal the workflow job timeout-minutes (50). Static worst
+# case: setup allowance 180 + 900 + 120 + 240 + 1140 + admission skew 32 +
+# cleanup 300 + margin 60 = 2972 <= 3000; the receipt enforces it dynamically.
+BUDGET_POLICY = dict(job_seconds=3000, cleanup_seconds=300, margin_seconds=60)
+SETUP_ALLOWANCE = 180
+BOOTSTRAP_CAP, BOOT_CAP, GUEST_SETUP_RESERVE, TEST_CAP, TEST_REQUIRED = 900, 120, 240, 1140, 1110
+BOOTSTRAP_REQUIRED = 300
 
 def require(ok, message):
     if not ok:
@@ -286,9 +311,10 @@ def teardown_guest(r, receipt):
     raise RuntimeError('guest machine or original PID survived termination')
 
 def emit_fixture_diagnostics(work, root):
-    # Explicit non-secret provisioning/boot logs only. Never recurse over the
-    # guest, credentials, arbitrary receipt paths, or /run contents.
-    for path in (work / 'provision.log', root / 'debootstrap/debootstrap.log', work / 'boot.log'):
+    # Bootstrap logs may contain mirror URLs or argv: summary enums ONLY, even
+    # when a later stage fails. Keep the existing separate guest boot diagnostic.
+    # Never recurse over credentials, arbitrary receipt paths, or /run contents.
+    for path in (work / 'boot.log',):
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
@@ -303,6 +329,116 @@ def emit_fixture_diagnostics(work, root):
             print(text, flush=True)
         finally:
             os.close(fd)
+
+class BootstrapFailure(RuntimeError):
+    """Closed outer error: never retain command, URL, environment or raw log."""
+
+
+def bootstrap_log_tail(work, relative):
+    # Only two known private files. Open each directory with NOFOLLOW as well as
+    # the leaf; no arbitrary paths, symlink parents, or recursive discovery.
+    require(relative in ('provision.log', 'rootfs/debootstrap/debootstrap.log'),
+            'unknown bootstrap log')
+    private_directory(work)
+    descriptors = []
+    try:
+        fd = os.open(work, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.append(fd)
+        st = os.fstat(fd)
+        require(stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and
+                stat.S_IMODE(st.st_mode) == 0o700, 'unsafe bootstrap work directory')
+        for component in relative.split('/')[:-1]:
+            fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=fd)
+            descriptors.append(fd)
+            st = os.fstat(fd)
+            require(stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022,
+                    'unsafe bootstrap log parent')
+        leaf = os.open(relative.split('/')[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                       dir_fd=fd)
+        descriptors.append(leaf)
+        st = os.fstat(leaf)
+        require(stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1 and
+                not st.st_mode & 0o022, 'unsafe bootstrap log')
+        offset = max(0, st.st_size - 65536)
+        os.lseek(leaf, offset, os.SEEK_SET)
+        data = os.read(leaf, 65536)
+        if offset:
+            # Do not classify a partial first line at the tail boundary.
+            data = data.partition(b'\n')[2]
+        return data.decode('utf-8', errors='replace')
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def bootstrap_log_enums(text):
+    # These are observations of recognized bounded log messages, NOT a root-
+    # cause diagnosis. No substring, package name, URL or raw line is emitted.
+    phase, error = 'unknown', 'unknown'
+    phases = ((r'^I: (?:Retrieving|Downloading) ', 'download'),
+              (r'^I: (?:Validating|Checking Release signature)', 'validate'),
+              (r'^I: Extracting ', 'extract'),
+              (r'^(?:I: Unpacking |Unpacking )', 'unpack'),
+              (r'^(?:I: Configuring |Setting up )', 'configure'))
+    errors = ((r'(?:Temporary failure in name resolution|unable to resolve host address|Name or service not known)', 'DNS'),
+              (r'(?:Connection refused|Connection timed out|Network is unreachable|No route to host)', 'connect'),
+              (r'(?:certificate verification failed|certificate .*not trusted|Unable to establish SSL connection|TLS connection .*terminated)', 'TLS'),
+              (r'(?:ERROR [45][0-9]{2}:|HTTP/[12](?:\.[01])? [45][0-9]{2})', 'HTTP'),
+              (r'(?:^dpkg: error|^Errors were encountered while processing:)', 'dpkg'),
+              (r'(?:No space left on device|Disk quota exceeded)', 'disk'))
+    for line in text.splitlines():
+        for pattern, label in phases:
+            if re.search(pattern, line):
+                phase = label
+        for pattern, label in errors:
+            if re.search(pattern, line):
+                error = label
+    return phase, error
+
+
+def observed_bootstrap(argv, env, log, work, identity, timeout):
+    require(set(identity) == {'head', 'run', 'attempt', 'slot'} and
+            re.fullmatch(r'[0-9a-f]{40}', identity['head']) and
+            re.fullmatch(r'[1-9][0-9]{0,19}', identity['run']) and
+            re.fullmatch(r'[1-9][0-9]{0,19}', identity['attempt']) and
+            identity['slot'] in ('live', 'offline'), 'invalid bootstrap diagnostic identity')
+    # One absolute acquisition timeout (budget-capped, never above the
+    # configured 900s); log activity or cache hits cannot reset it.
+    require(type(timeout) is int and 1 <= timeout <= BOOTSTRAP_CAP, 'invalid bootstrap timeout')
+    started = time.monotonic()
+    failure = None
+    try:
+        run_bootstrap(argv, env, log, timeout=timeout)
+    except Exception as exc:
+        failure = exc
+    # This observation occurs after the existing owned-group drain. Never feed
+    # diagnostics into cancellation, receipt, ownership, or success authority.
+    phase, error = 'unknown', 'unknown'
+    capture = 'complete'
+    for relative in ('provision.log', 'rootfs/debootstrap/debootstrap.log'):
+        try:
+            seen_phase, seen_error = bootstrap_log_enums(bootstrap_log_tail(work, relative))
+            # Prefer provision progress: distinct file tails have no shared clock.
+            if phase == 'unknown':
+                phase = seen_phase
+            if error == 'unknown':
+                error = seen_error
+        except Exception:
+            capture = 'unavailable'
+    if isinstance(failure, sp.TimeoutExpired):
+        error = 'timeout'  # Observed deadline, NOT evidence of network root cause.
+    if failure is None:
+        error = 'unknown'  # A prior retry message does not make success an error.
+    summary = dict(identity, phase=phase, error_class=error,
+                   result='success' if failure is None else 'failure',
+                   elapsed_seconds=max(0, int(time.monotonic() - started)),
+                   last_progress_age='unknown', capture=capture)
+    # No last-progress clock was sampled; mtime is NOT monotonic progress age.
+    print('Bootstrap diagnostic: ' + json.dumps(summary, sort_keys=True), flush=True)
+    if failure is not None:
+        raise BootstrapFailure('bootstrap acquisition failed; see closed diagnostic') from None
+
 
 def bootstrap_environment(work):
     private_directory(work)
@@ -380,7 +516,7 @@ def stop_bootstrap_group(proc, started):
     # No more destructive signals after releasing the original leader pin.
     reap_bootstrap_group(proc.pid)
 
-def run_bootstrap(argv, env, log, timeout=900):
+def run_bootstrap(argv, env, log, timeout):
     require(len(list(Path('/proc/self/task').iterdir())) == 1 and
             signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL,
             'bootstrap requires sole wait ownership and default SIGCHLD')
@@ -428,7 +564,7 @@ def run_bootstrap(argv, env, log, timeout=900):
                             'bootstrap wait ownership lost; no signal permitted')
                     stop_bootstrap_group(proc, started)
                 except Exception as cleanup_error:
-                    print('FAIL bootstrap group cleanup: ' + str(cleanup_error), file=sys.stderr, flush=True)
+                    print('FAIL bootstrap group cleanup: unknown', file=sys.stderr, flush=True)
             raise
         else:
             stop_bootstrap_group(proc, started)
@@ -443,14 +579,14 @@ def run_bootstrap(argv, env, log, timeout=900):
             except BaseException as restore_error:
                 if original is None:
                     raise
-                print('FAIL restore child subreaper: ' + str(restore_error), file=sys.stderr, flush=True)
+                print('FAIL restore child subreaper: unknown', file=sys.stderr, flush=True)
         finally:
             try:
                 restore_handlers()
             except BaseException as restore_error:
                 if original is None:
                     raise
-                print('FAIL restore cancellation handlers: ' + str(restore_error), file=sys.stderr, flush=True)
+                print('FAIL restore cancellation handlers: unknown', file=sys.stderr, flush=True)
     # Cancellation recorded during restoration must not become successful boot.
     check_cancelled()
 
@@ -474,7 +610,190 @@ def prepare_guest_config_dirs(root):
         require(target.is_dir() and not target.is_symlink(), 'unsafe guest config directory')
         require(target.resolve().is_relative_to(root.resolve()), 'guest config path escapes root')
 
+def verified_release_indices(inrelease, plain):
+    # Advisory cache KEY only; debootstrap independently re-verifies at use.
+    status = run(['/usr/bin/gpgv', '--keyring', KEYRING, '--status-fd', '1',
+                  '--output', str(plain), str(inrelease)],
+                 stdout=sp.PIPE, stderr=sp.DEVNULL, text=True, timeout=30).stdout
+    require(re.search(r'^\[GNUPG:\] VALIDSIG ', status, re.M), 'InRelease signature not valid')
+    lines, section = [], None
+    for line in plain.read_text().splitlines():
+        if line and not line[0].isspace():
+            section = line.split(':', 1)[0]
+        elif section == 'SHA256':
+            fields = line.split()
+            if (len(fields) == 3 and re.fullmatch('[0-9a-f]{64}', fields[0]) and
+                    re.fullmatch(r'(main|universe)/binary-' + ARCH + r'/Packages(\.xz|\.gz)?', fields[2])):
+                lines.append(fields)
+    require(len(lines) >= 2 and {f[2].split('/')[0] for f in lines} == {'main', 'universe'},
+            'signed Packages indices missing')
+    return sorted(lines, key=lambda f: f[2])
+
+
+def deb_cache_key():
+    import hashlib, urllib.request
+    with tempfile.TemporaryDirectory(prefix='nmcp-deb-key-') as scratch:
+        inrelease = Path(scratch) / 'InRelease'
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(MIRROR + '/dists/' + SUITE + '/InRelease', timeout=30) as response:
+            data = response.read((4 << 20) + 1)
+        require(len(data) <= 4 << 20, 'InRelease too large')
+        inrelease.write_bytes(data)
+        indices = verified_release_indices(inrelease, Path(scratch) / 'Release')
+    version = output(['/usr/bin/dpkg-query', '-W', '-f=${Version}', 'debootstrap'])
+    require(re.fullmatch(r'[0-9][A-Za-z0-9.+~:-]{0,63}', version), 'debootstrap version unavailable')
+    # The resolved closure is a deterministic function of exactly these inputs
+    # (signed index bytes, include set, variant, components, debootstrap).
+    material = dict(suite=SUITE, components=COMPONENTS, arch=ARCH, variant='minbase',
+                    include=PACKAGES, debootstrap=version, indices=indices)
+    digest = hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+    print('nmcp-debootstrap-debs-v1-' + digest)
+    return 0
+
+
+def import_deb_cache(source, work):
+    """Copy untrusted restored cache bytes into a fresh root-private directory.
+
+    Any shape violation rejects the WHOLE restored cache (fresh download);
+    content is verified per file by debootstrap against signed metadata.
+    """
+    target = work / 'deb-cache'
+    staging = work / 'deb-cache-import'
+    staging.mkdir(mode=0o700)
+    report = dict(status='miss', files=0, bytes=0)
+    try:
+        st = os.lstat(source)
+    except FileNotFoundError:
+        target.mkdir(mode=0o700)
+        return report
+    owner = os.stat(source.parent).st_uid
+    created = []
+    try:
+        require(stat.S_ISDIR(st.st_mode) and st.st_uid in (0, owner) and not st.st_mode & 0o022,
+                'restored cache directory unsafe')
+        dfd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            names = os.listdir(dfd)
+            require(len(names) <= DEB_MAX_FILES, 'restored cache has too many entries')
+            sfd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                for name in sorted(names):
+                    require(DEB_NAME.fullmatch(name), 'restored cache has unexpected entry')
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+                    try:
+                        fs = os.fstat(fd)
+                        require(stat.S_ISREG(fs.st_mode) and fs.st_nlink == 1 and
+                                fs.st_uid in (0, owner) and 0 < fs.st_size <= DEB_MAX_FILE,
+                                'restored cache has unsafe file')
+                        report['bytes'] += fs.st_size
+                        require(report['bytes'] <= DEB_MAX_TOTAL, 'restored cache too large')
+                        out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                      0o600, dir_fd=sfd)
+                        created.append(name)
+                        try:
+                            copied = 0
+                            while True:
+                                chunk = os.read(fd, 1 << 20)
+                                if not chunk:
+                                    break
+                                copied += len(chunk)
+                                require(copied <= fs.st_size, 'restored cache file changed')
+                                os.write(out, chunk)
+                            require(copied == fs.st_size, 'restored cache file changed')
+                        finally:
+                            os.close(out)
+                    finally:
+                        os.close(fd)
+            finally:
+                os.close(sfd)
+        finally:
+            os.close(dfd)
+    except Exception as exc:
+        for name in created:  # Only our own staging copies; never the source.
+            os.unlink(staging / name)
+        target.mkdir(mode=0o700)
+        print('Deb cache rejected (fresh download): ' + str(exc), flush=True)
+        return dict(status='rejected', files=0, bytes=0)
+    report.update(status='restored', files=len(created))
+    os.rename(staging, target)
+    return report
+
+
+def export_deb_cache(work, temp):
+    # Bytes leave root ownership only as cache candidates for the NEXT run,
+    # where they are again untrusted and verified before use.
+    source = work / 'deb-cache'
+    dest = temp / 'debootstrap-deb-cache'
+    owner = os.stat(temp)
+    dest.mkdir(mode=0o755)  # Exclusive: never merge into foreign content.
+    count = 0
+    for name in sorted(os.listdir(source)):
+        if not DEB_NAME.fullmatch(name) or not stat.S_ISREG(os.lstat(source / name).st_mode):
+            continue
+        fd = os.open(source / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            fs = os.fstat(fd)
+            if not (stat.S_ISREG(fs.st_mode) and fs.st_nlink == 1 and 0 < fs.st_size <= DEB_MAX_FILE):
+                continue
+            out = os.open(dest / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            try:
+                while True:
+                    chunk = os.read(fd, 1 << 20)
+                    if not chunk:
+                        break
+                    os.write(out, chunk)
+                os.fchmod(out, 0o644)
+                os.fchown(out, owner.st_uid, owner.st_gid)
+            finally:
+                os.close(out)
+            count += 1
+        finally:
+            os.close(fd)
+    os.chown(dest, owner.st_uid, owner.st_gid)
+    return count
+
+
+def budget_seconds(repo, temp, slot, head, phase, cap, required):
+    """Remaining job budget via the identity-bound admission receipt."""
+    receipt = temp / ('.nmcp-budget-' + slot + '.json')
+    # The run's reported head (PR head on pull_request; github.sha on push),
+    # distinct from the checked-out candidate SHA of a PR merge ref.
+    run_sha = os.environ['BUDGET_RUN_SHA']
+    require(re.fullmatch('[0-9a-f]{40}', run_sha), 'exact run SHA required')
+    argv = ['/usr/bin/python3', '-I', str(repo / 'scripts/backup-ci-admission'), 'check',
+            '--repo', os.environ['GITHUB_REPOSITORY'], '--sha', run_sha,
+            '--job-name', JOB_NAMES[slot], '--runner-name', os.environ['RUNNER_NAME'],
+            '--run-id', os.environ['GITHUB_RUN_ID'], '--attempt', os.environ['GITHUB_RUN_ATTEMPT'],
+            '--job-seconds', str(BUDGET_POLICY['job_seconds']),
+            '--cleanup-seconds', str(BUDGET_POLICY['cleanup_seconds']),
+            '--margin-seconds', str(BUDGET_POLICY['margin_seconds']),
+            '--receipt', str(receipt), '--phase', phase,
+            '--cap-seconds', str(cap), '--required-seconds', str(required)]
+    try:
+        result = run(argv, stdout=sp.PIPE, stderr=sp.PIPE, text=True, timeout=30)
+    except sp.CalledProcessError as exc:
+        code = (exc.stderr or '').strip()
+        # Closed helper codes only; never reflect arbitrary helper output.
+        raise RuntimeError('budget admission refused: ' +
+                           (code if re.fullmatch(r'admission_refused:[a-z_]{1,64}', code) else 'unknown')) from None
+    data = json.loads(result.stdout)
+    seconds = data['timeout_seconds']
+    require(type(seconds) is int and required <= seconds <= cap and data['phase'] == phase,
+            'invalid budget admission')
+    print('Budget admission: ' + json.dumps(dict(phase=phase, cap=cap, granted=seconds,
+                                                 job_id=data['job_id']), sort_keys=True), flush=True)
+    return seconds
+
+
+def phase_budget(repo, temp, slot, head, cap, downstream, minimum):
+    # Reserve every later active phase's minimum before granting this one.
+    remaining = budget_seconds(repo, temp, slot, head, 'active', 21600, downstream + minimum)
+    return min(cap, remaining - downstream)
+
+
 def main():
+    if sys.argv[1:] == ['--deb-cache-key']:
+        return deb_cache_key()  # Unprivileged; prints an advisory cache key only.
     require(os.geteuid() == 0, 'root required')
     require(os.environ.get('GITHUB_ACTIONS') == 'true' and
             os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted', 'hosted CI only')
@@ -535,6 +854,9 @@ def main():
         'backup-live-binaries', 'sRGB2014.icc', 'orientation-6.jpg')]
     for path in binds:
         canonical(str(path))
+    # Insufficient job budget fails here, before any owned root resource exists.
+    phase_budget(repo, temp, slot, head, BOOTSTRAP_CAP, BOOT_CAP + GUEST_SETUP_RESERVE + TEST_REQUIRED,
+                 BOOTSTRAP_REQUIRED)
     receipt_dir = temp / ('.nmcp-root-isolated-' + slot)
     receipt_dir.mkdir(mode=0o700)  # Exclusive: never reuse an earlier lifecycle.
     private_directory(receipt_dir)
@@ -566,11 +888,19 @@ def main():
     try:
         # debootstrap runs only against this new root. Its standard policy-rc.d
         # prevents package maintainer scripts starting services on the host.
+        cache = import_deb_cache(temp / 'debootstrap-deb-cache', work)
+        print('Deb cache input: ' + json.dumps(cache, sort_keys=True), flush=True)
+        bootstrap_timeout = phase_budget(repo, temp, slot, head, BOOTSTRAP_CAP,
+                                         BOOT_CAP + GUEST_SETUP_RESERVE + TEST_REQUIRED, BOOTSTRAP_REQUIRED)
         with (work / 'provision.log').open('w') as log:
-            run_bootstrap(['/usr/sbin/debootstrap', '--variant=minbase', '--components=main,universe',
-                 '--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg',
-                 '--include=' + PACKAGES, 'noble', str(root), 'https://archive.ubuntu.com/ubuntu'],
-                bootstrap_environment(work), log)
+            observed_bootstrap(['/usr/sbin/debootstrap', '--variant=minbase', '--components=' + COMPONENTS,
+                 '--keyring=' + KEYRING, '--cache-dir=' + str(work / 'deb-cache'),
+                 '--include=' + PACKAGES, SUITE, str(root), MIRROR],
+                bootstrap_environment(work), log, work,
+                dict(head=head, run=os.environ.get('GITHUB_RUN_ID', ''),
+                     attempt=os.environ.get('GITHUB_RUN_ATTEMPT', ''), slot=slot), bootstrap_timeout)
+        if cache['status'] == 'miss':  # Same path as restore; a hit is never rewritten.
+            print('Deb cache output files: ' + str(export_deb_cache(work, temp)), flush=True)
         require(not any(root.glob('usr/lib/systemd/system/postgresql*')), 'unexpected PG vendor units')
         require(not (root / 'etc/postgresql-common').exists(), 'postgresql-common must not be installed')
         prepare_guest_config_dirs(root)
@@ -593,7 +923,8 @@ def main():
             proc = sp.Popen(boot, env=HOST_ENV, stdout=log, stderr=sp.STDOUT)
         record.update(launcher=proc.pid, launcher_start=process_identity(proc.pid))
         save_receipt(receipt, record)
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + phase_budget(repo, temp, slot, head, BOOT_CAP,
+                                                   GUEST_SETUP_RESERVE + TEST_REQUIRED, 30)
         while time.monotonic() < deadline:
             require(proc.poll() is None, 'private systemd boot exited; see boot.log')
             try:
@@ -657,8 +988,9 @@ for tool in ('postgres','initdb','pg_ctl','pg_dump','pg_restore','psql'):
         guest(['/usr/bin/python3', '-c', preflight])
         # ldd is diagnostic plus a strict missing-library guard on the exact
         # received executables. Runtime tests remain the authoritative oracle.
-        executables = [binary, pg / 'bin/postgres', pg / 'bin/pg_dump',
-                       Path(env['TEST_BACKUP_NATIVE_PREFIX']) / 'bin/nmcp-video-helper']
+        executables = [binary, pg / 'bin/postgres', pg / 'bin/pg_dump']
+        executables += [Path(env['TEST_BACKUP_NATIVE_PREFIX']) / 'bin' / name
+                        for name in ('nmcp-video-helper', 'ffmpeg', 'ffprobe')]
         executables += [Path(env[k]) for k in ('TEST_BACKUP_STILL_HELPER', 'TEST_BACKUP_ANIMATION_HELPER',
                                                'TEST_BACKUP_CORE_API', 'TEST_BACKUP_CORE_WORKER', 'TEST_BACKUP_ADMIN_BINARY')]
         guest(['/usr/bin/python3', '-c', r'''
@@ -673,13 +1005,16 @@ for p in sys.argv[1:]:
         record['test_units'] = [test_unit(record, kind) for kind in ('timeout', 'cancel', 'actual')]
         save_receipt(receipt, record)  # Durable BEFORE any test service can start.
         prove_client_interrupts(record)
+        # Client bound >= go -test.timeout=18m (+30s) so Go's own timeout fires first.
+        test_timeout = phase_budget(repo, temp, slot, head, TEST_CAP, 0, TEST_REQUIRED)
         run(owned_test_command(record, 'actual',
-            [key + '=' + value for key, value in env.items()] + sys.argv[1:]), timeout=1200)
+            [key + '=' + value for key, value in env.items()] + sys.argv[1:]), timeout=test_timeout)
         result = 0
     except Exception as exc:
         print('FAIL isolated fixture: ' + str(exc), file=sys.stderr, flush=True)
         try:
-            emit_fixture_diagnostics(work, root)
+            if not isinstance(exc, BootstrapFailure):
+                emit_fixture_diagnostics(work, root)
         except Exception as diagnostic_error:
             print('FAIL safe diagnostic capture: ' + str(diagnostic_error), file=sys.stderr, flush=True)
     finally:

@@ -136,7 +136,12 @@ Cutover reads typed effective systemd properties, including all execution hooks
 and flags, runtime mode/lifetime, credential providers, environment precedence,
 capabilities and namespace remaps. It rejects pending daemon reloads and
 unreviewed drop-ins, rechecks before stopping units, and never auto-reloads to
-conceal a configuration change. The sole optional fixture drop-in exposes only
+conceal a configuration change. The production `10-postgresql.conf` dependency
+is mandatory: both backup and migrate files must exactly name the authority-bound
+PG17 unit, and effective `Requires`/`After` must agree. Online authority comes
+from the authenticated source HBA path; offline authority is stage-specific
+(source before switch, candidate only after validated reload). The optional
+fixture drop-in is additional, never a substitute for this dependency, and exposes only
 the two authenticated `/opt/nmcp-native-ci` and `/opt/nmcp-pg17-ci` prefixes as
 same-path recursive read-only binds; exact root-owned file bytes and effective
 bind tuples must agree. Privileged concurrent edits remain an operator
@@ -148,7 +153,21 @@ coordination boundary. Environment files cannot override credential routes.
 `sudo scripts/validate-backup-install --installed` performs **read-only local**
 metadata/configuration and client-version checks. It never installs anything,
 contacts a DB, enables units, or performs remote operations. It cannot prove
-role ACLs, HBA, served-mount exclusion, effective systemd state or restore.
+role ACLs, HBA, served-mount exclusion, full effective execution state or restore.
+It checks loaded identity/drop-in metadata and prospective disk configuration
+across the manager's actual `UnitPath`, including type-wide and dash-prefix
+drop-ins. Alias coverage deliberately overincludes every top-level service/timer
+symlink name: unrelated alias drop-ins may therefore be rejected. Empty, masked,
+symlinked and unreviewed drop-in entries fail closed. Only the exact root-safe
+production dependency matching the trusted migrate dependency is accepted.
+
+The pre-reload gate permits pending reviewed file updates; it is not proof that
+currently loaded execution settings match disk. The installer retains its HBA
+source-binding gate, explicitly reloads, then repeats metadata validation with
+`--fresh-manager` before starting or enabling anything. Metadata property reads
+may lazily load definitions, but never activate units. Future generator output
+and concurrent privileged edits cannot be predicted by a pre-reload snapshot;
+the post-reload gate and stable trusted-root/manager coordination are required.
 
 After separate deployment approval, inspect `systemd-analyze verify`, effective
 unit properties/drop-ins, actual database connectivity and the Nginx mount
