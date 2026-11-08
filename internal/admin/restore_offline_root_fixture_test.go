@@ -158,6 +158,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	// Real API and worker must be running on source *before* Restore; actual
 	// unit files retain production sandboxing and fixed executable paths.
 	f.run("/usr/bin/systemctl", "daemon-reload")
+	logBackupUnitReadStability(t, ctx)
 	if err := validateLoadedBackupUnit(ctx, offlineSourcePGUnit); err != nil {
 		t.Fatalf("actual offline production-shaped backup unit contract: %v", err)
 	}

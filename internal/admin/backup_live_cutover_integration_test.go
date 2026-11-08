@@ -27,6 +27,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -576,6 +577,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	// Real API and worker must be running on source *before* Restore; actual
 	// unit files retain production sandboxing and fixed executable paths.
 	f.run("/usr/bin/systemctl", "daemon-reload")
+	logBackupUnitReadStability(t, ctx)
 	if err := validateLoadedBackupUnit(ctx, liveSourcePGUnit); err != nil {
 		t.Fatalf("actual effective backup unit contract: %v", err)
 	}
@@ -1313,4 +1315,42 @@ func liveUploadAfterResume(t *testing.T, ctx context.Context, cycles ...int) {
 		t.Fatal(e)
 	}
 	livePostMedia(t, ctx, b.Bytes(), fmt.Sprintf("live-resumed-%d.png", cycle), fmt.Sprintf("live-cutover-explicit-resume-%d", cycle))
+}
+
+// logBackupUnitReadStability records real-manager evidence for the set-based
+// identity comparison: which properties changed raw order and which changed
+// membership across spaced reads. It logs property names only and asserts nothing.
+func logBackupUnitReadStability(t *testing.T, ctx context.Context) {
+	t.Helper()
+	first, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
+	if err != nil {
+		t.Logf("backup unit read stability: first read unavailable: %v", err)
+		return
+	}
+	order, membership := map[string]bool{}, map[string]bool{}
+	for i := 0; i < 8; i++ {
+		time.Sleep(150 * time.Millisecond)
+		next, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
+		if err != nil {
+			t.Logf("backup unit read stability: read %d unavailable: %v", i+2, err)
+			return
+		}
+		for name := range first {
+			if !bytes.Equal(first[name], next[name]) {
+				order[name] = true
+			}
+		}
+		for _, name := range backupUnitIdentityDrift(first, next) {
+			membership[name] = true
+		}
+	}
+	names := func(set map[string]bool) []string {
+		out := []string{}
+		for name := range set {
+			out = append(out, name)
+		}
+		sort.Strings(out)
+		return out
+	}
+	t.Logf("backup unit read stability across 9 reads: raw_changed=%v membership_changed=%v", names(order), names(membership))
 }

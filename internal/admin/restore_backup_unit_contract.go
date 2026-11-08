@@ -4,6 +4,7 @@ package admin
 // typed effective properties. Fixed LoadCredential sources authenticate
 // administrative provenance; install itself does not authenticate its source.
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -149,10 +151,79 @@ func backupUnitDependencyContract(pgUnit string) (map[string]backupUnitEdges, er
 	c["TriggeredBy"] = backupUnitEdges{nil, []string{"nmcp-backup.timer"}}
 	return c, nil
 }
-func backupUnitEdgeSet(raw json.RawMessage, e backupUnitEdges) (map[string]bool, bool) {
+
+// backupUnitDiagnosticName keeps operator/test diagnostics to systemd unit-name
+// characters; these lists carry unit names only, never settings or credentials.
+func backupUnitDiagnosticName(name string) string {
+	if name == "" || len(name) > 128 {
+		return "<invalid>"
+	}
+	for _, c := range name {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune(`:_.@\-`, c)) {
+			return "<invalid>"
+		}
+	}
+	return name
+}
+
+// backupUnitGuardError labels a fixed guard step. Callers on the cutover path
+// still discard it and report only errCutover.
+func backupUnitGuardError(step string) error {
+	return fmt.Errorf("backup unit %s: %w", step, errCutover)
+}
+
+// The D-Bus lists below are unordered sets: dbus-unit.c emits them by iterating
+// a hashmap keyed by Unit pointer, and an unreferenced inactive unit may be
+// collected and reloaded between two reads. Compare membership, exactly.
+func backupUnitIsSetProperty(name string) bool {
+	if name == "RequiresMountsFor" {
+		return true
+	}
+	for _, edge := range backupUnitEdgeProperties {
+		if edge == name {
+			return true
+		}
+	}
+	return false
+}
+func backupUnitPropertyStable(name string, a, b json.RawMessage) bool {
+	if !backupUnitIsSetProperty(name) {
+		return bytes.Equal(a, b)
+	}
+	var x, y []string
+	if !backupUnitArray(a, &x) || !backupUnitArray(b, &y) {
+		return false
+	}
+	sort.Strings(x)
+	sort.Strings(y)
+	return reflect.DeepEqual(x, y)
+}
+
+// backupUnitIdentityDrift returns the sorted names of properties whose value
+// changed. Every other property, and every set's membership, remains exact.
+func backupUnitIdentityDrift(before, after map[string]json.RawMessage) []string {
+	names := map[string]bool{}
+	for name := range before {
+		names[name] = true
+	}
+	for name := range after {
+		names[name] = true
+	}
+	var drift []string
+	for name := range names {
+		a, okA := before[name]
+		b, okB := after[name]
+		if !okA || !okB || !backupUnitPropertyStable(name, a, b) {
+			drift = append(drift, name)
+		}
+	}
+	sort.Strings(drift)
+	return drift
+}
+func backupUnitEdgeSet(raw json.RawMessage, e backupUnitEdges) (map[string]bool, string) {
 	var got []string
 	if !backupUnitArray(raw, &got) {
-		return nil, false
+		return nil, "malformed list"
 	}
 	allowed := map[string]bool{}
 	for _, s := range e.optional {
@@ -163,17 +234,22 @@ func backupUnitEdgeSet(raw json.RawMessage, e backupUnitEdges) (map[string]bool,
 	}
 	seen := map[string]bool{}
 	for _, s := range got {
-		if s == "" || seen[s] || !allowed[s] {
-			return nil, false
+		switch {
+		case s == "":
+			return nil, "empty name"
+		case seen[s]:
+			return nil, "duplicate " + backupUnitDiagnosticName(s)
+		case !allowed[s]:
+			return nil, "unexpected " + backupUnitDiagnosticName(s)
 		}
 		seen[s] = true
 	}
 	for _, s := range e.required {
 		if !seen[s] {
-			return nil, false
+			return nil, "missing " + backupUnitDiagnosticName(s)
 		}
 	}
-	return seen, true
+	return seen, ""
 }
 
 // validateBackupUnitDependencies is the backup-only effective edge contract.
@@ -186,9 +262,9 @@ func validateBackupUnitDependencies(p map[string]json.RawMessage, pgUnit string)
 	}
 	sets := map[string]map[string]bool{}
 	for _, name := range backupUnitEdgeProperties {
-		set, ok := backupUnitEdgeSet(p[name], contract[name])
-		if !ok {
-			return bad(name)
+		set, reason := backupUnitEdgeSet(p[name], contract[name])
+		if reason != "" {
+			return bad(name + " (" + reason + ")")
 		}
 		sets[name] = set
 	}
@@ -408,7 +484,7 @@ func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) err
 	}
 	artifactBind, err := backupUnitDropins(before["DropInPaths"])
 	if err != nil {
-		return errCutover
+		return backupUnitGuardError("drop-in set")
 	}
 	if err = validateBackupUnitDependencies(before, expectedPGUnit); err != nil {
 		return err
@@ -417,7 +493,7 @@ func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) err
 	for _, path := range []string{backupUnitFragment, backupPGDependencyDropin, migratePGDependencyDropin} {
 		file, err := safeCutoverFile(path, false, true)
 		if err != nil {
-			return err
+			return backupUnitGuardError("file metadata " + filepath.Base(filepath.Dir(path)) + "/" + filepath.Base(path))
 		}
 		snapshots = append(snapshots, file)
 	}
@@ -425,12 +501,15 @@ func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) err
 		return err
 	}
 	if validateBackupPGDependencyBodies(snapshots[1].before, snapshots[2].before, expectedPGUnit) != nil {
-		return errCutover
+		return backupUnitGuardError("PostgreSQL dependency body")
 	}
 	if artifactBind {
 		file, err := safeCutoverFile(backupArtifactDropin, false, true)
-		if err != nil || string(file.before) != backupArtifactDropinBody {
-			return errCutover
+		if err != nil {
+			return backupUnitGuardError("artifact drop-in metadata")
+		}
+		if string(file.before) != backupArtifactDropinBody {
+			return backupUnitGuardError("artifact drop-in body")
 		}
 		snapshots = append(snapshots, file)
 	}
@@ -445,13 +524,13 @@ func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) err
 	if err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(before, after) {
-		return errCutover
+	if drift := backupUnitIdentityDrift(before, after); len(drift) != 0 {
+		return backupUnitGuardError("identity changed during validation: " + strings.Join(drift, ","))
 	}
 	for _, file := range snapshots {
 		again, err := safeCutoverFile(file.path, false, true)
 		if err != nil || !sameBackupUnitFile(file, again) {
-			return errCutover
+			return backupUnitGuardError("file changed during validation " + filepath.Base(file.path))
 		}
 	}
 	return nil

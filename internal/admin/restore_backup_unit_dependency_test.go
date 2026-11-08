@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -310,5 +311,76 @@ func TestBackupUnitDependencyContractMatchesCanonicalFragment(t *testing.T) {
 		if _, ok := service[key]; ok {
 			t.Fatalf("fragment declares %s; re-derive implicit dependencies", key)
 		}
+	}
+}
+
+func TestBackupUnitIdentityDriftComparesSetsByMembershipOnly(t *testing.T) {
+	base := map[string]json.RawMessage{
+		"After":             json.RawMessage(`["a.service","b.service","c.mount"]`),
+		"RequiresMountsFor": json.RawMessage(`["/var/tmp","/run/nmcp-backup"]`),
+		"DropInPaths":       json.RawMessage(`["/x/10.conf","/x/artifact.conf"]`),
+		"FragmentPath":      json.RawMessage(`"/etc/systemd/system/nmcp-backup.service"`),
+	}
+	clone := func() map[string]json.RawMessage {
+		out := map[string]json.RawMessage{}
+		for k, v := range base {
+			out[k] = v
+		}
+		return out
+	}
+	// The manager reordered both sets after collecting and reloading the unit.
+	reordered := clone()
+	reordered["After"] = json.RawMessage(`["c.mount","a.service","b.service"]`)
+	reordered["RequiresMountsFor"] = json.RawMessage(`["/run/nmcp-backup","/var/tmp"]`)
+	if drift := backupUnitIdentityDrift(base, reordered); len(drift) != 0 {
+		t.Fatalf("reordered unordered sets reported as drift: %v", drift)
+	}
+	for _, c := range []struct {
+		name, value string
+	}{
+		{"After", `["a.service","b.service"]`},                       // removed member
+		{"After", `["a.service","b.service","c.mount","d.service"]`}, // added member
+		{"After", `["a.service","b.service","c.mount","c.mount"]`},   // duplicate is not a set match
+		{"After", `"a.service"`},                                     // wrong shape never matches
+		{"RequiresMountsFor", `["/var/tmp","/other"]`},               // replaced member
+		{"DropInPaths", `["/x/artifact.conf","/x/10.conf"]`},         // not a set property: order is exact
+		{"FragmentPath", `"/etc/systemd/system/other.service"`},
+	} {
+		changed := clone()
+		changed[c.name] = json.RawMessage(c.value)
+		if drift := backupUnitIdentityDrift(base, changed); !reflect.DeepEqual(drift, []string{c.name}) {
+			t.Fatalf("%s=%s drift = %v", c.name, c.value, drift)
+		}
+	}
+	missing := clone()
+	delete(missing, "After")
+	if drift := backupUnitIdentityDrift(base, missing); !reflect.DeepEqual(drift, []string{"After"}) {
+		t.Fatalf("missing property drift = %v", drift)
+	}
+	if !backupUnitIsSetProperty("TriggeredBy") || backupUnitIsSetProperty("Conditions") || backupUnitIsSetProperty("DropInPaths") {
+		t.Fatal("set-property classification")
+	}
+}
+
+func TestBackupUnitDependencyDiagnosticNamesRejection(t *testing.T) {
+	p := backupDependencyFixture(t, nil, false)
+	inject := backupDependencyWith(t, p, "Wants", `evil\x2dunit.service`)
+	err := validateBackupUnitDependencies(inject, backupDependencyTestPG)
+	if !errors.Is(err, errCutover) || !strings.Contains(err.Error(), `backup unit Wants (unexpected evil\x2dunit.service) contract`) {
+		t.Fatalf("diagnostic = %v", err)
+	}
+	secret := backupDependencyWith(t, p, "Wants", "password=CANARY-secret value")
+	err = validateBackupUnitDependencies(secret, backupDependencyTestPG)
+	if !errors.Is(err, errCutover) || strings.Contains(err.Error(), "CANARY") || !strings.Contains(err.Error(), "<invalid>") {
+		t.Fatalf("unsanitized diagnostic = %v", err)
+	}
+	missing := map[string]json.RawMessage{}
+	for k, v := range p {
+		missing[k] = v
+	}
+	missing["Conflicts"] = json.RawMessage(`[]`)
+	err = validateBackupUnitDependencies(missing, backupDependencyTestPG)
+	if !errors.Is(err, errCutover) || !strings.Contains(err.Error(), "missing shutdown.target") {
+		t.Fatalf("missing diagnostic = %v", err)
 	}
 }
