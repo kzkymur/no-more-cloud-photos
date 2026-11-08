@@ -58,17 +58,17 @@ class Isolation(unittest.TestCase):
     def test_diagnostics_are_bounded_and_missing_is_safe(self):
         with patch.object(MODULE.os, 'open', side_effect=FileNotFoundError) as opened:
             MODULE.emit_fixture_diagnostics(pathlib.Path('/owned'), pathlib.Path('/owned/rootfs'))
-            self.assertEqual(opened.call_count,3)
+            self.assertEqual(opened.call_count,1)
             self.assertTrue(all(c.args[1] & MODULE.os.O_NOFOLLOW for c in opened.call_args_list))
         st=types.SimpleNamespace(st_mode=MODULE.stat.S_IFREG,st_uid=0,st_nlink=1,st_size=999999)
         with patch.object(MODULE.os,'open',return_value=20), patch.object(MODULE.os,'fstat',return_value=st), \
                 patch.object(MODULE.os,'lseek') as seek, patch.object(MODULE.os,'read',return_value=b'diagnostic') as read, \
                 patch.object(MODULE.os,'close') as close, patch('builtins.print'):
             MODULE.emit_fixture_diagnostics(pathlib.Path('/owned'),pathlib.Path('/owned/rootfs'))
-            self.assertEqual(read.call_count,3)
+            self.assertEqual(read.call_count,1)
             self.assertTrue(all(c.args==(20,65536) for c in read.call_args_list))
             seek.assert_called_with(20,999999-65536,MODULE.os.SEEK_SET)
-            self.assertEqual(close.call_count,3)
+            self.assertEqual(close.call_count,1)
         for uid,mode,links in ((1000,MODULE.stat.S_IFREG,1),(0,MODULE.stat.S_IFIFO,1),(0,MODULE.stat.S_IFREG,2)):
             st=types.SimpleNamespace(st_mode=mode,st_uid=uid,st_nlink=links,st_size=1)
             with patch.object(MODULE.os,'open',return_value=20),patch.object(MODULE.os,'fstat',return_value=st), \
@@ -77,12 +77,148 @@ class Isolation(unittest.TestCase):
                     MODULE.emit_fixture_diagnostics(pathlib.Path('/owned'),pathlib.Path('/owned/rootfs'))
                 read.assert_not_called()
 
-    def test_noble_concrete_virtual_dependency_providers(self):
+    def test_bootstrap_closed_enums(self):
+        phases = [('I: Retrieving package', 'download'), ('I: Validating package', 'validate'),
+                  ('I: Extracting package', 'extract'), ('I: Unpacking package', 'unpack'),
+                  ('I: Configuring package', 'configure'), ('not progress', 'unknown')]
+        errors = [('Temporary failure in name resolution', 'DNS'),
+                  ('Connection refused', 'connect'), ('certificate verification failed', 'TLS'),
+                  ('ERROR 503: unavailable', 'HTTP'), ('dpkg: error processing package', 'dpkg'),
+                  ('No space left on device', 'disk'), ('unclassified failure', 'unknown')]
+        for line, expected in phases:
+            self.assertEqual(MODULE.bootstrap_log_enums(line)[0], expected)
+        for line, expected in errors:
+            self.assertEqual(MODULE.bootstrap_log_enums(line)[1], expected)
+        self.assertEqual(MODULE.bootstrap_log_enums('I: Retrieving first\nI: Configuring last')[0], 'configure')
+
+    def test_bootstrap_summary_success_failure_same_identity_no_reflection(self):
+        secret = 'SENSITIVE-https://user:password@mirror.invalid/file?token=secret'
+        identity = dict(head='a'*40, run='12345', attempt='2', slot='offline')
+        for failure, expected in [(None, 'unknown'), (MODULE.sp.TimeoutExpired([secret],900), 'timeout'),
+                                  (MODULE.sp.CalledProcessError(1,[secret]), 'DNS'),
+                                  (RuntimeError(secret), 'DNS')]:
+            with self.subTest(expected=expected), \
+                    patch.object(MODULE, 'run_bootstrap', side_effect=failure) as run, \
+                    patch.object(MODULE, 'bootstrap_log_tail', return_value=
+                        'I: Unpacking '+secret+'\nTemporary failure in name resolution '+secret), \
+                    patch.object(MODULE.time, 'monotonic', side_effect=[10.1, 914.9]), \
+                    patch('builtins.print') as printed:
+                if failure is None:
+                    MODULE.observed_bootstrap([secret], {'SECRET':secret}, None, pathlib.Path('/private'), identity, 520)
+                else:
+                    with self.assertRaises(MODULE.BootstrapFailure) as raised:
+                        MODULE.observed_bootstrap([secret], {'SECRET':secret}, None, pathlib.Path('/private'), identity, 520)
+                    self.assertNotIn(secret,str(raised.exception))
+                run.assert_called_once_with([secret], {'SECRET':secret}, None, timeout=520)
+                printed.assert_called_once()
+                output = printed.call_args.args[0]
+                self.assertNotIn(secret,output)
+                summary = MODULE.json.loads(output.removeprefix('Bootstrap diagnostic: '))
+                self.assertEqual(set(summary), set(identity)|{'phase','error_class','result',
+                    'elapsed_seconds','last_progress_age','capture'})
+                for key,value in identity.items(): self.assertEqual(summary[key],value)
+                self.assertEqual(summary['phase'],'unpack')
+                self.assertEqual(summary['error_class'],expected)
+                self.assertEqual(summary['elapsed_seconds'],904)
+                self.assertEqual(summary['last_progress_age'],'unknown')
+                self.assertEqual(summary['result'],'success' if failure is None else 'failure')
+
+    def test_bootstrap_capture_failure_no_reflection_or_success_authority_change(self):
+        identity = dict(head='a'*40,run='1',attempt='1',slot='live')
+        with patch.object(MODULE, 'run_bootstrap'), \
+                patch.object(MODULE,'bootstrap_log_tail',side_effect=OSError('SECRET unsafe path')), \
+                patch('builtins.print') as printed:
+            MODULE.observed_bootstrap([],{},None,pathlib.Path('/private'),identity,520)
+            value=printed.call_args.args[0]
+            self.assertNotIn('SECRET',value)
+            summary=MODULE.json.loads(value.removeprefix('Bootstrap diagnostic: '))
+            self.assertEqual(summary['capture'],'unavailable')
+            self.assertEqual(summary['phase'],'unknown')
+            self.assertEqual(summary['result'],'success')
+        for key in ('head','run','attempt','slot'):
+            bad=dict(identity);bad[key]='SECRET'
+            with patch.object(MODULE,'run_bootstrap') as run,patch('builtins.print') as printed:
+                with self.assertRaisesRegex(RuntimeError,'invalid bootstrap diagnostic identity'):
+                    MODULE.observed_bootstrap([],{},None,pathlib.Path('/private'),bad,520)
+                run.assert_not_called();printed.assert_not_called()
+
+    def test_bootstrap_safe_log_tail_fd_ancestry_and_bound(self):
+        directory=types.SimpleNamespace(st_mode=MODULE.stat.S_IFDIR|0o700,st_uid=0)
+        leaf=types.SimpleNamespace(st_mode=MODULE.stat.S_IFREG|0o644,st_uid=0,st_nlink=1,st_size=999999)
+        with patch.object(MODULE,'private_directory') as private, \
+                patch.object(MODULE.os,'open',side_effect=[10,11,12,13]) as opened, \
+                patch.object(MODULE.os,'fstat',side_effect=[directory,directory,directory,leaf]), \
+                patch.object(MODULE.os,'lseek') as seek, \
+                patch.object(MODULE.os,'read',return_value=b'partial\nI: Extracting safe\n') as read, \
+                patch.object(MODULE.os,'close') as close:
+            text=MODULE.bootstrap_log_tail(pathlib.Path('/private'),'rootfs/debootstrap/debootstrap.log')
+            self.assertEqual(text,'I: Extracting safe\n')
+            private.assert_called_once_with(pathlib.Path('/private'))
+            self.assertTrue(all(c.args[1]&MODULE.os.O_NOFOLLOW for c in opened.call_args_list))
+            self.assertEqual([c.kwargs.get('dir_fd') for c in opened.call_args_list],[None,10,11,12])
+            read.assert_called_once_with(13,65536)
+            seek.assert_called_once_with(13,999999-65536,MODULE.os.SEEK_SET)
+            self.assertEqual([c.args[0] for c in close.call_args_list],[13,12,11,10])
+        with patch.object(MODULE.os,'open') as opened:
+            with self.assertRaises(RuntimeError):
+                MODULE.bootstrap_log_tail(pathlib.Path('/private'),'../secret')
+            opened.assert_not_called()
+
+    def test_bootstrap_safe_log_rejects_metadata_before_read(self):
+        directory=types.SimpleNamespace(st_mode=MODULE.stat.S_IFDIR|0o700,st_uid=0)
+        for uid, mode, links in [(1000,MODULE.stat.S_IFREG|0o600,1),
+                                  (0,MODULE.stat.S_IFIFO|0o600,1),
+                                  (0,MODULE.stat.S_IFREG|0o666,1),
+                                  (0,MODULE.stat.S_IFREG|0o600,2)]:
+            leaf=types.SimpleNamespace(st_mode=mode,st_uid=uid,st_nlink=links,st_size=20)
+            with patch.object(MODULE,'private_directory'), \
+                    patch.object(MODULE.os,'open',side_effect=[10,11]), \
+                    patch.object(MODULE.os,'fstat',side_effect=[directory,leaf]), \
+                    patch.object(MODULE.os,'read') as read,patch.object(MODULE.os,'close') as close:
+                with self.assertRaises(RuntimeError):
+                    MODULE.bootstrap_log_tail(pathlib.Path('/private'),'provision.log')
+                read.assert_not_called()
+                self.assertEqual(close.call_count,2)
+
+    def test_bootstrap_log_missing_or_symlink_parent_never_reads(self):
+        directory=types.SimpleNamespace(st_mode=MODULE.stat.S_IFDIR|0o700,st_uid=0)
+        for error in (FileNotFoundError('missing private log'), OSError('symlink parent')):
+            with patch.object(MODULE,'private_directory'), \
+                    patch.object(MODULE.os,'open',side_effect=[10,error]), \
+                    patch.object(MODULE.os,'fstat',return_value=directory), \
+                    patch.object(MODULE.os,'read') as read,patch.object(MODULE.os,'close') as close:
+                with self.assertRaises(OSError):
+                    MODULE.bootstrap_log_tail(pathlib.Path('/private'),'rootfs/debootstrap/debootstrap.log')
+                read.assert_not_called();close.assert_called_once_with(10)
+
+    def test_bootstrap_raw_log_and_exception_fallback_removed(self):
+        diagnostic=SOURCE[SOURCE.index('def emit_fixture_diagnostics'):SOURCE.index('class BootstrapFailure')]
+        self.assertNotIn("work / 'provision.log'",diagnostic)
+        self.assertNotIn("root / 'debootstrap/debootstrap.log'",diagnostic)
+        self.assertIn('if not isinstance(exc, BootstrapFailure):',SOURCE)
+        bootstrap=SOURCE[SOURCE.index('def run_bootstrap'):SOURCE.index('def machine_scope')]
+        self.assertNotIn('str(cleanup_error)',bootstrap)
+        self.assertNotIn('str(restore_error)',bootstrap)
+        self.assertIn('raise sp.TimeoutExpired(argv, timeout)',SOURCE)
+        self.assertEqual(MODULE.KEYRING,'/usr/share/keyrings/ubuntu-archive-keyring.gpg')
+        self.assertIn("'--keyring=' + KEYRING",SOURCE)
+
+    def test_guest_closure_is_runtime_only(self):
         packages=MODULE.PACKAGES.split(',')
-        for actual in ('libpgm-5.3-0t64','libcdio19t64'):
-            self.assertEqual(packages.count(actual),1)
-        self.assertNotIn('libpgm-5.3-0',packages)
-        self.assertNotIn('libcdio19',packages)
+        self.assertEqual(len(packages),len(set(packages)))
+        # Never executed in the guest; their closures dominated bootstrap bytes.
+        for dropped in ('ffmpeg','libglib2.0-dev','libjpeg-turbo8-dev','libpng-dev','libwebp-dev',
+                        'libexif-dev','libde265-dev','libpgm-5.3-0t64','libcdio19t64','libpgm-5.3-0','libcdio19'):
+            self.assertNotIn(dropped,packages)
+        self.assertFalse([p for p in packages if p.endswith('-dev')])
+        # Exactly the shared objects resolved by guest ldd of the bound artifacts.
+        for runtime in ('libglib2.0-0t64','libjpeg-turbo8','libpng16-16t64','libwebp7','libwebpmux3',
+                        'libwebpdemux2','libsharpyuv0','libexif12','libde265-0','libexpat1','libffi8',
+                        'libimage-exiftool-perl','util-linux','python3','systemd-sysv','dbus'):
+            self.assertEqual(packages.count(runtime),1)
+        ldd=SOURCE[SOURCE.index('executables = [binary'):SOURCE.index("record['test_units']")]
+        for tool in ("'nmcp-video-helper'","'ffmpeg'","'ffprobe'","'not found' not in r.stdout"):
+            self.assertIn(tool,ldd)
         self.assertNotIn('force-depends',SOURCE)
         self.assertNotIn('--no-check-gpg',SOURCE)
 
@@ -190,7 +326,7 @@ class Isolation(unittest.TestCase):
                     patch.object(MODULE,'observe_bootstrap_exit',side_effect=timeout), \
                     patch.object(MODULE.os,'killpg') as kill,patch.object(MODULE,'reap_bootstrap_group'),patch('builtins.print'):
                 with self.assertRaises(MODULE.sp.TimeoutExpired) as raised:
-                    MODULE.run_bootstrap(['debootstrap'],{'WGETRC':'/private/wgetrc'},None)
+                    MODULE.run_bootstrap(['debootstrap'],{'WGETRC':'/private/wgetrc'},None,900)
                 self.assertIs(raised.exception,timeout)
                 self.assertTrue(popen.call_args.kwargs['start_new_session'])
                 if current==initial:
@@ -206,14 +342,14 @@ class Isolation(unittest.TestCase):
                 patch.object(MODULE,'bootstrap_identity',return_value=(MODULE.os.getpid(),99,99,'start')), \
                 patch.object(MODULE,'observe_bootstrap_exit',side_effect=ChildProcessError), \
                 patch.object(MODULE.os,'killpg') as kill,patch('builtins.print'):
-            with self.assertRaises(ChildProcessError): MODULE.run_bootstrap(['fake'],{},None)
+            with self.assertRaises(ChildProcessError): MODULE.run_bootstrap(['fake'],{},None,900)
             kill.assert_not_called()
             proc.wait.assert_not_called()
         with patch.object(MODULE.signal,'getsignal',return_value=MODULE.signal.SIG_IGN),patch.object(MODULE.sp,'Popen') as launch:
-            with self.assertRaises(RuntimeError): MODULE.run_bootstrap(['fake'],{},None)
+            with self.assertRaises(RuntimeError): MODULE.run_bootstrap(['fake'],{},None,900)
             launch.assert_not_called()
         with patch.object(MODULE.Path,'iterdir',return_value=iter([1,2])),patch.object(MODULE.sp,'Popen') as launch:
-            with self.assertRaises(RuntimeError): MODULE.run_bootstrap(['fake'],{},None)
+            with self.assertRaises(RuntimeError): MODULE.run_bootstrap(['fake'],{},None,900)
             launch.assert_not_called()
 
     def test_actual_exited_bootstrap_leader_retains_cleanup_authority(self):
@@ -284,10 +420,10 @@ else:
                         patch.object(MODULE,'observe_bootstrap_exit',return_value=0), \
                         patch.object(MODULE,'stop_bootstrap_group') as stop:
                     if handler==MODULE.signal.SIG_IGN:
-                        MODULE.run_bootstrap(['fake'],{},None)
+                        MODULE.run_bootstrap(['fake'],{},None,900)
                     else:
                         with self.assertRaisesRegex(RuntimeError,'interrupted during acquisition'):
-                            MODULE.run_bootstrap(['fake'],{},None)
+                            MODULE.run_bootstrap(['fake'],{},None,900)
                     stop.assert_called_once()
                 self.assertEqual(MODULE.signal.getsignal(MODULE.signal.SIGTERM),handler)
             finally:
@@ -301,7 +437,7 @@ else:
                 raise RuntimeError('install refused')
             return real_signal(sig,handler)
         with patch.object(MODULE.signal,'signal',side_effect=install),patch.object(MODULE.sp,'Popen') as launch:
-            with self.assertRaisesRegex(RuntimeError,'install refused'): MODULE.run_bootstrap(['fake'],{},None)
+            with self.assertRaisesRegex(RuntimeError,'install refused'): MODULE.run_bootstrap(['fake'],{},None,900)
             launch.assert_not_called()
         for sig,handler in saved.items(): self.assertEqual(MODULE.signal.getsignal(sig),handler)
 
@@ -319,7 +455,7 @@ else:
                     patch.object(MODULE,'observe_bootstrap_exit',return_value=0), \
                     patch.object(MODULE,'stop_bootstrap_group') as stop:
                 with self.assertRaisesRegex(RuntimeError,'interrupted during acquisition'):
-                    MODULE.run_bootstrap(['fake'],{},None)
+                    MODULE.run_bootstrap(['fake'],{},None,900)
                 stop.assert_called_once()
             self.assertEqual(MODULE.signal.getsignal(MODULE.signal.SIGTERM),MODULE.signal.SIG_DFL)
         finally:
@@ -608,8 +744,9 @@ sys.exit(1)
 
     def test_structural_isolation_and_receipt_contract(self):
         for required in ('--private-network', '--boot', '--settings=no', '--register=yes',
-                         ':norbind', '--bind-ro=', 'https://archive.ubuntu.com/ubuntu',
-                         '--keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg',
+                         ':norbind', '--bind-ro=', "MIRROR = 'https://archive.ubuntu.com/ubuntu'",
+                         "KEYRING = '/usr/share/keyrings/ubuntu-archive-keyring.gpg'",
+                         "'--cache-dir=' + str(work / 'deb-cache')",
                          'systemd-sysusers', '0o755', 'O_NOFOLLOW', '0o600', '0o700',
                          'os.fsync', 'root_inode', 'leader_start', 'launcher_start',
                          "('mnt', 'pid', 'net')", "record.get('stopped')"):
@@ -618,10 +755,214 @@ sys.exit(1)
                           "'--bind-ro=' + str(temp)"):
             self.assertNotIn(forbidden, SOURCE)
         self.assertNotIn('postgresql-common', MODULE.PACKAGES)
-        for package in ('libssl3t64', 'libreadline8t64', 'libimage-exiftool-perl',
-                        'libglib2.0-dev', 'libjpeg-turbo8-dev', 'libpng-dev', 'libwebp-dev',
-                        'libexif-dev', 'libde265-dev', 'ffmpeg'):
+        for package in ('libssl3t64', 'libreadline8t64', 'libimage-exiftool-perl'):
             self.assertIn(package, MODULE.PACKAGES.split(','))
+        for forbidden in ('allow-unauthenticated', 'AllowUnauthenticated', '--no-check-certificate',
+                          'unpack-tarball', 'timeout=900', 'timeout=1200'):
+            self.assertNotIn(forbidden, SOURCE)
+
+
+class DebCacheAndBudget(unittest.TestCase):
+    DEB = 'libc6_2.39-0ubuntu8_amd64.deb'
+
+    def make(self, entries, mode=0o755):
+        base = pathlib.Path(tempfile.mkdtemp())
+        src = base / 'debootstrap-deb-cache'
+        src.mkdir(mode=mode); src.chmod(mode)
+        for name, data in entries.items():
+            (src / name).write_bytes(data)
+        work = base / 'work'; work.mkdir(mode=0o700)
+        return base, src, work
+
+    def test_miss_creates_empty_private_cache(self):
+        base = pathlib.Path(tempfile.mkdtemp()); work = base / 'work'; work.mkdir(mode=0o700)
+        r = MODULE.import_deb_cache(base / 'debootstrap-deb-cache', work)
+        self.assertEqual(r['status'], 'miss')
+        self.assertEqual(list((work / 'deb-cache').iterdir()), [])
+        self.assertEqual((work / 'deb-cache').stat().st_mode & 0o777, 0o700)
+
+    def test_valid_restore_is_copied_not_linked_and_source_untouched(self):
+        base, src, work = self.make({self.DEB: b'x' * 10, 'apt_2.7.14build2_amd64.deb': b'y'})
+        r = MODULE.import_deb_cache(src, work)
+        self.assertEqual((r['status'], r['files'], r['bytes']), ('restored', 2, 11))
+        copy = work / 'deb-cache' / self.DEB
+        self.assertEqual(copy.read_bytes(), b'x' * 10)
+        self.assertNotEqual(copy.stat().st_ino, (src / self.DEB).stat().st_ino)
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(sorted(p.name for p in src.iterdir()), sorted([self.DEB, 'apt_2.7.14build2_amd64.deb']))
+        self.assertFalse((work / 'deb-cache-import').exists())
+
+    def test_any_shape_violation_rejects_whole_cache(self):
+        cases = {
+            'unexpected name': lambda src: (src / 'Packages').write_bytes(b'p'),
+            'path traversal name': lambda src: (src / '..deb').write_bytes(b'p'),
+            'symlink': lambda src: (src / 'evil_1_amd64.deb').symlink_to('/etc/shadow'),
+            'hardlink': lambda src: os.link(src / self.DEB, src / 'dup_1_all.deb'),
+            'empty file': lambda src: (src / 'empty_1_all.deb').write_bytes(b''),
+            'subdirectory': lambda src: (src / 'dir_1_all.deb').mkdir(),
+            'fifo': lambda src: os.mkfifo(src / 'fifo_1_all.deb'),
+        }
+        import os
+        for label, mutate in cases.items():
+            with self.subTest(label):
+                base, src, work = self.make({self.DEB: b'x'})
+                mutate(src)
+                with patch('builtins.print'):
+                    r = MODULE.import_deb_cache(src, work)
+                self.assertEqual(r['status'], 'rejected')
+                self.assertEqual(list((work / 'deb-cache').iterdir()), [])
+                self.assertEqual(list((work / 'deb-cache-import').iterdir()), [])
+                self.assertTrue((src / self.DEB).exists())
+
+    def test_writable_or_symlinked_cache_directory_rejected(self):
+        base, src, work = self.make({self.DEB: b'x'}, mode=0o777)
+        with patch('builtins.print'):
+            self.assertEqual(MODULE.import_deb_cache(src, work)['status'], 'rejected')
+        base, src, work = self.make({self.DEB: b'x'})
+        link = base / 'linked'; link.symlink_to(src)
+        with patch('builtins.print'):
+            self.assertEqual(MODULE.import_deb_cache(link, work)['status'], 'rejected')
+
+    def test_limits_reject(self):
+        base, src, work = self.make({self.DEB: b'x' * 8})
+        with patch.object(MODULE, 'DEB_MAX_FILE', 4), patch('builtins.print'):
+            self.assertEqual(MODULE.import_deb_cache(src, work)['status'], 'rejected')
+        base, src, work = self.make({'a_1_all.deb': b'x', 'b_1_all.deb': b'y'})
+        with patch.object(MODULE, 'DEB_MAX_FILES', 1), patch('builtins.print'):
+            self.assertEqual(MODULE.import_deb_cache(src, work)['status'], 'rejected')
+
+    def test_cached_bytes_are_verified_by_debootstrap_never_bypassed(self):
+        self.assertIn("'--cache-dir=' + str(work / 'deb-cache')", SOURCE)
+        for forbidden in ('--no-check-gpg', 'unpack-tarball', 'make-tarball', 'force-check-gpg=0',
+                          '--keep-debootstrap-dir', 'rootfs-cache', 'shutil.copytree'):
+            self.assertNotIn(forbidden, SOURCE)
+        main = SOURCE[SOURCE.index('def main():'):]
+        # Fresh rootfs every run: import precedes bootstrap into the new work dir.
+        self.assertLess(main.index('import_deb_cache('), main.index('observed_bootstrap('))
+        self.assertLess(main.index('observed_bootstrap('), main.index('export_deb_cache('))
+        self.assertIn("if cache['status'] == 'miss':", main)
+        self.assertIn('tempfile.mkdtemp(prefix=', main)
+
+    def test_export_only_regular_named_debs_owned_by_runner(self):
+        base = pathlib.Path(tempfile.mkdtemp()); work = base / 'work'; (work / 'deb-cache').mkdir(parents=True)
+        (work / 'deb-cache' / self.DEB).write_bytes(b'z')
+        (work / 'deb-cache' / 'partial').mkdir()
+        (work / 'deb-cache' / 'x_1_all.deb').symlink_to('/etc/passwd')
+        (work / 'deb-cache' / 'notes.txt').write_bytes(b'n')
+        self.assertEqual(MODULE.export_deb_cache(work, base), 1)
+        out = base / 'debootstrap-deb-cache'
+        self.assertEqual([p.name for p in out.iterdir()], [self.DEB])
+        self.assertEqual((out / self.DEB).stat().st_mode & 0o777, 0o644)
+        with self.assertRaises(FileExistsError):
+            MODULE.export_deb_cache(work, base)  # Never merges into existing content.
+
+    def test_release_indices_require_valid_signature_and_use_verified_plaintext(self):
+        d = pathlib.Path(tempfile.mkdtemp()); inrel = d / 'InRelease'; plain = d / 'Release'
+        good = 'a' * 64
+        body = ('Origin: Ubuntu\nSHA256:\n ' + good + ' 1 main/binary-amd64/Packages.xz\n '
+                + 'b' * 64 + ' 2 universe/binary-amd64/Packages.xz\n ' + 'c' * 64
+                + ' 3 main/binary-i386/Packages.xz\nMD5Sum:\n ' + 'd' * 32 + ' 1 main/binary-amd64/Packages\n')
+        def gpgv(argv, **kw):
+            self.assertEqual(argv[:3], ['/usr/bin/gpgv', '--keyring', MODULE.KEYRING])
+            pathlib.Path(argv[argv.index('--output') + 1]).write_text(body)
+            return types.SimpleNamespace(stdout='[GNUPG:] VALIDSIG F6EC 2024\n')
+        with patch.object(MODULE, 'run', side_effect=gpgv):
+            got = MODULE.verified_release_indices(inrel, plain)
+        self.assertEqual([f[2] for f in got], ['main/binary-amd64/Packages.xz', 'universe/binary-amd64/Packages.xz'])
+        self.assertEqual(got[0][0], good)
+        def bad(argv, **kw):
+            pathlib.Path(argv[argv.index('--output') + 1]).write_text(body)
+            return types.SimpleNamespace(stdout='[GNUPG:] BADSIG x\n')
+        with patch.object(MODULE, 'run', side_effect=bad), self.assertRaises(RuntimeError):
+            MODULE.verified_release_indices(inrel, plain)
+        def gpgv_fail(argv, **kw):
+            raise MODULE.sp.CalledProcessError(2, argv)
+        with patch.object(MODULE, 'run', side_effect=gpgv_fail), self.assertRaises(MODULE.sp.CalledProcessError):
+            MODULE.verified_release_indices(inrel, plain)
+
+    def budget_env(self):
+        return patch.dict(MODULE.os.environ, {'GITHUB_REPOSITORY': 'o/r', 'RUNNER_NAME': 'GitHub Actions 7',
+                                               'GITHUB_RUN_ID': '11', 'GITHUB_RUN_ATTEMPT': '1',
+                                               'BUDGET_RUN_SHA': 'b' * 40})
+
+    def test_budget_check_identity_policy_and_cap(self):
+        out = '{"deadline_mono": 9.0, "job_id": 5, "phase": "active", "timeout_seconds": 700}'
+        with self.budget_env(), patch.object(MODULE, 'run', return_value=types.SimpleNamespace(stdout=out)) as run, \
+                patch('builtins.print'):
+            self.assertEqual(MODULE.budget_seconds(pathlib.Path('/repo'), pathlib.Path('/t'), 'live', 'a' * 40,
+                                                   'active', 900, 300), 700)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:4], ['/usr/bin/python3', '-I', '/repo/scripts/backup-ci-admission', 'check'])
+        flags = dict(zip(argv[4::2], argv[5::2]))
+        self.assertEqual(flags['--job-name'], MODULE.JOB_NAMES['live'])
+        self.assertEqual(flags['--receipt'], '/t/.nmcp-budget-live.json')
+        self.assertEqual(flags['--job-seconds'], '2400')
+        self.assertEqual(flags['--cleanup-seconds'], '300')
+        self.assertEqual(flags['--sha'], 'b' * 40)  # Run head, not PR merge candidate.
+        with patch.dict(MODULE.os.environ, {'BUDGET_RUN_SHA': 'HEAD'}), self.assertRaises(RuntimeError):
+            MODULE.budget_seconds(pathlib.Path('/repo'), pathlib.Path('/t'), 'live', 'a' * 40, 'active', 900, 300)
+        self.assertNotIn('GITHUB_TOKEN', ' '.join(argv))
+        for bogus in ('{"job_id": 5, "phase": "active", "timeout_seconds": 901}',
+                      '{"job_id": 5, "phase": "active", "timeout_seconds": 10}',
+                      '{"job_id": 5, "phase": "cleanup", "timeout_seconds": 700}'):
+            with self.budget_env(), patch.object(MODULE, 'run', return_value=types.SimpleNamespace(stdout=bogus)), \
+                    self.assertRaises(RuntimeError):
+                MODULE.budget_seconds(pathlib.Path('/repo'), pathlib.Path('/t'), 'live', 'a' * 40, 'active', 900, 300)
+
+    def test_budget_refusal_is_closed_and_not_reflected(self):
+        for stderr, expected in (('admission_refused:insufficient_budget\n', 'admission_refused:insufficient_budget'),
+                                 ('SECRET token=abc', 'unknown')):
+            err = MODULE.sp.CalledProcessError(1, ['x'], stderr=stderr)
+            with self.budget_env(), patch.object(MODULE, 'run', side_effect=err), \
+                    self.assertRaises(RuntimeError) as raised:
+                MODULE.budget_seconds(pathlib.Path('/repo'), pathlib.Path('/t'), 'offline', 'a' * 40, 'active', 900, 300)
+            self.assertEqual(str(raised.exception), 'budget admission refused: ' + expected)
+
+    def test_phase_budget_reserves_all_downstream_phases(self):
+        with patch.object(MODULE, 'budget_seconds', return_value=1800) as check:
+            got = MODULE.phase_budget('/r', '/t', 'live', 'a' * 40, 900, 1470, 300)
+        self.assertEqual(got, 330)
+        check.assert_called_once_with('/r', '/t', 'live', 'a' * 40, 'active', 21600, 1770)
+        with patch.object(MODULE, 'budget_seconds', return_value=5000):
+            self.assertEqual(MODULE.phase_budget('/r', '/t', 'live', 'a' * 40, 900, 1470, 300), 900)
+        p = MODULE.BUDGET_POLICY
+        # Static worst case of the fixed caps fits inside the job, excluding
+        # the separately reserved cleanup and margin.
+        self.assertLessEqual(MODULE.SETUP_ALLOWANCE + MODULE.BOOTSTRAP_CAP + MODULE.BOOT_CAP
+                             + MODULE.GUEST_SETUP_RESERVE + MODULE.TEST_CAP + 32,
+                             p['job_seconds'] - p['cleanup_seconds'] - p['margin_seconds'])
+        # Teardown's own fixed bounds (210+30+45+15) fit the cleanup reserve.
+        self.assertGreaterEqual(p['cleanup_seconds'], 210 + 30 + 45 + 15)
+        workflow = (SCRIPT.parent.parent / '.github/workflows/ci.yml').read_text()
+        for name in MODULE.JOB_NAMES.values():
+            job = workflow[workflow.index('name: ' + name):]
+            job = job[:job.index('\n  backup-') if '\n  backup-' in job else len(job)]
+            self.assertIn('timeout-minutes: %d\n' % (p['job_seconds'] // 60), job)
+            self.assertIn('--job-seconds %d' % p['job_seconds'], job)
+            self.assertIn('--cleanup-seconds %d' % p['cleanup_seconds'], job)
+            self.assertIn('--margin-seconds %d' % p['margin_seconds'], job)
+            self.assertIn('--required-seconds %d' % (MODULE.BOOTSTRAP_REQUIRED + MODULE.BOOT_CAP
+                          + MODULE.GUEST_SETUP_RESERVE + MODULE.TEST_REQUIRED), job)
+        self.assertLessEqual(p['job_seconds'], 2400)  # Hosted job cap; never raised to fit.
+        self.assertGreaterEqual(MODULE.TEST_REQUIRED, 18 * 60 + 30)
+        self.assertLessEqual(MODULE.TEST_REQUIRED, MODULE.TEST_CAP)
+
+    def test_insufficient_budget_fails_before_owned_root_resources(self):
+        main = SOURCE[SOURCE.index('def main():'):]
+        first = main.index('phase_budget(')
+        self.assertLess(first, main.index("receipt_dir.mkdir(mode=0o700)"))
+        self.assertLess(first, main.index('tempfile.mkdtemp('))
+        for phase in ('bootstrap_timeout = phase_budget(', 'time.monotonic() + phase_budget(',
+                      'test_timeout = phase_budget('):
+            self.assertIn(phase, main)
+        self.assertIn('timeout=test_timeout', main)
+        with self.assertRaises(RuntimeError):
+            MODULE.observed_bootstrap([], {}, None, pathlib.Path('/private'),
+                                      dict(head='a'*40, run='1', attempt='1', slot='live'), MODULE.BOOTSTRAP_CAP + 1)
+
+    def test_cache_key_mode_is_unprivileged_and_first(self):
+        main = SOURCE[SOURCE.index('def main():'):]
+        self.assertLess(main.index("['--deb-cache-key']"), main.index("os.geteuid() == 0"))
 
 
 if __name__ == '__main__':

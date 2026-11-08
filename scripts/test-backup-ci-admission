@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Offline regression suite: no network, tokens, host services or test resources."""
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+path = Path(__file__).with_name('backup-ci-admission')
+loader = importlib.machinery.SourceFileLoader('admission', str(path))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+
+E = dict(repo='owner/repo', run_id=21, attempt=2, sha='a'*40,
+         job_name='Backup / offline', runner_name='runner-one', runner_id=None)
+P = dict(job_seconds=2400, cleanup_seconds=600, margin_seconds=120)
+BOOT = '12345678-1234-1234-1234-123456789abc'
+T = m.utc('2026-10-31T20:00:00Z')
+
+
+def job(i=31, name=None):
+    return dict(id=i, run_id=21, run_attempt=2, head_sha='a'*40,
+                name=name or E['job_name'], runner_id=41, runner_name='runner-one',
+                started_at='2026-10-31T20:00:00Z', status='in_progress', conclusion=None)
+
+
+class Fake:
+    def __init__(self, jobs=None):
+        self.rows = jobs if jobs is not None else [job()]
+        self.run = dict(id=21, run_attempt=2, head_sha='a'*40, status='in_progress',
+                        repository={'full_name':'owner/repo'})
+        self.detail = job()
+        self.samples = []
+        self.paths = []
+        self.mono = 1000
+        self.server = T+100
+        self.bad_count = None
+        self.error = False
+
+    def get(self, path):
+        self.paths.append(path)
+        if self.error:
+            raise m.Refused('api_failure')
+        self.samples.append((self.mono, self.mono+1, self.server, self.server+1, self.server))
+        if '/jobs?' in path:
+            page = int(path.rsplit('=', 1)[1])
+            return {'total_count':self.bad_count if self.bad_count is not None else len(self.rows),
+                    'jobs':self.rows[(page-1)*100:page*100]}
+        if '/jobs/' in path:
+            return self.detail
+        return self.run
+
+
+def acquire(api=None, **kwargs):
+    return m.acquire(copy.deepcopy(E), copy.deepcopy(P), 100, api or Fake(),
+                     now=lambda:1005, boot=BOOT, **kwargs)
+
+
+def checked(*args, **kwargs):
+    return m.check(*args, expected=E, policy=P, **kwargs)
+
+
+class Admission(unittest.TestCase):
+    def test_conservative_anchor(self):
+        r=acquire()
+        self.assertEqual(r['cleanup_deadline'], 1000+2400-100-32-120)
+        self.assertEqual(r['active_deadline'], r['cleanup_deadline']-600)
+        self.assertEqual(r['runner_id'],41)
+
+    def test_pagination(self):
+        f=Fake([job(i,'other'+str(i)) for i in range(100,200)]+[job()])
+        acquire(f)
+        self.assertTrue(any('page=2' in p for p in f.paths))
+
+    def test_run_identity(self):
+        for k,v in [('id',22),('run_attempt',1),('head_sha','b'*40),('status','completed')]:
+            with self.subTest(k=k):
+                f=Fake();f.run[k]=v
+                with self.assertRaises(m.Refused):acquire(f)
+        f=Fake();f.run['repository']['full_name']='evil/repo'
+        with self.assertRaises(m.Refused):acquire(f)
+
+    def test_detail_identity_and_state(self):
+        for k,v in [('id',32),('run_id',22),('run_attempt',1),('head_sha','b'*40),
+                    ('runner_name','other'),('runner_id',0),('name','other'),
+                    ('started_at','2026-10-31T20:00:01Z'),('status','completed'),('conclusion','success')]:
+            with self.subTest(k=k):
+                f=Fake();f.detail[k]=v
+                with self.assertRaises(m.Refused):acquire(f)
+
+    def test_ambiguous_and_missing(self):
+        for rows in ([job(),job(32)], [job(32,'other')]):
+            with self.assertRaises(m.Refused):acquire(Fake(rows))
+
+    def test_duplicate_page_ids(self):
+        with self.assertRaises(m.Refused):acquire(Fake([job(),job()]))
+
+    def test_count_bounds(self):
+        for count in (0,-1,2001,True,2):
+            f=Fake();f.bad_count=count
+            with self.subTest(count=count), self.assertRaises(m.Refused):acquire(f)
+
+    def test_pagination_change(self):
+        class Changed(Fake):
+            def get(self,path):
+                r=super().get(path)
+                if 'page=2' in path:r['total_count']=102
+                return r
+        f=Changed([job(i,'other'+str(i)) for i in range(100,200)]+[job()])
+        with self.assertRaises(m.Refused):acquire(f)
+
+    def test_api_failure(self):
+        f=Fake();f.error=True
+        with self.assertRaises(m.Refused):acquire(f)
+
+    def test_future_job(self):
+        f=Fake();f.server=T-5
+        with self.assertRaises(m.Refused):acquire(f)
+
+    def test_long_setup_refused(self):
+        f=Fake();f.server=T+2300
+        with self.assertRaises(m.Refused):acquire(f)
+
+    def test_sample_elapsed_skew_jump(self):
+        for sample in [(1,17,T,T+16,T), (1,2,T,T+1,T+40),
+                       (1,2,T,T+10,T), (2,1,T,T,T), (1,float('nan'),T,T,T)]:
+            with self.subTest(sample=sample),self.assertRaises(m.Refused):m.validate_sample(sample)
+
+    def test_later_clock_cannot_extend(self):
+        old=acquire()
+        f=Fake();f.server=T+50
+        result=acquire(f,previous=old)
+        self.assertEqual(result['active_deadline'],old['active_deadline'])
+        self.assertEqual(result['cleanup_deadline'],old['cleanup_deadline'])
+
+    def test_refresh_can_shorten(self):
+        old=acquire();f=Fake();f.server=T+150
+        result=acquire(f,previous=old)
+        self.assertLess(result['active_deadline'],old['active_deadline'])
+
+    def test_previous_wrong_identity(self):
+        for key,value in [('boot_id','other'),('job_id',99),('runner_id',99),
+                          ('started_at','2026-10-31T19:59:59Z')]:
+            r=acquire();r[key]=value
+            with self.subTest(key=key),self.assertRaises(m.Refused):acquire(previous=r)
+
+    def test_previous_changed_policy(self):
+        r=acquire();r['policy']['margin_seconds']=121
+        with self.assertRaises(m.Refused):acquire(previous=r)
+
+    def test_check_same_deadline_for_cleanup(self):
+        r=acquire();d=r['cleanup_deadline']
+        a=checked(r,'cleanup',300,1,now=d-100.7,boot=BOOT)
+        b=checked(r,'cleanup',300,1,now=d-20.4,boot=BOOT)
+        self.assertEqual((a['timeout_seconds'],b['timeout_seconds']),(100,20))
+        self.assertEqual(a['deadline_mono'],b['deadline_mono'])
+
+    def test_check_no_test_window(self):
+        r=acquire()
+        with self.assertRaises(m.Refused):checked(r,'active',1200,1200,now=r['active_deadline']-1199,boot=BOOT)
+        with self.assertRaises(m.Refused):checked(r,'cleanup',300,1,now=r['cleanup_deadline'],boot=BOOT)
+
+    def test_wrong_boot_and_future_receipt(self):
+        r=acquire()
+        with self.assertRaises(m.Refused):checked(r,'active',900,1,now=1005,boot='other')
+        with self.assertRaises(m.Refused):checked(r,'active',900,1,now=1000,boot=BOOT)
+
+    def test_invalid_expected_policy(self):
+        for key,v in [('repo','../bad?'),('sha','bad'),('job_name','bad\nname'),('runner_name',''),('run_id',True)]:
+            e=copy.deepcopy(E);e[key]=v
+            with self.subTest(key=key),self.assertRaises(m.Refused):m.validate_expected(e)
+        for p in [dict(P,margin_seconds=0),dict(P,job_seconds=600),dict(P,cleanup_seconds=float('inf'))]:
+            with self.assertRaises(m.Refused):m.validate_policy(p)
+
+    def test_explicit_runner_binding(self):
+        e=copy.deepcopy(E);e['runner_id']=99
+        with self.assertRaises(m.Refused):m.acquire(e,P,100,Fake(),now=lambda:1005,boot=BOOT)
+
+    def test_private_receipt_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p=Path(tmp)/'r';p.write_text(json.dumps(acquire()));p.chmod(0o600)
+            self.assertEqual(m.load_receipt(p)['job_id'],31)
+            p.chmod(0o644)
+            with self.assertRaises(m.Refused):m.load_receipt(p)
+            p.chmod(0o600);link=Path(tmp)/'link';link.symlink_to(p)
+            with self.assertRaises(OSError):m.load_receipt(link)
+            hard=Path(tmp)/'hard';os.link(p,hard)
+            with self.assertRaises(m.Refused):m.load_receipt(p)
+
+    def test_nonfinite_receipt(self):
+        r=acquire();r['active_deadline']=float('nan')
+        with self.assertRaises(m.Refused):m.validate_receipt(r,1005,BOOT)
+
+    def test_cli_failure_does_not_print_token(self):
+        # Invalid token is rejected BEFORE any network call.
+        env=dict(os.environ,GITHUB_TOKEN='SECRET\nCANARY',PYTHONDONTWRITEBYTECODE='1')
+        cmd=[sys.executable,str(path),'acquire','--repo','owner/repo','--run-id','21',
+             '--attempt','2','--sha','a'*40,'--job-name','Backup','--runner-name','runner',
+             '--job-seconds','2400','--cleanup-seconds','600','--margin-seconds','120',
+             '--required-seconds','100']
+        r=subprocess.run(cmd,env=env,capture_output=True,text=True,timeout=5)
+        self.assertNotEqual(r.returncode,0)
+        self.assertEqual(r.stdout,'')
+        self.assertNotIn('SECRET',r.stderr)
+        self.assertEqual(r.stderr.strip(),'admission_refused:missing_token')
+
+    def test_check_current_job_binding(self):
+        r=acquire()
+        for key,v in [('run_id',22),('attempt',3),('sha','b'*40),('job_name','other'),
+                      ('runner_name','other'),('repo','other/repo')]:
+            e=copy.deepcopy(E);e[key]=v
+            with self.subTest(key=key),self.assertRaises(m.Refused):
+                m.check(r,'active',900,1,expected=e,policy=P,now=1005,boot=BOOT)
+        with self.assertRaises(m.Refused):
+            m.check(r,'active',900,1,expected=E,policy=dict(P,margin_seconds=121),now=1005,boot=BOOT)
+
+    def test_cli_argument_canaries(self):
+        for args in [['acquire','--run-id','SECRET_CANARY'],
+                     ['check','--phase','SECRET_CANARY'],['SECRET_CANARY']]:
+            r=subprocess.run([sys.executable,str(path)]+args,capture_output=True,text=True,timeout=5)
+            self.assertEqual(r.returncode,1)
+            self.assertEqual(r.stdout,'')
+            self.assertEqual(r.stderr.strip(),'admission_refused:invalid_arguments')
+
+    def test_clock_jump_between_responses(self):
+        class Changed(Fake):
+            def get(self,path):
+                if self.paths:self.server+=5
+                return super().get(path)
+        with self.assertRaises(m.Refused):acquire(Changed())
+
+    def test_transport_date_size_and_token_sanitization(self):
+        class Headers:
+            def __init__(self, dates): self.dates=dates
+            def get_all(self, key, default): return self.dates
+        class Response:
+            status=200
+            def __init__(self, dates, data=b'{}'):
+                self.headers=Headers(dates);self.data=data
+            def __enter__(self): return self
+            def __exit__(self,*a): pass
+            def read(self,n): return self.data[:n]
+        cases=[([],b'{}'),(['invalid'],b'{}'),
+               (['Sat, 31 Oct 2026 20:01:40 GMT']*2,b'{}'),
+               (['Sat, 31 Oct 2026 20:01:40 GMT'],b'x'*(m.MAX_BYTES+1)),
+               (['Sat, 31 Oct 2026 20:01:40 GMT'],b'SECRET_CANARY')]
+        for dates,data in cases:
+            api=m.API('SECRET_CANARY')
+            api.opener=mock.Mock()
+            api.opener.open.return_value=Response(dates,data)
+            with mock.patch.object(m.time,'monotonic',side_effect=[1000,1001]), \
+                 mock.patch.object(m.time,'time',side_effect=[T+100,T+101]):
+                with self.assertRaises(m.Refused) as caught: api.get('/safe')
+                self.assertNotIn('SECRET',str(caught.exception))
+        api=m.API('SECRET_CANARY');api.opener=mock.Mock()
+        api.opener.open.side_effect=RuntimeError('SECRET_CANARY')
+        with self.assertRaises(m.Refused) as caught:api.get('/safe')
+        self.assertEqual(str(caught.exception),'api_failure')
+
+    def test_transport_success_date_anchor(self):
+        import email.message
+        response=mock.MagicMock()
+        response.__enter__.return_value=response
+        response.status=200
+        response.headers=email.message.Message()
+        response.headers['Date']='Sat, 31 Oct 2026 20:01:40 GMT'
+        response.read.return_value=b'{"ok":true}'
+        api=m.API('CANARY');api.opener=mock.Mock()
+        api.opener.open.return_value=response
+        with mock.patch.object(m.time,'monotonic',side_effect=[1000,1001]), \
+             mock.patch.object(m.time,'time',side_effect=[T+100,T+101]):
+            self.assertEqual(api.get('/safe'),{'ok':True})
+        self.assertEqual(api.samples,[(1000,1001,T+100,T+101,T+100)])
+
+    def test_redirect_refused(self):
+        with self.assertRaises(m.Refused):m.NoRedirect().redirect_request(None,None,None,None,None,None)
+
+
+if __name__=='__main__':
+    unittest.main(verbosity=2)

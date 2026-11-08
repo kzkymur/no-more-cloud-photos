@@ -487,7 +487,11 @@ jobs:
     name: Backup / actual systemd all-pool cutover and separate resume
     needs: [test, backup-postgresql17]
     runs-on: ubuntu-24.04
+    # Must equal BUDGET_POLICY job_seconds in scripts/run-backup-root-isolated.
     timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
     env:
       GOTOOLCHAIN: local
     steps:
@@ -506,6 +510,21 @@ jobs:
           sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
           bash -n scripts/run-backup-root-isolated
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
+      - name: Compute signed-metadata deb cache key
+        id: debkey
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(timeout 90 bash scripts/run-backup-root-isolated --deb-cache-key)"
+          [[ "$key" =~ ^nmcp-debootstrap-debs-v1-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore untrusted deb byte cache (re-verified against signed metadata at use)
+        id: debcache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
       - name: Receive exact-head native closure
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -528,14 +547,32 @@ jobs:
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
           /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-root-cleanup
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-installed-contract
           go test -c -o "$RUNNER_TEMP/backup-live.test" ./internal/admin
           "$RUNNER_TEMP/backup-live.test" -test.list '^TestBackupPG17LiveCutover$' | grep -Fx TestBackupPG17LiveCutover
+      - name: Acquire identity-bound job budget receipt
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          receipt="$(mktemp "$RUNNER_TEMP/budget.XXXXXX")"
+          python3 -I scripts/backup-ci-admission acquire --repo "$GITHUB_REPOSITORY" \
+            --sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --job-name "Backup / actual systemd all-pool cutover and separate resume" --runner-name "$RUNNER_NAME" \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --job-seconds 2400 --cleanup-seconds 300 --margin-seconds 60 --required-seconds 1650 > "$receipt"
+          sudo install -o root -g root -m 0600 "$receipt" "$RUNNER_TEMP/.nmcp-budget-live.json"
+          rm -f -- "$receipt"
       - name: Actual backup restore cutover live-pool and resume proof
         shell: bash
         run: |
           set -euo pipefail
           sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            GITHUB_RUN_ID="${{ github.run_id }}" GITHUB_RUN_ATTEMPT="${{ github.run_attempt }}" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" RUNNER_NAME="$RUNNER_NAME" \
+            BUDGET_RUN_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
             GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
             TEST_BACKUP_LIVE_SYSTEMD=1 \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
@@ -561,12 +598,30 @@ jobs:
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
             bash scripts/run-backup-root-isolated --cleanup live
+      - name: Detect exported deb byte cache
+        id: debexport
+        if: always() && steps.debkey.outputs.key != '' && steps.debcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if test -d "$RUNNER_TEMP/debootstrap-deb-cache" && ! test -L "$RUNNER_TEMP/debootstrap-deb-cache"; then
+            echo present=true >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save deb byte cache candidate
+        if: always() && steps.debexport.outputs.present == 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
 
   backup-offline-recovery:
     name: Backup / offline two-cluster source-stop recovery and separate resume
     needs: [test, backup-postgresql17]
     runs-on: ubuntu-24.04
+    # Must equal BUDGET_POLICY job_seconds in scripts/run-backup-root-isolated.
     timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
     env:
       GOTOOLCHAIN: local
     steps:
@@ -585,6 +640,21 @@ jobs:
           sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
           bash -n scripts/run-backup-root-isolated
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
+      - name: Compute signed-metadata deb cache key
+        id: debkey
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(timeout 90 bash scripts/run-backup-root-isolated --deb-cache-key)"
+          [[ "$key" =~ ^nmcp-debootstrap-debs-v1-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore untrusted deb byte cache (re-verified against signed metadata at use)
+        id: debcache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
       - name: Receive exact-head native closure
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -607,14 +677,32 @@ jobs:
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
           /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-root-cleanup
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-installed-contract
           go test -c -o "$RUNNER_TEMP/backup-offline.test" ./internal/admin
           "$RUNNER_TEMP/backup-offline.test" -test.list '^TestRestoreOfflineRootTwoClusters$' | grep -Fx TestRestoreOfflineRootTwoClusters
+      - name: Acquire identity-bound job budget receipt
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          receipt="$(mktemp "$RUNNER_TEMP/budget.XXXXXX")"
+          python3 -I scripts/backup-ci-admission acquire --repo "$GITHUB_REPOSITORY" \
+            --sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --job-name "Backup / offline two-cluster source-stop recovery and separate resume" --runner-name "$RUNNER_NAME" \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --job-seconds 2400 --cleanup-seconds 300 --margin-seconds 60 --required-seconds 1650 > "$receipt"
+          sudo install -o root -g root -m 0600 "$receipt" "$RUNNER_TEMP/.nmcp-budget-offline.json"
+          rm -f -- "$receipt"
       - name: Actual source-stop offline recovery crosscluster cutover and resume proof
         shell: bash
         run: |
           set -euo pipefail
           sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            GITHUB_RUN_ID="${{ github.run_id }}" GITHUB_RUN_ATTEMPT="${{ github.run_attempt }}" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" RUNNER_NAME="$RUNNER_NAME" \
+            BUDGET_RUN_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
             GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
             TEST_BACKUP_OFFLINE_SYSTEMD=1 \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
@@ -640,3 +728,17 @@ jobs:
             GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
             TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
             bash scripts/run-backup-root-isolated --cleanup offline
+      - name: Detect exported deb byte cache
+        id: debexport
+        if: always() && steps.debkey.outputs.key != '' && steps.debcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if test -d "$RUNNER_TEMP/debootstrap-deb-cache" && ! test -L "$RUNNER_TEMP/debootstrap-deb-cache"; then
+            echo present=true >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save deb byte cache candidate
+        if: always() && steps.debexport.outputs.present == 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
