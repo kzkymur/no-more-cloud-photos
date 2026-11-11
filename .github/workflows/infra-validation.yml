@@ -25,38 +25,114 @@ jobs:
         if: always()
         run: scripts/validation-env reset
 
-  # Issue #21 Compose E2E lane. The harness self-test always runs; the
-  # engineer-owned scenario (./test/e2e) runs on the same image once it exists.
-  # Only the scenario run is #21 evidence. The self-test proves the hook
-  # contract alone.
-  compose-e2e:
+  # Issue #21 Compose E2E lane (scripts/infra-e2e-env). The harness self-test
+  # proves the hook contract only. The engineer-owned scenario (./test/e2e) is
+  # the #21 evidence and runs in its own job with its own budget receipt.
+  compose-e2e-harness:
+    name: Infra / Compose E2E harness self-test
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Must equal NMCP_E2E_BUDGET_JOB_SECONDS.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
+    env:
+      GOTOOLCHAIN: local
+      NMCP_E2E_BUDGET_JOB_NAME: Infra / Compose E2E harness self-test
+      NMCP_E2E_BUDGET_JOB_SECONDS: "2700"
+      NMCP_E2E_BUDGET_CLEANUP_SECONDS: "300"
+      NMCP_E2E_BUDGET_MARGIN_SECONDS: "60"
+      NMCP_E2E_BUDGET_RUN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: 1.27.1
-          cache: true
       - name: Lint harness scripts
-        run: shellcheck scripts/infra-e2e-env infra/validation/e2e-selftest.sh
+        run: |
+          shellcheck scripts/infra-e2e-env infra/validation/e2e-selftest.sh
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
+      - name: Acquire identity-bound job budget receipt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/.nmcp-e2e-budget.json"
+          (umask 077; python3 -I scripts/backup-ci-admission acquire --repo "$GITHUB_REPOSITORY" \
+            --sha "$NMCP_E2E_BUDGET_RUN_SHA" --job-name "$NMCP_E2E_BUDGET_JOB_NAME" --runner-name "$RUNNER_NAME" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --job-seconds "$NMCP_E2E_BUDGET_JOB_SECONDS" --cleanup-seconds "$NMCP_E2E_BUDGET_CLEANUP_SECONDS" \
+            --margin-seconds "$NMCP_E2E_BUDGET_MARGIN_SECONDS" --required-seconds 1500 >"$receipt.tmp")
+          mv -- "$receipt.tmp" "$receipt"
+          echo "NMCP_E2E_BUDGET_RECEIPT=$receipt" >>"$GITHUB_ENV"
       - name: Harness self-test (contract only, not #21 acceptance)
         env:
           NMCP_E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-results/selftest
           NMCP_E2E_TIMEOUT_SECONDS: "600"
+          NMCP_E2E_SCENARIO_MIN_SECONDS: "300"
         run: scripts/infra-e2e-env lane -- infra/validation/e2e-selftest.sh
-      - name: Build #21 scenario
+      - name: Upload E2E results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-harness-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-results
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Always remove E2E resources
+        if: always()
+        run: scripts/infra-e2e-env reset
+
+  compose-e2e-scenario:
+    name: Infra / Compose E2E #21 scenario
+    runs-on: ubuntu-24.04
+    # Must equal NMCP_E2E_BUDGET_JOB_SECONDS.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
+    env:
+      GOTOOLCHAIN: local
+      NMCP_E2E_BUDGET_JOB_NAME: "Infra / Compose E2E #21 scenario"
+      NMCP_E2E_BUDGET_JOB_SECONDS: "3600"
+      NMCP_E2E_BUDGET_CLEANUP_SECONDS: "300"
+      NMCP_E2E_BUDGET_MARGIN_SECONDS: "60"
+      NMCP_E2E_BUDGET_RUN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Detect #21 scenario
         id: scenario
         run: |
           if [ ! -d test/e2e ]; then
-            echo "::notice title=#21 scenario absent::./test/e2e does not exist yet; only the harness self-test ran. This run is NOT #21 acceptance."
+            echo "::notice title=#21 scenario absent::./test/e2e does not exist yet; this job ran nothing and is NOT #21 acceptance."
             echo "present=false" >>"$GITHUB_OUTPUT"
-            exit 0
+          else
+            echo "present=true" >>"$GITHUB_OUTPUT"
           fi
+      - name: Install Go
+        if: steps.scenario.outputs.present == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Build #21 scenario
+        if: steps.scenario.outputs.present == 'true'
+        run: |
           go test -c -o "$RUNNER_TEMP/nmcp-e2e.test" ./test/e2e
-          echo "present=true" >>"$GITHUB_OUTPUT"
+          "$RUNNER_TEMP/nmcp-e2e.test" -test.list '.*' | grep -q . || { echo "scenario has no tests" >&2; exit 1; }
+      - name: Acquire identity-bound job budget receipt
+        if: steps.scenario.outputs.present == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/.nmcp-e2e-budget.json"
+          (umask 077; python3 -I scripts/backup-ci-admission acquire --repo "$GITHUB_REPOSITORY" \
+            --sha "$NMCP_E2E_BUDGET_RUN_SHA" --job-name "$NMCP_E2E_BUDGET_JOB_NAME" --runner-name "$RUNNER_NAME" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --job-seconds "$NMCP_E2E_BUDGET_JOB_SECONDS" --cleanup-seconds "$NMCP_E2E_BUDGET_CLEANUP_SECONDS" \
+            --margin-seconds "$NMCP_E2E_BUDGET_MARGIN_SECONDS" --required-seconds 2100 >"$receipt.tmp")
+          mv -- "$receipt.tmp" "$receipt"
+          echo "NMCP_E2E_BUDGET_RECEIPT=$receipt" >>"$GITHUB_ENV"
       - name: Run #21 scenario
         if: steps.scenario.outputs.present == 'true'
         env:
@@ -66,13 +142,13 @@ jobs:
           scripts/infra-e2e-env lane --
           "$RUNNER_TEMP/nmcp-e2e.test" -test.v -test.count=1 -test.timeout=20m
       - name: Upload E2E results
-        if: always()
+        if: always() && steps.scenario.outputs.present == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: e2e-results-${{ github.sha }}-${{ github.run_attempt }}
+          name: e2e-scenario-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/e2e-results
           retention-days: 14
           if-no-files-found: warn
       - name: Always remove E2E resources
-        if: always()
+        if: always() && steps.scenario.outputs.present == 'true'
         run: scripts/infra-e2e-env reset

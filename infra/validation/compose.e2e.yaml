@@ -33,3 +33,14 @@ services:
         read_only: true
     labels:
       com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER}"
+
+  # Scenario fixtures (read-only) and a private scratch dir outside the media
+  # volume, for `admin --` (the migrate one-shot, same core image as the worker).
+  migrate:
+    volumes:
+      - type: bind
+        source: "${NMCP_E2E_FIXTURES_DIR:?scripts/infra-e2e-env must set NMCP_E2E_FIXTURES_DIR}"
+        target: /e2e/fixtures
+        read_only: true
+    tmpfs:
+      - /e2e/work:size=1g,uid=10001,gid=10001,mode=0700

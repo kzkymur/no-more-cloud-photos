@@ -41,6 +41,34 @@ step "admin runs nmcp-admin as nmcp_migrator"
 "$ctl" admin -- migrate status --json >"$NMCP_E2E_ARTIFACT_DIR/selftest-admin.json" ||
   fail "nmcp-admin migrate status"
 
+step "admin one-shot mounts: fixtures read-only, private /e2e/work outside media"
+case "$NMCP_E2E_FIXTURES_DIR" in */no-fixtures) ;; *) fail "self-test expects the empty fixture dir, got $NMCP_E2E_FIXTURES_DIR" ;; esac
+marker="selftest-$$"
+printf '%s' "$marker" >"$NMCP_E2E_FIXTURES_DIR/selftest.marker"
+chmod 0644 "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
+# shellcheck disable=SC2016 # expanded by the container shell
+mounts=$(docker compose --project-name "$NMCP_E2E_PROJECT" \
+  --file "$NMCP_E2E_ROOT/infra/validation/compose.yaml" --file "$NMCP_E2E_ROOT/infra/validation/compose.e2e.yaml" \
+  run --rm --no-deps -T --entrypoint sh migrate -eu -c '
+    cat /e2e/fixtures/selftest.marker; echo
+    if touch /e2e/fixtures/x 2>/dev/null; then echo fixtures-writable; fi
+    echo w >/e2e/work/probe && rm /e2e/work/probe && echo work-writable
+    stat -c "%a %u" /e2e/work
+    [ "$(stat -c %d /e2e/work)" != "$(stat -c %d /e2e/fixtures)" ] && echo work-separate
+    if [ -e /var/lib/nmcp/media ]; then echo media-visible; fi') || fail "admin mount probe"
+rm -f "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
+# admin -- uses the same `compose run --no-deps -T migrate` invocation; prove
+# that stdin reaches the one-shot process (certify reads its spec from -).
+echoed=$(printf 'spec-%s' "$marker" | docker compose --project-name "$NMCP_E2E_PROJECT" \
+  --file "$NMCP_E2E_ROOT/infra/validation/compose.yaml" --file "$NMCP_E2E_ROOT/infra/validation/compose.e2e.yaml" \
+  run --rm --no-deps -T --entrypoint /usr/bin/timeout migrate 30s cat) || fail "stdin probe"
+[ "$echoed" = "spec-$marker" ] || fail "stdin not forwarded to the admin one-shot: $echoed"
+expected="$marker
+work-writable
+700 10001
+work-separate"
+[ "$mounts" = "$expected" ] || fail "admin mounts: $mounts"
+
 step "control kill worker SIGKILL prints the pid; start gives a new process"
 old=$("$ctl" control kill worker KILL) || fail "kill worker"
 old_pid=${old#pid=}; old_pid=${old_pid%% *}

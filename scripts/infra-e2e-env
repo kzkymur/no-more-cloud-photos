@@ -18,6 +18,8 @@
 #   NMCP_E2E_DEADLINE       unix epoch; the scenario is killed at this time,
 #                           and at least 60s remain afterwards for collection
 #   NMCP_E2E_HEAD_SHA       commit under test (GITHUB_SHA or git HEAD)
+#   NMCP_E2E_FIXTURES_DIR   host fixture dir (default <repo>/test/e2e/testdata),
+#                           visible to `admin --` at /e2e/fixtures
 #   NMCP_E2E_PROJECT / NMCP_E2E_ROOT  identity used by $NMCP_E2E_CONTROL
 #
 # Control commands (exit 0 only after the effect is observed):
@@ -26,11 +28,23 @@
 #   control pid SERVICE             prints the current host pid (0 if stopped)
 #   db-read                         SQL on stdin, read-only session, psql -At
 #   media-ls                        JSON lines {path,type,size,mode,sha256}
-#   admin -- ARGS...                one-shot nmcp-admin as nmcp_migrator
+#   admin -- ARGS...                one-shot nmcp-admin as nmcp_migrator in the
+#                                   core image (helpers /opt/nmcp/bin, ICC
+#                                   /opt/nmcp/share/sRGB2014.icc), no TTY,
+#                                   bounded by NMCP_E2E_DEADLINE (else 600s).
+#                                   stdin is forwarded (e.g. --file -).
+#                                   Mounts: NMCP_E2E_FIXTURES_DIR read-only at
+#                                   /e2e/fixtures; private tmpfs /e2e/work
+#                                   (uid 10001, 0700, 1g), not in media.
 #   fault media-readonly on|off     remount the whole media filesystem ro/rw
 #   fault media-full on|off [BYTES] shrink the media filesystem to used+BYTES
 #                                   (default 0) / restore the original size
 # SERVICE is one of: api worker files postgres.
+#
+# Job budget (CI): when NMCP_E2E_BUDGET_RECEIPT names a receipt from
+# scripts/backup-ci-admission, `lane` admits every phase against it and fails
+# before creating resources if the remaining budget cannot cover the minimum.
+# Under GITHUB_ACTIONS a receipt is mandatory.
 set -euo pipefail
 
 root=${NMCP_E2E_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -55,6 +69,12 @@ case "$media_bytes" in ''|*[!0-9]*) echo "error: invalid NMCP_E2E_MEDIA_BYTES" >
 
 export NMCP_VALIDATION_OWNER=$owner NMCP_API_PORT=$api_port NMCP_FILES_PORT=$files_port
 export NMCP_E2E_MEDIA_MOUNT=$media_mount
+# Scenario fixtures, mounted read-only at /e2e/fixtures in the admin one-shot.
+if [ -z "${NMCP_E2E_FIXTURES_DIR:-}" ]; then
+  if [ -d "$root/test/e2e/testdata" ]; then NMCP_E2E_FIXTURES_DIR=$root/test/e2e/testdata
+  else NMCP_E2E_FIXTURES_DIR=$state_dir/no-fixtures; fi
+fi
+export NMCP_E2E_FIXTURES_DIR
 
 log() { printf 'infra-e2e: %s\n' "$*" >&2; }
 die() { printf 'infra-e2e: error: %s\n' "$*" >&2; exit 1; }
@@ -240,7 +260,17 @@ for line in sys.stdin:
 
 admin() {
   [ "${1:-}" = -- ] && shift
-  compose run --rm --no-deps -T migrate nmcp-admin "$@"
+  local limit=600 remaining
+  if [ -n "${NMCP_E2E_DEADLINE:-}" ]; then
+    remaining=$(( NMCP_E2E_DEADLINE - $(date +%s) ))
+    [ "$remaining" -gt 0 ] || die "scenario deadline passed"
+    [ "$remaining" -ge "$limit" ] || limit=$remaining
+  fi
+  # The in-container timeout bounds nmcp-admin itself; the host timeout is a
+  # backstop for the compose client. --rm and lane teardown remove leftovers.
+  timeout --kill-after=10s "$((limit + 20))s" \
+    compose run --rm --no-deps -T migrate \
+    /usr/bin/timeout --kill-after=5s "${limit}s" nmcp-admin "$@"
 }
 
 remount_media() {
@@ -284,6 +314,7 @@ fault() {
 up() {
   assert_owned
   mount_media
+  if [ ! -d "$NMCP_E2E_FIXTURES_DIR" ]; then install -d -m 0755 "$NMCP_E2E_FIXTURES_DIR"; fi
   if ! compose up --build --detach --wait; then
     compose logs --no-color >&2 || true
     die "stack did not become ready"
@@ -326,7 +357,14 @@ verify_codec() {
           case "$resolved" in "$prefix"/*) ;; *) printf "%s=>%s " "$name" "$resolved" ;; esac
         fi
       done)
-      [ -z "$leaked" ] || fail "$binary resolves pinned libraries outside $prefix: $leaked"
+      if [ -n "$leaked" ]; then
+        # Diagnostics only: which object requested each leaked library and
+        # which search path (RPATH/RUNPATH/default) the loader used.
+        echo "codec-closure: loader trace for $binary (LD_DEBUG=libs, empty env)" >&2
+        env -i LC_ALL=C LD_DEBUG=libs ldd "$path" 2>&1 >/dev/null |
+          grep -E "find library=|search path=|trying file=.*(webp|sharpyuv)" | sed "s/^/codec-closure: trace /" >&2 || true
+        fail "$binary resolves pinned libraries outside $prefix: $leaked"
+      fi
       printf "%s\n" "$out" | sed "s/^/codec-closure: $binary ldd /"
       echo "codec-closure: $binary ok"
     done
@@ -381,6 +419,42 @@ collect() {
   if media_mounted; then media_ls >"$dir/media-ls.jsonl" 2>"$dir/media-ls.err" || true; fi
 }
 
+budget_enabled() {
+  if [ -n "${NMCP_E2E_BUDGET_RECEIPT:-}" ]; then return 0; fi
+  [ "${GITHUB_ACTIONS:-}" != true ] || die "NMCP_E2E_BUDGET_RECEIPT is required under GitHub Actions"
+  return 1
+}
+
+# Print the seconds granted for PHASE (active|cleanup), capped at CAP, or fail
+# if fewer than REQUIRED remain. Identity comes from the GitHub environment.
+budget_check() {
+  local phase=$1 cap=$2 required=$3 out
+  out=$(timeout 30 python3 -I "$root/scripts/backup-ci-admission" check \
+    --repo "$GITHUB_REPOSITORY" --sha "${NMCP_E2E_BUDGET_RUN_SHA:?}" \
+    --job-name "${NMCP_E2E_BUDGET_JOB_NAME:?}" --runner-name "$RUNNER_NAME" \
+    --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+    --job-seconds "${NMCP_E2E_BUDGET_JOB_SECONDS:?}" \
+    --cleanup-seconds "${NMCP_E2E_BUDGET_CLEANUP_SECONDS:?}" \
+    --margin-seconds "${NMCP_E2E_BUDGET_MARGIN_SECONDS:?}" \
+    --receipt "$NMCP_E2E_BUDGET_RECEIPT" --phase "$phase" \
+    --cap-seconds "$cap" --required-seconds "$required") || die "budget admission refused ($phase, need ${required}s)"
+  python3 -I -c '
+import json, sys
+d = json.loads(sys.argv[1]); s = d["timeout_seconds"]
+assert type(s) is int and int(sys.argv[3]) <= s <= int(sys.argv[2]) and d["phase"] == sys.argv[4]
+print(s)' "$out" "$cap" "$required" "$phase" || die "invalid budget admission output"
+}
+
+# Grant for one active phase: reserve DOWNSTREAM seconds for the later phases.
+phase_budget() {
+  local cap=$1 downstream=$2 minimum=$3 remaining
+  remaining=$(budget_check active 21600 $((downstream + minimum)))
+  remaining=$((remaining - downstream))
+  [ "$remaining" -le "$cap" ] || remaining=$cap
+  log "budget: phase granted ${remaining}s (cap ${cap}s, reserved ${downstream}s)"
+  echo "$remaining"
+}
+
 # Run a scenario command with the contract environment and a hard deadline.
 run_scenario() {
   [ "${1:-}" = -- ] && shift
@@ -401,6 +475,7 @@ run_scenario() {
     NMCP_E2E_PROJECT="$project" \
     NMCP_E2E_ROOT="$root" \
     NMCP_E2E_STATE_DIR="$state_dir" \
+    NMCP_E2E_FIXTURES_DIR="$NMCP_E2E_FIXTURES_DIR" \
     timeout --kill-after=10s "${budget}s" "$@" 2>&1 | tee "$artifacts/scenario.log" || status=$?
   if [ "$status" -ne 0 ]; then log "scenario exited $status"; return "$status"; fi
   grep -qx 'PASS' "$artifacts/scenario.log" || { log "scenario output has no final PASS line"; return 1; }
@@ -413,13 +488,44 @@ lane() {
   [ "${1:-}" = -- ] && shift
   local artifacts=${NMCP_E2E_ARTIFACT_DIR:-${RUNNER_TEMP:-/tmp}/e2e-results} status=0
   mkdir -p "$artifacts"
-  trap 'collect "$artifacts" || true; cleanup || true' EXIT
+  local scenario_cap=${NMCP_E2E_TIMEOUT_SECONDS:-1500}
+  local scenario_min=${NMCP_E2E_SCENARIO_MIN_SECONDS:-$scenario_cap}
+  local up_cap=${NMCP_E2E_UP_SECONDS:-1500} up_min=300 codec_cap=300 granted
+  local collect_reserve=180
+  if budget_enabled; then
+    # Fail before any resource exists if the whole lane cannot be admitted.
+    phase_budget "$up_cap" $((codec_cap + scenario_min + collect_reserve)) "$up_min" >/dev/null
+  fi
+  trap 'lane_teardown "$artifacts"' EXIT
   trap 'exit 130' HUP INT TERM
   cleanup
-  up
-  verify_codec | tee "$artifacts/codec-closure.log"
-  run_scenario "$@" || status=$?
+  granted=$up_cap
+  if budget_enabled; then granted=$(phase_budget "$up_cap" $((codec_cap + scenario_min + collect_reserve)) "$up_min"); fi
+  timeout --kill-after=10s "${granted}s" "$script" up || die "stack bring-up failed or exceeded ${granted}s"
+  granted=$codec_cap
+  if budget_enabled; then granted=$(phase_budget "$codec_cap" $((scenario_min + collect_reserve)) 60); fi
+  local codec_status=0
+  timeout --kill-after=10s "${granted}s" "$script" verify-codec 2>&1 | tee "$artifacts/codec-closure.log" || codec_status=$?
+  # A codec closure failure still fails the lane (below); the scenario runs
+  # anyway so one run reports both results.
+  granted=$scenario_cap
+  if budget_enabled; then granted=$(phase_budget "$scenario_cap" "$collect_reserve" "$scenario_min"); fi
+  NMCP_E2E_TIMEOUT_SECONDS=$granted run_scenario "$@" || status=$?
+  if [ "$codec_status" -ne 0 ]; then
+    log "FAIL: codec closure verification exited $codec_status (see codec-closure.log)"
+    [ "$status" -ne 0 ] || status=$codec_status
+  fi
   return "$status"
+}
+
+lane_teardown() {
+  local artifacts=$1 granted=300
+  timeout --kill-after=10s 150s "$script" collect "$artifacts" || log "collection incomplete"
+  if budget_enabled; then
+    # Cleanup must still run if admission refuses; fall back to a fixed bound.
+    granted=$( (budget_check cleanup 300 30) 2>/dev/null) || granted=120
+  fi
+  timeout --kill-after=10s "${granted}s" "$script" reset || log "cleanup failed; the always-run reset step retries"
 }
 
 require_tools
