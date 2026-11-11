@@ -268,7 +268,12 @@ sequence brand is still-image capable under ISO/IEC 23008-12 and is classified
 as still by its brands; its primary item is decoded by the bounded probe and
 processors, which reject a file without one. (This replaced an earlier #7 rule
 that rejected such mixed files, found by the #21 release gate because libheif
-and phones write them.) Contradictory brand sets remain rejected. Header recognition proves only a candidate container/family;
+and phones write them.) Contradictory brand sets remain rejected. This
+deliberately includes a HEIF still brand combined with an MP4/QuickTime/CR3
+container brand (for example Nokia conformance `C049.heic`: `mif1` plus
+`mp42`/`isom`): the registry cannot tell which container semantics apply, so
+it fails closed rather than guessing. Real-device HEIC/HEIF acceptance,
+including any phone file that hits this edge, is on the #22 checklist. Header recognition proves only a candidate container/family;
 ExifTool/FFprobe must still extract valid dimensions and video duration, and
 issues #11–#13 remain responsible for codec/transform runtime capability.
 
