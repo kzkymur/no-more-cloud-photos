@@ -244,7 +244,10 @@ MIME/source/output kind, maximum edge, and quality/CRF range. A database
 certification is deployment compatibility metadata, not proof that a particular
 Worker process has its binary/plugin/codec. The Worker therefore performs all
 three runtime capability probes and refuses registration on any claimable recipe
-mismatch. Migration application alone never certifies a capability.
+mismatch. Migration application alone never certifies a capability. The only
+supported writer is `nmcp-admin profile certify` (core API contract section 10
+and `docs/ubuntu-deployment.md`), which runs the real processors on operator
+fixtures and inserts all rows for one draft or none.
 
 ## Metadata probe boundary
 
@@ -258,9 +261,14 @@ Detection never consumes a multipart MIME declaration or filename. It performs
 at most 1 MiB of cumulative structural reads of JPEG/PNG/GIF/WebP/BMP, RAF, TIFF-derived RAW, and
 ISO-BMFF/legacy QuickTime headers. Generic TIFF, vendor-name-only TIFF, invalid
 offsets/lengths/loops, and contradictory BMFF brands are not coerced into a
-registered MIME. HEIF/HEIC sequence brands are rejected, including files that
-mix still and sequence compatibility, because the closed registry contains no
-sequence MIME. Header recognition proves only a candidate container/family;
+registered MIME. A HEIF/HEIC file whose brands are sequence-only is rejected,
+because the closed registry contains no sequence MIME. A file that carries a
+still-image structural brand (`mif1`, `heif`, or the `heic` family) alongside a
+sequence brand is still-image capable under ISO/IEC 23008-12 and is classified
+as still by its brands; its primary item is decoded by the bounded probe and
+processors, which reject a file without one. (This replaced an earlier #7 rule
+that rejected such mixed files, found by the #21 release gate because libheif
+and phones write them.) Contradictory brand sets remain rejected. Header recognition proves only a candidate container/family;
 ExifTool/FFprobe must still extract valid dimensions and video duration, and
 issues #11–#13 remain responsible for codec/transform runtime capability.
 

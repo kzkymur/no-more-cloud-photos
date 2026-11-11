@@ -902,7 +902,7 @@ func TestBackupPG17LifecycleMigration(t *testing.T) {
 		t.Fatalf("actual PG17 latest migration failed: %v", err)
 	}
 	status, err := m.Status(f.ctx)
-	if err != nil || !status.Ready() || status.CurrentVersion != 23 {
+	if err != nil || !status.Ready() || status.CurrentVersion != 24 {
 		t.Fatal("actual PG17 lifecycle migration not ready")
 	}
 	tx, err := migrator.Begin(f.ctx)

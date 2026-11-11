@@ -41,7 +41,11 @@ type options struct {
 	cutover          bool
 	ifDue            bool
 	definitionData   []byte
+	certifySpec      CertifySpec
 }
+
+// certifyStdin is the source for "profile certify --file -". Tests replace it.
+var certifyStdin io.Reader = os.Stdin
 
 func parse(args []string) (options, error) {
 	var o options
@@ -71,6 +75,8 @@ func parse(args []string) (options, error) {
 		flags.StringVar(&o.value, "value", "", "non-secret setting value")
 	case "profile create":
 		flags.StringVar(&o.file, "file", "", "profile JSON file")
+	case "profile certify":
+		flags.StringVar(&o.file, "file", "", "certification SPEC.json file, or - for stdin")
 	case "profile activate", "profile retire":
 		flags.StringVar(&o.id, "id", "", "profile UUIDv4")
 	case "regenerate":
@@ -131,6 +137,14 @@ func parse(args []string) (options, error) {
 			return o, ErrValidation
 		}
 		if _, err := DecodeProfile(o.definitionData); err != nil {
+			return o, err
+		}
+	case "profile certify":
+		data, err := readCertifySpec(o.file, certifyStdin)
+		if err != nil {
+			return o, err
+		}
+		if o.certifySpec, err = DecodeCertifySpec(data); err != nil {
 			return o, err
 		}
 	case "restore":
@@ -286,6 +300,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if err == nil {
 			err = service.ProfileCreate(ctx, definition)
 			result = map[string]any{"id": definition.ID, "status": "draft"}
+		}
+	case "profile certify":
+		result, err = service.ProfileCertify(ctx, o.certifySpec)
+		if err != nil {
+			// Only a fixed reason code and requirement; never paths or helper text.
+			result = certifyFailureResult(o.certifySpec.ProfileID, err)
 		}
 	case "profile activate", "profile retire":
 		err = service.ProfileTransition(ctx, o.id, o.command == "profile activate")

@@ -293,6 +293,89 @@ during activation. If compatible rollback activation fails, the installer stops
 all partial services, atomically restores the prior link, and restores its prior
 active/inactive service state; a failed restoration is left fully stopped.
 
+## Profile certification before activation
+
+Migrations seed the bundled `standard/v1` (`60000000-0000-4000-8000-000000000001`)
+and `thumbnail/v1` (`60000000-0000-4000-8000-000000000002`) profiles as
+**drafts**. `nmcp-admin profile activate` refuses a draft until append-only
+processor certification rows cover every exact input MIME, source mode, output
+kind, maximum edge, and setting its recipes need. On each real host, after the
+release is active and before activating a profile, certify it with the exact
+installed helpers:
+
+1. Collect operator-owned fixtures: at least one per input MIME of the profile
+   (all 17 candidate MIMEs for the bundled profiles, including every RAW alias,
+   HEIC/HEIF, BMP, MP4, and QuickTime). Every fixture's long edge must be at
+   least the recipe edge (1920 for `standard`, 640 for `thumbnail`) because each
+   output must reach exactly that edge. `image/webp` under `standard` needs a
+   **static** WebP (the Worker's still path) and an **animated** WebP; GIF and
+   video fixtures must be animated/real streams. Fixtures are evidence inputs,
+   not uploads; keep them outside the storage root.
+2. Write `SPEC.json` with absolute paths and the SHA-256 of each file, measured
+   by the operator on this host (for example `sha256sum`), never copied from
+   another host:
+
+   ```json
+   {
+     "profile_id": "60000000-0000-4000-8000-000000000002",
+     "helpers": {
+       "still_helper": {"path": "/opt/nmcp/current/bin/nmcp-still-helper", "sha256": "<64 hex>"},
+       "animation_helper": {"path": "/opt/nmcp/current/bin/nmcp-animation-helper", "sha256": "<64 hex>"},
+       "video_helper": {"path": "/opt/nmcp/current/bin/nmcp-video-helper", "sha256": "<64 hex>"},
+       "prlimit": {"path": "/usr/bin/prlimit", "sha256": "<64 hex>"},
+       "ffprobe": {"path": "/usr/bin/ffprobe", "sha256": "<64 hex>"},
+       "srgb_icc": {"path": "/opt/nmcp/current/share/sRGB2014.icc", "sha256": "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"}
+     },
+     "fixtures": [
+       {"mime_type": "image/jpeg", "path": "/root/nmcp-fixtures/landscape.jpg", "sha256": "<64 hex>"}
+     ]
+   }
+   ```
+
+   Use the same helper, `prlimit`, and ICC paths as the Worker configuration.
+   `ffprobe` is the independent output probe; prefer the distribution binary
+   rather than the video helper's bundled toolchain.
+3. Run, with the administrative (`nmcp_migrator`) environment loaded the same
+   way as the other administrative commands and the database in normal mode:
+
+   ```sh
+   /opt/nmcp/current/bin/nmcp-admin profile certify --file /root/nmcp-certify-thumbnail.json --json
+   /opt/nmcp/current/bin/nmcp-admin profile activate --id 60000000-0000-4000-8000-000000000002 --json
+   ```
+
+   `--file -` reads the spec from stdin instead. Certification does not activate;
+   activation stays a separate audited step and still enforces version order.
+4. Preserve the JSON result and the `profile_processor_certifications` evidence
+   receipts with the deployment record. Exit `2` means the spec, a helper or
+   fixture digest/owner/mode, a fixture MIME, or an output check was rejected;
+   `4` means the profile is not a draft, an identical certification already
+   exists (same requirement and byte-identical helper/ICC digests), or another
+   profile operation holds the lock; `1` is an operational helper or database
+   failure. Every non-zero exit inserts nothing. A refused requirement reports a
+   fixed `reason` (`requirement_not_covered`) and the exact
+   requirement in the JSON result.
+
+A certification proves that **this host's exact helper binaries** transformed
+**the given fixtures** with the profile's recipes and that independently probed
+outputs matched. It is not evidence that every possible input of those MIME
+types decodes, and it does not replace the Worker's startup capability probes.
+The registry is append-only history: rows are never updated or deleted. A
+requirement is refused as a duplicate only when an existing row for the same
+processor, schema version, MIME, source mode, output kind, edge, and setting
+range carries a receipt whose recorded still/animation/video helper, `ffprobe`,
+`prlimit`, and ICC digests are byte-identical to this run. After any helper or
+ICC change, re-certify: new rows are appended next to the old ones. An existing
+row whose evidence is not a well-formed receipt of this schema counts as not
+identical, so new evidence is appended beside it.
+
+Requirements follow the routes the Worker can execute
+(`profile.WorkerExecutableOutputs`, the same rule as migration 0024's
+activation validator). Under an all-frames recipe a GIF always produces
+animated WebP, so bundled `standard` needs only an `animation-webp` row for
+GIF, while `image/webp` needs both `still-avif` (static fixture) and
+`animation-webp` (animated fixture). Bundled `standard` and `thumbnail` are
+therefore certifiable once the full fixture matrix above is supplied.
+
 ## Firewall and Tailnet checks
 
 Binding to the concrete Tailnet address is mandatory but does not replace ACLs

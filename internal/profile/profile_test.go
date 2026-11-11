@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -626,12 +627,12 @@ func certifyDefinitionSkipping(t *testing.T, definition Definition, skipMIME str
 	parameters := decodeForTest(t, definition)
 	registry := CandidateRegistry()
 	for mimeType, recipe := range parameters.Recipes {
-		for _, output := range recipeOutputs(recipe) {
-			if output.kind == skipKind && (skipMIME == "" || mimeType == skipMIME) {
+		for _, output := range WorkerExecutableOutputs(mimeType, recipe) {
+			if output.Kind == skipKind && (skipMIME == "" || mimeType == skipMIME) {
 				continue
 			}
-			minimum, maximum := settingBounds(output.kind)
-			certification := certificationFor(mimeType, recipe, output.kind, recipe.MaxLongEdge, minimum, maximum)
+			minimum, maximum := settingBounds(output.Kind)
+			certification := certificationFor(mimeType, recipe, output.Kind, recipe.MaxLongEdge, minimum, maximum)
 			var err error
 			registry, err = registry.WithCertification(certification)
 			if err != nil {
@@ -647,10 +648,10 @@ func certifyDefinitionAdjusted(t *testing.T, definition Definition, targetMIME s
 	parameters := decodeForTest(t, definition)
 	registry := CandidateRegistry()
 	for mimeType, recipe := range parameters.Recipes {
-		for _, output := range recipeOutputs(recipe) {
-			minimum, maximum := settingBounds(output.kind)
-			certification := certificationFor(mimeType, recipe, output.kind, recipe.MaxLongEdge, minimum, maximum)
-			if mimeType == targetMIME && output.kind == targetKind {
+		for _, output := range WorkerExecutableOutputs(mimeType, recipe) {
+			minimum, maximum := settingBounds(output.Kind)
+			certification := certificationFor(mimeType, recipe, output.Kind, recipe.MaxLongEdge, minimum, maximum)
+			if mimeType == targetMIME && output.Kind == targetKind {
 				adjust(&certification)
 			}
 			var err error
@@ -697,4 +698,38 @@ func encodeForTest(t *testing.T, parameters Parameters) json.RawMessage {
 
 func validVideo() *VideoOutput {
 	return &VideoOutput{Container: "mp4", VideoCodec: "av1", CRF: 32, BitDepth: 10, Chroma: "4:2:0", AudioCodec: "aac", AudioBitrateKbps: 128}
+}
+
+func TestWorkerExecutableOutputsMatchesWorkerRoutes(t *testing.T) {
+	standard := StandardV1Parameters()
+	thumbnail := ThumbnailV1Parameters()
+	kinds := func(mimeType string, recipe Recipe) []OutputKind {
+		var result []OutputKind
+		for _, output := range WorkerExecutableOutputs(mimeType, recipe) {
+			result = append(result, output.Kind)
+		}
+		return result
+	}
+	for _, test := range []struct {
+		name   string
+		mime   string
+		recipe Recipe
+		want   []OutputKind
+	}{
+		{"still standard", "image/jpeg", standard.Recipes["image/jpeg"], []OutputKind{OutputStillAVIF}},
+		{"still thumbnail", "image/x-sony-arw", thumbnail.Recipes["image/x-sony-arw"], []OutputKind{OutputStillAVIF}},
+		{"gif all frames", "image/gif", standard.Recipes["image/gif"], []OutputKind{OutputAnimationWebP}},
+		{"gif first frame", "image/gif", thumbnail.Recipes["image/gif"], []OutputKind{OutputStillAVIF}},
+		{"webp all frames", "image/webp", standard.Recipes["image/webp"], []OutputKind{OutputStillAVIF, OutputAnimationWebP}},
+		{"webp first frame", "image/webp", thumbnail.Recipes["image/webp"], []OutputKind{OutputStillAVIF}},
+		{"video all frames", "video/mp4", standard.Recipes["video/mp4"], []OutputKind{OutputVideoAV1}},
+		{"video first frame", "video/quicktime", thumbnail.Recipes["video/quicktime"], []OutputKind{OutputStillAVIF}},
+	} {
+		if got := kinds(test.mime, test.recipe); !slices.Equal(got, test.want) {
+			t.Errorf("%s: got %v want %v", test.name, got, test.want)
+		}
+	}
+	if outputs := WorkerExecutableOutputs("image/gif", standard.Recipes["image/gif"]); outputs[0].Setting != 80 {
+		t.Fatalf("gif animation setting %+v", outputs)
+	}
 }

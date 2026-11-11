@@ -58,12 +58,12 @@ assert_migration() {
     "SELECT count(*) FILTER (WHERE version=$version AND name='$name' AND checksum='$checksum' AND NOT dirty)||':'||count(*) FILTER (WHERE dirty OR version>$version)||':'||max(version) FROM schema_migrations") == "1:0:$version" ]]
 }
 assert_current_migration() {
-  # Current boundary: exactly version 23 and nothing newer or dirty.
-  assert_migration 23 backup_checker_schema_compatibility e18b841175672304ca658f92e242978b447c64ae17c713c82ed55ba6e4c820aa
+  # Current boundary: exactly version 24 and nothing newer or dirty.
+  assert_migration 24 profile_route_certification e51192b64c5e9cb21f261ceb885efd6da25fa35d4e10f9a081b889c5edbd3c47
   # Retain exact historical evidence rather than replacing the old assertion
   # with an unconstrained max(version) check. Future/dirty versions still fail.
   [[ $(psql_root --tuples-only --no-align --command \
-    "SELECT count(*) FROM schema_migrations WHERE NOT dirty AND ((version=19 AND name='reconciliation_repair_execution' AND checksum='d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13') OR (version=20 AND name='admin_batch_receipts' AND checksum='31bf09939cd55366ef7486bde0bee42c9e0f255d20dece9a17b3139f81898acb') OR (version=21 AND name='admin_repair_schema_compatibility' AND checksum='42ed20866eaba31b0370352f8d011ae3faf16a4b4eca6bdac6a9432d6bd73558') OR (version=22 AND name='backup_artifact_lifecycle' AND checksum='6c3e581e8b5475dcba3faaa6ea5afd273e1b53569550bbf82ceb0b7c87126876'))") == 4 ]]
+    "SELECT count(*) FROM schema_migrations WHERE NOT dirty AND ((version=19 AND name='reconciliation_repair_execution' AND checksum='d67b0ec05f7f88c933786f87c4dcc4732a1c0af0e2eae561662a906fe72dfe13') OR (version=20 AND name='admin_batch_receipts' AND checksum='31bf09939cd55366ef7486bde0bee42c9e0f255d20dece9a17b3139f81898acb') OR (version=21 AND name='admin_repair_schema_compatibility' AND checksum='42ed20866eaba31b0370352f8d011ae3faf16a4b4eca6bdac6a9432d6bd73558') OR (version=22 AND name='backup_artifact_lifecycle' AND checksum='6c3e581e8b5475dcba3faaa6ea5afd273e1b53569550bbf82ceb0b7c87126876') OR (version=23 AND name='backup_checker_schema_compatibility' AND checksum='e18b841175672304ca658f92e242978b447c64ae17c713c82ed55ba6e4c820aa'))") == 5 ]]
 }
 wait_for_path() {
   local path=$1 attempt

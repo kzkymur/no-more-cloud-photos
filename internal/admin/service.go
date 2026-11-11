@@ -38,6 +38,8 @@ type Service struct {
 	afterResumeFence            func(context.Context) error
 	afterBackupCleanupSelection func(context.Context) error
 	beforeBackupArtifactDelete  func(context.Context) error
+	// Test-only seam over the real processors/probe; nil uses production.
+	newCertifyRuntime func(*certifyWorkspace) (certifyRuntime, error)
 }
 
 func New(pool *pgxpool.Pool) *Service {
