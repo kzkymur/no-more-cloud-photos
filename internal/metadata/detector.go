@@ -744,7 +744,12 @@ func classifyFTYP(reader io.ReaderAt, size, offset int64, boxSize, headerSize ui
 	if (sequence && !image && (cr3 || quickTime || mp4)) || (heic && explicitHEIF) || boolCount(image, cr3, quickTime, mp4) > 1 {
 		return Detection{}, invalid("conflicting BMFF brands")
 	}
-	if sequence {
+	// ISO/IEC 23008-12: a file may carry image items and an image sequence.
+	// A still-image structural brand (mif1/heif/heic family) declares that
+	// the file is still-image capable, so it is classified as still and its
+	// primary item is decoded downstream (a file without one fails the
+	// bounded probe). Only a sequence-only brand set remains unsupported.
+	if sequence && !image {
 		return Detection{}, ErrUnsupportedMediaType
 	}
 	// The major brand is the canonical container declaration. A generic mif1
