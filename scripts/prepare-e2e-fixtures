@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Prepare the #21 E2E fixture matrix into OUT (stdlib only, CI-only).
+
+Downloads every `source: download` entry of test/e2e/testdata/fixtures.json
+over HTTPS, accepting bytes only when size and SHA-256 equal the pin (a cached
+file is re-verified, never trusted). Generates the `source: generate` inputs
+at >= 1920 px with the repo's pinned static ffmpeg 6.0.1 (scripts/
+fetch-pinned-ffmpeg). Writes OUT/prepared.json describing each prepared file.
+Fetched third-party fixtures are test inputs only and are never committed.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+MAX_BYTES = 64 << 20
+FFMPEG = ROOT / '.tools/ffmpeg-6.0.1-amd64-static/ffmpeg'
+
+# Deterministic generated inputs. Sizes exceed the 1920 px recipe ceiling so a
+# certification run proves output at exactly the ceiling (no upscale).
+GENERATED = {
+    'bmp-generated': ('image/bmp', 'bmp', ['-f', 'lavfi', '-i', 'testsrc2=size=2400x1600:rate=1', '-frames:v', '1', '-pix_fmt', 'bgr24']),
+    'jpeg-generated': ('image/jpeg', 'jpg', ['-f', 'lavfi', '-i', 'testsrc2=size=2400x1600:rate=1', '-frames:v', '1', '-q:v', '3']),
+    'png-generated': ('image/png', 'png', ['-f', 'lavfi', '-i', 'testsrc2=size=2400x1600:rate=1', '-frames:v', '1']),
+    'gif-generated-animated': ('image/gif', 'gif', ['-f', 'lavfi', '-i', 'testsrc2=size=2000x1500:rate=5', '-t', '1.6',
+                                                   '-vf', 'split[a][b];[a]palettegen=max_colors=64[p];[b][p]paletteuse', '-loop', '0']),
+    'video-mp4-generated': ('video/mp4', 'mp4', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+                                                 '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', '-f', 'mp4']),
+    'video-quicktime-generated': ('video/quicktime', 'mov', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24', '-t', '2',
+                                                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', '-f', 'mov']),
+}
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def regular(path):
+    st = os.lstat(path)
+    return st.st_mode & 0o170000 == 0o100000 and st.st_nlink == 1
+
+
+def download(entry, target):
+    if os.path.lexists(target):
+        if regular(target) and os.path.getsize(target) == entry['size'] and digest(target) == entry['sha256']:
+            return 'cache'
+        raise RuntimeError('prepared fixture %s does not match its pin; refusing to replace it' % entry['name'])
+    if not entry['url'].startswith('https://') or entry['size'] > MAX_BYTES:
+        raise RuntimeError('unsafe fixture pin %s' % entry['name'])
+    partial = target.with_name(target.name + '.part')
+    if os.path.lexists(partial):
+        os.unlink(partial)
+    subprocess.run(['curl', '--fail', '--location', '--silent', '--show-error', '--proto', '=https', '--proto-redir', '=https',
+                    '--connect-timeout', '20', '--max-time', '300', '--retry', '3', '--retry-all-errors',
+                    '--max-filesize', str(MAX_BYTES), '--output', str(partial), entry['url']], check=True, timeout=1000)
+    if not regular(partial) or os.path.getsize(partial) != entry['size'] or digest(partial) != entry['sha256']:
+        os.unlink(partial)
+        raise RuntimeError('downloaded fixture %s does not match its pin' % entry['name'])
+    os.chmod(partial, 0o644)
+    os.rename(partial, target)
+    return 'https'
+
+
+def generate(name, target):
+    mime, _, args = GENERATED[name]
+    if not FFMPEG.is_file():
+        subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/fetch-pinned-ffmpeg')], check=True, timeout=600)
+        subprocess.run(['tar', '-xJf', str(ROOT / '.tools/ffmpeg-6.0.1-amd64-static.tar.xz'), '-C', str(ROOT / '.tools')], check=True, timeout=300)
+    if os.path.lexists(target):
+        os.unlink(target)
+    subprocess.run([str(FFMPEG), '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *args, str(target)],
+                   check=True, timeout=300, env={'PATH': '/usr/bin:/bin'})
+    os.chmod(target, 0o644)
+    return mime
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--out', required=True)
+    args = parser.parse_args()
+    out = Path(args.out).resolve()
+    out.mkdir(mode=0o755, parents=True, exist_ok=True)
+    entries = json.loads((ROOT / 'test/e2e/testdata/fixtures.json').read_text())
+    prepared = []
+    for entry in entries:
+        name = entry['name']
+        if entry['source'] == 'download':
+            ext = entry['url'].rsplit('.', 1)[-1].lower()
+            target = out / ('%s.%s' % (name, ext if ext.isalnum() and len(ext) <= 5 else 'bin'))
+            origin = download(entry, target)
+        elif entry['source'] == 'generate':
+            if name not in GENERATED:
+                raise RuntimeError('no generator for %s' % name)
+            target = out / ('%s.%s' % (name, GENERATED[name][1]))
+            generate(name, target)
+            origin = 'generated'
+        else:
+            raise RuntimeError('unknown fixture source for %s' % name)
+        prepared.append({'name': name, 'mime_type': entry['mime_type'], 'file': target.name, 'sha256': digest(target),
+                         'size': os.path.getsize(target), 'origin': origin,
+                         'certification': bool(entry.get('certification', entry['source'] == 'generate'))})
+    for name in GENERATED:
+        if name not in {p['name'] for p in prepared}:
+            target = out / ('%s.%s' % (name, GENERATED[name][1]))
+            mime = generate(name, target)
+            prepared.append({'name': name, 'mime_type': mime, 'file': target.name, 'sha256': digest(target),
+                             'size': os.path.getsize(target), 'origin': 'generated', 'certification': True})
+    (out / 'prepared.json').write_text(json.dumps(prepared, indent=1, sort_keys=True) + '\n')
+    print('prepared %d fixtures in %s' % (len(prepared), out))
+
+
+if __name__ == '__main__':
+    main()
