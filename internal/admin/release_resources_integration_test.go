@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -11,14 +12,19 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
+	"github.com/kzkymur/no-more-cloud-photos/internal/reconciliation"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 // #21 L3: the aggregate production budget is ONE nmcp.slice (CPUQuota=200%,
@@ -157,6 +163,14 @@ func TestReleaseGateResources(t *testing.T) {
 		t.Fatal("real production migrations failed")
 	}
 	f.bootstrapLive(true)
+	// The media root is a sized tmpfs owned by the runtime user so the real
+	// units can later be driven into ENOSPC without touching any host disk.
+	runtimeUser, _ := user.Lookup("nmcp")
+	f.run("/usr/bin/mount", "-t", "tmpfs", "-o", "size=2g,mode=0700,uid="+runtimeUser.Uid+",gid="+runtimeUser.Gid+",nosuid,nodev", "nmcp-release-media", "/var/lib/nmcp/media")
+	t.Cleanup(func() {
+		_, _ = systemctl(context.Background(), "stop", "nmcp-api.service", "nmcp-worker.service")
+		_ = exec.Command("/usr/bin/umount", "/var/lib/nmcp/media").Run()
+	})
 	f.installLiveUnits(artifacts, prefix, video, icc)
 
 	// A narrow standard-shaped profile for exactly the measured inputs,
@@ -264,4 +278,78 @@ func TestReleaseGateResources(t *testing.T) {
 		}
 	}
 	t.Log(fmt.Sprintf("actual RAW and AV1 transforms under one nmcp.slice: peak %.2f GiB < 4 GiB, no OOM", float64(peak)/(1<<30)))
+
+	// One real-unit ENOSPC case: shrink the media filesystem to its current
+	// use plus 64 KiB; a 12 MB upload through the sandboxed API unit must fail
+	// without accepting anything, and the same key must succeed after recovery.
+	var fs syscall.Statfs_t
+	if syscall.Statfs("/var/lib/nmcp/media", &fs) != nil {
+		t.Fatal("statfs media")
+	}
+	used := (int64(fs.Blocks) - int64(fs.Bfree)) * int64(fs.Bsize)
+	f.run("/usr/bin/mount", "-o", "remount,size="+strconv.FormatInt(used+64<<10, 10), "/var/lib/nmcp/media")
+	big := liveLargeBMP()
+	status := releaseUploadStatus(t, ctx, big, "enospc.bmp", "release-enospc")
+	f.run("/usr/bin/mount", "-o", "remount,size=2g", "/var/lib/nmcp/media")
+	if status != http.StatusInternalServerError && status != http.StatusServiceUnavailable {
+		t.Fatalf("real API upload on a full media filesystem: status %d, want 500/503", status)
+	}
+	if pg17Scalar(t, ctx, migrator, `SELECT count(*)::text FROM originals WHERE size_bytes=$1`, len(big)) != "0" {
+		t.Fatal("ENOSPC upload accepted an original")
+	}
+	if got := releaseUploadStatus(t, ctx, big, "enospc.bmp", "release-enospc"); got != http.StatusCreated {
+		t.Fatalf("same key after ENOSPC recovery: status %d, want 201 (transient failures are never stored)", got)
+	}
+	store, err := storage.Open("/var/lib/nmcp/media", storage.Options{})
+	if err != nil {
+		t.Fatal("open real media store")
+	}
+	defer store.Close()
+	if result, err := New(migrator).Check(ctx, store, reconciliation.ScopeAll); err != nil {
+		t.Fatalf("reconciliation after real-unit ENOSPC: sealed=%t findings=%d", result.Sealed, result.FindingCount)
+	}
+	t.Log("actual real-unit ENOSPC: upload refused without acceptance, same key accepted after recovery, DB/FS reconciliation clean")
+}
+
+func releaseUploadStatus(t *testing.T, ctx context.Context, data []byte, name, key string) int {
+	t.Helper()
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+	part, _ := w.CreateFormFile("file", name)
+	part.Write(data)
+	w.Close()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1:8080/media", &b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Idempotency-Key", key)
+	resp, err := (&http.Client{Timeout: 2 * time.Minute, Transport: &http.Transport{Proxy: nil}}).Do(req)
+	if err != nil {
+		t.Fatalf("upload %s: %v", name, err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// liveLargeBMP is a distinct 2000x2000 24-bit BMP (about 12 MB).
+func liveLargeBMP() []byte {
+	const w, h = 2000, 2000
+	row := (w*3 + 3) &^ 3
+	size := 54 + row*h
+	b := make([]byte, size)
+	copy(b, "BM")
+	binary.LittleEndian.PutUint32(b[2:], uint32(size))
+	binary.LittleEndian.PutUint32(b[10:], 54)
+	binary.LittleEndian.PutUint32(b[14:], 40)
+	binary.LittleEndian.PutUint32(b[18:], w)
+	binary.LittleEndian.PutUint32(b[22:], h)
+	binary.LittleEndian.PutUint16(b[26:], 1)
+	binary.LittleEndian.PutUint16(b[28:], 24)
+	binary.LittleEndian.PutUint32(b[34:], uint32(row*h))
+	for i := 54; i < size; i++ {
+		b[i] = byte(i * 2654435761 >> 24)
+	}
+	return b
 }
