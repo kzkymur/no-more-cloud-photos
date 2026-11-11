@@ -122,6 +122,12 @@ jobs:
         with:
           path: test/e2e/testdata/prepared
           key: nmcp-e2e-fixtures-v1-${{ hashFiles('test/e2e/testdata/fixtures.json', 'scripts/prepare-e2e-fixtures') }}
+      - name: Cache pinned fixture ffmpeg archive (shared with the test job; re-verified by fetch-pinned-ffmpeg)
+        if: steps.scenario.outputs.present == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .tools/downloads/ffmpeg-6.0.1-amd64-static-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5.tar.xz
+          key: fixture-ffmpeg-linux-amd64-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
       - name: Prepare issue 21 fixtures
         if: steps.scenario.outputs.present == 'true'
         run: |
