@@ -54,6 +54,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: scripts/infra-e2e-budget-acquire 1500
+      - name: Record resolver diagnostics (host vs container)
+        run: |
+          set +e
+          echo "--- host /etc/resolv.conf"; grep -v '^#' /etc/resolv.conf
+          resolvectl status 2>/dev/null | grep -E 'DNS Servers|Current DNS' | head -4
+          for name in archive.ubuntu.com security.ubuntu.com; do
+            printf 'host %s: ' "$name"; timeout 10 getent hosts "$name" | head -1 || echo FAIL
+            printf 'container (default bridge) %s: ' "$name"
+            timeout 20 docker run --rm ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 getent hosts "$name" | head -1 || echo FAIL
+          done
+          echo "--- container resolv.conf (default bridge)"
+          timeout 20 docker run --rm ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 cat /etc/resolv.conf
+          exit 0
       - name: Harness self-test (contract only, not issue 21 acceptance)
         env:
           NMCP_E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-results/selftest
