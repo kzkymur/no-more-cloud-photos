@@ -76,7 +76,14 @@ jobs:
         run: |
           timeout 1m internal/videoprocessor/helper/validate-inherited-toolchain_test.sh
           timeout 1m bash internal/videoprocessor/helper/acquisition_test.sh
+      - name: Restore untrusted still-toolchain source archives
+        id: stillsources
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/still-toolchain-work/downloads
+          key: still-toolchain-sources-v1-${{ hashFiles('internal/stillprocessor/helper/build-pinned-toolchain.sh', 'internal/stillprocessor/helper/toolchain.lock') }}
       - name: Build native still-image helper smoke target
+        id: stillbuild
         run: |
           sudo apt-get install -y --no-install-recommends \
             autoconf automake cmake libtool make meson nasm ninja-build pkg-config \
@@ -149,6 +156,15 @@ jobs:
             "${RUNNER_TEMP}/generated-heif-fixtures/collection-primary-second.avif" >> "${GITHUB_ENV}"
           printf 'LD_LIBRARY_PATH=%s\n' \
             "/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64" >> "${GITHUB_ENV}"
+      # Only after every archive passed its pinned SHA-256 in the step above, so a
+      # partial download can never be stored. build-pinned-toolchain.sh re-verifies
+      # the restored bytes before use.
+      - name: Save verified still-toolchain source archives
+        if: steps.stillbuild.outcome == 'success' && steps.stillsources.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/still-toolchain-work/downloads
+          key: still-toolchain-sources-v1-${{ hashFiles('internal/stillprocessor/helper/build-pinned-toolchain.sh', 'internal/stillprocessor/helper/toolchain.lock') }}
       - name: Build pinned native animation helper and fixtures
         run: |
           chmod +x internal/animationprocessor/helper/build-pinned-codecs.sh
@@ -379,7 +395,11 @@ jobs:
             ${{ runner.temp }}/backup-native-closure.tar.gz
             ${{ runner.temp }}/backup-native-toolchain.tar.gz
           if-no-files-found: error
-          retention-days: 1
+          # Handoff to the root jobs. A partial "re-run failed jobs" reuses this
+          # producer job without re-executing it, so the artifact must outlive the
+          # rerun window. Naming it by run_attempt would break exactly that case.
+          # Past this retention, only a full rerun can rebuild the handoff.
+          retention-days: 7
       - name: Preserve failed probe acquisition identity
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -482,7 +502,11 @@ jobs:
           name: backup-postgresql17-${{ github.sha }}
           path: ${{ runner.temp }}/backup-pg17-closure.tar.gz
           if-no-files-found: error
-          retention-days: 1
+          # Handoff to the root jobs. A partial "re-run failed jobs" reuses this
+          # producer job without re-executing it, so the artifact must outlive the
+          # rerun window. Naming it by run_attempt would break exactly that case.
+          # Past this retention, only a full rerun can rebuild the handoff.
+          retention-days: 7
   backup-live-cutover:
     name: Backup / actual systemd all-pool cutover and separate resume
     needs: [test, backup-postgresql17]

@@ -107,45 +107,79 @@ type offlineSourceActions interface {
 }
 type offlineSystemSource struct{ hba cutoverFile }
 
+// offlineFenceError is a closed, sanitized reason for a failed source fence.
+// It wraps errRestore; only fixed labels, validated unit names and systemd
+// ActiveState enum values are ever included.
+type offlineFenceError struct{ reason string }
+
+func (e offlineFenceError) Error() string     { return "offline source fence: " + e.reason }
+func (e offlineFenceError) Unwrap() error     { return errRestore }
+func offlineFenceFailure(reason string) error { return offlineFenceError{reason} }
+
+// offlineFenceUnit keeps only the fixed units and validated PG17 unit names.
+func offlineFenceUnit(unit string) string {
+	switch unit {
+	case "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service":
+		return unit
+	}
+	if backupPGUnitPattern.MatchString(unit) {
+		return unit
+	}
+	return "<invalid unit>"
+}
+func offlineActiveStateLabel(state string) string {
+	switch state {
+	case "active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing":
+		return state
+	}
+	return "unknown"
+}
+
 func (a *offlineSystemSource) Fence(ctx context.Context, op RestoreOperation) error {
 	ctx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 	// Install durable reject rules BEFORE stopping: even a failed/partial stop or
 	// subsequent operator restart cannot expose the old source to routine roles.
 	if replaceCutoverFile(a.hba) != nil {
-		return errRestore
+		return offlineFenceFailure("source HBA fence write")
 	}
 	if _, e := systemctl(ctx, "stop", "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service", op.OfflineAuthority.SourceUnit); e != nil {
-		return errRestore
+		return offlineFenceFailure("stop command")
 	}
 	return a.VerifyStopped(ctx, op)
 }
 func offlineInactive(ctx context.Context, unit string) error {
 	state, e := systemctl(ctx, "show", "--property=ActiveState", "--value", unit)
-	if e != nil || state != "inactive" {
-		return errRestore
+	if e != nil {
+		return offlineFenceFailure("state query " + offlineFenceUnit(unit))
+	}
+	if state != "inactive" {
+		return offlineFenceFailure("not inactive " + offlineFenceUnit(unit) + " (" + offlineActiveStateLabel(state) + ")")
 	}
 	pid, e := unitPID(ctx, unit)
 	if e != nil || pid != 0 {
-		return errRestore
+		return offlineFenceFailure("main PID present " + offlineFenceUnit(unit))
 	}
 	return nil
 }
 func (a *offlineSystemSource) VerifyStopped(ctx context.Context, op RestoreOperation) error {
 	for _, u := range []string{"nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service", op.OfflineAuthority.SourceUnit} {
-		if offlineInactive(ctx, u) != nil {
-			return errRestore
+		if e := offlineInactive(ctx, u); e != nil {
+			return e
 		}
 	}
 	return a.verifySourceStopped(ctx, op)
 }
 func (a *offlineSystemSource) verifySourceStopped(ctx context.Context, op RestoreOperation) error {
-	if offlineInactive(ctx, op.OfflineAuthority.SourceUnit) != nil {
-		return errRestore
+	if e := offlineInactive(ctx, op.OfflineAuthority.SourceUnit); e != nil {
+		return e
 	}
 	current, e := safeCutoverFile(op.OfflineAuthority.SourceHBAPath, true)
-	if e != nil || !bytes.Equal(current.before, a.hba.after) {
-		return errRestore
+	if e != nil {
+		return offlineFenceFailure("source HBA metadata")
+	}
+	if !bytes.Equal(current.before, a.hba.after) {
+		return offlineFenceFailure("source HBA content")
 	}
 	ep := op.OfflineAuthority.SourceEndpoint
 	endpoints := []struct{ network, address string }{{"unix", filepath.Join(ep.SocketDirectory, fmt.Sprintf(".s.PGSQL.%d", ep.Port))}}
@@ -158,11 +192,11 @@ func (a *offlineSystemSource) verifySourceStopped(ctx context.Context, op Restor
 		cancel()
 		if e == nil {
 			conn.Close()
-			return errRestore
+			return offlineFenceFailure("source endpoint reachable " + ep.network)
 		}
 		// A timeout, canceled context, or permission denial does not prove absence.
 		if ctx.Err() != nil || !(os.IsNotExist(e) || isOfflineRefused(e)) {
-			return errRestore
+			return offlineFenceFailure("source endpoint absence unproven " + ep.network)
 		}
 	}
 	return nil
@@ -206,7 +240,13 @@ func runOfflineFence(ctx context.Context, root string, op *RestoreOperation, a o
 	if save(root, *op) != nil {
 		return errRestore
 	}
-	if a.Fence(ctx, *op) != nil {
+	if e := a.Fence(ctx, *op); e != nil {
+		var typed offlineFenceError
+		if errors.As(e, &typed) {
+			op.FenceFailure = typed.reason
+		} else {
+			op.FenceFailure = "unclassified"
+		}
 		return errRestore
 	}
 	op.Phase = "offline_source_fenced"

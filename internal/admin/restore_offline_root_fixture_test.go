@@ -281,7 +281,8 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	migrator.Close()
 	op, e := New(nil).Restore(ctx, backupID, settings)
 	if e != nil || op.Phase != "offline_validated" {
-		t.Fatalf("actual offline Restore failed at sanitized phase %s", op.FailedPhase)
+		logOfflineFenceUnits(t, ctx, authority.SourceUnit)
+		t.Fatalf("actual offline Restore failed at sanitized phase %s fence_failure=%q", op.FailedPhase, op.FenceFailure)
 	}
 	if syscall.Kill(initialPID, 0) != syscall.ESRCH || VerifyOfflineSourceFence(ctx, op) != nil {
 		t.Fatal("actual source postmaster/fence/endpoint absence not proven")
@@ -841,4 +842,14 @@ func TestOfflineTimeoutChild(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.WriteFile(marker, []byte("unexpected cleanup"), 0600) })
 	select {}
+}
+
+// logOfflineFenceUnits records manager state of the exact fence targets after a
+// failed offline Restore. Fixed property names and unit names only.
+func logOfflineFenceUnits(t *testing.T, ctx context.Context, sourceUnit string) {
+	t.Helper()
+	for _, unit := range []string{"nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service", "nmcp-migrate.service", sourceUnit} {
+		out, err := systemctl(ctx, "show", "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=Result", "--property=MainPID", "--property=ExecMainStatus", "--property=ExecMainCode", unit)
+		t.Logf("offline fence target %s inspection_error=%t %q", offlineFenceUnit(unit), err != nil, strings.ReplaceAll(out, "\n", " "))
+	}
 }

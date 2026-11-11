@@ -120,6 +120,45 @@ func TestOfflineFenceRequiresDurableAuthorizationBeforeEffects(t *testing.T) {
 		t.Fatal("failed source stop claimed fenced")
 	}
 }
+
+type offlineFenceReasonSource struct{ err error }
+
+func (a offlineFenceReasonSource) Fence(context.Context, RestoreOperation) error { return a.err }
+func (a offlineFenceReasonSource) VerifyStopped(context.Context, RestoreOperation) error {
+	return nil
+}
+func TestOfflineFenceFailureRecordsClosedReason(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{offlineFenceFailure("not inactive nmcp-api.service (failed)"), "not inactive nmcp-api.service (failed)"},
+		{fmt.Errorf("wrapped: %w", offlineFenceFailure("stop command")), "stop command"},
+		{errors.New("raw SECRET systemctl stderr"), "unclassified"},
+	} {
+		op := RestoreOperation{}
+		e := runOfflineFence(context.Background(), "unused", &op, offlineFenceReasonSource{c.err}, func(string, RestoreOperation) error { return nil })
+		if !errors.Is(e, errRestore) || op.FenceFailure != c.want || op.Phase != "offline_fence_authorized" || strings.Contains(e.Error(), "SECRET") {
+			t.Fatalf("err=%v reason=%q phase=%s", e, op.FenceFailure, op.Phase)
+		}
+	}
+	if !errors.Is(offlineFenceFailure("x"), errRestore) {
+		t.Fatal("fence reason must remain a restore error")
+	}
+	for unit, want := range map[string]string{
+		"nmcp-api.service": "nmcp-api.service", "postgresql@17-nmcp-offline-fixture.service": "postgresql@17-nmcp-offline-fixture.service",
+		"evil.service": "<invalid unit>", "postgresql@17-x;rm.service": "<invalid unit>",
+	} {
+		if got := offlineFenceUnit(unit); got != want {
+			t.Fatalf("unit %q -> %q", unit, got)
+		}
+	}
+	for state, want := range map[string]string{"failed": "failed", "inactive": "inactive", "SECRET\nvalue": "unknown", "": "unknown"} {
+		if got := offlineActiveStateLabel(state); got != want {
+			t.Fatalf("state %q -> %q", state, got)
+		}
+	}
+}
 func TestOfflineAuthorityRejectsUnknownJSONAndRoutineUID(t *testing.T) {
 	var a OfflineRestoreAuthority
 	if decodeRestore([]byte(`{"unexpected":true}`), &a) == nil {
