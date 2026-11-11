@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Fail unless every given release binary contains no failpoint code.
+
+Usage: check-release-no-failpoints [--go GO] [--source-root DIR] BINARY...
+
+A binary built without -tags nmcp_failpoints inlines failpoint.Hit to nothing
+and the linker drops internal/failpoint entirely. This gate rejects a binary if
+any of the following holds:
+
+  * its bytes contain NMCP_FAILPOINT, nmcp-failpoint, any point name, or the
+    package path internal/failpoint. The package path check reads the runtime
+    function/file name tables (pclntab), which survive -ldflags='-s -w', so it
+    also covers stripped release binaries;
+  * `go tool nm` lists any internal/failpoint symbol. A stripped binary has no
+    symbol table; that is reported and the pclntab byte scan stands in for it.
+
+Point names are read from internal/failpoint/failpoint_on.go and must cover
+exactly the Point constants of internal/failpoint/points.go.
+Exit 0: all clean. Exit 1: a binary contains failpoint code. Exit 2: usage,
+source or tool error.
+"""
+import argparse
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+PACKAGE_PATH = b'internal/failpoint'
+FIXED_MARKERS = (b'NMCP_FAILPOINT', b'nmcp-failpoint', PACKAGE_PATH)
+NM_TIMEOUT_SECONDS = 120
+
+
+class GateError(Exception):
+    pass
+
+
+def point_names(source_root):
+    package = Path(source_root) / 'internal' / 'failpoint'
+    try:
+        points = (package / 'points.go').read_text(encoding='utf-8')
+        tagged = (package / 'failpoint_on.go').read_text(encoding='utf-8')
+    except OSError as error:
+        raise GateError(f'cannot read failpoint sources: {error}') from error
+    block = re.search(r'\bpointNone Point = iota\n(.*?)\n\tpointLimit\n', points, re.S)
+    if block is None:
+        raise GateError('points.go: Point enum block not found')
+    constants = re.findall(r'^\t([A-Z][A-Za-z0-9]*)$', block.group(1), re.M)
+    table = re.search(r'var pointNames = \[pointLimit\]string\{\n(.*?)\n\}', tagged, re.S)
+    if table is None:
+        raise GateError('failpoint_on.go: pointNames table not found')
+    mapping = {}
+    for line in table.group(1).splitlines():
+        match = re.fullmatch(r'\t([A-Z][A-Za-z0-9]*):\s+"([a-z_]+\.[a-z_]+)",', line)
+        if match is None or match.group(1) in mapping:
+            raise GateError(f'failpoint_on.go: unexpected pointNames entry {line!r}')
+        mapping[match.group(1)] = match.group(2)
+    if not constants or sorted(constants) != sorted(mapping):
+        raise GateError(f'point constants {sorted(constants)} do not match named points {sorted(mapping)}')
+    names = [mapping[constant] for constant in constants]
+    if len(set(names)) != len(names):
+        raise GateError('duplicate point names')
+    return names
+
+
+def go_tool(explicit):
+    candidate = explicit or os.environ.get('GO') or shutil.which('go')
+    if not candidate:
+        raise GateError('go toolchain not found (use --go or GO)')
+    return candidate
+
+
+def symbol_findings(go, binary):
+    try:
+        result = subprocess.run([go, 'tool', 'nm', str(binary)], capture_output=True, text=True,
+                                timeout=NM_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GateError(f'{binary}: go tool nm failed: {error}') from error
+    if result.returncode != 0:
+        if 'no symbols' in result.stderr:
+            return None
+        raise GateError(f'{binary}: go tool nm exited {result.returncode}: {result.stderr.strip()}')
+    return [line.split()[-1] for line in result.stdout.splitlines()
+            if PACKAGE_PATH.decode() + '.' in line]
+
+
+def check(binary, names, go):
+    try:
+        data = Path(binary).read_bytes()
+    except OSError as error:
+        raise GateError(f'cannot read {binary}: {error}') from error
+    findings = [f'contains {marker.decode()!r}' for marker in FIXED_MARKERS if marker in data]
+    findings += [f'contains point name {name!r}' for name in names if name.encode() in data]
+    symbols = symbol_findings(go, binary)
+    if symbols is None:
+        note = 'stripped: no symbol table, pclntab package-path scan applies'
+    else:
+        note = f'{len(symbols)} internal/failpoint symbols'
+        findings += [f'symbol {symbol}' for symbol in symbols]
+    return findings, note
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description='Reject release binaries containing failpoint code.')
+    parser.add_argument('--go', help='go command used for `go tool nm` (default: $GO or go on PATH)')
+    parser.add_argument('--source-root', default=str(Path(__file__).resolve().parent.parent),
+                        help='repository root holding internal/failpoint (default: this checkout)')
+    parser.add_argument('binaries', nargs='+')
+    arguments = parser.parse_args(argv)
+    try:
+        names = point_names(arguments.source_root)
+        go = go_tool(arguments.go)
+        failed = False
+        for binary in arguments.binaries:
+            findings, note = check(binary, names, go)
+            if findings:
+                failed = True
+                print(f'FAIL {binary}: failpoint code present ({note})')
+                for finding in findings:
+                    print(f'  {finding}')
+            else:
+                print(f'OK   {binary}: no failpoint strings, names or package ({note}; {len(names)} names checked)')
+    except GateError as error:
+        print(f'check-release-no-failpoints: {error}', file=sys.stderr)
+        return 2
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

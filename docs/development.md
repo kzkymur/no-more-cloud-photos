@@ -175,6 +175,46 @@ database context to requeue only a still-live lease with `worker_shutdown`
 before closing dependencies. A lost or exactly expired token never writes an
 error or state.
 
+## Crash-point injection
+
+`internal/failpoint` lets the end-to-end lane kill the real API and Worker
+processes at named crash boundaries and then prove restart reconciliation.
+Points exist only in binaries built with `-tags nmcp_failpoints`; those images
+are for the crash lane only. A tagged process reads `NMCP_FAILPOINT` once at
+startup as `NAME` or `NAME@N` (fire on the Nth hit of that point, default 1);
+an unknown name or malformed ordinal exits 2 before anything else starts. When
+the armed hit is reached the process writes `nmcp-failpoint fired NAME` to
+stderr and sends itself SIGKILL: no fsync, deferred cleanup, response or
+graceful shutdown. Restart the process without `NMCP_FAILPOINT` (or with a
+different point) to observe recovery. Untagged builds compile `failpoint.Hit`
+to an empty inlined function and the linker drops the package, so release
+binaries carry no point names, environment read or exit path.
+`scripts/check-release-no-failpoints api worker admin` gates release binaries
+(strings, point names, the package path in pclntab, which survives `-s -w`, and
+`go tool nm` symbols); `scripts/test-check-release-no-failpoints` proves it
+accepts untagged and rejects tagged `core-api` builds.
+
+| Point | Process | Exact boundary |
+| --- | --- | --- |
+| `upload.before_original_publish` | API | Temp written, fsynced, sealed and probed; acceptance transaction holds its locks; before the original rename. |
+| `upload.after_original_publish` | API | After the original rename and final directory fsync; acceptance transaction not committed. |
+| `upload.after_db_commit` | API | After a new (201, not replayed) acceptance commit; before the HTTP response is written. |
+| `rendition.before_file_publish` | Worker | Rendition temp produced; publication transaction holds Media/Job/Target locks; before temp fsync, validation and rename. |
+| `rendition.after_file_publish` | Worker | After the rendition rename and final directory fsync; rendition row, Target and Job transaction not committed. |
+| `rendition.after_db_commit` | Worker | After that transaction commits (Target succeeded, and the Job for its last Target); before the next Target or the Job result returns to the Worker loop. |
+| `purge.after_start` | Worker | Purge lease and file manifest committed; before any file deletion. |
+| `purge.after_file_delete` | Worker | One manifest file deleted (unlink and directory fsync) or found missing; its progress row not committed. Renditions go first, the Original last. |
+| `purge.after_file_step` | Worker | One file's progress row committed; before the next file step. |
+| `purge.before_finalize` | Worker | Every manifest file done; before the Media deletion, tombstone and Job success transaction. |
+| `purge.after_finalize` | Worker | After that transaction commits; before the executor returns. |
+
+With `@N`, count hits per process: for example a Media with two renditions hits
+`purge.after_file_delete` for its Original on hit 3. The storage
+`Options.Faults` injector stays unwired in API and Worker: its boundaries are
+shared by Originals, Renditions, quarantine and repair and do not identify the
+upload, publish and purge steps above, which the explicit points already cover
+at the same rename/fsync/commit edges.
+
 ## Job lease and process boundary
 
 `internal/job` claims only registered transform work in a short PostgreSQL

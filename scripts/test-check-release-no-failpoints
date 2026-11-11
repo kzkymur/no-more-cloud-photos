@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Prove check-release-no-failpoints accepts untagged and rejects tagged builds.
+
+Builds ./cmd/core-api without and with -tags nmcp_failpoints, each both with
+the release flags (-trimpath -ldflags='-s -w', as infra/validation/core.Dockerfile)
+and unstripped, into a private temporary directory. Requires a Go toolchain
+($GO or go on PATH); run from any directory.
+"""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+GATE = ROOT / 'scripts' / 'check-release-no-failpoints'
+GO = os.environ.get('GO') or shutil.which('go')
+BUILD_TIMEOUT_SECONDS = 600
+
+
+def build(go, output, tags, stripped):
+    command = [go, 'build', '-o', str(output)]
+    if tags:
+        command += ['-tags', 'nmcp_failpoints']
+    if stripped:
+        command += ['-trimpath', '-ldflags=-s -w']
+    command.append('./cmd/core-api')
+    environment = dict(os.environ, CGO_ENABLED='0')
+    subprocess.run(command, cwd=ROOT, env=environment, check=True, timeout=BUILD_TIMEOUT_SECONDS)
+
+
+def gate(*arguments):
+    go = ['--go', GO] if GO else []
+    return subprocess.run([sys.executable, '-I', str(GATE), *go, *map(str, arguments)],
+                          capture_output=True, text=True, timeout=300, check=False)
+
+
+@unittest.skipIf(GO is None, 'go toolchain not found')
+class GateVerdictTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix='nmcp-failpoint-gate-')
+        directory = Path(cls.temp.name)
+        cls.binaries = {}
+        for tags in (False, True):
+            for stripped in (False, True):
+                name = f"core-api-{'tagged' if tags else 'release'}-{'stripped' if stripped else 'symbols'}"
+                build(GO, directory / name, tags, stripped)
+                cls.binaries[(tags, stripped)] = directory / name
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def test_untagged_binaries_pass(self):
+        result = gate(self.binaries[(False, False)], self.binaries[(False, True)])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('0 internal/failpoint symbols', result.stdout)
+        self.assertIn('stripped: no symbol table', result.stdout)
+        self.assertNotIn('FAIL', result.stdout)
+
+    def test_tagged_unstripped_binary_fails_on_strings_names_and_symbols(self):
+        result = gate(self.binaries[(True, False)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for expected in ("contains 'NMCP_FAILPOINT'", "contains 'nmcp-failpoint'", "contains 'internal/failpoint'",
+                         "contains point name 'upload.after_original_publish'", "contains point name 'purge.after_finalize'",
+                         'symbol github.com/kzkymur/no-more-cloud-photos/internal/failpoint.parse'):
+            self.assertIn(expected, result.stdout)
+
+    def test_tagged_stripped_binary_fails_without_symbol_table(self):
+        result = gate(self.binaries[(True, True)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('stripped: no symbol table', result.stdout)
+        self.assertIn("contains 'internal/failpoint'", result.stdout)
+        self.assertIn("contains point name 'rendition.after_db_commit'", result.stdout)
+
+    def test_one_tagged_binary_fails_the_whole_set(self):
+        result = gate(self.binaries[(False, True)], self.binaries[(True, True)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count('OK   '), 1)
+        self.assertEqual(result.stdout.count('FAIL '), 1)
+
+
+class GateInputTests(unittest.TestCase):
+    def test_missing_binary_and_bad_source_root_are_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / 'fake'
+            fake.write_bytes(b'\x7fELF not really')
+            self.assertEqual(gate(Path(directory) / 'absent').returncode, 2)
+            self.assertEqual(gate('--source-root', directory, fake).returncode, 2)
+
+    def test_marker_bytes_fail_even_without_go_symbols(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / 'fake'
+            fake.write_bytes(b'padding nmcp-failpoint fired purge.after_start padding')
+            result = gate(fake)
+            # Not an object file: nm errors, so the gate must not report OK.
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/animationprocessor"
+	"github.com/kzkymur/no-more-cloud-photos/internal/failpoint"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 	"github.com/kzkymur/no-more-cloud-photos/internal/processrunner"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
@@ -280,6 +281,7 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 		DurationMS: transformed.durationMS, ProcessorAudit: audit,
 	}, func() (int64, string, error) {
 		var publishErr error
+		failpoint.Hit(failpoint.RenditionBeforeFilePublish)
 		info, publishErr = temporary.Publish(ctx, storage.Validation{ExpectedSize: -1})
 		if publishErr != nil {
 			var storageError *storage.PublishError
@@ -289,6 +291,7 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 			return 0, "", publishErr
 		}
 		published = true
+		failpoint.Hit(failpoint.RenditionAfterFilePublish)
 		if info.Size < 0 || generatedBytes > math.MaxInt64-info.Size {
 			return 0, "", job.ErrInvariant
 		}
@@ -297,6 +300,7 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 	if err != nil {
 		return false, info.Size, cancellationCause(ctx, err)
 	}
+	failpoint.Hit(failpoint.RenditionAfterDBCommit)
 	return false, info.Size, nil
 }
 

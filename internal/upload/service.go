@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/failpoint"
 	"github.com/kzkymur/no-more-cloud-photos/internal/metadata"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
@@ -311,9 +312,11 @@ func (s *Service) Accept(ctx context.Context, request Request) (outcome Outcome,
 			EXIFJSON: exifJSON, SourceJSON: sourceJSON,
 		}
 		outcome, finalizeErr := s.repository.Finalize(dbCtx, input, func() (string, error) {
+			failpoint.Hit(failpoint.UploadBeforeOriginalPublish)
 			key, publishErr := temporary.PublishSealed(dbCtx, extension)
 			if publishErr == nil {
 				published = true
+				failpoint.Hit(failpoint.UploadAfterOriginalPublish)
 			} else {
 				var storageErr *storage.PublishError
 				if errors.As(publishErr, &storageErr) && storageErr.Published {
@@ -324,6 +327,9 @@ func (s *Service) Accept(ctx context.Context, request Request) (outcome Outcome,
 		})
 		if finalizeErr == nil {
 			attemptFinished = true
+			if outcome.Status == 201 && !outcome.Replayed {
+				failpoint.Hit(failpoint.UploadAfterDBCommit)
+			}
 			return outcome, nil
 		}
 		var changed *timezoneChangedError

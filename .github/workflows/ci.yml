@@ -325,6 +325,11 @@ jobs:
         run: go vet ./...
       - name: Build all three Core binaries
         run: go build ./cmd/core-api ./cmd/core-worker ./cmd/nmcp-admin
+      - name: Instrumented failpoint build and tests (lane-only tag)
+        run: |
+          go vet -tags nmcp_failpoints ./...
+          go test -count=1 -tags nmcp_failpoints ./internal/failpoint ./internal/purgeexecutor ./internal/upload ./internal/transformexecutor
+          go vet -tags nmcp_failpoints_e2e ./test/e2e
       - name: Unit and local integration tests
         # Package test binaries share one PostgreSQL service. Run them serially
         # so their isolated-schema setup/teardown cannot deadlock on the
@@ -381,6 +386,11 @@ jobs:
           go build -o "$RUNNER_TEMP/backup-live-binaries/core-api" ./cmd/core-api
           go build -o "$RUNNER_TEMP/backup-live-binaries/core-worker" ./cmd/core-worker
           go build -o "$RUNNER_TEMP/backup-live-binaries/nmcp-admin" ./cmd/nmcp-admin
+          # The root lanes run exactly these release binaries: prove they carry
+          # no failpoint code (strings, point names, package path or symbols).
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-check-release-no-failpoints
+          python3 scripts/check-release-no-failpoints "$RUNNER_TEMP/backup-live-binaries/core-api" \
+            "$RUNNER_TEMP/backup-live-binaries/core-worker" "$RUNNER_TEMP/backup-live-binaries/nmcp-admin"
           printf '%s\n' "$RUNNER_TEMP" > "$RUNNER_TEMP/native-build-prefix.txt"
           tar -czf "$RUNNER_TEMP/backup-native-closure.tar.gz" -C "$RUNNER_TEMP" \
             still-helper-build/bin/nmcp-still-helper \
