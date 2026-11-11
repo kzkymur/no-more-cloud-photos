@@ -33,16 +33,43 @@ func (h *harness) ensureProfilesActive() {
 	}
 }
 
-// assertConsistent runs the read-only reconciliation check over DB and media
-// files: it must seal with zero findings (exit 0). Findings are a failure.
-func (h *harness) assertConsistent(when string) {
+// Finding kinds a crash or kill may legitimately leave behind: a temporary
+// file of the interrupted attempt, and a published file whose DB commit never
+// happened. The storage contract keeps both (they are reconcilable only after
+// a 48 h cutoff), and neither may be referenced by DB state. Every other kind
+// (missing/mismatched/invalid references, unexpected paths/types, residue)
+// is a consistency failure.
+var crashResidueKinds = map[string]bool{"recent_or_live_temp": true, "final_orphan": true}
+
+// assertReconciled runs the read-only DB/FS reconciliation check and requires
+// a sealed report whose findings are all of the allowed kinds (none for
+// assertConsistent) and none of them repairable-by-mistake references.
+func (h *harness) assertReconciled(when string, allowed map[string]bool) {
 	h.t.Helper()
 	stdout, stderr, err := h.runResult("", "admin", "--", "check", "--scope", "all", "--json")
-	h.record("check", map[string]any{"when": when, "exit_error": errText(err), "result": json.RawMessage(nonEmptyJSON(stdout))})
-	if err != nil {
-		h.t.Fatalf("reconciliation after %s not clean: err=%s result=%s stderr=%s", when, errText(err), truncate([]byte(stdout)), lastLine(stderr))
+	report := h.dbRead(`SELECT id::text || '|' || (SELECT count(*) FROM reconciliation_check_report_seals s WHERE s.report_id=r.id)::text
+		FROM reconciliation_check_reports r ORDER BY r.started_at DESC LIMIT 1`)
+	id, sealed, _ := strings.Cut(report, "|")
+	kinds := h.dbRead(`SELECT COALESCE(string_agg(kind || ':' || actionability, ',' ORDER BY kind), '') FROM reconciliation_check_findings WHERE report_id='` + id + `'`)
+	h.record("check", map[string]any{"when": when, "exit_error": errText(err), "report_id": id, "findings": kinds, "result": json.RawMessage(nonEmptyJSON(stdout))})
+	if sealed != "1" {
+		h.t.Fatalf("reconciliation after %s did not seal: err=%s stderr=%s", when, errText(err), lastLine(stderr))
+	}
+	for _, f := range strings.Split(kinds, ",") {
+		if f == "" {
+			continue
+		}
+		kind, _, _ := strings.Cut(f, ":")
+		if !allowed[kind] {
+			h.t.Fatalf("reconciliation after %s has a disallowed finding %s (all: %s)", when, f, kinds)
+		}
+	}
+	if len(allowed) == 0 && err != nil {
+		h.t.Fatalf("reconciliation after %s not clean: %s", when, errText(err))
 	}
 }
+
+func (h *harness) assertConsistent(when string) { h.assertReconciled(when, nil) }
 
 func (h *harness) pid(service string) int {
 	h.t.Helper()
@@ -102,98 +129,5 @@ func (h *harness) assertExactlyOneCurrentPerTarget(mediaID string) {
 	}
 	if byKey["standard"] != 1 || byKey["thumbnail"] != 1 {
 		h.t.Fatalf("current renditions after fault: %v", byKey)
-	}
-}
-
-// TestReleaseGateFaults injects process, heartbeat, database and storage
-// faults into the real stack and proves recovery plus DB/FS consistency.
-func TestReleaseGateFaults(t *testing.T) {
-	h := newHarness(t)
-	h.ensureProfilesActive()
-	h.assertConsistent("baseline")
-
-	t.Run("worker SIGKILL mid-job is reclaimed after lease expiry", func(t *testing.T) {
-		m, j := h.uploadAndRunning(t, "video-mp4-generated")
-		before := h.pid("worker")
-		killed := h.run("", "control", "kill", "worker", "KILL")
-		h.run("", "control", "start", "worker")
-		after := h.pid("worker")
-		if after == 0 || after == before {
-			t.Fatalf("worker not replaced: before=%d after=%d (%s)", before, after, strings.TrimSpace(killed))
-		}
-		done := h.waitJob(j.ID, "succeeded", reclaimWait)
-		h.record("sigkill_reclaim", map[string]any{"job_id": j.ID, "attempts": done.Attempts, "killed": strings.TrimSpace(killed)})
-		h.assertExactlyOneCurrentPerTarget(m.ID)
-		h.assertConsistent("worker SIGKILL")
-	})
-
-	t.Run("worker SIGSTOP heartbeat loss never double-publishes", func(t *testing.T) {
-		m, j := h.uploadAndRunning(t, "video-quicktime-generated")
-		h.run("", "control", "kill", "worker", "STOP")
-		time.Sleep(2*time.Minute + 20*time.Second) // past lease expiry without heartbeats
-		h.run("", "control", "kill", "worker", "CONT")
-		done := h.waitJob(j.ID, "succeeded", reclaimWait)
-		h.record("sigstop_heartbeat", map[string]any{"job_id": j.ID, "attempts": done.Attempts})
-		h.assertExactlyOneCurrentPerTarget(m.ID)
-		h.assertConsistent("worker SIGSTOP")
-	})
-
-	t.Run("database loss and recovery", func(t *testing.T) {
-		h.run("", "control", "stop", "postgres")
-		h.eventually("readyz unavailable", time.Minute, func() bool {
-			return h.do(http.MethodGet, "/readyz", nil, nil).Status == 503
-		})
-		data := fixtureImage(t, "png", 800, 600)
-		key := "e2e-dbdown-" + sha(data)[:20]
-		if r := h.upload(key, "db.png", "image/png", data); r.Status != 503 {
-			t.Fatalf("upload while database down: %d", r.Status)
-		}
-		h.run("", "control", "start", "postgres")
-		h.eventually("readyz ready", 2*time.Minute, func() bool {
-			return h.do(http.MethodGet, "/readyz", nil, nil).Status == 200
-		})
-		var up struct {
-			Media media `json:"media"`
-			Job   *job  `json:"job"`
-		}
-		// The transient 503 was never stored: the same key is a first acceptance.
-		h.expectJSON(h.upload(key, "db.png", "image/png", data), 201, &up)
-		h.waitJob(up.Job.ID, "succeeded", 5*time.Minute)
-		h.assertExactlyOneCurrentPerTarget(up.Media.ID)
-		h.assertConsistent("database loss")
-	})
-
-	for _, fault := range []struct{ name, on, off string }{
-		{"read-only media filesystem", "media-readonly", "media-readonly"},
-		{"full media filesystem", "media-full", "media-full"},
-	} {
-		t.Run(fault.name, func(t *testing.T) {
-			h.run("", "fault", fault.on, "on")
-			data := fixtureImage(t, "png", 1200, 900)
-			key := "e2e-" + fault.on + "-" + sha(data)[:16]
-			r := h.upload(key, "f.png", "image/png", data)
-			h.run("", "fault", fault.off, "off")
-			if r.Status != 500 && r.Status != 503 {
-				t.Fatalf("upload during %s: status %d, want 500/503", fault.name, r.Status)
-			}
-			var none struct {
-				Items []media `json:"items"`
-			}
-			h.expectJSON(h.do(http.MethodGet, "/media?deleted=include&limit=200", nil, nil), 200, &none)
-			for _, m := range none.Items {
-				if m.SizeBytes == int64(len(data)) && m.OriginalFilename != nil && *m.OriginalFilename == "f.png" {
-					t.Fatal("failed upload left an accepted media row")
-				}
-			}
-			h.assertConsistent(fault.name)
-			var up struct {
-				Media media `json:"media"`
-				Job   *job  `json:"job"`
-			}
-			h.expectJSON(h.upload(key, "f.png", "image/png", data), 201, &up)
-			h.waitJob(up.Job.ID, "succeeded", 5*time.Minute)
-			h.assertExactlyOneCurrentPerTarget(up.Media.ID)
-			h.assertConsistent(fault.name + " recovered")
-		})
 	}
 }
