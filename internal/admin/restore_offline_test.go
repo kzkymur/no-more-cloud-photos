@@ -159,6 +159,38 @@ func TestOfflineFenceFailureRecordsClosedReason(t *testing.T) {
 		}
 	}
 }
+func TestOfflineTimerStoppedWithoutMainPID(t *testing.T) {
+	saved := offlineTimerShow
+	defer func() { offlineTimerShow = saved }()
+	for out, ok := range map[string]bool{
+		// Observed systemd 255 timer state has no MainPID; an unrequested property is rejected.
+		"Result=success\nLoadState=loaded\nActiveState=inactive\nSubState=dead":     false, // extra property is not the queried set
+		"ActiveState=inactive\nSubState=dead\nResult=success":                       true,
+		"Result=success\nActiveState=inactive\nSubState=dead":                       true,
+		"ActiveState=active\nSubState=waiting\nResult=success":                      false,
+		"ActiveState=inactive\nSubState=dead\nResult=resources":                     false,
+		"ActiveState=inactive\nSubState=elapsed\nResult=success":                    false,
+		"ActiveState=inactive\nSubState=dead":                                       false,
+		"ActiveState=inactive\nActiveState=inactive\nSubState=dead\nResult=success": false,
+		"": false,
+	} {
+		offlineTimerShow = func(context.Context, string) (string, error) { return out, nil }
+		err := offlineTimerStopped(context.Background(), "nmcp-backup.timer")
+		if (err == nil) != ok {
+			t.Fatalf("timer state %q accepted=%t err=%v", out, err == nil, err)
+		}
+		if err != nil && !errors.Is(err, errRestore) {
+			t.Fatalf("timer reason must remain a restore error: %v", err)
+		}
+	}
+	offlineTimerShow = func(context.Context, string) (string, error) { return "", errors.New("SECRET query") }
+	if err := offlineTimerStopped(context.Background(), "nmcp-backup.timer"); err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("query failure: %v", err)
+	}
+	if offlineFenceUnit("nmcp-migrate.service") != "nmcp-migrate.service" || offlineFenceUnit("nmcp-migrate.timer") != "<invalid unit>" {
+		t.Fatal("diagnostic unit labels")
+	}
+}
 func TestOfflineAuthorityRejectsUnknownJSONAndRoutineUID(t *testing.T) {
 	var a OfflineRestoreAuthority
 	if decodeRestore([]byte(`{"unexpected":true}`), &a) == nil {

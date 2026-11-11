@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -119,7 +120,7 @@ func offlineFenceFailure(reason string) error { return offlineFenceError{reason}
 // offlineFenceUnit keeps only the fixed units and validated PG17 unit names.
 func offlineFenceUnit(unit string) string {
 	switch unit {
-	case "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service":
+	case "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service", "nmcp-migrate.service":
 		return unit
 	}
 	if backupPGUnitPattern.MatchString(unit) {
@@ -156,9 +157,38 @@ func offlineInactive(ctx context.Context, unit string) error {
 	if state != "inactive" {
 		return offlineFenceFailure("not inactive " + offlineFenceUnit(unit) + " (" + offlineActiveStateLabel(state) + ")")
 	}
+	if strings.HasSuffix(unit, ".timer") {
+		// Timer units have no MainPID property (systemctl prints an empty value).
+		// A stopped timer is exactly inactive/dead with a successful result.
+		return offlineTimerStopped(ctx, unit)
+	}
 	pid, e := unitPID(ctx, unit)
 	if e != nil || pid != 0 {
 		return offlineFenceFailure("main PID present " + offlineFenceUnit(unit))
+	}
+	return nil
+}
+
+var offlineTimerShow = func(ctx context.Context, unit string) (string, error) {
+	return systemctl(ctx, "show", "--property=ActiveState", "--property=SubState", "--property=Result", unit)
+}
+
+func offlineTimerStopped(ctx context.Context, unit string) error {
+	out, e := offlineTimerShow(ctx, unit)
+	if e != nil {
+		return offlineFenceFailure("timer state query " + offlineFenceUnit(unit))
+	}
+	got := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || got[key] != "" {
+			return offlineFenceFailure("timer state malformed " + offlineFenceUnit(unit))
+		}
+		got[key] = value
+	}
+	want := map[string]string{"ActiveState": "inactive", "SubState": "dead", "Result": "success"}
+	if !reflect.DeepEqual(got, want) {
+		return offlineFenceFailure("timer not stopped " + offlineFenceUnit(unit))
 	}
 	return nil
 }
