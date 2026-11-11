@@ -226,7 +226,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 		t.Fatal("candidate must be a second actual cluster")
 	}
 	hash := sha256.Sum256([]byte(candidateHBA))
-	receipt := RestoreReceipt{Source: si, Candidate: ci, Template0: true, Empty: true, RoutineLoginDenied: true, OperatorSocketOnly: true, HBASHA256: hex.EncodeToString(hash[:]), IssuedAt: time.Now()}
+	receipt := RestoreReceipt{Source: si, Candidate: ci, Template0: true, Empty: true, RoutineLoginDenied: true, OperatorSocketOnly: true, HBASHA256: hex.EncodeToString(hash[:]), IssuedAt: time.Now().UTC()}
 	raw, e := json.Marshal(receipt)
 	if e != nil {
 		t.Fatal(e)
@@ -257,7 +257,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	authority := OfflineRestoreAuthority{SourceBackupSucceeded: true, Source: si, Candidate: ci, Manifest: manifest, RoleGraphSHA256: graph,
 		SourceHBAPath: f.hbaPath, SourceHBASHA256: hex.EncodeToString(sourceHash[:]), SourceUnit: "postgresql@17-nmcp-offline-fixture.service", CandidateUnit: "postgresql@17-nmcp-offline-candidate.service",
 		SourceEndpoint:    OfflineRestoreEndpoint{SocketDirectory: f.socket, Port: 5432, LoopbackHosts: []string{"127.0.0.1"}},
-		CandidateEndpoint: OfflineRestoreEndpoint{SocketDirectory: g.socket, Port: 5544, LoopbackHosts: []string{}}, EndpointComplete: true, IssuedAt: time.Now(), Confirmation: offlineConfirmation}
+		CandidateEndpoint: OfflineRestoreEndpoint{SocketDirectory: g.socket, Port: 5544, LoopbackHosts: []string{}}, EndpointComplete: true, IssuedAt: time.Now().UTC(), Confirmation: offlineConfirmation}
 	settings.OfflineSource = true
 	settings.OfflineAuthorityFile = "/var/lib/nmcp-restore/offline-authority.json"
 	raw, e = json.Marshal(authority)
@@ -307,8 +307,19 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	}
 	pg17AssertBackupOtherDBHBA(t, ctx, f.passwords, g.socket, 5544, op.Candidate.DatabaseName)
 	durable, e := LoadRestoreOperation(settings.LedgerRoot, op.ID)
-	if e != nil || durable.Phase != "cutover_verified" || durable.Receipt != receipt || durable.BackupID != backupID || len(durable.DumpSHA256) != 64 {
-		t.Fatal("external authorization ledger lost pinned identity/receipt/digest")
+	// Compare the durable receipt by its persisted form: an in-memory time keeps
+	// a monotonic reading and zone pointer that a JSON round-trip never restores.
+	switch {
+	case e != nil:
+		t.Fatal("external authorization ledger unreadable after cutover")
+	case durable.Phase != "cutover_verified":
+		t.Fatalf("external authorization ledger phase %q after cutover", durable.Phase)
+	case !sameRestoreReceipt(durable.Receipt, receipt):
+		t.Fatal("external authorization ledger lost pinned receipt")
+	case durable.BackupID != backupID:
+		t.Fatal("external authorization ledger lost pinned backup identity")
+	case len(durable.DumpSHA256) != 64:
+		t.Fatal("external authorization ledger lost pinned dump digest")
 	}
 
 	if VerifyOfflineSourceFence(ctx, op) != nil {
@@ -317,7 +328,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	offlineRetargetProof(t, ctx, f, candidate, op, oldPIDs)
 	state, e := New(candidate).MaintenanceStatus(ctx)
 	if e != nil || state.Mode != "maintenance" || state.Owner == nil || *state.Owner != op.ID {
-		t.Fatal("candidate escaped cutover maintenance")
+		t.Fatalf("candidate escaped cutover maintenance: query_error=%t mode=%q owner_matches=%t", e != nil, state.Mode, state.Owner != nil && *state.Owner == op.ID)
 	}
 	if active, _ := systemctl(ctx, "is-active", "nmcp-backup.timer"); active == "active" {
 		t.Fatal("cutover started backup timer before explicit resume")
@@ -339,7 +350,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
-		t.Fatal("live restored media detail non-200")
+		t.Fatalf("live restored media detail status %d", resp.StatusCode)
 	}
 	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM renditions`) == "0" {
 		t.Fatal("restored positive rendition rows missing")
@@ -354,7 +365,7 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 		t.Fatal("source fence lost before separate resume")
 	}
 	if _, e := New(candidate).MaintenanceResume(ctx, store); e != nil {
-		t.Fatal("separate actual candidate MaintenanceResume failed")
+		t.Fatalf("separate actual candidate MaintenanceResume failed: %s", offlineErrorClass(e))
 	}
 	liveUploadAfterResume(t, ctx)
 	// Stabilize the positive fixture before its next DB-only snapshot. This does
@@ -373,11 +384,14 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM media`) != "2" || VerifyOfflineSourceFence(ctx, op) != nil {
-		t.Fatal("resumed real API write did not exclusively mutate candidate")
+	if count := pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM media`); count != "2" {
+		t.Fatalf("resumed real API write: candidate media count %s, want 2", count)
 	}
-	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM admin_audit WHERE command='maintenance_resume' AND outcome='succeeded'`) != "1" {
-		t.Fatal("resume audit missing")
+	if e := VerifyOfflineSourceFence(ctx, op); e != nil {
+		t.Fatalf("resumed real API write: source fence lost: %s", offlineErrorClass(e))
+	}
+	if count := pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM admin_audit WHERE command='maintenance_resume' AND outcome='succeeded'`); count != "1" {
+		t.Fatalf("resume audit count %s, want 1", count)
 	}
 	// Snapshot contains the originating run as running, correctly converted to
 	// failed by Restore. A real first candidate backup is therefore due, not a
@@ -385,7 +399,11 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 	f.startBackup(candidate)
 	postRuns, e := New(candidate).BackupList(ctx)
 	if e != nil || len(postRuns) < 2 || postRuns[0].Status != "succeeded" {
-		t.Fatal("first real resumed candidate backup did not succeed")
+		status := ""
+		if len(postRuns) > 0 {
+			status = postRuns[0].Status
+		}
+		t.Fatalf("first real resumed candidate backup did not succeed: list_error=%t runs=%d newest=%q", e != nil, len(postRuns), status)
 	}
 	before := pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM backup_runs`)
 	// Enabling happens ONLY after explicit resume plus successful real write.
@@ -403,17 +421,17 @@ func TestRestoreOfflineRootTwoClusters(t *testing.T) {
 		f.owned[path] = st
 	}
 	if enabled, e := systemctl(ctx, "is-enabled", "nmcp-backup.timer"); e != nil || enabled != "enabled" {
-		t.Fatal("timer enable not persistent")
+		t.Fatalf("timer enable not persistent: %q", offlineEnableStateLabel(enabled))
 	}
 	f.startBackup(candidate)
 	if active, e := systemctl(ctx, "is-active", "nmcp-backup.timer"); e != nil || active != "active" {
-		t.Fatal("timer not enabled after successful resume")
+		t.Fatalf("timer not enabled after successful resume: %q", offlineActiveStateLabel(active))
 	}
 	if status, err := systemctl(ctx, "show", "--property=ExecMainStatus", "--value", "nmcp-backup.service"); err != nil || status != "4" {
-		t.Fatal("real not-due timer wake did not return structured exit 4")
+		t.Fatalf("real not-due timer wake did not return structured exit 4: query_error=%t status=%q", err != nil, offlineExitStatusLabel(status))
 	}
-	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM backup_runs`) != before {
-		t.Fatal("timer wake/if-due created a false backup")
+	if after := pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM backup_runs`); after != before {
+		t.Fatalf("timer wake/if-due created a false backup: runs %s -> %s", before, after)
 	}
 	t.Logf("actual two-cluster PG17 offline restore+cutover+separate resume+real API write passed; backup=%s operation=%s rpo_ms=%d rto_ms=%d", backupID, op.ID, op.RPO.Milliseconds(), op.RTO.Milliseconds())
 	offlineActualTimeoutCleanup(t, f, g)
@@ -800,7 +818,7 @@ func offlineActualTimeoutCleanup(t *testing.T, f, g *liveCutoverFixture) {
 	child.Env = append(os.Environ(), "NMCP_OFFLINE_TIMEOUT_CHILD=1", "NMCP_OFFLINE_TIMEOUT_CLEANUP_MARKER="+marker)
 	output, err := child.CombinedOutput()
 	if err == nil || !bytes.Contains(output, []byte("test timed out")) {
-		t.Fatal("real Go timeout not observed")
+		t.Fatalf("real Go timeout not observed: child_failed=%t timeout_marker=%t deadlock=%t", err != nil, bytes.Contains(output, []byte("test timed out")), bytes.Contains(output, []byte("deadlock")))
 	}
 	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
 		t.Fatal("timeout unexpectedly ran child Cleanup")
@@ -852,4 +870,46 @@ func logOfflineFenceUnits(t *testing.T, ctx context.Context, sourceUnit string) 
 		out, err := systemctl(ctx, "show", "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=Result", "--property=MainPID", "--property=ExecMainStatus", "--property=ExecMainCode", unit)
 		t.Logf("offline fence target %s inspection_error=%t %q", offlineFenceUnit(unit), err != nil, strings.ReplaceAll(out, "\n", " "))
 	}
+}
+
+// sameRestoreReceipt compares two receipts by their persisted JSON form.
+func sameRestoreReceipt(a, b RestoreReceipt) bool {
+	x, e := json.Marshal(a)
+	y, f := json.Marshal(b)
+	return e == nil && f == nil && bytes.Equal(x, y)
+}
+
+// offlineErrorClass reports only the fixed restore/cutover/fence error class,
+// never arbitrary error text.
+func offlineErrorClass(e error) string {
+	var fence offlineFenceError
+	switch {
+	case e == nil:
+		return "none"
+	case errors.As(e, &fence):
+		return "fence: " + fence.reason
+	case errors.Is(e, errCutover):
+		return "cutover"
+	case errors.Is(e, errRestore):
+		return "restore"
+	case errors.Is(e, ErrValidation):
+		return "validation"
+	}
+	return "unclassified"
+}
+
+// offlineExitStatusLabel keeps a systemd ExecMainStatus to a bounded number.
+func offlineExitStatusLabel(s string) string {
+	if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 255 {
+		return s
+	}
+	return "invalid"
+}
+
+func offlineEnableStateLabel(s string) string {
+	switch s {
+	case "enabled", "enabled-runtime", "linked", "linked-runtime", "alias", "masked", "masked-runtime", "static", "indirect", "disabled", "generated", "transient", "bad", "not-found":
+		return s
+	}
+	return "unknown"
 }
