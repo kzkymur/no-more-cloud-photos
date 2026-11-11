@@ -82,3 +82,5 @@ Contract links: [HTTP API and CLI](contracts/core-api.md), [state, storage, work
 | #21 | ARC-01, ARC-02, ARC-07, ARC-13, WRK-08 through WRK-10, WRK-13, OPS-01, OPS-05 through OPS-10 |
 
 Issue #22 owns only production-specific Tailnet/Viewer/notification/server checks that cannot run in the team environment. It does not replace automated requirements in #21.
+
+The #21 lanes, binaries (release vs instrumented), pass conditions and limits are mapped in [release-gate.md](release-gate.md).
