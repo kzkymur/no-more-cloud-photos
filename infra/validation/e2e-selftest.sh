@@ -37,6 +37,17 @@ for required in ("originals", "renditions", "tmp", ".quarantine", "backups"):
 assert all(e["type"] == "dir" for e in entries), entries
 PY
 
+step "image-sha256: digests from a fresh one-shot of the worker/admin image"
+digests=$("$ctl" image-sha256 /opt/nmcp/share/sRGB2014.icc /usr/bin/prlimit) || fail "image-sha256"
+case "$digests" in
+  "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a  /opt/nmcp/share/sRGB2014.icc"*) ;;
+  *) fail "image-sha256 ICC digest: $digests" ;;
+esac
+[ "$(printf '%s\n' "$digests" | wc -l)" = 2 ] || fail "image-sha256 line count: $digests"
+if "$ctl" image-sha256 /etc/passwd 2>/dev/null; then fail "image-sha256 accepted a path outside the allowlist"; fi
+if "$ctl" image-sha256 /opt/nmcp/../../etc/passwd 2>/dev/null; then fail "image-sha256 accepted a non-canonical path"; fi
+if "$ctl" image-sha256 /opt/nmcp/bin/does-not-exist 2>/dev/null; then fail "image-sha256 accepted a missing file"; fi
+
 step "admin runs nmcp-admin as nmcp_migrator"
 "$ctl" admin -- migrate status --json >"$NMCP_E2E_ARTIFACT_DIR/selftest-admin.json" ||
   fail "nmcp-admin migrate status"

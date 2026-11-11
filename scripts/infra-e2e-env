@@ -28,6 +28,12 @@
 #   control pid SERVICE             prints the current host pid (0 if stopped)
 #   db-read                         SQL on stdin, read-only session, psql -At
 #   media-ls                        JSON lines {path,type,size,mode,sha256}
+#   image-sha256 PATH...            "<sha256>  <path>" for regular files under
+#                                   /opt/nmcp/ or /usr/bin/prlimit, computed in
+#                                   a fresh one-shot container (no network, no
+#                                   mounts, read-only root) of the core image.
+#                                   Refuses unless worker and admin (migrate)
+#                                   use the same image ID, printed to stderr.
 #   admin -- ARGS...                one-shot nmcp-admin as nmcp_migrator in the
 #                                   core image (helpers /opt/nmcp/bin, ICC
 #                                   /opt/nmcp/share/sRGB2014.icc), no TTY,
@@ -256,6 +262,31 @@ for line in sys.stdin:
     path, kind, size, mode, digest = line.rstrip("\n").split("\t")
     print(json.dumps({"path": path, "type": kind, "size": int(size), "mode": mode, "sha256": digest or None}, sort_keys=True))
 '
+}
+
+image_sha256() {
+  [ $# -ge 1 ] || die "usage: image-sha256 PATH..."
+  local path worker_image admin_image id
+  for path in "$@"; do
+    case "$path" in
+      /usr/bin/prlimit) ;;
+      /opt/nmcp/*) case "$path" in *//*|*/./*|*/../*|*/.|*/..) die "non-canonical path: $path" ;; esac ;;
+      *) die "image-sha256 is limited to /opt/nmcp/** and /usr/bin/prlimit: $path" ;;
+    esac
+  done
+  id=$(container_id worker); [ -n "$id" ] || die "worker container not found"
+  worker_image=$(docker container inspect --format '{{.Image}}' "$id")
+  id=$(container_id migrate); [ -n "$id" ] || die "migrate container not found"
+  admin_image=$(docker container inspect --format '{{.Image}}' "$id")
+  [ "$worker_image" = "$admin_image" ] || die "worker image $worker_image differs from admin image $admin_image"
+  log "image-sha256: core image $worker_image"
+  # shellcheck disable=SC2016 # expanded by the container shell
+  timeout --kill-after=5s 60s docker run --rm --network none --read-only --user 10001:10001 \
+    --label "com.nmcp.validation.owner=$owner" --entrypoint /bin/sh "$worker_image" -eu -c '
+      for path in "$@"; do
+        if [ ! -f "$path" ] || [ -L "$path" ]; then echo "not a regular file: $path" >&2; exit 1; fi
+        sha256sum "$path"
+      done' sh "$@"
 }
 
 admin() {
@@ -539,10 +570,11 @@ case "$command" in
   control) control "$@" ;;
   db-read) db_read ;;
   media-ls) media_ls ;;
+  image-sha256) image_sha256 "$@" ;;
   admin) admin "$@" ;;
   fault) fault "$@" ;;
   collect) collect "$@" ;;
   down) assert_owned; compose --profile e2e down --remove-orphans --timeout 20 ;;
   reset) cleanup ;;
-  *) echo "usage: scripts/infra-e2e-env {lane|up|verify-codec|run|control|db-read|media-ls|admin|fault|collect|down|reset}" >&2; exit 2 ;;
+  *) echo "usage: scripts/infra-e2e-env {lane|up|verify-codec|run|control|db-read|media-ls|image-sha256|admin|fault|collect|down|reset}" >&2; exit 2 ;;
 esac
