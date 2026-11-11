@@ -46,7 +46,9 @@ old=$("$ctl" control kill worker KILL) || fail "kill worker"
 old_pid=${old#pid=}; old_pid=${old_pid%% *}
 "$ctl" control start worker || fail "start worker"
 new_pid=$("$ctl" control pid worker)
-[ "$new_pid" -gt 0 ] && [ "$new_pid" != "$old_pid" ] || fail "worker pid not replaced ($old_pid -> $new_pid)"
+if [ "$new_pid" -le 0 ] || [ "$new_pid" = "$old_pid" ]; then
+  fail "worker pid not replaced ($old_pid -> $new_pid)"
+fi
 
 step "SIGSTOP/SIGCONT on worker"
 "$ctl" control kill worker STOP >/dev/null || fail "stop signal"
@@ -96,6 +98,7 @@ probe 'touch /var/lib/nmcp/media/tmp/.e2e-probe && rm /var/lib/nmcp/media/tmp/.e
 
 step "fault media-full: shrink to used size gives ENOSPC; off restores"
 "$ctl" fault media-full on 0 || fail "full on"
+# shellcheck disable=SC2016 # expanded by the container shell
 out=$(probe 'head -c 1048576 /dev/zero >/var/lib/nmcp/media/originals/.e2e-probe; status=$?; rm -f /var/lib/nmcp/media/originals/.e2e-probe; exit $status' || true)
 case "$out" in *"No space left on device"*) ;; *) fail "expected ENOSPC, got: $out" ;; esac
 "$ctl" fault media-full off || fail "full off"

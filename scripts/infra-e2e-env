@@ -101,8 +101,9 @@ media_mounted() {
   source=$(findmnt --noheadings --output SOURCE --mountpoint "$media_mount" 2>/dev/null || true)
   [ -n "$source" ] || return 1
   fstype=$(findmnt --noheadings --output FSTYPE --mountpoint "$media_mount")
-  [ "$source" = "$mount_source" ] && [ "$fstype" = tmpfs ] ||
+  if [ "$source" != "$mount_source" ] || [ "$fstype" != tmpfs ]; then
     die "$media_mount is mounted but not owned by this harness ($source/$fstype)"
+  fi
 }
 
 mount_media() {
@@ -221,6 +222,7 @@ db_read() {
 }
 
 media_ls() {
+  # shellcheck disable=SC2016 # expanded by the container shell
   compose --profile e2e run --rm --no-deps -T e2e-observer '
     cd /var/lib/nmcp/media
     find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r path; do
@@ -243,8 +245,8 @@ admin() {
 
 remount_media() {
   media_mounted || die "media tmpfs is not mounted"
-  local attempt
-  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
     if sudo mount -o "remount,$1" "$media_mount" 2>"$state_dir/remount.err"; then return 0; fi
     sleep 1
   done
@@ -300,6 +302,7 @@ up() {
 # environment (processrunner sets only LC_ALL/LANG/TZ), so the check runs the
 # same way.
 verify_codec() {
+  # shellcheck disable=SC2016 # expanded by the container shell
   compose exec -T worker sh -eu -c '
     prefix=/opt/nmcp
     icc=$prefix/share/sRGB2014.icc

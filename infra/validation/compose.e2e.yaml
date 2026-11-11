@@ -12,8 +12,7 @@ volumes:
       type: none
       o: bind
       device: "${NMCP_E2E_MEDIA_MOUNT:?scripts/infra-e2e-env must set NMCP_E2E_MEDIA_MOUNT}"
-    labels:
-      com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER:?scripts/infra-e2e-env must set NMCP_VALIDATION_OWNER}"
+    # Owner labels come from compose.yaml (merged).
 
 services:
   # Read-only observer for media-ls. It works while api/worker are stopped
