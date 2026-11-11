@@ -368,6 +368,61 @@ func TestOfflineLedgerPreservesAuthorityAndRejectsDrift(t *testing.T) {
 	}
 }
 
+func TestOfflineEndpointErrorClassUsesRealDialErrors(t *testing.T) {
+	// Short directory: a Unix socket path must fit sun_path (108 bytes), else
+	// the dial fails with EINVAL, which is correctly a fail-closed "other".
+	dir, err := os.MkdirTemp("/tmp", "nmcp-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	// A cleanly stopped postmaster removes its socket: the real dial error is a
+	// *net.OpError wrapping ENOENT, which os.IsNotExist does not recognise.
+	_, missing := net.Dial("unix", filepath.Join(dir, ".s.PGSQL.5432"))
+	if missing == nil || os.IsNotExist(missing) || offlineEndpointErrorClass(missing) != "absent" {
+		t.Fatalf("missing socket: %v class=%s", missing, offlineEndpointErrorClass(missing))
+	}
+	// A stale socket file with no listener is refused, which also proves absence.
+	stale := filepath.Join(dir, ".s.PGSQL.5433")
+	l, err := net.ListenUnix("unix", &net.UnixAddr{Name: stale, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.SetUnlinkOnClose(false)
+	l.Close()
+	if _, err := os.Lstat(stale); err != nil {
+		t.Fatal("stale socket file should remain")
+	}
+	_, refused := net.Dial("unix", stale)
+	if refused == nil || offlineEndpointErrorClass(refused) != "refused" {
+		t.Fatalf("stale socket: %v class=%s", refused, offlineEndpointErrorClass(refused))
+	}
+	// A live listener is never classified; it fails the probe before classification.
+	live := filepath.Join(dir, ".s.PGSQL.5434")
+	ll, err := net.Listen("unix", live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ll.Close()
+	if c, err := net.Dial("unix", live); err != nil {
+		t.Fatal("live listener must accept")
+	} else {
+		c.Close()
+	}
+	// Every other class fails closed.
+	for e, want := range map[error]string{
+		&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EACCES)}:       "permission",
+		&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EPERM)}:        "permission",
+		&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EINVAL)}:       "other",
+		&net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ENAMETOOLONG)}: "other",
+		context.DeadlineExceeded: "timeout",
+		errors.New("unknown"):    "other",
+	} {
+		if got := offlineEndpointErrorClass(e); got != want {
+			t.Fatalf("%v -> %s, want %s", e, got, want)
+		}
+	}
+}
 func TestOfflineFenceRejectsEveryRoleIncludingMigratorAndQuotesDatabase(t *testing.T) {
 	fence := string(offlineSourceFence("all"))
 	for _, rule := range []string{`local "all" all reject`, `host "all" all 0.0.0.0/0 reject`, `host "all" all ::/0 reject`} {

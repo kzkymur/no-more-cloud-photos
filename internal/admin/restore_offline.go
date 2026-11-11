@@ -225,11 +225,34 @@ func (a *offlineSystemSource) verifySourceStopped(ctx context.Context, op Restor
 			return offlineFenceFailure("source endpoint reachable " + ep.network)
 		}
 		// A timeout, canceled context, or permission denial does not prove absence.
-		if ctx.Err() != nil || !(os.IsNotExist(e) || isOfflineRefused(e)) {
-			return offlineFenceFailure("source endpoint absence unproven " + ep.network)
+		if ctx.Err() != nil {
+			return offlineFenceFailure("source endpoint absence unproven " + ep.network + " (canceled)")
+		}
+		if class := offlineEndpointErrorClass(e); class != "absent" && class != "refused" {
+			return offlineFenceFailure("source endpoint absence unproven " + ep.network + " (" + class + ")")
 		}
 	}
 	return nil
+}
+
+// offlineEndpointErrorClass classifies a failed dial. Only a missing socket
+// path or a refused connection proves that nothing listens; every other
+// class (permission, timeout, path too long, unknown) fails closed. Dial
+// errors are *net.OpError, which os.IsNotExist does not unwrap, so errno is
+// matched with errors.Is.
+func offlineEndpointErrorClass(e error) string {
+	var timeout interface{ Timeout() bool }
+	switch {
+	case errors.Is(e, unix.ENOENT):
+		return "absent"
+	case errors.Is(e, unix.ECONNREFUSED):
+		return "refused"
+	case errors.Is(e, unix.EACCES), errors.Is(e, unix.EPERM):
+		return "permission"
+	case errors.As(e, &timeout) && timeout.Timeout():
+		return "timeout"
+	}
+	return "other"
 }
 func isOfflineRefused(e error) bool { return errors.Is(e, unix.ECONNREFUSED) }
 
