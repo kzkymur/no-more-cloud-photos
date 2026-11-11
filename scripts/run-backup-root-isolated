@@ -58,6 +58,8 @@ BUDGET_POLICY = dict(job_seconds=2400, cleanup_seconds=300, margin_seconds=60)
 SETUP_ALLOWANCE = 120
 BOOTSTRAP_CAP, BOOT_CAP, GUEST_SETUP_RESERVE, TEST_CAP, TEST_REQUIRED = 520, 120, 120, 1110, 1110
 BOOTSTRAP_REQUIRED = 300
+# Transient connect failures only; every attempt shares the single deadline.
+BOOTSTRAP_ATTEMPTS, BOOTSTRAP_RETRY_MIN = 3, 60
 
 def require(ok, message):
     if not ok:
@@ -440,7 +442,54 @@ def observed_bootstrap(argv, env, log, work, identity, timeout):
     # No last-progress clock was sampled; mtime is NOT monotonic progress age.
     print('Bootstrap diagnostic: ' + json.dumps(summary, sort_keys=True), flush=True)
     if failure is not None:
-        raise BootstrapFailure('bootstrap acquisition failed; see closed diagnostic') from None
+        closed = BootstrapFailure('bootstrap acquisition failed; see closed diagnostic')
+        closed.summary = summary
+        raise closed from None
+    return summary
+
+
+def root_has_mounts(root):
+    # A first-stage download/validate failure never mounts inside the target;
+    # anything mounted there forbids a retry (the failed root is never reused).
+    prefix = str(root).rstrip('/') + '/'
+    with open('/proc/self/mountinfo') as mounts:
+        for line in mounts:
+            point = line.split()[4]
+            if point == str(root) or point.startswith(prefix):
+                return True
+    return False
+
+
+def bootstrap_with_retry(argv_for, env, work, root, identity, timeout):
+    """Bounded retry of transient connect failures inside ONE absolute deadline.
+
+    Only a failure classified `connect` during download/validate is retried, at
+    most BOOTSTRAP_ATTEMPTS times. Every attempt shares the original deadline
+    (never reset), reuses the same --cache-dir (each file re-verified against
+    the freshly signed metadata), and starts from a fresh target: the failed
+    root is renamed aside, never reused or deleted.
+    """
+    require(type(timeout) is int and 1 <= timeout <= BOOTSTRAP_CAP, 'invalid bootstrap timeout')
+    deadline = time.monotonic() + timeout
+    for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
+        remaining = int(deadline - time.monotonic())
+        try:
+            with (work / 'provision.log').open('w') as log:
+                return observed_bootstrap(argv_for(root), env, log, work, identity, max(1, min(remaining, BOOTSTRAP_CAP)))
+        except BootstrapFailure as failure:
+            summary = getattr(failure, 'summary', {})
+            remaining = int(deadline - time.monotonic())
+            retry = (summary.get('error_class') == 'connect' and summary.get('phase') in ('download', 'validate')
+                     and attempt < BOOTSTRAP_ATTEMPTS and remaining >= BOOTSTRAP_RETRY_MIN and not root_has_mounts(root))
+            print('Bootstrap attempt: ' + json.dumps(dict(attempt=attempt, error_class=summary.get('error_class', 'unknown'),
+                  phase=summary.get('phase', 'unknown'), remaining_seconds=max(0, remaining), retry=retry), sort_keys=True), flush=True)
+            if not retry:
+                raise
+            os.rename(work / 'provision.log', work / ('provision-attempt-%d.log' % attempt))
+            if os.path.lexists(root):
+                os.rename(root, work / ('rootfs-failed-attempt-%d' % attempt))
+            time.sleep(min(5, max(0, remaining - BOOTSTRAP_RETRY_MIN)))
+    raise BootstrapFailure('bootstrap acquisition failed; see closed diagnostic')
 
 
 def bootstrap_environment(work):
@@ -895,13 +944,12 @@ def main():
         print('Deb cache input: ' + json.dumps(cache, sort_keys=True), flush=True)
         bootstrap_timeout = phase_budget(repo, temp, slot, head, BOOTSTRAP_CAP,
                                          BOOT_CAP + GUEST_SETUP_RESERVE + TEST_REQUIRED, BOOTSTRAP_REQUIRED)
-        with (work / 'provision.log').open('w') as log:
-            observed_bootstrap(['/usr/sbin/debootstrap', '--variant=minbase', '--components=' + COMPONENTS,
+        bootstrap_with_retry(lambda target: ['/usr/sbin/debootstrap', '--variant=minbase', '--components=' + COMPONENTS,
                  '--keyring=' + KEYRING, '--cache-dir=' + str(work / 'deb-cache'),
-                 '--include=' + PACKAGES, SUITE, str(root), MIRROR],
-                bootstrap_environment(work), log, work,
-                dict(head=head, run=os.environ.get('GITHUB_RUN_ID', ''),
-                     attempt=os.environ.get('GITHUB_RUN_ATTEMPT', ''), slot=slot), bootstrap_timeout)
+                 '--include=' + PACKAGES, SUITE, str(target), MIRROR],
+            bootstrap_environment(work), work, root,
+            dict(head=head, run=os.environ.get('GITHUB_RUN_ID', ''),
+                 attempt=os.environ.get('GITHUB_RUN_ATTEMPT', ''), slot=slot), bootstrap_timeout)
         if cache['status'] == 'miss':  # Same path as restore; a hit is never rewritten.
             print('Deb cache output files: ' + str(export_deb_cache(work, temp)), flush=True)
         require(not any(root.glob('usr/lib/systemd/system/postgresql*')), 'unexpected PG vendor units')

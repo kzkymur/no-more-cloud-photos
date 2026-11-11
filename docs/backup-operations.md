@@ -147,6 +147,16 @@ same-path recursive read-only binds; exact root-owned file bytes and effective
 bind tuples must agree. Privileged concurrent edits remain an operator
 coordination boundary. Environment files cannot override credential routes.
 
+The supported service manager is systemd v255 (Ubuntu 24.04). The effective-unit
+allow-sets (every dependency list, path-derived mounts, conditions/asserts and
+the canonical fragment digest) are derived from v255 semantics and were proven on
+a real 255.4 manager. Before trusting any unit property, cutover reads the
+manager `Version` over D-Bus and fails closed with
+`systemd manager version unsupported` for any other major version; supporting
+another release requires re-deriving and re-proving those sets, not relaxing
+the check. Edge lists are compared by exact membership because the manager
+emits them in hash order that can change when an idle unit is reloaded.
+
 ## Wake timer, manual runs and results
 
 `scripts/validate-backup-install` runs repository-static checks;

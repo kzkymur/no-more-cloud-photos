@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -472,12 +474,52 @@ func validateBackupPGDependencyBodies(backup, migrate []byte, expected string) e
 	}
 	return nil
 }
+
+// The effective-unit allow-sets above are derived from systemd v255 semantics
+// (Ubuntu 24.04, the only supported production manager). Any other manager
+// version fails closed rather than being validated against the wrong rules.
+var backupManagerVersionPattern = regexp.MustCompile(`^255(\.[0-9]{1,4})?([-~+][A-Za-z0-9.+~-]{1,64})?$`)
+
+func supportedBackupManagerVersion(version string) bool {
+	return backupManagerVersionPattern.MatchString(version)
+}
+
+var backupManagerVersion = func(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/usr/bin/busctl", "--system", "--json=short", "--auto-start=no", "get-property",
+		"org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "Version")
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
+	cmd.WaitDelay = time.Second
+	var capture backupUnitWireCapture
+	cmd.Stdout = &capture
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil || capture.overflow {
+		return "", backupUnitGuardError("manager version query")
+	}
+	var reply struct {
+		Type string `json:"type"`
+		Data string `json:"data"`
+	}
+	if json.Unmarshal(capture.data, &reply) != nil || reply.Type != "s" {
+		return "", backupUnitGuardError("manager version reply")
+	}
+	return reply.Data, nil
+}
+
 func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) error {
 	if _, err := backupPGDependencyBody(expectedPGUnit); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
+	version, err := backupManagerVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if !supportedBackupManagerVersion(version) {
+		return backupUnitGuardError("systemd manager version unsupported (" + backupUnitDiagnosticName(version) + "; supported: 255)")
+	}
 	before, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
 	if err != nil {
 		return err
