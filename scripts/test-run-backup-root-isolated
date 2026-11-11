@@ -618,7 +618,7 @@ sys.exit(1)
         self.assertNotIn('"${RUNNER_TEMP}/still-toolchain"',workflow)
         self.assertNotIn('"${RUNNER_TEMP}/still-toolchain/',workflow)
         self.assertIn('-C /opt nmcp-native-ci',workflow)
-        self.assertEqual(workflow.count('backup-live-inputs/backup-native-toolchain.tar.gz'),2)
+        self.assertEqual(workflow.count('backup-live-inputs/backup-native-toolchain.tar.gz'),3)  # live, resources, offline
         self.assertIn('ProtectHome=yes',(repo/'infra/ubuntu/systemd/nmcp-worker.service').read_text())
 
     def test_python_syntax(self):
@@ -1027,6 +1027,19 @@ class BootstrapRetry(unittest.TestCase):
         body = SOURCE[SOURCE.index('def bootstrap_with_retry'):SOURCE.index('def bootstrap_environment')]
         self.assertNotIn('unlink', body)
         self.assertIn('os.rename(root', body)
+
+
+class ResourceSlot(unittest.TestCase):
+    def test_slot_table_is_exact_and_resources_binds_only_prepared_fixtures(self):
+        self.assertEqual(MODULE.SLOTS['release-resources.test'],
+                         ('resources', 'TEST_RELEASE_RESOURCES', '^TestReleaseGateResources$'))
+        self.assertEqual(set(MODULE.SLOTS), {'backup-live.test', 'backup-offline.test', 'release-resources.test'})
+        self.assertEqual({v[0] for v in MODULE.SLOTS.values()}, set(MODULE.JOB_NAMES))
+        main = SOURCE[SOURCE.index('def main():'):]
+        self.assertIn("fixtures = temp / 'e2e-prepared'", main)
+        self.assertIn("os.environ.get('TEST_RELEASE_FIXTURES_DIR') == str(fixtures)", main)
+        self.assertIn("+ extra_binds", main)
+        self.assertNotIn("'--bind=' ", SOURCE)
 
 
 if __name__ == '__main__':

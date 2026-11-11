@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -30,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -461,71 +463,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if b, e := os.ReadFile("/proc/1/comm"); e != nil || strings.TrimSpace(string(b)) != "systemd" {
 		t.Fatal("real systemd PID1 required")
 	}
-	ids := map[string]bool{}
-	for _, name := range []string{"postgres", "nmcp", "nmcp-backup"} {
-		u, e := user.Lookup(name)
-		if e != nil || u.Uid == "0" || ids[u.Uid] {
-			t.Fatal("distinct postgres/nmcp/nmcp-backup accounts required")
-		}
-		ids[u.Uid] = true
-	}
-	bin := os.Getenv("TEST_BACKUP_PG17_BINDIR")
-	if !filepath.IsAbs(bin) || filepath.Clean(bin) != bin {
-		t.Fatal("TEST_BACKUP_PG17_BINDIR must be a real absolute PG17 binary prefix")
-	}
-	if filepath.Base(bin) != "bin" {
-		t.Fatal("PG17 bindir must be actual prefix/bin for narrow sandbox bind")
-	}
-	for _, tool := range []string{"postgres", "pg_dump", "pg_restore", "initdb", "pg_ctl", "psql"} {
-		out, e := exec.Command(filepath.Join(bin, tool), "--version").Output()
-		if e != nil || !strings.Contains(string(out), "(PostgreSQL) 17.") {
-			t.Fatalf("real PG17 %s required", tool)
-		}
-	}
-	prefix := os.Getenv("TEST_BACKUP_NATIVE_PREFIX")
-	if prefix != "/opt/nmcp-native-ci" {
-		t.Fatal("TEST_BACKUP_NATIVE_PREFIX absolute closure required")
-	}
-	st, e := os.Stat(prefix)
-	if e != nil || !st.IsDir() {
-		t.Fatal("native closure prefix absent")
-	}
-	artifacts := map[string]string{}
-	for _, key := range []string{"TEST_BACKUP_STILL_HELPER", "TEST_BACKUP_ANIMATION_HELPER", "TEST_BACKUP_CORE_API", "TEST_BACKUP_CORE_WORKER", "TEST_BACKUP_ADMIN_BINARY"} {
-		artifacts[key] = liveRequired(t, key, true)
-	}
-	mediaFixture := liveRequired(t, "TEST_BACKUP_MEDIA_FIXTURE", false)
-	mediaBytes, e := os.ReadFile(mediaFixture)
-	if e != nil {
-		t.Fatal("read known native media fixture")
-	}
-	mediaHash := sha256.Sum256(mediaBytes)
-	if hex.EncodeToString(mediaHash[:]) != "9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124" {
-		t.Fatal("known real orientation JPEG digest mismatch")
-	}
-	icc := liveRequired(t, "TEST_BACKUP_ICC_PATH", false)
-	iccBytes, e := os.ReadFile(icc)
-	if e != nil {
-		t.Fatal(e)
-	}
-	digest := sha256.Sum256(iccBytes)
-	if hex.EncodeToString(digest[:]) != config.RequiredSRGBICCSHA256 {
-		t.Fatal("actual pinned ICC digest mismatch")
-	}
-	video := filepath.Join(prefix, "bin/nmcp-video-helper")
-	// Validate the video ELF with the same non-script rule without inventing an
-	// extra public environment variable in the formal-job API.
-	t.Setenv("NMCP_LIVE_VIDEO_ARTIFACT", video)
-	liveRequired(t, "NMCP_LIVE_VIDEO_ARTIFACT", true)
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "PG") {
-			t.Setenv(key, "")
-			if os.Unsetenv(key) != nil {
-				t.Fatal("clear ambient libpq override")
-			}
-		}
-	}
+	bin, prefix, video, icc, artifacts, mediaBytes := liveStackInputs(t)
 	f := newLiveCutoverFixture(t, bin)
 	ctx := f.ctx
 	admin := f.poolLive("operator", "postgres")
@@ -607,6 +545,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Log("actual production API/worker native job succeeded with positive rendition and no unfinished/failed jobs")
+	dataset := liveSeedSizedDataset(t, ctx, source)
 	f.startBackup(source)
 	runs, e := New(source).BackupList(ctx)
 	if e != nil || len(runs) != 1 || runs[0].Status != "succeeded" {
@@ -769,7 +708,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM media`) != "2" || pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM media`) != "1" {
+	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM media`) != liveMediaCount(2) || pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM media`) != liveMediaCount(1) {
 		t.Fatal("resumed real API write did not exclusively mutate candidate")
 	}
 	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM admin_audit WHERE command='maintenance_resume' AND outcome='succeeded'`) != "1" {
@@ -809,7 +748,7 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		t.Fatal("timer wake/if-due created a false backup")
 	}
 	f.secondLiveCycle(source, candidate, store, op, postRuns[0].ID, settings, generated)
-	t.Logf("actual PG17 live cutover+separate resume+real API write passed; backup=%s operation=%s rpo_ms=%d rto_ms=%d", backupID, op.ID, op.RPO.Milliseconds(), op.RTO.Milliseconds())
+	t.Logf("actual PG17 live cutover+separate resume+real API write passed; backup=%s operation=%s rpo_ms=%d rto_ms=%d dataset=%s", backupID, op.ID, op.RPO.Milliseconds(), op.RTO.Milliseconds(), dataset)
 }
 
 // Read the actual production outputs, never substitute freshly generated inputs.
@@ -926,7 +865,7 @@ func (f *liveCutoverFixture) secondLiveCycle(original, source *pgxpool.Pool, sto
 			t.Fatal("second actual Restore catalog/ACL/data mismatch")
 		}
 	}
-	if pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM media`) != "2" {
+	if pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM media`) != liveMediaCount(2) {
 		t.Fatal("second backup did not include first resumed API write")
 	}
 	// Bytes produced by operation1 MUST be the inputs consumed by operation2.
@@ -1024,7 +963,7 @@ func (f *liveCutoverFixture) secondLiveCycle(original, source *pgxpool.Pool, sto
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM media`) != "3" || pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM media`) != "2" || pg17Scalar(t, ctx, original, `SELECT count(*)::text FROM media`) != "1" {
+	if pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM media`) != liveMediaCount(3) || pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM media`) != liveMediaCount(2) || pg17Scalar(t, ctx, original, `SELECT count(*)::text FROM media`) != liveMediaCount(1) {
 		t.Fatal("second distinct API write did not exclusively mutate second candidate")
 	}
 	if pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM jobs WHERE status='failed'`) != "0" || pg17Scalar(t, ctx, target, `SELECT count(*)::text FROM admin_audit WHERE command='maintenance_resume' AND outcome='succeeded'`) != "2" {
@@ -1353,4 +1292,170 @@ func logBackupUnitReadStability(t *testing.T, ctx context.Context) {
 		return out
 	}
 	t.Logf("backup unit read stability across 9 reads: raw_changed=%v membership_changed=%v", names(order), names(membership))
+}
+
+// liveStackInputs validates the exact root-lane inputs shared by every real
+// guest stack test: distinct service accounts, the real PG17 prefix, the
+// pinned native closure, helper/API/Worker/admin artifacts, the known media
+// fixture and the pinned ICC. It clears ambient libpq overrides.
+func liveStackInputs(t *testing.T) (bin, prefix, video, icc string, artifacts map[string]string, mediaBytes []byte) {
+	t.Helper()
+	ids := map[string]bool{}
+	for _, name := range []string{"postgres", "nmcp", "nmcp-backup"} {
+		u, e := user.Lookup(name)
+		if e != nil || u.Uid == "0" || ids[u.Uid] {
+			t.Fatal("distinct postgres/nmcp/nmcp-backup accounts required")
+		}
+		ids[u.Uid] = true
+	}
+	bin = os.Getenv("TEST_BACKUP_PG17_BINDIR")
+	if !filepath.IsAbs(bin) || filepath.Clean(bin) != bin {
+		t.Fatal("TEST_BACKUP_PG17_BINDIR must be a real absolute PG17 binary prefix")
+	}
+	if filepath.Base(bin) != "bin" {
+		t.Fatal("PG17 bindir must be actual prefix/bin for narrow sandbox bind")
+	}
+	for _, tool := range []string{"postgres", "pg_dump", "pg_restore", "initdb", "pg_ctl", "psql"} {
+		out, e := exec.Command(filepath.Join(bin, tool), "--version").Output()
+		if e != nil || !strings.Contains(string(out), "(PostgreSQL) 17.") {
+			t.Fatalf("real PG17 %s required", tool)
+		}
+	}
+	prefix = os.Getenv("TEST_BACKUP_NATIVE_PREFIX")
+	if prefix != "/opt/nmcp-native-ci" {
+		t.Fatal("TEST_BACKUP_NATIVE_PREFIX absolute closure required")
+	}
+	st, e := os.Stat(prefix)
+	if e != nil || !st.IsDir() {
+		t.Fatal("native closure prefix absent")
+	}
+	artifacts = map[string]string{}
+	for _, key := range []string{"TEST_BACKUP_STILL_HELPER", "TEST_BACKUP_ANIMATION_HELPER", "TEST_BACKUP_CORE_API", "TEST_BACKUP_CORE_WORKER", "TEST_BACKUP_ADMIN_BINARY"} {
+		artifacts[key] = liveRequired(t, key, true)
+	}
+	mediaFixture := liveRequired(t, "TEST_BACKUP_MEDIA_FIXTURE", false)
+	mediaBytes, e = os.ReadFile(mediaFixture)
+	if e != nil {
+		t.Fatal("read known native media fixture")
+	}
+	mediaHash := sha256.Sum256(mediaBytes)
+	if hex.EncodeToString(mediaHash[:]) != "9b344e9f0c869d8637ea22e672df9451d8d3cc1d2d0b291af3b284e538e5f124" {
+		t.Fatal("known real orientation JPEG digest mismatch")
+	}
+	icc = liveRequired(t, "TEST_BACKUP_ICC_PATH", false)
+	iccBytes, e := os.ReadFile(icc)
+	if e != nil {
+		t.Fatal(e)
+	}
+	digest := sha256.Sum256(iccBytes)
+	if hex.EncodeToString(digest[:]) != config.RequiredSRGBICCSHA256 {
+		t.Fatal("actual pinned ICC digest mismatch")
+	}
+	video = filepath.Join(prefix, "bin/nmcp-video-helper")
+	// Validate the video ELF with the same non-script rule without inventing an
+	// extra public environment variable in the formal-job API.
+	t.Setenv("NMCP_LIVE_VIDEO_ARTIFACT", video)
+	liveRequired(t, "NMCP_LIVE_VIDEO_ARTIFACT", true)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "PG") {
+			t.Setenv(key, "")
+			if os.Unsetenv(key) != nil {
+				t.Fatal("clear ambient libpq override")
+			}
+		}
+	}
+	return bin, prefix, video, icc, artifacts, mediaBytes
+}
+
+// liveSizedMedia is the #21 production-scale RPO/RTO dataset: real API
+// uploads of distinct BMP originals, which no active fixture profile accepts,
+// so they add DB rows, change events and original files without transform
+// jobs. It is bounded by the live lane's job budget; real-hardware figures
+// remain #22 evidence.
+const liveSizedMedia = 3000
+
+func liveMediaCount(base int) string { return strconv.Itoa(base + liveSizedMedia) }
+
+func liveBMP(seed uint32) []byte {
+	const w, h = 64, 64
+	row := (w*3 + 3) &^ 3
+	size := 54 + row*h
+	b := make([]byte, size)
+	copy(b, "BM")
+	binary.LittleEndian.PutUint32(b[2:], uint32(size))
+	binary.LittleEndian.PutUint32(b[10:], 54)
+	binary.LittleEndian.PutUint32(b[14:], 40)
+	binary.LittleEndian.PutUint32(b[18:], w)
+	binary.LittleEndian.PutUint32(b[22:], h)
+	binary.LittleEndian.PutUint16(b[26:], 1)
+	binary.LittleEndian.PutUint16(b[28:], 24)
+	binary.LittleEndian.PutUint32(b[34:], uint32(row*h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			o := 54 + y*row + x*3
+			b[o], b[o+1], b[o+2] = byte(seed), byte(seed>>8)^byte(x), byte(seed>>16)^byte(y)
+		}
+	}
+	binary.LittleEndian.PutUint32(b[54:], seed) // first pixels carry the full seed: every original is distinct
+	return b
+}
+
+func liveSeedSizedDataset(t *testing.T, ctx context.Context, source *pgxpool.Pool) string {
+	t.Helper()
+	started := time.Now()
+	client := &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 8}}
+	work := make(chan int)
+	failed := make(chan string, 1)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range work {
+				var body bytes.Buffer
+				w := multipart.NewWriter(&body)
+				part, _ := w.CreateFormFile("file", fmt.Sprintf("sized-%05d.bmp", i))
+				part.Write(liveBMP(uint32(i) + 0x9e3779b9))
+				w.Close()
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1:8080/media", &body)
+				req.Header.Set("Content-Type", w.FormDataContentType())
+				req.Header.Set("Idempotency-Key", fmt.Sprintf("live-sized-%05d", i))
+				resp, err := client.Do(req)
+				status := 0
+				if err == nil {
+					status = resp.StatusCode
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+				if status != http.StatusCreated {
+					select {
+					case failed <- fmt.Sprintf("sized upload %d status %d", i, status):
+					default:
+					}
+				}
+			}
+		}()
+	}
+	for i := 0; i < liveSizedMedia; i++ {
+		work <- i
+	}
+	close(work)
+	wg.Wait()
+	select {
+	case msg := <-failed:
+		t.Fatal(msg)
+	default:
+	}
+	var media, jobs int64
+	var dbBytes int64
+	if source.QueryRow(ctx, `SELECT (SELECT count(*) FROM media), (SELECT count(*) FROM jobs), pg_database_size(current_database())`).Scan(&media, &jobs, &dbBytes) != nil {
+		t.Fatal("sized dataset inventory")
+	}
+	if media != int64(liveSizedMedia)+1 {
+		t.Fatalf("sized dataset media=%d, want %d", media, liveSizedMedia+1)
+	}
+	summary := fmt.Sprintf(`{"media":%d,"jobs":%d,"database_bytes":%d,"original_bytes_per_item":%d,"seed_seconds":%.1f}`, media, jobs, dbBytes, len(liveBMP(0)), time.Since(started).Seconds())
+	t.Logf("live sized RPO/RTO dataset: %s", summary)
+	return summary
 }

@@ -637,6 +637,159 @@ jobs:
           path: ${{ runner.temp }}/debootstrap-deb-cache
           key: ${{ steps.debkey.outputs.key }}
 
+  release-resources:
+    name: Release gate / RAW and AV1 under one nmcp.slice
+    needs: [test, backup-postgresql17]
+    runs-on: ubuntu-24.04
+    # Must equal BUDGET_POLICY job_seconds in scripts/run-backup-root-isolated.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Install isolated systemd machine provisioner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
+          bash -n scripts/run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
+      - name: Compute signed-metadata deb cache key
+        id: debkey
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(timeout 90 bash scripts/run-backup-root-isolated --deb-cache-key)"
+          [[ "$key" =~ ^nmcp-debootstrap-debs-v1-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore untrusted deb byte cache (re-verified against signed metadata at use)
+        id: debcache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
+      - name: Receive exact-head native closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-native-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Receive exact-head PostgreSQL17 closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-postgresql17-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Restore authenticated current-run build products
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
+          test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-toolchain.tar.gz" -C /opt
+          test ! -e /opt/nmcp-pg17-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
+          test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
+          /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-root-cleanup
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-installed-contract
+          go test -c -o "$RUNNER_TEMP/release-resources.test" ./internal/admin
+          "$RUNNER_TEMP/release-resources.test" -test.list '^TestReleaseGateResources$' | grep -Fx TestReleaseGateResources
+      - name: Restore content-addressed fixture archive
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .tools/downloads/ffmpeg-6.0.1-amd64-static-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5.tar.xz
+          key: fixture-ffmpeg-linux-amd64-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
+      - name: Restore untrusted prepared fixture matrix (re-verified against pins)
+        id: fixturecache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/e2e-prepared
+          key: nmcp-root-fixtures-v1-${{ hashFiles('test/e2e/testdata/fixtures.json', 'scripts/prepare-e2e-fixtures') }}
+      - name: Prepare pinned RAW and video fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600 python3 -I scripts/prepare-e2e-fixtures --out "$RUNNER_TEMP/e2e-prepared"
+      - name: Save prepared fixture matrix
+        if: steps.fixturecache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/e2e-prepared
+          key: nmcp-root-fixtures-v1-${{ hashFiles('test/e2e/testdata/fixtures.json', 'scripts/prepare-e2e-fixtures') }}
+      - name: Acquire identity-bound job budget receipt
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          receipt="$(mktemp "$RUNNER_TEMP/budget.XXXXXX")"
+          python3 -I scripts/backup-ci-admission acquire --repo "$GITHUB_REPOSITORY" \
+            --sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --job-name "Release gate / RAW and AV1 under one nmcp.slice" --runner-name "$RUNNER_NAME" \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --job-seconds 2400 --cleanup-seconds 300 --margin-seconds 60 --required-seconds 1650 > "$receipt"
+          sudo install -o root -g root -m 0600 "$receipt" "$RUNNER_TEMP/.nmcp-budget-resources.json"
+          rm -f -- "$receipt"
+      - name: Actual RAW and AV1 transforms under one nmcp.slice
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            GITHUB_RUN_ID="${{ github.run_id }}" GITHUB_RUN_ATTEMPT="${{ github.run_attempt }}" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" RUNNER_NAME="$RUNNER_NAME" \
+            BUDGET_RUN_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+            TEST_RELEASE_RESOURCES=1 TEST_RELEASE_FIXTURES_DIR="$RUNNER_TEMP/e2e-prepared" \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
+            TEST_BACKUP_NATIVE_PREFIX="/opt/nmcp-native-ci" \
+            TEST_BACKUP_STILL_HELPER="$RUNNER_TEMP/still-helper-build/bin/nmcp-still-helper" \
+            TEST_BACKUP_ANIMATION_HELPER="$RUNNER_TEMP/animation-helper-build/bin/nmcp-animation-helper" \
+            TEST_BACKUP_ICC_PATH="$RUNNER_TEMP/sRGB2014.icc" \
+            TEST_BACKUP_MEDIA_FIXTURE="$RUNNER_TEMP/orientation-6.jpg" \
+            TEST_BACKUP_CORE_API="$RUNNER_TEMP/backup-live-binaries/core-api" \
+            TEST_BACKUP_CORE_WORKER="$RUNNER_TEMP/backup-live-binaries/core-worker" \
+            TEST_BACKUP_ADMIN_BINARY="$RUNNER_TEMP/backup-live-binaries/nmcp-admin" \
+            bash scripts/run-backup-root-isolated "$RUNNER_TEMP/release-resources.test" -test.v -test.count=1 -test.timeout=18m \
+            -test.run '^TestReleaseGateResources$' | tee "$RUNNER_TEMP/release-resources.log"
+          grep -F -- '--- PASS: TestReleaseGateResources ' "$RUNNER_TEMP/release-resources.log"
+          ! grep -F -- '--- SKIP: TestReleaseGateResources' "$RUNNER_TEMP/release-resources.log"
+          grep -F 'release-gate resource evidence: ' "$RUNNER_TEMP/release-resources.log"
+      - name: Always stop only receipt-owned isolated machine
+        if: always()
+        shell: bash
+        run: |
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            bash scripts/run-backup-root-isolated --cleanup resources
+      - name: Detect exported deb byte cache
+        id: debexport
+        if: always() && steps.debkey.outputs.key != '' && steps.debcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if test -d "$RUNNER_TEMP/debootstrap-deb-cache" && ! test -L "$RUNNER_TEMP/debootstrap-deb-cache"; then
+            echo present=true >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save deb byte cache candidate
+        if: always() && steps.debexport.outputs.present == 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
+
   backup-offline-recovery:
     name: Backup / offline two-cluster source-stop recovery and separate resume
     needs: [test, backup-postgresql17]
