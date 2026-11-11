@@ -52,7 +52,7 @@ step "admin runs nmcp-admin as nmcp_migrator"
 "$ctl" admin -- migrate status --json >"$NMCP_E2E_ARTIFACT_DIR/selftest-admin.json" ||
   fail "nmcp-admin migrate status"
 
-step "admin one-shot mounts: fixtures read-only, private /e2e/work outside media"
+step "admin one-shot mounts: fixtures and media read-only, private /e2e/work outside media"
 case "$NMCP_E2E_FIXTURES_DIR" in */no-fixtures) ;; *) fail "self-test expects the empty fixture dir, got $NMCP_E2E_FIXTURES_DIR" ;; esac
 marker="selftest-$$"
 printf '%s' "$marker" >"$NMCP_E2E_FIXTURES_DIR/selftest.marker"
@@ -66,7 +66,9 @@ mounts=$(docker compose --project-name "$NMCP_E2E_PROJECT" \
     echo w >/e2e/work/probe && rm /e2e/work/probe && echo work-writable
     stat -c "%a %u" /e2e/work
     [ "$(stat -c %d /e2e/work)" != "$(stat -c %d /e2e/fixtures)" ] && echo work-separate
-    if [ -e /var/lib/nmcp/media ]; then echo media-visible; fi') || fail "admin mount probe"
+    [ "$NMCP_STORAGE_ROOT" = /var/lib/nmcp/media ] && echo storage-root
+    [ -d /var/lib/nmcp/media/originals ] && echo media-visible
+    if touch /var/lib/nmcp/media/tmp/.e2e-admin-probe 2>/dev/null; then echo media-writable; fi') || fail "admin mount probe"
 rm -f "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
 # admin -- uses the same `compose run --no-deps -T migrate` invocation; prove
 # that stdin reaches the one-shot process (certify reads its spec from -).
@@ -77,7 +79,9 @@ echoed=$(printf 'spec-%s' "$marker" | docker compose --project-name "$NMCP_E2E_P
 expected="$marker
 work-writable
 700 10001
-work-separate"
+work-separate
+storage-root
+media-visible"
 [ "$mounts" = "$expected" ] || fail "admin mounts: $mounts"
 
 step "control kill worker SIGKILL prints the pid; start gives a new process"

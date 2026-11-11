@@ -21,7 +21,6 @@ services:
     build:
       context: ../..
       dockerfile: infra/validation/core.Dockerfile
-      network: host
     profiles: [e2e]
     user: "10001:10001"
     entrypoint: ["sh", "-eu", "-c"]
@@ -38,9 +37,15 @@ services:
   # Scenario fixtures (read-only) and a private scratch dir outside the media
   # volume, for `admin --` (the migrate one-shot, same core image as the worker).
   migrate:
-    build:
-      network: host
+    environment:
+      NMCP_STORAGE_ROOT: /var/lib/nmcp/media
     volumes:
+      # Read-only view of the same media filesystem api/worker use, for
+      # read-only reconciliation (`admin -- check`). Never writable here.
+      - type: volume
+        source: media
+        target: /var/lib/nmcp/media
+        read_only: true
       - type: bind
         source: "${NMCP_E2E_FIXTURES_DIR:?scripts/infra-e2e-env must set NMCP_E2E_FIXTURES_DIR}"
         target: /e2e/fixtures
@@ -48,19 +53,3 @@ services:
     tmpfs:
       - /e2e/work:size=1g,uid=10001,gid=10001,mode=0700
 
-  # Image builds resolve through the runner host's resolver. Default build
-  # networking replaces a loopback stub resolver (127.0.0.53) with public DNS,
-  # which failed in runs 43033123750 attempts 1-2 while it worked on the host.
-  # Only build steps are affected; runtime networks are unchanged.
-  storage-init:
-    build:
-      network: host
-  api:
-    build:
-      network: host
-  worker:
-    build:
-      network: host
-  files:
-    build:
-      network: host
