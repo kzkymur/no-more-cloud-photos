@@ -1,0 +1,36 @@
+# Overlay used only by scripts/infra-e2e-env (issue #21 Compose E2E lane).
+#
+# The media volume is a bind of one host tmpfs that the harness mounts and
+# owns. Originals, renditions and their temporary files therefore share one
+# filesystem (same st_dev), and fault injection (read-only remount, size
+# shrink) acts on that whole filesystem without writing filler files into
+# the media tree.
+volumes:
+  media:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${NMCP_E2E_MEDIA_MOUNT:?scripts/infra-e2e-env must set NMCP_E2E_MEDIA_MOUNT}"
+    labels:
+      com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER:?scripts/infra-e2e-env must set NMCP_VALIDATION_OWNER}"
+
+services:
+  # Read-only observer for media-ls. It works while api/worker are stopped
+  # and never needs network access.
+  e2e-observer:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    profiles: [e2e]
+    user: "10001:10001"
+    entrypoint: ["sh", "-eu", "-c"]
+    network_mode: none
+    read_only: true
+    volumes:
+      - type: volume
+        source: media
+        target: /var/lib/nmcp/media
+        read_only: true
+    labels:
+      com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER}"
