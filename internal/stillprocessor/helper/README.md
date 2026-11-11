@@ -16,12 +16,19 @@ tests can be built with `-DNMCP_BUILD_HELPER=OFF`.
 CI and production builds first run `build-pinned-toolchain.sh` with an absolute
 install prefix and scratch directory. It verifies every direct source archive
 against `toolchain.lock` and builds libaom 3.8.2, lcms2 2.14, LibRaw 0.22.2,
-libheif 1.23.5, and libvips 8.18.7 using the recorded reduced feature set.
+libheif 1.23.5, libwebp 1.6.0 (before libvips, so libvips never links the
+distro libwebp with the same SONAMEs), and libvips 8.18.7 using the recorded
+reduced feature set. Every pinned shared object gets `DT_RUNPATH=$prefix/lib`
+(linker flags, no patchelf), and a closure gate fails the build unless each one
+resolves every pinned SONAME from the prefix under an empty environment, as
+processrunner executes helpers.
 System packages supply only the transitive build closure; pinning that complete
 closure and the deployment image is the explicit issue #20 boundary.
 The build also writes `share/nmcp/still-toolchain.manifest`, binding the verified
 libaom commit and source archive to the concrete installed shared-object digest
-for downstream toolchains that inherit this prefix.
+for downstream toolchains that inherit this prefix, and
+`share/nmcp/still-webp.manifest` with the libwebp version, source digest, and
+installed object digests that the animation build validates.
 
 ## Closed behavior
 
