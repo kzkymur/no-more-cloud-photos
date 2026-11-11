@@ -186,15 +186,17 @@ jobs:
   compose-e2e-failpoints:
     name: Infra / Compose E2E issue 21 failpoints
     runs-on: ubuntu-24.04
-    # Must equal NMCP_E2E_BUDGET_JOB_SECONDS.
-    timeout-minutes: 60
+    # Must equal NMCP_E2E_BUDGET_JOB_SECONDS. 8 worker failpoints each wait
+    # out the real 2-minute lease; the scenario needs ~30-35 min plus a cold
+    # image build, so 60 minutes cannot admit it (leader decision pending).
+    timeout-minutes: 80
     permissions:
       contents: read
       actions: read  # Budget admission reads only this run's own job identity.
     env:
       GOTOOLCHAIN: local
       NMCP_E2E_BUDGET_JOB_NAME: Infra / Compose E2E issue 21 failpoints
-      NMCP_E2E_BUDGET_JOB_SECONDS: "3600"
+      NMCP_E2E_BUDGET_JOB_SECONDS: "4800"
       NMCP_E2E_BUDGET_CLEANUP_SECONDS: "300"
       NMCP_E2E_BUDGET_MARGIN_SECONDS: "60"
       NMCP_E2E_BUDGET_RUN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -225,7 +227,7 @@ jobs:
         if: steps.scenario.outputs.present == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: scripts/infra-e2e-budget-acquire 2700
+        run: scripts/infra-e2e-budget-acquire 3960
       - name: Restore prepared E2E fixture cache (untrusted; re-verified against pins)
         if: steps.scenario.outputs.present == 'true'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -256,10 +258,10 @@ jobs:
         env:
           NMCP_E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-results/failpoints
           NMCP_E2E_LANE: failpoints
-          NMCP_E2E_TIMEOUT_SECONDS: "1260"
+          NMCP_E2E_TIMEOUT_SECONDS: "2580"
         run: >-
           scripts/infra-e2e-env lane --
-          "$RUNNER_TEMP/nmcp-e2e.test" -test.v -test.count=1 -test.timeout=20m
+          "$RUNNER_TEMP/nmcp-e2e.test" -test.v -test.count=1 -test.timeout=40m
       - name: Upload E2E results
         if: always() && steps.scenario.outputs.present == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
