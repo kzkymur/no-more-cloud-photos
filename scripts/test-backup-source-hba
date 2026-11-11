@@ -1,0 +1,255 @@
+#!/usr/bin/python3
+"""Non-root pure/fake-file counterexamples, NOT a root or PostgreSQL fixture."""
+import configparser
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import stat
+import tempfile
+import types
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parent
+loader = importlib.machinery.SourceFileLoader('source_hba', str(ROOT / 'configure-backup-source-hba'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+hba = importlib.util.module_from_spec(spec)
+loader.exec_module(hba)
+
+
+def services(database='source'):
+    return ''.join(f'[{role}]\nhost=/var/run/postgresql\nport=5432\ndbname={database}\nuser={role}\nsslmode=disable\n'
+                   for role in hba.ROLES.split(',')).encode()
+
+
+def cutover(source='source', candidate='candidate'):
+    roles = 'nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator'
+    def rejects(db):
+        return f'local "{db}" {roles} reject\nhost "{db}" {roles} 0.0.0.0/0 reject\nhost "{db}" {roles} ::/0 reject\n'
+    return ('# nmcp explicit cutover 12345678-1234-4123-8123-123456789abc; source remains fenced\n'
+            + rejects(source) + f'local "{candidate}" {roles} scram-sha-256\n'
+            + f'host "{candidate}" {roles} 127.0.0.1/32 scram-sha-256\n'
+            + f'host "{candidate}" {roles} ::1/128 scram-sha-256\n' + rejects(candidate))
+
+
+class SourceHBA(unittest.TestCase):
+    def test_services_closed(self):
+        self.assertEqual(hba.service_database(services()), 'source')
+        for role in hba.ROLES.split(','):
+            raw=services().replace(('user='+role+'\n').encode(),('user='+role+'\napplication_name=nmcp_restore_12345678123441238123123456789abc_'+role.removeprefix('nmcp_')+'\n').encode())
+            self.assertEqual(hba.service_database(raw),'source')
+        for data in [services().replace(b'dbname=source', b'dbname=other', 1),
+                     services().replace(b'/var/run/postgresql', b'localhost'),
+                     services().replace(b'5432', b'5433'),
+                     services().replace(b'sslmode=disable', b'sslmode=prefer'),
+                     services().replace(b'user=nmcp_backup_dump', b'user=postgres'),
+                     services() + b'\n[other]\nhost=remote\n',
+                     services() + b'options=-c search_path=public\n',
+                     b'[DEFAULT]\npassword=secret\n' + services(),
+                     services().replace(b'dbname=source', b'dbname=service=x'),
+                     services().replace(b'host=', b'HOST='),
+                     services().replace(b'dbname=source', b'dbname="all"')]:
+            with self.subTest(data=data):
+                with self.assertRaises((ValueError, configparser.Error)):
+                    hba.service_database(data)
+
+    def test_quotes_keywords_and_boundary(self):
+        for database in ['all', 'replication', 'sameuser', 'samegroup', 'samerole', 'a', 'a' * 63]:
+            result = hba.block(database)
+            self.assertIn(f'local "{database}" ', result)
+            self.assertNotIn(f'local {database} ', result.splitlines()[1])
+        for database in ['a' * 64, 'x"', 'x\ny', '../source', 'x,y', 'x y', 'Source', '1db', '']:
+            with self.assertRaises(ValueError):
+                hba.block(database)
+
+    def test_first_match_order_all_hosts_and_only_two_roles(self):
+        old = b'local all all trust\nhost all all 0.0.0.0/0 trust\nhost all all ::/0 trust\n'
+        result = hba.candidate(old, 'source')
+        self.assertTrue(result.endswith(old))
+        lines = hba.block('source').splitlines()[1:-1]
+        self.assertEqual(len(lines), 6)
+        self.assertEqual([line.split()[-1] for line in lines], ['scram-sha-256'] * 3 + ['reject'] * 3)
+        self.assertEqual([line.split()[2] for line in lines], [hba.ROLES] * 6)
+        self.assertIn('127.0.0.1/32 scram-sha-256', lines[1])
+        self.assertIn('::1/128 scram-sha-256', lines[2])
+        self.assertEqual(lines[3], 'local all ' + hba.ROLES + ' reject')
+        self.assertEqual(lines[4], 'host all ' + hba.ROLES + ' 0.0.0.0/0 reject')
+        self.assertEqual(lines[5], 'host all ' + hba.ROLES + ' ::/0 reject')
+        self.assertNotIn('nmcp_api', result.decode())
+        self.assertNotIn('nmcp_worker', result.decode())
+
+    def test_owned_closed_parse_and_update(self):
+        initial = hba.candidate(b'# existing\nlocal all all peer\n', 'source')
+        self.assertEqual(hba.candidate(initial, 'source'), initial)
+        self.assertIn(b'"new_source"', hba.candidate(initial, 'new_source'))
+        mutations = [initial.replace(b'scram-sha-256', b'trust', 1),
+                     initial.replace(b'0.0.0.0/0', b'127.0.0.1/32'),
+                     initial.replace(b'v1', b'v2'), initial + hba.BEGIN.encode(),
+                     initial.replace(hba.END.encode(), b''),
+                     initial.replace(b'local "source"', b'local all', 1),
+                     initial.replace(hba.END.encode(), b'# extra\n' + hba.END.encode()),
+                     b'local all all trust\n' + initial]
+        for mutation in mutations:
+            with self.assertRaises(ValueError):
+                hba.candidate(mutation, 'source')
+
+    def test_existing_cutover_precedence_preserved(self):
+        prefix = cutover().encode()
+        original = prefix + hba.block('source').encode() + b'local all all peer\n'
+        self.assertEqual(hba.candidate(original, 'source'), original)
+        self.assertTrue(hba.candidate(original, 'candidate').startswith(prefix))
+        for mutation in [original.replace(b'0.0.0.0/0 reject', b'0.0.0.0/0 trust', 1),
+                         original.replace(b'# nmcp explicit cutover', b'# unrecognized cutover'),
+                         b'local all all trust\n' + original]:
+            with self.assertRaises(ValueError):
+                hba.candidate(mutation, 'source')
+
+    def test_metadata_unsafe_owner_permissions_symlink_hardlink(self):
+        good = dict(st_mode=stat.S_IFREG | 0o640, st_uid=42, st_nlink=1)
+        hba.metadata(types.SimpleNamespace(**good), (0, 42))
+        for changes in [dict(st_uid=99), dict(st_mode=stat.S_IFLNK | 0o777),
+                        dict(st_nlink=2), dict(st_mode=stat.S_IFREG | 0o660),
+                        dict(st_mode=stat.S_IFREG | 0o642)]:
+            with self.assertRaises(ValueError):
+                hba.metadata(types.SimpleNamespace(**(good | changes)), (0, 42))
+        with self.assertRaises(ValueError):
+            hba.metadata(types.SimpleNamespace(**good), (42,), mode=0o600)
+
+    def test_fake_files_cas_and_symlink(self):
+        # All writes are temporary workspace files; never /etc or source PG.
+        with tempfile.TemporaryDirectory(prefix='.test-source-hba-', dir=ROOT) as folder:
+            directory = Path(folder).resolve()
+            self.assertEqual(directory.parent, ROOT)
+            target = directory / 'pg_hba.conf'
+            target.write_bytes(b'local all all peer\n')
+            target.chmod(0o600)
+            # Fake-file trust set only: workspace ancestors are not production root-owned.
+            owners = tuple({0, os.getuid()} | {p.stat().st_uid for p in directory.parents})
+            original, st = hba.read_safe(target, owners)
+            target.write_bytes(b'# concurrent operator\n' + original)
+            with self.assertRaises(ValueError):
+                hba.cas(target, original, st, hba.candidate(original, 'source'), owners)
+            self.assertEqual(target.read_bytes(), b'# concurrent operator\n' + original)
+            original, st = hba.read_safe(target, owners)
+            # No root privileges needed: preserve this fake file's existing UID/GID.
+            replacement = hba.candidate(original, 'source')
+            hba.cas(target, original, st, replacement, owners)
+            self.assertEqual(target.read_bytes(), replacement)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            symlink = directory / 'link'
+            symlink.symlink_to(target)
+            with self.assertRaises(ValueError):
+                hba.read_safe(symlink, owners)
+            hardlink = directory / 'hardlink'
+            os.link(target, hardlink)
+            with self.assertRaises(ValueError):
+                hba.read_safe(target, owners)
+
+    def test_source_unit_path_identity_no_includes_or_errors(self):
+        unit, cluster = hba.dependency(b'[Unit]\nRequires=postgresql@17-main.service\nAfter=postgresql@17-main.service\n')
+        self.assertEqual((unit, cluster), ('postgresql@17-main.service', 'main'))
+        for data in [b'[Unit]\nRequires=postgresql.service\nAfter=postgresql.service\n',
+                     b'[Unit]\nRequires=postgresql@17-main.service\nAfter=postgresql@17-other.service\n',
+                     b'[Unit]\nRequires=postgresql@17-../main.service\nAfter=postgresql@17-../main.service\n']:
+            with self.assertRaises(ValueError):
+                hba.dependency(data)
+        path = Path('/etc/postgresql/17/main/pg_hba.conf')
+        identity = dict(db='source', oid=1234, system='123456', hba=str(path), port='5432', pid='123', version='170005', user='postgres', super=True)
+        hba.validate_identity(identity, 'source', path, '123')
+        for key, value in [('db', 'postgres'), ('hba', '/tmp/pg_hba.conf'), ('pid', '124'),
+                           ('port', '5433'), ('version', '180000'), ('super', False), ('user', 'nmcp_backup_control')]:
+            with self.assertRaises(ValueError):
+                hba.validate_identity(identity | {key: value}, 'source', path, '123')
+        hba.validate_rules(dict(errors=0, files=[str(path)]), path)
+        for value in [dict(errors=1, files=[str(path)]), dict(errors=0, files=[str(path), '/included.conf']),
+                      dict(errors=0, files=['/tmp/pg_hba.conf']), dict(errors=0, files=None)]:
+            with self.assertRaises(ValueError):
+                hba.validate_rules(value, path)
+
+    def test_fake_command_scrubbed_no_dsn_no_password_argv(self):
+        calls = []
+        def fake(argv):
+            calls.append(argv)
+            return 'fake-result'
+        with patch.dict(os.environ, {'PGHOST': 'rogue', 'PGDATABASE': 'postgres', 'PGPASSWORD': 'secret'}):
+            self.assertEqual(hba.psql('source', 'SELECT 1', run=fake), 'fake-result')
+            with patch.object(hba.subprocess, 'run', return_value=types.SimpleNamespace(stdout=' ok\n')) as run:
+                self.assertEqual(hba.command(['/usr/bin/true']), 'ok')
+                self.assertEqual(run.call_args.kwargs['env'], hba.ENV)
+                self.assertNotIn('PGPASSWORD', run.call_args.kwargs['env'])
+                self.assertNotIn('PGHOST', run.call_args.kwargs['env'])
+                self.assertEqual(run.call_args.kwargs['stdin'], hba.subprocess.DEVNULL)
+        argv = calls[0]
+        self.assertEqual(argv[:5], ['/usr/bin/runuser', '-u', 'postgres', '--', '/usr/bin/psql'])
+        for item in ['-X', '--no-password', '--host=/var/run/postgresql', '--port=5432', '--dbname=source', '--username=postgres']:
+            self.assertIn(item, argv)
+        self.assertNotIn('secret', ' '.join(argv))
+        self.assertNotIn('service=', ' '.join(argv))
+        with patch.object(hba.os, 'geteuid', return_value=1000):
+            with self.assertRaises(ValueError):
+                hba.main()
+
+    def test_fake_install_reload_verification_counterexamples(self):
+        # Entire root/PG interface is FAKE. This exercises decisions only and
+        # explicitly does NOT demonstrate real permissions, reload or auth.
+        import json
+        path = Path('/etc/postgresql/17/main/pg_hba.conf')
+        identity = dict(db='source', oid=1234, system='123456', hba=str(path), port='5432', pid='123', version='170005', user='postgres', super=True)
+        dependency = b'[Unit]\nRequires=postgresql@17-main.service\nAfter=postgresql@17-main.service\n'
+        for fault in [None, 'wrong-source', 'initial-hash', 'nonloaded-hash', 'reload-stale', 'parse-error', 'includes', 'concurrent-hash']:
+            with self.subTest(fault=fault):
+                state = dict(data=b'local all all peer\n', written=False, reloaded=False)
+                def read(pathname, *args, **kwargs):
+                    if pathname == hba.SERVICE:
+                        return services(), None
+                    if pathname == hba.DEPENDENCY:
+                        return dependency, None
+                    self.assertEqual(pathname, path)
+                    if fault == 'concurrent-hash' and state['reloaded']:
+                        return state['data'] + b'# concurrent\n', None
+                    return state['data'], None
+                def cas(pathname, original, st, replacement, owners):
+                    self.assertEqual(pathname, path)
+                    self.assertEqual(original, state['data'])
+                    state.update(data=replacement, written=True)
+                def run(argv):
+                    self.assertEqual(argv[0], '/usr/bin/systemctl')
+                    return 'active' if argv[1] == 'is-active' else '123'
+                def sql(database, query):
+                    self.assertEqual(database, 'source')
+                    if query == hba.IDENTITY_SQL:
+                        return json.dumps(identity | ({'db': 'postgres'} if fault == 'wrong-source' else {}))
+                    if query == hba.HASH_SQL:
+                        if fault == 'initial-hash' or (fault == 'nonloaded-hash' and state['reloaded']):
+                            return '0' * 64
+                        return hba.digest(state['data'])
+                    if query == hba.RULES_SQL:
+                        return json.dumps(dict(errors=int(fault == 'parse-error' and state['written']),
+                                               files=[str(path), '/include'] if fault == 'includes' else [str(path)]))
+                    if query == 'SELECT pg_reload_conf()':
+                        state['reloaded'] = True
+                        return 't'
+                    self.assertEqual(query, 'SELECT pg_conf_load_time()::text')
+                    return 'new' if state['reloaded'] and fault != 'reload-stale' else 'old'
+                with patch.object(hba.os, 'geteuid', return_value=0), patch.object(hba.sys, 'argv', ['configure']), \
+                     patch.object(hba, 'verify_locks'), patch.object(hba, 'read_safe', side_effect=read), \
+                     patch.object(hba, 'cas', side_effect=cas), patch.object(hba, 'command', side_effect=run), \
+                     patch.object(hba, 'psql', side_effect=sql), patch.object(hba.pwd, 'getpwnam', return_value=types.SimpleNamespace(pw_uid=42)), \
+                     patch.object(hba.time, 'sleep'), patch('builtins.print'):
+                    if fault:
+                        with self.assertRaises(ValueError):
+                            hba.main()
+                    else:
+                        hba.main()
+                        self.assertTrue(state['written'] and state['reloaded'])
+
+    def test_installer_before_wake(self):
+        script = (ROOT / 'install-backup-config').read_text()
+        self.assertLess(script.index('"$script_dir/validate-backup-install" --installed'), script.index('"$script_dir/configure-backup-source-hba"'))
+        self.assertLess(script.index('"$script_dir/configure-backup-source-hba"'), script.index('/usr/bin/systemctl start nmcp-backup.service'))
+        self.assertLess(script.index('"$script_dir/configure-backup-source-hba"'), script.index('/usr/bin/systemctl enable --now nmcp-backup.timer'))
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

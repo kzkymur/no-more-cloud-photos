@@ -138,3 +138,179 @@ and unrelated untracked files are not sent to the builder.
   that full budget independently to every unit. Worker concurrency starts at
   one. Timer wakeups invoke the application; database configuration determines
   backup/cleanup eligibility.
+
+### Backup root fixtures: isolated systemd machine
+
+The two Issue19 root lanes use `scripts/run-backup-root-isolated` on a disposable
+GitHub-hosted Ubuntu runner. They do not adopt the runner's PostgreSQL units or
+change `/etc/postgresql` ownership. A fresh signed Ubuntu 24.04 root filesystem
+omits `postgresql-common` (whose configuration ownership and service template
+conflict with the deliberately strict empty-fixture preflight). It boots its own
+systemd PID1 and private network, mount, process, `/run`, and `/tmp` namespaces.
+The exact-run repository, PG17 binaries, and native build artifacts are bound
+read-only at their original absolute paths. The existing fixture and production
+identity/permission/HBA checks remain mandatory and unchanged.
+
+Native CI dependencies are built and received at the same fixed
+`/opt/nmcp-native-ci` prefix. Their ELF search paths and the video helper's
+strict sibling/manifest/RPATH checks therefore remain valid beneath production
+`ProtectHome=yes`. Same-path mounts beneath `/home` cannot bypass that setting,
+and helper subprocesses intentionally do not inherit `LD_LIBRARY_PATH`. No
+production sandbox directive, helper environment allowlist, or RPATH verifier
+is relaxed to accommodate build artifacts.
+
+The live workloads do not assume seeded draft profiles create transform jobs.
+Before worker startup, a fixture-only JPEG/PNG thumbnail profile is created
+through the administrative boundary and its uncertified activation must fail.
+Both exact pinned native transformations (edge 640, quality 50) and independent
+bounded AVIF probes must then succeed before the corresponding two narrow
+fixture evidence rows may be recorded. Only then does normal administrative
+activation run. Broad bundled profiles remain drafts, and no production
+certification validator is bypassed. Upload responses must contain the expected
+native transform target; subsequent actual production-worker completion and
+positive renditions remain separate mandatory assertions.
+
+Acquisition exit is observed with `waitid(WNOWAIT)`: the original direct-child
+session leader remains unreaped until the last owned-group signal, including
+when it has already exited. The single-threaded launcher requires default
+SIGCHLD and explicitly clears auto-reap flags before spawning. PPID, starttime,
+SID and PGID must still match; lost wait ownership never authorizes a signal.
+Only after group termination does it reap the launcher and adopted group
+children. A live adopted child is not substituted as an identity pin, because
+it could change groups. Controlled real probes cover timeout, caught cancel,
+and launcher exit 0, 23 and SIGTERM with an unaffected separate-session control.
+TERM/INT handlers defer cancellation without changing inherited signal masks;
+the observer checks the bounded pending signal every 20ms. Original callbacks
+run inside the owned cleanup boundary, and bounded cleanup completes before
+handlers are restored. Deterministic pre-capture and pre-kill cancellation
+probes cover both windows. These are not proofs of unhandled signals,
+outer-wrapper hardkill, arbitrary identity-read failures, or descendants
+escaping process groups or sessions.
+
+Offline membership replay resolves the complete direct ADMIN-option dependency
+graph before executing grants. It preserves each original grantor and all three
+options; missing authority dependencies fail closed. In these PG17 fixtures,
+only the reserved bootstrap identity (OID 10, initialized as `operator` in both
+clusters) anchors the graph. A non-bootstrap superuser still needs direct ADMIN
+for its explicitly recorded `GRANTED BY`. The actual PG17 regression covers that
+negative case, reverse-name two-level grantors, all eight option tuples, and an
+independent raw catalog oracle rather than comparing the DDL generator with itself.
+
+The explicit PG17 private-passfile regression creates an actual self-only POSIX
+ACL (0440 group-class mask) in a private test directory. It proves pgx can
+authenticate while the unchanged Go dump guard and libpq reject that file;
+ordinary `install -T -m 0600` creates byte-identical, current-UID, single-link copies
+that pass the strict Go identity check, real `pg_dump`, and `pg_restore --list`.
+It also rejects weak/stale copies and covers owner-private 0400 input. This is
+credential-format portability evidence, not actual systemd delivery, distinct-UID
+isolation, or a claim about the precise attributes in earlier failed root runs.
+Actual live/offline tests exercise the production runtime-directory lifecycle,
+refuse a preexisting `/run/nmcp-backup` before mutation, and require manager removal
+after each oneshot and owned-unit cleanup, with a five-second read-only wait.
+In [systemd 255](https://github.com/systemd/systemd/blob/v255/src/core/service.c),
+job completion is emitted before synchronous runtime-data destruction; a single
+immediate absence sample is insufficient. Leftovers are preserved and fail;
+neither normal nor fallback cleanup manually deletes that runtime path.
+
+`TestBackupInstallExactLeaf` separately requires actual GNU coreutils 9.4:
+no-`-T` directory-symlink redirection is the negative control; `-T` refuses a real
+directory and replaces symlink, dangling, hardlink and stale regular leaves with
+private current copies without changing victim contents. Unsupported local
+install implementations explicitly skip; CI requires a non-skipped PASS. These
+are filesystem semantics, not authenticated-source or systemd-lifecycle proof.
+Typed effective-unit decoder tests cover malformed/duplicate/trailing JSON,
+command flags and argv boundaries; the root fixture must separately prove the
+actual manager contract. Both root fixtures now require production-shaped PG
+dependency files and a real receipt-owned PostgreSQL unit (including the live
+`postgresql@17-backup-ci.service`, exact socket and port). Before adding the known
+artifact-only bind drop-ins, they exercise the installed metadata gate against
+the real manager: positive, an exclusively owned unsafe execution drop-in
+rejected without explicit reload/activation, then restored positive. The probe
+checks that neither its execution sentinel nor runtime credentials appeared;
+it removes only its inode-checked unit input, never `/run/nmcp-backup`. This is
+not a full installer/HBA proof, and metadata reads may lazily refresh definitions.
+Pure fake-manager tests separately cover stale-cache prospective changes.
+These are required probes, not claims of actual success before CI completes.
+Automatic failure/interruption cleanup and complete
+online/offline restore/resume remain actual acceptance gates, not mock claims.
+
+The launcher retains a root-only exact-head ownership receipt and diagnostic
+root filesystem below `RUNNER_TEMP`. Normal finalization and the workflow's
+outer `always()` step both run receipt-scoped cleanup **inside that machine**,
+then stop only its identity-checked machine and verify process absence. Use
+`--cleanup live` or `--cleanup offline` with the same explicit CI/head/path
+environment; never run the inner cleanup helper against the host manager.
+A missing receipt is a no-op; a stale or unverifiable receipt fails closed.
+Unexpected boot, runtime-library, identity, cleanup, or machine-shutdown errors
+fail the lane rather than become skipped success. Logs and rootfs are preserved
+for runner diagnostics, not installed on a customer machine.
+
+Bootstrap downloads use a root-private Wget configuration (10-second DNS and
+connect limits, 30-second read limit, three tries) within a single absolute
+provisioning deadline of at most 520 seconds (budget-capped). HTTPS certificate checks, archive
+signatures, and package verification remain mandatory.
+
+The guest `--include` set is the runtime closure the guest actually executes:
+systemd/D-Bus, util-linux, Python, ExifTool and exactly the shared libraries that
+guest `ldd` resolves for the bound test, API, Worker, admin, PG17 and native
+helper artifacts (including the native prefix's own `ffmpeg`/`ffprobe`, now
+also covered by the strict guest `ldd` guard). Ubuntu's `ffmpeg` and all `-dev`
+packages were never executed in the guest; dropping them reduced the measured
+noble closure from about 367 packages / 183 MiB to about 142 packages / 65 MiB.
+
+A `.deb` byte cache keyed on suite, components, architecture, variant, include
+set, debootstrap version and the SHA-256 of the gpgv-verified signed
+`binary-amd64` Packages indices may be restored by `actions/cache`. Restored
+bytes are untrusted: the launcher copies only regular, single-link, bounded,
+canonically named `.deb` files into a fresh root-private directory (any shape
+violation rejects the whole cache), and `debootstrap --cache-dir` then fetches a
+fresh signed InRelease (never cached), verifies the Packages index against it and
+verifies each cached file's size and SHA-256 before use, deleting and
+re-downloading any mismatch. A rootfs is never cached or reused. Only a cache
+miss followed by a successful bootstrap exports a candidate for the next run. This configuration is passed only to bootstrap,
+not to guest tests. On a caught timeout or interruption, the launcher signals
+only its freshly created, live PID/start-time/session/group-attested bootstrap
+process group. A process-local child-subreaper setting lets it reap adopted
+children only in that group and require group absence; the prior setting is
+restored on return or failure. Controlled unprivileged timeout/cancel probes
+exercise this path with a real signal-resistant descendant and an unaffected
+separate session. These are not live PostgreSQL outer-interruption proofs. An
+unattestable leader or abrupt outer termination still fails closed; descendant
+absence after such interruption is not established by a no-machine cleanup.
+
+Bootstrap success and failure emit a closed, exact-head/run/attempt/slot diagnostic
+with observed phase/error-class enums and monotonic elapsed time. Only two known
+private log tails (64 KiB each) are inspected through root-owned, no-symlink file
+descriptors; raw lines, URLs, arguments and environment values are not emitted.
+Missing/unsafe logs are unavailable, and last-progress age remains unknown rather
+than being inferred from modification time. A timeout reports the deadline, not
+its underlying cause. No heartbeat or cache hit resets the absolute bound.
+
+Both root jobs share one monotonic job budget. Before any owned root resource
+exists, the workflow obtains an identity-bound admission receipt
+(`scripts/backup-ci-admission`: this run/attempt/head/job/runner's reported
+`started_at` plus the 2400-second job timeout, minus clock uncertainty, a
+60-second margin and a 300-second cleanup reserve). The launcher grants each
+active phase `min(configured cap, remaining active budget − later phases'
+minimums)`: bootstrap ≤ 520 s, guest boot ≤ 120 s, and the guest test client
+exactly 1110 s, so Go's own `-test.timeout=18m` fires first. Insufficient budget
+fails before provisioning, with a closed refusal code. The static worst case
+(120 s setup allowance + 520 + 120 + 120 guest setup + 1110 + 32 s skew + 300
+cleanup + 60 margin = 2382 s) fits the 2400-second job, and teardown's fixed
+bounds (210 + 30 + 45 + 15 s) fit the cleanup reserve. The receipt is an
+estimate from the reported job start, not a guarantee against external cancellation, SIGKILL or VM loss.
+
+Pure launcher tests do not prove actual boot, service sandboxing, resource
+limits, restore/cutover, timeout cleanup, or HBA behavior. Those remain separate
+mandatory supported-runner executions. An interrupted unregistered launch or
+already-dead guest can prevent verified in-guest cleanup; that is a failed
+acceptance condition, not a successful cleanup receipt. Hosted VM disposal is
+only the final containment boundary, not product acceptance evidence.
+
+The transient test services are also named and recorded before launch. A timed
+out or cancelled `systemd-run` **client** is not treated as a stopped test.
+Finalization first attests and stops only those guest test units, verifies
+inactive/MainPID zero/empty cgroups, and only then invokes PG cleanup. Required
+in-machine probes interrupt a real waiting client while its signal-resistant
+service remains active, then exercise this same drain path. Their code and pure
+mock tests are not substitutes for the supported-runner timeout/cancel results.

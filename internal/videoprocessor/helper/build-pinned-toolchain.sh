@@ -1,6 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Kept separate from dependency acquisition: only FFmpeg uses the proven mirror.
+# A cached archive or a completed download with the wrong hash is a hard error,
+# not a reason to try another source. Only transport/HTTP failures fall back.
+fetch_verified_source() {
+  local name=$1 digest=$2 primary=$3 mirror=$4
+  local target="$work/downloads/$name" partial url
+  [[ "$work" == /* && "$name" != */* && -n "$name" ]] || return 2
+  [[ "$primary" == https://* && "$mirror" == https://* ]] || return 2
+  if [[ -f "$target" ]]; then
+    printf '%s  %s\n' "$digest" "$target" | sha256sum --check
+    return
+  fi
+  partial=$(mktemp "$target.partial.XXXXXX") || return 1
+  # Verify the absolute cleanup/move target before using it.
+  [[ "$partial" == "$target".partial.* ]] || return 1
+  for url in "$primary" "$mirror"; do
+    if curl --fail --location --silent --show-error \
+      --proto '=https' --proto-redir '=https' \
+      --connect-timeout 10 --max-time 120 "$url" --output "$partial"; then
+      if printf '%s  %s\n' "$digest" "$partial" | sha256sum --check; then
+        mv -- "$partial" "$target"
+        return
+      fi
+      rm -f -- "$partial"
+      return 1
+    fi
+  done
+  rm -f -- "$partial"
+  return 1
+}
+
+# Allow acquisition-only fixture tests without invoking validation or builds.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 if [[ $# -ne 2 || "$1" != /* || "$2" != /* ]]; then
   printf 'usage: %s ABSOLUTE_PREFIX ABSOLUTE_WORK\n' "$0" >&2
   exit 2
@@ -30,9 +66,10 @@ download zimg-3.0.6.tar.gz \
 download SVT-AV1-v4.2.0.tar.gz \
   https://gitlab.com/AOMediaCodec/SVT-AV1/-/archive/v4.2.0/SVT-AV1-v4.2.0.tar.gz \
   c7b13c4a84bd3751aa35fcc72be13e6875467e7c2216879251a486e5b1e4e740
-download ffmpeg-9.0.2.tar.xz \
+fetch_verified_source ffmpeg-9.0.2.tar.xz \
+  8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e \
   https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz \
-  8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
+  https://distfiles.macports.org/ffmpeg/ffmpeg-9.0.2.tar.xz
 
 rm -rf "$work/source/zimg-release-3.0.6" "$work/source/SVT-AV1-v4.2.0" \
   "$work/source/ffmpeg-9.0.2" "$work/build/svt-av1"

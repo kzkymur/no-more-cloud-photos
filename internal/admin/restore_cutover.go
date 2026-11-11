@@ -1,0 +1,1336 @@
+package admin
+
+// Cutover is deliberately a separate operator action, never a Restore retry or
+// a maintenance resume. An interrupted cutover leaves services stopped and both
+// databases in maintenance; its append-only journal prevents automatic replay.
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgservicefile"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/config"
+	"golang.org/x/sys/unix"
+)
+
+var cutoverName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var cutoverHBAPath = regexp.MustCompile(`^/etc/postgresql/[0-9]+/[A-Za-z0-9_-]+/pg_hba\.conf$`)
+var errCutover = fmt.Errorf("restore cutover failed; inspect external operation ledger; do not resume or restart services")
+
+// Only this closed set of system actions is available to the state machine.
+// Tests replace the interface, not production commands, paths, or credentials.
+type cutoverActions interface {
+	Preflight(context.Context, RestoreOperation) error
+	Stop(context.Context) error
+	Switch(context.Context, RestoreOperation) error
+	VerifyTargets(context.Context, RestoreOperation) error
+	Start(context.Context) error
+	VerifyLive(context.Context, RestoreOperation) error
+	// EmergencyDrain is the failure-path stop: no validation precondition, every
+	// fixed unit attempted independently, all errors aggregated. It never
+	// resumes, unfences or restarts anything.
+	EmergencyDrain(context.Context) error
+}
+
+// cutoverDrainTimeout bounds the drain's wait for every unit to become
+// inactive (API/worker TimeoutStopSec=330s). A unit still active at the bound
+// is reported, never waited on indefinitely.
+const cutoverDrainTimeout = 6 * time.Minute
+
+// drainCutover runs the emergency drain in an independent bounded context
+// (the caller's context may already be cancelled) and returns sanitized errors.
+func drainCutover(a cutoverActions) error {
+	ctx, cancel := context.WithTimeout(context.Background(), cutoverDrainTimeout)
+	defer cancel()
+	return a.EmergencyDrain(ctx)
+}
+
+// cutoverDrainError carries only a fixed step label and a fixed or
+// pattern-validated unit name; raw systemctl/D-Bus output never enters it.
+type cutoverDrainError struct{ step, unit string }
+
+func (e *cutoverDrainError) Error() string {
+	if e.unit == "" {
+		return "emergency drain: " + e.step
+	}
+	return "emergency drain: " + e.step + " " + e.unit
+}
+func newCutoverDrainError(step, unit string) *cutoverDrainError {
+	switch unit {
+	case "", "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service":
+	default:
+		if !offlinePGUnit.MatchString(unit) || len(unit) > 128 {
+			unit = "offline-source-unit"
+		}
+	}
+	return &cutoverDrainError{step: step, unit: unit}
+}
+
+// cutoverFailure records drain evidence in the operation (persisted with the
+// failed phase when that save is still possible) and returns a wrapped error.
+// Errors of any other type are reduced to a fixed label at this boundary.
+func cutoverFailure(op *RestoreOperation, drainErr error) error {
+	if drainErr == nil {
+		return errCutover
+	}
+	parts := []error{drainErr}
+	if joined, ok := drainErr.(interface{ Unwrap() []error }); ok {
+		parts = joined.Unwrap()
+	}
+	out := []error{errCutover}
+	for _, e := range parts {
+		var typed *cutoverDrainError
+		if !errors.As(e, &typed) {
+			typed = newCutoverDrainError("unclassified failure", "")
+		}
+		op.DrainErrors = append(op.DrainErrors, typed.Error())
+		out = append(out, typed)
+	}
+	return errors.Join(out...)
+}
+
+type cutoverSave func(string, RestoreOperation) error
+
+func runCutover(ctx context.Context, root string, op RestoreOperation, a cutoverActions, save cutoverSave) (RestoreOperation, error) {
+	if (!op.SourceOffline && (op.Phase != "validated" || op.Source.ClusterID != op.Candidate.ClusterID || op.Source.DatabaseOID == op.Candidate.DatabaseOID)) || (op.SourceOffline && (op.Phase != "offline_validated" || !validOfflineOperation(op))) || !cutoverName.MatchString(op.Source.DatabaseName) || !cutoverName.MatchString(op.Candidate.DatabaseName) {
+		return op, errCutover
+	}
+	phase := func(p string) error {
+		op.Phase = p
+		op.UpdatedAt = time.Now()
+		op.RTO = time.Since(op.StartedAt)
+		return save(root, op)
+	}
+	// Authorize once, before even preflight. A crash or failed preflight requires
+	// operator investigation, not replay of a partially applied side effect.
+	if phase("cutover_authorized") != nil {
+		return op, errCutover
+	}
+	steps := []struct {
+		phase string
+		run   func() error
+	}{
+		{"cutover_preflight", func() error { return a.Preflight(ctx, op) }},
+		{"cutover_stopped", func() error { return a.Stop(ctx) }},
+		{"cutover_switched", func() error { return a.Switch(ctx, op) }},
+		{"cutover_targets_verified", func() error { return a.VerifyTargets(ctx, op) }},
+		{"cutover_started", func() error { return a.Start(ctx) }},
+		{"cutover_verified", func() error { return a.VerifyLive(ctx, op) }},
+	}
+	for _, step := range steps {
+		if e := step.run(); e != nil {
+			// In particular, a partial Start/verification must not leave a worker or
+			// timer running. The drain has no validation precondition (the validating
+			// Stop may itself be what failed) and never short-circuits. The old-source
+			// fence and maintenance state are left exactly as they are.
+			err := cutoverFailure(&op, drainCutover(a))
+			op.FailedPhase = step.phase
+			_ = phase("cutover_failed")
+			return op, err
+		}
+		if phase(step.phase) != nil {
+			return op, cutoverFailure(&op, drainCutover(a))
+		}
+	}
+	return op, nil
+}
+
+// RestoreCutover is root/operator-only. Settings never select systemctl, units,
+// live configuration, HBA destinations, or HTTP destinations. No automatic
+// resume occurs and no source database is dropped or unfenced.
+func (s *Service) RestoreCutover(ctx context.Context, operationID string, c RestoreSettings) (RestoreOperation, error) {
+	var op RestoreOperation
+	if os.Geteuid() != 0 || c.validate() != nil {
+		return op, ErrValidation
+	}
+	op, e := LoadRestoreOperation(c.LedgerRoot, operationID)
+	if e != nil {
+		return op, errCutover
+	}
+	if op.SourceOffline {
+		return restoreOfflineCutover(ctx, op, c)
+	}
+	if s.Pool == nil || c.OfflineSource {
+		return op, ErrValidation
+	}
+	unlock, e := s.sessionLock(ctx, "maintenance")
+	if e != nil {
+		return op, errCutover
+	}
+	defer unlock()
+	actual, e := restoreIdentity(ctx, s.Pool)
+	if e != nil || actual != op.Source {
+		return op, errCutover
+	}
+	target, e := restorePool(ctx, c, c.Service)
+	if e != nil {
+		return op, errCutover
+	}
+	defer target.Close()
+	sourceConfig, targetConfig := s.Pool.Config().ConnConfig, target.Config().ConnConfig
+	// A copied physical cluster may share system_identifier. The fixed dbname
+	// rewrite is authorized only for the exact same operator socket endpoint.
+	if !filepath.IsAbs(sourceConfig.Host) || sourceConfig.Host != targetConfig.Host || sourceConfig.Port != targetConfig.Port {
+		return op, errCutover
+	}
+	actual, e = restoreIdentity(ctx, target)
+	if e != nil || actual != op.Candidate {
+		return op, errCutover
+	}
+	targetUnlock, e := New(target).sessionLock(ctx, "maintenance")
+	if e != nil {
+		return op, errCutover
+	}
+	defer targetUnlock()
+	for _, p := range []*pgxpool.Pool{s.Pool, target} {
+		state, e := New(p).MaintenanceStatus(ctx)
+		if e != nil || state.Mode != "maintenance" || state.Owner == nil || *state.Owner != op.ID {
+			return op, errCutover
+		}
+		graph, e := restoreRoleGraph(ctx, p)
+		if e != nil || graph != op.RoleGraphSHA256 {
+			return op, errCutover
+		}
+	}
+	a := &systemCutover{source: s.Pool, target: target, settings: c}
+	return runCutover(ctx, c.LedgerRoot, op, a, SaveRestoreOperation)
+}
+
+type cutoverFile struct {
+	path          string
+	before, after []byte
+	mode          uint32
+	uid, gid      int
+}
+type cutoverProbe struct {
+	config    *pgx.ConnConfig
+	role, app string
+	pass      string
+}
+type systemCutover struct {
+	offline        *RestoreOperation
+	source, target *pgxpool.Pool
+	settings       RestoreSettings
+	files          []cutoverFile
+	probes         []cutoverProbe
+	hba            cutoverFile
+	oldPIDs        map[string]int
+	backupPGUnit   string
+	// Test seams for the emergency drain only; nil selects the fixed production
+	// /usr/bin/systemctl argv runner and the manager runtime-removal wait.
+	drainSystemctl     func(context.Context, ...string) (string, error)
+	drainRuntimeAbsent func(context.Context) error
+	drainPoll          time.Duration
+}
+
+func systemctl(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "/usr/bin/systemctl", args...)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
+	cmd.Stderr = io.Discard
+	cmd.WaitDelay = 5 * time.Second
+	b, e := cmd.Output()
+	if e != nil {
+		return "", errCutover
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+func unitPID(ctx context.Context, unit string) (int, error) {
+	s, e := systemctl(ctx, "show", "--property=MainPID", "--value", unit)
+	if e != nil {
+		return 0, e
+	}
+	n, e := strconv.Atoi(s)
+	if e != nil || n < 0 {
+		return 0, errCutover
+	}
+	return n, nil
+}
+
+// safeCutoverFile pins every ancestor without symlink traversal. Root and the
+// PostgreSQL service owner may own HBA ancestors; neither group nor world may
+// write them. Configuration under /etc/nmcp must be root-owned throughout.
+func safeCutoverFile(path string, hba bool, metadata ...bool) (cutoverFile, error) {
+	publicMetadata := len(metadata) == 1 && metadata[0]
+	if len(metadata) > 1 || (hba && publicMetadata) {
+		return cutoverFile{}, errCutover
+	}
+	var out cutoverFile
+	out.path = path
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return out, errCutover
+	}
+	pgUID := uint32(0)
+	if hba {
+		u, e := user.Lookup("postgres")
+		if e != nil {
+			return out, errCutover
+		}
+		n, e := strconv.ParseUint(u.Uid, 10, 32)
+		if e != nil {
+			return out, errCutover
+		}
+		pgUID = uint32(n)
+	}
+	fd, e := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if e != nil {
+		return out, errCutover
+	}
+	defer func() { unix.Close(fd) }()
+	for _, part := range strings.Split(strings.TrimPrefix(filepath.Dir(path), "/"), "/") {
+		n, e := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if e != nil {
+			return out, errCutover
+		}
+		unix.Close(fd)
+		fd = n
+		var st unix.Stat_t
+		if unix.Fstat(fd, &st) != nil || st.Mode&0022 != 0 || (st.Uid != 0 && (!hba || st.Uid != pgUID)) {
+			return out, errCutover
+		}
+	}
+	n, e := unix.Openat(fd, filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if e != nil {
+		return out, errCutover
+	}
+	f := os.NewFile(uintptr(n), path)
+	defer f.Close()
+	var st unix.Stat_t
+	if unix.Fstat(n, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Mode&0022 != 0 || st.Size > 1<<20 || (st.Uid != 0 && (!hba || st.Uid != pgUID)) {
+		return out, errCutover
+	}
+	if (!hba && !publicMetadata && st.Mode&0077 != 0) || (publicMetadata && st.Mode&0777 != 0644) {
+		return out, errCutover
+	}
+	b, e := io.ReadAll(io.LimitReader(f, 1<<20))
+	if e != nil {
+		return out, errCutover
+	}
+	out.before = b
+	out.mode = st.Mode & 0777
+	out.uid = int(st.Uid)
+	out.gid = int(st.Gid)
+	return out, nil
+}
+
+// replaceCutoverFile performs a content+metadata compare before rename. The
+// parent directory is descriptor-pinned and revalidated; all target files are
+// fixed production paths. A post-rename failure is not rolled back silently.
+func replaceCutoverFile(f cutoverFile) error {
+	now, e := safeCutoverFile(f.path, cutoverHBAPath.MatchString(f.path), f.path == backupPGDependencyDropin || f.path == migratePGDependencyDropin)
+	if e != nil || string(now.before) != string(f.before) || now.uid != f.uid || now.gid != f.gid || now.mode != f.mode {
+		return errCutover
+	}
+	// Open the parent again with O_NOFOLLOW on every ancestor, not just the last.
+	fd, e := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if e != nil {
+		return errCutover
+	}
+	defer func() { unix.Close(fd) }()
+	for _, part := range strings.Split(strings.TrimPrefix(filepath.Dir(f.path), "/"), "/") {
+		n, e := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if e != nil {
+			return errCutover
+		}
+		unix.Close(fd)
+		fd = n
+	}
+	return publishCutoverFile(fd, f, nil)
+}
+
+// publishCutoverFile receives an already trusted pinned directory. The narrow
+// hook injects syscall-boundary faults in tests only; production always nil.
+func publishCutoverFile(fd int, f cutoverFile, fault func(string) error) error {
+	check := func() error {
+		n, e := unix.Openat(fd, filepath.Base(f.path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if e != nil {
+			return errCutover
+		}
+		file := os.NewFile(uintptr(n), "current")
+		defer file.Close()
+		var st unix.Stat_t
+		if unix.Fstat(n, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 || st.Uid != uint32(f.uid) || st.Gid != uint32(f.gid) || st.Mode&0777 != f.mode || st.Size > 1<<20 {
+			return errCutover
+		}
+		b, e := io.ReadAll(io.LimitReader(file, 1<<20))
+		if e != nil || string(b) != string(f.before) {
+			return errCutover
+		}
+		return nil
+	}
+	if check() != nil {
+		return errCutover
+	}
+	inject := func(p string) error {
+		if fault != nil {
+			return fault(p)
+		}
+		return nil
+	}
+	name := ".nmcp-cutover-" + newID()
+	n, e := unix.Openat(fd, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if e != nil {
+		return errCutover
+	}
+	file := os.NewFile(uintptr(n), name)
+	if e = inject("write"); e == nil {
+		_, e = file.Write(f.after)
+	}
+	if e == nil {
+		e = file.Chown(f.uid, f.gid)
+	}
+	if e == nil {
+		e = file.Chmod(os.FileMode(f.mode))
+	}
+	if e == nil {
+		e = inject("file_sync")
+	}
+	if e == nil {
+		e = file.Sync()
+	}
+	ce := file.Close()
+	if e != nil || ce != nil {
+		return errCutover
+	}
+	if check() != nil || inject("rename") != nil {
+		return errCutover
+	}
+	if unix.Renameat(fd, name, fd, filepath.Base(f.path)) != nil {
+		return errCutover
+	}
+	if inject("dir_sync") != nil || unix.Fsync(fd) != nil {
+		return errCutover
+	}
+	return nil
+}
+
+func rewriteCutoverEnv(b []byte, source, candidate, role, app string, targetPorts ...uint16) ([]byte, *pgx.ConnConfig, error) {
+	lines := strings.Split(string(b), "\n")
+	for _, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "PG") || strings.HasPrefix(trim, "export ") || strings.HasPrefix(trim, "NMCP_DATABASE_URL") && !strings.HasPrefix(line, "NMCP_DATABASE_URL=") {
+			return nil, nil, errCutover
+		}
+	}
+	found := false
+	var config *pgx.ConnConfig
+	for n, line := range lines {
+		if !strings.HasPrefix(line, "NMCP_DATABASE_URL=") {
+			continue
+		}
+		if found {
+			return nil, nil, errCutover
+		}
+		found = true
+		raw := strings.TrimPrefix(line, "NMCP_DATABASE_URL=")
+		u, e := url.Parse(raw)
+		if e != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") || u.User == nil || u.User.Username() != role || u.Hostname() != "127.0.0.1" || u.Fragment != "" || u.Path != "/"+source {
+			return nil, nil, errCutover
+		}
+		// No ambient service, passfile, role, host override or multi-host routing.
+		q := u.Query()
+		for k := range q {
+			if k != "sslmode" && k != "connect_timeout" && k != "application_name" {
+				return nil, nil, errCutover
+			}
+		}
+		if q.Get("sslmode") != "disable" {
+			return nil, nil, errCutover
+		}
+		if _, ok := u.User.Password(); !ok {
+			return nil, nil, errCutover
+		}
+		if len(targetPorts) > 1 {
+			return nil, nil, errCutover
+		}
+		if len(targetPorts) == 1 {
+			if targetPorts[0] == 0 {
+				return nil, nil, errCutover
+			}
+			u.Host = net.JoinHostPort("127.0.0.1", strconv.Itoa(int(targetPorts[0])))
+		}
+		u.Path = "/" + candidate
+		u.RawPath = ""
+		q.Set("application_name", app)
+		u.RawQuery = q.Encode()
+		config, e = pgx.ParseConfig(u.String())
+		if e != nil || len(config.Fallbacks) != 0 || config.Database != candidate || config.User != role {
+			return nil, nil, errCutover
+		}
+		for k := range config.RuntimeParams {
+			if k != "application_name" {
+				return nil, nil, errCutover
+			}
+		}
+		lines[n] = "NMCP_DATABASE_URL=" + u.String()
+	}
+	if !found {
+		return nil, nil, errCutover
+	}
+	return []byte(strings.Join(lines, "\n")), config, nil
+}
+func cutoverApp(id, suffix string) string {
+	return "nmcp_restore_" + strings.ReplaceAll(id, "-", "") + "_" + suffix
+}
+
+func rewriteCutoverServices(b []byte, op RestoreOperation, host string, port uint16, targets ...OfflineRestoreEndpoint) ([]byte, []cutoverProbe, error) {
+	if len(targets) > 1 || (len(targets) == 1 && !offlineEndpointValid(targets[0], true)) {
+		return nil, nil, errCutover
+	}
+	sf, e := pgservicefile.ParseServicefile(strings.NewReader(string(b)))
+	if e != nil || len(sf.Services) != 2 {
+		return nil, nil, errCutover
+	}
+	var out strings.Builder
+	var probes []cutoverProbe
+	seen := map[string]bool{}
+	for _, role := range []string{"nmcp_backup_control", "nmcp_backup_dump"} {
+		s, e := sf.GetService(role)
+		if e != nil || seen[s.Name] {
+			return nil, nil, errCutover
+		}
+		seen[s.Name] = true
+		if s.Settings["host"] != host || s.Settings["port"] != strconv.Itoa(int(port)) || s.Settings["dbname"] != op.Source.DatabaseName || s.Settings["user"] != role {
+			return nil, nil, errCutover
+		}
+		for k := range s.Settings {
+			if k == "application_name" {
+				if !validPriorCutoverApp(s.Settings[k], strings.TrimPrefix(role, "nmcp_")) {
+					return nil, nil, errCutover
+				}
+				continue
+			}
+			if k != "host" && k != "port" && k != "dbname" && k != "user" && k != "sslmode" {
+				return nil, nil, errCutover
+			}
+		}
+		if len(targets) == 1 {
+			s.Settings["host"] = targets[0].SocketDirectory
+			s.Settings["port"] = strconv.Itoa(int(targets[0].Port))
+		}
+		s.Settings["dbname"] = op.Candidate.DatabaseName
+		s.Settings["application_name"] = cutoverApp(op.ID, strings.TrimPrefix(role, "nmcp_"))
+		fmt.Fprintf(&out, "[%s]\n", role)
+		keys := make([]string, 0, len(s.Settings))
+		for k := range s.Settings {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var dsn strings.Builder
+		for _, k := range keys {
+			v := s.Settings[k]
+			fmt.Fprintf(&out, "%s=%s\n", k, v)
+			fmt.Fprintf(&dsn, "%s=%s ", k, cutoverQuote(v))
+		}
+		out.WriteString("\n")
+		pass := "/etc/nmcp/credentials/backup-" + strings.TrimPrefix(role, "nmcp_backup_") + ".pgpass"
+		cfg, e := pgx.ParseConfig(dsn.String() + "password='' passfile=" + cutoverQuote(pass))
+		if e != nil {
+			return nil, nil, errCutover
+		}
+		for k := range cfg.RuntimeParams {
+			if k != "application_name" {
+				return nil, nil, errCutover
+			}
+		}
+		probes = append(probes, cutoverProbe{cfg, role, s.Settings["application_name"], pass})
+	}
+	return []byte(out.String()), probes, nil
+}
+func cutoverQuote(s string) string {
+	return "'" + strings.ReplaceAll(strings.ReplaceAll(s, "\\", "\\\\"), "'", "\\'") + "'"
+}
+
+// One exact credential is accepted, optionally repeated for the two equivalent
+// Unix socket lookup aliases. Wildcards, other identities and duplicate aliases
+// are never authority to retarget another database or login.
+func rewriteCutoverPass(b []byte, source, candidate, role, host string, port uint16, aliases ...string) ([]byte, error) {
+	return rewriteCutoverPassTo(b, source, candidate, role, host, port, nil, aliases...)
+}
+func rewriteCutoverPassTo(b []byte, source, candidate, role, host string, port uint16, target *OfflineRestoreEndpoint, aliases ...string) ([]byte, error) {
+	if target != nil && !offlineEndpointValid(*target, true) {
+		return nil, errCutover
+	}
+	lines := strings.Split(string(b), "\n")
+	count := 0
+	permitted := map[string]bool{host: true}
+	seenHosts := map[string]bool{}
+	if len(aliases) > 1 {
+		return nil, errCutover
+	}
+	for _, alias := range aliases {
+		if host != "localhost" || !filepath.IsAbs(alias) || filepath.Clean(alias) != alias {
+			return nil, errCutover
+		}
+		permitted[alias] = true
+	}
+	password := ""
+	for n, l := range lines {
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		var fields []string
+		var s strings.Builder
+		escaped := false
+		for _, r := range l {
+			if escaped {
+				s.WriteRune(r)
+				escaped = false
+			} else if r == '\\' {
+				escaped = true
+			} else if r == ':' {
+				fields = append(fields, s.String())
+				s.Reset()
+			} else {
+				s.WriteRune(r)
+			}
+		}
+		if escaped {
+			return nil, errCutover
+		}
+		fields = append(fields, s.String())
+		if len(fields) != 5 || (!permitted[fields[0]] || seenHosts[fields[0]]) || fields[1] != strconv.Itoa(int(port)) || fields[2] != source || fields[3] != role || fields[4] == "" {
+			return nil, errCutover
+		}
+		if count > 0 && fields[4] != password {
+			return nil, errCutover
+		}
+		password = fields[4]
+		seenHosts[fields[0]] = true
+		count++
+		fields[2] = candidate
+		if target != nil {
+			fields[1] = strconv.Itoa(int(target.Port))
+			if fields[0] != "localhost" {
+				fields[0] = target.SocketDirectory
+			}
+		}
+		for i := range fields {
+			fields[i] = strings.ReplaceAll(strings.ReplaceAll(fields[i], "\\", "\\\\"), ":", "\\:")
+		}
+		lines[n] = strings.Join(fields, ":")
+	}
+	if count < 1 || count > len(permitted) {
+		return nil, errCutover
+	}
+	return []byte(strings.Join(lines, "\n")), nil
+}
+
+func cutoverHBA(b []byte, op RestoreOperation) []byte {
+	roles := "nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator"
+	var out strings.Builder
+	fmt.Fprintf(&out, "# nmcp explicit cutover %s; source remains fenced\n", op.ID)
+	databases := []string{op.Source.DatabaseName, op.Candidate.DatabaseName}
+	if op.SourceOffline {
+		databases = []string{op.Candidate.DatabaseName}
+	} // old source is fenced in its own cluster, never an unrelated target DB
+	for _, database := range databases {
+		db := `"` + database + `"`
+		if database == op.Candidate.DatabaseName {
+			fmt.Fprintf(&out, "local %s %s scram-sha-256\nhost %s %s 127.0.0.1/32 scram-sha-256\nhost %s %s ::1/128 scram-sha-256\n", db, roles, db, roles, db, roles)
+		}
+		fmt.Fprintf(&out, "local %s %s reject\nhost %s %s 0.0.0.0/0 reject\nhost %s %s ::/0 reject\n", db, roles, db, roles, db, roles)
+	}
+	out.Write(b)
+	return []byte(out.String())
+}
+
+func validateCutoverBackupUnit(env []string, credentials [][]string) error {
+	expected := map[string]string{"PGSERVICEFILE": "pg_service.conf", "PGPASSFILE": "control.pgpass", "NMCP_BACKUP_DUMP_PASSFILE": "dump.pgpass"}
+	if len(env) != len(expected) || len(credentials) != 3 {
+		return errCutover
+	}
+	seen := map[string]bool{}
+	for _, token := range env {
+		pair := strings.SplitN(token, "=", 2)
+		if len(pair) != 2 {
+			return errCutover
+		}
+		leaf, ok := expected[pair[0]]
+		if !ok || seen[pair[0]] {
+			return errCutover
+		}
+		valid := pair[1] == "/run/nmcp-backup/"+leaf
+		if pair[0] == "PGSERVICEFILE" {
+			valid = pair[1] == "%d/"+leaf || pair[1] == "/run/credentials/nmcp-backup.service/"+leaf
+		}
+		if !valid {
+			return errCutover
+		}
+		seen[pair[0]] = true
+	}
+	want := map[string]string{"pg_service.conf": "/etc/nmcp/backup.pg_service.conf", "dump.pgpass": "/etc/nmcp/credentials/backup-dump.pgpass", "control.pgpass": "/etc/nmcp/credentials/backup-control.pgpass"}
+	seen = map[string]bool{}
+	for _, pair := range credentials {
+		if len(pair) != 2 || seen[pair[0]] || want[pair[0]] == "" || want[pair[0]] != pair[1] {
+			return errCutover
+		}
+		seen[pair[0]] = true
+	}
+	return nil
+}
+
+func (a *systemCutover) Preflight(ctx context.Context, op RestoreOperation) error {
+	a.backupPGUnit = ""
+	var expectedPGUnit string
+	if a.offline != nil {
+		if op.OfflineAuthority == nil {
+			return errCutover
+		}
+		expectedPGUnit = op.OfflineAuthority.SourceUnit
+		if _, err := backupPGDependencyBody(expectedPGUnit); err != nil {
+			return err
+		}
+		if _, err := backupPGDependencyBody(op.OfflineAuthority.CandidateUnit); err != nil {
+			return err
+		}
+	} else {
+		var sourceHBA string
+		if a.source == nil || a.source.QueryRow(ctx, `SELECT current_setting('hba_file')`).Scan(&sourceHBA) != nil {
+			return errCutover
+		}
+		var err error
+		expectedPGUnit, err = backupPGUnitFromHBA(sourceHBA)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Migration must not be triggered against the old admin.env on restart.
+	state, e := systemctl(ctx, "is-active", "nmcp-migrate.service")
+	if (e != nil || state != "active") && a.offline == nil {
+		return errCutover
+	}
+	a.oldPIDs = map[string]int{}
+	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service"} {
+		p, e := unitPID(ctx, unit)
+		if e != nil || (a.offline == nil && p <= 0) || (a.offline != nil && p != 0) {
+			return errCutover
+		}
+		a.oldPIDs[unit] = p
+	}
+	for _, item := range []struct{ file, role, suffix string }{{"api.env", "nmcp_api", "api"}, {"worker.env", "nmcp_worker", "worker"}, {"admin.env", "nmcp_migrator", "admin"}} {
+		f, e := safeCutoverFile("/etc/nmcp/"+item.file, false)
+		if e != nil {
+			return e
+		}
+		if item.suffix != "admin" && cutoverRuntimeStorage(f.before, a.settings) != nil {
+			return errCutover
+		}
+		b, cfg, e := rewriteCutoverEnv(f.before, op.Source.DatabaseName, op.Candidate.DatabaseName, item.role, cutoverApp(op.ID, item.suffix))
+		if e != nil {
+			return e
+		}
+		if item.file == "api.env" && !strings.Contains("\n"+string(f.before)+"\n", "\nNMCP_API_ADDR=127.0.0.1:8080\n") {
+			return errCutover
+		}
+		_, sourcePort := a.originEndpoint()
+		if cfg.Port != sourcePort {
+			return errCutover
+		}
+		if a.offline != nil {
+			b, cfg, e = rewriteCutoverEnv(f.before, op.Source.DatabaseName, op.Candidate.DatabaseName, item.role, cutoverApp(op.ID, item.suffix), a.target.Config().ConnConfig.Port)
+			if e != nil {
+				return e
+			}
+		}
+		f.after = b
+		a.files = append(a.files, f)
+		a.probes = append(a.probes, cutoverProbe{cfg, item.role, cutoverApp(op.ID, item.suffix), ""})
+	}
+	// backup.env must load exactly the fixed service source; no credentials or
+	// arbitrary environment routing may override the rewritten service file.
+	f, e := safeCutoverFile("/etc/nmcp/backup.env", false)
+	if e != nil {
+		return e
+	}
+	if validateCutoverBackupEnvironment(f.before) != nil {
+		return errCutover
+	}
+	if e = validateLoadedBackupUnit(ctx, expectedPGUnit); e != nil {
+		return e
+	}
+	a.backupPGUnit = expectedPGUnit
+	f, e = safeCutoverFile("/etc/nmcp/backup.pg_service.conf", false)
+	if e != nil {
+		return e
+	}
+	var aExtra []cutoverProbe
+	originHost, originPort := a.originEndpoint()
+	if a.offline == nil {
+		f.after, aExtra, e = rewriteCutoverServices(f.before, op, originHost, originPort)
+	} else {
+		f.after, aExtra, e = rewriteCutoverServices(f.before, op, originHost, originPort, a.offline.OfflineAuthority.CandidateEndpoint)
+	}
+	if e != nil {
+		return e
+	}
+	a.files = append(a.files, f)
+	a.probes = append(a.probes, aExtra...)
+	for _, p := range aExtra {
+		f, e := safeCutoverFile(p.pass, false)
+		if e != nil {
+			return e
+		}
+		// libpq uses localhost for the default Unix socket passfile lookup.
+		host := p.config.Host
+		var aliases []string
+		if filepath.IsAbs(host) {
+			aliases = []string{host}
+			host = "localhost"
+		}
+		if a.offline == nil {
+			f.after, e = rewriteCutoverPass(f.before, op.Source.DatabaseName, op.Candidate.DatabaseName, p.role, host, p.config.Port, aliases...)
+		} else {
+			sourceHost, sourcePort := a.originEndpoint()
+			sourceAliases := []string{sourceHost}
+			f.after, e = rewriteCutoverPassTo(f.before, op.Source.DatabaseName, op.Candidate.DatabaseName, p.role, "localhost", sourcePort, &a.offline.OfflineAuthority.CandidateEndpoint, sourceAliases...)
+		}
+		if e != nil {
+			return e
+		}
+		a.files = append(a.files, f)
+	}
+	var path string
+	if a.observer().QueryRow(ctx, `SELECT current_setting('hba_file')`).Scan(&path) != nil || !cutoverHBAPath.MatchString(path) {
+		return errCutover
+	}
+	a.hba, e = safeCutoverFile(path, true)
+	if e != nil {
+		return e
+	}
+	h := sha256.Sum256(a.hba.before)
+	if hex.EncodeToString(h[:]) != op.Receipt.HBASHA256 || verifyGate(ctx, a.observer(), op.Receipt) != nil {
+		return errCutover
+	}
+	if a.offline != nil {
+		expected := filepath.Join("/etc/postgresql/17", offlinePGUnit.FindStringSubmatch(op.OfflineAuthority.CandidateUnit)[1], "pg_hba.conf")
+		if path != expected || path == op.OfflineAuthority.SourceHBAPath {
+			return errCutover
+		}
+		if VerifyOfflineSourceFence(ctx, op) != nil || a.offlineDependencies(ctx) != nil {
+			return errCutover
+		}
+	}
+	policy, policyErr := retargetBackupHBAPolicy(a.hba.before, op.Candidate.DatabaseName)
+	if policyErr != nil {
+		return errCutover
+	}
+	a.hba.after = cutoverHBA(policy, op)
+	return nil
+}
+
+func (a *systemCutover) Stop(ctx context.Context) error {
+	// Recheck before any destructive transition; privileged concurrent unit
+	// edits remain an operator coordination boundary, never auto-reloaded here.
+	if e := validateLoadedBackupUnit(ctx, a.backupPGUnit); e != nil {
+		return e
+	}
+	if _, e := systemctl(ctx, "stop", "nmcp-backup.timer", "nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service"); e != nil {
+		return e
+	}
+	if e := waitBackupRuntimeCredentialsAbsent(ctx); e != nil {
+		return errCutover
+	}
+	if a.offline != nil {
+		if _, e := systemctl(ctx, "stop", a.offline.OfflineAuthority.SourceUnit); e != nil {
+			return errCutover
+		}
+	}
+	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service", "nmcp-backup.service"} {
+		p, e := unitPID(ctx, unit)
+		if e != nil || p != 0 {
+			return errCutover
+		}
+	}
+	for _, pid := range a.oldPIDs {
+		if _, e := os.Stat(fmt.Sprintf("/proc/%d", pid)); !os.IsNotExist(e) {
+			return errCutover
+		}
+	}
+	if a.offline != nil && VerifyOfflineSourceFence(ctx, *a.offline) != nil {
+		return errCutover
+	}
+	var count int
+	if a.observer().QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE usename IN ('nmcp_api','nmcp_worker','nmcp_backup_dump','nmcp_backup_control')`).Scan(&count) != nil || count != 0 {
+		return errCutover
+	}
+	return nil
+}
+
+// EmergencyDrain is the unconditional failure-path stop. Unlike Stop it has no
+// backup-unit validation precondition: after a partial Start, or when the
+// loaded unit no longer validates, every fixed unit must still be stopped.
+// Each systemctl invocation gets its own bound derived from a non-cancelable
+// copy of ctx, so one hung or failed unit never prevents an attempt on the
+// rest. Only stop/show are issued: nothing is started, resumed or unfenced,
+// and the offline candidate cluster is never a drain target.
+func (a *systemCutover) EmergencyDrain(ctx context.Context) error {
+	run := a.drainSystemctl
+	if run == nil {
+		run = systemctl
+	}
+	call := func(bound time.Duration, args ...string) (string, error) {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), bound)
+		defer cancel()
+		return run(c, args...)
+	}
+	var errs []error
+	// The timer first and synchronously, so it cannot start a fresh backup run
+	// after the service stop below has been queued.
+	const timer = "nmcp-backup.timer"
+	if _, err := call(30*time.Second, "stop", timer); err != nil {
+		errs = append(errs, newCutoverDrainError("stop", timer))
+	}
+	units := []string{"nmcp-backup.service", "nmcp-api.service", "nmcp-worker.service"}
+	if a.offline != nil {
+		auth := a.offline.OfflineAuthority
+		if auth != nil && offlinePGUnit.MatchString(auth.SourceUnit) && auth.SourceUnit != auth.CandidateUnit {
+			units = append(units, auth.SourceUnit)
+		} else {
+			errs = append(errs, newCutoverDrainError("offline source authority unavailable", ""))
+		}
+	}
+	// Queue every stop job without waiting on any single unit (API/worker may
+	// take TimeoutStopSec=330s); the manager then runs them concurrently.
+	for _, unit := range units {
+		if _, err := call(15*time.Second, "stop", "--no-block", unit); err != nil {
+			errs = append(errs, newCutoverDrainError("stop", unit))
+		}
+	}
+	poll := a.drainPoll
+	if poll <= 0 {
+		poll = 250 * time.Millisecond
+	}
+	pending := append([]string{timer}, units...)
+	for len(pending) > 0 {
+		var next []string
+		for _, unit := range pending {
+			state, err := call(10*time.Second, "show", "--property=ActiveState", "--value", unit)
+			if err != nil || (state != "inactive" && state != "failed") {
+				next = append(next, unit)
+			}
+		}
+		pending = next
+		if len(pending) == 0 {
+			break
+		}
+		wait := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+			for _, unit := range pending {
+				errs = append(errs, newCutoverDrainError("still active", unit))
+			}
+			pending = nil
+		case <-wait.C:
+		}
+	}
+	// Checked last, so the runtime wait can never delay any stop above.
+	absent := a.drainRuntimeAbsent
+	if absent == nil {
+		absent = waitBackupRuntimeCredentialsAbsent
+	}
+	if absent(context.WithoutCancel(ctx)) != nil {
+		errs = append(errs, newCutoverDrainError("backup runtime directory still present", ""))
+	}
+	return errors.Join(errs...)
+}
+func (a *systemCutover) Switch(ctx context.Context, op RestoreOperation) error {
+	if a.offline != nil {
+		if op.OfflineAuthority == nil || a.backupPGUnit != op.OfflineAuthority.SourceUnit {
+			return errCutover
+		}
+		// No valid dependency authority survives a partially applied offline switch.
+		a.backupPGUnit = ""
+	}
+
+	// The preprovisioned candidate deliberately denied routine DB access. A
+	// database dump does not recreate database-level CONNECT ACLs. Grant only
+	// the intended fixed logins while the old HBA gate still denies them; this
+	// is part of the explicit operator cutover, never routine provisioning.
+	grants, grantErr := cutoverTargetGrants(op.Candidate.DatabaseName)
+	if grantErr != nil {
+		return grantErr
+	}
+	if _, grantErr = a.target.Exec(ctx, grants); grantErr != nil {
+		return errCutover
+	}
+	if replaceCutoverFile(a.hba) != nil {
+		return errCutover
+	}
+	var ok bool
+	if a.observer().QueryRow(ctx, `SELECT pg_reload_conf()`).Scan(&ok) != nil || !ok {
+		return errCutover
+	}
+	h := sha256.Sum256(a.hba.after)
+	receipt := op.Receipt
+	receipt.HBASHA256 = hex.EncodeToString(h[:])
+	// Reload is asynchronous. Bounded polling observes the server-applied file,
+	// not merely a successful pg_reload_conf signal or on-disk hash.
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if verifyGate(ctx, a.observer(), receipt) == nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return errCutover
+		case <-deadline.C:
+			return errCutover
+		case <-tick.C:
+		}
+	}
+	// Persist the new HBA digest independently of the immutable original receipt.
+	d, e := privateDirectory(a.settings.LedgerRoot)
+	if e != nil {
+		return e
+	}
+	defer d.Close()
+	n, e := unix.Openat(int(d.Fd()), op.ID+".cutover-hba-sha256", unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if e != nil {
+		return errCutover
+	}
+	f := os.NewFile(uintptr(n), "hba-digest")
+	_, e = f.WriteString(receipt.HBASHA256 + "\n")
+	if e == nil {
+		e = f.Sync()
+	}
+	ce := f.Close()
+	if e != nil || ce != nil || d.Sync() != nil {
+		return errCutover
+	}
+	for _, f := range a.files {
+		if replaceCutoverFile(f) != nil {
+			return errCutover
+		}
+	}
+	if a.offline != nil {
+		if _, e := systemctl(ctx, "daemon-reload"); e != nil {
+			return errCutover
+		}
+		if VerifyOfflineSourceFence(ctx, op) != nil {
+			return errCutover
+		}
+		if validateLoadedBackupUnit(ctx, op.OfflineAuthority.CandidateUnit) != nil {
+			return errCutover
+		}
+		a.backupPGUnit = op.OfflineAuthority.CandidateUnit
+	}
+	return nil
+}
+func (a *systemCutover) VerifyTargets(ctx context.Context, op RestoreOperation) error {
+	for _, p := range a.probes {
+		cfg := p.config.Copy()
+		cfg.ConnectTimeout = 5 * time.Second
+		// ParseConfig reads pgpass at parse time; reparse the now-rewritten file.
+		if p.pass != "" {
+			var e error
+			cfg, e = pgx.ParseConfig(cfg.ConnString())
+			if e != nil {
+				return errCutover
+			}
+			cfg.ConnectTimeout = 5 * time.Second
+		}
+		conn, e := pgx.ConnectConfig(ctx, cfg)
+		if e != nil {
+			return errCutover
+		}
+		var oid uint32
+		var name, login, current string
+		var pid int
+		e = conn.QueryRow(ctx, `SELECT (SELECT oid FROM pg_database WHERE datname=current_database()),current_database(),session_user,current_user,pg_backend_pid()`).Scan(&oid, &name, &login, &current, &pid)
+		var visible bool
+		if e == nil {
+			e = a.observer().QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND datid=$2 AND usename=$3)`, pid, op.Candidate.DatabaseOID, p.role).Scan(&visible)
+		}
+		_ = conn.Close(ctx)
+		if e != nil || !visible || oid != op.Candidate.DatabaseOID || name != op.Candidate.DatabaseName || login != p.role || current != p.role {
+			return errCutover
+		}
+		if a.offline != nil {
+			if VerifyOfflineSourceFence(ctx, op) != nil {
+				return errCutover
+			}
+			continue
+		}
+
+		old := cfg.Copy()
+		old.Database = op.Source.DatabaseName
+		denied, e := pgx.ConnectConfig(ctx, old)
+		if e == nil {
+			_ = denied.Close(ctx)
+			return errCutover
+		}
+		var rejected *pgconn.PgError
+		if !errors.As(e, &rejected) || rejected.Code != "28000" || !strings.Contains(rejected.Message, "pg_hba.conf rejects connection") {
+			return errCutover
+		}
+	}
+	return nil
+}
+func (a *systemCutover) Start(ctx context.Context) error {
+	if err := validateLoadedBackupUnit(ctx, a.backupPGUnit); err != nil {
+		return err
+	}
+
+	// Timer remains stopped until a separate successful maintenance resume.
+	if a.offline != nil {
+		if a.verifyNoSourceDependencies(ctx) != nil {
+			return errCutover
+		}
+		if _, e := systemctl(ctx, "start", "nmcp-migrate.service"); e != nil {
+			return errCutover
+		}
+	}
+	_, e := systemctl(ctx, "start", "nmcp-api.service", "nmcp-worker.service")
+	return e
+}
+func (a *systemCutover) VerifyLive(ctx context.Context, op RestoreOperation) error {
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(250 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if a.verifyLiveOnce(ctx, op) == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errCutover
+		case <-deadline.C:
+			return errCutover
+		case <-tick.C:
+		}
+	}
+}
+func (a *systemCutover) verifyLiveOnce(ctx context.Context, op RestoreOperation) error {
+	if a.offline != nil && VerifyOfflineSourceFence(ctx, op) != nil {
+		return errCutover
+	}
+	// API pools are lazy: drive real HTTP queries before proving kernel socket ownership.
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, path := range []string{"/readyz", "/media", "/jobs", "/profiles", "/changes"} {
+		req, e := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:8080"+path, nil)
+		if e != nil {
+			return errCutover
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, e := client.Do(req)
+		if e != nil {
+			return errCutover
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return errCutover
+		}
+	}
+	for _, unit := range []string{"nmcp-api.service", "nmcp-worker.service"} {
+		pid, e := unitPID(ctx, unit)
+		if e != nil || pid <= 0 || pid == a.oldPIDs[unit] {
+			return errCutover
+		}
+		role := "nmcp_api"
+		suffix := "api"
+		if unit == "nmcp-worker.service" {
+			role = "nmcp_worker"
+			suffix = "worker"
+		}
+		if e := a.verifyProcessSockets(ctx, pid, role, cutoverApp(op.ID, suffix), op.Candidate.DatabaseOID); e != nil {
+			return e
+		}
+	}
+	var count int
+	if a.observer().QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE usename IN ('nmcp_api','nmcp_worker','nmcp_backup_dump','nmcp_backup_control') AND datid<>$1`, op.Candidate.DatabaseOID).Scan(&count) != nil || count != 0 {
+		return errCutover
+	}
+	for _, p := range []*pgxpool.Pool{a.source, a.target} {
+		if p == nil {
+			continue
+		}
+		state, e := New(p).MaintenanceStatus(ctx)
+		if e != nil || state.Mode != "maintenance" || state.Owner == nil || *state.Owner != op.ID {
+			return errCutover
+		}
+	}
+	return nil
+}
+
+// Correlate every PostgreSQL TCP socket owned by the fresh service process
+// with the operator's live backend view. An application_name alone can be
+// spoofed by a test probe; kernel socket ownership establishes process causality.
+func (a *systemCutover) verifyProcessSockets(ctx context.Context, pid int, role, app string, oid uint32) error {
+	entries, e := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+	if e != nil {
+		return errCutover
+	}
+	inodes := map[string]bool{}
+	for _, entry := range entries {
+		s, e := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, entry.Name()))
+		if e == nil && strings.HasPrefix(s, "socket:[") {
+			inodes[strings.TrimSuffix(strings.TrimPrefix(s, "socket:["), "]")] = true
+		}
+	}
+	port := fmt.Sprintf("%04X", a.target.Config().ConnConfig.Port)
+	ports := map[int]bool{}
+	for _, table := range []string{"tcp", "tcp6"} {
+		b, e := os.ReadFile(fmt.Sprintf("/proc/%d/net/%s", pid, table))
+		if e != nil {
+			return errCutover
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			f := strings.Fields(line)
+			if len(f) < 10 || !inodes[f[9]] {
+				continue
+			}
+			remote := strings.Split(f[2], ":")
+			local := strings.Split(f[1], ":")
+			if len(remote) != 2 || len(local) != 2 || remote[1] != port || f[3] != "01" {
+				continue
+			}
+			p, e := strconv.ParseUint(local[1], 16, 16)
+			if e != nil {
+				return errCutover
+			}
+			ports[int(p)] = true
+		}
+	}
+	if len(ports) == 0 {
+		return errCutover
+	}
+	for port := range ports {
+		var valid bool
+		if a.observer().QueryRow(ctx, `SELECT count(*)=1 AND bool_and(datid=$1 AND usename=$2 AND application_name=$3 AND client_addr='127.0.0.1'::inet) FROM pg_stat_activity WHERE client_port=$4`, oid, role, app, port).Scan(&valid) != nil || !valid {
+			return errCutover
+		}
+	}
+	return nil
+}
+
+func cutoverTargetGrants(database string) (string, error) {
+	if !cutoverName.MatchString(database) || len(database) > 63 {
+		return "", errCutover
+	}
+	name := pgx.Identifier{database}.Sanitize()
+	return "REVOKE CONNECT,TEMPORARY ON DATABASE " + name + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + name + " TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump", nil
+}
+
+// Runtime processes must use the same FS namespace that Restore actually
+// checked, not an unrelated valid copy selected only by the operator probe.
+func cutoverRuntimeStorage(raw []byte, c RestoreSettings) error {
+	expected := map[string]string{"NMCP_STORAGE_ROOT": c.StorageRoot, "NMCP_FILE_BASE_URL": c.FileBaseURL}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, ok := strings.Cut(line, "=")
+		want, required := expected[name]
+		if !required {
+			continue
+		}
+		if name == "NMCP_FILE_BASE_URL" {
+			normalized, err := config.NormalizeFileBaseURL(value)
+			if err != nil {
+				return errCutover
+			}
+			expectedURL, err := config.NormalizeFileBaseURL(want)
+			if err != nil {
+				return errCutover
+			}
+			value, want = normalized, expectedURL
+		} else if !filepath.IsAbs(value) {
+			return errCutover
+		} else {
+			value = filepath.Clean(value)
+		}
+		if !ok || seen[name] || value != want {
+			return errCutover
+		}
+		seen[name] = true
+	}
+	if len(seen) != len(expected) {
+		return errCutover
+	}
+	return nil
+}
+
+func validPriorCutoverApp(value, suffix string) bool {
+	const prefix = "nmcp_restore_"
+	tail := "_" + suffix
+	if !strings.HasPrefix(value, prefix) || !strings.HasSuffix(value, tail) {
+		return false
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(value, prefix), tail)
+	if len(id) != 32 {
+		return false
+	}
+	expanded := id[:8] + "-" + id[8:12] + "-" + id[12:16] + "-" + id[16:20] + "-" + id[20:]
+	return uuidPattern.MatchString(expanded)
+}
+
+func (a *systemCutover) observer() *pgxpool.Pool {
+	if a.source != nil {
+		return a.source
+	}
+	return a.target
+}
+func (a *systemCutover) originEndpoint() (string, uint16) {
+	if a.offline != nil {
+		p := a.offline.OfflineAuthority.SourceEndpoint
+		return p.SocketDirectory, p.Port
+	}
+	p := a.source.Config().ConnConfig
+	return p.Host, p.Port
+}
+
+func backupSourceHBABlock(database string) string {
+	db := `"` + database + `"`
+	roles := "nmcp_backup_dump,nmcp_backup_control"
+	return "# BEGIN nmcp backup source-only v1\nlocal " + db + " " + roles + " scram-sha-256\nhost " + db + " " + roles + " 127.0.0.1/32 scram-sha-256\nhost " + db + " " + roles + " ::1/128 scram-sha-256\nlocal all " + roles + " reject\nhost all " + roles + " 0.0.0.0/0 reject\nhost all " + roles + " ::/0 reject\n# END nmcp backup source-only v1\n"
+}
+func retargetBackupHBAPolicy(raw []byte, database string) ([]byte, error) {
+	if !regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`).MatchString(database) {
+		return nil, errCutover
+	}
+	text := string(raw)
+	const begin = "# BEGIN nmcp backup source-only v1\n"
+	const end = "# END nmcp backup source-only v1\n"
+	if !strings.Contains(text, "nmcp backup source-only") {
+		return []byte(backupSourceHBABlock(database) + text), nil
+	}
+	if strings.Count(text, begin) != 1 || strings.Count(text, end) != 1 {
+		return nil, errCutover
+	}
+	a, b := strings.Index(text, begin), strings.Index(text, end)+len(end)
+	if b <= a {
+		return nil, errCutover
+	}
+	matched := regexp.MustCompile(`\nlocal "([a-z][a-z0-9_]{0,62})" nmcp_backup_dump,nmcp_backup_control scram-sha-256\n`).FindStringSubmatch(text[a:b])
+	if len(matched) != 2 || text[a:b] != backupSourceHBABlock(matched[1]) {
+		return nil, errCutover
+	}
+	return []byte(text[:a] + backupSourceHBABlock(database) + text[b:]), nil
+}

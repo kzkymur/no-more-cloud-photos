@@ -15,27 +15,32 @@ import (
 )
 
 type options struct {
-	command        string
-	json           bool
-	dry            bool
-	yes            bool
-	name           string
-	value          string
-	file           string
-	id             string
-	profile        string
-	mediaID        string
-	all            bool
-	jobID          string
-	status         string
-	jobType        string
-	additional     int
-	batchSize      int
-	resume         string
-	scope          string
-	report         string
-	kind           string
-	definitionData []byte
+	command          string
+	json             bool
+	dry              bool
+	yes              bool
+	name             string
+	value            string
+	file             string
+	id               string
+	profile          string
+	mediaID          string
+	all              bool
+	jobID            string
+	status           string
+	jobType          string
+	additional       int
+	batchSize        int
+	resume           string
+	scope            string
+	report           string
+	kind             string
+	operationID      string
+	offlineSource    bool
+	offlineAuthority string
+	cutover          bool
+	ifDue            bool
+	definitionData   []byte
 }
 
 func parse(args []string) (options, error) {
@@ -58,7 +63,9 @@ func parse(args []string) (options, error) {
 	flags.SetOutput(io.Discard)
 	flags.BoolVar(&o.json, "json", false, "write one JSON value")
 	switch o.command {
-	case "config show", "maintenance status", "backup run", "backup list":
+	case "config show", "maintenance status", "backup list":
+	case "backup run":
+		flags.BoolVar(&o.ifDue, "if-due", false, "run only when current database configuration is due")
 	case "config set":
 		flags.StringVar(&o.name, "name", "", "typed setting name")
 		flags.StringVar(&o.value, "value", "", "non-secret setting value")
@@ -84,6 +91,10 @@ func parse(args []string) (options, error) {
 	case "maintenance resume":
 	case "restore":
 		flags.StringVar(&o.id, "backup-id", "", "backup UUIDv4")
+		flags.StringVar(&o.operationID, "operation-id", "", "validated restore operation UUIDv4")
+		flags.BoolVar(&o.cutover, "cutover", false, "explicit operator cutover; never resumes maintenance")
+		flags.BoolVar(&o.offlineSource, "offline-source", false, "explicit root/operator recovery without source SQL")
+		flags.StringVar(&o.offlineAuthority, "offline-authority", "", "root-private external offline authorization file")
 	default:
 		return o, ErrValidation
 	}
@@ -122,7 +133,18 @@ func parse(args []string) (options, error) {
 		if _, err := DecodeProfile(o.definitionData); err != nil {
 			return o, err
 		}
-	case "profile activate", "profile retire", "restore":
+	case "restore":
+		if o.offlineAuthority != "" && !o.offlineSource {
+			return o, ErrValidation
+		}
+		if o.cutover {
+			if !uuidPattern.MatchString(o.operationID) || o.id != "" {
+				return o, ErrValidation
+			}
+		} else if !uuidPattern.MatchString(o.id) || o.operationID != "" {
+			return o, ErrValidation
+		}
+	case "profile activate", "profile retire":
 		if !uuidPattern.MatchString(o.id) {
 			return o, ErrValidation
 		}
@@ -179,9 +201,28 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "usage: nmcp-admin config|profile|regenerate|jobs|check|repair|cleanup|maintenance [options]")
 		return finish(stdout, stderr, o.json, nil, err)
 	}
-	if o.command == "backup run" || o.command == "backup list" || o.command == "restore" || o.command == "cleanup" && (o.kind == "backups" || o.kind == "all") {
-		fmt.Fprintln(stderr, "backup operations are not supported until Issue19; no cleanup performed")
-		return finish(stdout, stderr, o.json, nil, ErrUnsupported)
+
+	// Offline recovery must not establish a source connection or run source
+	// migration status before the explicit operator boundary can fence it.
+	if o.command == "restore" && o.offlineSource {
+		if os.Geteuid() != 0 {
+			return finish(stdout, stderr, o.json, nil, ErrValidation)
+		}
+		settings, settingsErr := restoreSettings()
+		settings.OfflineSource = true
+		settings.OfflineAuthorityFile = o.offlineAuthority
+		if settings.OfflineAuthorityFile == "" {
+			settings.OfflineAuthorityFile = os.Getenv("NMCP_RESTORE_OFFLINE_AUTHORITY")
+		}
+		var result any
+		if settingsErr == nil {
+			if o.cutover {
+				result, settingsErr = New(nil).RestoreCutover(ctx, o.operationID, settings)
+			} else {
+				result, settingsErr = New(nil).Restore(ctx, o.id, settings)
+			}
+		}
+		return finish(stdout, stderr, o.json, result, settingsErr)
 	}
 	cfg, err := config.LoadAdmin()
 	if err != nil {
@@ -206,6 +247,35 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	service := New(pool)
 	var result any
 	switch o.command {
+	case "restore":
+		var settings RestoreSettings
+		settings, err = restoreSettings()
+		if err == nil {
+			if o.cutover {
+				result, err = service.RestoreCutover(ctx, o.operationID, settings)
+			} else {
+				result, err = service.Restore(ctx, o.id, settings)
+			}
+		}
+	case "cleanup":
+		if o.kind == "backups" {
+			root := os.Getenv("NMCP_BACKUP_ROOT")
+			if root == "" {
+				err = ErrValidation
+			} else {
+				result, err = service.CleanupBackups(ctx, BackupSettings{Root: root}, o.dry)
+			}
+		} else {
+			result, err = service.Operational(ctx, o)
+		}
+	case "backup list":
+		result, err = service.BackupList(ctx)
+	case "backup run":
+		var settings BackupSettings
+		settings, err = backupSettings()
+		if err == nil {
+			result, err = service.Backup(ctx, settings, o.ifDue)
+		}
 	case "config show":
 		result, err = service.ConfigShow(ctx)
 	case "config set":

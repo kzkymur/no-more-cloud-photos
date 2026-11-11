@@ -73,8 +73,17 @@ jobs:
           .tools/ffmpeg-6.0.1-amd64-static/ffprobe -version
           prlimit --version
       - name: Validate inherited video toolchain rejection checks
-        run: timeout 1m internal/videoprocessor/helper/validate-inherited-toolchain_test.sh
+        run: |
+          timeout 1m internal/videoprocessor/helper/validate-inherited-toolchain_test.sh
+          timeout 1m bash internal/videoprocessor/helper/acquisition_test.sh
+      - name: Restore untrusted still-toolchain source archives
+        id: stillsources
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/still-toolchain-work/downloads
+          key: still-toolchain-sources-v1-${{ hashFiles('internal/stillprocessor/helper/build-pinned-toolchain.sh', 'internal/stillprocessor/helper/toolchain.lock') }}
       - name: Build native still-image helper smoke target
+        id: stillbuild
         run: |
           sudo apt-get install -y --no-install-recommends \
             autoconf automake cmake libtool make meson nasm ninja-build pkg-config \
@@ -104,19 +113,23 @@ jobs:
           printf '%s  %s\n' \
             f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38 \
             "${RUNNER_TEMP}/canon-a410.dng" | sha256sum --check
+          # The production sandbox hides /home; native ELF paths must be /opt.
+          test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
+          sudo mkdir -m 0755 /opt/nmcp-native-ci
+          sudo chown "$(id -u):$(id -g)" /opt/nmcp-native-ci
           chmod +x internal/stillprocessor/helper/build-pinned-toolchain.sh
           internal/stillprocessor/helper/build-pinned-toolchain.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/still-toolchain-work"
+            "/opt/nmcp-native-ci" "${RUNNER_TEMP}/still-toolchain-work"
           heic_fixture="${RUNNER_TEMP}/still-toolchain-work/source/libheif-1.23.5/examples/example.heic"
           printf '%s  %s\n' \
             7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2 \
             "${heic_fixture}" | sha256sum --check
-          export PKG_CONFIG_PATH="${RUNNER_TEMP}/still-toolchain/lib/pkgconfig:${RUNNER_TEMP}/still-toolchain/lib64/pkgconfig"
-          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
+          export PKG_CONFIG_PATH="/opt/nmcp-native-ci/lib/pkgconfig:/opt/nmcp-native-ci/lib64/pkgconfig"
+          export LD_LIBRARY_PATH="/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64"
           cmake -S internal/stillprocessor/helper \
             -B "${RUNNER_TEMP}/still-helper-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/still-toolchain"
+            -DCMAKE_PREFIX_PATH="/opt/nmcp-native-ci"
           cmake --build "${RUNNER_TEMP}/still-helper-build" --parallel 2
           ctest --test-dir "${RUNNER_TEMP}/still-helper-build" --output-on-failure
           "${RUNNER_TEMP}/still-helper-build/bin/nmcp-heif-fixture-generator" \
@@ -142,18 +155,27 @@ jobs:
             "${RUNNER_TEMP}/generated-heif-fixtures/invalid-icc.avif" \
             "${RUNNER_TEMP}/generated-heif-fixtures/collection-primary-second.avif" >> "${GITHUB_ENV}"
           printf 'LD_LIBRARY_PATH=%s\n' \
-            "${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64" >> "${GITHUB_ENV}"
+            "/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64" >> "${GITHUB_ENV}"
+      # Only after every archive passed its pinned SHA-256 in the step above, so a
+      # partial download can never be stored. build-pinned-toolchain.sh re-verifies
+      # the restored bytes before use.
+      - name: Save verified still-toolchain source archives
+        if: steps.stillbuild.outcome == 'success' && steps.stillsources.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/still-toolchain-work/downloads
+          key: still-toolchain-sources-v1-${{ hashFiles('internal/stillprocessor/helper/build-pinned-toolchain.sh', 'internal/stillprocessor/helper/toolchain.lock') }}
       - name: Build pinned native animation helper and fixtures
         run: |
           chmod +x internal/animationprocessor/helper/build-pinned-codecs.sh
           internal/animationprocessor/helper/build-pinned-codecs.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/animation-toolchain-work"
-          export PKG_CONFIG_PATH="${RUNNER_TEMP}/still-toolchain/lib/pkgconfig:${RUNNER_TEMP}/still-toolchain/lib64/pkgconfig"
-          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
+            "/opt/nmcp-native-ci" "${RUNNER_TEMP}/animation-toolchain-work"
+          export PKG_CONFIG_PATH="/opt/nmcp-native-ci/lib/pkgconfig:/opt/nmcp-native-ci/lib64/pkgconfig"
+          export LD_LIBRARY_PATH="/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64"
           cmake -S internal/animationprocessor/helper \
             -B "${RUNNER_TEMP}/animation-helper-build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DNMCP_PINNED_PREFIX="${RUNNER_TEMP}/still-toolchain"
+            -DNMCP_PINNED_PREFIX="/opt/nmcp-native-ci"
           cmake --build "${RUNNER_TEMP}/animation-helper-build" --parallel 2
           ctest --test-dir "${RUNNER_TEMP}/animation-helper-build" --output-on-failure
           "${RUNNER_TEMP}/animation-helper-build/bin/nmcp-animation-fixture-generator" \
@@ -177,18 +199,18 @@ jobs:
       - name: Build isolated pinned video toolchain and fixtures
         run: |
           timeout 20m internal/videoprocessor/helper/build-pinned-toolchain.sh \
-            "${RUNNER_TEMP}/still-toolchain" "${RUNNER_TEMP}/video-toolchain-work"
-          timeout 2m go build -o "${RUNNER_TEMP}/still-toolchain/bin/nmcp-video-helper" \
+            "/opt/nmcp-native-ci" "${RUNNER_TEMP}/video-toolchain-work"
+          timeout 2m go build -o "/opt/nmcp-native-ci/bin/nmcp-video-helper" \
             ./cmd/nmcp-video-helper
-          export LD_LIBRARY_PATH="${RUNNER_TEMP}/still-toolchain/lib:${RUNNER_TEMP}/still-toolchain/lib64"
-          video_helper="${RUNNER_TEMP}/still-toolchain/bin/nmcp-video-helper"
+          export LD_LIBRARY_PATH="/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64"
+          video_helper="/opt/nmcp-native-ci/bin/nmcp-video-helper"
           capabilities=$(timeout 1m "${video_helper}" capabilities --protocol 1 --threads 1 \
             --srgb-icc /proc/self/fd/3 3<"${RUNNER_TEMP}/sRGB2014.icc")
           printf '%s\n' "${capabilities}"
           CAPABILITIES="${capabilities}" python3 -c \
             'import json,os; r=json.loads(os.environ["CAPABILITIES"])["result"]; v=r["library_versions"]; assert v=={"ffmpeg":"9.0.2","libsvtav1":"4.2.0","zimg":"3.0.6","libaom":"v3.8.2"} and r["video_encoder"]=="libsvtav1" and r["audio_encoder"]=="aac-lc" and r["tone_map"]=="zscale+hable" and r["build_manifest"]=="ffmpeg=9.0.2;svt-av1=4.2.0;zimg=3.0.6;libaom=v3.8.2;threads=1", r'
-          ldd "${RUNNER_TEMP}/still-toolchain/bin/ffmpeg" | tee "${RUNNER_TEMP}/video-ffmpeg-ldd.txt"
-          python3 - "${RUNNER_TEMP}/video-ffmpeg-ldd.txt" "${RUNNER_TEMP}/still-toolchain" <<'PY'
+          ldd "/opt/nmcp-native-ci/bin/ffmpeg" | tee "${RUNNER_TEMP}/video-ffmpeg-ldd.txt"
+          python3 - "${RUNNER_TEMP}/video-ffmpeg-ldd.txt" "/opt/nmcp-native-ci" <<'PY'
           import pathlib,sys
           text=pathlib.Path(sys.argv[1]).read_text()
           prefix=sys.argv[2]
@@ -351,6 +373,33 @@ jobs:
         run: go test -v -count=1 -run '^TestLifecycleRepositoryIntegration' ./internal/medialifecycle
       - name: Explicit lifecycle HTTP and PostgreSQL integration evidence
         run: go test -v -count=1 -run '^TestLifecycleHTTPPostgreSQLIntegration$' ./internal/httpapi
+      - name: Preserve exact-head native closure for live backup cutover
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/backup-live-binaries"
+          go build -o "$RUNNER_TEMP/backup-live-binaries/core-api" ./cmd/core-api
+          go build -o "$RUNNER_TEMP/backup-live-binaries/core-worker" ./cmd/core-worker
+          go build -o "$RUNNER_TEMP/backup-live-binaries/nmcp-admin" ./cmd/nmcp-admin
+          printf '%s\n' "$RUNNER_TEMP" > "$RUNNER_TEMP/native-build-prefix.txt"
+          tar -czf "$RUNNER_TEMP/backup-native-closure.tar.gz" -C "$RUNNER_TEMP" \
+            still-helper-build/bin/nmcp-still-helper \
+            animation-helper-build/bin/nmcp-animation-helper sRGB2014.icc \
+            orientation-6.jpg backup-live-binaries native-build-prefix.txt
+          tar -czf "$RUNNER_TEMP/backup-native-toolchain.tar.gz" -C /opt nmcp-native-ci
+      - name: Publish exact-head native closure
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: backup-native-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/backup-native-closure.tar.gz
+            ${{ runner.temp }}/backup-native-toolchain.tar.gz
+          if-no-files-found: error
+          # Handoff to the root jobs. A partial "re-run failed jobs" reuses this
+          # producer job without re-executing it, so the artifact must outlive the
+          # rerun window. Naming it by run_attempt would break exactly that case.
+          # Past this retention, only a full rerun can rebuild the handoff.
+          retention-days: 7
       - name: Preserve failed probe acquisition identity
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -360,3 +409,360 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
           retention-days: 7
+  backup-postgresql17:
+    name: Backup / PostgreSQL 17 production roles and operator restore
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Build pinned PostgreSQL 17 server and clients
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            bison flex make gcc zlib1g-dev postgresql-common util-linux
+          mkdir -p "$RUNNER_TEMP/backup-pg17"
+          curl --fail --location --silent --show-error \
+            https://ftp.postgresql.org/pub/source/v17.7/postgresql-17.7.tar.bz2 \
+            --output "$RUNNER_TEMP/backup-pg17/source.tar.bz2"
+          printf '%s  %s\n' \
+            ef9e343302eccd33112f1b2f0247be493cb5768313adeb558b02de8797a2e9b5 \
+            "$RUNNER_TEMP/backup-pg17/source.tar.bz2" | sha256sum --check
+          tar -xjf "$RUNNER_TEMP/backup-pg17/source.tar.bz2" -C "$RUNNER_TEMP/backup-pg17"
+          cd "$RUNNER_TEMP/backup-pg17/postgresql-17.7"
+          test ! -e /opt/nmcp-pg17-ci
+          ./configure --prefix=/opt/nmcp-pg17-ci --without-readline --without-icu
+          make -j2
+          sudo make -j2 install
+          /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
+          /opt/nmcp-pg17-ci/bin/pg_dump --version | grep -F '17.7'
+          /opt/nmcp-pg17-ci/bin/pg_restore --version | grep -F '17.7'
+          # Fresh standard root-owned tool installation, not permissions relaxed
+          # on runner homes. initdb validates read+execute access after setpriv.
+          namei -l /opt/nmcp-pg17-ci/bin/initdb
+          for tool in postgres initdb pg_ctl psql pg_dump pg_restore; do
+            sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -r "/opt/nmcp-pg17-ci/bin/$tool"
+            sudo setpriv --reuid=postgres --regid=postgres --init-groups /usr/bin/test -x "/opt/nmcp-pg17-ci/bin/$tool"
+          done
+      - name: Provision isolated runtime and backup UIDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          workspace=$(realpath -e -- "${GITHUB_WORKSPACE:?}")
+          config=$(realpath -e -- "$workspace/infra/ubuntu/sysusers.d/nmcp.conf")
+          test "$config" = "$workspace/infra/ubuntu/sysusers.d/nmcp.conf"
+          test -f "$config" && test ! -L "$config"
+          sudo systemd-sysusers "$config"
+          python3 - <<'PYUID'
+          import grp, os, pwd
+          runtime, backup, postgres = [pwd.getpwnam(name) for name in ('nmcp', 'nmcp-backup', 'postgres')]
+          assert len({runtime.pw_uid, backup.pw_uid, postgres.pw_uid, 0}) == 4
+          assert len({runtime.pw_gid, backup.pw_gid, postgres.pw_gid, 0}) == 4
+          for user in (runtime, backup):
+              assert user.pw_gid != 0 and grp.getgrgid(user.pw_gid).gr_name == user.pw_name
+              assert user.pw_dir == '/var/lib/' + user.pw_name
+              assert user.pw_shell == '/usr/sbin/nologin'
+              assert set(os.getgrouplist(user.pw_name, user.pw_gid)) == {user.pw_gid}
+              print(f'Isolated UID verified: {user.pw_name} uid={user.pw_uid} gid={user.pw_gid}')
+          PYUID
+      - name: Build exact candidate backup acceptance test binary
+        run: |
+          go test -c -o "$RUNNER_TEMP/backup17.test" ./internal/admin
+          "$RUNNER_TEMP/backup17.test" -test.list '^TestBackupPG17' | grep -Fx TestBackupPG17ProductionRoles
+          "$RUNNER_TEMP/backup17.test" -test.list '^TestBackupPG17' | grep -Fx TestBackupPG17OperatorRestore
+      - name: Actual multiowner dump and operator restore acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
+            "$RUNNER_TEMP/backup17.test" -test.v -test.count=1 -test.timeout=10m \
+            -test.run '^(TestBackupPG17(ProductionRoles|OperatorRestore|LifecycleMigration|AuthorityLossDuringRealDump|RetentionPolicySerialization|SourceOnlyHBA|FixtureMembershipDDL|PrivatePassfileMaterialization)|TestRestoreConnectionPG17Pinned|TestBackupInstallExactLeaf)$' | tee "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          grep -F -- '--- PASS: TestBackupPG17ProductionRoles ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          grep -F -- '--- PASS: TestBackupPG17OperatorRestore ' "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          ! grep -F -- '--- SKIP: TestBackupPG17' "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          for name in TestBackupPG17AuthorityLossDuringRealDump TestBackupPG17RetentionPolicySerialization TestBackupPG17SourceOnlyHBA TestBackupPG17FixtureMembershipDDL TestBackupPG17PrivatePassfileMaterialization TestRestoreConnectionPG17Pinned TestBackupInstallExactLeaf; do
+            grep -F -- "--- PASS: $name " "$RUNNER_TEMP/backup-pg17-acceptance.log"
+          done
+          ! grep -F -- '--- SKIP: TestRestoreConnectionPG17Pinned' "$RUNNER_TEMP/backup-pg17-acceptance.log"
+      - name: Preserve exact-head PostgreSQL17 closure
+        run: tar -czf "$RUNNER_TEMP/backup-pg17-closure.tar.gz" -C /opt nmcp-pg17-ci
+      - name: Publish exact-head PostgreSQL17 closure
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: backup-postgresql17-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-pg17-closure.tar.gz
+          if-no-files-found: error
+          # Handoff to the root jobs. A partial "re-run failed jobs" reuses this
+          # producer job without re-executing it, so the artifact must outlive the
+          # rerun window. Naming it by run_attempt would break exactly that case.
+          # Past this retention, only a full rerun can rebuild the handoff.
+          retention-days: 7
+  backup-live-cutover:
+    name: Backup / actual systemd all-pool cutover and separate resume
+    needs: [test, backup-postgresql17]
+    runs-on: ubuntu-24.04
+    # Must equal BUDGET_POLICY job_seconds in scripts/run-backup-root-isolated.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Install isolated systemd machine provisioner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
+          bash -n scripts/run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
+      - name: Compute signed-metadata deb cache key
+        id: debkey
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(timeout 90 bash scripts/run-backup-root-isolated --deb-cache-key)"
+          [[ "$key" =~ ^nmcp-debootstrap-debs-v1-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore untrusted deb byte cache (re-verified against signed metadata at use)
+        id: debcache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
+      - name: Receive exact-head native closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-native-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Receive exact-head PostgreSQL17 closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-postgresql17-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Restore authenticated current-run build products
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
+          test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-toolchain.tar.gz" -C /opt
+          test ! -e /opt/nmcp-pg17-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
+          test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
+          /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-root-cleanup
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-installed-contract
+          go test -c -o "$RUNNER_TEMP/backup-live.test" ./internal/admin
+          "$RUNNER_TEMP/backup-live.test" -test.list '^TestBackupPG17LiveCutover$' | grep -Fx TestBackupPG17LiveCutover
+      - name: Acquire identity-bound job budget receipt
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          receipt="$(mktemp "$RUNNER_TEMP/budget.XXXXXX")"
+          python3 -I scripts/backup-ci-admission acquire --repo "$GITHUB_REPOSITORY" \
+            --sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --job-name "Backup / actual systemd all-pool cutover and separate resume" --runner-name "$RUNNER_NAME" \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --job-seconds 2400 --cleanup-seconds 300 --margin-seconds 60 --required-seconds 1650 > "$receipt"
+          sudo install -o root -g root -m 0600 "$receipt" "$RUNNER_TEMP/.nmcp-budget-live.json"
+          rm -f -- "$receipt"
+      - name: Actual backup restore cutover live-pool and resume proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            GITHUB_RUN_ID="${{ github.run_id }}" GITHUB_RUN_ATTEMPT="${{ github.run_attempt }}" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" RUNNER_NAME="$RUNNER_NAME" \
+            BUDGET_RUN_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+            TEST_BACKUP_LIVE_SYSTEMD=1 \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
+            TEST_BACKUP_NATIVE_PREFIX="/opt/nmcp-native-ci" \
+            TEST_BACKUP_STILL_HELPER="$RUNNER_TEMP/still-helper-build/bin/nmcp-still-helper" \
+            TEST_BACKUP_ANIMATION_HELPER="$RUNNER_TEMP/animation-helper-build/bin/nmcp-animation-helper" \
+            TEST_BACKUP_ICC_PATH="$RUNNER_TEMP/sRGB2014.icc" \
+            TEST_BACKUP_MEDIA_FIXTURE="$RUNNER_TEMP/orientation-6.jpg" \
+            TEST_BACKUP_CORE_API="$RUNNER_TEMP/backup-live-binaries/core-api" \
+            TEST_BACKUP_CORE_WORKER="$RUNNER_TEMP/backup-live-binaries/core-worker" \
+            TEST_BACKUP_ADMIN_BINARY="$RUNNER_TEMP/backup-live-binaries/nmcp-admin" \
+            bash scripts/run-backup-root-isolated "$RUNNER_TEMP/backup-live.test" -test.v -test.count=1 -test.timeout=18m \
+            -test.run '^TestBackupPG17LiveCutover$' | tee "$RUNNER_TEMP/backup-live-cutover.log"
+          grep -F -- '--- PASS: TestBackupPG17LiveCutover ' "$RUNNER_TEMP/backup-live-cutover.log"
+          ! grep -F -- '--- SKIP: TestBackupPG17LiveCutover' "$RUNNER_TEMP/backup-live-cutover.log"
+      - name: Always stop only receipt-owned isolated machine
+        if: always()
+        shell: bash
+        run: |
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            bash scripts/run-backup-root-isolated --cleanup live
+      - name: Detect exported deb byte cache
+        id: debexport
+        if: always() && steps.debkey.outputs.key != '' && steps.debcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if test -d "$RUNNER_TEMP/debootstrap-deb-cache" && ! test -L "$RUNNER_TEMP/debootstrap-deb-cache"; then
+            echo present=true >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save deb byte cache candidate
+        if: always() && steps.debexport.outputs.present == 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
+
+  backup-offline-recovery:
+    name: Backup / offline two-cluster source-stop recovery and separate resume
+    needs: [test, backup-postgresql17]
+    runs-on: ubuntu-24.04
+    # Must equal BUDGET_POLICY job_seconds in scripts/run-backup-root-isolated.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Install isolated systemd machine provisioner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
+          bash -n scripts/run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
+      - name: Compute signed-metadata deb cache key
+        id: debkey
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(timeout 90 bash scripts/run-backup-root-isolated --deb-cache-key)"
+          [[ "$key" =~ ^nmcp-debootstrap-debs-v1-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore untrusted deb byte cache (re-verified against signed metadata at use)
+        id: debcache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}
+      - name: Receive exact-head native closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-native-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Receive exact-head PostgreSQL17 closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: backup-postgresql17-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-live-inputs
+      - name: Restore authenticated current-run build products
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
+          test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-toolchain.tar.gz" -C /opt
+          test ! -e /opt/nmcp-pg17-ci
+          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
+          test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
+          /opt/nmcp-pg17-ci/bin/postgres --version | grep -F '17.7'
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-root-cleanup
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-installed-contract
+          go test -c -o "$RUNNER_TEMP/backup-offline.test" ./internal/admin
+          "$RUNNER_TEMP/backup-offline.test" -test.list '^TestRestoreOfflineRootTwoClusters$' | grep -Fx TestRestoreOfflineRootTwoClusters
+      - name: Acquire identity-bound job budget receipt
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          receipt="$(mktemp "$RUNNER_TEMP/budget.XXXXXX")"
+          python3 -I scripts/backup-ci-admission acquire --repo "$GITHUB_REPOSITORY" \
+            --sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --job-name "Backup / offline two-cluster source-stop recovery and separate resume" --runner-name "$RUNNER_NAME" \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --job-seconds 2400 --cleanup-seconds 300 --margin-seconds 60 --required-seconds 1650 > "$receipt"
+          sudo install -o root -g root -m 0600 "$receipt" "$RUNNER_TEMP/.nmcp-budget-offline.json"
+          rm -f -- "$receipt"
+      - name: Actual source-stop offline recovery crosscluster cutover and resume proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            GITHUB_RUN_ID="${{ github.run_id }}" GITHUB_RUN_ATTEMPT="${{ github.run_attempt }}" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" RUNNER_NAME="$RUNNER_NAME" \
+            BUDGET_RUN_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+            TEST_BACKUP_OFFLINE_SYSTEMD=1 \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            TEST_BACKUP_PG17_BINDIR=/opt/nmcp-pg17-ci/bin \
+            TEST_BACKUP_NATIVE_PREFIX="/opt/nmcp-native-ci" \
+            TEST_BACKUP_STILL_HELPER="$RUNNER_TEMP/still-helper-build/bin/nmcp-still-helper" \
+            TEST_BACKUP_ANIMATION_HELPER="$RUNNER_TEMP/animation-helper-build/bin/nmcp-animation-helper" \
+            TEST_BACKUP_ICC_PATH="$RUNNER_TEMP/sRGB2014.icc" \
+            TEST_BACKUP_MEDIA_FIXTURE="$RUNNER_TEMP/orientation-6.jpg" \
+            TEST_BACKUP_CORE_API="$RUNNER_TEMP/backup-live-binaries/core-api" \
+            TEST_BACKUP_CORE_WORKER="$RUNNER_TEMP/backup-live-binaries/core-worker" \
+            TEST_BACKUP_ADMIN_BINARY="$RUNNER_TEMP/backup-live-binaries/nmcp-admin" \
+            bash scripts/run-backup-root-isolated "$RUNNER_TEMP/backup-offline.test" -test.v -test.count=1 -test.timeout=18m \
+            -test.run '^TestRestoreOfflineRootTwoClusters$' | tee "$RUNNER_TEMP/backup-offline-recovery.log"
+          grep -F -- '--- PASS: TestRestoreOfflineRootTwoClusters ' "$RUNNER_TEMP/backup-offline-recovery.log"
+          ! grep -F -- '--- SKIP: TestRestoreOfflineRootTwoClusters' "$RUNNER_TEMP/backup-offline-recovery.log"
+      - name: Always stop only receipt-owned isolated machine
+        if: always()
+        shell: bash
+        run: |
+          sudo env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+            GITHUB_WORKSPACE="$GITHUB_WORKSPACE" RUNNER_TEMP="$RUNNER_TEMP" \
+            GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted \
+            TEST_BACKUP_CANDIDATE_SHA="${{ github.sha }}" \
+            bash scripts/run-backup-root-isolated --cleanup offline
+      - name: Detect exported deb byte cache
+        id: debexport
+        if: always() && steps.debkey.outputs.key != '' && steps.debcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if test -d "$RUNNER_TEMP/debootstrap-deb-cache" && ! test -L "$RUNNER_TEMP/debootstrap-deb-cache"; then
+            echo present=true >> "$GITHUB_OUTPUT"
+          fi
+      - name: Save deb byte cache candidate
+        if: always() && steps.debexport.outputs.present == 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/debootstrap-deb-cache
+          key: ${{ steps.debkey.outputs.key }}

@@ -1,0 +1,277 @@
+#!/usr/bin/python3
+"""Explicit root operator installation; no arguments, daemon or credential inputs.
+
+Internal functions are importable for non-root counterexample tests. CLI always
+uses fixed production paths and scrubbed local postgres OS-administrator commands.
+A failed post-rename verification leaves the restrictive candidate in place and
+fails the installer (no wake); it never silently restores a broader old policy.
+"""
+import configparser
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+SERVICE = Path('/etc/nmcp/backup.pg_service.conf')
+DEPENDENCY = Path('/etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf')
+IDENT = re.compile(r'[a-z][a-z0-9_]{0,62}\Z')
+CLUSTER = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_-]{0,62}\Z')
+BEGIN = '# BEGIN nmcp backup source-only v1\n'
+END = '# END nmcp backup source-only v1\n'
+ROLES = 'nmcp_backup_dump,nmcp_backup_control'
+ENV = {'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/nonexistent',
+       'PGSYSCONFDIR': '/nonexistent', 'PGSERVICEFILE': '/dev/null', 'PGPASSFILE': '/dev/null'}
+
+
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def metadata(st, owners, mode=None, directory=False):
+    require((stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode))
+            and st.st_uid in owners and not st.st_mode & 0o022
+            and (directory or st.st_nlink == 1), 'unsafe file metadata')
+    require(mode is None or stat.S_IMODE(st.st_mode) == mode, 'unsafe file mode')
+
+
+def read_safe(path, owners=(0,), mode=None, private=False):
+    path = Path(path)
+    require(path.is_absolute(), 'absolute path required')
+    for parent in reversed(path.parents):
+        metadata(parent.lstat(), owners, directory=True)
+    if private:
+        metadata(path.parent.lstat(), (0,), 0o700, directory=True)
+    before = path.lstat()
+    metadata(before, owners, mode)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        after = os.fstat(stream.fileno())
+        require((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), 'file changed')
+        data = stream.read(1024 * 1024 + 1)
+        require(len(data) <= 1024 * 1024, 'file too large')
+    return data, after
+
+
+def service_database(data):
+    cfg = configparser.ConfigParser(interpolation=None, strict=True)
+    cfg.optionxform = str
+    cfg.read_string(data.decode('utf-8'))
+    require(not cfg.defaults() and set(cfg.sections()) == set(ROLES.split(',')), 'unexpected services')
+    databases = set()
+    for role in ROLES.split(','):
+        values = dict(cfg[role])
+        if 'application_name' in values:
+            suffix=role.removeprefix('nmcp_')
+            require(re.fullmatch(r'nmcp_restore_[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}_'+re.escape(suffix),values.pop('application_name')) is not None,'unbound prior operation witness')
+        require(set(values) == {'host', 'port', 'dbname', 'user', 'sslmode'}
+                and values['host'] == '/var/run/postgresql' and values['port'] == '5432'
+                and values['user'] == role and values['sslmode'] == 'disable'
+                and IDENT.fullmatch(values['dbname']), 'service routing differs')
+        databases.add(values['dbname'])
+    require(len(databases) == 1, 'source databases differ')
+    return databases.pop()
+
+
+def dependency(data):
+    match = re.fullmatch(rb'\[Unit\]\nRequires=(postgresql@17-([A-Za-z0-9_][A-Za-z0-9_-]{0,62})\.service)\nAfter=\1\n', data)
+    require(match is not None, 'unexpected migrate dependency')
+    return match[1].decode(), match[2].decode()
+
+
+def block(database):
+    require(IDENT.fullmatch(database), 'unsafe database identifier')
+    # Always quote: all, sameuser, replication and samegroup are HBA keywords.
+    db = '"' + database + '"'
+    return (BEGIN + f'local {db} {ROLES} scram-sha-256\n'
+            + f'host {db} {ROLES} 127.0.0.1/32 scram-sha-256\n'
+            + f'host {db} {ROLES} ::1/128 scram-sha-256\n'
+            + f'local all {ROLES} reject\n'
+            + f'host all {ROLES} 0.0.0.0/0 reject\n'
+            + f'host all {ROLES} ::/0 reject\n' + END)
+
+
+def candidate(data, database):
+    text = data.decode('utf-8')
+    # Refuse any unrecognized version, partial/duplicate marker or mutated block.
+    markers = [line for line in text.splitlines() if 'nmcp backup source-only' in line]
+    if not markers:
+        return (block(database) + text).encode()
+    require(markers == [BEGIN.rstrip('\n'), END.rstrip('\n')], 'unknown owned block')
+    start, end = text.index(BEGIN), text.index(END) + len(END)
+    old = text[start:end]
+    match = re.search(r'\nlocal "([a-z][a-z0-9_]{0,62})" ', old)
+    require(match is not None and old == block(match[1]), 'mutated owned block')
+    validate_prefix(text[:start])
+    # Preserve only the closed existing cutover grammar above our fallback.
+    return (text[:start] + block(database) + text[end:]).encode()
+
+
+def validate_prefix(prefix):
+    roles = 'nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator'
+    header = re.compile(r'# nmcp explicit cutover [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}; source remains fenced\n')
+    # Source-online cutover has source rejects then candidate allows/rejects;
+    # offline cutover has only candidate allows/rejects. Never accept free-form
+    # rules before the fallback on an idempotent update.
+    db = r'"([a-z][a-z0-9_]{0,62})"'
+    reject = re.compile(r'local ' + db + ' ' + roles + r' reject\nhost "\1" ' + roles
+                        + r' 0\.0\.0\.0/0 reject\nhost "\1" ' + roles + r' ::/0 reject\n')
+    allow = re.compile(r'local ' + db + ' ' + roles + r' scram-sha-256\nhost "\1" ' + roles
+                       + r' 127\.0\.0\.1/32 scram-sha-256\nhost "\1" ' + roles + r' ::1/128 scram-sha-256\n')
+    while prefix:
+        match = header.match(prefix)
+        require(match is not None, 'unknown rules above owned block')
+        prefix = prefix[match.end():]
+        source = reject.match(prefix)
+        if source:
+            prefix = prefix[source.end():]
+        permitted = allow.match(prefix)
+        require(permitted is not None, 'mutated cutover prefix')
+        prefix = prefix[permitted.end():]
+        denied = reject.match(prefix)
+        require(denied is not None and denied[1] == permitted[1]
+                and (not source or source[1] != permitted[1]), 'mutated cutover fence')
+        prefix = prefix[denied.end():]
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def fingerprint(st):
+    # Reading may change atime; it is not part of the metadata/content CAS.
+    return (st.st_dev, st.st_ino, st.st_uid, st.st_gid, st.st_mode, st.st_nlink, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def cas(path, original, expected, replacement, owners):
+    current, st = read_safe(path, owners)
+    require(current == original and digest(current) == digest(original)
+            and fingerprint(st) == fingerprint(expected),
+            'HBA changed before installation')
+    if replacement == original:
+        return
+    fd, name = tempfile.mkstemp(prefix='.nmcp-backup-hba-', dir=path.parent)
+    # Only this exact mkstemp-created path is ever removed/replaced.
+    temporary = Path(name)
+    require(temporary.parent == path.parent and temporary.name.startswith('.nmcp-backup-hba-'), 'unexpected temporary path')
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            os.fchown(stream.fileno(), st.st_uid, st.st_gid)
+            os.fchmod(stream.fileno(), stat.S_IMODE(st.st_mode))
+            stream.write(replacement)
+            stream.flush()
+            os.fsync(stream.fileno())
+        final, final_st = read_safe(path, owners)
+        require(final == original and fingerprint(final_st) == fingerprint(st), 'HBA changed at compare-and-swap')
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def command(argv):
+    return subprocess.run(argv, env=ENV, stdin=subprocess.DEVNULL, check=True,
+                          capture_output=True, text=True, timeout=15).stdout.strip()
+
+
+def psql(database, sql, run=command):
+    # No shell, DSN, password argv, inherited PG* or .psqlrc/.pgpass routing.
+    return run(['/usr/bin/runuser', '-u', 'postgres', '--', '/usr/bin/psql',
+                '-X', '--no-password', '--host=/var/run/postgresql', '--port=5432',
+                '--dbname=' + database, '--username=postgres', '--no-psqlrc',
+                '--quiet', '--tuples-only', '--no-align', '--set=ON_ERROR_STOP=1',
+                '--command=' + sql])
+
+
+IDENTITY_SQL = """SELECT json_build_object(
+'db',current_database(),'oid',(SELECT oid FROM pg_database WHERE datname=current_database()),
+'system',(SELECT system_identifier::text FROM pg_control_system()),
+'hba',current_setting('hba_file'),'port',current_setting('port'),
+'pid',split_part(pg_read_file(current_setting('data_directory')||'/postmaster.pid'),E'\\n',1),
+'version',current_setting('server_version_num'), 'user',current_user,
+'super',(SELECT rolsuper FROM pg_roles WHERE rolname=current_user))::text"""
+HASH_SQL = "SELECT encode(sha256(pg_read_binary_file(current_setting('hba_file'))),'hex')"
+RULES_SQL = """SELECT json_build_object('errors',count(*) FILTER (WHERE error IS NOT NULL),
+'files',array_agg(DISTINCT file_name))::text FROM pg_hba_file_rules"""
+
+
+def validate_identity(identity, database, hba, pid):
+    require(identity['db'] == database and identity['user'] == 'postgres' and identity['super'] is True
+            and identity['hba'] == str(hba) and identity['port'] == '5432'
+            and identity['pid'] == pid and str(identity['oid']).isdigit()
+            and str(identity['system']).isdigit()
+            and 170000 <= int(identity['version']) < 180000, 'wrong source identity')
+
+
+def validate_rules(value, hba):
+    require(value == {'errors': 0, 'files': [str(hba)]}, 'HBA parse errors/includes/foreign file')
+
+
+def verify_locks():
+    # Root operator must enter through install-backup-config or the existing
+    # lock owner. No user-controlled environment mode can substitute for FDs.
+    helper = Path(__file__).resolve().parent / 'acquire-ubuntu-deployment-locks'
+    read_safe(helper, mode=0o755)
+    subprocess.run([str(helper), 'verify', 'direct'], env=ENV,
+                   stdin=subprocess.DEVNULL, check=True, capture_output=True,
+                   text=True, timeout=15, pass_fds=(8, 9))
+
+
+def main():
+    require(os.geteuid() == 0 and len(sys.argv) == 1, 'usage (root): configure-backup-source-hba (no arguments)')
+    verify_locks()
+    database = service_database(read_safe(SERVICE, mode=0o600, private=True)[0])
+    unit, cluster = dependency(read_safe(DEPENDENCY, mode=0o644)[0])
+    require(CLUSTER.fullmatch(cluster), 'unsafe cluster')
+    hba = Path('/etc/postgresql/17') / cluster / 'pg_hba.conf'
+    owners = (0, pwd.getpwnam('postgres').pw_uid)
+    require(command(['/usr/bin/systemctl', 'is-active', unit]) == 'active', 'source unit inactive')
+    pid = command(['/usr/bin/systemctl', 'show', '--property=MainPID', '--value', unit])
+    require(pid.isdigit() and int(pid) > 1, 'source unit has no main PID')
+    identity = json.loads(psql(database, IDENTITY_SQL))
+    validate_identity(identity, database, hba, pid)
+    original, st = read_safe(hba, owners)
+    require(psql(database, HASH_SQL) == digest(original), 'server HBA hash differs')
+    # Includes cannot be safely subordinated or hash-bound by this single-file installer.
+    require(not re.search(rb'(?m)^\s*"?include(?:_dir|_if_exists)?"?\s', original), 'HBA includes not supported')
+    require(not any(b'@' in line.split(b'#', 1)[0] for line in original.splitlines()), 'HBA list-file includes not supported')
+    validate_rules(json.loads(psql(database, RULES_SQL)), hba)
+    replacement = candidate(original, database)
+    before = psql(database, 'SELECT pg_conf_load_time()::text')
+    cas(hba, original, st, replacement, owners)
+    validate_rules(json.loads(psql(database, RULES_SQL)), hba)
+    require(psql(database, 'SELECT pg_reload_conf()') == 't', 'reload refused')
+    # Reload is asynchronous; signal success alone does not establish application.
+    for _ in range(50):
+        if psql(database, 'SELECT pg_conf_load_time()::text') != before:
+            break
+        time.sleep(0.1)
+    else:
+        raise ValueError('configuration reload not observed')
+    validate_rules(json.loads(psql(database, RULES_SQL)), hba)
+    require(read_safe(hba, owners)[0] == replacement
+            and psql(database, HASH_SQL) == digest(replacement), 'HBA changed/not loaded from expected file')
+    require(json.loads(psql(database, IDENTITY_SQL)) == identity, 'source changed during reload')
+    require(command(['/usr/bin/systemctl', 'is-active', unit]) == 'active'
+            and command(['/usr/bin/systemctl', 'show', '--property=MainPID', '--value', unit]) == pid,
+            'active cluster changed')
+    print('Source-only HBA installed; disk hash, parsed rules, reload epoch and source identity verified. Authentication acceptance requires root PG17 fixture.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, configparser.Error, subprocess.SubprocessError):
+        sys.exit('FAIL source-only HBA installation; backup remains stopped. Inspect fixed-path source/configuration; no automatic policy rollback.')

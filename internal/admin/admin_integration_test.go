@@ -524,8 +524,9 @@ func TestAdminIntegrationFiniteMediaCleanupDryRunAndExecution(t *testing.T) {
 	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM media WHERE id=$1)`, mediaID).Scan(&exists); err != nil || exists {
 		t.Fatalf("cleanup did not converge exists=%v err=%v", exists, err)
 	}
-	if _, err := s.Cleanup(ctx, store, "all", false); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("backup unsupported falsely succeeded: %v", err)
+	t.Setenv("NMCP_BACKUP_ROOT", "")
+	if _, err := s.Cleanup(ctx, store, "all", false); !errors.Is(err, ErrValidation) {
+		t.Fatalf("missing backup configuration falsely succeeded: %v", err)
 	}
 }
 
@@ -790,10 +791,10 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 		// Everything except the explicit supported-version whitelist matches:
 		// valid applied history/name/hash, sealed report, three clean sources.
 		if _, err := s.Pool.Exec(ctx, `INSERT INTO schema_migrations(version,name,checksum,transactional,idempotent,dirty)
-			VALUES(22,'future_compatibility_fixture',repeat('a',64),true,false,false)`); err != nil {
+			VALUES(24,'future_compatibility_fixture',repeat('a',64),true,false,false)`); err != nil {
 			t.Fatal(err)
 		}
-		checkAdmission(t, 22, false, false, true, false, false)
+		checkAdmission(t, 24, false, false, true, false, false)
 	})
 }
 

@@ -3,6 +3,12 @@
 -- Execute as the local PostgreSQL cluster administrator while connected to the
 -- intended nmcp database. Passwords are deliberately set separately with
 -- interactive \password commands and never stored in this repository.
+-- This also provisions isolated nmcp_backup_dump/nmcp_backup_control logins.
+-- After application migrations, explicitly rerun with
+--   --set=nmcp_backup_grants_after_migration=1
+-- to install/verify the exact object ACLs. Default bootstrap needs no objects.
+-- Restrict these credentials to the intended source database in pg_hba.conf;
+-- other cluster databases may otherwise still allow PUBLIC CONNECT.
 BEGIN;
 
 SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION', role_name)
@@ -31,6 +37,13 @@ BEGIN
 END;
 $$;
 
+SELECT format('ALTER DATABASE %I OWNER TO nmcp_migrator', current_database())
+\gexec
+ALTER SCHEMA public OWNER TO nmcp_migrator;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON DATABASE :DBNAME FROM PUBLIC;
+GRANT CONNECT ON DATABASE :DBNAME TO nmcp_migrator,nmcp_api,nmcp_worker;
+
 \set nmcp_migrator_role nmcp_migrator
 \set nmcp_api_role nmcp_api
 \set nmcp_worker_role nmcp_worker
@@ -41,11 +54,5 @@ $$;
 \ir ../postgresql/runtime-roles.sql
 \endif
 
-SELECT format('ALTER DATABASE %I OWNER TO nmcp_migrator', current_database())
-\gexec
-ALTER SCHEMA public OWNER TO nmcp_migrator;
-REVOKE ALL ON SCHEMA public FROM PUBLIC;
-REVOKE ALL ON DATABASE :DBNAME FROM PUBLIC;
-GRANT CONNECT ON DATABASE :DBNAME TO nmcp_migrator,nmcp_api,nmcp_worker;
 
 COMMIT;

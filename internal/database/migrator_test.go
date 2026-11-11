@@ -60,10 +60,10 @@ func TestEmbeddedMigrationExpectedVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discoverMigrations() error = %v", err)
 	}
-	if got := expectedVersion(migrations); got != 21 {
-		t.Fatalf("expectedVersion() = %d, want 21", got)
+	if got := expectedVersion(migrations); got != 23 {
+		t.Fatalf("expectedVersion() = %d, want 23", got)
 	}
-	if migrations[len(migrations)-1].name != "admin_repair_schema_compatibility" {
+	if migrations[len(migrations)-1].name != "backup_checker_schema_compatibility" {
 		t.Fatalf("latest migration name = %q", migrations[len(migrations)-1].name)
 	}
 }
