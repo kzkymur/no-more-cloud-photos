@@ -84,6 +84,11 @@ storage-root
 media-visible"
 [ "$mounts" = "$expected" ] || fail "admin mounts: $mounts"
 
+step "release lane: set-failpoint is refused and the lane is reported"
+[ "${NMCP_E2E_LANE:-}" = release ] && [ "${NMCP_E2E_FAILPOINTS:-}" = 0 ] || fail "lane env: ${NMCP_E2E_LANE:-unset}/${NMCP_E2E_FAILPOINTS:-unset}"
+status=0; "$ctl" control set-failpoint worker none 2>/dev/null || status=$?
+[ "$status" = 2 ] || fail "set-failpoint in the release lane returned $status, want 2"
+
 step "control kill worker SIGKILL prints the pid; start gives a new process"
 old=$("$ctl" control kill worker KILL) || fail "kill worker"
 old_pid=${old#pid=}; old_pid=${old_pid%% *}

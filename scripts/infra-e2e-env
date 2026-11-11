@@ -18,6 +18,8 @@
 #   NMCP_E2E_DEADLINE       unix epoch; the scenario is killed at this time,
 #                           and at least 60s remain afterwards for collection
 #   NMCP_E2E_HEAD_SHA       commit under test (GITHUB_SHA or git HEAD)
+#   NMCP_E2E_LANE           release | failpoints (NMCP_E2E_FAILPOINTS 0 | 1);
+#                           the failpoint lane builds Core with nmcp_failpoints
 #   NMCP_E2E_FIXTURES_DIR   host fixture dir (default <repo>/test/e2e/testdata),
 #                           visible to `admin --` at /e2e/fixtures
 #   NMCP_E2E_PROJECT / NMCP_E2E_ROOT  identity used by $NMCP_E2E_CONTROL
@@ -26,6 +28,10 @@
 #   control stop|start|restart|pause|unpause|wait-ready SERVICE
 #   control kill SERVICE [SIGNAL]   prints "pid=<host pid> container=<id>"
 #   control pid SERVICE             prints the current host pid (0 if stopped)
+#   control set-failpoint api|worker NAME[@N]|none
+#                                   failpoint lane only: recreate SERVICE with
+#                                   NMCP_FAILPOINT set/cleared, wait ready,
+#                                   print "pid=<pid> container=<id> failpoint=..."
 #   db-read                         SQL on stdin, read-only session, psql -At
 #   media-ls                        JSON lines {path,type,size,mode,sha256}
 #   image-sha256 PATH...            "<sha256>  <path>" for regular files under
@@ -57,9 +63,16 @@ root=${NMCP_E2E_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}
 script="$root/scripts/infra-e2e-env"
 base_file="$root/infra/validation/compose.yaml"
 overlay_file="$root/infra/validation/compose.e2e.yaml"
-owner=$(printf 'e2e:%s' "$root" | sha256sum | cut -c1-64)
+lane=${NMCP_E2E_LANE:-release}
+case "$lane" in
+  release) lane_tag=e2e; failpoints=0 ;;
+  failpoints) lane_tag=e2e-fp; failpoints=1 ;;
+  *) echo "error: NMCP_E2E_LANE must be release or failpoints" >&2; exit 2 ;;
+esac
+failpoint_file="$root/infra/validation/compose.failpoints.yaml"
+owner=$(printf '%s:%s' "$lane_tag" "$root" | sha256sum | cut -c1-64)
 owner_short=${owner:0:12}
-project=${NMCP_E2E_PROJECT:-nmcp-e2e-$owner_short}
+project=${NMCP_E2E_PROJECT:-nmcp-$lane_tag-$owner_short}
 api_port=${NMCP_E2E_API_PORT:-19080}
 files_port=${NMCP_E2E_FILES_PORT:-19443}
 state_dir=${NMCP_E2E_STATE_DIR:-${RUNNER_TEMP:-/tmp}/$project}
@@ -86,7 +99,65 @@ log() { printf 'infra-e2e: %s\n' "$*" >&2; }
 die() { printf 'infra-e2e: error: %s\n' "$*" >&2; exit 1; }
 
 compose() {
-  docker compose --project-name "$project" --file "$base_file" --file "$overlay_file" "$@"
+  if [ "$failpoints" = 1 ]; then
+    # Interpolation inputs for compose.failpoints.yaml persist across calls,
+    # so recreating one service never silently changes the other.
+    local api_point="" worker_point=""
+    if [ -f "$state_dir/failpoints" ]; then
+      IFS=' ' read -r api_point worker_point <"$state_dir/failpoints" || true
+    fi
+    NMCP_E2E_FAILPOINT_API=$api_point NMCP_E2E_FAILPOINT_WORKER=$worker_point \
+      docker compose --project-name "$project" --file "$base_file" --file "$overlay_file" \
+      --file "$failpoint_file" "$@"
+  else
+    docker compose --project-name "$project" --file "$base_file" --file "$overlay_file" "$@"
+  fi
+}
+
+# control set-failpoint SERVICE NAME[@N]|none (failpoint lane only)
+set_failpoint() {
+  [ "$failpoints" = 1 ] || { echo "infra-e2e: set-failpoint is refused outside the failpoint lane" >&2; exit 2; }
+  [ $# -eq 2 ] || die "usage: control set-failpoint api|worker NAME[@N]|none"
+  local service=$1 point=$2 api_point="" worker_point="" id pid
+  case "$service" in api|worker) ;; *) die "set-failpoint is limited to api and worker" ;; esac
+  if [ "$point" = none ]; then point=""
+  elif ! printf '%s' "$point" | grep -Eqx '[a-z0-9_.-]{1,64}(@[0-9]{1,6})?'; then die "invalid failpoint: $point"; fi
+  if [ -f "$state_dir/failpoints" ]; then IFS=' ' read -r api_point worker_point <"$state_dir/failpoints" || true; fi
+  if [ "$service" = api ]; then api_point=$point; else worker_point=$point; fi
+  printf '%s %s\n' "$api_point" "$worker_point" >"$state_dir/failpoints"
+  compose up --detach --no-deps --no-build --force-recreate "$service"
+  wait_ready "$service"
+  id=$(container_id "$service")
+  pid=$(docker container inspect --format '{{.State.Pid}}' "$id")
+  [ "$(docker container inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$id" | grep -cx "NMCP_FAILPOINT=$point" || true)" = 1 ] ||
+    die "$service was not recreated with NMCP_FAILPOINT=$point"
+  printf 'pid=%s container=%s failpoint=%s\n' "$pid" "${id:0:12}" "${point:-none}"
+}
+
+# Release lane: the Core binaries in the image under test carry no build tags
+# and no failpoint code. Binaries are copied out of the worker container.
+release_binary_gate() {
+  local dir=${1:?artifact dir} id binary
+  [ "$failpoints" = 0 ] || return 0
+  command -v go >/dev/null 2>&1 || die "go is required for the release binary gate"
+  mkdir -p "$dir/release-binaries"
+  id=$(container_id worker); [ -n "$id" ] || die "worker container not found"
+  for binary in core-api core-worker nmcp-admin; do
+    docker container cp "$id:/usr/local/bin/$binary" "$dir/release-binaries/$binary" >/dev/null
+    go version -m "$dir/release-binaries/$binary" >"$dir/release-binaries/$binary.buildinfo"
+    if grep -E '^\s+build\s+-tags=' "$dir/release-binaries/$binary.buildinfo"; then
+      die "release $binary was built with tags"
+    fi
+  done
+  if [ -x "$root/scripts/check-release-no-failpoints" ]; then
+    "$root/scripts/check-release-no-failpoints" "$dir/release-binaries/core-api" \
+      "$dir/release-binaries/core-worker" "$dir/release-binaries/nmcp-admin"
+  elif [ -d "$root/test/e2e" ]; then
+    die "scripts/check-release-no-failpoints is required once ./test/e2e exists"
+  else
+    log "release gate: check-release-no-failpoints not present yet; build-tag check only"
+  fi
+  log "release binary gate PASS (no build tags)"
 }
 
 require_tools() {
@@ -208,6 +279,7 @@ wait_proc_state() {
 }
 
 control() {
+  if [ "${1:-}" = set-failpoint ]; then shift; set_failpoint "$@"; return; fi
   [ $# -ge 2 ] || die "usage: control ACTION SERVICE [SIGNAL]"
   local action=$1 service=$2 signal=${3:-KILL} id pid
   require_service "$service"
@@ -507,6 +579,8 @@ run_scenario() {
     NMCP_E2E_ROOT="$root" \
     NMCP_E2E_STATE_DIR="$state_dir" \
     NMCP_E2E_FIXTURES_DIR="$NMCP_E2E_FIXTURES_DIR" \
+    NMCP_E2E_LANE="$lane" \
+    NMCP_E2E_FAILPOINTS="$failpoints" \
     timeout --kill-after=10s "${budget}s" "$@" 2>&1 | tee "$artifacts/scenario.log" || status=$?
   if [ "$status" -ne 0 ]; then log "scenario exited $status"; return "$status"; fi
   grep -qx 'PASS' "$artifacts/scenario.log" || { log "scenario output has no final PASS line"; return 1; }
@@ -535,6 +609,8 @@ lane() {
   timeout --kill-after=10s "${granted}s" "$script" up || die "stack bring-up failed or exceeded ${granted}s"
   granted=$codec_cap
   if budget_enabled; then granted=$(phase_budget "$codec_cap" $((scenario_min + collect_reserve)) 60); fi
+  rm -f -- "$state_dir/failpoints"
+  release_binary_gate "$artifacts"
   local codec_status=0
   timeout --kill-after=10s "${granted}s" "$script" verify-codec 2>&1 | tee "$artifacts/codec-closure.log" || codec_status=$?
   # A codec closure failure still fails the lane (below); the scenario runs
