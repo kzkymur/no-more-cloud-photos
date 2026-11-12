@@ -275,6 +275,38 @@ release migration and the post-migration ACL phase; it captures trusted input,
 installs only fixed paths and validates them before enabling the wake timer.
 This is an operator deployment action, not routine restore authority.
 
+## Abandoning a restore without cutover
+
+`restore` (prepare) puts the **source** into maintenance owned by the
+operation, and only a verified cutover can resume a restore maintenance. After
+a validation-only restore (for example a drill), the explicit root decision to
+keep the source is:
+
+```sh
+nmcp-admin restore --operation-id OP --abandon --yes --json
+```
+
+run as root with the owner credential of the **source** (`admin.dsn`), a
+`check.dsn` credential naming the source, `NMCP_RESTORE_LEDGER_ROOT` and
+`NMCP_STORAGE_ROOT`. It is accepted only when the operation never reached any
+cutover or offline phase (latest phase `prepared`, `maintenance`, `restored`
+or `validated`, a prepare that failed in one of those, or an interrupted
+abandon) and the live database identity is the operation's source; otherwise
+it exits `4` and changes nothing. It then
+
+1. records `abandoned` durably in the ledger first, after which the operation
+   can never be cut over or resumed as a restore;
+2. runs a fresh full check as `nmcp_check` (pinned to the owner connection's
+   database);
+3. returns the source to normal in one audited transaction
+   (`restore_abandon`), and exits `0` with the maintenance status.
+
+It starts and stops no units (prepare stopped none) and never touches the
+candidate: drop the unused candidate database as the cluster administrator
+and keep the ledger and receipt files as the record. A new `restore` is
+admitted again afterwards. Recovery from a failed cutover is not covered
+(#59).
+
 ## Explicit cutover and separate resume
 
 After `restore --backup-id ID --yes --json` reaches externally recorded
