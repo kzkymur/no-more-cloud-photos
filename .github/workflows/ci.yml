@@ -732,7 +732,15 @@ jobs:
           # refuses helpers (and ancestors) owned by anyone but root or the
           # invoking user, and root-run tar would keep the runner's numeric UID.
           sudo tar --no-same-owner -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-toolchain.tar.gz" -C /opt
-          sudo chown root:root /opt/nmcp-native-ci
+          # Match the production installer: root-owned and not group/other
+          # writable (the archive carries the build user's umask), which profile
+          # certify requires of every helper and its ancestors.
+          sudo chown -R root:root /opt/nmcp-native-ci
+          sudo chmod -R go-w /opt/nmcp-native-ci
+          for path in /opt/nmcp-native-ci/bin/nmcp-video-helper /opt/nmcp-native-ci/bin/ffprobe /opt/nmcp-native-ci/bin/ffmpeg \
+            /opt/nmcp-native-ci/bin /opt/nmcp-native-ci /opt /; do
+            stat -c '%U:%G %a %F %n' "$path"
+          done
           test ! -e /opt/nmcp-pg17-ci
           sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"
