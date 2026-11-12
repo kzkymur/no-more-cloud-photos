@@ -39,6 +39,10 @@ services:
   migrate:
     environment:
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
+      # nmcp-admin check/repair use only these capability logins (file paths,
+      # never DSNs in env); the migrator DSN above stays for readiness/locks.
+      NMCP_CHECK_DATABASE_URL_FILE: /run/nmcp-credentials/check.dsn
+      NMCP_REPAIR_DATABASE_URL_FILE: /run/nmcp-credentials/repair.dsn
     volumes:
       # Read-only view of the same media filesystem api/worker use, for
       # read-only reconciliation (`admin -- check`). Never writable here.
@@ -49,6 +53,10 @@ services:
       - type: bind
         source: "${NMCP_E2E_FIXTURES_DIR:?scripts/infra-e2e-env must set NMCP_E2E_FIXTURES_DIR}"
         target: /e2e/fixtures
+        read_only: true
+      - type: bind
+        source: "${NMCP_E2E_CREDENTIALS_DIR:?scripts/infra-e2e-env must set NMCP_E2E_CREDENTIALS_DIR}"
+        target: /run/nmcp-credentials
         read_only: true
     tmpfs:
       - /e2e/work:size=1g,uid=10001,gid=10001,mode=0700

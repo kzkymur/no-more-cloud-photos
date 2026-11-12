@@ -48,6 +48,12 @@
 #                                   Mounts: NMCP_E2E_FIXTURES_DIR read-only at
 #                                   /e2e/fixtures; private tmpfs /e2e/work
 #                                   (uid 10001, 0700, 1g), not in media.
+#                                   NMCP_CHECK_DATABASE_URL_FILE /
+#                                   NMCP_REPAIR_DATABASE_URL_FILE point at
+#                                   validation-only nmcp_check / nmcp_repair
+#                                   DSN files (/run/nmcp-credentials, 0600,
+#                                   uid 10001, read-only), so `admin -- check`
+#                                   and `admin -- repair` use their own logins.
 #   fault media-readonly on|off     remount the whole media filesystem ro/rw
 #   fault media-full on|off [BYTES] shrink the media filesystem to used+BYTES
 #                                   (default 0) / restore the original size
@@ -88,6 +94,10 @@ case "$media_bytes" in ''|*[!0-9]*) echo "error: invalid NMCP_E2E_MEDIA_BYTES" >
 
 export NMCP_VALIDATION_OWNER=$owner NMCP_API_PORT=$api_port NMCP_FILES_PORT=$files_port
 export NMCP_E2E_MEDIA_MOUNT=$media_mount
+# Validation-only check/repair DSN files for the admin one-shot (uid 10001,
+# 0600, in a 0700 dir), mounted read-only at /run/nmcp-credentials.
+credentials_dir="$state_dir/credentials"
+export NMCP_E2E_CREDENTIALS_DIR=$credentials_dir
 # Scenario fixtures, mounted read-only at /e2e/fixtures in the admin one-shot.
 if [ -z "${NMCP_E2E_FIXTURES_DIR:-}" ]; then
   if [ -d "$root/test/e2e/testdata" ]; then NMCP_E2E_FIXTURES_DIR=$root/test/e2e/testdata
@@ -222,6 +232,22 @@ mount_media() {
   printf '%s\n' "$media_bytes" >"$state_dir/media-size"
 }
 
+write_credentials() {
+  # Owned by the container uid so nmcp-admin's owner check (uid 0 or euid)
+  # accepts them; never group/other readable.
+  remove_credentials
+  sudo install -d -o 10001 -g 10001 -m 0700 "$credentials_dir"
+  printf '%s\n' 'postgres://nmcp_check:nmcp-check-validation-only@postgres:5432/nmcp?sslmode=disable' |
+    sudo install -o 10001 -g 10001 -m 0600 /dev/stdin "$credentials_dir/check.dsn"
+  printf '%s\n' 'postgres://nmcp_repair:nmcp-repair-validation-only@postgres:5432/nmcp?sslmode=disable' |
+    sudo install -o 10001 -g 10001 -m 0600 /dev/stdin "$credentials_dir/repair.dsn"
+}
+
+remove_credentials() {
+  case "$credentials_dir" in "$state_dir"/credentials) ;; *) die "refusing to remove $credentials_dir" ;; esac
+  if [ -e "$credentials_dir" ]; then sudo rm -rf -- "$credentials_dir"; fi
+}
+
 umount_media() {
   if media_mounted; then sudo umount "$media_mount"; fi
   if [ -d "$media_mount" ]; then rmdir "$media_mount"; fi
@@ -231,6 +257,7 @@ cleanup() {
   assert_owned
   compose --profile e2e down --volumes --remove-orphans --timeout 20 || return 1
   umount_media
+  remove_credentials
 }
 
 container_id() { compose ps --all --quiet "$1" 2>/dev/null | head -n1; }
@@ -445,6 +472,7 @@ fault() {
 up() {
   assert_owned
   mount_media
+  write_credentials
   if [ ! -d "$NMCP_E2E_FIXTURES_DIR" ]; then install -d -m 0755 "$NMCP_E2E_FIXTURES_DIR"; fi
   # Build the profile-only observer now, so media-ls never builds mid-scenario.
   compose --profile e2e build --quiet e2e-observer

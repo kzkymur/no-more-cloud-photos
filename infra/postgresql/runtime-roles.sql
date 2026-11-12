@@ -143,6 +143,33 @@ INSERT INTO nmcp_allowed_membership VALUES (
 );
 \endif
 
+-- Operational logins for `nmcp-admin check` / `nmcp-admin repair`, created by
+-- infra/ubuntu/postgresql-roles.sql. Fixed names, like the capability roles
+-- the migrations grant to. When present, each must be a plain LOGIN INHERIT
+-- role whose ONLY edge is its capability role (INHERIT TRUE, SET FALSE, no
+-- ADMIN). The closure below then rejects every other edge in or out. Callers
+-- need no extra variables, and clusters without these logins are unaffected.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles
+        WHERE rolname IN ('nmcp_check','nmcp_repair')
+          AND (NOT rolcanlogin OR NOT rolinherit OR rolsuper OR rolcreatedb
+               OR rolcreaterole OR rolreplication OR rolbypassrls)
+    ) THEN
+        RAISE EXCEPTION 'unsafe operational check/repair login attributes';
+    END IF;
+END;
+$$;
+INSERT INTO nmcp_managed_role
+SELECT r.oid FROM pg_catalog.pg_roles AS r WHERE r.rolname IN ('nmcp_check','nmcp_repair');
+INSERT INTO nmcp_allowed_membership (roleid,member,admin_option,inherit_option,set_option)
+SELECT capability.oid,login.oid,false,true,false
+FROM (VALUES ('nmcp_check_runtime','nmcp_check'),('nmcp_repair_runtime','nmcp_repair'))
+    AS edge(capability_name,login_name)
+JOIN pg_catalog.pg_roles AS capability ON capability.rolname=edge.capability_name
+JOIN pg_catalog.pg_roles AS login ON login.rolname=edge.login_name;
+
 -- Compatibility mode may start only from the exact hardened graph or from an
 -- exact preexisting compatibility graph left by interruption. In particular,
 -- it never normalizes a rogue edge or an ADMIN/SET option before enabling
@@ -222,6 +249,12 @@ GRANT nmcp_runtime TO :"nmcp_api_role"
 GRANT nmcp_worker_runtime TO :"nmcp_worker_role"
     WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
 \endif
+SELECT format('GRANT %I TO %I WITH ADMIN FALSE, INHERIT TRUE, SET FALSE',
+              edge.capability_name,edge.login_name)
+FROM (VALUES ('nmcp_check_runtime','nmcp_check'),('nmcp_repair_runtime','nmcp_repair'))
+    AS edge(capability_name,login_name)
+WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname=edge.login_name)
+\gexec
 
 -- Every direct edge touching a managed login or stable role must match this
 -- exact allowlist. Closing both sides of every edge also closes all transitive
