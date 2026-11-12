@@ -243,11 +243,36 @@ force_backup() {
   sudo scripts/validate-backup-install --installed; echo "validate exit: $?"
   sudo journalctl -u nmcp-backup.service --since -10min -o cat | grep -E '"(status|outcome|error_code|notification_status)"' | tail -n 4
 }
+# After every deliberate login change below, prove both backup logins are back
+# to their provisioned shape (LOGIN, NOINHERIT, no elevated attributes; the
+# rule infra/postgresql/runtime-roles.sql enforces) and the install is intact.
+backup_logins_restored() {
+  sudo -u postgres psql -d nmcp -XAt -c "SELECT rolname||':'||(rolcanlogin AND NOT rolinherit AND NOT rolsuper
+    AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls)
+    FROM pg_roles WHERE rolname IN ('nmcp_backup_control','nmcp_backup_dump') ORDER BY 1"
+  sudo scripts/validate-backup-install --installed; echo "validate exit: $?"
+}
 # Stop the timer for the whole item: a timer wake while the drop-in exists
 # would also run without --if-due. Do not start a restore while it exists
 # (restore --cutover refuses a modified backup unit).
 sudo systemctl stop nmcp-backup.timer
 ```
+
+**Login-change window (cases a and b).** Each case disables one backup login
+for a single forced run. While it is disabled:
+
+- every backup fails;
+- the role bootstrap `infra/postgresql/runtime-roles.sql` refuses to run,
+  because it requires both backup logins to be LOGIN;
+- a restore or cutover whose window spans the change is refused (role graph
+  mismatch), so start none;
+- the API and Worker are unaffected.
+
+**Always re-enable the login, even if `force_backup` fails, is interrupted, or
+your session drops.** The first thing to do on return is the `ALTER ROLE …
+LOGIN` line of that case, then `backup_logins_restored`. Do not continue with
+another case or a restore until both logins show `:t` and
+`validate exit: 0`.
 
 1. **Success case.** `force_backup`. Expected: outcome success, `validate exit: 0`;
    your endpoint receives **no** notification.
@@ -273,48 +298,50 @@ sudo systemctl stop nmcp-backup.timer
    `notification_status` is `succeeded` if your hook exited 0, `failed`
    otherwise. Nothing is dumped or published, and no data changes.
 
-   **Mandatory restore check**, before anything else:
+   **Mandatory restore check**, before anything else: `backup_logins_restored`,
+   then one `force_backup` that must succeed.
+
+   Expected: `nmcp_backup_control:t` and `nmcp_backup_dump:t`, `validate exit: 0`,
+   and the following forced backup succeeds. While the login is disabled every
+   backup fails at `prepare`, and a restore or cutover whose window spans the
+   change is refused (role graph mismatch); after the revert both are normal
+   again. The failed run stays in history; that is intended.
+3. **(b) Failure before the run is recorded (needs a release with #57).** On
+   an older release this sends nothing, so record it as NOT_EXECUTED, reason
+   "release without #57". Do **not** simulate this by stopping PostgreSQL:
+   `nmcp-backup.service` requires the PostgreSQL unit, so starting it starts
+   PostgreSQL again and the backup succeeds. Instead make the backup's control
+   login unusable for one forced run. The API and Worker keep running; only
+   backups are affected.
 
    ```sh
-   sudo -u postgres psql -d nmcp -Atc "SELECT rolcanlogin FROM pg_roles WHERE rolname='nmcp_backup_dump'"   # t
-   sudo scripts/validate-backup-install --installed                                                          # exit 0
-   sudo -u postgres psql -d nmcp -X -v ON_ERROR_STOP=1 -f /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
-   ```
-
-   Expected: `t`, exit 0, and the role graph verifier succeeds. While the
-   login is disabled every backup fails at `prepare`, and a restore taken in
-   that window is refused (role graph mismatch); after the revert both are
-   normal again. The failed run stays in history; that is intended.
-3. **(b) Database unreachable (needs a release with #57).** A backup that
-   fails before its run is recorded now also notifies, exactly once. On an
-   older release it sends nothing, so record this case as NOT_EXECUTED,
-   reason "release without #57". With #57:
-
-   ```sh
-   PG_UNIT=$(cat /etc/nmcp/postgresql-unit)
-   sudo systemctl stop nmcp.target
-   sudo systemctl stop "$PG_UNIT"
+   sudo -u postgres psql -d nmcp -c 'ALTER ROLE nmcp_backup_control NOLOGIN'
    force_backup                       # expected to fail
-   sudo systemctl start "$PG_UNIT"
-   sudo systemctl start nmcp.target
-   curl --fail --silent -H 'Accept: application/json' "$API/readyz"
+   sudo -u postgres psql -d nmcp -c 'ALTER ROLE nmcp_backup_control LOGIN'
+   backup_logins_restored
+   force_backup                       # must succeed again
    ```
 
-   Expected: the unit fails (non-zero exit); the journal has one line
-   `"backup failed before a history row existed"` with `"cause":"db_unreachable"`
-   and `"notification":"succeeded"` (or `failed` if your hook exited non-zero);
-   your endpoint receives exactly one notification whose stdin was
-   `{"status":"failed","phase":"precondition","cause":"db_unreachable","at":"<UTC>"}`.
-   It has no `backup_id`, and nothing new appears in backup history, because
-   the database was down. Such a notification is not retried by a later run.
-   `/readyz` returns to 200 after the restart, and `validate exit: 0`.
+   Expected for the failing run: unit exit non-zero (nmcp-admin exit 1). The
+   journal has
+   `{"cause":"db_unreachable","level":"ERROR","message":"backup failed before a history row existed","notification":"succeeded"}`
+   (`failed` if your hook exited non-zero or timed out, `not_configured` if
+   no hook is set), then
+   `{"exit_code":1,"level":"ERROR","message":"administrative operation failed"}`.
+   Your endpoint receives exactly one notification with stdin
+   `{"at":"<UTC>","cause":"db_unreachable","phase":"precondition","status":"failed"}`.
+   There is no `backup_id`, nothing new in backup history, and nothing in
+   the backup root; such a notification is not retried. Then the restore
+   check: `nmcp_backup_control:t`, `nmcp_backup_dump:t`, `validate exit: 0`,
+   and the next forced backup succeeds.
 4. `sudo systemctl start nmcp-backup.timer`.
 
 Report: success run (no notification: PASS/FAIL); case (a): unit exit,
 failure UTC, notification received UTC, delay in seconds, ID matched yes/no,
-`notification_status`, and the three restore-check results; case (b):
-NOT_EXECUTED (release without #57) or its result. Never paste the hook URL or
-message body.
+`notification_status`, and the restore-check results; case (b): unit exit,
+failure UTC, notification received UTC, delay, `cause` and `notification`
+from the journal line, and the restore-check results; or NOT_EXECUTED
+(release without #57). Never paste the hook URL or message body.
 
 ## 5. Database backup and originals storage locations
 
@@ -486,8 +513,17 @@ until a release with #58 is deployed, record B as NOT_EXECUTED, reason
    `NMCP_STORAGE_ROOT`:
 
    ```sh
-   nmcp-admin restore --operation-id <OP> --abandon --yes --json   # root only (non-root: exit 2)
+   sudo systemd-run --quiet --pipe --wait --collect -p User=root \
+     -p EnvironmentFile=/etc/nmcp/capability.env \
+     -p LoadCredential=admin.dsn:/etc/nmcp/credentials/admin.dsn \
+     -p LoadCredential=check.dsn:/etc/nmcp/credentials/check.dsn \
+     /opt/nmcp/current/bin/nmcp-admin restore --operation-id <OP> --abandon --yes --json
    ```
+
+   This is item 9's owner invocation plus the `check.dsn` credential. It
+   needs `NMCP_STORAGE_ROOT` and `NMCP_RESTORE_LEDGER_ROOT` in
+   `capability.env`, and both DSNs naming the **source** database. Run as
+   anything but root, it exits 2.
 
    Expected: exit 0, and stdout is the maintenance status with mode `normal`
    and a successful check report. In order, the ledger records `abandoned`, a
