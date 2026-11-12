@@ -126,3 +126,90 @@ func TestBackupRunCLINotifiesUnreachableDatabaseOnce(t *testing.T) {
 		t.Fatalf("stderr does not log the cause: %q", stderr.String())
 	}
 }
+
+// TestBackupMaintenanceRefusalNotifiesOncePerEntry pins the leader's #57
+// decision: every hourly wake during one maintenance is refused, but only the
+// first notifies; a new maintenance entry notifies again, and a failed hook
+// is retried on the next wake.
+func TestBackupMaintenanceRefusalNotifiesOncePerEntry(t *testing.T) {
+	hook, log := prerunHook(t, 0)
+	b := BackupSettings{Root: t.TempDir(), NotifyHook: hook}
+	now := time.Now()
+	wake := func(key string) string {
+		var stderr bytes.Buffer
+		got := notifyBackupPreRunOnce(context.Background(), b, backupCauseMaintenance, key, now, &stderr)
+		if !strings.Contains(stderr.String(), `"cause":"maintenance"`) {
+			t.Fatalf("wake not logged: %q", stderr.String())
+		}
+		return got
+	}
+	first := "2026-11-12T10:00:00.123456Z"
+	if got := wake(first); got != "succeeded" {
+		t.Fatalf("first wake = %q", got)
+	}
+	if got := wake(first); got != "already_sent" {
+		t.Fatalf("second wake in the same maintenance = %q", got)
+	}
+	if calls := prerunCalls(t, log); len(calls) != 1 {
+		t.Fatalf("hook calls in one maintenance = %d, want 1", len(calls))
+	}
+	if got := wake("2026-11-12T12:00:00Z"); got != "succeeded" {
+		t.Fatalf("new maintenance entry = %q", got)
+	}
+	if calls := prerunCalls(t, log); len(calls) != 2 {
+		t.Fatalf("hook calls after a new maintenance = %d, want 2", len(calls))
+	}
+	// A failed notification leaves no marker, so the next wake retries.
+	failing, failLog := prerunHook(t, 9)
+	b.NotifyHook = failing
+	third := "2026-11-12T14:00:00Z"
+	if got := wake(third); got != "failed" {
+		t.Fatalf("failing hook = %q", got)
+	}
+	if got := wake(third); got != "failed" || len(prerunCalls(t, failLog)) != 2 {
+		t.Fatalf("failed notification not retried: %q", got)
+	}
+	// Other causes are never deduplicated.
+	b.NotifyHook = hook
+	for range 2 {
+		notifyBackupPreRunOnce(context.Background(), b, backupCauseDBUnreachable, "", now, &bytes.Buffer{})
+	}
+	if calls := prerunCalls(t, log); len(calls) != 4 {
+		t.Fatalf("db_unreachable calls = %d, want every wake", len(calls)-2)
+	}
+}
+
+// TestAdminIntegrationBackupMaintenanceRefusalKeyedOnEntry: Backup during
+// maintenance reports the maintenance cause keyed on that entry's entered_at.
+func TestAdminIntegrationBackupMaintenanceRefusalKeyedOnEntry(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	if _, err := s.Pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='administrative repair',owner='t',entered_at=clock_timestamp() WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	var entered time.Time
+	if err := s.Pool.QueryRow(ctx, `SELECT entered_at FROM maintenance_state WHERE id=1`).Scan(&entered); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(t.TempDir(), "backups")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Backup(ctx, BackupSettings{Root: root}, false)
+	cause, key, ok := backupPreRunDetail(err)
+	if !ok || cause != backupCauseMaintenance || key != entered.UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("maintenance refusal = %q %q %v (%v)", cause, key, ok, err)
+	}
+	if n := backupRunCount(t, ctx, s); n != 0 {
+		t.Fatalf("maintenance refusal wrote %d history rows", n)
+	}
+}
+
+func backupRunCount(t *testing.T, ctx context.Context, s *Service) int {
+	t.Helper()
+	var n int
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM backup_runs`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}

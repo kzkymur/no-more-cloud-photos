@@ -99,7 +99,13 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 	defer rollback(tx)
 	if err = backupNormal(ctx, tx); err != nil {
 		if errors.Is(err, ErrConflict) {
-			return result, backupPreRun(backupCauseMaintenance, err)
+			// Keyed on this maintenance's entry so it notifies once per entry.
+			pre := &backupPreRunError{cause: backupCauseMaintenance, err: err}
+			var entered *time.Time
+			if s.Pool.QueryRow(ctx, `SELECT entered_at FROM maintenance_state WHERE id=1`).Scan(&entered) == nil && entered != nil {
+				pre.key = entered.UTC().Format(time.RFC3339Nano)
+			}
+			return result, pre
 		}
 		return result, backupPreRun(backupCauseDBUnreachable, err)
 	}

@@ -347,8 +347,8 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return preRun(err, backupCauseConfiguration)
 		}
 		result, err = service.Backup(ctx, settings, o.ifDue)
-		if cause, ok := backupPreRunCause(err); ok {
-			notifyBackupPreRun(ctx, settings.NotifyHook, cause, time.Now(), stderr)
+		if cause, key, ok := backupPreRunDetail(err); ok {
+			notifyBackupPreRunOnce(ctx, settings, cause, key, time.Now(), stderr)
 		}
 	case "config show":
 		result, err = service.ConfigShow(ctx)

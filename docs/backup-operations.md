@@ -236,7 +236,13 @@ stdin document is exactly one of:
   logs one stderr line
   `{"level":"ERROR","message":"backup failed before a history row existed","cause":…,"notification":"succeeded|failed|not_configured"}`
   and exits non-zero. Because no row exists, a failed pre-history
-  notification is not retried by later runs.
+  notification is not retried by later runs, except for `maintenance`: a
+  backup refused because the system is in maintenance notifies **once per
+  maintenance entry** (keyed on that maintenance's `entered_at`, recorded in
+  `.maintenance-notified` in the backup root after a successful hook), so
+  later timer wakes in the same maintenance only log
+  `"notification":"already_sent"`. A failed hook leaves no record and is
+  retried on the next wake; a new maintenance entry notifies again.
 
 An overlapping run (`overlap_conflict`) and `--if-due` with nothing due
 (`not_due`) are not failures and notify nothing.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,9 @@ const (
 type backupPreRunError struct {
 	cause string
 	err   error
+	// key identifies the condition instance for once-only causes: for
+	// maintenance, that maintenance's entered_at.
+	key string
 }
 
 func (e *backupPreRunError) Error() string {
@@ -50,11 +54,48 @@ func backupPreRun(cause string, err error) error {
 
 // backupPreRunCause returns the closed cause of a pre-history failure.
 func backupPreRunCause(err error) (string, bool) {
+	cause, _, ok := backupPreRunDetail(err)
+	return cause, ok
+}
+
+func backupPreRunDetail(err error) (cause, key string, ok bool) {
 	var pre *backupPreRunError
 	if errors.As(err, &pre) {
-		return pre.cause, true
+		return pre.cause, pre.key, true
 	}
-	return "", false
+	return "", "", false
+}
+
+// maintenanceNotifiedMarker records, in the backup root (the only path the
+// backup unit may write), the entered_at of the maintenance whose refusal was
+// already notified. Nothing else reads the backup root by name.
+const maintenanceNotifiedMarker = ".maintenance-notified"
+
+// notifyBackupPreRunOnce is notifyBackupPreRun, except that a `maintenance`
+// refusal is notified once per maintenance entry (keyed on its entered_at),
+// not on every timer wake: later wakes in the same maintenance only log. The
+// marker is written only after a successful notification, so a failed hook
+// is retried on the next wake.
+func notifyBackupPreRunOnce(ctx context.Context, b BackupSettings, cause, key string, now time.Time, stderr io.Writer) string {
+	if cause != backupCauseMaintenance || key == "" || !filepath.IsAbs(b.Root) {
+		return notifyBackupPreRun(ctx, b.NotifyHook, cause, now, stderr)
+	}
+	marker := filepath.Join(b.Root, maintenanceNotifiedMarker)
+	if previous, err := os.ReadFile(marker); err == nil && string(previous) == key {
+		_ = json.NewEncoder(stderr).Encode(map[string]string{"level": "ERROR", "message": "backup failed before a history row existed",
+			"cause": cause, "notification": "already_sent"})
+		return "already_sent"
+	}
+	notification := notifyBackupPreRun(ctx, b.NotifyHook, cause, now, stderr)
+	if notification == "succeeded" {
+		tmp := marker + ".tmp"
+		if os.WriteFile(tmp, []byte(key), 0o600) == nil {
+			_ = os.Rename(tmp, marker)
+		} else {
+			_ = os.Remove(tmp)
+		}
+	}
+	return notification
 }
 
 // backupPreRunTimeout bounds the hook exactly like the post-history hook.
