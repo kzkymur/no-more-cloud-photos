@@ -497,10 +497,15 @@ until a release with #58 is deployed, record B as NOT_EXECUTED, reason
    maintenance mode until this step. Exit 4 means a refusal that changed
    nothing: a cutover or offline phase was recorded, the operation is
    unknown, the live database is not the source, or maintenance belongs to
-   something else. The other exit-4 case is a check with findings, after
-   `abandoned` is already recorded: fix the findings, then rerun abandon.
-   Start `nmcp-backup.timer` again (you stopped it in step 1; backups during
-   the maintenance would only fail with cause `maintenance`). Stop the clock
+   something else. The other exit-4 case is a check with findings: `abandoned`
+   is then already recorded and the source stays in its restore maintenance.
+   Run the capability `check`, then `repair --report <ID>` (item 9's
+   capability invocation), then rerun the same abandon command, which resumes
+   the interrupted abandon. Once `abandoned` is recorded, that operation can
+   never be cut over or resumed as a restore.
+   Start `nmcp-backup.timer` again. You stopped it in step 1; had it run
+   during the maintenance, each backup would fail with cause `maintenance`,
+   notifying once per maintenance entry. Stop the clock
    when `/readyz` is 200 and one upload completes.
 4. Abandon never drops the candidate. Drop the unused candidate database
    yourself as the PostgreSQL cluster administrator (the API and Worker never
