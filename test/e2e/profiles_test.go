@@ -126,6 +126,15 @@ func (h *harness) activateBundledProfiles() {
 	fixtures := h.preparedFixtures()
 	digests := h.helperDigests()
 	h.record("helper_digests", digests)
+	activated := false
+	defer func() {
+		// The Worker binds its claimable profiles to the capability envelope it
+		// validates at startup, so a newly activated profile is claimed only
+		// after a restart: the documented operator step after activation.
+		if activated && !h.t.Failed() {
+			h.run("", "control", "restart", "worker")
+		}
+	}()
 	for _, id := range []string{thumbnailProfileID, standardProfileID} {
 		if bundledProfilesActive[id] {
 			continue
@@ -147,6 +156,7 @@ func (h *harness) activateBundledProfiles() {
 		}
 		h.admin("profile", "activate", "--id", id, "--json")
 		bundledProfilesActive[id] = true
+		activated = true
 	}
 	var profiles struct {
 		Items []struct {

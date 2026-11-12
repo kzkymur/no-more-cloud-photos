@@ -345,6 +345,10 @@ installed helpers:
 
    `--file -` reads the spec from stdin instead. Certification does not activate;
    activation stays a separate audited step and still enforces version order.
+   Then restart the Worker (`systemctl restart nmcp-worker.service`). The
+   Worker validates its capability envelope against the active profiles once at
+   startup and claims only those profiles' jobs; until it restarts, jobs for a
+   newly activated profile stay `queued` (they are not lost or failed).
 4. Preserve the JSON result and the `profile_processor_certifications` evidence
    receipts with the deployment record. Exit `2` means the spec, a helper or
    fixture digest/owner/mode, a fixture MIME, or an output check was rejected;
