@@ -482,7 +482,9 @@ verify_codec() {
         # Diagnostics only: which object requested each leaked library and
         # which search path (RPATH/RUNPATH/default) the loader used.
         echo "codec-closure: loader trace for $binary (LD_DEBUG=libs, empty env)" >&2
-        env -i LC_ALL=C LD_DEBUG=libs ldd "$path" 2>&1 >/dev/null |
+        # Call the loader directly: ldd is a shell script, so LD_DEBUG on
+        # ldd would trace the shell instead of the helper.
+        env -i LC_ALL=C LD_DEBUG=libs /lib64/ld-linux-x86-64.so.2 --list "$path" 2>&1 >/dev/null |
           grep -E "find library=|search path=|trying file=.*(webp|sharpyuv)" | sed "s/^/codec-closure: trace /" >&2 || true
         fail "$binary resolves pinned libraries outside $prefix: $leaked"
       fi

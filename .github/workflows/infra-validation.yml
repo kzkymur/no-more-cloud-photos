@@ -80,6 +80,7 @@ jobs:
       - name: Harness self-test (contract only, not issue 21 acceptance)
         env:
           NMCP_E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-results/selftest
+          NMCP_E2E_FIXTURES_DIR: ${{ runner.temp }}/e2e-selftest-fixtures
           NMCP_E2E_TIMEOUT_SECONDS: "600"
           NMCP_E2E_SCENARIO_MIN_SECONDS: "300"
         run: scripts/infra-e2e-env lane -- infra/validation/e2e-selftest.sh
