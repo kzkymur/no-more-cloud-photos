@@ -196,7 +196,7 @@ jobs:
     runs-on: ubuntu-24.04
     # Must equal NMCP_E2E_BUDGET_JOB_SECONDS. 8 worker failpoints each wait
     # out the real 2-minute lease; the scenario needs ~30-35 min plus a cold
-    # image build, so 60 minutes cannot admit it (leader decision pending).
+    # image build, so 60 minutes cannot admit it (decided: single 80-minute job).
     timeout-minutes: 80
     permissions:
       contents: read
