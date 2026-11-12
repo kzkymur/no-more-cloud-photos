@@ -48,12 +48,39 @@ if "$ctl" image-sha256 /etc/passwd 2>/dev/null; then fail "image-sha256 accepted
 if "$ctl" image-sha256 /opt/nmcp/../../etc/passwd 2>/dev/null; then fail "image-sha256 accepted a non-canonical path"; fi
 if "$ctl" image-sha256 /opt/nmcp/bin/does-not-exist 2>/dev/null; then fail "image-sha256 accepted a missing file"; fi
 
+step "image trust: helper/ICC/prlimit paths and every ancestor are root-owned, not group/world-writable"
+# shellcheck disable=SC2016 # expanded by the container shell
+trust=$(docker run --rm --network none --read-only --user 10001:10001 --entrypoint /bin/sh \
+  "$(docker container inspect --format '{{.Image}}' "$(docker container ls --quiet \
+    --filter "label=com.docker.compose.project=$NMCP_E2E_PROJECT" --filter label=com.docker.compose.service=worker)")" -eu -c '
+  for path in /opt/nmcp/bin/nmcp-still-helper /opt/nmcp/bin/nmcp-animation-helper /opt/nmcp/bin/nmcp-video-helper \
+              /opt/nmcp/bin/ffmpeg /opt/nmcp/bin/ffprobe /opt/nmcp/share/sRGB2014.icc /usr/bin/prlimit; do
+    p=$path
+    while :; do
+      stat -c "%u %a %n" "$p"
+      [ "$p" = / ] && break
+      p=$(dirname "$p")
+    done
+  done' | sort -u) || fail "image trust probe"
+printf '%s\n' "$trust" >"$NMCP_E2E_ARTIFACT_DIR/selftest-image-trust.txt"
+bad=$(printf '%s\n' "$trust" | while read -r uid mode path; do
+  # 1777 /tmp-style dirs are not on these paths; any group/other write bit is bad.
+  if [ "$uid" != 0 ] || [ $(( 0$mode & 022 )) -ne 0 ]; then printf '%s %s %s; ' "$uid" "$mode" "$path"; fi
+done)
+[ -z "$bad" ] || fail "untrusted owner/mode in image: $bad"
+
 step "admin runs nmcp-admin as nmcp_migrator"
 "$ctl" admin -- migrate status --json >"$NMCP_E2E_ARTIFACT_DIR/selftest-admin.json" ||
   fail "nmcp-admin migrate status"
 
 step "admin one-shot mounts: fixtures and media read-only, private /e2e/work outside media"
-case "$NMCP_E2E_FIXTURES_DIR" in */no-fixtures) ;; *) fail "self-test expects the empty fixture dir, got $NMCP_E2E_FIXTURES_DIR" ;; esac
+# The self-test owns its fixture dir (the workflow points NMCP_E2E_FIXTURES_DIR
+# at an empty runner-temp dir), so writing a marker never touches real
+# scenario fixtures such as test/e2e/testdata.
+[ -d "$NMCP_E2E_FIXTURES_DIR" ] || fail "fixture dir missing: $NMCP_E2E_FIXTURES_DIR"
+if [ -n "$(ls -A "$NMCP_E2E_FIXTURES_DIR")" ]; then
+  fail "self-test needs an empty fixture dir of its own, got non-empty $NMCP_E2E_FIXTURES_DIR"
+fi
 marker="selftest-$$"
 printf '%s' "$marker" >"$NMCP_E2E_FIXTURES_DIR/selftest.marker"
 chmod 0644 "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
