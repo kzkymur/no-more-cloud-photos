@@ -81,7 +81,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("configure job repository: %w", err)
 	}
-	executor, envelope, err := configureTransformExecutor(ctx, cfg, repository, store)
+	executor, envelope, err := configureTransformExecutor(ctx, cfg, repository, store, logger)
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func runWorkers(ctx context.Context, loops ...workerLoop) error {
 	return first
 }
 
-func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, repository *job.Repository, store *storage.Store) (*transformexecutor.Executor, transformcapability.Envelope, error) {
+func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, repository *job.Repository, store *storage.Store, logger *slog.Logger) (*transformexecutor.Executor, transformcapability.Envelope, error) {
 	still, err := stillprocessor.New(stillprocessor.Config{
 		Helper: cfg.StillHelperPath, Prlimit: cfg.PrlimitPath, SRGBICC: cfg.SRGBICCPath,
 		SRGBICCSHA256: cfg.SRGBICCSHA256, Policy: stillprocessor.DefaultPolicy(),
@@ -183,7 +183,7 @@ func configureTransformExecutor(ctx context.Context, cfg config.WorkerConfig, re
 	if err != nil {
 		return nil, transformcapability.Envelope{}, err
 	}
-	executor, err := transformexecutor.New(repository, transformexecutor.StoreAdapter{Store: store}, still, animation, video, transformexecutor.Options{})
+	executor, err := transformexecutor.New(repository, transformexecutor.StoreAdapter{Store: store}, still, animation, video, transformexecutor.Options{Logger: logger})
 	if err != nil {
 		return nil, transformcapability.Envelope{}, fmt.Errorf("configure transform executor: %w", err)
 	}

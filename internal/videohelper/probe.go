@@ -139,8 +139,16 @@ func (e *engine) inspect(path, mime string, expectedVideoStreamIndex *int, limit
 		return inspection{}, nil, err
 	}
 	primaries, transfer, matrix, colorRange, hdr, peak, mastering, maxCLL, err := classifyColor(video, facts.frameHDR)
+	inferred := false
 	if err != nil {
-		return inspection{}, nil, err
+		// Untagged SDR is accepted with conventional inference only when the
+		// stream is provably 8-bit and nothing it does declare conflicts.
+		var inferErr error
+		primaries, transfer, matrix, colorRange, inferErr = inferSDRColor(video, facts.frameHDR)
+		if inferErr != nil {
+			return inspection{}, nil, err
+		}
+		hdr, peak, mastering, maxCLL, inferred = false, 0, 0, 0, true
 	}
 	i := inspection{
 		TotalStreams: len(document.Streams), VideoStreamIndex: videoIndex, AudioPresent: audioPresent, AudioStreamIndex: -1,
@@ -148,7 +156,7 @@ func (e *engine) inspect(path, mime string, expectedVideoStreamIndex *int, limit
 		SampleAspectRatio: sar, RotationDegrees: rotation, FrameCount: len(facts.pts), DurationUS: facts.durationUS,
 		EffectiveFPS: facts.fps, TimeBase: timeBase, FirstPTS: facts.pts[0], LastPTS: facts.pts[len(facts.pts)-1], PTSDeltaSHA256: hashDeltas(facts.pts),
 		ColorPrimaries: primaries, ColorTransfer: transfer, ColorMatrix: matrix, ColorRange: colorRange, HDR: hdr, SourcePeakNits: peak, MasteringMaxNits: mastering, MaxCLLNits: maxCLL,
-		AudioCodec: "none", AudioChannelLayout: "none", CumulativeDecodedPixels: facts.decodedPixels,
+		AudioCodec: "none", AudioChannelLayout: "none", CumulativeDecodedPixels: facts.decodedPixels, ColorInferred: inferred,
 	}
 	var selectedAudio *probeStream
 	if audioPresent {
@@ -495,6 +503,64 @@ func classifyColor(stream probeStream, frameHDR hdrEvidence) (string, string, st
 		return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 	}
 	return primaries, transfer, matrix, rangeName, false, 0, 0, 0, nil
+}
+
+// colorUnspecified reports an absent or explicitly unspecified ffprobe color
+// field.
+func colorUnspecified(value string) bool {
+	return value == "" || value == "unknown" || value == "unspecified" || value == "reserved"
+}
+
+// eightBitPixelFormats are the ffprobe pix_fmt values that prove 8 bits per
+// sample. Anything else (10/12/16-bit, float, unknown) may be HDR and is never
+// inferred.
+var eightBitPixelFormats = map[string]bool{
+	"yuv420p": true, "yuvj420p": true, "yuv422p": true, "yuvj422p": true, "yuv444p": true, "yuvj444p": true,
+	"nv12": true, "nv21": true, "yuv411p": true, "yuv440p": true, "yuvj440p": true,
+}
+
+// inferSDRColor applies conventional SDR inference to a stream whose color
+// signalling is wholly or partly unspecified: height >= 720 is BT.709,
+// smaller is the BT.601 matrix (smpte170m; 525- and 625-line BT.601 share it)
+// with BT.709 primaries and transfer, and an unspecified range is limited.
+// Every specified field must equal the inferred value (a declared range is
+// kept). A fully tagged stream, a stream that is not provably 8-bit, PQ/HLG,
+// BT.2020, or HDR side data is refused, so tagged input keeps exactly the
+// classifyColor behaviour.
+func inferSDRColor(stream probeStream, frameHDR hdrEvidence) (string, string, string, string, error) {
+	refuse := fail("unsupported_input")
+	if !colorUnspecified(stream.ColorPrimaries) && !colorUnspecified(stream.ColorTransfer) && !colorUnspecified(stream.ColorSpace) && !colorUnspecified(stream.ColorRange) {
+		return "", "", "", "", refuse
+	}
+	if !eightBitPixelFormats[stream.PixFmt] || stream.BitsPerRaw != "" && stream.BitsPerRaw != "8" || stream.Height <= 0 {
+		return "", "", "", "", refuse
+	}
+	if frameHDR.present || frameHDR.invalid {
+		return "", "", "", "", refuse
+	}
+	if streamHDR, err := parseHDREvidence(stream.SideDataList); err != nil || streamHDR.present {
+		return "", "", "", "", refuse
+	}
+	primaries, transfer, matrix := "bt709", "bt709", "bt709"
+	if stream.Height < 720 {
+		matrix = "smpte170m"
+	}
+	for _, field := range []struct{ declared, inferred string }{
+		{stream.ColorPrimaries, primaries}, {stream.ColorTransfer, transfer}, {stream.ColorSpace, matrix},
+	} {
+		if !colorUnspecified(field.declared) && field.declared != field.inferred {
+			return "", "", "", "", refuse
+		}
+	}
+	colorRange := "limited"
+	if !colorUnspecified(stream.ColorRange) {
+		declared, ok := map[string]string{"tv": "limited", "mpeg": "limited", "pc": "full", "jpeg": "full"}[stream.ColorRange]
+		if !ok {
+			return "", "", "", "", refuse
+		}
+		colorRange = declared
+	}
+	return primaries, transfer, matrix, colorRange, nil
 }
 
 func parseHDREvidence(sideData []map[string]interface{}) (hdrEvidence, error) {

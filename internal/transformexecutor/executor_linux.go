@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math"
 	"os"
 	"time"
@@ -72,6 +74,9 @@ type VideoProcessor interface {
 type Options struct {
 	UUID         func() (string, error)
 	AbortTimeout time.Duration
+	// Logger receives operator-visible processing notes (for example inferred
+	// video color). Nil discards them.
+	Logger *slog.Logger
 }
 
 type Executor struct {
@@ -82,6 +87,7 @@ type Executor struct {
 	video      VideoProcessor
 	uuid       func() (string, error)
 	abortAfter time.Duration
+	logger     *slog.Logger
 }
 
 // StoreAdapter narrows the concrete filesystem store to the executor's testable
@@ -106,7 +112,10 @@ func New(repository Repository, store Storage, still StillProcessor, animation A
 	if options.AbortTimeout == 0 {
 		options.AbortTimeout = defaultAbortTimeout
 	}
-	return &Executor{repository: repository, storage: store, still: still, animation: animation, video: video, uuid: options.UUID, abortAfter: options.AbortTimeout}, nil
+	if options.Logger == nil {
+		options.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	return &Executor{repository: repository, storage: store, still: still, animation: animation, video: video, uuid: options.UUID, abortAfter: options.AbortTimeout, logger: options.Logger}, nil
 }
 
 func (executor *Executor) Execute(ctx context.Context, lease job.Lease, limits worker.ExecutionLimits) error {
@@ -247,6 +256,14 @@ func (executor *Executor) executeTarget(ctx context.Context, lease job.Lease, ta
 			case profile.SourceVideo:
 				result, err := executor.video.Transform(ctx, videoprocessor.Request{Input: input, Output: output, MIMEType: lease.Original.MIMEType, Recipe: recipe, GeneratedBytesBefore: generatedBytes, ExpectedVideoStreamIndex: lease.Original.PrimaryVideoStreamIndex})
 				processErr = err
+				if err == nil && result.Source.ColorInferred {
+					// Never infer silently: the assumption is in the persisted audit
+					// (input_color "inferred:...") and in the Worker log.
+					executor.logger.InfoContext(ctx, "video source color inferred",
+						slog.String("job_id", lease.ID),
+						slog.String("color_primaries", result.Source.ColorPrimaries), slog.String("color_transfer", result.Source.ColorTransfer),
+						slog.String("color_matrix", result.Source.ColorMatrix), slog.String("color_range", result.Source.ColorRange))
+				}
 				transformed = transformResult{mimeType: result.OutputMIME, extension: extension, width: result.Width, height: result.Height,
 					audit: processorAudit{SchemaVersion: 1, Family: worker.FamilyVideo, Result: result}}
 				if result.OutputMIME == "video/mp4" {

@@ -142,7 +142,7 @@ func makeAudit(source inspection, probe *mediaProbe, digest, videoFilter, audioF
 		SelectedVideoStream: source.VideoStreamIndex, SelectedAudioStream: source.AudioStreamIndex, StreamSelection: "expected-absolute-index",
 		RotationSource: probe.rotation, RotationDegreesApplied: source.RotationDegrees, Orientation: "identity", Geometry: geometry,
 		Timing: "preserve-presentation-order-vfr-rebase-zero", VideoFilterGraph: videoFilter, AudioFilterGraph: audioFilter,
-		InputColor: source.ColorPrimaries + "/" + source.ColorTransfer + "/" + source.ColorMatrix + "/" + source.ColorRange, OutputColor: outputColor,
+		InputColor: inputColor(source), OutputColor: outputColor,
 		OutputPrimaries: "bt709", OutputTransfer: outputTransfer, OutputMatrix: "bt709", OutputRange: "limited", HDRDisposition: hdrDisposition, ToneMap: toneMap,
 		TargetNits: 100, SourcePeakNits: source.SourcePeakNits, InputAudioLayout: source.AudioChannelLayout,
 		OutputAudioLayout: map[bool]string{true: source.AudioChannelLayout, false: "none"}[source.AudioPresent && kind == "mp4-av1"], InputAudioSampleRate: source.AudioSampleRate,
@@ -169,6 +169,11 @@ func filterGraph(source inspection, width, height, bitDepth int, kind string) st
 			"zscale=transfer=linear:npl="+strconv.Itoa(source.SourcePeakNits),
 			"format=gbrpf32le", "tonemap=hable:desat=0:peak="+strconv.Itoa(source.SourcePeakNits),
 			"zscale=primaries=bt709:transfer="+outputTransfer+":matrix=bt709:range=limited:npl=100")
+	} else if source.ColorInferred {
+		// Untagged frames carry no color properties for zscale to read, so the
+		// inferred source values are stated explicitly.
+		parts = append(parts, "zscale=primariesin="+source.ColorPrimaries+":transferin="+source.ColorTransfer+":matrixin="+source.ColorMatrix+":rangein="+source.ColorRange+
+			":primaries=bt709:transfer="+outputTransfer+":matrix=bt709:range=limited")
 	} else {
 		parts = append(parts, "zscale=primaries=bt709:transfer="+outputTransfer+":matrix=bt709:range=limited")
 	}
@@ -178,6 +183,16 @@ func filterGraph(source inspection, width, height, bitDepth int, kind string) st
 	}
 	parts = append(parts, "scale="+strconv.Itoa(width)+":"+strconv.Itoa(height)+":flags=lanczos", "setsar=1", pixelFormat, "setpts=PTS-STARTPTS")
 	return strings.Join(parts, ",")
+}
+
+// inputColor is the audit's source color; inferred values are marked so the
+// persisted rendition audit never presents an assumption as a tag.
+func inputColor(source inspection) string {
+	color := source.ColorPrimaries + "/" + source.ColorTransfer + "/" + source.ColorMatrix + "/" + source.ColorRange
+	if source.ColorInferred {
+		return "inferred:" + color
+	}
+	return color
 }
 
 func outputAudio(source inspection) (int, string) {

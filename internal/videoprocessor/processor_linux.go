@@ -104,6 +104,9 @@ type Inspection struct {
 	AudioChannelLayout      string   `json:"audio_channel_layout"`
 	AudioSampleRate         int      `json:"audio_sample_rate"`
 	CumulativeDecodedPixels uint64   `json:"cumulative_decoded_pixels"`
+	// ColorInferred marks conventional SDR values assumed for a source without
+	// (or with partial, non-conflicting) color signalling.
+	ColorInferred bool `json:"color_inferred"`
 }
 
 type Result struct {
@@ -467,6 +470,12 @@ func validateInspection(i Inspection, p Policy) error {
 }
 
 func safeColor(i Inspection) bool {
+	if i.ColorInferred {
+		// Inference only ever yields SDR BT.709 primaries/transfer with the
+		// BT.709 (HD) or BT.601 smpte170m (SD) matrix.
+		return !i.HDR && i.ColorPrimaries == "bt709" && i.ColorTransfer == "bt709" &&
+			(i.ColorMatrix == "bt709" && i.CodedHeight >= 720 || i.ColorMatrix == "smpte170m" && i.CodedHeight < 720) && oneOf(i.ColorRange, "limited", "full")
+	}
 	return oneOf(i.ColorPrimaries, "bt709", "bt2020") && oneOf(i.ColorTransfer, "bt709", "smpte2084", "arib-std-b67") && oneOf(i.ColorMatrix, "bt709", "bt2020nc", "bt2020c") && oneOf(i.ColorRange, "limited", "full")
 }
 
@@ -537,6 +546,9 @@ func auditVideoFilter(source Inspection, width, height, bitDepth int, kind strin
 	if source.HDR {
 		peak := strconv.Itoa(source.SourcePeakNits)
 		parts = append(parts, "zscale=transfer=linear:npl="+peak, "format=gbrpf32le", "tonemap=hable:desat=0:peak="+peak, "zscale=primaries=bt709:transfer="+transfer+":matrix=bt709:range=limited:npl=100")
+	} else if source.ColorInferred {
+		parts = append(parts, "zscale=primariesin="+source.ColorPrimaries+":transferin="+source.ColorTransfer+":matrixin="+source.ColorMatrix+":rangein="+source.ColorRange+
+			":primaries=bt709:transfer="+transfer+":matrix=bt709:range=limited")
 	} else {
 		parts = append(parts, "zscale=primaries=bt709:transfer="+transfer+":matrix=bt709:range=limited")
 	}
@@ -560,7 +572,11 @@ func auditAudio(source Inspection, kind string) (int, string) {
 }
 
 func auditInputColor(source Inspection) string {
-	return source.ColorPrimaries + "/" + source.ColorTransfer + "/" + source.ColorMatrix + "/" + source.ColorRange
+	color := source.ColorPrimaries + "/" + source.ColorTransfer + "/" + source.ColorMatrix + "/" + source.ColorRange
+	if source.ColorInferred {
+		return "inferred:" + color
+	}
+	return color
 }
 
 func validateCapability(r capabilityWire, digest string) error {

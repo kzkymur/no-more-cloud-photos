@@ -329,3 +329,49 @@ func regularFile(t *testing.T, content []byte) *os.File {
 	}
 	return file
 }
+
+// TestValidateInspectionInferredColor accepts an inferred source only with the
+// exact SDR values the helper can infer for its height, and mirrors the
+// explicit zscale input and the audit marker.
+func TestValidateInspectionInferredColor(t *testing.T) {
+	policy := DefaultPolicy()
+	hd := validInspection()
+	hd.CodedWidth, hd.CodedHeight, hd.DisplayWidth, hd.DisplayHeight, hd.CumulativeDecodedPixels = 1920, 1080, 1920, 1080, 2*1920*1080
+	hd.ColorInferred = true
+	sd := validInspection()
+	sd.ColorInferred, sd.ColorMatrix = true, "smpte170m"
+	for name, test := range map[string]struct {
+		inspection Inspection
+		valid      bool
+	}{
+		"inferred HD BT.709":          {hd, true},
+		"inferred SD BT.601 matrix":   {sd, true},
+		"tagged SD smpte170m refused": {func() Inspection { i := sd; i.ColorInferred = false; return i }(), false},
+		"inferred HD with SD matrix":  {func() Inspection { i := hd; i.ColorMatrix = "smpte170m"; return i }(), false},
+		"inferred SD with HD matrix":  {func() Inspection { i := sd; i.ColorMatrix = "bt709"; return i }(), false},
+		"inferred BT.2020 refused":    {func() Inspection { i := hd; i.ColorPrimaries, i.ColorMatrix = "bt2020", "bt2020nc"; return i }(), false},
+		"inferred PQ refused": {func() Inspection {
+			i := hd
+			i.ColorTransfer, i.HDR, i.SourcePeakNits, i.MasteringMaxNits, i.MaxCLLNits = "smpte2084", true, 1000, 1000, 1000
+			return i
+		}(), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateInspection(test.inspection, policy); (err == nil) != test.valid {
+				t.Fatalf("validateInspection = %v, want valid=%v", err, test.valid)
+			}
+		})
+	}
+	if got := auditInputColor(sd); got != "inferred:bt709/bt709/smpte170m/limited" {
+		t.Fatalf("audit input color = %s", got)
+	}
+	if got := auditInputColor(validInspection()); got != "bt709/bt709/bt709/limited" {
+		t.Fatalf("tagged audit input color changed: %s", got)
+	}
+	if got := auditVideoFilter(sd, 320, 180, 10, "mp4-av1"); !strings.Contains(got, "zscale=primariesin=bt709:transferin=bt709:matrixin=smpte170m:rangein=limited:primaries=bt709:transfer=bt709:matrix=bt709:range=limited") {
+		t.Fatalf("inferred filter = %s", got)
+	}
+	if got := auditVideoFilter(validInspection(), 320, 180, 10, "mp4-av1"); strings.Contains(got, "primariesin") {
+		t.Fatalf("tagged filter changed: %s", got)
+	}
+}

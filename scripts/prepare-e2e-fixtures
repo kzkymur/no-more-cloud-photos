@@ -45,6 +45,11 @@ GENERATED = {
                                                  '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', *BT709, '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', '-f', 'mp4']),
     'video-quicktime-generated': ('video/quicktime', 'mov', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24:duration=2', '-t', '2',
                                                              '-c:v', 'libx264', '-pix_fmt', 'yuv420p', *BT709, '-an', '-f', 'mov']),
+    # Regression input for the #21 untagged-SDR decision: 1080p 8-bit with no
+    # color signalling at all, which the helper must infer as BT.709 limited
+    # (color_inferred) rather than refuse. Deliberately NOT tagged.
+    'video-mp4-untagged-generated': ('video/mp4', 'mp4', ['-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=24:duration=2', '-t', '2',
+                                                          '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', '-f', 'mp4']),
 }
 
 
