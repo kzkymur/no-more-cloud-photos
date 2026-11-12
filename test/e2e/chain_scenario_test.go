@@ -221,10 +221,11 @@ func TestReleaseGateChain(t *testing.T) {
 		}
 		h.assertFileBytes(fresh.FileURL, fresh.SHA256, fresh.MIMEType, fresh.SizeBytes)
 		h.expectJSON(h.do(http.MethodGet, "/renditions/"+old.ID, nil, nil), 200, nil) // superseded, retained until cleanup
-		// Zero-day retention means "due at the next scan": the documented
-		// manual cleanup runs that scan with the automatic path's locks.
-		h.admin("cleanup", "--kind", "renditions", "--yes", "--json")
-		h.eventually("superseded rendition cleanup", 2*time.Minute, func() bool {
+		// Zero-day retention means "due at the next scan": the Worker's
+		// automatic rendition cleanup sweeps every 30 s in production. (The
+		// manual `cleanup` CLI cannot delete here: the harness gives the admin
+		// one-shot a read-only media view by design.)
+		h.eventually("superseded rendition cleanup by the Worker's automatic sweep", 3*time.Minute, func() bool {
 			return h.do(http.MethodGet, "/renditions/"+old.ID, nil, nil).Status == 404
 		})
 		h.assertFileGone(old.FileURL)
