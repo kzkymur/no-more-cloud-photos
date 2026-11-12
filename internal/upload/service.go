@@ -188,12 +188,16 @@ func (s *Service) Accept(ctx context.Context, request Request) (outcome Outcome,
 
 	temporary, err := s.store.Begin(ctx, originalID, attemptID)
 	if err != nil {
+		// Decide before cancelling: cancelOperation cancels ctx itself, so
+		// checking ctx.Err() afterwards reported every storage failure (EROFS,
+		// ENOSPC on the temporary) as a 408 client timeout.
+		timedOut := ctx.Err() != nil
 		cancelOperation(nil)
 		heartbeat.Stop()
 		if heartbeatErr := heartbeat.Err(); heartbeatErr != nil {
 			return Outcome{}, dependencyFailure(heartbeatErr)
 		}
-		if ctx.Err() != nil {
+		if timedOut {
 			return Outcome{}, timeoutFailure(err)
 		}
 		return Outcome{}, dependencyFailure(err)

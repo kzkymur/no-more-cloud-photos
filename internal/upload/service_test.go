@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -209,6 +210,28 @@ func TestServiceAcceptClassifiesTemporaryWriteFailureAsDependency(t *testing.T) 
 	var failure *Failure
 	if !errors.As(err, &failure) || failure.Status != 503 || failure.Code != "unavailable" || !temporary.aborted {
 		t.Fatalf("error=%#v aborted=%v", err, temporary.aborted)
+	}
+}
+
+// A storage failure creating the temporary (EROFS, ENOSPC) is a dependency
+// failure (503), never a client timeout: the operation context is cancelled
+// as cleanup, which must not be mistaken for the request having timed out.
+func TestServiceAcceptClassifiesTemporaryCreateFailureAsDependency(t *testing.T) {
+	for _, cause := range []error{syscall.EROFS, syscall.ENOSPC} {
+		service := testService(&fakeOriginalStore{beginErr: cause}, &fakeMetadataProber{result: validMetadata()}, &fakeAcceptanceRepository{timezone: "UTC"})
+		_, err := service.Accept(context.Background(), validRequest(bytes.NewBufferString("body")))
+		var failure *Failure
+		if !errors.As(err, &failure) || failure.Status != 503 || failure.Code != "unavailable" || !errors.Is(err, cause) {
+			t.Fatalf("%v: error=%#v", cause, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	service := testService(&fakeOriginalStore{beginErr: context.Canceled}, &fakeMetadataProber{result: validMetadata()}, &fakeAcceptanceRepository{timezone: "UTC"})
+	_, err := service.Accept(ctx, validRequest(bytes.NewBufferString("body")))
+	var failure *Failure
+	if !errors.As(err, &failure) || failure.Status == 503 {
+		t.Fatalf("already cancelled request classified as dependency: %#v", err)
 	}
 }
 
@@ -499,10 +522,14 @@ func TestUploadAndJobResponseContract(t *testing.T) {
 type fakeOriginalStore struct {
 	temporary stagedOriginal
 	events    *[]string
+	beginErr  error
 }
 
 func (s *fakeOriginalStore) Begin(context.Context, string, string) (stagedOriginal, error) {
 	appendEvent(s.events, "begin")
+	if s.beginErr != nil {
+		return nil, s.beginErr
+	}
 	return s.temporary, nil
 }
 
