@@ -225,6 +225,55 @@ func TestReleaseGateResources(t *testing.T) {
 	if output, err := idRunner.Run(ctx, processrunner.Command{Executable: "/usr/bin/id", Arguments: []string{"-u"}}); err != nil || strings.TrimSpace(string(output.Stdout)) != runtimeUser.Uid {
 		t.Fatalf("certify-identity tool process ran as uid %q (%v), want nmcp %s", output.Stdout, err, runtimeUser.Uid)
 	}
+	// The helpers reopen /proc/self/fd/3 (input) and /fd/4 (output), which
+	// re-checks the inode mode against the dropped uid: root-owned private
+	// copies refuse it; the shared root:nmcp 0440/0660 copies admit it.
+	reopenDir, err := os.MkdirTemp("", "nmcp-certify-reopen-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(reopenDir)
+	reopenInput, reopenOutput := filepath.Join(reopenDir, "input-00"), filepath.Join(reopenDir, "output-00")
+	if err := os.WriteFile(reopenInput, []byte("certify fixture copy"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	reopenRunner, err := processrunner.New("/usr/bin/prlimit", processrunner.Limits{Timeout: 10 * time.Second, AddressSpaceBytes: 1 << 30, FileSizeBytes: 1 << 20, OutputBytesPerStream: 1024, RunAs: runAs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopen := func() error {
+		in, err := os.Open(reopenInput)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.OpenFile(reopenOutput, os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+		_, err = reopenRunner.Run(ctx, processrunner.Command{Executable: "/usr/bin/cp", Arguments: []string{"/proc/self/fd/3", "/proc/self/fd/4"}, Files: []*os.File{in, out}})
+		return err
+	}
+	if err := os.WriteFile(reopenOutput, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if reopen() == nil {
+		t.Fatal("dropped helper reopened root-private certify copies; the negative control is broken")
+	}
+	ws := &certifyWorkspace{dir: reopenDir, fixtures: []certifyVerifiedFixture{{path: reopenInput}}}
+	if err := ws.shareWithGroup(int(runAs.GID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(reopenOutput, -1, *ws.outputGID); err != nil || os.Chmod(reopenOutput, 0o660) != nil {
+		t.Fatal("share output copy")
+	}
+	if err := reopen(); err != nil {
+		t.Fatalf("dropped helper cannot reopen shared certify copies through /proc/self/fd: %v", err)
+	}
+	if copied, err := os.ReadFile(reopenOutput); err != nil || string(copied) != "certify fixture copy" {
+		t.Fatal("dropped helper output through /proc/self/fd/4 differs")
+	}
 	if _, err := service.ProfileCertify(ctx, decoded); err != nil {
 		// Same sanitized result the CLI prints: reason, input, check, detail.
 		failure, _ := json.Marshal(certifyFailureResult(definition.ID, err))
