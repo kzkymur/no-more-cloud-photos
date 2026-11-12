@@ -47,7 +47,12 @@ DEB_MAX_FILES, DEB_MAX_FILE, DEB_MAX_TOTAL = 1024, 256 << 20, 1 << 30
 # phase is capped by min(configured cap, remaining active budget); the cleanup
 # reserve and margin are never consumed by active phases.
 JOB_NAMES = {'live': 'Backup / actual systemd all-pool cutover and separate resume',
-             'offline': 'Backup / offline two-cluster source-stop recovery and separate resume'}
+             'offline': 'Backup / offline two-cluster source-stop recovery and separate resume',
+             'resources': 'Release gate / RAW and AV1 under one nmcp.slice'}
+# Exact test binary -> (slot, explicit opt-in variable, single test regex).
+SLOTS = {'backup-live.test': ('live', 'TEST_BACKUP_LIVE_SYSTEMD', '^TestBackupPG17LiveCutover$'),
+         'backup-offline.test': ('offline', 'TEST_BACKUP_OFFLINE_SYSTEMD', '^TestRestoreOfflineRootTwoClusters$'),
+         'release-resources.test': ('resources', 'TEST_RELEASE_RESOURCES', '^TestReleaseGateResources$')}
 # job_seconds MUST equal the workflow job timeout-minutes (40). Static worst
 # case: setup allowance 120 + bootstrap 520 + boot 120 + guest setup 120 +
 # test 1110 + admission skew 32 + cleanup 300 + margin 60 = 2382 <= 2400; the
@@ -58,6 +63,8 @@ BUDGET_POLICY = dict(job_seconds=2400, cleanup_seconds=300, margin_seconds=60)
 SETUP_ALLOWANCE = 120
 BOOTSTRAP_CAP, BOOT_CAP, GUEST_SETUP_RESERVE, TEST_CAP, TEST_REQUIRED = 520, 120, 120, 1110, 1110
 BOOTSTRAP_REQUIRED = 300
+# Transient connect failures only; every attempt shares the single deadline.
+BOOTSTRAP_ATTEMPTS, BOOTSTRAP_RETRY_MIN = 3, 60
 
 def require(ok, message):
     if not ok:
@@ -405,7 +412,7 @@ def observed_bootstrap(argv, env, log, work, identity, timeout):
             re.fullmatch(r'[0-9a-f]{40}', identity['head']) and
             re.fullmatch(r'[1-9][0-9]{0,19}', identity['run']) and
             re.fullmatch(r'[1-9][0-9]{0,19}', identity['attempt']) and
-            identity['slot'] in ('live', 'offline'), 'invalid bootstrap diagnostic identity')
+            identity['slot'] in JOB_NAMES, 'invalid bootstrap diagnostic identity')
     # One absolute acquisition timeout (budget-capped, never above the
     # configured cap); log activity or cache hits cannot reset it.
     require(type(timeout) is int and 1 <= timeout <= BOOTSTRAP_CAP, 'invalid bootstrap timeout')
@@ -440,7 +447,56 @@ def observed_bootstrap(argv, env, log, work, identity, timeout):
     # No last-progress clock was sampled; mtime is NOT monotonic progress age.
     print('Bootstrap diagnostic: ' + json.dumps(summary, sort_keys=True), flush=True)
     if failure is not None:
-        raise BootstrapFailure('bootstrap acquisition failed; see closed diagnostic') from None
+        closed = BootstrapFailure('bootstrap acquisition failed; see closed diagnostic')
+        closed.summary = summary
+        raise closed from None
+    return summary
+
+
+def root_has_mounts(root):
+    # A first-stage download/validate failure never mounts inside the target;
+    # anything mounted there forbids a retry (the failed root is never reused).
+    prefix = str(root).rstrip('/') + '/'
+    with open('/proc/self/mountinfo') as mounts:
+        for line in mounts:
+            point = line.split()[4]
+            if point == str(root) or point.startswith(prefix):
+                return True
+    return False
+
+
+def bootstrap_with_retry(argv_for, env, work, root, identity, timeout):
+    """Bounded retry of transient connect failures inside ONE absolute deadline.
+
+    Only a failure classified `connect` or `DNS` during download/validate is retried, at
+    most BOOTSTRAP_ATTEMPTS times. Every attempt shares the original deadline
+    (never reset), reuses the same --cache-dir (each file re-verified against
+    the freshly signed metadata), and starts from a fresh target: the failed
+    root is renamed aside, never reused or deleted.
+    """
+    require(type(timeout) is int and 1 <= timeout <= BOOTSTRAP_CAP, 'invalid bootstrap timeout')
+    deadline = time.monotonic() + timeout
+    for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
+        remaining = int(deadline - time.monotonic())
+        try:
+            with (work / 'provision.log').open('w') as log:
+                return observed_bootstrap(argv_for(root), env, log, work, identity, max(1, min(remaining, BOOTSTRAP_CAP)))
+        except BootstrapFailure as failure:
+            summary = getattr(failure, 'summary', {})
+            remaining = int(deadline - time.monotonic())
+            # Transient network classes only (review n7: DNS resolution too),
+            # only before anything is extracted, within the shared deadline.
+            retry = (summary.get('error_class') in ('connect', 'DNS') and summary.get('phase') in ('download', 'validate')
+                     and attempt < BOOTSTRAP_ATTEMPTS and remaining >= BOOTSTRAP_RETRY_MIN and not root_has_mounts(root))
+            print('Bootstrap attempt: ' + json.dumps(dict(attempt=attempt, error_class=summary.get('error_class', 'unknown'),
+                  phase=summary.get('phase', 'unknown'), remaining_seconds=max(0, remaining), retry=retry), sort_keys=True), flush=True)
+            if not retry:
+                raise
+            os.rename(work / 'provision.log', work / ('provision-attempt-%d.log' % attempt))
+            if os.path.lexists(root):
+                os.rename(root, work / ('rootfs-failed-attempt-%d' % attempt))
+            time.sleep(min(5, max(0, remaining - BOOTSTRAP_RETRY_MIN)))
+    raise BootstrapFailure('bootstrap acquisition failed; see closed diagnostic')
 
 
 def bootstrap_environment(work):
@@ -807,7 +863,7 @@ def main():
     require(re.fullmatch('[0-9a-f]{40}', head), 'exact SHA required')
     require(repo != temp and repo not in temp.parents and temp not in repo.parents, 'overlapping binds')
     if sys.argv[1] == '--cleanup':
-        require(len(sys.argv) == 3 and sys.argv[2] in ('live', 'offline'), 'cleanup requires live or offline')
+        require(len(sys.argv) == 3 and sys.argv[2] in JOB_NAMES, 'cleanup requires a known slot')
         slot = sys.argv[2]
         receipt_dir = temp / ('.nmcp-root-isolated-' + slot)
         if not receipt_dir.exists() and not receipt_dir.is_symlink():
@@ -816,7 +872,7 @@ def main():
         receipt = receipt_dir / 'owner.json'
         return teardown(load_receipt(receipt, repo, temp, head, slot), receipt)
     binary = canonical(sys.argv[1])
-    require(binary.parent == temp and binary.name in ('backup-live.test', 'backup-offline.test'),
+    require(binary.parent == temp and binary.name in SLOTS,
             'unexpected root test binary')
     require((repo / 'scripts/cleanup-backup-root-fixture').is_file(), 'cleanup helper missing')
     require(Path('/proc/1/comm').read_text().strip() == 'systemd', 'host systemd PID1 required')
@@ -824,12 +880,19 @@ def main():
     output(['/usr/bin/machinectl', 'list', '--no-legend', '--no-pager'])  # real machined/D-Bus
     env = {key: os.environ[key] for key in KEYS}
     require(re.fullmatch('[0-9a-f]{40}', env['TEST_BACKUP_CANDIDATE_SHA']), 'exact SHA required')
-    mode = 'TEST_BACKUP_OFFLINE_SYSTEMD' if binary.name == 'backup-offline.test' else 'TEST_BACKUP_LIVE_SYSTEMD'
+    slot, mode, regex = SLOTS[binary.name]
     require(os.environ.get(mode) == '1', 'explicit fixture opt-in required')
     env[mode] = '1'
     env['GITHUB_WORKSPACE'], env['RUNNER_TEMP'] = str(repo), str(temp)
-    slot = 'offline' if binary.name == 'backup-offline.test' else 'live'
-    regex = '^TestRestoreOfflineRootTwoClusters$' if slot == 'offline' else '^TestBackupPG17LiveCutover$'
+    extra_binds = []
+    if slot == 'resources':
+        # Prepared, SHA-verified fixture matrix (scripts/prepare-e2e-fixtures),
+        # bound read-only; it is never host runtime state.
+        fixtures = temp / 'e2e-prepared'
+        require(os.environ.get('TEST_RELEASE_FIXTURES_DIR') == str(fixtures), 'unexpected fixture directory')
+        require((canonical(str(fixtures)) / 'prepared.json').is_file(), 'prepared fixture manifest missing')
+        env['TEST_RELEASE_FIXTURES_DIR'] = str(fixtures)
+        extra_binds.append(fixtures)
     require(sys.argv[2:] == ['-test.v', '-test.count=1', '-test.timeout=18m', '-test.run', regex],
             'unexpected test arguments')
     require(env['TEST_BACKUP_PG17_BINDIR'] == '/opt/nmcp-pg17-ci/bin', 'unexpected PG prefix')
@@ -854,7 +917,7 @@ def main():
     # below are immutable inputs, never host runtime state or control sockets.
     binds = [repo, pg, native, binary] + [temp / name for name in (
         'still-helper-build', 'animation-helper-build',
-        'backup-live-binaries', 'sRGB2014.icc', 'orientation-6.jpg')]
+        'backup-live-binaries', 'sRGB2014.icc', 'orientation-6.jpg')] + extra_binds
     for path in binds:
         canonical(str(path))
     # Insufficient job budget fails here, before any owned root resource exists.
@@ -895,13 +958,12 @@ def main():
         print('Deb cache input: ' + json.dumps(cache, sort_keys=True), flush=True)
         bootstrap_timeout = phase_budget(repo, temp, slot, head, BOOTSTRAP_CAP,
                                          BOOT_CAP + GUEST_SETUP_RESERVE + TEST_REQUIRED, BOOTSTRAP_REQUIRED)
-        with (work / 'provision.log').open('w') as log:
-            observed_bootstrap(['/usr/sbin/debootstrap', '--variant=minbase', '--components=' + COMPONENTS,
+        bootstrap_with_retry(lambda target: ['/usr/sbin/debootstrap', '--variant=minbase', '--components=' + COMPONENTS,
                  '--keyring=' + KEYRING, '--cache-dir=' + str(work / 'deb-cache'),
-                 '--include=' + PACKAGES, SUITE, str(root), MIRROR],
-                bootstrap_environment(work), log, work,
-                dict(head=head, run=os.environ.get('GITHUB_RUN_ID', ''),
-                     attempt=os.environ.get('GITHUB_RUN_ATTEMPT', ''), slot=slot), bootstrap_timeout)
+                 '--include=' + PACKAGES, SUITE, str(target), MIRROR],
+            bootstrap_environment(work), work, root,
+            dict(head=head, run=os.environ.get('GITHUB_RUN_ID', ''),
+                 attempt=os.environ.get('GITHUB_RUN_ATTEMPT', ''), slot=slot), bootstrap_timeout)
         if cache['status'] == 'miss':  # Same path as restore; a hit is never rewritten.
             print('Deb cache output files: ' + str(export_deb_cache(work, temp)), flush=True)
         require(not any(root.glob('usr/lib/systemd/system/postgresql*')), 'unexpected PG vendor units')

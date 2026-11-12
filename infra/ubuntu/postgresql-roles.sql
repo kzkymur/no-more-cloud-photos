@@ -3,7 +3,10 @@
 -- Execute as the local PostgreSQL cluster administrator while connected to the
 -- intended nmcp database. Passwords are deliberately set separately with
 -- interactive \password commands and never stored in this repository.
--- This also provisions isolated nmcp_backup_dump/nmcp_backup_control logins.
+-- This also provisions isolated nmcp_backup_dump/nmcp_backup_control logins,
+-- and the operational nmcp_check/nmcp_repair logins used only by
+-- `nmcp-admin check` / `nmcp-admin repair` (each a member of exactly its
+-- capability role, see runtime-roles.sql).
 -- After application migrations, explicitly rerun with
 --   --set=nmcp_backup_grants_after_migration=1
 -- to install/verify the exact object ACLs. Default bootstrap needs no objects.
@@ -15,7 +18,9 @@ SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLIC
 FROM (VALUES
     ('nmcp_migrator'),
     ('nmcp_api'),
-    ('nmcp_worker')
+    ('nmcp_worker'),
+    ('nmcp_check'),
+    ('nmcp_repair')
 ) AS required(role_name)
 WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname=role_name)
 \gexec
@@ -23,7 +28,7 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname=role_name)
 DO $$
 DECLARE role_name text;
 BEGIN
-    FOREACH role_name IN ARRAY ARRAY['nmcp_migrator','nmcp_api','nmcp_worker'] LOOP
+    FOREACH role_name IN ARRAY ARRAY['nmcp_migrator','nmcp_api','nmcp_worker','nmcp_check','nmcp_repair'] LOOP
         IF NOT EXISTS (
             SELECT 1 FROM pg_catalog.pg_roles
             WHERE rolname=role_name
@@ -42,7 +47,7 @@ SELECT format('ALTER DATABASE %I OWNER TO nmcp_migrator', current_database())
 ALTER SCHEMA public OWNER TO nmcp_migrator;
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 REVOKE ALL ON DATABASE :DBNAME FROM PUBLIC;
-GRANT CONNECT ON DATABASE :DBNAME TO nmcp_migrator,nmcp_api,nmcp_worker;
+GRANT CONNECT ON DATABASE :DBNAME TO nmcp_migrator,nmcp_api,nmcp_worker,nmcp_check,nmcp_repair;
 
 \set nmcp_migrator_role nmcp_migrator
 \set nmcp_api_role nmcp_api

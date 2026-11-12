@@ -18,6 +18,11 @@ url https://github.com/libvips/libvips/releases/download/v8.18.7/vips-8.18.7.tar
 sha256 5baaead3b0bb20ffdb9e9ff09aa9fda08620923df77b63b436654cb5e0b3bf94
 license LGPL-2.1-or-later
 
+libwebp 1.6.0 (also inherited, not rebuilt, by the animation helper)
+url https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz
+sha256 e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+license BSD-3-Clause
+
 libheif 1.23.5
 url https://github.com/strukturag/libheif/releases/download/v1.23.5/libheif-1.23.5.tar.gz
 sha256 fd9036064c4432f0550d15072ddf34956a248279ee9aeaff0fba3fa0f77d8f1a

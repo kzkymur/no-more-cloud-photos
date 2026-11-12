@@ -169,7 +169,9 @@ run_admin() {
     admin_command=(/usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
       "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json)
   else
-    admin_command=(/usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs
+    # Root, no new privileges (#21 B2): the migrator credential never reaches
+    # a uid-nmcp process, and nmcp-admin refuses it unless euid is 0.
+    admin_command=(/usr/bin/setpriv --no-new-privs
       "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json)
   fi
   /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$$" "$owner_start" "$handoff" \
@@ -215,6 +217,18 @@ run_migration() {
   /usr/bin/rm -f -- "$token"
 }
 
+# The shipped Core binaries must carry no failpoint code (#21). Bytes-only:
+# production hosts have no Go toolchain; the pclntab package-path scan is the
+# check that applies to stripped release binaries anyway. Point names come
+# from this checkout's internal/failpoint sources.
+verify_no_failpoints() {
+  local directory=$1
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I \
+    "$script_dir/check-release-no-failpoints" --bytes-only --source-root "$script_dir/.." \
+    "$directory/bin/core-api" "$directory/bin/core-worker" "$directory/bin/nmcp-admin" ||
+    { printf 'release binaries contain failpoint code or could not be checked\n' >&2; exit 1; }
+}
+
 activate_services() {
   run_migration
   /usr/bin/systemctl restart nmcp-api.service nmcp-worker.service
@@ -237,6 +251,7 @@ case "$action" in
     /usr/bin/chown -R root:root "$temporary"
     verify_release "$temporary"
     verify_runtime_access "$temporary"
+    verify_no_failpoints "$temporary"
     /usr/bin/mv -- "$temporary" "$release_path"
     trap - EXIT
     printf 'Staged %s; run activate explicitly.\n' "$release_id"
@@ -246,6 +261,7 @@ case "$action" in
     load_host_contract
     verify_release "$release_path"
     verify_runtime_access "$release_path"
+    verify_no_failpoints "$release_path"
     old_target=
     if [[ -L $current ]]; then old_target=$(/usr/bin/readlink -f -- "$current"); fi
     was_active=false
@@ -284,6 +300,7 @@ case "$action" in
     load_host_contract
     verify_release "$release_path"
     verify_runtime_access "$release_path"
+    verify_no_failpoints "$release_path"
     [[ -f /etc/nmcp/admin.env ]] || { printf 'host assets are not installed\n' >&2; exit 1; }
     # The old admin binary must understand the current schema before switching.
     run_admin "$release_path" migrate status

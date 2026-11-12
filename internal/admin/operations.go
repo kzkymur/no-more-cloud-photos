@@ -16,7 +16,13 @@ import (
 // transactions. A failed unlock destroys the connection, never returning a
 // locked PostgreSQL session to the pool.
 func (s *Service) sessionLock(ctx context.Context, name string) (func(), error) {
-	conn, err := s.Pool.Acquire(ctx)
+	pool := s.Pool
+	if s.capability {
+		// Advisory locks need no grant; a capability process holds them on its
+		// repair connection, so they serialize with owner processes as before.
+		pool = s.RepairPool
+	}
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +75,11 @@ func (s *Service) Operational(ctx context.Context, o options) (any, error) {
 }
 
 func (s *Service) Check(ctx context.Context, store *storage.Store, scope reconciliation.Scope) (reconciliation.Result, error) {
-	repository, err := reconciliation.NewPostgresRepository(s.Pool)
+	pool := s.Pool
+	if s.CheckPool != nil {
+		pool = s.CheckPool
+	}
+	repository, err := reconciliation.NewPostgresRepository(pool)
 	if err != nil {
 		return reconciliation.Result{}, err
 	}
@@ -94,12 +104,19 @@ type Maintenance struct {
 
 func (s *Service) MaintenanceStatus(ctx context.Context) (Maintenance, error) {
 	var state Maintenance
-	err := s.Pool.QueryRow(ctx, `SELECT mode,reason,owner,entered_at,successful_check_report FROM maintenance_state WHERE id=1`).Scan(
+	query, pool := `SELECT mode,reason,owner,entered_at,successful_check_report FROM maintenance_state WHERE id=1`, s.Pool
+	if s.capability {
+		query, pool = `SELECT mode,reason,owner,entered_at,successful_check_report FROM nmcp_admin_read_maintenance_state()`, s.RepairPool
+	}
+	err := pool.QueryRow(ctx, query).Scan(
 		&state.Mode, &state.Reason, &state.Owner, &state.EnteredAt, &state.SuccessfulCheck)
 	return state, err
 }
 
 func (s *Service) MaintenanceResume(ctx context.Context, store *storage.Store) (any, error) {
+	if s.capability {
+		return s.capabilityResume(ctx, store)
+	}
 	unlock, err := s.sessionLock(ctx, "maintenance")
 	if err != nil {
 		return nil, err
@@ -186,7 +203,11 @@ func repairError(err error) error {
 }
 
 func (s *Service) Repair(ctx context.Context, store *storage.Store, report string, dry bool) (any, error) {
-	repository, err := reconciliation.NewRepairPostgresRepository(s.Pool)
+	pool := s.Pool
+	if s.RepairPool != nil {
+		pool = s.RepairPool
+	}
+	repository, err := reconciliation.NewRepairPostgresRepository(pool)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +236,18 @@ func (s *Service) Repair(ctx context.Context, store *storage.Store, report strin
 	if _, err := repository.ReadFindings(ctx, report); err != nil {
 		return nil, repairError(err)
 	}
-	err = s.mutate(ctx, "repair_enter", "maintenance-state", map[string]any{"report_id": report}, []string{report}, func(tx pgx.Tx) error {
+	if s.capability {
+		// The same lock, transition and audit row as below, through the 0025
+		// definer; a concurrent maintenance holder is an audited 'locked'.
+		var entered string
+		if err := s.RepairPool.QueryRow(ctx, `SELECT nmcp_admin_repair_enter_maintenance($1,$2,$3,$4,$5)`,
+			report, newID(), s.Actor, s.Host, time.Now()).Scan(&entered); err != nil {
+			return nil, classified(err)
+		}
+		if entered == "locked" {
+			return nil, ErrConflict
+		}
+	} else if err = s.mutate(ctx, "repair_enter", "maintenance-state", map[string]any{"report_id": report}, []string{report}, func(tx pgx.Tx) error {
 		var mode string
 		if err := tx.QueryRow(ctx, `SELECT mode FROM maintenance_state WHERE id=1 FOR UPDATE NOWAIT`).Scan(&mode); err != nil {
 			return err
@@ -226,8 +258,7 @@ func (s *Service) Repair(ctx context.Context, store *storage.Store, report strin
 		_, err := tx.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='administrative repair',owner=$1,
 			entered_at=clock_timestamp(),successful_check_report=NULL,updated_at=clock_timestamp() WHERE id=1`, s.Actor+"@"+s.Host)
 		return err
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, err
 	}
 	// report ID is a durable idempotency authorization. Re-running the same
@@ -241,7 +272,13 @@ func (s *Service) Repair(ctx context.Context, store *storage.Store, report strin
 	if effectErr != nil || result.Failed > 0 || result.Unknown > 0 {
 		outcome = "partial"
 	}
-	auditErr := s.recordAudit(ctx, "repair_result", map[string]any{"report_id": report}, []string{plan.Run.RunID}, outcome)
+	var auditErr error
+	if s.capability {
+		_, auditErr = s.RepairPool.Exec(ctx, `SELECT nmcp_admin_record_repair_result($1,$2,$3,$4,$5,$6,$7)`,
+			report, plan.Run.RunID, outcome, newID(), s.Actor, s.Host, time.Now())
+	} else {
+		auditErr = s.recordAudit(ctx, "repair_result", map[string]any{"report_id": report}, []string{plan.Run.RunID}, outcome)
+	}
 	if effectErr != nil || outcome == "partial" {
 		return result, ErrPartial
 	}
@@ -249,13 +286,15 @@ func (s *Service) Repair(ctx context.Context, store *storage.Store, report strin
 }
 
 type CleanupResult struct {
-	RunID        string   `json:"run_id,omitempty"`
-	Skipped      int      `json:"skipped"`
-	Kind         string   `json:"kind"`
-	DryRun       bool     `json:"dry_run"`
-	Eligible     int      `json:"eligible"`
-	Completed    int      `json:"completed"`
-	Failed       int      `json:"failed"`
+	RunID     string `json:"run_id,omitempty"`
+	Skipped   int    `json:"skipped"`
+	Kind      string `json:"kind"`
+	DryRun    bool   `json:"dry_run"`
+	Eligible  int    `json:"eligible"`
+	Completed int    `json:"completed"`
+	Failed    int    `json:"failed"`
+	// Pending items stay authorized in the run until the Worker finishes them.
+	Pending      int      `json:"pending"`
 	MorePossible bool     `json:"more_possible"`
 	IDs          []string `json:"affected_ids"`
 }
@@ -270,4 +309,55 @@ func (s *Service) recordAudit(ctx context.Context, command string, args any, ids
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// capabilityResume is MaintenanceResume for a uid-nmcp process (review B2):
+// the same fence, fresh full check and predicate, with the owner-table steps
+// through the 0025 definers on the repair login and the check on the check
+// login. A post-restore maintenance needs the root operator procedure (its
+// ledger is root-only) and is refused here.
+func (s *Service) capabilityResume(ctx context.Context, store *storage.Store) (any, error) {
+	unlock, err := s.sessionLock(ctx, "maintenance")
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	started := time.Now()
+	tx, err := s.RepairPool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rollback(tx)
+	// The row lock taken by the definer belongs to this transaction and is held
+	// through the fresh check until commit: the real cross-process fence.
+	var mode string
+	var reason, owner *string
+	if err := tx.QueryRow(ctx, `SELECT mode,reason,owner FROM nmcp_admin_lock_maintenance_for_resume()`).Scan(&mode, &reason, &owner); err != nil {
+		return nil, classified(err)
+	}
+	if mode != "maintenance" || reason != nil && *reason == "operator restore" {
+		return nil, ErrConflict
+	}
+	if s.afterResumeFence != nil {
+		if err := s.afterResumeFence(ctx); err != nil {
+			return nil, err
+		}
+	}
+	check, err := s.Check(ctx, store, reconciliation.ScopeAll)
+	if err != nil {
+		return check, err
+	}
+	encoded, _ := json.Marshal(check)
+	var resumed bool
+	if err := tx.QueryRow(ctx, `SELECT nmcp_admin_resume_maintenance($1,$2::jsonb,$3,$4,$5,$6)`,
+		check.ReportID, encoded, newID(), s.Actor, s.Host, started).Scan(&resumed); err != nil {
+		return check, classified(err)
+	}
+	if !resumed {
+		return check, ErrConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return check, err
+	}
+	return s.MaintenanceStatus(ctx)
 }

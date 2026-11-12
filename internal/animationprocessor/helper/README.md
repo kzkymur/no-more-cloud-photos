@@ -13,9 +13,12 @@ cmake --build build/animation-helper
 ctest --test-dir build/animation-helper --output-on-failure
 ```
 
-libwebp 1.6.0 and giflib 5.2.2 come from this directory's verified build
-script. libheif 1.23.5, libaom 3.8.2, lcms2 2.14, and unchanged sRGB2014.icc
-come from `internal/stillprocessor/helper/build-pinned-toolchain.sh`. The
+giflib 5.2.2 comes from this directory's verified build script. libwebp 1.6.0,
+libheif 1.23.5, libaom 3.8.2, lcms2 2.14, and unchanged sRGB2014.icc come from
+`internal/stillprocessor/helper/build-pinned-toolchain.sh`; this script only
+validates the inherited libwebp objects against `share/nmcp/still-webp.manifest`
+(version, source digest, object digests, RUNPATH) and never reinstalls them, so
+the prefix holds exactly one libwebp. The
 transitive system/OCI closure remains the issue #20 boundary.
 
 For dependency-free parser, accounting, geometry, hash, and resize tests, build

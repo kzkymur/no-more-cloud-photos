@@ -4,6 +4,8 @@ This matrix covers the published Core architecture and Worker design requirement
 
 Contract links: [HTTP API and CLI](contracts/core-api.md), [state, storage, workers, and operations](contracts/state-and-storage.md).
 
+Behaviour changed against the immutable design snapshot by #21 decisions is listed once in [release gate: deviations from the design snapshot](release-gate.md#deviations-from-the-design-snapshot).
+
 ## Architecture and API
 
 | ID | Published requirement | Contract | Issue(s) | Required tests/evidence |
@@ -82,3 +84,5 @@ Contract links: [HTTP API and CLI](contracts/core-api.md), [state, storage, work
 | #21 | ARC-01, ARC-02, ARC-07, ARC-13, WRK-08 through WRK-10, WRK-13, OPS-01, OPS-05 through OPS-10 |
 
 Issue #22 owns only production-specific Tailnet/Viewer/notification/server checks that cannot run in the team environment. It does not replace automated requirements in #21.
+
+The #21 lanes, binaries (release vs instrumented), pass conditions and limits are mapped in [release-gate.md](release-gate.md).

@@ -1,0 +1,748 @@
+#!/usr/bin/env bash
+# Issue #21 Compose E2E harness (infra-owned).
+#
+# Brings up the real validation stack from infra/validation/compose.yaml
+# (core-api, core-worker with the three pinned codec helpers, PostgreSQL 17,
+# HTTPS Nginx) under a separate, owner-labelled Compose project whose media
+# volume is a harness-owned host tmpfs. No hand-written media fixtures are
+# placed. A scenario binary (engineer-owned, ./test/e2e) runs on the runner
+# host against the published loopback ports and drives the control commands
+# below.
+#
+# Scenario contract (environment exported by `run`):
+#   NMCP_E2E_API_URL        http://127.0.0.1:<api port>
+#   NMCP_E2E_FILES_URL      https://127.0.0.1:<files port>/files
+#   NMCP_E2E_FILES_CA_FILE  PEM of the self-signed Nginx certificate
+#   NMCP_E2E_ARTIFACT_DIR   writable directory, uploaded as a CI artifact
+#   NMCP_E2E_CONTROL        absolute path of this script
+#   NMCP_E2E_DEADLINE       unix epoch; the scenario is killed at this time,
+#                           and at least 60s remain afterwards for collection
+#   NMCP_E2E_HEAD_SHA       commit under test (GITHUB_SHA or git HEAD)
+#   NMCP_E2E_LANE           release | failpoints (NMCP_E2E_FAILPOINTS 0 | 1);
+#                           the failpoint lane builds Core with nmcp_failpoints
+#   NMCP_E2E_FIXTURES_DIR   host fixture dir (default <repo>/test/e2e/testdata),
+#                           visible to `admin --` at /e2e/fixtures
+#   NMCP_E2E_PROJECT / NMCP_E2E_ROOT  identity used by $NMCP_E2E_CONTROL
+#
+# Control commands (exit 0 only after the effect is observed):
+#   control stop|start|restart|pause|unpause|wait-ready SERVICE
+#   control kill SERVICE [SIGNAL]   prints "pid=<host pid> container=<id>"
+#   control pid SERVICE             prints the current host pid (0 if stopped)
+#   control set-failpoint api|worker NAME[@N]|none
+#                                   failpoint lane only: recreate SERVICE with
+#                                   NMCP_FAILPOINT set/cleared, wait ready,
+#                                   print "pid=<pid> container=<id> failpoint=..."
+#   db-read                         SQL on stdin, read-only session, psql -At
+#   media-ls                        JSON lines {path,type,size,mode,sha256}
+#   image-sha256 PATH...            "<sha256>  <path>" for regular files under
+#                                   /opt/nmcp/ or /usr/bin/prlimit, computed in
+#                                   a fresh one-shot container (no network, no
+#                                   mounts, read-only root) of the core image.
+#                                   Refuses unless the worker and both admin
+#                                   one-shot images share one image ID.
+#   admin [--capability|--owner] -- ARGS...
+#                                   one-shot nmcp-admin in the core image, no
+#                                   TTY, stdin forwarded, bounded by
+#                                   NMCP_E2E_DEADLINE (else 600s). The run mode
+#                                   follows nmcp-admin's own table; a
+#                                   contradicting override exits 2.
+#                                   capability (check, repair, maintenance
+#                                   resume): uid 10001, check.dsn/repair.dsn
+#                                   files only, media READ-WRITE.
+#                                   owner (everything else): uid 0, admin.dsn
+#                                   (nmcp_migrator) file only, media read-only,
+#                                   NMCP_E2E_FIXTURES_DIR ro at /e2e/fixtures,
+#                                   private tmpfs /e2e/work.
+#                                   NMCP_DATABASE_URL is absent in both; DSNs
+#                                   arrive as *_FILE paths under
+#                                   /run/nmcp-credentials (0600, read-only).
+#   fault media-readonly on|off     remount the whole media filesystem ro/rw
+#   fault media-full on|off [BYTES] shrink the media filesystem to used+BYTES
+#                                   (default 0) / restore the original size
+# SERVICE is one of: api worker files postgres.
+#
+# Job budget (CI): when NMCP_E2E_BUDGET_RECEIPT names a receipt from
+# scripts/backup-ci-admission, `lane` admits every phase against it and fails
+# before creating resources if the remaining budget cannot cover the minimum.
+# Under GITHUB_ACTIONS a receipt is mandatory.
+set -euo pipefail
+
+root=${NMCP_E2E_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}
+script="$root/scripts/infra-e2e-env"
+base_file="$root/infra/validation/compose.yaml"
+overlay_file="$root/infra/validation/compose.e2e.yaml"
+lane=${NMCP_E2E_LANE:-release}
+case "$lane" in
+  release) lane_tag=e2e; failpoints=0 ;;
+  failpoints) lane_tag=e2e-fp; failpoints=1 ;;
+  *) echo "error: NMCP_E2E_LANE must be release or failpoints" >&2; exit 2 ;;
+esac
+failpoint_file="$root/infra/validation/compose.failpoints.yaml"
+owner=$(printf '%s:%s' "$lane_tag" "$root" | sha256sum | cut -c1-64)
+owner_short=${owner:0:12}
+project=${NMCP_E2E_PROJECT:-nmcp-$lane_tag-$owner_short}
+api_port=${NMCP_E2E_API_PORT:-19080}
+files_port=${NMCP_E2E_FILES_PORT:-19443}
+state_dir=${NMCP_E2E_STATE_DIR:-${RUNNER_TEMP:-/tmp}/$project}
+media_mount="$state_dir/media"
+# shellcheck source=scripts/infra-e2e-failpoint-state.sh
+. "$root/scripts/infra-e2e-failpoint-state.sh"
+media_bytes=${NMCP_E2E_MEDIA_BYTES:-1073741824}
+mount_source="nmcp-e2e-$owner_short"
+services="api worker files postgres"
+
+case "$project" in
+  ""|[!a-z0-9]*|*[!a-z0-9_-]*) echo "error: invalid NMCP_E2E_PROJECT: $project" >&2; exit 2 ;;
+esac
+case "$media_bytes" in ''|*[!0-9]*) echo "error: invalid NMCP_E2E_MEDIA_BYTES" >&2; exit 2 ;; esac
+
+export NMCP_VALIDATION_OWNER=$owner NMCP_API_PORT=$api_port NMCP_FILES_PORT=$files_port
+export NMCP_E2E_MEDIA_MOUNT=$media_mount
+# Validation-only check/repair DSN files for the admin one-shot (uid 10001,
+# 0600, in a 0700 dir), mounted read-only at /run/nmcp-credentials.
+credentials_dir="$state_dir/credentials"
+export NMCP_E2E_OWNER_CREDENTIALS_DIR=$credentials_dir/owner
+export NMCP_E2E_CAPABILITY_CREDENTIALS_DIR=$credentials_dir/capability
+# Scenario fixtures, mounted read-only at /e2e/fixtures in the admin one-shot.
+if [ -z "${NMCP_E2E_FIXTURES_DIR:-}" ]; then
+  if [ -d "$root/test/e2e/testdata" ]; then NMCP_E2E_FIXTURES_DIR=$root/test/e2e/testdata
+  else NMCP_E2E_FIXTURES_DIR=$state_dir/no-fixtures; fi
+fi
+export NMCP_E2E_FIXTURES_DIR
+
+log() { printf 'infra-e2e: %s\n' "$*" >&2; }
+die() { printf 'infra-e2e: error: %s\n' "$*" >&2; exit 1; }
+
+# Fill the global array compose_cmd with the complete, exec-able compose
+# command line (an `env` prefix carries the failpoint interpolation inputs).
+# Use "${compose_cmd[@]}" wherever a real executable is required, e.g. under
+# timeout(1), which cannot run shell functions such as compose().
+compose_cmd=()
+build_compose_cmd() {
+  if [ "$failpoints" = 1 ]; then
+    # Interpolation inputs for compose.failpoints.yaml persist across calls,
+    # so recreating one service never silently changes the other.
+    local api_point worker_point
+    api_point=$(failpoint_get api)
+    worker_point=$(failpoint_get worker)
+    compose_cmd=(env "NMCP_E2E_FAILPOINT_API=$api_point" "NMCP_E2E_FAILPOINT_WORKER=$worker_point"
+      docker compose --project-name "$project" --file "$base_file" --file "$overlay_file"
+      --file "$failpoint_file")
+  else
+    compose_cmd=(docker compose --project-name "$project" --file "$base_file" --file "$overlay_file")
+  fi
+}
+
+compose() {
+  build_compose_cmd
+  "${compose_cmd[@]}" "$@"
+}
+
+# control set-failpoint SERVICE NAME[@N]|none (failpoint lane only)
+set_failpoint() {
+  [ "$failpoints" = 1 ] || { echo "infra-e2e: set-failpoint is refused outside the failpoint lane" >&2; exit 2; }
+  [ $# -eq 2 ] || die "usage: control set-failpoint api|worker NAME[@N]|none"
+  local service=$1 point=$2 id pid
+  case "$service" in api|worker) ;; *) die "set-failpoint is limited to api and worker" ;; esac
+  if [ "$point" = none ]; then point=""
+  elif ! printf '%s' "$point" | grep -Eqx '[a-z0-9_.-]{1,64}(@[0-9]{1,6})?'; then die "invalid failpoint: $point"; fi
+  failpoint_set "$service" "$point"
+  [ "$(failpoint_get "$service")" = "$point" ] || die "failpoint state for $service did not persist"
+  compose up --detach --no-deps --no-build --force-recreate "$service"
+  wait_ready "$service"
+  id=$(container_id "$service")
+  pid=$(docker container inspect --format '{{.State.Pid}}' "$id")
+  [ "$(docker container inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$id" | grep -cx "NMCP_FAILPOINT=$point" || true)" = 1 ] ||
+    die "$service was not recreated with NMCP_FAILPOINT=$point"
+  printf 'pid=%s container=%s failpoint=%s\n' "$pid" "${id:0:12}" "${point:-none}"
+}
+
+# Release lane: the Core binaries in the image under test carry no build tags
+# and no failpoint code. Binaries are copied out of the worker container.
+release_binary_gate() {
+  local dir=${1:?artifact dir} id binary service
+  local -a copied=()
+  [ "$failpoints" = 0 ] || return 0
+  command -v go >/dev/null 2>&1 || die "go is required for the release binary gate"
+  [ -x "$root/scripts/check-release-no-failpoints" ] || die "scripts/check-release-no-failpoints is required"
+  # The api and worker images are built separately, so gate each container's
+  # own copies (the api's core-api is the binary actually serving requests).
+  for service in worker api; do
+    mkdir -p "$dir/release-binaries/$service"
+    id=$(container_id "$service"); [ -n "$id" ] || die "$service container not found"
+    for binary in core-api core-worker nmcp-admin; do
+      docker container cp "$id:/usr/local/bin/$binary" "$dir/release-binaries/$service/$binary" >/dev/null
+      go version -m "$dir/release-binaries/$service/$binary" >"$dir/release-binaries/$service/$binary.buildinfo"
+      if grep -E '^\s+build\s+-tags=' "$dir/release-binaries/$service/$binary.buildinfo"; then
+        die "release $service/$binary was built with tags"
+      fi
+      copied+=("$dir/release-binaries/$service/$binary")
+    done
+  done
+  "$root/scripts/check-release-no-failpoints" "${copied[@]}"
+  log "release binary gate PASS (worker and api images: no build tags, no failpoint code)"
+}
+
+require_tools() {
+  local tool
+  for tool in docker curl python3 sha256sum findmnt sudo timeout; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
+  done
+  docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
+}
+
+require_service() {
+  case " $services " in *" $1 "*) ;; *) die "unknown service: $1 (allowed: $services)" ;; esac
+}
+
+# Refuse to touch Compose resources of this project that another owner created.
+assert_owned() {
+  local type resources resource actual
+  for type in container volume network; do
+    if [ "$type" = container ]; then
+      resources=$(docker container ls --all --quiet --filter "label=com.docker.compose.project=$project")
+    else
+      resources=$(docker "$type" ls --quiet --filter "label=com.docker.compose.project=$project")
+    fi
+    for resource in $resources; do
+      if [ "$type" = container ]; then
+        actual=$(docker container inspect --format '{{ index .Config.Labels "com.nmcp.validation.owner" }}' "$resource")
+      else
+        actual=$(docker "$type" inspect --format '{{ index .Labels "com.nmcp.validation.owner" }}' "$resource")
+      fi
+      [ "$actual" = "$owner" ] || die "refusing to operate on $type $resource of $project: owner mismatch"
+    done
+  done
+}
+
+# The media mount is ours only if it is a tmpfs whose source is our tag.
+media_mounted() {
+  local source fstype
+  source=$(findmnt --noheadings --output SOURCE --mountpoint "$media_mount" 2>/dev/null || true)
+  [ -n "$source" ] || return 1
+  fstype=$(findmnt --noheadings --output FSTYPE --mountpoint "$media_mount")
+  if [ "$source" != "$mount_source" ] || [ "$fstype" != tmpfs ]; then
+    die "$media_mount is mounted but not owned by this harness ($source/$fstype)"
+  fi
+}
+
+mount_media() {
+  install -d -m 0700 "$state_dir"
+  install -d -m 0755 "$media_mount"
+  if media_mounted; then die "media tmpfs already mounted; run reset first"; fi
+  [ -z "$(ls -A "$media_mount")" ] || die "media mount point is not empty: $media_mount"
+  sudo mount -t tmpfs -o "size=$media_bytes,mode=0755,nosuid,nodev" "$mount_source" "$media_mount"
+  printf '%s\n' "$media_bytes" >"$state_dir/media-size"
+}
+
+write_credentials() {
+  # nmcp-admin's *_FILE fallback accepts a regular, non-symlink file owned by
+  # uid 0 or the effective uid, with no group/other bits. Owner commands run
+  # as root (admin.dsn 0:0 0600); capability commands as uid 10001
+  # (check/repair 10001 0600). Each one-shot mounts only its own directory.
+  remove_credentials
+  sudo install -d -o 0 -g 0 -m 0755 "$credentials_dir"
+  sudo install -d -o 0 -g 0 -m 0700 "$NMCP_E2E_OWNER_CREDENTIALS_DIR"
+  sudo install -d -o 10001 -g 10001 -m 0700 "$NMCP_E2E_CAPABILITY_CREDENTIALS_DIR"
+  printf '%s\n' 'postgres://nmcp_migrator:nmcp-migrator-validation-only@postgres:5432/nmcp?sslmode=disable' |
+    sudo install -o 0 -g 0 -m 0600 /dev/stdin "$NMCP_E2E_OWNER_CREDENTIALS_DIR/admin.dsn"
+  printf '%s\n' 'postgres://nmcp_check:nmcp-check-validation-only@postgres:5432/nmcp?sslmode=disable' |
+    sudo install -o 10001 -g 10001 -m 0600 /dev/stdin "$NMCP_E2E_CAPABILITY_CREDENTIALS_DIR/check.dsn"
+  printf '%s\n' 'postgres://nmcp_repair:nmcp-repair-validation-only@postgres:5432/nmcp?sslmode=disable' |
+    sudo install -o 10001 -g 10001 -m 0600 /dev/stdin "$NMCP_E2E_CAPABILITY_CREDENTIALS_DIR/repair.dsn"
+}
+
+remove_credentials() {
+  case "$credentials_dir" in "$state_dir"/credentials) ;; *) die "refusing to remove $credentials_dir" ;; esac
+  if [ -e "$credentials_dir" ]; then sudo rm -rf -- "$credentials_dir"; fi
+}
+
+umount_media() {
+  if media_mounted; then sudo umount "$media_mount"; fi
+  if [ -d "$media_mount" ]; then rmdir "$media_mount"; fi
+}
+
+cleanup() {
+  assert_owned
+  compose --profile e2e down --volumes --remove-orphans --timeout 20 || return 1
+  umount_media
+  remove_credentials
+}
+
+container_id() { compose ps --all --quiet "$1" 2>/dev/null | head -n1; }
+
+host_pid() {
+  local id
+  id=$(container_id "$1")
+  if [ -z "$id" ]; then echo 0; return; fi
+  docker container inspect --format '{{.State.Pid}}' "$id"
+}
+
+# Wait until SERVICE is healthy (services with a healthcheck) or running.
+wait_ready() {
+  local service=$1 deadline=$((SECONDS + ${2:-120})) id state health
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    id=$(container_id "$service")
+    if [ -n "$id" ]; then
+      state=$(docker container inspect --format '{{.State.Status}}' "$id")
+      health=$(docker container inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id")
+      if [ "$state" = running ] && { [ "$health" = healthy ] || [ "$health" = none ]; }; then
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  die "$service did not become ready"
+}
+
+wait_state() {
+  local service=$1 want=$2 deadline=$((SECONDS + 60)) id state
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    id=$(container_id "$service")
+    state=exited
+    if [ -n "$id" ]; then state=$(docker container inspect --format '{{.State.Status}}' "$id"); fi
+    case "$want:$state" in
+      stopped:exited|stopped:dead|stopped:created|paused:paused) return 0 ;;
+    esac
+    sleep 1
+  done
+  die "$service did not reach $want"
+}
+
+# /proc/<pid>/stat field 3 is the scheduler state; T means stopped.
+wait_proc_state() {
+  local pid=$1 want=$2 deadline=$((SECONDS + 30)) state
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || echo X)
+    case "$want:$state" in
+      stopped:T|stopped:t) return 0 ;;
+      continued:T|continued:t|continued:X) ;;
+      continued:*) return 0 ;;
+    esac
+    sleep 0.2
+  done
+  die "pid $pid did not reach $want"
+}
+
+control() {
+  if [ "${1:-}" = set-failpoint ]; then shift; set_failpoint "$@"; return; fi
+  [ $# -ge 2 ] || die "usage: control ACTION SERVICE [SIGNAL]"
+  local action=$1 service=$2 signal=${3:-KILL} id pid
+  require_service "$service"
+  case "$action" in
+    stop) compose stop --timeout 20 "$service"; wait_state "$service" stopped ;;
+    start) compose start "$service"; wait_ready "$service" ;;
+    restart) compose restart --timeout 20 "$service"; wait_ready "$service" ;;
+    pause) compose pause "$service"; wait_state "$service" paused ;;
+    unpause) compose unpause "$service"; wait_ready "$service" ;;
+    wait-ready) wait_ready "$service" ;;
+    pid) host_pid "$service" ;;
+    kill)
+      case "$signal" in KILL|TERM|INT|STOP|CONT|SIGKILL|SIGTERM|SIGINT|SIGSTOP|SIGCONT) ;; *) die "unsupported signal: $signal" ;; esac
+      signal=${signal#SIG}
+      id=$(container_id "$service")
+      [ -n "$id" ] || die "$service has no container"
+      pid=$(docker container inspect --format '{{.State.Pid}}' "$id")
+      [ "$pid" -gt 0 ] || die "$service is not running"
+      docker container kill --signal "$signal" "$id" >/dev/null
+      case "$signal" in
+        KILL|TERM|INT) wait_state "$service" stopped ;;
+        STOP) wait_proc_state "$pid" stopped ;;
+        CONT) wait_proc_state "$pid" continued ;;
+      esac
+      printf 'pid=%s container=%s\n' "$pid" "${id:0:12}"
+      ;;
+    *) die "unknown control action: $action" ;;
+  esac
+}
+
+# Read-only observation session. This is a guard against accidental writes by
+# the scenario, not a security boundary (the validation bootstrap role is a
+# superuser of the disposable database).
+db_read() {
+  compose exec -T --env PGOPTIONS='-c default_transaction_read_only=on' postgres \
+    psql --username nmcp_bootstrap --dbname nmcp --no-psqlrc --set ON_ERROR_STOP=1 \
+    --tuples-only --no-align --quiet
+}
+
+media_ls() {
+  # shellcheck disable=SC2016 # expanded by the container shell
+  compose --profile e2e run --rm --no-deps -T e2e-observer '
+    cd /var/lib/nmcp/media
+    find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r path; do
+      if [ -L "$path" ]; then type=symlink; elif [ -d "$path" ]; then type=dir; elif [ -f "$path" ]; then type=file; else type=other; fi
+      size=$(stat -c %s "$path"); mode=$(stat -c %a "$path"); sum=""
+      if [ "$type" = file ]; then sum=$(sha256sum "$path" | cut -c1-64); fi
+      printf "nmcp-media\t%s\t%s\t%s\t%s\t%s\n" "${path#./}" "$type" "$size" "$mode" "$sum"
+    done' | python3 -c '
+import json, sys
+for line in sys.stdin:
+    # Only marker lines are entries; anything else (compose notices) goes to
+    # stderr so it can never be mistaken for, or corrupt, the tree listing.
+    if not line.startswith("nmcp-media\t"):
+        sys.stderr.write("media-ls: ignored non-entry line: " + line)
+        continue
+    _, path, kind, size, mode, digest = line.rstrip("\n").split("\t")
+    print(json.dumps({"path": path, "type": kind, "size": int(size), "mode": mode, "sha256": digest or None}, sort_keys=True))
+'
+}
+
+image_sha256() {
+  [ $# -ge 1 ] || die "usage: image-sha256 PATH..."
+  local path worker_image other_image service id
+  for path in "$@"; do
+    case "$path" in
+      /usr/bin/prlimit) ;;
+      /opt/nmcp/*) case "$path" in *//*|*/./*|*/../*|*/.|*/..) die "non-canonical path: $path" ;; esac ;;
+      *) die "image-sha256 is limited to /opt/nmcp/** and /usr/bin/prlimit: $path" ;;
+    esac
+  done
+  id=$(container_id worker); [ -n "$id" ] || die "worker container not found"
+  worker_image=$(docker container inspect --format '{{.Image}}' "$id")
+  # The admin one-shots must run the very image the worker runs.
+  for service in admin-owner admin-capability; do
+    other_image=$(docker image inspect --format '{{.Id}}' "$project-$service" 2>/dev/null) ||
+      die "$service image not built"
+    [ "$worker_image" = "$other_image" ] || die "worker image $worker_image differs from $service image $other_image"
+  done
+  log "image-sha256: core image $worker_image"
+  # shellcheck disable=SC2016 # expanded by the container shell
+  timeout --kill-after=5s 60s docker run --rm --network none --read-only --user 10001:10001 \
+    --label "com.nmcp.validation.owner=$owner" --entrypoint /bin/sh "$worker_image" -eu -c '
+      for path in "$@"; do
+        if [ ! -f "$path" ] || [ -L "$path" ]; then echo "not a regular file: $path" >&2; exit 1; fi
+        sha256sum "$path"
+      done' sh "$@"
+}
+
+# The run mode of an nmcp-admin command, by the same table as nmcp-admin
+# itself: capability = check, repair (incl. --dry-run), maintenance resume;
+# owner = everything else.
+admin_mode() {
+  case "${1:-}" in
+    check|repair) echo capability ;;
+    maintenance) if [ "${2:-}" = resume ]; then echo capability; else echo owner; fi ;;
+    *) echo owner ;;
+  esac
+}
+
+admin() {
+  local forced="" mode service limit=600 remaining
+  case "${1:-}" in --capability|--owner) forced=${1#--}; shift ;; esac
+  [ "${1:-}" = -- ] && shift
+  [ $# -ge 1 ] || die "usage: admin [--capability|--owner] -- ARGS..."
+  mode=$(admin_mode "$@")
+  if [ -n "$forced" ] && [ "$forced" != "$mode" ]; then
+    echo "infra-e2e: admin --$forced contradicts the run mode of '$*' ($mode)" >&2
+    return 2
+  fi
+  service=admin-$mode
+  if [ -n "${NMCP_E2E_DEADLINE:-}" ]; then
+    remaining=$(( NMCP_E2E_DEADLINE - $(date +%s) ))
+    [ "$remaining" -gt 0 ] || die "scenario deadline passed"
+    [ "$remaining" -ge "$limit" ] || limit=$remaining
+  fi
+  # The in-container timeout bounds nmcp-admin itself; the host timeout is a
+  # backstop for the compose client. --rm and lane teardown remove leftovers.
+  build_compose_cmd
+  timeout --kill-after=10s "$((limit + 20))s" \
+    "${compose_cmd[@]}" --profile e2e run --rm --no-deps -T "$service" \
+    /usr/bin/timeout --kill-after=5s "${limit}s" nmcp-admin "$@"
+}
+
+remount_media() {
+  media_mounted || die "media tmpfs is not mounted"
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if sudo mount -o "remount,$1" "$media_mount" 2>"$state_dir/remount.err"; then return 0; fi
+    sleep 1
+  done
+  cat "$state_dir/remount.err" >&2
+  die "remount,$1 failed"
+}
+
+fault() {
+  [ $# -ge 2 ] || die "usage: fault media-readonly|media-full on|off [BYTES]"
+  local kind=$1 mode=$2 extra=${3:-0} used options page target size
+  case "$kind:$mode" in
+    media-readonly:on)
+      remount_media ro
+      options=$(findmnt --noheadings --output OPTIONS --mountpoint "$media_mount")
+      case ",$options," in *,ro,*) ;; *) die "media is not read-only after remount" ;; esac
+      ;;
+    media-readonly:off)
+      remount_media rw
+      options=$(findmnt --noheadings --output OPTIONS --mountpoint "$media_mount")
+      case ",$options," in *,rw,*) ;; *) die "media is not read-write after remount" ;; esac
+      ;;
+    media-full:on)
+      case "$extra" in ''|*[!0-9]*) die "invalid BYTES: $extra" ;; esac
+      used=$(df --block-size=1 --output=used "$media_mount" | tail -n1 | tr -d ' ')
+      page=$(getconf PAGESIZE)
+      # tmpfs treats size=0 as UNLIMITED, and an almost-empty media tree (only
+      # directories) reports 0 bytes used. Never request less than one page,
+      # and round up to whole pages, which is what tmpfs enforces.
+      target=$(( (used + extra + page - 1) / page * page ))
+      [ "$target" -ge "$page" ] || target=$page
+      remount_media "size=$target"
+      df --block-size=1 --output=size,used,avail "$media_mount" >&2
+      size=$(df --block-size=1 --output=size "$media_mount" | tail -n1 | tr -d ' ')
+      if [ "$size" -le 0 ] || [ "$size" -gt "$target" ]; then
+        die "media-full did not take effect (size=$size, wanted $target)"
+      fi
+      ;;
+    media-full:off)
+      remount_media "size=$(cat "$state_dir/media-size")"
+      size=$(df --block-size=1 --output=size "$media_mount" | tail -n1 | tr -d ' ')
+      [ "$size" -ge "$(cat "$state_dir/media-size")" ] || die "media-full off did not restore the size (size=$size)"
+      ;;
+    *) die "unknown fault: $kind $mode" ;;
+  esac
+}
+
+up() {
+  assert_owned
+  mount_media
+  write_credentials
+  if [ ! -d "$NMCP_E2E_FIXTURES_DIR" ]; then install -d -m 0755 "$NMCP_E2E_FIXTURES_DIR"; fi
+  # Build the profile-only observer now, so media-ls never builds mid-scenario.
+  compose --profile e2e build --quiet e2e-observer admin-owner admin-capability
+  if ! compose up --build --detach --wait; then
+    compose logs --no-color >&2 || true
+    die "stack did not become ready"
+  fi
+  local service
+  for service in $services; do wait_ready "$service"; done
+  compose exec -T files cat /tmp/nmcp-tls/cert.pem >"$state_dir/files-ca.pem"
+  curl --fail --silent --show-error "http://127.0.0.1:$api_port/readyz" >/dev/null
+  curl --fail --silent --show-error --cacert "$state_dir/files-ca.pem" \
+    "https://127.0.0.1:$files_port/files-healthz" >/dev/null
+  log "stack ready: project=$project api=$api_port files=$files_port media=$media_mount"
+}
+
+# A2: the worker image must carry the complete pinned codec closure and must
+# not resolve any pinned library from the host. Helpers run with an empty
+# environment (processrunner sets only LC_ALL/LANG/TZ), so the check runs the
+# same way.
+verify_codec() {
+  # shellcheck disable=SC2016 # expanded by the container shell
+  compose exec -T worker sh -eu -c '
+    prefix=/opt/nmcp
+    icc=$prefix/share/sRGB2014.icc
+    expected_icc=384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
+    fail() { echo "codec-closure: FAIL $*" >&2; exit 1; }
+    [ -f "$icc" ] && [ ! -L "$icc" ] || fail "ICC missing: $icc"
+    [ "$(sha256sum "$icc" | cut -c1-64)" = "$expected_icc" ] || fail "ICC digest mismatch"
+    [ -f "$prefix/share/nmcp/video-toolchain.manifest" ] || fail "video toolchain manifest missing"
+    pinned=$(find "$prefix/lib" "$prefix/lib64" -maxdepth 1 -name "*.so*" -printf "%f\n" 2>/dev/null | sort -u)
+    for binary in nmcp-still-helper nmcp-animation-helper nmcp-video-helper ffmpeg ffprobe; do
+      path=$prefix/bin/$binary
+      [ -f "$path" ] && [ ! -L "$path" ] && [ -x "$path" ] || fail "$path is not a regular executable"
+      if ! out=$(env -i LC_ALL=C ldd "$path" 2>&1); then
+        case "$out" in *"not a dynamic executable"*) echo "codec-closure: $binary static"; continue ;; esac
+        fail "ldd $binary: $out"
+      fi
+      case "$out" in *"not found"*) fail "$binary has unresolved libraries: $out" ;; esac
+      leaked=$(printf "%s\n" "$out" | while read -r name arrow resolved rest; do
+        [ "$arrow" = "=>" ] || continue
+        if printf "%s\n" "$pinned" | grep -qxF "$name"; then
+          case "$resolved" in "$prefix"/*) ;; *) printf "%s=>%s " "$name" "$resolved" ;; esac
+        fi
+      done)
+      if [ -n "$leaked" ]; then
+        # Diagnostics only: which object requested each leaked library and
+        # which search path (RPATH/RUNPATH/default) the loader used.
+        echo "codec-closure: loader trace for $binary (LD_DEBUG=libs, empty env)" >&2
+        # Call the loader directly: ldd is a shell script, so LD_DEBUG on
+        # ldd would trace the shell instead of the helper.
+        env -i LC_ALL=C LD_DEBUG=libs /lib64/ld-linux-x86-64.so.2 --list "$path" 2>&1 >/dev/null |
+          grep -E "find library=|search path=|trying file=.*(webp|sharpyuv)" | sed "s/^/codec-closure: trace /" >&2 || true
+        fail "$binary resolves pinned libraries outside $prefix: $leaked"
+      fi
+      printf "%s\n" "$out" | sed "s/^/codec-closure: $binary ldd /"
+      echo "codec-closure: $binary ok"
+    done
+    for helper in nmcp-still-helper nmcp-animation-helper nmcp-video-helper; do
+      out=$(env -i LC_ALL=C LANG=C TZ=UTC "$prefix/bin/$helper" capabilities --protocol 1 --threads 1 --srgb-icc /proc/self/fd/3 3<"$icc") ||
+        fail "$helper capabilities exited non-zero: $out"
+      printf "capability\t%s\t%s\n" "$helper" "$out"
+    done
+    if [ -e /usr/bin/ffmpeg ]; then echo "codec-closure: note /usr/bin/ffmpeg (distribution package) is present; the video helper uses its sibling $prefix/bin/ffmpeg"; fi
+  ' >"$state_dir/codec-closure.txt" || { cat "$state_dir/codec-closure.txt" >&2; die "codec closure verification failed"; }
+  python3 - "$state_dir/codec-closure.txt" <<'PY'
+import json, sys
+ICC = "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"
+seen = set()
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.rstrip("\n")
+    print(line)
+    if not line.startswith("capability\t"):
+        continue
+    _, helper, payload = line.split("\t", 2)
+    doc = json.loads(payload)
+    if doc.get("protocol") != 1 or doc.get("ok") is not True or not isinstance(doc.get("result"), dict):
+        sys.exit(f"codec-closure: FAIL {helper} capabilities not ok: {payload}")
+    result = doc["result"]
+    if result.get("threads") != 1:
+        sys.exit(f"codec-closure: FAIL {helper} threads={result.get('threads')}")
+    if result.get("icc_sha256") not in (None, ICC):
+        sys.exit(f"codec-closure: FAIL {helper} icc_sha256={result.get('icc_sha256')}")
+    seen.add(helper)
+missing = {"nmcp-still-helper", "nmcp-animation-helper", "nmcp-video-helper"} - seen
+if missing:
+    sys.exit(f"codec-closure: FAIL missing capability output: {sorted(missing)}")
+print("codec-closure: PASS")
+PY
+}
+
+collect() {
+  local dir=${1:?artifact dir} service
+  mkdir -p "$dir/logs"
+  compose ps --all >"$dir/compose-ps.txt" 2>&1 || true
+  for service in $services migrate role-compatibility role-harden storage-init; do
+    compose logs --no-color --timestamps "$service" >"$dir/logs/$service.log" 2>&1 || true
+  done
+  [ ! -f "$state_dir/codec-closure.txt" ] || cp "$state_dir/codec-closure.txt" "$dir/"
+  findmnt --mountpoint "$media_mount" >"$dir/media-mount.txt" 2>&1 || true
+  df --block-size=1 "$media_mount" >>"$dir/media-mount.txt" 2>&1 || true
+  if [ -n "$(container_id postgres)" ] && compose exec -T postgres pg_isready -U nmcp_bootstrap -d nmcp >/dev/null 2>&1; then
+    compose exec -T postgres pg_dump --username nmcp_bootstrap --dbname nmcp --format custom >"$dir/nmcp.dump" 2>"$dir/pg_dump.err" || true
+  else
+    echo "postgres not running; no dump" >"$dir/pg_dump.err"
+  fi
+  if media_mounted; then media_ls >"$dir/media-ls.jsonl" 2>"$dir/media-ls.err" || true; fi
+}
+
+budget_enabled() {
+  if [ -n "${NMCP_E2E_BUDGET_RECEIPT:-}" ]; then return 0; fi
+  [ "${GITHUB_ACTIONS:-}" != true ] || die "NMCP_E2E_BUDGET_RECEIPT is required under GitHub Actions"
+  return 1
+}
+
+# Print the seconds granted for PHASE (active|cleanup), capped at CAP, or fail
+# if fewer than REQUIRED remain. Identity comes from the GitHub environment.
+budget_check() {
+  local phase=$1 cap=$2 required=$3 out
+  out=$(timeout 30 python3 -I "$root/scripts/backup-ci-admission" check \
+    --repo "$GITHUB_REPOSITORY" --sha "${NMCP_E2E_BUDGET_RUN_SHA:?}" \
+    --job-name "${NMCP_E2E_BUDGET_JOB_NAME:?}" --runner-name "$RUNNER_NAME" \
+    --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+    --job-seconds "${NMCP_E2E_BUDGET_JOB_SECONDS:?}" \
+    --cleanup-seconds "${NMCP_E2E_BUDGET_CLEANUP_SECONDS:?}" \
+    --margin-seconds "${NMCP_E2E_BUDGET_MARGIN_SECONDS:?}" \
+    --receipt "$NMCP_E2E_BUDGET_RECEIPT" --phase "$phase" \
+    --cap-seconds "$cap" --required-seconds "$required") || die "budget admission refused ($phase, need ${required}s)"
+  python3 -I -c '
+import json, sys
+d = json.loads(sys.argv[1]); s = d["timeout_seconds"]
+assert type(s) is int and int(sys.argv[3]) <= s <= int(sys.argv[2]) and d["phase"] == sys.argv[4]
+print(s)' "$out" "$cap" "$required" "$phase" || die "invalid budget admission output"
+}
+
+# Grant for one active phase: reserve DOWNSTREAM seconds for the later phases.
+phase_budget() {
+  local cap=$1 downstream=$2 minimum=$3 remaining
+  remaining=$(budget_check active 21600 $((downstream + minimum)))
+  remaining=$((remaining - downstream))
+  [ "$remaining" -le "$cap" ] || remaining=$cap
+  log "budget: phase granted ${remaining}s (cap ${cap}s, reserved ${downstream}s)"
+  echo "$remaining"
+}
+
+# Run a scenario command with the contract environment and a hard deadline.
+run_scenario() {
+  [ "${1:-}" = -- ] && shift
+  [ $# -ge 1 ] || die "usage: run -- COMMAND [ARGS...]"
+  local artifacts=${NMCP_E2E_ARTIFACT_DIR:-${RUNNER_TEMP:-/tmp}/e2e-results}
+  local budget=${NMCP_E2E_TIMEOUT_SECONDS:-1500} status=0
+  mkdir -p "$artifacts"
+  local deadline=$(( $(date +%s) + budget ))
+  local head_sha=${GITHUB_SHA:-$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)}
+  log "scenario: $* (deadline in ${budget}s)"
+  env NMCP_E2E_API_URL="http://127.0.0.1:$api_port" \
+    NMCP_E2E_FILES_URL="https://127.0.0.1:$files_port/files" \
+    NMCP_E2E_FILES_CA_FILE="$state_dir/files-ca.pem" \
+    NMCP_E2E_ARTIFACT_DIR="$artifacts" \
+    NMCP_E2E_CONTROL="$script" \
+    NMCP_E2E_DEADLINE="$deadline" \
+    NMCP_E2E_HEAD_SHA="$head_sha" \
+    NMCP_E2E_PROJECT="$project" \
+    NMCP_E2E_ROOT="$root" \
+    NMCP_E2E_STATE_DIR="$state_dir" \
+    NMCP_E2E_FIXTURES_DIR="$NMCP_E2E_FIXTURES_DIR" \
+    NMCP_E2E_LANE="$lane" \
+    NMCP_E2E_FAILPOINTS="$failpoints" \
+    timeout --kill-after=10s "${budget}s" "$@" 2>&1 | tee "$artifacts/scenario.log" || status=$?
+  if [ "$status" -ne 0 ]; then log "scenario exited $status"; return "$status"; fi
+  grep -qx 'PASS' "$artifacts/scenario.log" || { log "scenario output has no final PASS line"; return 1; }
+  if grep -q -- '--- SKIP:' "$artifacts/scenario.log"; then log "scenario skipped tests; fail closed"; return 1; fi
+  log "scenario PASS"
+}
+
+# Full lane: up, A2 verification, scenario, collection, owned cleanup.
+lane() {
+  [ "${1:-}" = -- ] && shift
+  local artifacts=${NMCP_E2E_ARTIFACT_DIR:-${RUNNER_TEMP:-/tmp}/e2e-results} status=0
+  mkdir -p "$artifacts"
+  local scenario_cap=${NMCP_E2E_TIMEOUT_SECONDS:-1500}
+  local scenario_min=${NMCP_E2E_SCENARIO_MIN_SECONDS:-$scenario_cap}
+  local up_cap=${NMCP_E2E_UP_SECONDS:-1500} up_min=300 codec_cap=300 granted
+  local collect_reserve=180
+  if budget_enabled; then
+    # Fail before any resource exists if the whole lane cannot be admitted.
+    phase_budget "$up_cap" $((codec_cap + scenario_min + collect_reserve)) "$up_min" >/dev/null
+  fi
+  lane_artifacts=$artifacts
+  trap 'lane_teardown "$lane_artifacts"' EXIT
+  trap 'exit 130' HUP INT TERM
+  cleanup
+  granted=$up_cap
+  if budget_enabled; then granted=$(phase_budget "$up_cap" $((codec_cap + scenario_min + collect_reserve)) "$up_min"); fi
+  timeout --kill-after=10s "${granted}s" "$script" up || die "stack bring-up failed or exceeded ${granted}s"
+  granted=$codec_cap
+  if budget_enabled; then granted=$(phase_budget "$codec_cap" $((scenario_min + collect_reserve)) 60); fi
+  failpoint_clear_all
+  release_binary_gate "$artifacts"
+  local codec_status=0
+  timeout --kill-after=10s "${granted}s" "$script" verify-codec 2>&1 | tee "$artifacts/codec-closure.log" || codec_status=$?
+  # A codec closure failure still fails the lane (below); the scenario runs
+  # anyway so one run reports both results.
+  granted=$scenario_cap
+  if budget_enabled; then granted=$(phase_budget "$scenario_cap" "$collect_reserve" "$scenario_min"); fi
+  NMCP_E2E_TIMEOUT_SECONDS=$granted run_scenario "$@" || status=$?
+  if [ "$codec_status" -ne 0 ]; then
+    log "FAIL: codec closure verification exited $codec_status (see codec-closure.log)"
+    [ "$status" -ne 0 ] || status=$codec_status
+  fi
+  return "$status"
+}
+
+lane_teardown() {
+  local artifacts=$1 granted=300
+  timeout --kill-after=10s 150s "$script" collect "$artifacts" || log "collection incomplete"
+  if budget_enabled; then
+    # Cleanup must still run if admission refuses; fall back to a fixed bound.
+    granted=$( (budget_check cleanup 300 30) 2>/dev/null) || granted=120
+  fi
+  timeout --kill-after=10s "${granted}s" "$script" reset || log "cleanup failed; the always-run reset step retries"
+}
+
+require_tools
+command=${1:-}
+[ $# -eq 0 ] || shift
+case "$command" in
+  up) up ;;
+  verify-codec) verify_codec ;;
+  run) run_scenario "$@" ;;
+  lane) lane "$@" ;;
+  control) control "$@" ;;
+  db-read) db_read ;;
+  media-ls) media_ls ;;
+  image-sha256) image_sha256 "$@" ;;
+  admin) admin "$@" ;;
+  fault) fault "$@" ;;
+  collect) collect "$@" ;;
+  down) assert_owned; compose --profile e2e down --remove-orphans --timeout 20 ;;
+  reset) cleanup ;;
+  *) echo "usage: scripts/infra-e2e-env {lane|up|verify-codec|run|control|db-read|media-ls|image-sha256|admin|fault|collect|down|reset}" >&2; exit 2 ;;
+esac

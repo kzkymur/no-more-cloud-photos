@@ -65,6 +65,10 @@ type inspection struct {
 	AudioChannelLayout      string   `json:"audio_channel_layout"`
 	AudioSampleRate         int      `json:"audio_sample_rate"`
 	CumulativeDecodedPixels uint64   `json:"cumulative_decoded_pixels"`
+	// ColorInferred is true only when the source declared no (or partial,
+	// non-conflicting) color signalling and the conventional SDR values above
+	// were assumed (see inferSDRColor).
+	ColorInferred bool `json:"color_inferred"`
 }
 
 type audit struct {

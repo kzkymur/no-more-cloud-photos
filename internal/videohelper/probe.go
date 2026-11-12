@@ -26,31 +26,27 @@ type probeDocument struct {
 }
 
 type probeStream struct {
-	Index          int    `json:"index"`
-	CodecName      string `json:"codec_name"`
-	CodecType      string `json:"codec_type"`
-	Profile        string `json:"profile"`
-	Width          int    `json:"width"`
-	Height         int    `json:"height"`
-	PixFmt         string `json:"pix_fmt"`
-	BitsPerRaw     string `json:"bits_per_raw_sample"`
-	SampleAspect   string `json:"sample_aspect_ratio"`
-	TimeBase       string `json:"time_base"`
-	DurationTicks  int64  `json:"duration_ts"`
-	ColorPrimaries string `json:"color_primaries"`
-	ColorTransfer  string `json:"color_transfer"`
-	ColorSpace     string `json:"color_space"`
-	ColorRange     string `json:"color_range"`
-	Channels       int    `json:"channels"`
-	ChannelLayout  string `json:"channel_layout"`
-	SampleRate     string `json:"sample_rate"`
-	Disposition    struct {
-		Default         int `json:"default"`
-		AttachedPic     int `json:"attached_pic"`
-		TimedThumbnails int `json:"timed_thumbnails"`
-	} `json:"disposition"`
-	Tags         map[string]string        `json:"tags"`
-	SideDataList []map[string]interface{} `json:"side_data_list"`
+	Index          int                      `json:"index"`
+	CodecName      string                   `json:"codec_name"`
+	CodecType      string                   `json:"codec_type"`
+	Profile        string                   `json:"profile"`
+	Width          int                      `json:"width"`
+	Height         int                      `json:"height"`
+	PixFmt         string                   `json:"pix_fmt"`
+	BitsPerRaw     string                   `json:"bits_per_raw_sample"`
+	SampleAspect   string                   `json:"sample_aspect_ratio"`
+	TimeBase       string                   `json:"time_base"`
+	DurationTicks  int64                    `json:"duration_ts"`
+	ColorPrimaries string                   `json:"color_primaries"`
+	ColorTransfer  string                   `json:"color_transfer"`
+	ColorSpace     string                   `json:"color_space"`
+	ColorRange     string                   `json:"color_range"`
+	Channels       int                      `json:"channels"`
+	ChannelLayout  string                   `json:"channel_layout"`
+	SampleRate     string                   `json:"sample_rate"`
+	Disposition    streamDisposition        `json:"disposition"`
+	Tags           map[string]string        `json:"tags"`
+	SideDataList   []map[string]interface{} `json:"side_data_list"`
 }
 
 type mediaProbe struct {
@@ -139,8 +135,16 @@ func (e *engine) inspect(path, mime string, expectedVideoStreamIndex *int, limit
 		return inspection{}, nil, err
 	}
 	primaries, transfer, matrix, colorRange, hdr, peak, mastering, maxCLL, err := classifyColor(video, facts.frameHDR)
+	inferred := false
 	if err != nil {
-		return inspection{}, nil, err
+		// Untagged SDR is accepted with conventional inference only when the
+		// stream is provably 8-bit and nothing it does declare conflicts.
+		var inferErr error
+		primaries, transfer, matrix, colorRange, inferErr = inferSDRColor(video, facts.frameHDR)
+		if inferErr != nil {
+			return inspection{}, nil, err
+		}
+		hdr, peak, mastering, maxCLL, inferred = false, 0, 0, 0, true
 	}
 	i := inspection{
 		TotalStreams: len(document.Streams), VideoStreamIndex: videoIndex, AudioPresent: audioPresent, AudioStreamIndex: -1,
@@ -148,7 +152,7 @@ func (e *engine) inspect(path, mime string, expectedVideoStreamIndex *int, limit
 		SampleAspectRatio: sar, RotationDegrees: rotation, FrameCount: len(facts.pts), DurationUS: facts.durationUS,
 		EffectiveFPS: facts.fps, TimeBase: timeBase, FirstPTS: facts.pts[0], LastPTS: facts.pts[len(facts.pts)-1], PTSDeltaSHA256: hashDeltas(facts.pts),
 		ColorPrimaries: primaries, ColorTransfer: transfer, ColorMatrix: matrix, ColorRange: colorRange, HDR: hdr, SourcePeakNits: peak, MasteringMaxNits: mastering, MaxCLLNits: maxCLL,
-		AudioCodec: "none", AudioChannelLayout: "none", CumulativeDecodedPixels: facts.decodedPixels,
+		AudioCodec: "none", AudioChannelLayout: "none", CumulativeDecodedPixels: facts.decodedPixels, ColorInferred: inferred,
 	}
 	var selectedAudio *probeStream
 	if audioPresent {
@@ -370,18 +374,49 @@ func parseJSONInt(value json.RawMessage) (int64, error) {
 	return strconv.ParseInt(text, 10, 64)
 }
 
+// streamDisposition is the ffprobe disposition subset stream selection uses.
+type streamDisposition struct {
+	Default         int `json:"default"`
+	AttachedPic     int `json:"attached_pic"`
+	StillImage      int `json:"still_image"`
+	TimedThumbnails int `json:"timed_thumbnails"`
+}
+
+// selectStream picks the primary stream of a kind. For video it is exactly
+// the upload probe's rule (internal/metadata primaryVideoStream, review N7):
+// only non-auxiliary streams with positive dimensions, then default
+// disposition first, then the largest area, then the lowest index. Audio is
+// default first, then the lowest index.
 func selectStream(streams []probeStream, kind string) (int, bool) {
-	selected, found, selectedDefault := 0, false, false
+	var selected probeStream
+	found := false
 	for _, stream := range streams {
-		if stream.Index < 0 || stream.CodecType != kind || kind == "video" && auxiliaryVideoStream(stream) {
+		if stream.Index < 0 || stream.CodecType != kind {
 			continue
 		}
-		isDefault := stream.Disposition.Default != 0
-		if !found || isDefault && !selectedDefault || isDefault == selectedDefault && stream.Index < selected {
-			selected, found, selectedDefault = stream.Index, true, isDefault
+		if kind == "video" && (auxiliaryVideoStream(stream) || stream.Width <= 0 || stream.Height <= 0) {
+			continue
+		}
+		if !found || preferStream(stream, selected, kind == "video") {
+			selected, found = stream, true
 		}
 	}
-	return selected, found
+	return selected.Index, found
+}
+
+func preferStream(candidate, current probeStream, byArea bool) bool {
+	candidateDefault, currentDefault := candidate.Disposition.Default != 0, current.Disposition.Default != 0
+	if candidateDefault != currentDefault {
+		return candidateDefault
+	}
+	if byArea {
+		candidateArea := uint64(candidate.Width) * uint64(candidate.Height)
+		currentArea := uint64(current.Width) * uint64(current.Height)
+		if candidateArea != currentArea {
+			return candidateArea > currentArea
+		}
+	}
+	return candidate.Index < current.Index
 }
 
 func validVideoStream(streams []probeStream, index int) bool {
@@ -390,7 +425,7 @@ func validVideoStream(streams []probeStream, index int) bool {
 }
 
 func auxiliaryVideoStream(stream probeStream) bool {
-	return stream.Disposition.AttachedPic != 0 || stream.Disposition.TimedThumbnails != 0
+	return stream.Disposition.AttachedPic != 0 || stream.Disposition.StillImage != 0 || stream.Disposition.TimedThumbnails != 0
 }
 
 func streamByIndex(streams []probeStream, index int) (probeStream, bool) {
@@ -495,6 +530,79 @@ func classifyColor(stream probeStream, frameHDR hdrEvidence) (string, string, st
 		return "", "", "", "", false, 0, 0, 0, fail("unsupported_input")
 	}
 	return primaries, transfer, matrix, rangeName, false, 0, 0, 0, nil
+}
+
+// colorUnspecified reports an absent or explicitly unspecified ffprobe color
+// field.
+func colorUnspecified(value string) bool {
+	return value == "" || value == "unknown" || value == "unspecified" || value == "reserved"
+}
+
+// eightBitPixelFormats are the ffprobe pix_fmt values that prove 8 bits per
+// sample. Anything else (10/12/16-bit, float, unknown) may be HDR and is never
+// inferred.
+var eightBitPixelFormats = map[string]bool{
+	"yuv420p": true, "yuvj420p": true, "yuv422p": true, "yuvj422p": true, "yuv444p": true, "yuvj444p": true,
+	"nv12": true, "nv21": true, "yuv411p": true, "yuv440p": true, "yuvj440p": true,
+}
+
+// sdInferenceFrame reports whether coded dimensions are a standard-definition
+// frame for untagged-color inference (review N4): anything at least 1280
+// wide or taller than 576 lines is HD (BT.709 matrix); the rest is SD
+// (BT.601 matrix). The processor's acceptance check uses the same rule.
+func sdInferenceFrame(width, height int) bool { return width < 1280 && height <= 576 }
+
+// fullRangePixelFormats are the JPEG-range (yuvj*) formats: their samples are
+// full range by definition, so an untagged one is never inferred as limited.
+var fullRangePixelFormats = map[string]bool{"yuvj420p": true, "yuvj422p": true, "yuvj444p": true, "yuvj440p": true}
+
+// inferSDRColor applies conventional SDR inference to a stream whose color
+// signalling is wholly or partly unspecified: an HD frame (sdInferenceFrame
+// false) is BT.709, an SD frame the BT.601 matrix (smpte170m; 525- and
+// 625-line BT.601 share it) with BT.709 primaries and transfer, and an
+// unspecified range is limited, except for a yuvj* format, which is full
+// (a yuvj* stream declaring limited range is contradictory and refused).
+// Every specified field must equal the inferred value (a declared range is
+// kept). A fully tagged stream, a stream that is not provably 8-bit, PQ/HLG,
+// BT.2020, or HDR side data is refused, so tagged input keeps exactly the
+// classifyColor behaviour.
+func inferSDRColor(stream probeStream, frameHDR hdrEvidence) (string, string, string, string, error) {
+	refuse := fail("unsupported_input")
+	if !colorUnspecified(stream.ColorPrimaries) && !colorUnspecified(stream.ColorTransfer) && !colorUnspecified(stream.ColorSpace) && !colorUnspecified(stream.ColorRange) {
+		return "", "", "", "", refuse
+	}
+	if !eightBitPixelFormats[stream.PixFmt] || stream.BitsPerRaw != "" && stream.BitsPerRaw != "8" || stream.Height <= 0 || stream.Width <= 0 {
+		return "", "", "", "", refuse
+	}
+	if frameHDR.present || frameHDR.invalid {
+		return "", "", "", "", refuse
+	}
+	if streamHDR, err := parseHDREvidence(stream.SideDataList); err != nil || streamHDR.present {
+		return "", "", "", "", refuse
+	}
+	primaries, transfer, matrix := "bt709", "bt709", "bt709"
+	if sdInferenceFrame(stream.Width, stream.Height) {
+		matrix = "smpte170m"
+	}
+	for _, field := range []struct{ declared, inferred string }{
+		{stream.ColorPrimaries, primaries}, {stream.ColorTransfer, transfer}, {stream.ColorSpace, matrix},
+	} {
+		if !colorUnspecified(field.declared) && field.declared != field.inferred {
+			return "", "", "", "", refuse
+		}
+	}
+	colorRange := "limited"
+	if fullRangePixelFormats[stream.PixFmt] {
+		colorRange = "full"
+	}
+	if !colorUnspecified(stream.ColorRange) {
+		declared, ok := map[string]string{"tv": "limited", "mpeg": "limited", "pc": "full", "jpeg": "full"}[stream.ColorRange]
+		if !ok || fullRangePixelFormats[stream.PixFmt] && declared != "full" {
+			return "", "", "", "", refuse
+		}
+		colorRange = declared
+	}
+	return primaries, transfer, matrix, colorRange, nil
 }
 
 func parseHDREvidence(sideData []map[string]interface{}) (hdrEvidence, error) {

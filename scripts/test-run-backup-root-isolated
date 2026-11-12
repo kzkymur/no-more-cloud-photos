@@ -618,7 +618,7 @@ sys.exit(1)
         self.assertNotIn('"${RUNNER_TEMP}/still-toolchain"',workflow)
         self.assertNotIn('"${RUNNER_TEMP}/still-toolchain/',workflow)
         self.assertIn('-C /opt nmcp-native-ci',workflow)
-        self.assertEqual(workflow.count('backup-live-inputs/backup-native-toolchain.tar.gz'),2)
+        self.assertEqual(workflow.count('backup-live-inputs/backup-native-toolchain.tar.gz'),3)  # live, resources, offline
         self.assertIn('ProtectHome=yes',(repo/'infra/ubuntu/systemd/nmcp-worker.service').read_text())
 
     def test_python_syntax(self):
@@ -838,8 +838,8 @@ class DebCacheAndBudget(unittest.TestCase):
             self.assertNotIn(forbidden, SOURCE)
         main = SOURCE[SOURCE.index('def main():'):]
         # Fresh rootfs every run: import precedes bootstrap into the new work dir.
-        self.assertLess(main.index('import_deb_cache('), main.index('observed_bootstrap('))
-        self.assertLess(main.index('observed_bootstrap('), main.index('export_deb_cache('))
+        self.assertLess(main.index('import_deb_cache('), main.index('bootstrap_with_retry('))
+        self.assertLess(main.index('bootstrap_with_retry('), main.index('export_deb_cache('))
         self.assertIn("if cache['status'] == 'miss':", main)
         self.assertIn('tempfile.mkdtemp(prefix=', main)
 
@@ -963,6 +963,92 @@ class DebCacheAndBudget(unittest.TestCase):
     def test_cache_key_mode_is_unprivileged_and_first(self):
         main = SOURCE[SOURCE.index('def main():'):]
         self.assertLess(main.index("['--deb-cache-key']"), main.index("os.geteuid() == 0"))
+
+
+class BootstrapRetry(unittest.TestCase):
+    def run_attempts(self, outcomes, timeout=520, clock=None, mounts=False):
+        work = pathlib.Path(tempfile.mkdtemp())
+        root = work / 'rootfs'
+        calls = []
+        def fake(argv, env, log, work_, identity, t):
+            calls.append(t)
+            root.mkdir()
+            outcome = outcomes[len(calls) - 1]
+            if outcome is None:
+                return {'result': 'success'}
+            exc = MODULE.BootstrapFailure('x')
+            exc.summary = {'error_class': outcome[0], 'phase': outcome[1]}
+            raise exc
+        ident = dict(head='a'*40, run='1', attempt='1', slot='live')
+        with patch.object(MODULE, 'observed_bootstrap', side_effect=fake), \
+                patch.object(MODULE, 'root_has_mounts', return_value=mounts), \
+                patch.object(MODULE.time, 'sleep'), patch('builtins.print') as printed:
+            if clock:
+                with patch.object(MODULE.time, 'monotonic', side_effect=clock):
+                    result = self._call(work, root, ident, timeout)
+            else:
+                result = self._call(work, root, ident, timeout)
+        return result, calls, work, printed
+
+    def _call(self, work, root, ident, timeout):
+        try:
+            return MODULE.bootstrap_with_retry(lambda target: ['debootstrap', str(target)], {}, work, root, ident, timeout)
+        except MODULE.BootstrapFailure as exc:
+            return exc
+
+    def test_connect_in_download_is_retried_on_fresh_root_with_shared_deadline(self):
+        result, calls, work, printed = self.run_attempts([('connect', 'validate'), None])
+        self.assertEqual(result, {'result': 'success'})
+        self.assertEqual(len(calls), 2)
+        self.assertLessEqual(calls[1], calls[0])  # never reset
+        self.assertTrue((work / 'rootfs-failed-attempt-1').is_dir())
+        self.assertTrue(any('Bootstrap attempt' in str(c) for c in printed.call_args_list))
+
+    def test_dns_in_download_is_retried(self):
+        result, calls, work, _ = self.run_attempts([('DNS', 'download'), None])
+        self.assertEqual(result, {'result': 'success'})
+        self.assertEqual(len(calls), 2)
+        self.assertTrue((work / 'rootfs-failed-attempt-1').is_dir())
+        result, calls, _, _ = self.run_attempts([('DNS', 'configure'), None])
+        self.assertIsInstance(result, MODULE.BootstrapFailure)
+        self.assertEqual(len(calls), 1)
+
+    def test_non_network_or_late_phase_never_retried(self):
+        for outcome in [('timeout', 'download'), ('connect', 'configure'), ('dpkg', 'unpack'), ('unknown', 'unknown')]:
+            result, calls, _, _ = self.run_attempts([outcome, None])
+            self.assertIsInstance(result, MODULE.BootstrapFailure, outcome)
+            self.assertEqual(len(calls), 1, outcome)
+
+    def test_attempts_bounded_and_mounts_or_low_budget_stop_retry(self):
+        result, calls, _, _ = self.run_attempts([('connect', 'download')] * 3)
+        self.assertIsInstance(result, MODULE.BootstrapFailure)
+        self.assertEqual(len(calls), MODULE.BOOTSTRAP_ATTEMPTS)
+        result, calls, _, _ = self.run_attempts([('connect', 'download'), None], mounts=True)
+        self.assertIsInstance(result, MODULE.BootstrapFailure)
+        self.assertEqual(len(calls), 1)
+        # deadline=0+520; after the failure only 30 s remain -> below retry minimum.
+        result, calls, _, _ = self.run_attempts([('connect', 'download'), None], clock=[0, 0, 490, 490, 490])
+        self.assertIsInstance(result, MODULE.BootstrapFailure)
+        self.assertEqual(len(calls), 1)
+
+    def test_retry_never_deletes(self):
+        self.assertNotIn('shutil.rmtree', SOURCE)
+        body = SOURCE[SOURCE.index('def bootstrap_with_retry'):SOURCE.index('def bootstrap_environment')]
+        self.assertNotIn('unlink', body)
+        self.assertIn('os.rename(root', body)
+
+
+class ResourceSlot(unittest.TestCase):
+    def test_slot_table_is_exact_and_resources_binds_only_prepared_fixtures(self):
+        self.assertEqual(MODULE.SLOTS['release-resources.test'],
+                         ('resources', 'TEST_RELEASE_RESOURCES', '^TestReleaseGateResources$'))
+        self.assertEqual(set(MODULE.SLOTS), {'backup-live.test', 'backup-offline.test', 'release-resources.test'})
+        self.assertEqual({v[0] for v in MODULE.SLOTS.values()}, set(MODULE.JOB_NAMES))
+        main = SOURCE[SOURCE.index('def main():'):]
+        self.assertIn("fixtures = temp / 'e2e-prepared'", main)
+        self.assertIn("os.environ.get('TEST_RELEASE_FIXTURES_DIR') == str(fixtures)", main)
+        self.assertIn("+ extra_binds", main)
+        self.assertNotIn("'--bind=' ", SOURCE)
 
 
 if __name__ == '__main__':

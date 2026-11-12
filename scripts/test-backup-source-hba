@@ -23,8 +23,11 @@ def services(database='source'):
                    for role in hba.ROLES.split(',')).encode()
 
 
-def cutover(source='source', candidate='candidate'):
-    roles = 'nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator'
+def cutover(source='source', candidate='candidate', roles=None):
+    # The same grammar internal/admin cutoverHBA writes (current role list
+    # unless a legacy one is requested); the exact bytes are pinned by
+    # testdata/cutover-hba-prefix.txt.
+    roles = roles or hba.CUTOVER_ROLES
     def rejects(db):
         return f'local "{db}" {roles} reject\nhost "{db}" {roles} 0.0.0.0/0 reject\nhost "{db}" {roles} ::/0 reject\n'
     return ('# nmcp explicit cutover 12345678-1234-4123-8123-123456789abc; source remains fenced\n'
@@ -93,6 +96,25 @@ class SourceHBA(unittest.TestCase):
         for mutation in mutations:
             with self.assertRaises(ValueError):
                 hba.candidate(mutation, 'source')
+
+    def test_go_cutover_writer_golden_accepted(self):
+        # Review K2: the Go writer's exact output (chained online cutovers and
+        # an offline one) is the shared contract; installing the owned block
+        # below it must succeed and keep every cutover rule above it.
+        golden = (ROOT / 'testdata/cutover-hba-prefix.txt').read_text()
+        self.assertIn(hba.CUTOVER_ROLES + ' scram-sha-256', golden)
+        hba.validate_prefix(golden)
+        data = hba.candidate((golden + hba.block('source') + 'local all all reject\n').encode(), 'candidate3').decode()
+        self.assertTrue(data.startswith(golden))
+
+    def test_legacy_and_mixed_cutover_roles(self):
+        hba.validate_prefix(cutover(roles=hba.LEGACY_CUTOVER_ROLES))
+        hba.validate_prefix(cutover(roles=hba.LEGACY_CUTOVER_ROLES) + cutover('candidate', 'candidate2'))
+        mixed = cutover().replace(hba.CUTOVER_ROLES + ' ::1/128', hba.LEGACY_CUTOVER_ROLES + ' ::1/128', 1)
+        for prefix in [mixed, cutover(roles=hba.CUTOVER_ROLES + ',nmcp_other'),
+                       cutover().replace('nmcp_check,nmcp_repair', 'nmcp_repair,nmcp_check', 1)]:
+            with self.assertRaises(ValueError):
+                hba.validate_prefix(prefix)
 
     def test_existing_cutover_precedence_preserved(self):
         prefix = cutover().encode()

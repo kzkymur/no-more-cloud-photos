@@ -24,10 +24,9 @@ func ValidateActivation(definition Definition, registry Registry) error {
 	}
 	for _, mimeType := range definition.InputMIMETypes {
 		recipe := parameters.Recipes[mimeType]
-		outputs := recipeOutputs(recipe)
-		for _, output := range outputs {
-			if !registry.certifies(mimeType, recipe.SourceMode, output.kind, recipe.MaxLongEdge, output.setting) {
-				return fmt.Errorf("input MIME type %q output kind %q is not certified for edge %d and setting %d", mimeType, output.kind, recipe.MaxLongEdge, output.setting)
+		for _, output := range WorkerExecutableOutputs(mimeType, recipe) {
+			if !registry.certifies(mimeType, recipe.SourceMode, output.Kind, recipe.MaxLongEdge, output.Setting) {
+				return fmt.Errorf("input MIME type %q output kind %q is not certified for edge %d and setting %d", mimeType, output.Kind, recipe.MaxLongEdge, output.Setting)
 			}
 		}
 	}
@@ -159,21 +158,31 @@ func validateRecipe(mimeType string, recipe Recipe) error {
 	return nil
 }
 
-type recipeOutput struct {
-	kind    OutputKind
-	setting int
+// WorkerOutput is one output the Worker's transform routes execute for a
+// recipe: exactly one required processor certification at the recipe edge.
+type WorkerOutput struct {
+	Kind    OutputKind
+	Setting int
 }
 
-func recipeOutputs(recipe Recipe) []recipeOutput {
-	outputs := make([]recipeOutput, 0, 2)
-	if recipe.StillOutput != nil {
-		outputs = append(outputs, recipeOutput{kind: OutputStillAVIF, setting: recipe.StillOutput.Quality})
+// WorkerExecutableOutputs returns the outputs the Worker's transform routes
+// (internal/transformexecutor) can execute for recipe on mimeType. It is the
+// single Go statement of migration 0024's nmcp_profile_recipe_certified:
+// a still_output is executable, and so needs certification, except for a
+// probe-animation source other than image/webp under an all-frames recipe.
+// Such a source (GIF) always produces animated WebP; only a static WebP is
+// rerouted to the still processor.
+func WorkerExecutableOutputs(mimeType string, recipe Recipe) []WorkerOutput {
+	outputs := make([]WorkerOutput, 0, 2)
+	stillUnreachable := recipe.SourceMode == SourceProbeAnimation && recipe.FramePolicy == FrameAll && mimeType != "image/webp"
+	if recipe.StillOutput != nil && !stillUnreachable {
+		outputs = append(outputs, WorkerOutput{Kind: OutputStillAVIF, Setting: recipe.StillOutput.Quality})
 	}
 	if recipe.AnimationOutput != nil {
-		outputs = append(outputs, recipeOutput{kind: OutputAnimationWebP, setting: recipe.AnimationOutput.Quality})
+		outputs = append(outputs, WorkerOutput{Kind: OutputAnimationWebP, Setting: recipe.AnimationOutput.Quality})
 	}
 	if recipe.VideoOutput != nil {
-		outputs = append(outputs, recipeOutput{kind: OutputVideoAV1, setting: recipe.VideoOutput.CRF})
+		outputs = append(outputs, WorkerOutput{Kind: OutputVideoAV1, Setting: recipe.VideoOutput.CRF})
 	}
 	return outputs
 }

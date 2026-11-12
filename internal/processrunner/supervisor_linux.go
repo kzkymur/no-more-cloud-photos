@@ -46,6 +46,12 @@ func runSupervisor(arguments []string) int {
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 		return 125
 	}
+	// no_new_privs is inherited across fork and execve: prlimit and the tool
+	// can never gain privileges through setuid/setgid binaries or file
+	// capabilities (review K4).
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		return 125
+	}
 	control := os.NewFile(3, "process-supervisor-control")
 	if control == nil {
 		return 125

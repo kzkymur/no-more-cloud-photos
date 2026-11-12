@@ -114,6 +114,8 @@ sudo -u postgres psql --dbname nmcp
 \password nmcp_migrator
 \password nmcp_api
 \password nmcp_worker
+\password nmcp_check
+\password nmcp_repair
 ```
 
 The script creates credential-free `nmcp_runtime`, `nmcp_worker_runtime`,
@@ -121,11 +123,15 @@ The script creates credential-free `nmcp_runtime`, `nmcp_worker_runtime`,
 `nmcp_check_function_owner`, and `nmcp_repair_function_owner` roles. The two
 reconciliation capability roles and two function owners are NOINHERIT and
 isolated from the common runtime graph. API and Worker receive only their
-reviewed existing memberships; no check/repair login or capability member is
-created. The migrator is a member of the three function-owner roles only so
+reviewed existing memberships. The operational logins `nmcp_check` and
+`nmcp_repair` (LOGIN INHERIT, no superuser, CREATEDB, CREATEROLE, replication
+or BYPASSRLS) each receive exactly one edge, their capability role
+(`nmcp_check_runtime` / `nmcp_repair_runtime`, INHERIT TRUE, SET FALSE, no
+ADMIN), plus CONNECT on the database, and nothing else. They are used only by
+`nmcp-admin check` and `nmcp-admin repair`. The migrator is a member of the three function-owner roles only so
 forward migrations can transfer narrowly scoped SECURITY DEFINER functions.
 The bootstrap treats every direct incoming or outgoing membership edge touching
-these stable roles or the three managed logins as a closed allowlist; this also
+these stable roles or the five managed logins as a closed allowlist; this also
 blocks an external login from reaching the migrator or an owner transitively.
 Membership normalization and the final graph check run in one transaction, so
 an unsafe extra edge cannot leave a partially rewritten graph.
@@ -156,8 +162,26 @@ hardening/verifier, normal signal, or interrupted compatibility phase prevents
 service start. A power loss or SIGKILL can leave the database in compatibility
 mode, but the next mandatory wrapper attempt accepts only that exact interrupted
 state, reruns migration idempotently, and hardens before reporting readiness.
-Issue #20 will provision future operational check/repair credentials after the
-CLI contract lands; the root migration credential must not be reused. The
+`nmcp-admin check`, `repair` and `maintenance resume` never reuse the root
+migration credential for reconciliation; they connect as `nmcp_check` /
+`nmcp_repair`. Create `/etc/nmcp/credentials` as root:root 0700, and
+`check.dsn` / `repair.dsn` from `infra/ubuntu/credentials/*.dsn.example` as
+root:root 0600: one libpq connection string for `nmcp_check` / `nmcp_repair`,
+with the password set above. Restrict both logins to the `nmcp` database on
+loopback in `pg_hba.conf`, like the other credentials. The capability
+invocation in [Running nmcp-admin](#running-nmcp-admin) hands both files to the
+process as systemd credentials, so they are never readable by the `nmcp` user
+at rest. (`NMCP_CHECK_DATABASE_URL_FILE`, `NMCP_REPAIR_DATABASE_URL_FILE` and
+`NMCP_ADMIN_DATABASE_URL_FILE` are honoured only when no systemd credential
+directory is present, as in the validation harness; production uses
+`LoadCredential=`.) nmcp-admin refuses a credential that is not a regular, non-symlink file with the
+expected owner and no group/other access (systemd's own credential shape is
+accepted), and refuses any connection whose session user is not exactly the
+expected login. Both DSNs must name the
+same database as the owner credential (`admin.dsn`); after a restore cutover, update them to the
+active candidate database (see `docs/backup-operations.md`). If you change the
+shape of these two logins (for example add a connection limit), restore's role
+graph comparison will refuse until the change is reviewed there too. The
 bootstrap transfers database/schema ownership to `nmcp_migrator` and removes
 PUBLIC schema creation. Embedded migrations own all application object grants;
 the bootstrap deliberately does not grant table or function access after the
@@ -292,6 +316,182 @@ explicit disaster-recovery operation. Never delete the last known-good release
 during activation. If compatible rollback activation fails, the installer stops
 all partial services, atomically restores the prior link, and restores its prior
 active/inactive service state; a failed restoration is left fully stopped.
+
+## Running nmcp-admin
+
+No process running as the `nmcp` user ever receives the migrator credential.
+Operator `nmcp-admin` commands therefore run in one of exactly two documented
+modes, each a transient unit. nmcp-admin refuses a command in the wrong mode
+(capability commands refuse to run as root or with any migrator credential
+present; owner commands refuse to use the migrator login unless the process
+is root).
+
+**Capability commands** (`check`, `repair` including `--dry-run`,
+`maintenance resume`) run as `nmcp` with only the reconciliation logins:
+
+```sh
+sudo systemd-run --quiet --pipe --wait --collect \
+  -p User=nmcp -p Group=nmcp \
+  -p EnvironmentFile=/etc/nmcp/capability.env \
+  -p LoadCredential=check.dsn:/etc/nmcp/credentials/check.dsn \
+  -p LoadCredential=repair.dsn:/etc/nmcp/credentials/repair.dsn \
+  /opt/nmcp/current/bin/nmcp-admin check|repair|maintenance resume ...
+```
+
+They run as `nmcp` because repair creates, renames and removes entries under
+the nmcp:nmcp 0700 media root; as root it would leave root-owned entries.
+Their database access is limited to the `nmcp_check` / `nmcp_repair` SECURITY
+DEFINER API (migration readiness, maintenance state, audit, and the
+reconciliation functions).
+
+**Owner commands** (everything else: `config *`, `profile *`, `regenerate`,
+`jobs retry`, `cleanup`, other `maintenance` subcommands) run as root with the
+migrator credential, and never write under the media root;
+`cleanup --kind backups` deletes expired backup artifacts as root:
+
+```sh
+sudo systemd-run --quiet --pipe --wait --collect \
+  -p User=root \
+  -p EnvironmentFile=/etc/nmcp/capability.env \
+  -p LoadCredential=admin.dsn:/etc/nmcp/credentials/admin.dsn \
+  /opt/nmcp/current/bin/nmcp-admin <command> ...
+```
+
+- **Cleanup:** `cleanup --kind renditions` reports what the Worker's automatic
+  sweep will delete and waits for it; `--kind media` only enqueues purge jobs
+  that the Worker executes; `--kind backups` deletes artifacts only inside
+  `NMCP_BACKUP_ROOT`.
+- **Secrets stay root-only at rest:** systemd (PID 1) reads
+  `/etc/nmcp/capability.env` (non-secret, root:root 0644 or 0600, from
+  `infra/ubuntu/env/capability.env.example`) and copies each named DSN file
+  into the unit's private `$CREDENTIALS_DIRECTORY`. `/etc/nmcp/admin.env`
+  (the migrator DSN) is used only by `nmcp-migrate.service`, never by these
+  invocations.
+- **Exit status and I/O:** `--wait` returns nmcp-admin's exit code, and `--pipe`
+  connects stdin/stdout/stderr, so `--file -` works.
+- **Exceptions:** the root-only restore and cutover commands keep their own
+  documented procedure in `docs/backup-operations.md`, and `migrate` runs only
+  through the release installer's migration unit.
+
+Create the three credential files under `/etc/nmcp/credentials` (root:root
+0700) as root:root 0600, from `infra/ubuntu/credentials/*.dsn.example`:
+`check.dsn` (`nmcp_check`), `repair.dsn` (`nmcp_repair`), and `admin.dsn`
+(`nmcp_migrator`, the same password as `admin.env`).
+
+## Profile certification before activation
+
+Migrations seed the bundled `standard/v1` (`60000000-0000-4000-8000-000000000001`)
+and `thumbnail/v1` (`60000000-0000-4000-8000-000000000002`) profiles as
+**drafts**. `nmcp-admin profile activate` refuses a draft until append-only
+processor certification rows cover every exact input MIME, source mode, output
+kind, maximum edge, and setting its recipes need. On each real host, after the
+release is active and before activating a profile, certify it with the exact
+installed helpers:
+
+1. Collect operator-owned fixtures: at least one per input MIME of the profile
+   (all 17 candidate MIMEs for the bundled profiles, including every RAW alias,
+   HEIC/HEIF, BMP, MP4, and QuickTime). Every fixture's long edge must be at
+   least the recipe edge (1920 for `standard`, 640 for `thumbnail`) because each
+   output must reach exactly that edge. `image/webp` under `standard` needs a
+   **static** WebP (the Worker's still path) and an **animated** WebP; GIF and
+   video fixtures must be animated/real streams. Fixtures are evidence inputs,
+   not uploads; keep them outside the storage root (for example under
+   `/root/nmcp-fixtures`). Certification is an owner command: root nmcp-admin
+   copies each fixture into its private workspace and hands it to the helpers,
+   which run as `nmcp`, as inherited file descriptors, so fixtures need not be
+   readable by `nmcp`.
+2. Write `SPEC.json` with absolute paths and the SHA-256 of each file, measured
+   by the operator on this host (for example `sha256sum`), never copied from
+   another host:
+
+   ```json
+   {
+     "profile_id": "60000000-0000-4000-8000-000000000002",
+     "helpers": {
+       "still_helper": {"path": "/opt/nmcp/current/bin/nmcp-still-helper", "sha256": "<64 hex>"},
+       "animation_helper": {"path": "/opt/nmcp/current/bin/nmcp-animation-helper", "sha256": "<64 hex>"},
+       "video_helper": {"path": "/opt/nmcp/current/bin/nmcp-video-helper", "sha256": "<64 hex>"},
+       "prlimit": {"path": "/usr/bin/prlimit", "sha256": "<64 hex>"},
+       "ffprobe": {"path": "/opt/nmcp/current/bin/ffprobe", "sha256": "<64 hex>"},
+       "srgb_icc": {"path": "/opt/nmcp/current/share/sRGB2014.icc", "sha256": "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"}
+     },
+     "fixtures": [
+       {"mime_type": "image/jpeg", "path": "/root/nmcp-fixtures/landscape.jpg", "sha256": "<64 hex>"}
+     ]
+   }
+   ```
+
+   Use the same helper, `prlimit`, and ICC paths as the Worker configuration.
+   `ffprobe` is the independent output probe: use the pinned
+   `/opt/nmcp/current/bin/ffprobe` (the version CI certifies with). The API's
+   upload metadata probe still uses the distribution `/usr/bin/ffprobe`; that
+   version skew is a recorded known limit (release-gate deviation table).
+   Running as root, certify starts every helper and probe as uid/gid `nmcp`
+   (no supplementary groups) with the Worker's `prlimit` limits, so it never
+   decodes untrusted fixtures as root. It does not reproduce the Worker unit's
+   systemd sandbox (ProtectSystem, PrivateTmp, RestrictAddressFamilies,
+   `nmcp.slice`, …), but the helper processes run with `no_new_privs` set.
+   While a helper runs, its output file is group-writable by `nmcp`, so
+   another uid-`nmcp` process could alter it before certify probes and
+   digests it. This is a recorded known limit (release-gate deviation table).
+   Use only fixtures you trust.
+3. Run, as owner commands (see [Running nmcp-admin](#running-nmcp-admin)),
+   with the database in normal mode. The spec is passed on stdin:
+
+   ```sh
+   run_owner() {
+     sudo systemd-run --quiet --pipe --wait --collect \
+       -p User=root \
+       -p EnvironmentFile=/etc/nmcp/capability.env \
+       -p LoadCredential=admin.dsn:/etc/nmcp/credentials/admin.dsn \
+       /opt/nmcp/current/bin/nmcp-admin "$@"
+   }
+   sudo cat /root/nmcp-certify-thumbnail.json | run_owner profile certify --file - --json
+   run_owner profile activate --id 60000000-0000-4000-8000-000000000002 --json
+   ```
+
+   Certification does not activate;
+   activation stays a separate audited step and still enforces version order.
+   Then restart the Worker (`systemctl restart nmcp-worker.service`). The
+   Worker validates its capability envelope against the active profiles once at
+   startup and claims only those profiles' jobs; until it restarts, jobs for a
+   newly activated profile stay `queued` (they are not lost or failed).
+4. Preserve the JSON result and the `profile_processor_certifications` evidence
+   receipts with the deployment record. Exit `2` means the spec, a helper or
+   fixture digest/owner/mode, a fixture MIME, or an output check was rejected;
+   `4` means the profile is not a draft, an identical certification already
+   exists (same requirement and byte-identical helper/ICC digests), or another
+   profile operation holds the lock; `1` is an operational helper or database
+   failure. Every non-zero exit inserts nothing. A refused requirement reports a
+   fixed `reason` (`requirement_not_covered`) and the exact
+   requirement in the JSON result. A refused helper, ICC, fixture, processor
+   setup or capability probe reports `reason` `input_evidence_rejected` with the
+   failing `input` (for example `still_helper` or `fixture[3]:image/heic`) and
+   `check` (`open`, `owner_mode`, `ancestor`, `digest`, `type_size`,
+   `processor_config`, `capabilities`, `requirements`, `mime_not_in_profile`,
+   `mime_without_fixture`, `inspect`, `routing`, `decoder_not_advertised`),
+   never a path.
+
+A certification proves that **this host's exact helper binaries** transformed
+**the given fixtures** with the profile's recipes and that independently probed
+outputs matched. It is not evidence that every possible input of those MIME
+types decodes, and it does not replace the Worker's startup capability probes.
+The registry is append-only history: rows are never updated or deleted. A
+requirement is refused as a duplicate only when an existing row for the same
+processor, schema version, MIME, source mode, output kind, edge, and setting
+range carries a receipt whose recorded still/animation/video helper, `ffprobe`,
+`prlimit`, and ICC digests are byte-identical to this run. After any helper or
+ICC change, re-certify: new rows are appended next to the old ones. An existing
+row whose evidence is not a well-formed receipt of this schema counts as not
+identical, so new evidence is appended beside it.
+
+Requirements follow the routes the Worker can execute
+(`profile.WorkerExecutableOutputs`, the same rule as migration 0024's
+activation validator). Under an all-frames recipe a GIF always produces
+animated WebP, so bundled `standard` needs only an `animation-webp` row for
+GIF, while `image/webp` needs both `still-avif` (static fixture) and
+`animation-webp` (animated fixture). Bundled `standard` and `thumbnail` are
+therefore certifiable once the full fixture matrix above is supplied.
 
 ## Firewall and Tailnet checks
 

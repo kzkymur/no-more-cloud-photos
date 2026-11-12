@@ -3,6 +3,7 @@
 package transformexecutor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -158,16 +161,17 @@ func (temporary *fakeTemporary) Abort(context.Context) error {
 }
 
 type fakeProcessors struct {
-	calls          []string
-	classification animationprocessor.Classification
-	stillHook      func(context.Context) error
-	videoHook      func(videoprocessor.Request) error
-	inspectHook    func(animationprocessor.InspectRequest) error
-	animationHook  func(animationprocessor.Request) error
-	stillInput     [][]byte
-	inspectInput   [][]byte
-	animationInput [][]byte
-	videoRequests  []videoprocessor.Request
+	videoColorInferred bool
+	calls              []string
+	classification     animationprocessor.Classification
+	stillHook          func(context.Context) error
+	videoHook          func(videoprocessor.Request) error
+	inspectHook        func(animationprocessor.InspectRequest) error
+	animationHook      func(animationprocessor.Request) error
+	stillInput         [][]byte
+	inspectInput       [][]byte
+	animationInput     [][]byte
+	videoRequests      []videoprocessor.Request
 }
 
 func (processors *fakeProcessors) Inspect(_ context.Context, request animationprocessor.InspectRequest) (animationprocessor.Inspection, error) {
@@ -227,8 +231,12 @@ func (processors *fakeProcessors) TransformVideo(_ context.Context, request vide
 		}
 	}
 	_, _ = request.Output.Write([]byte("video"))
+	source := videoprocessor.Inspection{DurationUS: 300000}
+	if processors.videoColorInferred {
+		source.ColorInferred, source.ColorPrimaries, source.ColorTransfer, source.ColorMatrix, source.ColorRange = true, "bt709", "bt709", "smpte170m", "limited"
+	}
 	return videoprocessor.Result{OutputMIME: "video/mp4", OutputExtension: "mp4", Width: 10, Height: 8,
-		OutputDurationUS: 250000, Source: videoprocessor.Inspection{DurationUS: 300000}, Audit: videoprocessor.Audit{ToolVersion: "fake"}}, nil
+		OutputDurationUS: 250000, Source: source, Audit: videoprocessor.Audit{ToolVersion: "fake"}}, nil
 }
 
 type animationAdapter struct{ processors *fakeProcessors }
@@ -834,4 +842,23 @@ func leaseFor(t *testing.T, mime, attempt string, attempts, targetAttempts int) 
 
 func executionLimits() worker.ExecutionLimits {
 	return worker.ExecutionLimits{Threads: 1, OutputBytesPerStream: 1 << 20, StillTimeoutCeiling: time.Minute, AnimationTimeoutCeiling: time.Minute, VideoTimeoutCeiling: time.Minute}
+}
+
+// TestExecutorLogsInferredVideoColor proves inferred source color is never
+// silent: the Worker logs it and the persisted processor audit carries it.
+func TestExecutorLogsInferredVideoColor(t *testing.T) {
+	for _, inferred := range []bool{false, true} {
+		executor, repository, _, processors := fixture(t, "", nil, nil, []string{renderOne})
+		processors.videoColorInferred = inferred
+		var logs bytes.Buffer
+		executor.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		if err := executor.Execute(context.Background(), leaseFor(t, "video/mp4", attemptOne, 1, 0), executionLimits()); err != nil {
+			t.Fatal(err)
+		}
+		logged := strings.Contains(logs.String(), `"msg":"video source color inferred"`) && strings.Contains(logs.String(), `"color_matrix":"smpte170m"`)
+		audited := strings.Contains(string(repository.candidates[0].ProcessorAudit), `"color_inferred":true`)
+		if logged != inferred || audited != inferred {
+			t.Fatalf("inferred=%v logged=%v audited=%v logs=%s", inferred, logged, audited, logs.String())
+		}
+	}
 }

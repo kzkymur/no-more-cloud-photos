@@ -494,3 +494,22 @@ type staticObservationScanner struct{ observations []storage.Observation }
 func (scanner staticObservationScanner) Scan(context.Context) ([]storage.Observation, error) {
 	return scanner.observations, nil
 }
+
+// TestCheckerRecordsUnstableScanDistinctly: a scan stopped by the mutation
+// fence is recorded as storage_scan_unstable, so operators (and the release
+// gate) can tell a retryable concurrent change from a storage fault.
+func TestCheckerRecordsUnstableScanDistinctly(t *testing.T) {
+	cutoff := time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC)
+	repository := &recordingRepository{snapshot: Snapshot{StartedAt: cutoff, CutoffAt: cutoff, EndedAt: cutoff}, now: cutoff}
+	checker, err := NewChecker(repository, failingScanner{err: storage.ErrUnstableScan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checker.newID = func() (string, error) { return "01234567-89ab-4cde-8f01-23456789abcd", nil }
+	if _, err := checker.Check(context.Background(), ScopeAll); !errors.Is(err, storage.ErrUnstableScan) || repository.sealed {
+		t.Fatalf("Check() err=%v sealed=%v", err, repository.sealed)
+	}
+	if got := repository.sources["storage_scan"]; got == nil || *got != "storage_scan_unstable" {
+		t.Fatalf("storage source outcome = %v", got)
+	}
+}

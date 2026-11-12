@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/kzkymur/no-more-cloud-photos/internal/failpoint"
 	"github.com/kzkymur/no-more-cloud-photos/internal/job"
 	"github.com/kzkymur/no-more-cloud-photos/internal/medialifecycle"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
@@ -49,15 +50,31 @@ func (e Executor) Execute(ctx context.Context, lease job.Lease, _ worker.Executi
 	if e.Service == nil || e.Store == nil || lease.Type != job.TypePurge || lease.ID == "" || lease.MediaID == "" || lease.Token == "" {
 		return job.ErrInvalid
 	}
-	action := medialifecycle.StoragePurgeFileAction(e.Store)
+	// The lease reaching Execute means StartPurge committed the running Job and
+	// its file manifest; no file has been touched yet.
+	failpoint.Hit(failpoint.PurgeAfterStart)
+	deleteFile := medialifecycle.StoragePurgeFileAction(e.Store)
+	action := func(ctx context.Context, file medialifecycle.PurgeFile) (medialifecycle.PurgeFileDisposition, error) {
+		disposition, err := deleteFile(ctx, file)
+		if err == nil {
+			failpoint.Hit(failpoint.PurgeAfterFileDelete)
+		}
+		return disposition, err
+	}
 	for {
 		step, err := e.Service.RunPurgeFileStep(ctx, lease.ID, lease.Token, action)
 		if err != nil {
 			return mapError(err)
 		}
 		if step.Done {
-			return mapError(e.Service.FinalizePurge(ctx, lease.ID, lease.Token))
+			failpoint.Hit(failpoint.PurgeBeforeFinalize)
+			if err := e.Service.FinalizePurge(ctx, lease.ID, lease.Token); err != nil {
+				return mapError(err)
+			}
+			failpoint.Hit(failpoint.PurgeAfterFinalize)
+			return nil
 		}
+		failpoint.Hit(failpoint.PurgeAfterFileStep)
 	}
 }
 

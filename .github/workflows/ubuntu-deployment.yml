@@ -21,6 +21,7 @@ on:
       - "scripts/check-ubuntu-tls-expiry"
       - "scripts/install-ubuntu-host"
       - "scripts/install-ubuntu-release"
+      - "scripts/infra-apt-install"
       - "scripts/acquire-ubuntu-deployment-locks"
       - "scripts/handoff-ubuntu-migration-lock"
       - "scripts/render-ubuntu-nginx"
@@ -75,6 +76,7 @@ on:
       - "scripts/check-ubuntu-tls-expiry"
       - "scripts/install-ubuntu-host"
       - "scripts/install-ubuntu-release"
+      - "scripts/infra-apt-install"
       - "scripts/acquire-ubuntu-deployment-locks"
       - "scripts/handoff-ubuntu-migration-lock"
       - "scripts/render-ubuntu-nginx"
@@ -134,8 +136,7 @@ jobs:
         cache: true
     - name: Install parser and HTTP test dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install --yes --no-install-recommends \
+        scripts/infra-apt-install \
           ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck util-linux
     - name: Provision isolated VM identity
       run: sudo systemd-sysusers "$GITHUB_WORKSPACE/infra/ubuntu/sysusers.d/nmcp.conf"
@@ -282,8 +283,7 @@ jobs:
         cache: true
     - name: Install parser and HTTP test dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install --yes --no-install-recommends \
+        scripts/infra-apt-install \
           ffmpeg libimage-exiftool-perl nginx-core postgresql python3-yaml shellcheck util-linux
     - name: Provision isolated VM identity
       run: sudo systemd-sysusers "$GITHUB_WORKSPACE/infra/ubuntu/sysusers.d/nmcp.conf"

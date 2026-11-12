@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# Harness self-test for scripts/infra-e2e-env. It proves the scenario contract
+# (environment, control, db-read, media-ls, admin, faults) against the real
+# stack. It is NOT issue #21 acceptance: it uploads nothing and asserts no
+# application behaviour beyond readiness.
+set -euo pipefail
+
+ctl=${NMCP_E2E_CONTROL:?run through scripts/infra-e2e-env run}
+step() { printf '=== selftest: %s\n' "$*"; }
+fail() { printf -- '--- FAIL: selftest: %s\n' "$*"; exit 1; }
+
+for name in NMCP_E2E_API_URL NMCP_E2E_FILES_URL NMCP_E2E_FILES_CA_FILE NMCP_E2E_ARTIFACT_DIR NMCP_E2E_DEADLINE NMCP_E2E_HEAD_SHA; do
+  [ -n "${!name:-}" ] || fail "$name is not set"
+done
+[ "$NMCP_E2E_DEADLINE" -gt "$(date +%s)" ] || fail "deadline already passed"
+[ -w "$NMCP_E2E_ARTIFACT_DIR" ] || fail "artifact dir not writable"
+
+step "API readiness and Nginx TLS with the exported CA"
+curl --fail --silent --show-error "$NMCP_E2E_API_URL/readyz" >/dev/null || fail "api readyz"
+curl --fail --silent --show-error --cacert "$NMCP_E2E_FILES_CA_FILE" \
+  "${NMCP_E2E_FILES_URL%/files}/files-healthz" >/dev/null || fail "files healthz"
+
+step "db-read is a read-only session"
+[ "$(printf 'SELECT 1;\n' | "$ctl" db-read)" = 1 ] || fail "db-read SELECT"
+if printf 'CREATE TABLE e2e_selftest_write (x int);\n' | "$ctl" db-read 2>/dev/null; then
+  fail "db-read accepted a write"
+fi
+
+step "media-ls lists the real tree (storage-init layout, no fixtures)"
+"$ctl" media-ls >"$NMCP_E2E_ARTIFACT_DIR/selftest-media-ls.jsonl"
+python3 - "$NMCP_E2E_ARTIFACT_DIR/selftest-media-ls.jsonl" <<'PY' || fail "media-ls shape"
+import json, sys
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+paths = {e["path"] for e in entries}
+# Exactly the checker's allowed top level; no validation-only backups/ or tmp/.
+assert {p for p in paths if "/" not in p} == {"originals", "renditions", ".quarantine"}, sorted(paths)
+assert all(e["type"] == "dir" for e in entries), entries
+PY
+
+step "check/repair logins: exact capability edges, verifier negatives, credential login"
+pg_id=$(docker container ls --quiet --filter "label=com.docker.compose.project=$NMCP_E2E_PROJECT" \
+  --filter label=com.docker.compose.service=postgres)
+[ -n "$pg_id" ] || fail "postgres container not found"
+pg() { docker container exec -i "$pg_id" psql --username nmcp_bootstrap --dbname nmcp --no-psqlrc -X -q "$@"; }
+# Positives: the full verifiers pass on the provisioned graph.
+printf '\\set ON_ERROR_STOP on\n\\i /opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql\n\\i /opt/nmcp-infra/validation/verify-runtime-roles.sql\n' |
+  pg >/dev/null 2>"$NMCP_E2E_ARTIFACT_DIR/selftest-role-verifiers.err" || fail "role verifiers rejected the provisioned graph: $(head -c 300 "$NMCP_E2E_ARTIFACT_DIR/selftest-role-verifiers.err")"
+edges=$(pg -At <<'SQL'
+SELECT r.rolname || '>' || m.rolname || ':' || a.admin_option || a.inherit_option || a.set_option
+FROM pg_auth_members a
+JOIN pg_roles r ON r.oid = a.roleid
+JOIN pg_roles m ON m.oid = a.member
+WHERE r.rolname IN ('nmcp_check','nmcp_repair') OR m.rolname IN ('nmcp_check','nmcp_repair')
+ORDER BY 1;
+SQL
+)
+[ "$edges" = "nmcp_check_runtime>nmcp_check:falsetruefalse
+nmcp_repair_runtime>nmcp_repair:falsetruefalse" ] || fail "unexpected check/repair edges: $edges"
+privs=$(printf "SELECT has_function_privilege('nmcp_check','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE'), has_function_privilege('nmcp_repair','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE'), has_function_privilege('nmcp_check','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE'), has_function_privilege('nmcp_repair','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE');\n" | pg -At)
+[ "$privs" = "t|t|f|f" ] || fail "check/repair effective EXECUTE is not exactly own-capability: $privs"
+admin_api=$(pg -At <<'SQL'
+SELECT has_function_privilege('nmcp_check','public.nmcp_admin_read_migration_history()','EXECUTE'),
+       has_function_privilege('nmcp_repair','public.nmcp_admin_read_migration_history()','EXECUTE'),
+       has_function_privilege('nmcp_repair','public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_check','public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_check','public.nmcp_admin_resume_maintenance(nmcp_uuid_v4,jsonb,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_api','public.nmcp_admin_read_migration_history()','EXECUTE');
+SQL
+)
+[ "$admin_api" = "t|t|t|f|f|f" ] || fail "0025 admin API EXECUTE is not exactly as contracted: $admin_api"
+# Negatives: each mutation runs with a verifier in ONE transaction that is
+# always rolled back, and the verifier must reject it.
+negative() {
+  local name=$1 mutation=$2 verifier=$3 out
+  if out=$(printf '\\set ON_ERROR_STOP on\nBEGIN;\n%s\n\\i %s\nROLLBACK;\n' "$mutation" "$verifier" | pg 2>&1); then
+    fail "role negative not rejected: $name"
+  fi
+  case "$out" in *ERROR:*) ;; *) fail "role negative failed without a verifier error: $name: $out" ;; esac
+}
+graph=/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql
+roles=/opt/nmcp-infra/validation/verify-runtime-roles.sql
+negative "repair capability granted to nmcp_check" "GRANT nmcp_repair_runtime TO nmcp_check;" "$graph"
+negative "check edge with SET TRUE" "GRANT nmcp_check_runtime TO nmcp_check WITH SET TRUE;" "$graph"
+negative "check edge removed" "REVOKE nmcp_check_runtime FROM nmcp_check;" "$graph"
+negative "nmcp_check CREATEROLE" "ALTER ROLE nmcp_check CREATEROLE;" "$graph"
+negative "check capability granted to nmcp_repair" "GRANT nmcp_check_runtime TO nmcp_repair;" "$graph"
+negative "migrator granted to nmcp_check" "GRANT nmcp_migrator TO nmcp_check;" "$graph"
+negative "nmcp_check connection limit" "ALTER ROLE nmcp_check CONNECTION LIMIT 5;" "$graph"
+negative "nmcp_repair per-database setting" "ALTER ROLE nmcp_repair IN DATABASE nmcp SET work_mem='64MB';" "$graph"
+negative "0025 enter-maintenance executable by the check capability" \
+  "GRANT EXECUTE ON FUNCTION public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz) TO nmcp_check_runtime;" "$roles"
+negative "0025 migration-history reader executable by PUBLIC" \
+  "GRANT EXECUTE ON FUNCTION public.nmcp_admin_read_migration_history() TO PUBLIC;" "$roles"
+negative "check owner may update maintenance_state" \
+  "GRANT UPDATE ON public.maintenance_state TO nmcp_check_function_owner;" "$roles"
+negative "repair owner may write check-report evidence" \
+  "GRANT INSERT ON public.reconciliation_check_reports TO nmcp_repair_function_owner;" "$roles"
+negative "stray EXECUTE on a repair function for nmcp_check" \
+  "GRANT EXECUTE ON FUNCTION public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer) TO nmcp_check;" "$roles"
+[ "$(echo "SELECT count(*) FROM pg_auth_members a JOIN pg_roles m ON m.oid=a.member WHERE m.rolname IN ('nmcp_check','nmcp_repair');" | pg -At)" = 2 ] ||
+  fail "role negatives leaked a membership change"
+# The provisioned credential file logs in as exactly its login, inheriting
+# only its capability.
+dsn=$(sudo cat "$NMCP_E2E_STATE_DIR/credentials/capability/check.dsn") || fail "read check.dsn"
+who=$(docker container exec "$pg_id" psql "${dsn/@postgres:/@127.0.0.1:}" --no-psqlrc -XAt -c \
+  "SELECT session_user, pg_has_role(session_user,'nmcp_check_runtime','USAGE'), pg_has_role(session_user,'nmcp_repair_runtime','MEMBER'), pg_has_role(session_user,'nmcp_migrator','MEMBER')") ||
+  fail "check credential login"
+[ "$who" = "nmcp_check|t|f|f" ] || fail "check credential identity: $who"
+
+step "image-sha256: digests from a fresh one-shot of the worker/admin image"
+digests=$("$ctl" image-sha256 /opt/nmcp/share/sRGB2014.icc /usr/bin/prlimit) || fail "image-sha256"
+case "$digests" in
+  "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a  /opt/nmcp/share/sRGB2014.icc"*) ;;
+  *) fail "image-sha256 ICC digest: $digests" ;;
+esac
+[ "$(printf '%s\n' "$digests" | wc -l)" = 2 ] || fail "image-sha256 line count: $digests"
+if "$ctl" image-sha256 /etc/passwd 2>/dev/null; then fail "image-sha256 accepted a path outside the allowlist"; fi
+if "$ctl" image-sha256 /opt/nmcp/../../etc/passwd 2>/dev/null; then fail "image-sha256 accepted a non-canonical path"; fi
+if "$ctl" image-sha256 /opt/nmcp/bin/does-not-exist 2>/dev/null; then fail "image-sha256 accepted a missing file"; fi
+
+step "image trust: helper/ICC/prlimit paths and every ancestor are root-owned, not group/world-writable"
+# shellcheck disable=SC2016 # expanded by the container shell
+trust=$(docker run --rm --network none --read-only --user 10001:10001 --entrypoint /bin/sh \
+  "$(docker container inspect --format '{{.Image}}' "$(docker container ls --quiet \
+    --filter "label=com.docker.compose.project=$NMCP_E2E_PROJECT" --filter label=com.docker.compose.service=worker)")" -eu -c '
+  for path in /opt/nmcp/bin/nmcp-still-helper /opt/nmcp/bin/nmcp-animation-helper /opt/nmcp/bin/nmcp-video-helper \
+              /opt/nmcp/bin/ffmpeg /opt/nmcp/bin/ffprobe /opt/nmcp/share/sRGB2014.icc /usr/bin/prlimit; do
+    p=$path
+    while :; do
+      stat -c "%u %a %n" "$p"
+      [ "$p" = / ] && break
+      p=$(dirname "$p")
+    done
+  done' | sort -u) || fail "image trust probe"
+printf '%s\n' "$trust" >"$NMCP_E2E_ARTIFACT_DIR/selftest-image-trust.txt"
+bad=$(printf '%s\n' "$trust" | while read -r uid mode path; do
+  # 1777 /tmp-style dirs are not on these paths; any group/other write bit is bad.
+  if [ "$uid" != 0 ] || [ $(( 0$mode & 022 )) -ne 0 ]; then printf '%s %s %s; ' "$uid" "$mode" "$path"; fi
+done)
+[ -z "$bad" ] || fail "untrusted owner/mode in image: $bad"
+
+step "admin owner mode: nmcp-admin as root with only the migrator DSN file"
+"$ctl" admin -- migrate status --json >"$NMCP_E2E_ARTIFACT_DIR/selftest-admin.json" ||
+  fail "nmcp-admin migrate status (owner mode)"
+status=0; "$ctl" admin --capability -- migrate status --json >/dev/null 2>&1 || status=$?
+[ "$status" = 2 ] || fail "admin --capability for an owner command returned $status, want 2"
+status=0; "$ctl" admin --owner -- check --scope all >/dev/null 2>&1 || status=$?
+[ "$status" = 2 ] || fail "admin --owner for a capability command returned $status, want 2"
+
+oneshot() {
+  # Run a probe in an admin one-shot exactly as `admin --` would (same
+  # service, user, environment and mounts), but with a shell entrypoint.
+  local service=$1 entrypoint=$2; shift 2
+  docker compose --project-name "$NMCP_E2E_PROJECT" \
+    --file "$NMCP_E2E_ROOT/infra/validation/compose.yaml" --file "$NMCP_E2E_ROOT/infra/validation/compose.e2e.yaml" \
+    --profile e2e run --rm --no-deps -T --entrypoint "$entrypoint" "$service" "$@"
+}
+
+step "admin one-shots: identity, credentials, mounts, no migrator DSN in any environment"
+# The self-test owns its fixture dir (the workflow points NMCP_E2E_FIXTURES_DIR
+# at an empty runner-temp dir), so writing a marker never touches real
+# scenario fixtures such as test/e2e/testdata.
+[ -d "$NMCP_E2E_FIXTURES_DIR" ] || fail "fixture dir missing: $NMCP_E2E_FIXTURES_DIR"
+if [ -n "$(ls -A "$NMCP_E2E_FIXTURES_DIR")" ]; then
+  fail "self-test needs an empty fixture dir of its own, got non-empty $NMCP_E2E_FIXTURES_DIR"
+fi
+marker="selftest-$$"
+printf '%s' "$marker" >"$NMCP_E2E_FIXTURES_DIR/selftest.marker"
+chmod 0644 "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
+# shellcheck disable=SC2016 # expanded by the container shell
+owner=$(oneshot admin-owner sh -eu -c '
+    id -u
+    if env | grep -q "^NMCP_DATABASE_URL="; then echo migrator-url-present; fi
+    ls /run/nmcp-credentials
+    stat -c "%a %u" /run/nmcp-credentials/admin.dsn
+    cat /e2e/fixtures/selftest.marker; echo
+    if touch /e2e/fixtures/x 2>/dev/null; then echo fixtures-writable; fi
+    echo w >/e2e/work/probe && rm /e2e/work/probe && echo work-writable
+    [ "$(stat -c %d /e2e/work)" != "$(stat -c %d /e2e/fixtures)" ] && echo work-separate
+    [ -d /var/lib/nmcp/media/originals ] && echo media-visible
+    if touch /var/lib/nmcp/media/originals/.e2e-admin-probe 2>/dev/null; then echo media-writable; fi') ||
+  fail "owner one-shot probe"
+rm -f "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
+expected="0
+admin.dsn
+600 0
+$marker
+work-writable
+work-separate
+media-visible"
+[ "$owner" = "$expected" ] || fail "owner one-shot: $owner"
+# shellcheck disable=SC2016 # expanded by the container shell
+capability=$(oneshot admin-capability sh -eu -c '
+    id -u
+    if env | grep -q "^NMCP_DATABASE_URL="; then echo migrator-url-present; fi
+    if env | grep -q "^NMCP_ADMIN_DATABASE_URL_FILE="; then echo admin-file-present; fi
+    ls /run/nmcp-credentials
+    stat -c "%a %u" /run/nmcp-credentials/check.dsn /run/nmcp-credentials/repair.dsn
+    if [ -e /e2e/fixtures ]; then echo fixtures-mounted; fi
+    touch /var/lib/nmcp/media/originals/.e2e-admin-probe && rm /var/lib/nmcp/media/originals/.e2e-admin-probe && echo media-writable') ||
+  fail "capability one-shot probe"
+expected="10001
+check.dsn
+repair.dsn
+600 10001
+600 10001
+media-writable"
+[ "$capability" = "$expected" ] || fail "capability one-shot: $capability"
+# Owner commands such as `profile certify --file -` read their spec on stdin.
+echoed=$(printf 'spec-%s' "$marker" | oneshot admin-owner /usr/bin/timeout 30s cat) || fail "stdin probe"
+[ "$echoed" = "spec-$marker" ] || fail "stdin not forwarded to the admin one-shot: $echoed"
+
+step "release lane: set-failpoint is refused and the lane is reported"
+if [ "${NMCP_E2E_LANE:-}" != release ] || [ "${NMCP_E2E_FAILPOINTS:-}" != 0 ]; then
+  fail "lane env: ${NMCP_E2E_LANE:-unset}/${NMCP_E2E_FAILPOINTS:-unset}"
+fi
+status=0; "$ctl" control set-failpoint worker none 2>/dev/null || status=$?
+[ "$status" = 2 ] || fail "set-failpoint in the release lane returned $status, want 2"
+
+step "control kill worker SIGKILL prints the pid; start gives a new process"
+old=$("$ctl" control kill worker KILL) || fail "kill worker"
+old_pid=${old#pid=}; old_pid=${old_pid%% *}
+"$ctl" control start worker || fail "start worker"
+new_pid=$("$ctl" control pid worker)
+if [ "$new_pid" -le 0 ] || [ "$new_pid" = "$old_pid" ]; then
+  fail "worker pid not replaced ($old_pid -> $new_pid)"
+fi
+
+step "SIGSTOP/SIGCONT on worker"
+"$ctl" control kill worker STOP >/dev/null || fail "stop signal"
+"$ctl" control kill worker CONT >/dev/null || fail "cont signal"
+
+step "DB loss: stop postgres, API not ready, start, API ready"
+"$ctl" control stop postgres || fail "stop postgres"
+if curl --fail --silent --max-time 5 "$NMCP_E2E_API_URL/readyz" >/dev/null; then
+  fail "api reported ready without postgres"
+fi
+"$ctl" control start postgres || fail "start postgres"
+# Whether api/worker survive DB loss is application behaviour asserted by the
+# #21 scenario, not by this self-test; restart whichever exited.
+for service in api worker; do
+  if [ "$("$ctl" control pid "$service")" = 0 ]; then "$ctl" control start "$service" || fail "start $service"; fi
+done
+deadline=$((SECONDS + 60))
+until curl --fail --silent --max-time 5 "$NMCP_E2E_API_URL/readyz" >/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || fail "api not ready after postgres restart"
+  sleep 1
+done
+
+step "db-read while api and worker are stopped"
+"$ctl" control stop api || fail "stop api"
+"$ctl" control stop worker || fail "stop worker"
+[ "$(printf 'SELECT 1;\n' | "$ctl" db-read)" = 1 ] || fail "db-read with api/worker stopped"
+"$ctl" control start api || fail "start api"
+"$ctl" control start worker || fail "start worker"
+
+probe() {
+  # Run a write probe as the service user inside the API container; prints errno text on failure.
+  local id
+  id=$(docker container ls --quiet \
+    --filter "label=com.docker.compose.project=$NMCP_E2E_PROJECT" \
+    --filter label=com.docker.compose.service=api)
+  [ -n "$id" ] || fail "api container not found"
+  docker container exec "$id" sh -c "$1" 2>&1
+}
+
+step "fault media-readonly: whole media filesystem rejects writes with EROFS"
+"$ctl" fault media-readonly on || fail "readonly on"
+out=$(probe 'touch /var/lib/nmcp/media/originals/.e2e-probe' || true)
+case "$out" in *"Read-only file system"*) ;; *) fail "expected EROFS, got: $out" ;; esac
+"$ctl" fault media-readonly off || fail "readonly off"
+probe 'touch /var/lib/nmcp/media/originals/.e2e-probe && rm /var/lib/nmcp/media/originals/.e2e-probe' >/dev/null ||
+  fail "write after readonly off"
+
+step "fault media-full: shrink to used size gives ENOSPC; off restores"
+"$ctl" fault media-full on 0 || fail "full on"
+# shellcheck disable=SC2016 # expanded by the container shell
+out=$(probe 'head -c 1048576 /dev/zero >/var/lib/nmcp/media/originals/.e2e-probe; status=$?; rm -f /var/lib/nmcp/media/originals/.e2e-probe; exit $status' || true)
+case "$out" in *"No space left on device"*) ;; *) fail "expected ENOSPC, got: $out" ;; esac
+"$ctl" fault media-full off || fail "full off"
+probe 'head -c 1048576 /dev/zero >/var/lib/nmcp/media/originals/.e2e-probe && rm /var/lib/nmcp/media/originals/.e2e-probe' >/dev/null ||
+  fail "write after full off"
+
+step "media tree is unchanged by the faults"
+"$ctl" media-ls >"$NMCP_E2E_ARTIFACT_DIR/selftest-media-ls-after.jsonl"
+cmp -s "$NMCP_E2E_ARTIFACT_DIR/selftest-media-ls.jsonl" "$NMCP_E2E_ARTIFACT_DIR/selftest-media-ls-after.jsonl" ||
+  fail "media tree changed"
+
+echo "--- PASS: selftest (harness contract only; NOT #21 acceptance)"
+echo PASS

@@ -41,7 +41,11 @@ type options struct {
 	cutover          bool
 	ifDue            bool
 	definitionData   []byte
+	certifySpec      CertifySpec
 }
+
+// certifyStdin is the source for "profile certify --file -". Tests replace it.
+var certifyStdin io.Reader = os.Stdin
 
 func parse(args []string) (options, error) {
 	var o options
@@ -71,6 +75,8 @@ func parse(args []string) (options, error) {
 		flags.StringVar(&o.value, "value", "", "non-secret setting value")
 	case "profile create":
 		flags.StringVar(&o.file, "file", "", "profile JSON file")
+	case "profile certify":
+		flags.StringVar(&o.file, "file", "", "certification SPEC.json file, or - for stdin")
 	case "profile activate", "profile retire":
 		flags.StringVar(&o.id, "id", "", "profile UUIDv4")
 	case "regenerate":
@@ -131,6 +137,14 @@ func parse(args []string) (options, error) {
 			return o, ErrValidation
 		}
 		if _, err := DecodeProfile(o.definitionData); err != nil {
+			return o, err
+		}
+	case "profile certify":
+		data, err := readCertifySpec(o.file, certifyStdin)
+		if err != nil {
+			return o, err
+		}
+		if o.certifySpec, err = DecodeCertifySpec(data); err != nil {
 			return o, err
 		}
 	case "restore":
@@ -224,7 +238,19 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		return finish(stdout, stderr, o.json, result, settingsErr)
 	}
-	cfg, err := config.LoadAdmin()
+	// Review B2: no uid-nmcp process ever holds the owner (migrator) DSN.
+	// check, repair and maintenance resume are capability commands: they run
+	// as uid nmcp with only the nmcp_check / nmcp_repair logins. Everything
+	// else is an owner command. The single exception is the post-restore
+	// resume, a root operator procedure that keeps the owner connection.
+	if capabilityCommand(o.command) && !(o.command == "maintenance resume" && os.Geteuid() == 0) {
+		return runCapability(ctx, o, stdout, stderr)
+	}
+	dsn, err := loadOwnerDSN(os.Getenv)
+	if err != nil {
+		return finish(stdout, stderr, o.json, nil, err)
+	}
+	cfg, err := config.LoadAdminFrom(ownerGetenv(os.Getenv, dsn))
 	if err != nil {
 		return finish(stdout, stderr, o.json, nil, err)
 	}
@@ -233,6 +259,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return finish(stdout, stderr, o.json, nil, err)
 	}
 	defer pool.Close()
+	if err := refuseUnprivilegedOwner(ctx, pool); err != nil {
+		return finish(stdout, stderr, o.json, nil, err)
+	}
 	migrator, err := database.NewMigrator(pool)
 	if err != nil {
 		return finish(stdout, stderr, o.json, nil, err)
@@ -245,6 +274,34 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return finish(stdout, stderr, o.json, nil, err)
 	}
 	service := New(pool)
+	if o.command == "maintenance resume" {
+		// The owner (root) resume is the post-restore operator procedure only;
+		// any other maintenance is resumed by the capability invocation.
+		state, stateErr := service.MaintenanceStatus(ctx)
+		if stateErr == nil && (state.Reason == nil || *state.Reason != "operator restore") {
+			stateErr = ErrConflict
+		}
+		if stateErr != nil {
+			return finish(stdout, stderr, o.json, nil, stateErr)
+		}
+		// Its fresh check still runs only as nmcp_check (review B1/D3), on a
+		// connection pinned to the owner connection's database, so a check.dsn
+		// still naming the old source refuses instead of checking it.
+		identity, identityErr := queryDatabaseIdentity(ctx, pool)
+		if identityErr != nil {
+			return finish(stdout, stderr, o.json, nil, identityErr)
+		}
+		checkDSN, credentialErr := loadCapabilityDSN(checkCredential, os.Getenv)
+		if credentialErr != nil {
+			return finish(stdout, stderr, o.json, nil, credentialErr)
+		}
+		checkPool, poolErr := openCapabilityPool(ctx, checkCredential, checkDSN, &identity)
+		if poolErr != nil {
+			return finish(stdout, stderr, o.json, nil, poolErr)
+		}
+		defer checkPool.Close()
+		service.CheckPool = checkPool
+	}
 	var result any
 	switch o.command {
 	case "restore":
@@ -286,6 +343,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if err == nil {
 			err = service.ProfileCreate(ctx, definition)
 			result = map[string]any{"id": definition.ID, "status": "draft"}
+		}
+	case "profile certify":
+		result, err = service.ProfileCertify(ctx, o.certifySpec)
+		if err != nil {
+			// Only a fixed reason code and requirement; never paths or helper text.
+			result = certifyFailureResult(o.certifySpec.ProfileID, err)
 		}
 	case "profile activate", "profile retire":
 		err = service.ProfileTransition(ctx, o.id, o.command == "profile activate")

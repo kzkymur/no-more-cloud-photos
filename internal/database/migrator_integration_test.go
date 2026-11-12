@@ -39,7 +39,7 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() error = %v", err)
 		}
-		if status.CurrentVersion != 0 || status.ExpectedVersion != 23 || status.Ready() || !status.Pending {
+		if status.CurrentVersion != 0 || status.ExpectedVersion != 25 || status.Ready() || !status.Pending {
 			t.Fatalf("Status() = %+v, want pending version twenty", status)
 		}
 		var historyExists bool
@@ -63,7 +63,7 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Status() after Up error = %v", err)
 		}
-		if status.CurrentVersion != 23 || status.ExpectedVersion != 23 || !status.Ready() {
+		if status.CurrentVersion != 25 || status.ExpectedVersion != 25 || !status.Ready() {
 			t.Fatalf("Status() after Up = %+v, want ready version twenty", status)
 		}
 		if err := migrator.Up(context.Background()); err != nil {
@@ -221,8 +221,8 @@ func TestMigratorIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(full.migrations) != 23 {
-			t.Fatalf("migration count = %d, want 23", len(full.migrations))
+		if len(full.migrations) != 25 {
+			t.Fatalf("migration count = %d, want 25", len(full.migrations))
 		}
 		migrationUnderTest := full.migrations[17]
 		if migrationUnderTest.version != 18 || migrationUnderTest.name != "reconciliation_checker_sources" ||
@@ -682,7 +682,7 @@ func TestMigratorIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			status, err := roleMigrator.Status(ctx)
-			if err != nil || !status.Ready() || status.CurrentVersion != 23 {
+			if err != nil || !status.Ready() || status.CurrentVersion != 25 {
 				t.Fatalf("%s migration status = %+v, %v", roleName, status, err)
 			}
 			if err := roleMigrator.Up(ctx); err == nil || !strings.Contains(err.Error(), "lacks CREATE privilege") {
@@ -2296,7 +2296,7 @@ func TestRepairMigrationCatalogFreshAndV18Upgrade(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(migrator.migrations) != 23 || migrator.migrations[18].version != 19 || migrator.migrations[18].name != "reconciliation_repair_execution" {
+			if len(migrator.migrations) != 25 || migrator.migrations[18].version != 19 || migrator.migrations[18].name != "reconciliation_repair_execution" {
 				t.Fatalf("migration 19 identity = %+v", migrator.migrations[18])
 			}
 			if mode == "v18_upgrade" {
@@ -2464,7 +2464,7 @@ func TestRepairMigrationDrainsExistingRepairWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	var version int64
-	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 23 {
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations WHERE NOT dirty`).Scan(&version); err != nil || version != 25 {
 		t.Fatalf("migration version after writer drain = %d, %v", version, err)
 	}
 }
@@ -2495,6 +2495,12 @@ func assertRepairDefinerSetClosure(t *testing.T, ctx context.Context, pool *pgxp
 		"nmcp_record_transform_storage_attempt()", "nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)",
 		"nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)", "nmcp_require_normal_maintenance()",
 		"nmcp_require_terminal_repair_attempt()", "nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)",
+		// 0025: narrow owner-table steps of the uid-nmcp check/repair/resume CLI.
+		"nmcp_admin_read_migration_history()", "nmcp_admin_read_maintenance_state()",
+		"nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamp with time zone)",
+		"nmcp_admin_record_repair_result(nmcp_uuid_v4,nmcp_uuid_v4,text,nmcp_uuid_v4,text,text,timestamp with time zone)",
+		"nmcp_admin_lock_maintenance_for_resume()",
+		"nmcp_admin_resume_maintenance(nmcp_uuid_v4,jsonb,nmcp_uuid_v4,text,text,timestamp with time zone)",
 	}
 	for index, signature := range expected {
 		if err := pool.QueryRow(ctx, `SELECT $1::regprocedure::text`, signature).Scan(&expected[index]); err != nil {
@@ -2707,7 +2713,7 @@ func assertCheckerTempShadowCannotIntercept(t *testing.T, ctx context.Context, p
 	if err := tx.QueryRow(ctx, `SELECT migration_version FROM reconciliation_check_reports WHERE id=$1`, reportID).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 23 {
+	if version != 25 {
 		t.Fatalf("checker definer used shadow migration history version %d", version)
 	}
 	if err := tx.Commit(ctx); err != nil {

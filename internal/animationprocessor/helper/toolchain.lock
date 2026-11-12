@@ -3,7 +3,8 @@
 # inputs recorded by internal/stillprocessor/helper/toolchain.lock. The
 # transitive system/OCI closure remains owned by issue #20.
 
-libwebp 1.6.0
+libwebp 1.6.0 (inherited from internal/stillprocessor/helper/toolchain.lock;
+validated against the still toolchain manifest, never rebuilt here)
 url https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz
 sha256 e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
 license BSD-3-Clause

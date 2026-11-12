@@ -19,30 +19,31 @@ download() {
   printf '%s  %s\n' "$digest" "$target" | sha256sum --check
 }
 
-download libwebp-1.6.0.tar.gz \
-  https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz \
-  e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
 download giflib-5.2.2.tar.gz \
   https://sourceforge.net/projects/giflib/files/giflib-5.2.2.tar.gz/download \
   be7ffbd057cadebe2aa144542fd90c6838c6a083b5e8a9048b8ee3b66b29d5fb
 
-rm -rf "$work/source/libwebp-1.6.0" "$work/source/giflib-5.2.2" \
-  "$work/build/libwebp"
-tar -xzf "$work/downloads/libwebp-1.6.0.tar.gz" -C "$work/source"
+rm -rf "$work/source/giflib-5.2.2"
 tar -xzf "$work/downloads/giflib-5.2.2.tar.gz" -C "$work/source"
 
-cmake -S "$work/source/libwebp-1.6.0" -B "$work/build/libwebp" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
-  -DBUILD_SHARED_LIBS=ON -DWEBP_BUILD_ANIM_UTILS=OFF \
-  -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_EXTRAS=OFF \
-  -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF \
-  -DWEBP_BUILD_LIBWEBPMUX=ON -DWEBP_BUILD_VWEBP=OFF \
-  -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF \
-  -DWEBP_BUILD_WEBP_JS=OFF -DWEBP_BUILD_FUZZTEST=OFF \
-  -DWEBP_ENABLE_SIMD=ON -DWEBP_USE_THREAD=ON -DWEBP_NEAR_LOSSLESS=ON \
-  -DWEBP_ENABLE_SWAP_16BIT_CSP=OFF -DWEBP_ENABLE_WUNUSED_RESULT=ON
-cmake --build "$work/build/libwebp" --parallel 2
-cmake --install "$work/build/libwebp"
+# libwebp 1.6.0 is INHERITED from the still toolchain (built before libvips so
+# the whole prefix has exactly one webp). Validate it; never reinstall it.
+manifest="$prefix/share/nmcp/still-webp.manifest"
+[[ -f "$manifest" && ! -L "$manifest" ]] || { printf 'still toolchain webp manifest missing; build it first\n' >&2; exit 1; }
+grep -qx 'manifest_version=1' "$manifest"
+grep -qx 'libwebp_version=1.6.0' "$manifest"
+grep -qx 'libwebp_source_sha256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564' "$manifest"
+[[ "$(PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig" \
+  pkg-config --modversion libwebp libwebpdemux libwebpmux libsharpyuv | sort -u)" == 1.6.0 ]]
+for lib in libwebp libwebpmux libwebpdemux libsharpyuv; do
+  object=$(sed -n "s/^${lib}_object=//p" "$manifest")
+  digest=$(sed -n "s/^${lib}_object_sha256=//p" "$manifest")
+  [[ -n "$object" && -n "$digest" && -f "$prefix/$object" && ! -L "$prefix/$object" ]] ||
+    { printf 'inherited %s object missing\n' "$lib" >&2; exit 1; }
+  printf '%s  %s\n' "$digest" "$prefix/$object" | sha256sum --check --quiet
+  [[ "$(readelf -d "$prefix/$object" | sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p')" == *"$prefix/lib"* ]] ||
+    { printf 'inherited %s lacks RUNPATH %s\n' "$lib" "$prefix/lib" >&2; exit 1; }
+done
 
 (
   cd "$work/source/giflib-5.2.2"

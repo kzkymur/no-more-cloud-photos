@@ -346,16 +346,64 @@ The binary is `nmcp-admin` using Go `flag`. All commands accept `--json`; human-
 | `config show [--json]` | Show typed non-secret system configuration. |
 | `config set --name NAME --value VALUE [--json]` | Set one of `deleted_media_retention_days`, `superseded_rendition_retention_days`, `default_timezone`, `db_backup_interval_hours`, `db_backup_retention_days`; literal `null` is allowed only for the two retention values. Validate before transaction. |
 | `profile create --file FILE [--json]` | Create immutable draft profile from JSON; validate processor/schema/MIME recipes. |
-| `profile activate --id UUID [--json]` | Under a key-scoped advisory lock, activate a draft only when its version is greater than every version ever activated for that key, atomically retiring the prior active version. A lower/equal stale draft returns conflict and remains draft. Never backfills media. |
+| `profile certify --file SPEC.json\|- [--json]` | Self-authenticating, audited writer of the append-only processor certification registry for one **draft** profile; never activates. `SPEC.json` (or `-` for stdin; one strictly decoded JSON value of at most 1 MiB, no unknown/duplicate fields) names `profile_id`, the exact `still_helper`, `animation_helper`, `video_helper`, `prlimit`, `ffprobe`, and `srgb_icc` (`{path, sha256}`; the ICC must be the Worker's pinned digest), and `fixtures` (`[{mime_type, path, sha256}]`, 1..64). Every file is opened `O_NOFOLLOW` and must be a regular file whose content SHA-256 matches; helpers/ICC must be root- or invoker-owned, not group/world-writable, below non-replaceable directories, and are re-verified after use; fixtures are copied into a private 0700 directory while hashed. Requirements are derived from the stored draft exactly as `nmcp_profile_definition_valid` (migration 0024) consults them: one per input MIME and Worker-executable recipe output, at the recipe edge and setting. A `still_output` is not required for a probe-animation MIME other than `image/webp` under an all-frames recipe, because the Worker always produces animated WebP there. Every profile MIME needs a fixture and every fixture MIME must be in the profile. A requirement with no covering fixture fails with exit `2` and the fixed `reason` `requirement_not_covered` plus the requirement in the JSON result. A refused input fails with exit `2` and the fixed `reason` `input_evidence_rejected`, an `input` (`still_helper`, `animation_helper`, `video_helper`, `prlimit`, `ffprobe`, `srgb_icc`, `fixture[N]:<mime>`, `still`/`animation`/`video`/`ffprobe` for processor setup, or `profile`) and a `check` (`open`, `owner_mode`, `ancestor`, `digest`, `type_size`, `processor_config`, `capabilities`, `requirements`, `mime_not_in_profile`, `mime_without_fixture` (input `profile:<mime>`), `inspect`, `routing`, `decoder_not_advertised`); neither field ever carries a path or helper text, and the same reason is recorded in the failed audit row. Each fixture runs only through the Worker's processor routing and resource policy with the profile recipe; each output must reach exactly the recipe edge without upscale or aspect change and pass an independent bounded `ffprobe` probe (plus a structural RIFF check for animated WebP). Only after every run succeeds are all rows inserted in one audited transaction under the key-scoped profile lock in normal mode; the transaction re-checks draft status, refuses (exit `4`) only a requirement whose existing row's strictly parsed receipt records byte-identical still/animation/video helper, `ffprobe`, `prlimit`, and ICC digests (changed helpers append new rows; malformed or foreign evidence counts as not identical; rows are never updated or deleted), and requires `nmcp_profile_definition_valid(..., true)`. Evidence is a canonical JSON receipt of digests, output facts, processor identity, `nmcp-admin` build revision, and actor/host; it contains no paths or secrets. Exit `2` for spec/evidence/fixture/recipe validation failures, `4` for a missing or non-draft profile, identical-helper existing certification, lock conflict, or maintenance mode, `1` for operational helper/database failure; nothing is inserted on any non-zero exit. A certification proves only this host's exact helper binaries on the given fixtures, not every possible input. |
+| `profile activate --id UUID [--json]` | Under a key-scoped advisory lock, activate a draft only when its version is greater than every version ever activated for that key, atomically retiring the prior active version. A lower/equal stale draft returns conflict and remains draft. Never backfills media. Activation takes effect for transform claims when the Worker next starts: it binds its claimable profile set to the capability envelope validated at startup, so jobs for a newly activated profile stay `queued` until a Worker restart. |
 | `profile retire --id UUID [--json]` | Retire an active profile; historical targets remain valid. |
 | `regenerate --profile KEY (--media-id UUID OR --all) [--batch-size N] [--resume TOKEN] [--dry-run] [--yes] [--json]` | Create paged transform jobs pinned to the active profile version. `--all` requires `--yes` unless dry-run. Persisted batch state makes `--resume` safe and prevents duplicate target work. |
 | `jobs retry (--job-id UUID OR --status failed) [--type TYPE] [--additional-attempts N] [--batch-size N] [--resume TOKEN] [--dry-run] [--yes] [--json]` | Requeue the same failed job and only failed/pending targets; succeeded targets are immutable. `--additional-attempts` is a positive integer, defaults to 3, and atomically sets `max_attempts = max(max_attempts, attempts + N)` before requeue so an exhausted job is claimable without erasing its attempt history. Bulk retry requires confirmation. |
-| `check [--scope VALUE] [--json]` | `--scope` accepts `files`, `db`, or `all`. Read-only reconciliation classifies temporary, orphan, missing, checksum mismatch, and invariant violations. Never deletes. |
-| `repair --report UUID [--dry-run] --yes [--json]` | Apply an explicit saved check report under maintenance lock. Ambiguous/orphan files are quarantined only beneath canonical `${NMCP_STORAGE_ROOT}/.quarantine`, not immediately deleted. |
-| `cleanup [--kind VALUE] [--dry-run] --yes [--json]` | `--kind` accepts `renditions`, `media`, `backups`, or `all`. Run due cleanup using the same locks/rechecks as automatic cleanup. |
+| `check [--scope VALUE] [--json]` | `--scope` accepts `files`, `db`, or `all`. Read-only reconciliation classifies temporary, orphan, missing, checksum mismatch, and invariant violations. Never deletes. Capability command: runs only as the dedicated `nmcp_check` login (see "Run modes and capability credentials" below); schema readiness is read through the `nmcp_admin_read_migration_history()` definer. |
+| `repair --report UUID [--dry-run] --yes [--json]` | Apply an explicit saved check report under maintenance lock. Ambiguous/orphan files are quarantined only beneath canonical `${NMCP_STORAGE_ROOT}/.quarantine`, not immediately deleted. Capability command: runs only as the dedicated `nmcp_repair` login; maintenance entry, the repair-result audit and maintenance reads go through the migration 0025 definers on that login, and the advisory lock is held on it. |
+| `cleanup [--kind VALUE] [--dry-run] --yes [--json]` | `--kind` accepts `renditions`, `media`, `backups`, or `all`. Owner command; it never deletes media files itself. It freezes the due items in a durable run, re-checks each with the automatic cleanup's predicates, binds an exact purge job for due deleted media (executed by the Worker's purge executor) or leaves a due superseded rendition to the Worker's sweep, and waits (up to 3 minutes) for the native journals proving each effect. Items the Worker has not finished are reported as `pending` with exit `5`, stay authorized in the run, and are adopted by the next invocation. `backups` deletes artifacts only inside `NMCP_BACKUP_ROOT`. |
 | `backup run [--json]` / `backup list [--json]` | Run one database backup or list persistent history. |
 | `restore --backup-id UUID --yes [--json]` | Enter maintenance, restore and validate into the configured database, run DB/file reconciliation, and remain in maintenance until `maintenance resume`. |
-| `maintenance status [--json]` / `maintenance resume --yes [--json]` | Inspect or explicitly leave maintenance after successful checks. |
+| `maintenance status [--json]` / `maintenance resume --yes [--json]` | Inspect or explicitly leave maintenance after successful checks. `maintenance resume` is a capability command (fresh check on `nmcp_check`, fence and transition through the 0025 definers on `nmcp_repair`); it refuses a post-restore (`operator restore`) maintenance, which only the root restore procedure resumes. |
+
+### Run modes and capability credentials
+
+No process running as the `nmcp` user ever receives the migrator credential.
+Every command runs in exactly one of two modes
+([Ubuntu deployment](../ubuntu-deployment.md#running-nmcp-admin) documents both
+invocations):
+
+- **Capability commands** (`check`, `repair` including `--dry-run`,
+  `maintenance resume`) run as the non-root service user with only the
+  `nmcp_check` / `nmcp_repair` logins, because repair creates entries under the
+  media root. They exit `2` before connecting when run as root or when any
+  owner DSN source is present, even empty: `NMCP_DATABASE_URL`,
+  `NMCP_ADMIN_DATABASE_URL_FILE`, or an `admin.dsn` systemd credential. Their
+  only owner-table access is the migration 0025 SECURITY DEFINER API
+  (migration history, maintenance state and transitions, audit rows).
+- **Owner commands** (everything else) use the migrator login only when the
+  process is root (exit `2` otherwise) and never write under the media root.
+  The owner DSN comes from the `admin.dsn` systemd credential, else (only
+  without `$CREDENTIALS_DIRECTORY`) the file named by
+  `NMCP_ADMIN_DATABASE_URL_FILE`, else `NMCP_DATABASE_URL` (the migration and
+  backup units). A non-migrator owner login (the backup unit's
+  `nmcp_backup_control`) is not restricted to root.
+
+A capability login's libpq connection string comes from the systemd
+credential `check.dsn` / `repair.dsn` in `$CREDENTIALS_DIRECTORY` (which must
+be systemd's `/run/credentials/<unit>`: exactly one level below
+`/run/credentials`, root-owned, without group/other write; the credential
+file may be root-owned 0440 as systemd delivers it). Only without
+`$CREDENTIALS_DIRECTORY` does the file named by `NMCP_CHECK_DATABASE_URL_FILE`
+/ `NMCP_REPAIR_DATABASE_URL_FILE` apply, which must be an absolute, clean path
+to a regular file opened without following a final symlink, owned by root or
+the invoking user, with no group/other permission bits. Either holds exactly
+one connection string of at most 4 KiB (one trailing newline allowed).
+`maintenance resume` needs both. Every pooled connection then proves, before
+any query, that `session_user` and `current_user` are exactly `nmcp_check` /
+`nmcp_repair`, that it is not a superuser, that its capability role
+(`nmcp_check_runtime` / `nmcp_repair_runtime`) is usable through inheritance,
+and that it is not a member of any other managed role (migrator, API, Worker,
+runtimes, the other capability, function owners, backup roles); the second
+pool must reach the same database on the same running server as the first. A
+missing, unsafe or mismatching credential, including the migrator's, exits `2`
+before reconciliation starts; the path and contents are never printed. An
+unreachable database or failed authentication stays exit `1`. The roles,
+memberships and credential files are provisioned by the deployment. The
+restore cutover keeps running its target-side check through the restore
+operator connection.
 
 Mutating commands take a named PostgreSQL advisory lock appropriate to their operation. A conflicting operation fails rather than running concurrently. Every mutation writes an admin audit record containing command, actor/host, sanitized arguments, timestamps, result, and affected IDs. Batch order is stable by Media ID; checkpoint and active profile ID are persisted, so activation during a batch cannot change its pinned version.
 

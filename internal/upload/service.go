@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/failpoint"
 	"github.com/kzkymur/no-more-cloud-photos/internal/metadata"
 	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
@@ -187,12 +188,16 @@ func (s *Service) Accept(ctx context.Context, request Request) (outcome Outcome,
 
 	temporary, err := s.store.Begin(ctx, originalID, attemptID)
 	if err != nil {
+		// Decide before cancelling: cancelOperation cancels ctx itself, so
+		// checking ctx.Err() afterwards reported every storage failure (EROFS,
+		// ENOSPC on the temporary) as a 408 client timeout.
+		timedOut := ctx.Err() != nil
 		cancelOperation(nil)
 		heartbeat.Stop()
 		if heartbeatErr := heartbeat.Err(); heartbeatErr != nil {
 			return Outcome{}, dependencyFailure(heartbeatErr)
 		}
-		if ctx.Err() != nil {
+		if timedOut {
 			return Outcome{}, timeoutFailure(err)
 		}
 		return Outcome{}, dependencyFailure(err)
@@ -311,9 +316,11 @@ func (s *Service) Accept(ctx context.Context, request Request) (outcome Outcome,
 			EXIFJSON: exifJSON, SourceJSON: sourceJSON,
 		}
 		outcome, finalizeErr := s.repository.Finalize(dbCtx, input, func() (string, error) {
+			failpoint.Hit(failpoint.UploadBeforeOriginalPublish)
 			key, publishErr := temporary.PublishSealed(dbCtx, extension)
 			if publishErr == nil {
 				published = true
+				failpoint.Hit(failpoint.UploadAfterOriginalPublish)
 			} else {
 				var storageErr *storage.PublishError
 				if errors.As(publishErr, &storageErr) && storageErr.Published {
@@ -324,6 +331,9 @@ func (s *Service) Accept(ctx context.Context, request Request) (outcome Outcome,
 		})
 		if finalizeErr == nil {
 			attemptFinished = true
+			if outcome.Status == 201 && !outcome.Replayed {
+				failpoint.Hit(failpoint.UploadAfterDBCommit)
+			}
 			return outcome, nil
 		}
 		var changed *timezoneChangedError

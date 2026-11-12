@@ -30,12 +30,16 @@ type Config struct {
 	SRGBICC       string
 	SRGBICCSHA256 string
 	Policy        Policy
+	// RunAs drops helper processes to an unprivileged identity (see
+	// processrunner.Limits.RunAs); nil keeps the caller's identity (Worker).
+	RunAs *processrunner.RunAs
 }
 
 type Processor struct {
 	helper, prlimit, srgbICC, iccSHA256 string
 	policy                              Policy
 	runner, thumbnailRunner             *processrunner.Runner
+	runAs                               *processrunner.RunAs
 }
 
 type InspectRequest struct {
@@ -104,6 +108,9 @@ type Inspection struct {
 	AudioChannelLayout      string   `json:"audio_channel_layout"`
 	AudioSampleRate         int      `json:"audio_sample_rate"`
 	CumulativeDecodedPixels uint64   `json:"cumulative_decoded_pixels"`
+	// ColorInferred marks conventional SDR values assumed for a source without
+	// (or with partial, non-conflicting) color signalling.
+	ColorInferred bool `json:"color_inferred"`
 }
 
 type Result struct {
@@ -157,6 +164,7 @@ func New(config Config) (*Processor, error) {
 	runner, err := processrunner.New(config.Prlimit, processrunner.Limits{
 		Timeout: policy.Timeout, AddressSpaceBytes: policy.AddressSpaceBytes,
 		FileSizeBytes: uint64(policy.GeneratedOutputMaxBytes), OutputBytesPerStream: policy.LogBytesPerStream,
+		RunAs: config.RunAs,
 	})
 	if err != nil {
 		return nil, ErrInvalid
@@ -164,11 +172,12 @@ func New(config Config) (*Processor, error) {
 	thumbnailRunner, err := processrunner.New(config.Prlimit, processrunner.Limits{
 		Timeout: policy.Timeout, AddressSpaceBytes: policy.AddressSpaceBytes,
 		FileSizeBytes: uint64(policy.ThumbnailOutputMaxBytes), OutputBytesPerStream: policy.LogBytesPerStream,
+		RunAs: config.RunAs,
 	})
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	return &Processor{helper: config.Helper, prlimit: config.Prlimit, srgbICC: config.SRGBICC, iccSHA256: config.SRGBICCSHA256, policy: policy, runner: runner, thumbnailRunner: thumbnailRunner}, nil
+	return &Processor{helper: config.Helper, prlimit: config.Prlimit, srgbICC: config.SRGBICC, iccSHA256: config.SRGBICCSHA256, policy: policy, runner: runner, thumbnailRunner: thumbnailRunner, runAs: config.RunAs}, nil
 }
 
 func (p *Processor) Capabilities(ctx context.Context) (Capabilities, error) {
@@ -276,7 +285,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		return Result{}, ErrResourcePolicy
 	}
 	if kindLimit := limitForKind(p.policy, kind); remaining < kindLimit {
-		operationRunner, err = processrunner.New(p.prlimit, processrunner.Limits{Timeout: p.policy.Timeout, AddressSpaceBytes: p.policy.AddressSpaceBytes, FileSizeBytes: uint64(remaining), OutputBytesPerStream: p.policy.LogBytesPerStream})
+		operationRunner, err = processrunner.New(p.prlimit, processrunner.Limits{Timeout: p.policy.Timeout, AddressSpaceBytes: p.policy.AddressSpaceBytes, FileSizeBytes: uint64(remaining), OutputBytesPerStream: p.policy.LogBytesPerStream, RunAs: p.runAs})
 		if err != nil {
 			return Result{}, ErrInvalid
 		}
@@ -466,7 +475,17 @@ func validateInspection(i Inspection, p Policy) error {
 	return nil
 }
 
+// sdInferenceFrame mirrors the helper's untagged-color rule (review N4):
+// SD is narrower than 1280 and at most 576 lines; everything else is HD.
+func sdInferenceFrame(width, height int) bool { return width < 1280 && height <= 576 }
+
 func safeColor(i Inspection) bool {
+	if i.ColorInferred {
+		// Inference only ever yields SDR BT.709 primaries/transfer with the
+		// BT.709 (HD) or BT.601 smpte170m (SD) matrix.
+		return !i.HDR && i.ColorPrimaries == "bt709" && i.ColorTransfer == "bt709" &&
+			(i.ColorMatrix == "bt709" && !sdInferenceFrame(i.CodedWidth, i.CodedHeight) || i.ColorMatrix == "smpte170m" && sdInferenceFrame(i.CodedWidth, i.CodedHeight)) && oneOf(i.ColorRange, "limited", "full")
+	}
 	return oneOf(i.ColorPrimaries, "bt709", "bt2020") && oneOf(i.ColorTransfer, "bt709", "smpte2084", "arib-std-b67") && oneOf(i.ColorMatrix, "bt709", "bt2020nc", "bt2020c") && oneOf(i.ColorRange, "limited", "full")
 }
 
@@ -537,6 +556,9 @@ func auditVideoFilter(source Inspection, width, height, bitDepth int, kind strin
 	if source.HDR {
 		peak := strconv.Itoa(source.SourcePeakNits)
 		parts = append(parts, "zscale=transfer=linear:npl="+peak, "format=gbrpf32le", "tonemap=hable:desat=0:peak="+peak, "zscale=primaries=bt709:transfer="+transfer+":matrix=bt709:range=limited:npl=100")
+	} else if source.ColorInferred {
+		parts = append(parts, "zscale=primariesin="+source.ColorPrimaries+":transferin="+source.ColorTransfer+":matrixin="+source.ColorMatrix+":rangein="+source.ColorRange+
+			":primaries=bt709:transfer="+transfer+":matrix=bt709:range=limited")
 	} else {
 		parts = append(parts, "zscale=primaries=bt709:transfer="+transfer+":matrix=bt709:range=limited")
 	}
@@ -560,7 +582,11 @@ func auditAudio(source Inspection, kind string) (int, string) {
 }
 
 func auditInputColor(source Inspection) string {
-	return source.ColorPrimaries + "/" + source.ColorTransfer + "/" + source.ColorMatrix + "/" + source.ColorRange
+	color := source.ColorPrimaries + "/" + source.ColorTransfer + "/" + source.ColorMatrix + "/" + source.ColorRange
+	if source.ColorInferred {
+		return "inferred:" + color
+	}
+	return color
 }
 
 func validateCapability(r capabilityWire, digest string) error {

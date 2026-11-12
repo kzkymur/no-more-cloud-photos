@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 var (
@@ -30,6 +31,21 @@ type Service struct {
 	Pool  *pgxpool.Pool
 	Actor string
 	Host  string
+	// CheckPool and RepairPool are the dedicated nmcp_check / nmcp_repair
+	// capability connections the CLI opens for check, maintenance resume and
+	// repair; the administrative Pool keeps readiness, maintenance state,
+	// locks and audit. Library callers without them use Pool (for example the
+	// restore cutover's operator connection to its candidate).
+	CheckPool  *pgxpool.Pool
+	RepairPool *pgxpool.Pool
+	// capability marks a uid-nmcp capability process (review B2): Pool is nil
+	// and every owner-table step goes through the 0025 definer functions on
+	// RepairPool.
+	capability bool
+	// cleanupWorker is a test-only stand-in for the Worker processes that
+	// perform awaited cleanup effects; cleanupWaitFor overrides the wait.
+	cleanupWorker  func(context.Context, *storage.Store, string, []cleanupItem)
+	cleanupWaitFor time.Duration
 
 	afterBatchCommit func(context.Context) error
 	// Test-only lost acknowledgement seam, invoked only AFTER real success commit.
@@ -38,6 +54,8 @@ type Service struct {
 	afterResumeFence            func(context.Context) error
 	afterBackupCleanupSelection func(context.Context) error
 	beforeBackupArtifactDelete  func(context.Context) error
+	// Test-only seam over the real processors/probe; nil uses production.
+	newCertifyRuntime func(*certifyWorkspace) (certifyRuntime, error)
 }
 
 func New(pool *pgxpool.Pool) *Service {

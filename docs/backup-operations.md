@@ -147,6 +147,16 @@ same-path recursive read-only binds; exact root-owned file bytes and effective
 bind tuples must agree. Privileged concurrent edits remain an operator
 coordination boundary. Environment files cannot override credential routes.
 
+The supported service manager is systemd v255 (Ubuntu 24.04). The effective-unit
+allow-sets (every dependency list, path-derived mounts, conditions/asserts and
+the canonical fragment digest) are derived from v255 semantics and were proven on
+a real 255.4 manager. Before trusting any unit property, cutover reads the
+manager `Version` over D-Bus and fails closed with
+`systemd manager version unsupported` for any other major version; supporting
+another release requires re-deriving and re-proving those sets, not relaxing
+the check. Edge lists are compared by exact membership because the manager
+emits them in hash order that can change when an idle unit is reloaded.
+
 ## Wake timer, manual runs and results
 
 `scripts/validate-backup-install` runs repository-static checks;
@@ -276,6 +286,25 @@ fixed pool credentials/configuration destinations, verifies the new live API
 and Worker pools, and leaves the candidate in maintenance. On any failure units
 stay stopped; never manually restart around a failed operation ledger.
 
+The role graph that restore pins (and the offline authority records) covers
+every `nmcp_` role and membership, with one tolerance: the optional
+reconciliation logins `nmcp_check` and `nmcp_repair` are ignored when, and
+only when, each is exactly LOGIN INHERIT with no other attribute, no
+connection limit and no per-role setting, holding only its capability edge
+(`nmcp_check_runtime` / `nmcp_repair_runtime`, ADMIN FALSE, INHERIT TRUE,
+SET FALSE). A source bootstrapped before those logins existed therefore
+restores onto a host that has them, and the reverse. Any other difference,
+including a deviant shape of those logins or any extra edge into or out of
+them, still refuses; rerun the same release's role bootstrap on both clusters.
+Cutover also requires zero live `nmcp_check` / `nmcp_repair` sessions,
+alongside API, Worker and backup.
+
+Before the post-cutover resume, point `/etc/nmcp/credentials/check.dsn` (and
+`repair.dsn`) at the candidate database: `maintenance resume` runs the checker
+as `nmcp_check`, and that connection must reach exactly the administrative
+connection's database (name, OID and server start), so a file still naming the
+old source fails closed with exit `2` instead of checking the wrong database.
+
 Use a separate operator `maintenance resume --yes --json` invocation with
 `NMCP_RESTORE_LEDGER_ROOT=/var/lib/nmcp-restore` and operator candidate service
 credentials. Imported DB state alone cannot authorize resume: the external
@@ -288,8 +317,9 @@ manifest to match committed success history in the pinned source database.
 A valid-looking orphan or an artifact from another DB is not implicit restore
 authority; retain it for explicit operator investigation rather than inventing
 success history. Candidate PUBLIC CONNECT remains revoked. Explicit cutover
-opens CONNECT only for the five fixed intended logins, behind the maintenance
-and HBA fences; it never grants CREATEDB, role membership or PUBLIC access.
+opens CONNECT only for the five fixed intended logins plus `nmcp_check` /
+`nmcp_repair` when present (so the post-cutover resume can check the
+candidate), behind the maintenance and HBA fences; it never grants CREATEDB, role membership or PUBLIC access.
 
 ## Source-only database login boundary
 

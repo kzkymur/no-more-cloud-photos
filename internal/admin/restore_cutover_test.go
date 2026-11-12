@@ -219,7 +219,7 @@ func TestCutoverHBAPrependsPermanentSourceFence(t *testing.T) {
 	op := cutoverTestOperation()
 	old := "local all all peer\nhost all all 0.0.0.0/0 trust\n"
 	b := string(cutoverHBA([]byte(old), op))
-	for _, line := range []string{`local "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator 0.0.0.0/0 reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator ::/0 reject`, `host "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator 127.0.0.1/32 scram-sha-256`, `local "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator scram-sha-256`} {
+	for _, line := range []string{`local "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair 0.0.0.0/0 reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair ::/0 reject`, `host "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair 127.0.0.1/32 scram-sha-256`, `local "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair scram-sha-256`} {
 		if !strings.Contains(b, line) {
 			t.Fatal("missing gate", line)
 		}
@@ -409,6 +409,12 @@ func TestCutoverCandidateGrantsAreClosedAndQuoted(t *testing.T) {
 	if err != nil || !strings.Contains(sql, `DATABASE "all"`) || !strings.Contains(sql, "FROM PUBLIC") || !strings.Contains(sql, "TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump") {
 		t.Fatal("candidate CONNECT grant is not closed and quoted")
 	}
+	// Review B1: the optional capability logins get CONNECT when present.
+	for _, login := range []string{"nmcp_check", "nmcp_repair"} {
+		if !strings.Contains(sql, "rolname='"+login+"') THEN EXECUTE 'GRANT CONNECT ON DATABASE \"all\" TO "+login+"'") {
+			t.Fatalf("candidate grants omit %s: %s", login, sql)
+		}
+	}
 	for _, name := range []string{"", "x;DROP DATABASE source", "other db", strings.Repeat("x", 64)} {
 		if _, err := cutoverTargetGrants(name); err == nil {
 			t.Fatal("unsafe candidate name accepted")
@@ -512,5 +518,41 @@ func TestBackupSourceOnlyPolicyRetargetPreservesSingleBlock(t *testing.T) {
 		if _, err := retargetBackupHBAPolicy(bad, "candidate"); err == nil {
 			t.Fatal("mutated source-only policy accepted")
 		}
+	}
+}
+
+// cutoverHBAGoldenPath is the cross-language contract between cutoverHBA and
+// scripts/configure-backup-source-hba (review K2): the script's validator
+// must accept exactly what this writer prepends after any cutover, and its
+// test (scripts/test-backup-source-hba) loads the same file.
+const cutoverHBAGoldenPath = "../../scripts/testdata/cutover-hba-prefix.txt"
+
+func cutoverHBAGolden() string {
+	first := cutoverTestOperation()
+	first.ID = "11111111-1111-4111-8111-111111111111"
+	second := cutoverTestOperation()
+	second.ID = "22222222-2222-4222-8222-222222222222"
+	second.Source.DatabaseName, second.Candidate.DatabaseName = "candidate", "candidate2"
+	offline := cutoverTestOperation()
+	offline.ID = "33333333-3333-4333-8333-333333333333"
+	offline.SourceOffline = true
+	offline.Candidate.DatabaseName = "candidate3"
+	// Newest cutover first, as each cutover prepends to the live file.
+	return string(cutoverHBA(cutoverHBA(cutoverHBA(nil, first), second), offline))
+}
+
+func TestCutoverHBAMatchesTheBackupSourceScriptGolden(t *testing.T) {
+	got := cutoverHBAGolden()
+	if os.Getenv("NMCP_UPDATE_GOLDEN") == "1" {
+		if err := os.WriteFile(cutoverHBAGoldenPath, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(cutoverHBAGoldenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Fatalf("cutoverHBA output drifted from %s (the backup source script validates that exact grammar); got:\n%s", cutoverHBAGoldenPath, got)
 	}
 }

@@ -1,0 +1,110 @@
+# Overlay used only by scripts/infra-e2e-env (issue #21 Compose E2E lane).
+#
+# The media volume is a bind of one host tmpfs that the harness mounts and
+# owns. Originals, renditions and their temporary files therefore share one
+# filesystem (same st_dev), and fault injection (read-only remount, size
+# shrink) acts on that whole filesystem without writing filler files into
+# the media tree.
+volumes:
+  media:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${NMCP_E2E_MEDIA_MOUNT:?scripts/infra-e2e-env must set NMCP_E2E_MEDIA_MOUNT}"
+    # Owner labels come from compose.yaml (merged).
+
+services:
+  # The E2E media root holds exactly the storage layout the checker allows
+  # (originals, renditions, .quarantine; internal/reconciliation). Backups
+  # live outside media in production and the store writes temporaries beside
+  # their key, so the validation-only backups/ and tmp/ of the base
+  # storage-init (used by scripts/validation-env fixtures) are not created
+  # here: they would be reported as unexpected objects by `nmcp-admin check`.
+  storage-init:
+    command: ["sh", "-eu", "-c", "if [ -e /var/lib/nmcp/media/quarantine ] || [ -L /var/lib/nmcp/media/quarantine ]; then echo 'legacy dotless quarantine requires reviewed migration' >&2; exit 1; fi; install -d -o 10001 -g 10001 -m 0700 /var/lib/nmcp/media /var/lib/nmcp/media/originals /var/lib/nmcp/media/renditions /var/lib/nmcp/media/.quarantine"]
+
+  # Read-only observer for media-ls. It works while api/worker are stopped
+  # and never needs network access.
+  e2e-observer:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    profiles: [e2e]
+    user: "10001:10001"
+    entrypoint: ["sh", "-eu", "-c"]
+    network_mode: none
+    read_only: true
+    volumes:
+      - type: volume
+        source: media
+        target: /var/lib/nmcp/media
+        read_only: true
+    labels:
+      com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER}"
+
+  # `admin --` one-shots (scripts/infra-e2e-env picks one per command, by the
+  # same table as nmcp-admin). Neither inherits the base common environment,
+  # so NMCP_DATABASE_URL is absent, not merely empty, in both. Database
+  # credentials arrive only as files (the *_FILE fallbacks, honoured because
+  # no $CREDENTIALS_DIRECTORY exists here).
+  #
+  # Owner commands: root, migrator DSN file, media read-only (they never
+  # write media), scenario fixtures read-only, private scratch.
+  admin-owner:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    profiles: [e2e]
+    user: "0:0"
+    environment:
+      NMCP_STORAGE_ROOT: /var/lib/nmcp/media
+      NMCP_LOG_LEVEL: info
+      NMCP_SHUTDOWN_TIMEOUT: 10s
+      NMCP_ADMIN_DATABASE_URL_FILE: /run/nmcp-credentials/admin.dsn
+      NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
+    volumes:
+      - type: volume
+        source: media
+        target: /var/lib/nmcp/media
+        read_only: true
+      - type: bind
+        source: "${NMCP_E2E_FIXTURES_DIR:?scripts/infra-e2e-env must set NMCP_E2E_FIXTURES_DIR}"
+        target: /e2e/fixtures
+        read_only: true
+      - type: bind
+        source: "${NMCP_E2E_OWNER_CREDENTIALS_DIR:?scripts/infra-e2e-env must set NMCP_E2E_OWNER_CREDENTIALS_DIR}"
+        target: /run/nmcp-credentials
+        read_only: true
+    tmpfs:
+      - /e2e/work:size=1g,uid=0,gid=0,mode=0700
+    networks: [backend]
+    labels:
+      com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER}"
+
+  # Capability commands (check, repair, maintenance resume): uid 10001 (the
+  # service user), only the nmcp_check / nmcp_repair DSN files, media
+  # READ-WRITE because repair renames entries as the service user.
+  admin-capability:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    profiles: [e2e]
+    user: "10001:10001"
+    environment:
+      NMCP_STORAGE_ROOT: /var/lib/nmcp/media
+      NMCP_LOG_LEVEL: info
+      NMCP_SHUTDOWN_TIMEOUT: 10s
+      NMCP_CHECK_DATABASE_URL_FILE: /run/nmcp-credentials/check.dsn
+      NMCP_REPAIR_DATABASE_URL_FILE: /run/nmcp-credentials/repair.dsn
+    volumes:
+      - type: volume
+        source: media
+        target: /var/lib/nmcp/media
+      - type: bind
+        source: "${NMCP_E2E_CAPABILITY_CREDENTIALS_DIR:?scripts/infra-e2e-env must set NMCP_E2E_CAPABILITY_CREDENTIALS_DIR}"
+        target: /run/nmcp-credentials
+        read_only: true
+    networks: [backend]
+    labels:
+      com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER}"

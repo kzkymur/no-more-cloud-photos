@@ -500,12 +500,45 @@ func restorePool(ctx context.Context, c RestoreSettings, service string) (*pgxpo
 	}
 	return pgxpool.NewWithConfig(ctx, cfg)
 }
+
+// restoreOptionalLogins are the reconciliation capability logins (#21). A
+// cluster may lack them (bootstrapped before they existed) or have them, so
+// the role graph ignores exactly them in their exact provisioned shape: a
+// LOGIN INHERIT role with no other attribute, no connection limit and no
+// per-role config (global or per-database), holding only its capability edge with ADMIN FALSE,
+// INHERIT TRUE, SET FALSE. Any deviation (other attributes, other edges, other
+// options, or any edge into or out of them) stays in the hash and refuses.
+var restoreOptionalLogins = []struct{ login, capability string }{
+	{"nmcp_check", "nmcp_check_runtime"},
+	{"nmcp_repair", "nmcp_repair_runtime"},
+}
+
 func restoreRoleGraph(ctx context.Context, p *pgxpool.Pool) (string, error) {
+	logins, capabilities := make([]string, 0, len(restoreOptionalLogins)), make([]string, 0, len(restoreOptionalLogins))
+	for _, optional := range restoreOptionalLogins {
+		logins, capabilities = append(logins, optional.login), append(capabilities, optional.capability)
+	}
+	return restoreRoleGraphWith(ctx, p, "nmcp_", logins, capabilities)
+}
+
+const restoreRoleGraphRolesQuery = `SELECT COALESCE(jsonb_agg(jsonb_build_array(rolname,rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcanlogin,rolreplication,rolbypassrls,rolconnlimit,rolconfig) ORDER BY rolname),'[]'::jsonb)
+	FROM pg_roles WHERE starts_with(rolname,$1)
+	AND NOT (rolname=ANY($2::text[]) AND rolcanlogin AND rolinherit AND NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb
+	         AND NOT rolreplication AND NOT rolbypassrls AND rolconnlimit=-1 AND rolconfig IS NULL
+	         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting AS s WHERE s.setrole=pg_roles.oid))`
+
+const restoreRoleGraphMembersQuery = `SELECT COALESCE(jsonb_agg(jsonb_build_array(r.rolname,m.rolname,g.rolname,a.admin_option,a.inherit_option,a.set_option) ORDER BY r.rolname,m.rolname,g.rolname),'[]'::jsonb)
+	FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor
+	WHERE (starts_with(r.rolname,$1) OR starts_with(m.rolname,$1))
+	AND NOT (NOT a.admin_option AND a.inherit_option AND NOT a.set_option
+	         AND EXISTS (SELECT 1 FROM unnest($2::text[],$3::text[]) AS o(login,capability) WHERE o.login=m.rolname AND o.capability=r.rolname))`
+
+func restoreRoleGraphWith(ctx context.Context, p *pgxpool.Pool, prefix string, optionalLogins, optionalCapabilities []string) (string, error) {
 	var roles, members []byte
-	if p.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(rolname,rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcanlogin,rolreplication,rolbypassrls,rolconnlimit,rolconfig) ORDER BY rolname),'[]'::jsonb) FROM pg_roles WHERE starts_with(rolname,'nmcp_')`).Scan(&roles) != nil {
+	if p.QueryRow(ctx, restoreRoleGraphRolesQuery, prefix, optionalLogins).Scan(&roles) != nil {
 		return "", errRestore
 	}
-	if p.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(jsonb_build_array(r.rolname,m.rolname,g.rolname,a.admin_option,a.inherit_option,a.set_option) ORDER BY r.rolname,m.rolname,g.rolname),'[]'::jsonb) FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor WHERE starts_with(r.rolname,'nmcp_') OR starts_with(m.rolname,'nmcp_')`).Scan(&members) != nil {
+	if p.QueryRow(ctx, restoreRoleGraphMembersQuery, prefix, optionalLogins, optionalCapabilities).Scan(&members) != nil {
 		return "", errRestore
 	}
 	h := sha256.New()

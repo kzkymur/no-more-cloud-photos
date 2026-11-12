@@ -24,3 +24,267 @@ jobs:
       - name: Always remove validation resources
         if: always()
         run: scripts/validation-env reset
+
+  # Issue #21 Compose E2E lane (scripts/infra-e2e-env). The harness self-test
+  # proves the hook contract only. The engineer-owned scenario (./test/e2e) is
+  # the #21 evidence and runs in its own job with its own budget receipt.
+  compose-e2e-harness:
+    name: Infra / Compose E2E harness self-test
+    runs-on: ubuntu-24.04
+    # Must equal NMCP_E2E_BUDGET_JOB_SECONDS.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
+    env:
+      GOTOOLCHAIN: local
+      NMCP_E2E_BUDGET_JOB_NAME: Infra / Compose E2E harness self-test
+      NMCP_E2E_BUDGET_JOB_SECONDS: "2700"
+      NMCP_E2E_BUDGET_CLEANUP_SECONDS: "300"
+      NMCP_E2E_BUDGET_MARGIN_SECONDS: "60"
+      NMCP_E2E_BUDGET_RUN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Lint harness scripts
+        run: |
+          shellcheck -x scripts/infra-e2e-env scripts/infra-e2e-failpoint-state.sh scripts/test-infra-e2e-failpoint-state \
+            scripts/infra-e2e-budget-acquire scripts/infra-e2e-resource-trace infra/validation/e2e-selftest.sh
+          scripts/test-infra-e2e-failpoint-state
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
+      - name: Acquire identity-bound job budget receipt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/infra-e2e-budget-acquire 1500
+      - name: Record resolver diagnostics (host vs container)
+        run: |
+          set +e
+          image=ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+          echo "--- host /etc/resolv.conf"; grep -v '^#' /etc/resolv.conf
+          resolvectl status 2>/dev/null | grep -E 'DNS Servers|Current DNS' | head -4
+          docker pull --quiet "$image" >/dev/null
+          for name in archive.ubuntu.com security.ubuntu.com github.com; do
+            for family in ahostsv4 ahostsv6; do
+              out=$(timeout 10 getent "$family" "$name"); rc=$?
+              echo "host $family $name rc=$rc ${out%%$'\n'*}"
+              out=$(timeout 20 docker run --rm "$image" getent "$family" "$name"); rc=$?
+              echo "container $family $name rc=$rc ${out%%$'\n'*}"
+            done
+          done
+          echo "--- container resolv.conf (default bridge)"
+          timeout 20 docker run --rm "$image" cat /etc/resolv.conf
+          exit 0
+      - name: Harness self-test (contract only, not issue 21 acceptance)
+        env:
+          NMCP_E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-results/selftest
+          NMCP_E2E_FIXTURES_DIR: ${{ runner.temp }}/e2e-selftest-fixtures
+          NMCP_E2E_TIMEOUT_SECONDS: "600"
+          NMCP_E2E_SCENARIO_MIN_SECONDS: "300"
+        run: scripts/infra-e2e-env lane -- infra/validation/e2e-selftest.sh
+      - name: Upload E2E results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-harness-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-results
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Always remove E2E resources
+        if: always()
+        run: scripts/infra-e2e-env reset
+
+  compose-e2e-scenario:
+    name: Infra / Compose E2E issue 21 scenario
+    runs-on: ubuntu-24.04
+    # Must equal NMCP_E2E_BUDGET_JOB_SECONDS.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
+    env:
+      GOTOOLCHAIN: local
+      NMCP_E2E_BUDGET_JOB_NAME: Infra / Compose E2E issue 21 scenario
+      NMCP_E2E_BUDGET_JOB_SECONDS: "3600"
+      NMCP_E2E_BUDGET_CLEANUP_SECONDS: "300"
+      NMCP_E2E_BUDGET_MARGIN_SECONDS: "60"
+      NMCP_E2E_BUDGET_RUN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Detect issue 21 scenario
+        id: scenario
+        run: |
+          if [ ! -d test/e2e ]; then
+            # Reviewer N11b: an absent scenario must fail, never look green.
+            echo "::error title=#21 scenario absent::./test/e2e does not exist; this job cannot provide #21 acceptance."
+            echo "present=false" >>"$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "present=true" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Install Go
+        if: steps.scenario.outputs.present == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Build issue 21 scenario
+        if: steps.scenario.outputs.present == 'true'
+        run: |
+          go test -c -o "$RUNNER_TEMP/nmcp-e2e.test" ./test/e2e
+          "$RUNNER_TEMP/nmcp-e2e.test" -test.list '.*' | grep -q . || { echo "scenario has no tests" >&2; exit 1; }
+      - name: Acquire identity-bound job budget receipt
+        if: steps.scenario.outputs.present == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/infra-e2e-budget-acquire 2700
+      - name: Restore prepared E2E fixture cache (untrusted; re-verified against pins)
+        if: steps.scenario.outputs.present == 'true'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        id: fixturecache
+        with:
+          path: test/e2e/testdata/prepared
+          key: nmcp-e2e-fixtures-v1-${{ hashFiles('test/e2e/testdata/fixtures.json', 'scripts/prepare-e2e-fixtures') }}
+      - name: Cache pinned fixture ffmpeg archive (shared with the test job; re-verified by fetch-pinned-ffmpeg)
+        if: steps.scenario.outputs.present == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .tools/downloads/ffmpeg-6.0.1-amd64-static-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5.tar.xz
+          key: fixture-ffmpeg-linux-amd64-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
+      - name: Prepare issue 21 fixtures
+        if: steps.scenario.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          test -f scripts/prepare-e2e-fixtures || { echo "scripts/prepare-e2e-fixtures is required by ./test/e2e" >&2; exit 1; }
+          # The runner died ~58s into this step in three runs; the trace streams
+          # memory/disk/top-RSS samples to this log so the cause survives.
+          NMCP_E2E_TRACE_INTERVAL=2 scripts/infra-e2e-resource-trace --reclaim-below-gib 20 -- \
+            timeout --kill-after=10s 600s python3 -I scripts/prepare-e2e-fixtures --out test/e2e/testdata/prepared
+      - name: Save prepared E2E fixture cache
+        if: steps.scenario.outputs.present == 'true' && steps.fixturecache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: test/e2e/testdata/prepared
+          key: nmcp-e2e-fixtures-v1-${{ hashFiles('test/e2e/testdata/fixtures.json', 'scripts/prepare-e2e-fixtures') }}
+      - name: Run issue 21 scenario
+        if: steps.scenario.outputs.present == 'true'
+        env:
+          NMCP_E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-results/scenario
+          NMCP_E2E_TIMEOUT_SECONDS: "1260"
+        run: >-
+          scripts/infra-e2e-env lane --
+          "$RUNNER_TEMP/nmcp-e2e.test" -test.v -test.count=1 -test.timeout=20m
+      - name: Upload E2E results
+        if: always() && steps.scenario.outputs.present == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-scenario-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-results
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Always remove E2E resources
+        if: always() && steps.scenario.outputs.present == 'true'
+        run: scripts/infra-e2e-env reset
+
+  compose-e2e-failpoints:
+    name: Infra / Compose E2E issue 21 failpoints
+    runs-on: ubuntu-24.04
+    # Must equal NMCP_E2E_BUDGET_JOB_SECONDS. 8 worker failpoints each wait
+    # out the real 2-minute lease; the scenario needs ~30-35 min plus a cold
+    # image build, so 60 minutes cannot admit it (decided: single 80-minute job).
+    timeout-minutes: 80
+    permissions:
+      contents: read
+      actions: read  # Budget admission reads only this run's own job identity.
+    env:
+      GOTOOLCHAIN: local
+      NMCP_E2E_BUDGET_JOB_NAME: Infra / Compose E2E issue 21 failpoints
+      NMCP_E2E_BUDGET_JOB_SECONDS: "4800"
+      NMCP_E2E_BUDGET_CLEANUP_SECONDS: "300"
+      NMCP_E2E_BUDGET_MARGIN_SECONDS: "60"
+      NMCP_E2E_BUDGET_RUN_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Detect issue 21 scenario
+        id: scenario
+        run: |
+          if [ ! -d test/e2e ]; then
+            # Reviewer N11b: an absent scenario must fail, never look green.
+            echo "::error title=#21 scenario absent::./test/e2e does not exist; this job cannot provide #21 failpoint acceptance."
+            echo "present=false" >>"$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "present=true" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Install Go
+        if: steps.scenario.outputs.present == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.1
+          cache: true
+      - name: Build issue 21 scenario
+        if: steps.scenario.outputs.present == 'true'
+        run: |
+          go test -c -tags nmcp_failpoints_e2e -o "$RUNNER_TEMP/nmcp-e2e.test" ./test/e2e
+          "$RUNNER_TEMP/nmcp-e2e.test" -test.list '.*' | grep -q . || { echo "scenario has no tests" >&2; exit 1; }
+      - name: Acquire identity-bound job budget receipt
+        if: steps.scenario.outputs.present == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/infra-e2e-budget-acquire 3960
+      - name: Restore prepared E2E fixture cache (untrusted; re-verified against pins)
+        if: steps.scenario.outputs.present == 'true'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        id: fixturecache
+        with:
+          path: test/e2e/testdata/prepared
+          key: nmcp-e2e-fixtures-v1-${{ hashFiles('test/e2e/testdata/fixtures.json', 'scripts/prepare-e2e-fixtures') }}
+      - name: Cache pinned fixture ffmpeg archive (shared with the test job; re-verified by fetch-pinned-ffmpeg)
+        if: steps.scenario.outputs.present == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .tools/downloads/ffmpeg-6.0.1-amd64-static-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5.tar.xz
+          key: fixture-ffmpeg-linux-amd64-28268bf402f1083833ea269331587f60a242848880073be8016501d864bd07a5
+      - name: Prepare issue 21 fixtures
+        if: steps.scenario.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          test -f scripts/prepare-e2e-fixtures || { echo "scripts/prepare-e2e-fixtures is required by ./test/e2e" >&2; exit 1; }
+          # The runner died ~58s into this step in three runs; the trace streams
+          # memory/disk/top-RSS samples to this log so the cause survives.
+          NMCP_E2E_TRACE_INTERVAL=2 scripts/infra-e2e-resource-trace --reclaim-below-gib 20 -- \
+            timeout --kill-after=10s 600s python3 -I scripts/prepare-e2e-fixtures --out test/e2e/testdata/prepared
+      - name: Save prepared E2E fixture cache
+        if: steps.scenario.outputs.present == 'true' && steps.fixturecache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: test/e2e/testdata/prepared
+          key: nmcp-e2e-fixtures-v1-${{ hashFiles('test/e2e/testdata/fixtures.json', 'scripts/prepare-e2e-fixtures') }}
+      - name: Run issue 21 scenario
+        if: steps.scenario.outputs.present == 'true'
+        env:
+          NMCP_E2E_ARTIFACT_DIR: ${{ runner.temp }}/e2e-results/failpoints
+          NMCP_E2E_LANE: failpoints
+          NMCP_E2E_TIMEOUT_SECONDS: "2580"
+        run: >-
+          scripts/infra-e2e-env lane --
+          "$RUNNER_TEMP/nmcp-e2e.test" -test.v -test.count=1 -test.timeout=40m
+      - name: Upload E2E results
+        if: always() && steps.scenario.outputs.present == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-failpoints-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/e2e-results
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Always remove E2E resources
+        if: always() && steps.scenario.outputs.present == 'true'
+        env:
+          NMCP_E2E_LANE: failpoints
+        run: scripts/infra-e2e-env reset

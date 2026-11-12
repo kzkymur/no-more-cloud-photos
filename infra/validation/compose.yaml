@@ -39,6 +39,9 @@ services:
       context: ../..
       dockerfile: infra/validation/core.Dockerfile
     command: ["nmcp-admin", "migrate", "up", "--json"]
+    # Root (#21 B2): nmcp-admin refuses a migrator session unless euid is 0,
+    # like production's root migration unit. The image default is uid 10001.
+    user: "0:0"
     environment: &common-environment
       NMCP_DATABASE_URL: postgres://nmcp_migrator:nmcp-migrator-validation-only@postgres:5432/nmcp?sslmode=disable
       NMCP_LOG_LEVEL: info

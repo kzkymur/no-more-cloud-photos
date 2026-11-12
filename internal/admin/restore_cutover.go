@@ -634,7 +634,7 @@ func rewriteCutoverPassTo(b []byte, source, candidate, role, host string, port u
 }
 
 func cutoverHBA(b []byte, op RestoreOperation) []byte {
-	roles := "nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator"
+	roles := "nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair"
 	var out strings.Builder
 	fmt.Fprintf(&out, "# nmcp explicit cutover %s; source remains fenced\n", op.ID)
 	databases := []string{op.Source.DatabaseName, op.Candidate.DatabaseName}
@@ -868,8 +868,7 @@ func (a *systemCutover) Stop(ctx context.Context) error {
 	if a.offline != nil && VerifyOfflineSourceFence(ctx, *a.offline) != nil {
 		return errCutover
 	}
-	var count int
-	if a.observer().QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE usename IN ('nmcp_api','nmcp_worker','nmcp_backup_dump','nmcp_backup_control')`).Scan(&count) != nil || count != 0 {
+	if count, err := fencedSessionCount(ctx, a.observer(), 0); err != nil || count != 0 {
 		return errCutover
 	}
 	return nil
@@ -1161,8 +1160,7 @@ func (a *systemCutover) verifyLiveOnce(ctx context.Context, op RestoreOperation)
 			return e
 		}
 	}
-	var count int
-	if a.observer().QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE usename IN ('nmcp_api','nmcp_worker','nmcp_backup_dump','nmcp_backup_control') AND datid<>$1`, op.Candidate.DatabaseOID).Scan(&count) != nil || count != 0 {
+	if count, err := fencedSessionCount(ctx, a.observer(), op.Candidate.DatabaseOID); err != nil || count != 0 {
 		return errCutover
 	}
 	for _, p := range []*pgxpool.Pool{a.source, a.target} {
@@ -1233,7 +1231,16 @@ func cutoverTargetGrants(database string) (string, error) {
 		return "", errCutover
 	}
 	name := pgx.Identifier{database}.Sanitize()
-	return "REVOKE CONNECT,TEMPORARY ON DATABASE " + name + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + name + " TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump", nil
+	// The reconciliation capability logins (review B1) are optional in a
+	// cluster (restoreOptionalLogins), so they get CONNECT only when present;
+	// without it check, repair and maintenance resume could never reach the
+	// restored database.
+	optional := ""
+	for _, login := range restoreOptionalLogins {
+		optional += " IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='" + login.login + "') THEN EXECUTE " +
+			"'GRANT CONNECT ON DATABASE " + strings.ReplaceAll(name, "'", "''") + " TO " + login.login + "'; END IF;"
+	}
+	return "REVOKE CONNECT,TEMPORARY ON DATABASE " + name + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + name + " TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump; DO $nmcp_cutover$ BEGIN" + optional + " END $nmcp_cutover$", nil
 }
 
 // Runtime processes must use the same FS namespace that Restore actually
@@ -1289,6 +1296,21 @@ func validPriorCutoverApp(value, suffix string) bool {
 	}
 	expanded := id[:8] + "-" + id[8:12] + "-" + id[12:16] + "-" + id[16:20] + "-" + id[20:]
 	return uuidPattern.MatchString(expanded)
+}
+
+// cutoverFencedLogins are every routine login that must have no live session
+// while the source is fenced: API, Worker, both backup roles, and the
+// reconciliation capability logins (a check or repair run would otherwise
+// keep reading or mutating the database being replaced).
+var cutoverFencedLogins = []string{"nmcp_api", "nmcp_worker", "nmcp_backup_dump", "nmcp_backup_control", "nmcp_check", "nmcp_repair"}
+
+// fencedSessionCount counts live sessions of the fenced logins, excluding the
+// candidate database when exceptDatabaseOID is non-zero.
+func fencedSessionCount(ctx context.Context, p *pgxpool.Pool, exceptDatabaseOID uint32) (int, error) {
+	var count int
+	err := p.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE usename=ANY($1::text[]) AND ($2::oid=0 OR datid<>$2::oid)`,
+		cutoverFencedLogins, exceptDatabaseOID).Scan(&count)
+	return count, err
 }
 
 func (a *systemCutover) observer() *pgxpool.Pool {

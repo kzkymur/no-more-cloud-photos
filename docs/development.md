@@ -175,6 +175,49 @@ database context to requeue only a still-live lease with `worker_shutdown`
 before closing dependencies. A lost or exactly expired token never writes an
 error or state.
 
+## Crash-point injection
+
+`internal/failpoint` lets the end-to-end lane kill the real API and Worker
+processes at named crash boundaries and then prove restart reconciliation.
+Points exist only in binaries built with `-tags nmcp_failpoints`; those images
+are for the crash lane only. A tagged process reads `NMCP_FAILPOINT` once at
+startup as `NAME` or `NAME@N` (fire on the Nth hit of that point, default 1);
+an unknown name or malformed ordinal exits 2 before anything else starts. When
+the armed hit is reached the process writes `nmcp-failpoint fired NAME` to
+stderr and sends itself SIGKILL: no fsync, deferred cleanup, response or
+graceful shutdown. Restart the process without `NMCP_FAILPOINT` (or with a
+different point) to observe recovery. Untagged builds compile `failpoint.Hit`
+to an empty inlined function and the linker drops the package, so release
+binaries carry no point names, environment read or exit path.
+`scripts/check-release-no-failpoints [--go GO | --bytes-only] [--source-root DIR] BINARY...`
+(for example `bin/core-api bin/core-worker bin/nmcp-admin`) gates release binaries
+(strings, point names, the package path in pclntab, which survives `-s -w`, and
+`go tool nm` symbols); `scripts/test-check-release-no-failpoints` proves it
+accepts untagged and rejects tagged `core-api` builds. `--bytes-only` skips `go tool
+nm` for hosts without Go; `scripts/install-ubuntu-release` runs it on the
+shipped `bin/` in both `stage` and `activate`/`rollback`.
+
+| Point | Process | Exact boundary |
+| --- | --- | --- |
+| `upload.before_original_publish` | API | Temp written, fsynced, sealed and probed; acceptance transaction holds its locks; before the original rename. |
+| `upload.after_original_publish` | API | After the original rename and final directory fsync; acceptance transaction not committed. |
+| `upload.after_db_commit` | API | After a new (201, not replayed) acceptance commit; before the HTTP response is written. |
+| `rendition.before_file_publish` | Worker | Rendition temp produced; publication transaction holds Media/Job/Target locks; before temp fsync, validation and rename. |
+| `rendition.after_file_publish` | Worker | After the rendition rename and final directory fsync; rendition row, Target and Job transaction not committed. |
+| `rendition.after_db_commit` | Worker | After that transaction commits (Target succeeded, and the Job for its last Target); before the next Target or the Job result returns to the Worker loop. |
+| `purge.after_start` | Worker | Purge lease and file manifest committed; before any file deletion. |
+| `purge.after_file_delete` | Worker | One manifest file deleted (unlink and directory fsync) or found missing; its progress row not committed. Renditions go first, the Original last. |
+| `purge.after_file_step` | Worker | One file's progress row committed; before the next file step. |
+| `purge.before_finalize` | Worker | Every manifest file done; before the Media deletion, tombstone and Job success transaction. |
+| `purge.after_finalize` | Worker | After that transaction commits; before the executor returns. |
+
+With `@N`, count hits per process: for example a Media with two renditions hits
+`purge.after_file_delete` for its Original on hit 3. The storage
+`Options.Faults` injector stays unwired in API and Worker: its boundaries are
+shared by Originals, Renditions, quarantine and repair and do not identify the
+upload, publish and purge steps above, which the explicit points already cover
+at the same rename/fsync/commit edges.
+
 ## Job lease and process boundary
 
 `internal/job` claims only registered transform work in a short PostgreSQL
@@ -244,7 +287,10 @@ MIME/source/output kind, maximum edge, and quality/CRF range. A database
 certification is deployment compatibility metadata, not proof that a particular
 Worker process has its binary/plugin/codec. The Worker therefore performs all
 three runtime capability probes and refuses registration on any claimable recipe
-mismatch. Migration application alone never certifies a capability.
+mismatch. Migration application alone never certifies a capability. The only
+supported writer is `nmcp-admin profile certify` (core API contract section 10
+and `docs/ubuntu-deployment.md`), which runs the real processors on operator
+fixtures and inserts all rows for one draft or none.
 
 ## Metadata probe boundary
 
@@ -258,9 +304,19 @@ Detection never consumes a multipart MIME declaration or filename. It performs
 at most 1 MiB of cumulative structural reads of JPEG/PNG/GIF/WebP/BMP, RAF, TIFF-derived RAW, and
 ISO-BMFF/legacy QuickTime headers. Generic TIFF, vendor-name-only TIFF, invalid
 offsets/lengths/loops, and contradictory BMFF brands are not coerced into a
-registered MIME. HEIF/HEIC sequence brands are rejected, including files that
-mix still and sequence compatibility, because the closed registry contains no
-sequence MIME. Header recognition proves only a candidate container/family;
+registered MIME. A HEIF/HEIC file whose brands are sequence-only is rejected,
+because the closed registry contains no sequence MIME. A file that carries a
+still-image structural brand (`mif1`, `heif`, or the `heic` family) alongside a
+sequence brand is still-image capable under ISO/IEC 23008-12 and is classified
+as still by its brands; its primary item is decoded by the bounded probe and
+processors, which reject a file without one. (This replaced an earlier #7 rule
+that rejected such mixed files, found by the #21 release gate because libheif
+and phones write them.) Contradictory brand sets remain rejected. This
+deliberately includes a HEIF still brand combined with an MP4/QuickTime/CR3
+container brand (for example Nokia conformance `C049.heic`: `mif1` plus
+`mp42`/`isom`): the registry cannot tell which container semantics apply, so
+it fails closed rather than guessing. Real-device HEIC/HEIF acceptance,
+including any phone file that hits this edge, is on the #22 checklist. Header recognition proves only a candidate container/family;
 ExifTool/FFprobe must still extract valid dimensions and video duration, and
 issues #11–#13 remain responsible for codec/transform runtime capability.
 

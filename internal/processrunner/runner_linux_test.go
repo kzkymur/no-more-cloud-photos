@@ -23,6 +23,8 @@ func TestRunnerValidatesConfigurationAndCommands(t *testing.T) {
 		{path: "prlimit", limits: valid},
 		{path: "/usr/bin/../bin/prlimit", limits: valid},
 		{path: "/usr/bin/prlimit", limits: Limits{}},
+		{path: "/usr/bin/prlimit", limits: Limits{Timeout: time.Second, AddressSpaceBytes: 1 << 30, OutputBytesPerStream: 1024, RunAs: &RunAs{UID: 0, GID: 1}}},
+		{path: "/usr/bin/prlimit", limits: Limits{Timeout: time.Second, AddressSpaceBytes: 1 << 30, OutputBytesPerStream: 1024, RunAs: &RunAs{UID: 1, GID: 0}}},
 	} {
 		if _, err := New(test.path, test.limits); !errors.Is(err, ErrInvalid) {
 			t.Errorf("New(%q, %+v) error = %v", test.path, test.limits, err)
@@ -145,4 +147,33 @@ func assertGone(t *testing.T, pid int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("escaped descendant %d still exists", pid)
+}
+
+// TestRunnerRunAsDropsIdentity proves RunAs reaches the tool process. It needs
+// root to change identity; the L3 release lane asserts it as root again.
+func TestRunnerRunAsDropsIdentity(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("identity drop needs root; asserted in the root L3 release lane")
+	}
+	runner, err := New("/usr/bin/prlimit", Limits{Timeout: 10 * time.Second, AddressSpaceBytes: 1 << 30, OutputBytesPerStream: 1024, RunAs: &RunAs{UID: 65534, GID: 65534}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := runner.Run(context.Background(), Command{Executable: "/usr/bin/id", Arguments: []string{"-u"}})
+	if err != nil || strings.TrimSpace(string(output.Stdout)) != "65534" {
+		t.Fatalf("tool uid = %q, %v", output.Stdout, err)
+	}
+}
+
+// TestRunnerToolHasNoNewPrivs pins review K4: every tool process runs with
+// no_new_privs set by the supervisor.
+func TestRunnerToolHasNoNewPrivs(t *testing.T) {
+	runner, err := New("/usr/bin/prlimit", Limits{Timeout: 10 * time.Second, AddressSpaceBytes: 1 << 30, OutputBytesPerStream: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := runner.Run(context.Background(), Command{Executable: "/usr/bin/grep", Arguments: []string{"^NoNewPrivs:", "/proc/self/status"}})
+	if err != nil || strings.Join(strings.Fields(string(output.Stdout)), " ") != "NoNewPrivs: 1" {
+		t.Fatalf("tool status = %q, %v", output.Stdout, err)
+	}
 }

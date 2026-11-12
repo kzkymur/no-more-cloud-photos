@@ -19,7 +19,7 @@ or transform every camera/codec variant.
 | `Nikon.nef` | `image/x-nikon-nef` | `6fae30a2809b52ece100316f33a3fade4b65cf5690af2d62bb00f44ae052bdd6` |
 | `Panasonic.rw2` | `image/x-panasonic-rw2` | `431a1239713ce1bca8f0b422b9a094372246669432060e2a0a21d1fd2f761678` |
 | `PNG.png` | `image/png` | `45f0bd6bd3c85cf8c79028dee8f0de5cd470eb3b0124d2c7559f0dd3de24a288` |
-| `QuickTime.heic` | rejection evidence (`mif1` major brand mixes still `heic` and sequence `hevc` compatibility) | `4e1785e9924600d0274176f52609a2d514481877103b91c714bd2088ea803ae7` |
+| `QuickTime.heic` | `image/heif` (`mif1` major brand with still `heic` and sequence `hevc` compatibility; still-image capable per ISO/IEC 23008-12, #21 regression evidence) | `4e1785e9924600d0274176f52609a2d514481877103b91c714bd2088ea803ae7` |
 | `QuickTime.mov` | `video/quicktime` | `eea529609b6026e0cd7b3d9188b997889f905cd89a93421ad7a9063c670449ec` |
 | `RIFF.webp` | `image/webp` | `054fb882674304992a0af031a77df061c3f802c30891dbb8bc2d16e41213767d` |
 

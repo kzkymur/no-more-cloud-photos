@@ -90,15 +90,37 @@ func TestParseLimitsExactPlusOneAndOverflow(t *testing.T) {
 	}
 }
 
-func TestPrimarySelectionDefaultThenIndexExcludesAttachedPicture(t *testing.T) {
-	streams := []probeStream{
-		{Index: 0, CodecType: "video", Disposition: disposition(1, 1)},
-		{Index: 4, CodecType: "video", Disposition: disposition(1, 0)},
-		{Index: 2, CodecType: "video", Disposition: disposition(1, 0)},
-		{Index: 1, CodecType: "video"},
+// TestPrimaryVideoSelectionMatchesUploadRule pins review N7: the helper picks
+// exactly the stream internal/metadata primaryVideoStream records at upload.
+func TestPrimaryVideoSelectionMatchesUploadRule(t *testing.T) {
+	video := func(index, width, height int, d streamDisposition) probeStream {
+		return probeStream{Index: index, CodecType: "video", Width: width, Height: height, Disposition: d}
 	}
-	if got, ok := selectStream(streams, "video"); !ok || got != 2 {
-		t.Fatalf("selected %d, %t", got, ok)
+	for _, test := range []struct {
+		name    string
+		streams []probeStream
+		want    int
+		ok      bool
+	}{
+		{"default before index", []probeStream{video(0, 1920, 1080, disposition(1, 1)), video(4, 640, 480, disposition(1, 0)),
+			video(2, 640, 480, disposition(1, 0)), video(1, 1920, 1080, disposition(0, 0))}, 2, true},
+		{"default beats a larger non-default", []probeStream{video(0, 3840, 2160, disposition(0, 0)), video(1, 640, 480, disposition(1, 0))}, 1, true},
+		{"larger area among equal defaults", []probeStream{video(0, 640, 480, disposition(0, 0)), video(1, 1920, 1080, disposition(0, 0))}, 1, true},
+		{"lowest index among equal area", []probeStream{video(3, 1280, 720, disposition(0, 0)), video(1, 1280, 720, disposition(0, 0))}, 1, true},
+		{"still_image is auxiliary", []probeStream{video(0, 4000, 3000, streamDisposition{Default: 1, StillImage: 1}), video(1, 640, 480, disposition(0, 0))}, 1, true},
+		{"timed thumbnails are auxiliary", []probeStream{video(0, 4000, 3000, streamDisposition{Default: 1, TimedThumbnails: 1}), video(2, 640, 480, disposition(0, 0))}, 2, true},
+		{"zero dimensions are skipped", []probeStream{video(0, 0, 0, disposition(1, 0)), video(1, 640, 480, disposition(0, 0))}, 1, true},
+		{"only auxiliary streams", []probeStream{video(0, 640, 480, disposition(1, 1))}, 0, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, ok := selectStream(test.streams, "video"); ok != test.ok || ok && got != test.want {
+				t.Fatalf("selected %d, %t; want %d, %t", got, ok, test.want, test.ok)
+			}
+		})
+	}
+	audio := []probeStream{{Index: 5, CodecType: "audio"}, {Index: 3, CodecType: "audio", Disposition: disposition(1, 0)}, {Index: 2, CodecType: "audio"}}
+	if got, ok := selectStream(audio, "audio"); !ok || got != 3 {
+		t.Fatalf("audio selected %d, %t; want default 3", got, ok)
 	}
 }
 
@@ -506,16 +528,8 @@ func probeJSON(codec, pixFmt string, width, height int, audio bool) []byte {
 	return encoded
 }
 
-func disposition(defaultValue, attached int) struct {
-	Default         int `json:"default"`
-	AttachedPic     int `json:"attached_pic"`
-	TimedThumbnails int `json:"timed_thumbnails"`
-} {
-	return struct {
-		Default         int `json:"default"`
-		AttachedPic     int `json:"attached_pic"`
-		TimedThumbnails int `json:"timed_thumbnails"`
-	}{defaultValue, attached, 0}
+func disposition(defaultValue, attached int) streamDisposition {
+	return streamDisposition{Default: defaultValue, AttachedPic: attached}
 }
 
 func intPointer(value int) *int { return &value }
@@ -600,5 +614,105 @@ func symlink(t *testing.T, oldname, newname string) {
 	t.Helper()
 	if err := os.Symlink(oldname, newname); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestInspectInfersUntaggedSDRColor pins the customer decision for untagged
+// SDR video: conventional inference only for provably 8-bit SDR streams whose
+// declared fields do not conflict; tagged input is unchanged.
+func TestInspectInfersUntaggedSDRColor(t *testing.T) {
+	untagged := map[string]interface{}{"color_primaries": nil, "color_transfer": nil, "color_space": nil, "color_range": nil}
+	for _, test := range []struct {
+		name          string
+		pixFmt, bits  string
+		width, height int
+		color         map[string]interface{}
+		sideData      []interface{}
+		wantErr       bool
+		want          [4]string
+		wantInferred  bool
+	}{
+		{name: "untagged 1080p 8-bit is BT.709 limited", pixFmt: "yuv420p", bits: "8", width: 1920, height: 1080, color: untagged,
+			want: [4]string{"bt709", "bt709", "bt709", "limited"}, wantInferred: true},
+		{name: "unknown strings are unspecified too", pixFmt: "yuv420p", bits: "8", width: 1280, height: 720,
+			color: map[string]interface{}{"color_primaries": "unknown", "color_transfer": "unknown", "color_space": "unknown", "color_range": "unknown"},
+			want:  [4]string{"bt709", "bt709", "bt709", "limited"}, wantInferred: true},
+		{name: "untagged SD is the BT.601 matrix", pixFmt: "yuv420p", bits: "8", width: 640, height: 480, color: untagged,
+			want: [4]string{"bt709", "bt709", "smpte170m", "limited"}, wantInferred: true},
+		{name: "partial non-conflicting tags keep the declared range", pixFmt: "yuv420p", bits: "8", width: 1920, height: 1080,
+			color: map[string]interface{}{"color_primaries": "bt709", "color_transfer": nil, "color_space": nil, "color_range": "pc"},
+			want:  [4]string{"bt709", "bt709", "bt709", "full"}, wantInferred: true},
+		{name: "untagged 10-bit stays refused", pixFmt: "yuv420p10le", bits: "10", width: 1920, height: 1080, color: untagged, wantErr: true},
+		{name: "untagged without bit depth proof stays refused", pixFmt: "", bits: "", width: 1920, height: 1080, color: untagged, wantErr: true},
+		{name: "partial PQ transfer stays refused", pixFmt: "yuv420p", bits: "8", width: 1920, height: 1080,
+			color: map[string]interface{}{"color_primaries": nil, "color_transfer": "smpte2084", "color_space": nil, "color_range": nil}, wantErr: true},
+		{name: "partial BT.2020 primaries stay refused", pixFmt: "yuv420p", bits: "8", width: 1920, height: 1080,
+			color: map[string]interface{}{"color_primaries": "bt2020", "color_transfer": nil, "color_space": nil, "color_range": nil}, wantErr: true},
+		{name: "partial matrix conflicting with the inferred one stays refused", pixFmt: "yuv420p", bits: "8", width: 640, height: 480,
+			color: map[string]interface{}{"color_primaries": nil, "color_transfer": nil, "color_space": "bt709", "color_range": nil}, wantErr: true},
+		{name: "untagged with HDR mastering side data stays refused", pixFmt: "yuv420p", bits: "8", width: 1920, height: 1080, color: untagged,
+			sideData: []interface{}{map[string]interface{}{"side_data_type": "Mastering display metadata", "max_luminance": "10000000/10000"}}, wantErr: true},
+		// Review N4: HD is width >= 1280 or height > 576; SD otherwise.
+		{name: "untagged 1280x544 scope is HD by width", pixFmt: "yuv420p", bits: "8", width: 1280, height: 544, color: untagged,
+			want: [4]string{"bt709", "bt709", "bt709", "limited"}, wantInferred: true},
+		{name: "untagged 768x600 is HD by height", pixFmt: "yuv420p", bits: "8", width: 768, height: 600, color: untagged,
+			want: [4]string{"bt709", "bt709", "bt709", "limited"}, wantInferred: true},
+		{name: "untagged 720x576 is SD", pixFmt: "yuv420p", bits: "8", width: 720, height: 576, color: untagged,
+			want: [4]string{"bt709", "bt709", "smpte170m", "limited"}, wantInferred: true},
+		{name: "untagged 960x540 is SD", pixFmt: "yuv420p", bits: "8", width: 960, height: 540, color: untagged,
+			want: [4]string{"bt709", "bt709", "smpte170m", "limited"}, wantInferred: true},
+		{name: "untagged yuvj420p is full range, never limited", pixFmt: "yuvj420p", bits: "8", width: 640, height: 480, color: untagged,
+			want: [4]string{"bt709", "bt709", "smpte170m", "full"}, wantInferred: true},
+		{name: "yuvj420p declaring limited range is refused", pixFmt: "yuvj420p", bits: "8", width: 640, height: 480,
+			color: map[string]interface{}{"color_primaries": nil, "color_transfer": nil, "color_space": nil, "color_range": "tv"}, wantErr: true},
+		{name: "yuvj420p declaring full range keeps it", pixFmt: "yuvj420p", bits: "8", width: 640, height: 480,
+			color: map[string]interface{}{"color_primaries": nil, "color_transfer": nil, "color_space": nil, "color_range": "pc"}, want: [4]string{"bt709", "bt709", "smpte170m", "full"}, wantInferred: true},
+		{name: "fully tagged BT.709 is unchanged", pixFmt: "yuv420p", bits: "8", width: 1920, height: 1080,
+			color: map[string]interface{}{"color_primaries": "bt709", "color_transfer": "bt709", "color_space": "bt709", "color_range": "tv"},
+			want:  [4]string{"bt709", "bt709", "bt709", "limited"}},
+		{name: "fully tagged unsupported transfer is still refused", pixFmt: "yuv420p", bits: "8", width: 1920, height: 1080,
+			color: map[string]interface{}{"color_primaries": "bt709", "color_transfer": "smpte170m", "color_space": "bt709", "color_range": "tv"}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var document map[string]interface{}
+			if err := json.Unmarshal(probeJSON("h264", test.pixFmt, test.width, test.height, false), &document); err != nil {
+				t.Fatal(err)
+			}
+			stream := document["streams"].([]interface{})[0].(map[string]interface{})
+			stream["bits_per_raw_sample"] = test.bits
+			if test.bits == "" {
+				delete(stream, "bits_per_raw_sample")
+			}
+			for key, value := range test.color {
+				if value == nil {
+					delete(stream, key)
+				} else {
+					stream[key] = value
+				}
+			}
+			if test.sideData != nil {
+				stream["side_data_list"] = test.sideData
+			}
+			metadata, _ := json.Marshal(document)
+			frames := frameJSON(0, test.width, test.height, frameTiming{0, 40}, frameTiming{40, 40})
+			e := engine{ffprobe: "/p/ffprobe", run: &fakeRunner{runs: [][]byte{metadata}, streams: []string{frames}}}
+			got, _, err := e.inspect("input", "video/mp4", nil, maxLimits())
+			if test.wantErr {
+				if !isCode(err, "unsupported_input") {
+					t.Fatalf("error = %v, want unsupported_input (got %+v)", err, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if [4]string{got.ColorPrimaries, got.ColorTransfer, got.ColorMatrix, got.ColorRange} != test.want || got.ColorInferred != test.wantInferred || got.HDR {
+				t.Fatalf("color = %s/%s/%s/%s inferred=%v hdr=%v", got.ColorPrimaries, got.ColorTransfer, got.ColorMatrix, got.ColorRange, got.ColorInferred, got.HDR)
+			}
+			filter := filterGraph(got, 1280, 720, 10, "mp4-av1")
+			if test.wantInferred != strings.Contains(filter, "primariesin=") || test.wantInferred != strings.HasPrefix(inputColor(got), "inferred:") {
+				t.Fatalf("inferred source not stated explicitly: filter=%s input_color=%s", filter, inputColor(got))
+			}
+		})
 	}
 }

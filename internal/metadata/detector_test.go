@@ -372,19 +372,46 @@ func TestDetectBMFFRequiresSpecificRegisteredEvidence(t *testing.T) {
 		t.Fatalf("ftyp-less moov error = %v, want unsupported", err)
 	}
 
+	// Sequence-only brand sets stay unsupported.
 	for _, brand := range []string{"hevc", "hevx", "hevm", "hevs", "msf1"} {
-		for _, data := range [][]byte{ftypFixture(brand, "mif1"), ftypFixture("mif1", brand)} {
+		for _, data := range [][]byte{ftypFixture(brand), ftypFixture(brand, "isom"), ftypFixture("msf1", brand)} {
 			if _, err := Detect(bytes.NewReader(data), int64(len(data))); !errors.Is(err, ErrUnsupportedMediaType) {
-				t.Errorf("sequence brand %q error = %v, want unsupported", brand, err)
+				t.Errorf("sequence-only brand %q error = %v, want unsupported", brand, err)
 			}
 		}
 	}
-	ambiguousFixture, err := os.ReadFile(filepath.Join("testdata", "QuickTime.heic"))
+	// #21 release-gate regression of #7: a still-image brand alongside a
+	// sequence brand (ISO/IEC 23008-12 still+sequence files, as written by
+	// libheif and phones) is still-image capable and classifies by brand.
+	for _, brand := range []string{"hevc", "hevx", "hevm", "hevs", "msf1"} {
+		for _, c := range []struct {
+			data []byte
+			want string
+		}{
+			{ftypFixture("mif1", brand), "image/heif"},
+			{ftypFixture(brand, "mif1"), "image/heif"},
+			{ftypFixture("mif1", "heic", brand), "image/heif"},
+			{ftypFixture("heic", "mif1", brand), "image/heic"},
+			{ftypFixture(brand, "mif1", "heic"), "image/heic"},
+		} {
+			got, err := Detect(bytes.NewReader(c.data), int64(len(c.data)))
+			if err != nil || got.Format.MIMEType != c.want {
+				t.Errorf("still+sequence brands %q = (%+v, %v), want %s", c.data[8:], got, err, c.want)
+			}
+		}
+	}
+	// Contradictory brands remain fail-closed even with a sequence brand.
+	for _, data := range [][]byte{ftypFixture("heic", "heif", "hevc"), ftypFixture("mif1", "crx ", "hevc"), ftypFixture("hevc", "qt  "), ftypFixture("msf1", "mp42")} {
+		if _, err := Detect(bytes.NewReader(data), int64(len(data))); err == nil {
+			t.Errorf("contradictory brands %q accepted", data[8:])
+		}
+	}
+	mixedFixture, err := os.ReadFile(filepath.Join("testdata", "QuickTime.heic"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Detect(bytes.NewReader(ambiguousFixture), int64(len(ambiguousFixture))); !errors.Is(err, ErrUnsupportedMediaType) {
-		t.Fatalf("still/sequence-compatible HEIF fixture error = %v, want unsupported", err)
+	if got, err := Detect(bytes.NewReader(mixedFixture), int64(len(mixedFixture))); err != nil || got.Format.MIMEType != "image/heif" {
+		t.Fatalf("real mif1+heic+hevc still HEIF fixture = (%+v, %v), want image/heif", got, err)
 	}
 
 	legacySpoofPayload := append(bmffBox("mvhd", make([]byte, 20)), bmffBox("trak", nil)...)

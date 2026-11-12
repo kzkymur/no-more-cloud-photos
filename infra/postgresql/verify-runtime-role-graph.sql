@@ -41,6 +41,23 @@ BEGIN
             RAISE EXCEPTION 'unsafe PostgreSQL login role attributes: %', role_name;
         END IF;
     END LOOP;
+    -- Operational check/repair logins are optional, but when present they are
+    -- plain LOGIN INHERIT roles (their single capability edge is checked below).
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles
+        WHERE rolname IN ('nmcp_check','nmcp_repair')
+          AND (NOT rolcanlogin OR NOT rolinherit OR rolsuper OR rolcreatedb
+               OR rolcreaterole OR rolreplication OR rolbypassrls
+               OR rolconnlimit <> -1 OR rolconfig IS NOT NULL)
+    ) OR EXISTS (
+        -- Per-database role settings (ALTER ROLE ... IN DATABASE ... SET) are
+        -- not visible in rolconfig; reject them in every database.
+        SELECT 1 FROM pg_catalog.pg_db_role_setting AS setting
+        JOIN pg_catalog.pg_roles AS r ON r.oid=setting.setrole
+        WHERE r.rolname IN ('nmcp_check','nmcp_repair')
+    ) THEN
+        RAISE EXCEPTION 'unsafe operational check/repair login attributes';
+    END IF;
 END;
 $$;
 
@@ -58,6 +75,8 @@ BEGIN
             ('nmcp_migrator'::pg_catalog.regrole::oid),
             ('nmcp_api'::pg_catalog.regrole::oid),
             ('nmcp_worker'::pg_catalog.regrole::oid)
+            UNION ALL
+            SELECT oid FROM pg_catalog.pg_roles WHERE rolname IN ('nmcp_check','nmcp_repair')
         ), allowed(roleid,member,admin_option,inherit_option,set_option) AS (VALUES
             ('nmcp_runtime'::pg_catalog.regrole::oid,
              'nmcp_worker_runtime'::pg_catalog.regrole::oid,false,true,false),
@@ -71,6 +90,12 @@ BEGIN
              'nmcp_api'::pg_catalog.regrole::oid,false,true,false),
             ('nmcp_worker_runtime'::pg_catalog.regrole::oid,
              'nmcp_worker'::pg_catalog.regrole::oid,false,true,false)
+            UNION ALL
+            SELECT capability.oid,login.oid,false,true,false
+            FROM (VALUES ('nmcp_check_runtime','nmcp_check'),('nmcp_repair_runtime','nmcp_repair'))
+                AS edge(capability_name,login_name)
+            JOIN pg_catalog.pg_roles AS capability ON capability.rolname=edge.capability_name
+            JOIN pg_catalog.pg_roles AS login ON login.rolname=edge.login_name
         )
         SELECT 1
         FROM pg_catalog.pg_auth_members AS actual
@@ -98,6 +123,12 @@ BEGIN
              'nmcp_api'::pg_catalog.regrole::oid,false,true,false),
             ('nmcp_worker_runtime'::pg_catalog.regrole::oid,
              'nmcp_worker'::pg_catalog.regrole::oid,false,true,false)
+            UNION ALL
+            SELECT capability.oid,login.oid,false,true,false
+            FROM (VALUES ('nmcp_check_runtime','nmcp_check'),('nmcp_repair_runtime','nmcp_repair'))
+                AS edge(capability_name,login_name)
+            JOIN pg_catalog.pg_roles AS capability ON capability.rolname=edge.capability_name
+            JOIN pg_catalog.pg_roles AS login ON login.rolname=edge.login_name
         )
         SELECT 1 FROM allowed
         WHERE NOT EXISTS (

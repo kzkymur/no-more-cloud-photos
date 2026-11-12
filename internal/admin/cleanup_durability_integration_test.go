@@ -69,7 +69,7 @@ func TestAdminIntegrationCleanupLegacyEmptyRunDoesNotStarveNewWork(t *testing.T)
 				cleanupDurabilityExec(t, s, `INSERT INTO admin_cleanup_runs(id,kind) VALUES($1,'media')`, legacyRun)
 			}
 			id := cleanupDurabilityDelete(t, s, lifecycle, 601)
-			result, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+			result, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "media", false)
 			if err != nil || result.RunID == legacyRun || result.Completed != 1 || len(result.IDs) != 1 || result.IDs[0] != id {
 				t.Fatalf("new work starved: result=%+v err=%v", result, err)
 			}
@@ -117,15 +117,15 @@ func TestAdminIntegrationCleanupInterruptedLeaseExpiresAndRecovers(t *testing.T)
 	if err := s.Pool.QueryRow(ctx, `SELECT to_jsonb(j) FROM jobs j WHERE id=$1`, lease.JobID).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	live, err := New(s.Pool).Cleanup(ctx, store, "media", false)
-	if !errors.Is(err, ErrPartial) || live.Failed != 1 || live.Completed != 0 {
+	live, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "media", false)
+	if !errors.Is(err, ErrPartial) || live.Pending != 1 || live.Failed != 0 || live.Completed != 0 {
 		t.Fatalf("live lease cleanup=%+v err=%v", live, err)
 	}
 	if err := s.Pool.QueryRow(ctx, `SELECT to_jsonb(j) FROM jobs j WHERE id=$1`, lease.JobID).Scan(&after); err != nil || !bytes.Equal(before, after) {
 		t.Fatalf("live lease changed: before=%s after=%s err=%v", before, after, err)
 	}
 	cleanupDurabilityExec(t, s, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, lease.JobID)
-	recovered, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	recovered, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "media", false)
 	if errors.Is(err, ErrPartial) {
 		// Native reclaim honors retry backoff; advance eligibility, not leases.
 		var released bool
@@ -134,7 +134,7 @@ func TestAdminIntegrationCleanupInterruptedLeaseExpiresAndRecovers(t *testing.T)
 			t.Fatalf("expired attempt not released=%v err=%v", released, err)
 		}
 		cleanupDurabilityExec(t, s, `UPDATE jobs SET available_at=clock_timestamp() WHERE id=$1`, lease.JobID)
-		recovered, err = New(s.Pool).Cleanup(ctx, store, "media", false)
+		recovered, err = withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "media", false)
 	}
 	if err != nil || recovered.RunID != live.RunID || recovered.Completed != 1 || recovered.Failed != 0 {
 		t.Fatalf("recovery=%+v err=%v", recovered, err)
@@ -185,7 +185,7 @@ func TestAdminIntegrationCleanupRestoreRedeletePinsNewAuthorizationAndAudit(t *t
 	if err != nil || second.Job.ID == first.Job.ID {
 		t.Fatalf("replacement=%+v err=%v", second, err)
 	}
-	skipped, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	skipped, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "media", false)
 	if err != nil || skipped.RunID != oldRun || skipped.Skipped != 1 || skipped.Completed != 0 {
 		t.Fatalf("old authorization=%+v err=%v", skipped, err)
 	}
@@ -201,7 +201,7 @@ func TestAdminIntegrationCleanupRestoreRedeletePinsNewAuthorizationAndAudit(t *t
 	cleanupDurabilityExec(t, s, `CREATE FUNCTION reject_durable_cleanup_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
 		IF NEW.command='cleanup_result' THEN RAISE EXCEPTION 'injected receipt rejection'; END IF; RETURN NEW; END $$;
 		CREATE TRIGGER reject_durable_cleanup_audit BEFORE INSERT ON admin_audit FOR EACH ROW EXECUTE FUNCTION reject_durable_cleanup_audit()`)
-	rejected, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	rejected, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "media", false)
 	if !errors.Is(err, ErrPartial) || rejected.RunID == oldRun || rejected.RunID == "" || rejected.Failed != 1 || rejected.Completed != 0 {
 		t.Fatalf("rejected receipt=%+v err=%v", rejected, err)
 	}
@@ -216,11 +216,11 @@ func TestAdminIntegrationCleanupRestoreRedeletePinsNewAuthorizationAndAudit(t *t
 		t.Fatalf("receipt crash gap lost authorization: recoverable=%v err=%v", recoverable, err)
 	}
 	cleanupDurabilityExec(t, s, `DROP TRIGGER reject_durable_cleanup_audit ON admin_audit`)
-	resumed, err := New(s.Pool).Cleanup(ctx, store, "media", false)
+	resumed, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "media", false)
 	if err != nil || resumed.RunID != rejected.RunID || resumed.Completed != 1 || len(resumed.IDs) != 1 || resumed.IDs[0] != id {
 		t.Fatalf("receipt recovery=%+v err=%v", resumed, err)
 	}
-	if _, err := New(s.Pool).Cleanup(ctx, store, "media", false); err != nil {
+	if _, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "media", false); err != nil {
 		t.Fatal(err)
 	}
 	var receipts, attempts int
@@ -262,7 +262,7 @@ func TestAdminIntegrationCleanupDeleteFailureReleasesAttempt(t *testing.T) {
 	}
 	defer store.Close()
 	failed, err := s.Cleanup(ctx, store, "media", false)
-	if !errors.Is(err, ErrPartial) || failed.Failed != 1 || !faulted {
+	if !errors.Is(err, ErrPartial) || failed.Pending != 1 || !faulted {
 		t.Fatalf("faulted cleanup=%+v injected=%v err=%v", failed, faulted, err)
 	}
 	var released bool
@@ -281,7 +281,7 @@ func TestAdminIntegrationCleanupDeleteFailureReleasesAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clean.Close()
-	resumed, err := New(s.Pool).Cleanup(ctx, clean, "media", false)
+	resumed, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, clean, "media", false)
 	if err != nil || resumed.RunID != failed.RunID || resumed.Completed != 1 {
 		t.Fatalf("released attempt recovery=%+v err=%v", resumed, err)
 	}
@@ -307,7 +307,7 @@ func TestAdminIntegrationCleanupFrozenRenditionBecomesNativeIneligible(t *testin
 	}
 	// A started native purge owns this exact rendition; the frozen CLI run
 	// must close as skipped rather than retry forever or bypass ownership.
-	result, err := New(s.Pool).Cleanup(ctx, store, "renditions", false)
+	result, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, "renditions", false)
 	if err != nil || result.RunID != runID || result.Skipped != 1 || result.Completed != 0 || result.Failed != 0 {
 		t.Fatalf("native takeover cleanup=%+v err=%v", result, err)
 	}
@@ -359,7 +359,7 @@ func TestAdminIntegrationCleanupPhysicalUncertaintyPreservesLiveTokenUntilExpiry
 			}
 			defer faulted.Close()
 			first, err := s.Cleanup(ctx, faulted, "media", false)
-			if !errors.Is(err, ErrPartial) || first.Failed != 1 || first.Completed != 0 || !injected {
+			if !errors.Is(err, ErrPartial) || first.Pending != 1 || first.Completed != 0 || !injected {
 				t.Fatalf("uncertain cleanup=%+v injected=%v err=%v", first, injected, err)
 			}
 			if _, err := os.Stat(fullPath); !errors.Is(err, os.ErrNotExist) {
@@ -387,7 +387,7 @@ func TestAdminIntegrationCleanupPhysicalUncertaintyPreservesLiveTokenUntilExpiry
 				t.Fatal(err)
 			}
 			defer clean.Close()
-			live, err := New(s.Pool).Cleanup(ctx, clean, "media", false)
+			live, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, clean, "media", false)
 			if !errors.Is(err, ErrPartial) || live.RunID != first.RunID || live.Completed != 0 {
 				t.Fatalf("live uncertain lease was stolen=%+v err=%v", live, err)
 			}
@@ -395,7 +395,7 @@ func TestAdminIntegrationCleanupPhysicalUncertaintyPreservesLiveTokenUntilExpiry
 				t.Fatalf("live job mutated before expiry: before=%s after=%s err=%v", before, after, err)
 			}
 			cleanupDurabilityExec(t, s, `UPDATE jobs SET lease_expires_at=clock_timestamp() WHERE id=$1`, jobID)
-			recovered, err := New(s.Pool).Cleanup(ctx, clean, "media", false)
+			recovered, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, clean, "media", false)
 			if errors.Is(err, ErrPartial) {
 				var backoff bool
 				if err := s.Pool.QueryRow(ctx, `SELECT status='queued' AND attempts=1 AND lease_token IS NULL
@@ -403,12 +403,12 @@ func TestAdminIntegrationCleanupPhysicalUncertaintyPreservesLiveTokenUntilExpiry
 					t.Fatalf("exact expiry did not preserve native backoff: %v err=%v", backoff, err)
 				}
 				cleanupDurabilityExec(t, s, `UPDATE jobs SET available_at=clock_timestamp() WHERE id=$1`, jobID)
-				recovered, err = New(s.Pool).Cleanup(ctx, clean, "media", false)
+				recovered, err = withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, clean, "media", false)
 			}
 			if err != nil || recovered.RunID != first.RunID || recovered.Completed != 1 || len(recovered.IDs) != 1 || recovered.IDs[0] != id {
 				t.Fatalf("uncertain missing-file recovery=%+v err=%v", recovered, err)
 			}
-			if _, err := New(s.Pool).Cleanup(ctx, clean, "media", false); err != nil {
+			if _, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, clean, "media", false); err != nil {
 				t.Fatal(err)
 			}
 			var completedOnce bool

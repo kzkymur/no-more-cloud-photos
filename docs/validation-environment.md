@@ -267,7 +267,19 @@ violation rejects the whole cache), and `debootstrap --cache-dir` then fetches a
 fresh signed InRelease (never cached), verifies the Packages index against it and
 verifies each cached file's size and SHA-256 before use, deleting and
 re-downloading any mismatch. A rootfs is never cached or reused. Only a cache
-miss followed by a successful bootstrap exports a candidate for the next run. This configuration is passed only to bootstrap,
+miss followed by a successful bootstrap exports a candidate for the next run.
+The cache is ref-scoped by `actions/cache`, but feature branches can restore the
+default branch's entry, so one successful cold bootstrap on `main` seeds every
+later branch. A cold start is therefore exposed to transient archive connect
+failures: a bootstrap failure classified `connect` during the download/validate
+phase is retried at most three times inside the SAME absolute bootstrap
+deadline (never reset), with at least 60 s remaining, only when nothing is
+mounted beneath the target. Each retry starts from a fresh target (the failed
+root and its provision log are renamed aside, never reused or deleted) and
+reuses the same `--cache-dir`, whose files debootstrap re-verifies against the
+newly fetched signed metadata. Every attempt is logged as a closed
+`Bootstrap attempt` record. DNS, TLS, HTTP, dpkg, disk, timeout and unknown
+failures are not retried. This configuration is passed only to bootstrap,
 not to guest tests. On a caught timeout or interruption, the launcher signals
 only its freshly created, live PID/start-time/session/group-attested bootstrap
 process group. A process-local child-subreaper setting lets it reap adopted
