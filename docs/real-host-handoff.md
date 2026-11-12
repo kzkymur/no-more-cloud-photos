@@ -285,22 +285,35 @@ sudo systemctl stop nmcp-backup.timer
    login is disabled every backup fails at `prepare`, and a restore taken in
    that window is refused (role graph mismatch); after the revert both are
    normal again. The failed run stays in history; that is intended.
-3. **(b) Database unreachable (requires #57).** Today, if PostgreSQL is
-   unreachable, a backup fails before its run is recorded: **no history row,
-   no audit and no notification**, only exit code 1 and the log line
-   "administrative operation failed". This is a known limit (#57). After #57
-   ships, the same failure sends exactly one notification with no
-   `backup_id` and a `cause` class such as `db_unreachable`. Run this case
-   only on a release containing #57, with `nmcp.target` stopped, the concrete
-   PostgreSQL unit stopped for one `force_backup`, then PostgreSQL and
-   `nmcp.target` started again and `/readyz` checked. Until then, record it as
-   NOT_EXECUTED, reason "requires #57".
+3. **(b) Database unreachable (needs a release with #57).** A backup that
+   fails before its run is recorded now also notifies, exactly once. On an
+   older release it sends nothing, so record this case as NOT_EXECUTED,
+   reason "release without #57". With #57:
+
+   ```sh
+   PG_UNIT=$(cat /etc/nmcp/postgresql-unit)
+   sudo systemctl stop nmcp.target
+   sudo systemctl stop "$PG_UNIT"
+   force_backup                       # expected to fail
+   sudo systemctl start "$PG_UNIT"
+   sudo systemctl start nmcp.target
+   curl --fail --silent -H 'Accept: application/json' "$API/readyz"
+   ```
+
+   Expected: the unit fails (non-zero exit); the journal has one line
+   `"backup failed before a history row existed"` with `"cause":"db_unreachable"`
+   and `"notification":"succeeded"` (or `failed` if your hook exited non-zero);
+   your endpoint receives exactly one notification whose stdin was
+   `{"status":"failed","phase":"precondition","cause":"db_unreachable","at":"<UTC>"}`.
+   It has no `backup_id`, and nothing new appears in backup history, because
+   the database was down. Such a notification is not retried by a later run.
+   `/readyz` returns to 200 after the restart, and `validate exit: 0`.
 4. `sudo systemctl start nmcp-backup.timer`.
 
 Report: success run (no notification: PASS/FAIL); case (a): unit exit,
 failure UTC, notification received UTC, delay in seconds, ID matched yes/no,
 `notification_status`, and the three restore-check results; case (b):
-NOT_EXECUTED (requires #57) or its result. Never paste the hook URL or
+NOT_EXECUTED (release without #57) or its result. Never paste the hook URL or
 message body.
 
 ## 5. Database backup and originals storage locations
@@ -437,8 +450,8 @@ required)" and "Explicit cutover and separate resume".
 > start units around a failed operation ("Explicit cutover and separate
 > resume"). A failed cutover (`cutover_failed`) leaves the timer, backup, API
 > and Worker stopped and the source fenced in maintenance, with no supported
-> recovery today, not even after #58 (which abandons only a prepared or
-> validated restore).
+> recovery today. #58's abandon refuses any restore that recorded a cutover
+> phase; a failed cutover is tracked in #59.
 >
 > The offline restore mode (`--offline-source`) needs the source and the
 > candidate in two different PostgreSQL 17 clusters; it is not the path on a
@@ -467,14 +480,32 @@ until a release with #58 is deployed, record B as NOT_EXECUTED, reason
    goes into `operator restore` maintenance and refuses every write (503)
    until step 3. Prepare does not drain: if a write was in flight at that
    instant, prepare fails without entering maintenance; simply run it again.
-3. Abandon the restore as root: `restore --operation-id <OP> --abandon`
-   (#58; use the exact form documented there). Expected: the abandonment is
-   recorded in the restore ledger and the source returns to normal after a
-   fresh check. Start `nmcp-backup.timer` again. Stop the clock when
-   `/readyz` is 200 and one upload completes.
-4. Drop the unused candidate database as the PostgreSQL cluster administrator
-   (the API and Worker never point at it before cutover), and handle its
-   receipt as #58 documents.
+3. Abandon the restore as root, following `docs/backup-operations.md`,
+   "Abandoning a restore without cutover". It reads the source's `admin.dsn`,
+   a `check.dsn` that names the source, `NMCP_RESTORE_LEDGER_ROOT` and
+   `NMCP_STORAGE_ROOT`:
+
+   ```sh
+   nmcp-admin restore --operation-id <OP> --abandon --yes --json   # root only (non-root: exit 2)
+   ```
+
+   Expected: exit 0, and stdout is the maintenance status with mode `normal`
+   and a successful check report. In order, the ledger records `abandoned`, a
+   fresh full check runs as `nmcp_check`, and an audited `restore_abandon`
+   returns the source to normal. Abandon starts and stops no units:
+   `nmcp.target` keeps running throughout, and the API and Worker answer in
+   maintenance mode until this step. Exit 4 means a refusal that changed
+   nothing: a cutover or offline phase was recorded, the operation is
+   unknown, the live database is not the source, or maintenance belongs to
+   something else. The other exit-4 case is a check with findings, after
+   `abandoned` is already recorded: fix the findings, then rerun abandon.
+   Start `nmcp-backup.timer` again (you stopped it in step 1; backups during
+   the maintenance would only fail with cause `maintenance`). Stop the clock
+   when `/readyz` is 200 and one upload completes.
+4. Abandon never drops the candidate. Drop the unused candidate database
+   yourself as the PostgreSQL cluster administrator (the API and Worker never
+   point at it before cutover). Keep the ledger, with its `abandoned` record,
+   and the receipt with your deployment record.
 
 **C. Rehearsal host with cutover (for cutover RTO numbers).** On a separate
 host built from the same release and fed a copy of a production backup
@@ -578,8 +609,8 @@ None blocks this runbook; note them when you interpret a result.
 | #54 | `nmcp-admin check` fails closed with `storage_scan_unstable` (exit 1) when storage changes during its scan, and does not retry by itself. | Common right after a Worker restart or during uploads. It is not a finding: wait briefly and rerun (the CI scenario allows up to 3 tries) before reporting item 9. |
 | #55 | Root `profile certify` runs helpers as `nmcp` with the Worker's limits, but not inside the Worker unit's systemd sandbox. | Certify only trusted fixtures (item 9). |
 | #59 | A planned production cutover needs writes quiesced before the final backup; there is no supported procedure yet. | Item 8 A is NOT_EXECUTED. Never cut over on production, and never stop `nmcp.target` before an online cutover. |
-| #57 | A backup that fails before its run is recorded (for example, database unreachable) writes no history and sends no notification; only exit 1 and a log line. | Item 4(b) is NOT_EXECUTED until a release with #57. Watch `nmcp-backup.service` failures in the journal meanwhile. |
-| #58 | A restore cannot yet be abandoned: without cutover, the source stays in `operator restore` maintenance and an unused candidate/ledger entry cannot be retired by a CLI. | Item 8 B (production validation-only drill) requires #58's `restore --operation-id OP --abandon`. Keep ledger and receipt files. |
+| #57 | On releases before #57, a backup that fails before its run is recorded (for example, database unreachable) writes no history and sends no notification. With #57 it notifies once (`phase` `precondition`, a `cause`, no `backup_id`) but still writes no history and does not retry the notification. | Item 4(b) needs a release with #57. On older releases, watch `nmcp-backup.service` failures in the journal. |
+| #58 | Before #58, a restore cannot be abandoned: without cutover the source stays in `operator restore` maintenance. #58 adds `restore --operation-id OP --abandon` for restores that have not cut over; it never drops the candidate, and a failed cutover is not covered (#59). | Item 8 B needs a release with #58; drop the candidate yourself and keep the ledger and receipt. |
 
 ## Reporting back
 
