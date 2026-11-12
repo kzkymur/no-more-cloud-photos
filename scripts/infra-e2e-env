@@ -38,22 +38,24 @@
 #                                   /opt/nmcp/ or /usr/bin/prlimit, computed in
 #                                   a fresh one-shot container (no network, no
 #                                   mounts, read-only root) of the core image.
-#                                   Refuses unless worker and admin (migrate)
-#                                   use the same image ID, printed to stderr.
-#   admin -- ARGS...                one-shot nmcp-admin as nmcp_migrator in the
-#                                   core image (helpers /opt/nmcp/bin, ICC
-#                                   /opt/nmcp/share/sRGB2014.icc), no TTY,
-#                                   bounded by NMCP_E2E_DEADLINE (else 600s).
-#                                   stdin is forwarded (e.g. --file -).
-#                                   Mounts: NMCP_E2E_FIXTURES_DIR read-only at
-#                                   /e2e/fixtures; private tmpfs /e2e/work
-#                                   (uid 10001, 0700, 1g), not in media.
-#                                   NMCP_CHECK_DATABASE_URL_FILE /
-#                                   NMCP_REPAIR_DATABASE_URL_FILE point at
-#                                   validation-only nmcp_check / nmcp_repair
-#                                   DSN files (/run/nmcp-credentials, 0600,
-#                                   uid 10001, read-only), so `admin -- check`
-#                                   and `admin -- repair` use their own logins.
+#                                   Refuses unless the worker and both admin
+#                                   one-shot images share one image ID.
+#   admin [--capability|--owner] -- ARGS...
+#                                   one-shot nmcp-admin in the core image, no
+#                                   TTY, stdin forwarded, bounded by
+#                                   NMCP_E2E_DEADLINE (else 600s). The run mode
+#                                   follows nmcp-admin's own table; a
+#                                   contradicting override exits 2.
+#                                   capability (check, repair, maintenance
+#                                   resume): uid 10001, check.dsn/repair.dsn
+#                                   files only, media READ-WRITE.
+#                                   owner (everything else): uid 0, admin.dsn
+#                                   (nmcp_migrator) file only, media read-only,
+#                                   NMCP_E2E_FIXTURES_DIR ro at /e2e/fixtures,
+#                                   private tmpfs /e2e/work.
+#                                   NMCP_DATABASE_URL is absent in both; DSNs
+#                                   arrive as *_FILE paths under
+#                                   /run/nmcp-credentials (0600, read-only).
 #   fault media-readonly on|off     remount the whole media filesystem ro/rw
 #   fault media-full on|off [BYTES] shrink the media filesystem to used+BYTES
 #                                   (default 0) / restore the original size
@@ -99,7 +101,8 @@ export NMCP_E2E_MEDIA_MOUNT=$media_mount
 # Validation-only check/repair DSN files for the admin one-shot (uid 10001,
 # 0600, in a 0700 dir), mounted read-only at /run/nmcp-credentials.
 credentials_dir="$state_dir/credentials"
-export NMCP_E2E_CREDENTIALS_DIR=$credentials_dir
+export NMCP_E2E_OWNER_CREDENTIALS_DIR=$credentials_dir/owner
+export NMCP_E2E_CAPABILITY_CREDENTIALS_DIR=$credentials_dir/capability
 # Scenario fixtures, mounted read-only at /e2e/fixtures in the admin one-shot.
 if [ -z "${NMCP_E2E_FIXTURES_DIR:-}" ]; then
   if [ -d "$root/test/e2e/testdata" ]; then NMCP_E2E_FIXTURES_DIR=$root/test/e2e/testdata
@@ -233,14 +236,20 @@ mount_media() {
 }
 
 write_credentials() {
-  # Owned by the container uid so nmcp-admin's owner check (uid 0 or euid)
-  # accepts them; never group/other readable.
+  # nmcp-admin's *_FILE fallback accepts a regular, non-symlink file owned by
+  # uid 0 or the effective uid, with no group/other bits. Owner commands run
+  # as root (admin.dsn 0:0 0600); capability commands as uid 10001
+  # (check/repair 10001 0600). Each one-shot mounts only its own directory.
   remove_credentials
-  sudo install -d -o 10001 -g 10001 -m 0700 "$credentials_dir"
+  sudo install -d -o 0 -g 0 -m 0755 "$credentials_dir"
+  sudo install -d -o 0 -g 0 -m 0700 "$NMCP_E2E_OWNER_CREDENTIALS_DIR"
+  sudo install -d -o 10001 -g 10001 -m 0700 "$NMCP_E2E_CAPABILITY_CREDENTIALS_DIR"
+  printf '%s\n' 'postgres://nmcp_migrator:nmcp-migrator-validation-only@postgres:5432/nmcp?sslmode=disable' |
+    sudo install -o 0 -g 0 -m 0600 /dev/stdin "$NMCP_E2E_OWNER_CREDENTIALS_DIR/admin.dsn"
   printf '%s\n' 'postgres://nmcp_check:nmcp-check-validation-only@postgres:5432/nmcp?sslmode=disable' |
-    sudo install -o 10001 -g 10001 -m 0600 /dev/stdin "$credentials_dir/check.dsn"
+    sudo install -o 10001 -g 10001 -m 0600 /dev/stdin "$NMCP_E2E_CAPABILITY_CREDENTIALS_DIR/check.dsn"
   printf '%s\n' 'postgres://nmcp_repair:nmcp-repair-validation-only@postgres:5432/nmcp?sslmode=disable' |
-    sudo install -o 10001 -g 10001 -m 0600 /dev/stdin "$credentials_dir/repair.dsn"
+    sudo install -o 10001 -g 10001 -m 0600 /dev/stdin "$NMCP_E2E_CAPABILITY_CREDENTIALS_DIR/repair.dsn"
 }
 
 remove_credentials() {
@@ -380,7 +389,7 @@ for line in sys.stdin:
 
 image_sha256() {
   [ $# -ge 1 ] || die "usage: image-sha256 PATH..."
-  local path worker_image admin_image id
+  local path worker_image other_image service id
   for path in "$@"; do
     case "$path" in
       /usr/bin/prlimit) ;;
@@ -390,9 +399,12 @@ image_sha256() {
   done
   id=$(container_id worker); [ -n "$id" ] || die "worker container not found"
   worker_image=$(docker container inspect --format '{{.Image}}' "$id")
-  id=$(container_id migrate); [ -n "$id" ] || die "migrate container not found"
-  admin_image=$(docker container inspect --format '{{.Image}}' "$id")
-  [ "$worker_image" = "$admin_image" ] || die "worker image $worker_image differs from admin image $admin_image"
+  # The admin one-shots must run the very image the worker runs.
+  for service in admin-owner admin-capability; do
+    other_image=$(docker image inspect --format '{{.Id}}' "$project-$service" 2>/dev/null) ||
+      die "$service image not built"
+    [ "$worker_image" = "$other_image" ] || die "worker image $worker_image differs from $service image $other_image"
+  done
   log "image-sha256: core image $worker_image"
   # shellcheck disable=SC2016 # expanded by the container shell
   timeout --kill-after=5s 60s docker run --rm --network none --read-only --user 10001:10001 \
@@ -403,9 +415,28 @@ image_sha256() {
       done' sh "$@"
 }
 
+# The run mode of an nmcp-admin command, by the same table as nmcp-admin
+# itself: capability = check, repair (incl. --dry-run), maintenance resume;
+# owner = everything else.
+admin_mode() {
+  case "${1:-}" in
+    check|repair) echo capability ;;
+    maintenance) if [ "${2:-}" = resume ]; then echo capability; else echo owner; fi ;;
+    *) echo owner ;;
+  esac
+}
+
 admin() {
+  local forced="" mode service limit=600 remaining
+  case "${1:-}" in --capability|--owner) forced=${1#--}; shift ;; esac
   [ "${1:-}" = -- ] && shift
-  local limit=600 remaining
+  [ $# -ge 1 ] || die "usage: admin [--capability|--owner] -- ARGS..."
+  mode=$(admin_mode "$@")
+  if [ -n "$forced" ] && [ "$forced" != "$mode" ]; then
+    echo "infra-e2e: admin --$forced contradicts the run mode of '$*' ($mode)" >&2
+    return 2
+  fi
+  service=admin-$mode
   if [ -n "${NMCP_E2E_DEADLINE:-}" ]; then
     remaining=$(( NMCP_E2E_DEADLINE - $(date +%s) ))
     [ "$remaining" -gt 0 ] || die "scenario deadline passed"
@@ -415,7 +446,7 @@ admin() {
   # backstop for the compose client. --rm and lane teardown remove leftovers.
   build_compose_cmd
   timeout --kill-after=10s "$((limit + 20))s" \
-    "${compose_cmd[@]}" run --rm --no-deps -T migrate \
+    "${compose_cmd[@]}" --profile e2e run --rm --no-deps -T "$service" \
     /usr/bin/timeout --kill-after=5s "${limit}s" nmcp-admin "$@"
 }
 
@@ -475,7 +506,7 @@ up() {
   write_credentials
   if [ ! -d "$NMCP_E2E_FIXTURES_DIR" ]; then install -d -m 0755 "$NMCP_E2E_FIXTURES_DIR"; fi
   # Build the profile-only observer now, so media-ls never builds mid-scenario.
-  compose --profile e2e build --quiet e2e-observer
+  compose --profile e2e build --quiet e2e-observer admin-owner admin-capability
   if ! compose up --build --detach --wait; then
     compose logs --no-color >&2 || true
     die "stack did not become ready"

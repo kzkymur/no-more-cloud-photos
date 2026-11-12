@@ -43,18 +43,26 @@ services:
     labels:
       com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER}"
 
-  # Scenario fixtures (read-only) and a private scratch dir outside the media
-  # volume, for `admin --` (the migrate one-shot, same core image as the worker).
-  migrate:
+  # `admin --` one-shots (scripts/infra-e2e-env picks one per command, by the
+  # same table as nmcp-admin). Neither inherits the base common environment,
+  # so NMCP_DATABASE_URL is absent, not merely empty, in both. Database
+  # credentials arrive only as files (the *_FILE fallbacks, honoured because
+  # no $CREDENTIALS_DIRECTORY exists here).
+  #
+  # Owner commands: root, migrator DSN file, media read-only (they never
+  # write media), scenario fixtures read-only, private scratch.
+  admin-owner:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    profiles: [e2e]
+    user: "0:0"
     environment:
       NMCP_STORAGE_ROOT: /var/lib/nmcp/media
-      # nmcp-admin check/repair use only these capability logins (file paths,
-      # never DSNs in env); the migrator DSN above stays for readiness/locks.
-      NMCP_CHECK_DATABASE_URL_FILE: /run/nmcp-credentials/check.dsn
-      NMCP_REPAIR_DATABASE_URL_FILE: /run/nmcp-credentials/repair.dsn
+      NMCP_LOG_LEVEL: info
+      NMCP_SHUTDOWN_TIMEOUT: 10s
+      NMCP_ADMIN_DATABASE_URL_FILE: /run/nmcp-credentials/admin.dsn
     volumes:
-      # Read-only view of the same media filesystem api/worker use, for
-      # read-only reconciliation (`admin -- check`). Never writable here.
       - type: volume
         source: media
         target: /var/lib/nmcp/media
@@ -64,9 +72,38 @@ services:
         target: /e2e/fixtures
         read_only: true
       - type: bind
-        source: "${NMCP_E2E_CREDENTIALS_DIR:?scripts/infra-e2e-env must set NMCP_E2E_CREDENTIALS_DIR}"
+        source: "${NMCP_E2E_OWNER_CREDENTIALS_DIR:?scripts/infra-e2e-env must set NMCP_E2E_OWNER_CREDENTIALS_DIR}"
         target: /run/nmcp-credentials
         read_only: true
     tmpfs:
-      - /e2e/work:size=1g,uid=10001,gid=10001,mode=0700
+      - /e2e/work:size=1g,uid=0,gid=0,mode=0700
+    networks: [backend]
+    labels:
+      com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER}"
 
+  # Capability commands (check, repair, maintenance resume): uid 10001 (the
+  # service user), only the nmcp_check / nmcp_repair DSN files, media
+  # READ-WRITE because repair renames entries as the service user.
+  admin-capability:
+    build:
+      context: ../..
+      dockerfile: infra/validation/core.Dockerfile
+    profiles: [e2e]
+    user: "10001:10001"
+    environment:
+      NMCP_STORAGE_ROOT: /var/lib/nmcp/media
+      NMCP_LOG_LEVEL: info
+      NMCP_SHUTDOWN_TIMEOUT: 10s
+      NMCP_CHECK_DATABASE_URL_FILE: /run/nmcp-credentials/check.dsn
+      NMCP_REPAIR_DATABASE_URL_FILE: /run/nmcp-credentials/repair.dsn
+    volumes:
+      - type: volume
+        source: media
+        target: /var/lib/nmcp/media
+      - type: bind
+        source: "${NMCP_E2E_CAPABILITY_CREDENTIALS_DIR:?scripts/infra-e2e-env must set NMCP_E2E_CAPABILITY_CREDENTIALS_DIR}"
+        target: /run/nmcp-credentials
+        read_only: true
+    networks: [backend]
+    labels:
+      com.nmcp.validation.owner: "${NMCP_VALIDATION_OWNER}"
