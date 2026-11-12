@@ -249,8 +249,14 @@ force_backup() {
 sudo systemctl stop nmcp-backup.timer
 ```
 
-1. **Success case.** `force_backup`. Expected: outcome success; your endpoint
-   receives **no** notification.
+1. **Success case.** `force_backup`. Expected: outcome success, `validate exit: 0`;
+   your endpoint receives **no** notification.
+
+   If a `force_backup` is interrupted (Ctrl-C, lost session), the runtime
+   drop-in may remain: run its last cleanup lines by hand
+   (`rm` the `.conf`, `rmdir` the directory, `daemon-reload`) and
+   `sudo scripts/validate-backup-install --installed` until it exits 0 before
+   continuing. `/run` is also cleared at reboot.
 2. **(a) Failure after the run is recorded.** Make the dump login unable to
    log in, force one run, and restore it immediately:
 
@@ -362,7 +368,10 @@ systemctl is-enabled nmcp-backup.timer
 sudo journalctl -u nmcp-backup.service --since -30min -o cat | grep -E '"(status|outcome)"' | tail -n 3
 ```
 
-Expected: both scripts exit 0 and print "No backup success claimed"; the timer
+Expected: both scripts exit 0; `install-backup-config` ends with "Backup
+configuration installed; wake timer enabled. No backup success claimed." and
+`validate-backup-install --installed` prints its "PASS local install
+metadata/client checks" line (which also lists what it does NOT prove); the timer
 is `enabled`; `/readyz` stays 200 after the PostgreSQL reload. The service's
 structured JSON outcome in the journal is a successful backup, or
 `not_due` (exit 4) if the database policy did not consider one due. Neither
@@ -407,6 +416,13 @@ Report: per device: model class (e.g. "phone, 2024"), file types, accepted /
 refused (status + code), visual check PASS/FAIL. No personal media.
 
 ## 8. Production-scale RPO/RTO [window]
+
+> **ON HOLD: do not run this item yet.** The steps below are being corrected:
+> stopping `nmcp.target` before the backup makes the online cutover's
+> preflight fail (it requires the API and Worker running), and a failed
+> cutover leaves the services stopped with no supported recovery today (#58).
+> Record item 8 as NOT_EXECUTED, reason "runbook item on hold", until this
+> banner is removed.
 
 Goal: real recovery point and recovery time with your data volume. CI only
 measured a small seeded dataset (`docs/release-gate.md`, "RPO/RTO"). Follow
