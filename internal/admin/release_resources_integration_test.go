@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -22,10 +24,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
-	"github.com/kzkymur/no-more-cloud-photos/internal/reconciliation"
-	"github.com/kzkymur/no-more-cloud-photos/internal/storage"
 )
 
 // #21 L3: the aggregate production budget is ONE nmcp.slice (CPUQuota=200%,
@@ -238,6 +240,7 @@ func TestReleaseGateResources(t *testing.T) {
 		UploadToDoneSeconds float64 `json:"upload_to_done_seconds"`
 	}
 	var results []measured
+	var rawMediaID string
 	for _, fx := range []releasePrepared{rawFixture, videoFixture} {
 		data, err := os.ReadFile(filepath.Join(fixtures, fx.File))
 		if err != nil {
@@ -245,6 +248,9 @@ func TestReleaseGateResources(t *testing.T) {
 		}
 		started := time.Now()
 		mediaID, jobID := releasePostMedia(t, ctx, data, fx.File, "release-resources-"+fx.SHA256[:20])
+		if fx.Name == rawFixture.Name {
+			rawMediaID = mediaID
+		}
 		deadline := time.Now().Add(15 * time.Minute)
 		var status string
 		var elapsed float64
@@ -314,15 +320,173 @@ func TestReleaseGateResources(t *testing.T) {
 	if got := releaseUploadStatus(t, ctx, big, "enospc.bmp", "release-enospc"); got != http.StatusCreated {
 		t.Fatalf("same key after ENOSPC recovery: status %d, want 201 (transient failures are never stored)", got)
 	}
-	store, err := storage.Open("/var/lib/nmcp/media", storage.Options{})
-	if err != nil {
-		t.Fatal("open real media store")
-	}
-	defer store.Close()
-	if result, err := New(migrator).Check(ctx, store, reconciliation.ScopeAll); err != nil {
-		t.Fatalf("reconciliation after real-unit ENOSPC: sealed=%t findings=%d", result.Sealed, result.FindingCount)
+	operator := releaseOperatorCLI(t, f, admin)
+	if out := operator([]int{0}, "check", "--scope", "all", "--json"); !releaseCheckClean(out) {
+		t.Fatalf("reconciliation after real-unit ENOSPC not clean: %s", out)
 	}
 	t.Log("actual real-unit ENOSPC: upload refused without acceptance, same key accepted after recovery, DB/FS reconciliation clean")
+
+	// Manual rendition cleanup through the documented operator invocation.
+	// A superseded rendition's purge_after is fixed at supersession from the
+	// retention then in force, so zero-day retention is set first; a second
+	// version of the measured profile (same recipes, existing certification
+	// rows) is activated, the Worker restarted to claim it, the RAW media
+	// regenerated, and the shipped CLI deletes the due superseded rendition.
+	operator([]int{0}, "config", "set", "--name", "superseded_rendition_retention_days", "--value", "0", "--json")
+	var oldRendition, oldPath string
+	if err := migrator.QueryRow(ctx, `SELECT id::text, relative_path FROM renditions WHERE media_id=$1 AND is_current`, rawMediaID).Scan(&oldRendition, &oldPath); err != nil {
+		t.Fatal("current RAW rendition query")
+	}
+	v2 := definition
+	v2.ID, v2.Version = newID(), definition.Version+1
+	if err := service.ProfileCreate(ctx, v2); err != nil {
+		t.Fatalf("create resource profile v2: sqlstate=%s", fixtureSQLState(err))
+	}
+	if err := service.ProfileTransition(ctx, v2.ID, true); err != nil {
+		t.Fatalf("activate resource profile v2 on the existing certification registry: sqlstate=%s", fixtureSQLState(err))
+	}
+	f.run("/usr/bin/systemctl", "restart", "nmcp-worker.service")
+	operator([]int{0}, "regenerate", "--profile", definition.Key, "--media-id", rawMediaID, "--yes", "--json")
+	for deadline := time.Now().Add(15 * time.Minute); ; {
+		if pg17Scalar(t, ctx, migrator, `SELECT count(*)::text FROM renditions WHERE media_id=$1 AND is_current AND id::text<>$2`, rawMediaID, oldRendition) == "1" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("regenerated RAW rendition did not become current within 15m")
+		}
+		time.Sleep(time.Second)
+	}
+	operator([]int{0}, "cleanup", "--kind", "renditions", "--yes", "--json")
+	if pg17Scalar(t, ctx, migrator, `SELECT count(*)::text FROM renditions WHERE id::text=$1`, oldRendition) != "0" {
+		t.Fatal("manual cleanup left the due superseded rendition row")
+	}
+	if _, err := os.Lstat(filepath.Join("/var/lib/nmcp/media", oldPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("manual cleanup left the due superseded rendition file")
+	}
+	operator([]int{0}, "config", "set", "--name", "superseded_rendition_retention_days", "--value", "null", "--json")
+
+	// Manual repair through the same invocation: a planted unreferenced
+	// canonical original (nmcp-owned, as a lost publish would leave it) is a
+	// repairable final_orphan; repair quarantines it under maintenance, a
+	// fresh check is clean, and maintenance resume returns to normal mode.
+	orphanID := newID()
+	orphanDir := filepath.Join("/var/lib/nmcp/media/originals", orphanID[:2], orphanID)
+	for _, dir := range []string{filepath.Dir(orphanDir), orphanDir} {
+		f.run("/usr/bin/install", "-d", "-o", runtimeUser.Username, "-g", runtimeUser.Username, "-m", "0700", dir)
+	}
+	orphanSource := filepath.Join(t.TempDir(), "orphan")
+	if err := os.WriteFile(orphanSource, liveLargeBMP()[:4096], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(orphanDir, "original.bmp")
+	f.run("/usr/bin/install", "-o", runtimeUser.Username, "-g", runtimeUser.Username, "-m", "0600", orphanSource, orphan)
+	report := releaseCheckReport(t, operator([]int{4}, "check", "--scope", "all", "--json"))
+	operator([]int{0}, "repair", "--report", report, "--yes", "--json")
+	if _, err := os.Lstat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("repair left the planted orphan in place")
+	}
+	if out := operator([]int{0}, "check", "--scope", "all", "--json"); !releaseCheckClean(out) {
+		t.Fatalf("reconciliation after repair not clean: %s", out)
+	}
+	operator([]int{0}, "maintenance", "resume", "--yes", "--json")
+
+	// Nothing the operator commands created or renamed may be root-owned:
+	// every entry under media stays the nmcp runtime user's.
+	uid, _ := strconv.ParseUint(runtimeUser.Uid, 10, 32)
+	gid, _ := strconv.ParseUint(runtimeUser.Gid, 10, 32)
+	quarantined := 0
+	if err := filepath.WalkDir("/var/lib/nmcp/media", func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		if uint64(stat.Uid) != uid || uint64(stat.Gid) != gid {
+			return fmt.Errorf("%s owned by %d:%d, want nmcp %d:%d", strings.TrimPrefix(path, "/var/lib/nmcp/media"), stat.Uid, stat.Gid, uid, gid)
+		}
+		if strings.HasPrefix(path, "/var/lib/nmcp/media/.quarantine/") && info.Mode().IsRegular() {
+			quarantined++
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("media ownership after operator cleanup/repair: %v", err)
+	}
+	if quarantined == 0 {
+		t.Fatal("repair quarantined nothing")
+	}
+	t.Log("actual operator CLI as nmcp via systemd-run + LoadCredential: manual rendition cleanup, check -> repair -> check -> resume; every media entry nmcp-owned")
+}
+
+// releaseOperatorCLI runs the shipped nmcp-admin exactly as the Ubuntu
+// deployment documents: a transient unit as the nmcp user, admin.env read by
+// PID 1, and the capability DSNs delivered as systemd credentials. It returns
+// stdout and fails unless the exit status is one of the allowed codes.
+func releaseOperatorCLI(t *testing.T, f *liveCutoverFixture, admin *pgxpool.Pool) func(allowed []int, args ...string) []byte {
+	t.Helper()
+	for _, role := range []string{"nmcp_check", "nmcp_repair"} {
+		var secret [32]byte
+		if _, err := rand.Read(secret[:]); err != nil {
+			t.Fatal(err)
+		}
+		f.passwords[role] = hex.EncodeToString(secret[:])
+		f.sql(admin, "ALTER ROLE "+pgx.Identifier{role}.Sanitize()+" PASSWORD '"+f.passwords[role]+"'")
+		leaf := strings.TrimPrefix(role, "nmcp_")
+		dsn := (&url.URL{Scheme: "postgres", Host: "127.0.0.1:5432", Path: "/source", User: url.UserPassword(role, f.passwords[role]), RawQuery: "sslmode=disable"}).String()
+		f.write("/etc/nmcp/credentials/"+leaf+".dsn", dsn+"\n", 0600)
+	}
+	return func(allowed []int, args ...string) []byte {
+		t.Helper()
+		command := append([]string{"--quiet", "--pipe", "--wait", "--collect",
+			"-p", "User=nmcp", "-p", "Group=nmcp",
+			"-p", "EnvironmentFile=/etc/nmcp/admin.env",
+			"-p", "LoadCredential=check.dsn:/etc/nmcp/credentials/check.dsn",
+			"-p", "LoadCredential=repair.dsn:/etc/nmcp/credentials/repair.dsn",
+			"/opt/nmcp/current/bin/nmcp-admin"}, args...)
+		c := exec.CommandContext(f.ctx, "/usr/bin/systemd-run", command...)
+		c.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
+		var stdout, stderr bytes.Buffer
+		c.Stdout, c.Stderr = &stdout, &stderr
+		err := c.Run()
+		code := 0
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			code = exit.ExitCode()
+		} else if err != nil {
+			t.Fatalf("operator nmcp-admin %s did not run: %v", args[0], err)
+		}
+		for _, ok := range allowed {
+			if code == ok {
+				return stdout.Bytes()
+			}
+		}
+		t.Fatalf("operator nmcp-admin %s exit %d, want %v; stdout=%.512s stderr=%.512s", strings.Join(args, " "), code, allowed, stdout.String(), stderr.String())
+		return nil
+	}
+}
+
+func releaseCheckReport(t *testing.T, out []byte) string {
+	t.Helper()
+	var envelope struct {
+		Result struct {
+			ReportID string
+			Sealed   bool
+		} `json:"result"`
+	}
+	if json.Unmarshal(out, &envelope) != nil || !envelope.Result.Sealed || !uuidPattern.MatchString(envelope.Result.ReportID) {
+		t.Fatalf("check with findings did not report a sealed report: %s", out)
+	}
+	return envelope.Result.ReportID
+}
+
+func releaseCheckClean(out []byte) bool {
+	var result struct {
+		Sealed       bool
+		FindingCount int64
+	}
+	return json.Unmarshal(out, &result) == nil && result.Sealed && result.FindingCount == 0
 }
 
 func releaseUploadStatus(t *testing.T, ctx context.Context, data []byte, name, key string) int {
