@@ -235,11 +235,18 @@ force_backup() {
     sudo tee /run/systemd/system/nmcp-backup.service.d/90-handoff-force.conf >/dev/null
   sudo systemctl daemon-reload
   sudo systemctl start nmcp-backup.service; echo "unit exit: $?"
-  sudo rm -f /run/systemd/system/nmcp-backup.service.d/90-handoff-force.conf
-  sudo systemctl daemon-reload
+  # Remove the file AND the directory: validate-backup-install rejects any
+  # entry, even an empty /run/systemd/system/nmcp-backup.service.d.
+  sudo rm /run/systemd/system/nmcp-backup.service.d/90-handoff-force.conf &&
+    sudo rmdir /run/systemd/system/nmcp-backup.service.d &&
+    sudo systemctl daemon-reload
+  sudo scripts/validate-backup-install --installed; echo "validate exit: $?"
   sudo journalctl -u nmcp-backup.service --since -10min -o cat | grep -E '"(status|outcome|error_code|notification_status)"' | tail -n 4
 }
-sudo systemctl stop nmcp-backup.timer        # no timer run during this item
+# Stop the timer for the whole item: a timer wake while the drop-in exists
+# would also run without --if-due. Do not start a restore while it exists
+# (restore --cutover refuses a modified backup unit).
+sudo systemctl stop nmcp-backup.timer
 ```
 
 1. **Success case.** `force_backup`. Expected: outcome success; your endpoint
