@@ -62,6 +62,7 @@ services:
       NMCP_LOG_LEVEL: info
       NMCP_SHUTDOWN_TIMEOUT: 10s
       NMCP_ADMIN_DATABASE_URL_FILE: /run/nmcp-credentials/admin.dsn
+      NMCP_FILE_BASE_URL: https://127.0.0.1:${NMCP_FILES_PORT:-18443}/files
     volumes:
       - type: volume
         source: media

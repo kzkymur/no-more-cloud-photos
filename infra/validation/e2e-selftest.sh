@@ -58,6 +58,16 @@ SQL
 nmcp_repair_runtime>nmcp_repair:falsetruefalse" ] || fail "unexpected check/repair edges: $edges"
 privs=$(printf "SELECT has_function_privilege('nmcp_check','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE'), has_function_privilege('nmcp_repair','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE'), has_function_privilege('nmcp_check','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE'), has_function_privilege('nmcp_repair','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE');\n" | pg -At)
 [ "$privs" = "t|t|f|f" ] || fail "check/repair effective EXECUTE is not exactly own-capability: $privs"
+admin_api=$(pg -At <<'SQL'
+SELECT has_function_privilege('nmcp_check','public.nmcp_admin_read_migration_history()','EXECUTE'),
+       has_function_privilege('nmcp_repair','public.nmcp_admin_read_migration_history()','EXECUTE'),
+       has_function_privilege('nmcp_repair','public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_check','public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_check','public.nmcp_admin_resume_maintenance(nmcp_uuid_v4,jsonb,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_api','public.nmcp_admin_read_migration_history()','EXECUTE');
+SQL
+)
+[ "$admin_api" = "t|t|t|f|f|f" ] || fail "0025 admin API EXECUTE is not exactly as contracted: $admin_api"
 # Negatives: each mutation runs with a verifier in ONE transaction that is
 # always rolled back, and the verifier must reject it.
 negative() {
@@ -75,6 +85,16 @@ negative "check edge removed" "REVOKE nmcp_check_runtime FROM nmcp_check;" "$gra
 negative "nmcp_check CREATEROLE" "ALTER ROLE nmcp_check CREATEROLE;" "$graph"
 negative "check capability granted to nmcp_repair" "GRANT nmcp_check_runtime TO nmcp_repair;" "$graph"
 negative "migrator granted to nmcp_check" "GRANT nmcp_migrator TO nmcp_check;" "$graph"
+negative "nmcp_check connection limit" "ALTER ROLE nmcp_check CONNECTION LIMIT 5;" "$graph"
+negative "nmcp_repair per-database setting" "ALTER ROLE nmcp_repair IN DATABASE nmcp SET work_mem='64MB';" "$graph"
+negative "0025 enter-maintenance executable by the check capability" \
+  "GRANT EXECUTE ON FUNCTION public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz) TO nmcp_check_runtime;" "$roles"
+negative "0025 migration-history reader executable by PUBLIC" \
+  "GRANT EXECUTE ON FUNCTION public.nmcp_admin_read_migration_history() TO PUBLIC;" "$roles"
+negative "check owner may update maintenance_state" \
+  "GRANT UPDATE ON public.maintenance_state TO nmcp_check_function_owner;" "$roles"
+negative "repair owner may write check-report evidence" \
+  "GRANT INSERT ON public.reconciliation_check_reports TO nmcp_repair_function_owner;" "$roles"
 negative "stray EXECUTE on a repair function for nmcp_check" \
   "GRANT EXECUTE ON FUNCTION public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer) TO nmcp_check;" "$roles"
 [ "$(echo "SELECT count(*) FROM pg_auth_members a JOIN pg_roles m ON m.oid=a.member WHERE m.rolname IN ('nmcp_check','nmcp_repair');" | pg -At)" = 2 ] ||

@@ -330,42 +330,49 @@ $$;
 CREATE TEMPORARY TABLE expected_reconciliation_definers (
     signature text PRIMARY KEY,
     owner_name text NOT NULL,
-    acl_grantee text,
+    acl_grantees text[] NOT NULL,
     effective_grantees text[] NOT NULL
 );
 INSERT INTO expected_reconciliation_definers VALUES
-    ('nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime','nmcp_check']),
-    ('nmcp_complete_check_source(nmcp_uuid_v4,text,text)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime','nmcp_check']),
-    ('nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime','nmcp_check']),
-    ('nmcp_append_check_finding_once(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner',NULL,ARRAY[]::text[]),
-    ('nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime','nmcp_check']),
-    ('nmcp_read_check_database_references(timestamptz)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime','nmcp_check']),
-    ('nmcp_read_check_database_references_v18(timestamptz)','nmcp_check_function_owner',NULL,ARRAY[]::text[]),
-    ('nmcp_read_check_attempt_owners()','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime','nmcp_check']),
-    ('nmcp_read_check_report_outcome(nmcp_uuid_v4)','nmcp_check_function_owner','nmcp_check_runtime',ARRAY['nmcp_check_runtime','nmcp_check']),
-    ('nmcp_require_normal_maintenance()','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
-    ('nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
-    ('nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
-    ('nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
-    ('nmcp_complete_upload_attempt(nmcp_uuid_v4,text)','nmcp_repair_function_owner','nmcp_runtime',ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
-    ('nmcp_record_transform_storage_attempt()','nmcp_repair_function_owner',NULL,ARRAY[]::text[]),
-    ('nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','nmcp_repair_function_owner',NULL,ARRAY[]::text[]),
-    ('nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',NULL,ARRAY[]::text[]),
-    ('nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_read_repair_plan_digest(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_read_repair_run_outcome(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_read_repair_run_by_authorization(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_finish_repair_run(nmcp_uuid_v4)','nmcp_repair_function_owner','nmcp_repair_runtime',ARRAY['nmcp_repair_runtime','nmcp_repair']),
-    ('nmcp_require_terminal_repair_attempt()','nmcp_repair_function_owner',NULL,ARRAY[]::text[]);
+    ('nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner',ARRAY['nmcp_check_runtime'],ARRAY['nmcp_check_runtime','nmcp_check']),
+    ('nmcp_complete_check_source(nmcp_uuid_v4,text,text)','nmcp_check_function_owner',ARRAY['nmcp_check_runtime'],ARRAY['nmcp_check_runtime','nmcp_check']),
+    ('nmcp_append_check_finding(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner',ARRAY['nmcp_check_runtime'],ARRAY['nmcp_check_runtime','nmcp_check']),
+    ('nmcp_append_check_finding_once(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text,text,bigint,text,text,bigint,text,timestamptz,timestamptz,timestamptz)','nmcp_check_function_owner',ARRAY[]::text[],ARRAY[]::text[]),
+    ('nmcp_seal_check_report(nmcp_uuid_v4,bigint,timestamptz)','nmcp_check_function_owner',ARRAY['nmcp_check_runtime'],ARRAY['nmcp_check_runtime','nmcp_check']),
+    ('nmcp_read_check_database_references(timestamptz)','nmcp_check_function_owner',ARRAY['nmcp_check_runtime'],ARRAY['nmcp_check_runtime','nmcp_check']),
+    ('nmcp_read_check_database_references_v18(timestamptz)','nmcp_check_function_owner',ARRAY[]::text[],ARRAY[]::text[]),
+    ('nmcp_read_check_attempt_owners()','nmcp_check_function_owner',ARRAY['nmcp_check_runtime'],ARRAY['nmcp_check_runtime','nmcp_check']),
+    ('nmcp_read_check_report_outcome(nmcp_uuid_v4)','nmcp_check_function_owner',ARRAY['nmcp_check_runtime'],ARRAY['nmcp_check_runtime','nmcp_check']),
+    ('nmcp_require_normal_maintenance()','nmcp_repair_function_owner',ARRAY['nmcp_runtime'],ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_register_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_runtime'],ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_heartbeat_upload_attempt(nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_runtime'],ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_require_live_upload_attempt(nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_runtime'],ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_complete_upload_attempt(nmcp_uuid_v4,text)','nmcp_repair_function_owner',ARRAY['nmcp_runtime'],ARRAY['nmcp_runtime','nmcp_worker_runtime','nmcp_api','nmcp_worker']),
+    ('nmcp_record_transform_storage_attempt()','nmcp_repair_function_owner',ARRAY[]::text[],ARRAY[]::text[]),
+    ('nmcp_begin_repair_run(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','nmcp_repair_function_owner',ARRAY[]::text[],ARRAY[]::text[]),
+    ('nmcp_prepare_repair_manifest_item(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY[]::text[],ARRAY[]::text[]),
+    ('nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_begin_repair_run_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,text)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_prepare_repair_manifest_item_v2(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_read_repair_plan_digest(nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_seal_repair_plan(nmcp_uuid_v4,nmcp_uuid_v4,smallint,bigint,text)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_preflight_repair_finding(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_lock_repair_item_apply(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_begin_repair_attempt(nmcp_uuid_v4,nmcp_uuid_v4,nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_append_repair_event(nmcp_uuid_v4,nmcp_uuid_v4,text,text,text,bigint,text)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_read_repair_run_outcome(nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_read_repair_run_by_authorization(nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_read_repair_manifest(nmcp_uuid_v4,bigint,integer)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_read_repair_attempt_history(nmcp_uuid_v4,integer,integer,integer)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_finish_repair_run(nmcp_uuid_v4)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_require_terminal_repair_attempt()','nmcp_repair_function_owner',ARRAY[]::text[],ARRAY[]::text[]),
+    -- Migration 0025: narrow admin API for capability-mode nmcp-admin (#21 B2).
+    ('nmcp_admin_read_migration_history()','nmcp_check_function_owner',ARRAY['nmcp_check_runtime','nmcp_repair_runtime'],ARRAY['nmcp_check_runtime','nmcp_repair_runtime','nmcp_check','nmcp_repair']),
+    ('nmcp_admin_read_maintenance_state()','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_admin_record_repair_result(nmcp_uuid_v4,nmcp_uuid_v4,text,nmcp_uuid_v4,text,text,timestamptz)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_admin_lock_maintenance_for_resume()','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']),
+    ('nmcp_admin_resume_maintenance(nmcp_uuid_v4,jsonb,nmcp_uuid_v4,text,text,timestamptz)','nmcp_repair_function_owner',ARRAY['nmcp_repair_runtime'],ARRAY['nmcp_repair_runtime','nmcp_repair']);
 DO $$
 DECLARE
     boundary record;
@@ -391,16 +398,19 @@ BEGIN
             RAISE EXCEPTION 'unsafe owner, SECURITY DEFINER, or search_path on %',boundary.signature;
         END IF;
 
-        IF boundary.acl_grantee IS NOT NULL AND NOT EXISTS (
-            SELECT 1
-            FROM pg_catalog.pg_proc AS p
-            CROSS JOIN LATERAL pg_catalog.aclexplode(
-                COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))
-            ) AS acl
-            WHERE p.oid=boundary_oid
-              AND acl.grantee=boundary.acl_grantee::pg_catalog.regrole::oid
-              AND acl.privilege_type='EXECUTE'
-              AND NOT acl.is_grantable
+        IF EXISTS (
+            SELECT 1 FROM unnest(boundary.acl_grantees) AS intended(role_name)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_proc AS p
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    COALESCE(p.proacl,pg_catalog.acldefault('f',p.proowner))
+                ) AS acl
+                WHERE p.oid=boundary_oid
+                  AND acl.grantee=intended.role_name::pg_catalog.regrole::oid
+                  AND acl.privilege_type='EXECUTE'
+                  AND NOT acl.is_grantable
+            )
         ) THEN
             RAISE EXCEPTION 'missing intended EXECUTE ACL on %',boundary.signature;
         END IF;
@@ -414,8 +424,7 @@ BEGIN
         WHERE p.oid=boundary_oid
           AND acl.privilege_type='EXECUTE'
           AND acl.grantee<>p.proowner
-          AND (boundary.acl_grantee IS NULL
-               OR acl.grantee<>boundary.acl_grantee::pg_catalog.regrole::oid)
+          AND (acl.grantee=0 OR NOT pg_catalog.pg_get_userbyid(acl.grantee)::text=ANY(boundary.acl_grantees))
         LIMIT 1;
         IF unintended_role IS NOT NULL THEN
             RAISE EXCEPTION 'unintended EXECUTE ACL for % on %',unintended_role,boundary.signature;
@@ -761,6 +770,9 @@ BEGIN
         WITH expected_base(table_name,grantee,privilege_type,is_grantable) AS (VALUES
             ('maintenance_state','nmcp_purge_function_owner','SELECT',false),
             ('maintenance_state','nmcp_repair_function_owner','SELECT',false),
+            -- 0025: repair enter/resume and the repair audit rows (#21 B2).
+            ('maintenance_state','nmcp_repair_function_owner','UPDATE',false),
+            ('admin_audit','nmcp_repair_function_owner','INSERT',false),
             ('change_events','nmcp_purge_function_owner','SELECT',false),
             ('change_events','nmcp_runtime','SELECT',false),
             ('change_events','nmcp_runtime','INSERT',false),
@@ -933,6 +945,14 @@ BEGIN
        OR pg_catalog.has_table_privilege('nmcp_repair_function_owner','public.reconciliation_check_report_seals','UPDATE')
        OR NOT pg_catalog.has_column_privilege('nmcp_repair_function_owner','public.reconciliation_check_report_seals','report_id','UPDATE') THEN
         RAISE EXCEPTION 'unsafe reconciliation source/seal owner ACL';
+    END IF;
+    -- 0025 readiness gate: both reconciliation owners read schema_migrations
+    -- and nothing more.
+    IF NOT pg_catalog.has_table_privilege('nmcp_check_function_owner','public.schema_migrations','SELECT')
+       OR NOT pg_catalog.has_table_privilege('nmcp_repair_function_owner','public.schema_migrations','SELECT')
+       OR pg_catalog.has_table_privilege('nmcp_check_function_owner','public.schema_migrations','INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+       OR pg_catalog.has_table_privilege('nmcp_repair_function_owner','public.schema_migrations','INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') THEN
+        RAISE EXCEPTION 'unsafe reconciliation owner schema_migrations ACL';
     END IF;
 END;
 $$;
