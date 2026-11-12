@@ -30,6 +30,13 @@ type Service struct {
 	Pool  *pgxpool.Pool
 	Actor string
 	Host  string
+	// CheckPool and RepairPool are the dedicated nmcp_check / nmcp_repair
+	// capability connections the CLI opens for check, maintenance resume and
+	// repair; the administrative Pool keeps readiness, maintenance state,
+	// locks and audit. Library callers without them use Pool (for example the
+	// restore cutover's operator connection to its candidate).
+	CheckPool  *pgxpool.Pool
+	RepairPool *pgxpool.Pool
 
 	afterBatchCommit func(context.Context) error
 	// Test-only lost acknowledgement seam, invoked only AFTER real success commit.

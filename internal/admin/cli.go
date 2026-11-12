@@ -238,6 +238,23 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		return finish(stdout, stderr, o.json, result, settingsErr)
 	}
+	// check / maintenance resume (which runs the checker) and repair need their
+	// dedicated capability login; its credential file is validated before any
+	// database connection so a missing or unsafe credential fails closed early.
+	var capability *capabilityCredential
+	switch o.command {
+	case "check", "maintenance resume":
+		capability = &checkCredential
+	case "repair":
+		capability = &repairCredential
+	}
+	var capabilityDSN string
+	if capability != nil {
+		var dsnErr error
+		if capabilityDSN, dsnErr = loadCapabilityDSN(*capability, os.Getenv); dsnErr != nil {
+			return finish(stdout, stderr, o.json, nil, dsnErr)
+		}
+	}
 	cfg, err := config.LoadAdmin()
 	if err != nil {
 		return finish(stdout, stderr, o.json, nil, err)
@@ -259,6 +276,18 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return finish(stdout, stderr, o.json, nil, err)
 	}
 	service := New(pool)
+	if capability != nil {
+		capabilityPool, capabilityErr := openCapabilityPool(ctx, *capability, capabilityDSN)
+		if capabilityErr != nil {
+			return finish(stdout, stderr, o.json, nil, capabilityErr)
+		}
+		defer capabilityPool.Close()
+		if capability == &repairCredential {
+			service.RepairPool = capabilityPool
+		} else {
+			service.CheckPool = capabilityPool
+		}
+	}
 	var result any
 	switch o.command {
 	case "restore":
