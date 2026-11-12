@@ -37,6 +37,56 @@ for required in ("originals", "renditions", "tmp", ".quarantine", "backups"):
 assert all(e["type"] == "dir" for e in entries), entries
 PY
 
+step "check/repair logins: exact capability edges, verifier negatives, credential login"
+pg_id=$(docker container ls --quiet --filter "label=com.docker.compose.project=$NMCP_E2E_PROJECT" \
+  --filter label=com.docker.compose.service=postgres)
+[ -n "$pg_id" ] || fail "postgres container not found"
+pg() { docker container exec -i "$pg_id" psql --username nmcp_bootstrap --dbname nmcp --no-psqlrc -X -q "$@"; }
+# Positives: the full verifiers pass on the provisioned graph.
+printf '\\set ON_ERROR_STOP on\n\\i /opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql\n\\i /opt/nmcp-infra/validation/verify-runtime-roles.sql\n' |
+  pg >/dev/null 2>"$NMCP_E2E_ARTIFACT_DIR/selftest-role-verifiers.err" || fail "role verifiers rejected the provisioned graph: $(head -c 300 "$NMCP_E2E_ARTIFACT_DIR/selftest-role-verifiers.err")"
+edges=$(pg -At <<'SQL'
+SELECT r.rolname || '>' || m.rolname || ':' || a.admin_option || a.inherit_option || a.set_option
+FROM pg_auth_members a
+JOIN pg_roles r ON r.oid = a.roleid
+JOIN pg_roles m ON m.oid = a.member
+WHERE r.rolname IN ('nmcp_check','nmcp_repair') OR m.rolname IN ('nmcp_check','nmcp_repair')
+ORDER BY 1;
+SQL
+)
+[ "$edges" = "nmcp_check_runtime>nmcp_check:falsetruefalse
+nmcp_repair_runtime>nmcp_repair:falsetruefalse" ] || fail "unexpected check/repair edges: $edges"
+privs=$(printf "SELECT has_function_privilege('nmcp_check','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE'), has_function_privilege('nmcp_repair','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE'), has_function_privilege('nmcp_check','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE'), has_function_privilege('nmcp_repair','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE');\n" | pg -At)
+[ "$privs" = "t|t|f|f" ] || fail "check/repair effective EXECUTE is not exactly own-capability: $privs"
+# Negatives: each mutation runs with a verifier in ONE transaction that is
+# always rolled back, and the verifier must reject it.
+negative() {
+  local name=$1 mutation=$2 verifier=$3 out
+  if out=$(printf '\\set ON_ERROR_STOP on\nBEGIN;\n%s\n\\i %s\nROLLBACK;\n' "$mutation" "$verifier" | pg 2>&1); then
+    fail "role negative not rejected: $name"
+  fi
+  case "$out" in *ERROR:*) ;; *) fail "role negative failed without a verifier error: $name: $out" ;; esac
+}
+graph=/opt/nmcp-infra/postgresql/verify-runtime-role-graph.sql
+roles=/opt/nmcp-infra/validation/verify-runtime-roles.sql
+negative "repair capability granted to nmcp_check" "GRANT nmcp_repair_runtime TO nmcp_check;" "$graph"
+negative "check edge with SET TRUE" "GRANT nmcp_check_runtime TO nmcp_check WITH SET TRUE;" "$graph"
+negative "check edge removed" "REVOKE nmcp_check_runtime FROM nmcp_check;" "$graph"
+negative "nmcp_check CREATEROLE" "ALTER ROLE nmcp_check CREATEROLE;" "$graph"
+negative "check capability granted to nmcp_repair" "GRANT nmcp_check_runtime TO nmcp_repair;" "$graph"
+negative "migrator granted to nmcp_check" "GRANT nmcp_migrator TO nmcp_check;" "$graph"
+negative "stray EXECUTE on a repair function for nmcp_check" \
+  "GRANT EXECUTE ON FUNCTION public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer) TO nmcp_check;" "$roles"
+[ "$(echo "SELECT count(*) FROM pg_auth_members a JOIN pg_roles m ON m.oid=a.member WHERE m.rolname IN ('nmcp_check','nmcp_repair');" | pg -At)" = 2 ] ||
+  fail "role negatives leaked a membership change"
+# The provisioned credential file logs in as exactly its login, inheriting
+# only its capability.
+dsn=$(sudo cat "$NMCP_E2E_STATE_DIR/credentials/check.dsn") || fail "read check.dsn"
+who=$(docker container exec "$pg_id" psql "${dsn/@postgres:/@127.0.0.1:}" --no-psqlrc -XAt -c \
+  "SELECT session_user, pg_has_role(session_user,'nmcp_check_runtime','USAGE'), pg_has_role(session_user,'nmcp_repair_runtime','MEMBER'), pg_has_role(session_user,'nmcp_migrator','MEMBER')") ||
+  fail "check credential login"
+[ "$who" = "nmcp_check|t|f|f" ] || fail "check credential identity: $who"
+
 step "image-sha256: digests from a fresh one-shot of the worker/admin image"
 digests=$("$ctl" image-sha256 /opt/nmcp/share/sRGB2014.icc /usr/bin/prlimit) || fail "image-sha256"
 case "$digests" in

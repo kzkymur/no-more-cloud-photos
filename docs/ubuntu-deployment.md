@@ -114,6 +114,8 @@ sudo -u postgres psql --dbname nmcp
 \password nmcp_migrator
 \password nmcp_api
 \password nmcp_worker
+\password nmcp_check
+\password nmcp_repair
 ```
 
 The script creates credential-free `nmcp_runtime`, `nmcp_worker_runtime`,
@@ -121,11 +123,15 @@ The script creates credential-free `nmcp_runtime`, `nmcp_worker_runtime`,
 `nmcp_check_function_owner`, and `nmcp_repair_function_owner` roles. The two
 reconciliation capability roles and two function owners are NOINHERIT and
 isolated from the common runtime graph. API and Worker receive only their
-reviewed existing memberships; no check/repair login or capability member is
-created. The migrator is a member of the three function-owner roles only so
+reviewed existing memberships. The operational logins `nmcp_check` and
+`nmcp_repair` (LOGIN INHERIT, no superuser, CREATEDB, CREATEROLE, replication
+or BYPASSRLS) each receive exactly one edge, their capability role
+(`nmcp_check_runtime` / `nmcp_repair_runtime`, INHERIT TRUE, SET FALSE, no
+ADMIN), plus CONNECT on the database, and nothing else. They are used only by
+`nmcp-admin check` and `nmcp-admin repair`. The migrator is a member of the three function-owner roles only so
 forward migrations can transfer narrowly scoped SECURITY DEFINER functions.
 The bootstrap treats every direct incoming or outgoing membership edge touching
-these stable roles or the three managed logins as a closed allowlist; this also
+these stable roles or the five managed logins as a closed allowlist; this also
 blocks an external login from reaching the migrator or an owner transitively.
 Membership normalization and the final graph check run in one transaction, so
 an unsafe extra edge cannot leave a partially rewritten graph.
@@ -156,8 +162,16 @@ hardening/verifier, normal signal, or interrupted compatibility phase prevents
 service start. A power loss or SIGKILL can leave the database in compatibility
 mode, but the next mandatory wrapper attempt accepts only that exact interrupted
 state, reruns migration idempotently, and hardens before reporting readiness.
-Issue #20 will provision future operational check/repair credentials after the
-CLI contract lands; the root migration credential must not be reused. The
+`nmcp-admin check` and `nmcp-admin repair` never reuse the root migration
+credential for reconciliation. They read their capability DSN from a file named
+by `NMCP_CHECK_DATABASE_URL_FILE` / `NMCP_REPAIR_DATABASE_URL_FILE` in
+`/etc/nmcp/admin.env`. Create `/etc/nmcp/credentials` as root:root 0700, and
+`check.dsn` / `repair.dsn` from `infra/ubuntu/credentials/*.dsn.example` as
+root:root 0600: one libpq connection string for `nmcp_check` / `nmcp_repair`,
+with the password set above. Restrict both logins to the `nmcp` database on
+loopback in `pg_hba.conf`, like the other credentials. nmcp-admin refuses a file
+that is not a regular, non-symlink, owner-only file, and refuses any connection
+whose session user is not exactly the expected login. The
 bootstrap transfers database/schema ownership to `nmcp_migrator` and removes
 PUBLIC schema creation. Embedded migrations own all application object grants;
 the bootstrap deliberately does not grant table or function access after the
