@@ -104,8 +104,9 @@ done
 /usr/bin/chmod 0600 /etc/nmcp/*
 /usr/bin/install -m 0755 "$repo/scripts/run-ubuntu-migration" /usr/local/libexec/nmcp/run-ubuntu-migration
 # Release-transaction tests use deterministic admin stubs. Model the production
-# wrapper's non-root execution here; role graph transitions are covered by the
-# dedicated migration compatibility verifier.
+# wrapper's execution here: root under no-new-privs (#21 B2, nmcp-admin refuses
+# a migrator session unless euid is 0); role graph transitions are covered by
+# the dedicated migration compatibility verifier.
 cat > /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility <<EOF
 #!/bin/sh
 if test "\${1:-}" = /opt/nmcp/releases/stalefail/bin/nmcp-admin; then
@@ -113,7 +114,7 @@ if test "\${1:-}" = /opt/nmcp/releases/stalefail/bin/nmcp-admin; then
   /usr/bin/printf 'NMCP_TEST_STALE_COMPATIBILITY_ENTERED\n'
   while :; do /usr/bin/sleep 1; done
 fi
-exec /usr/sbin/runuser -u nmcp -- "\$@"
+exec /usr/bin/setpriv --no-new-privs -- "\$@"
 EOF
 /usr/bin/chown root:root /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
 /usr/bin/chmod 0755 /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility

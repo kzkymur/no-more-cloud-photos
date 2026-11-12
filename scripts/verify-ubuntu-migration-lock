@@ -18,11 +18,12 @@ trap cleanup EXIT
 /usr/bin/install -o root -g root -m 0755 "$repo/scripts/run-ubuntu-migration" \
   /usr/local/libexec/nmcp/run-ubuntu-migration
 # This fixture isolates deployment/execution-lock behavior. Model the production
-# compatibility wrapper's non-root migration execution without requiring a
-# PostgreSQL role graph, which has its own end-to-end verifier.
+# compatibility wrapper's migration execution (root under no-new-privs, #21 B2)
+# without requiring a PostgreSQL role graph, which has its own end-to-end
+# verifier.
 cat > /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility <<'EOF'
 #!/bin/sh
-exec /usr/sbin/runuser -u nmcp -- "$@"
+exec /usr/bin/setpriv --no-new-privs -- "$@"
 EOF
 /usr/bin/chown root:root /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
 /usr/bin/chmod 0755 /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
@@ -156,5 +157,5 @@ wait "$holder"
 /usr/local/libexec/nmcp/run-ubuntu-migration
 [[ ! -e /run/nmcp-migration-complete ]]
 [[ $(/usr/bin/wc -l < "$work/entries") -eq 1 ]]
-[[ $(/usr/bin/cat "$work/identities") == nmcp ]]
+[[ $(/usr/bin/cat "$work/identities") == root ]]
 printf 'Direct and dependency migration lock races passed\n'
