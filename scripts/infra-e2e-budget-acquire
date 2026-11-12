@@ -4,13 +4,14 @@
 #
 # usage: scripts/infra-e2e-budget-acquire REQUIRED_SECONDS
 #
-# The only tolerated refusal is admission_refused:run_mismatch while GitHub's
-# run-attempt API still reports THIS run as `queued`: the first job of a run
-# can be running for well over a minute before the run itself leaves `queued`
-# (seen in run 43195441621). It is retried with backoff for at most
-# NMCP_E2E_BUDGET_RETRY_SECONDS (default 180), printing the API-reported
-# status each time. A run_mismatch while the API reports any other status
-# (in_progress, completed), and every other refusal, fails immediately.
+# scripts/backup-ci-admission binds admission to THIS job's own record and
+# accepts a run that GitHub still reports as `queued` (siblings waiting for
+# runners), so a lagging run status no longer refuses. As a bounded defence,
+# admission_refused:run_mismatch is still retried with backoff for at most
+# NMCP_E2E_BUDGET_RETRY_SECONDS (default 180) while the API reports THIS run
+# (same head and attempt) as `queued` or the API call fails, printing the
+# API-reported status each time. A run_mismatch while the API reports any
+# other status, and every other refusal, fails immediately.
 #
 # Test hooks (scripts/test-infra-e2e-budget-acquire):
 #   NMCP_E2E_ADMISSION_HELPER  admission command (default: scripts/backup-ci-admission)

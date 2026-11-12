@@ -160,13 +160,24 @@ def validate_receipt(r, now, boot):
     need(r['cleanup_deadline'] - r['issued_mono'] <= r['policy']['job_seconds'], 'invalid_receipt')
 
 
+# Non-terminal workflow run statuses (GitHub REST). `completed` is refused.
+RUN_ACTIVE_STATUSES = frozenset({'requested', 'waiting', 'pending', 'queued', 'in_progress'})
+
+
 def acquire(e, policy, required, api, now=time.monotonic, boot=None, previous=None):
     validate_expected(e); validate_policy(policy); number(required, 1, 21600)
     boot = boot or boot_id()
     base = '/repos/' + e['repo'] + '/actions'
     run = api.get(base + '/runs/' + str(e['run_id']) + '/attempts/' + str(e['attempt']))
+    # The RUN is checked for identity and for not being finished. Its status
+    # is not required to be in_progress: GitHub keeps a run `queued` while any
+    # sibling job still waits for a runner, even after this job started
+    # (runs 43195441621 / 43195451726). That "this job is running" is
+    # enforced below on the job's own record (job id, run attempt, head SHA,
+    # name, runner, status in_progress, no conclusion), and the budget is
+    # anchored to the job's own started_at.
     need(run['id'] == e['run_id'] and run['run_attempt'] == e['attempt'] and
-         run['head_sha'] == e['sha'] and run['status'] == 'in_progress' and
+         run['head_sha'] == e['sha'] and run['status'] in RUN_ACTIVE_STATUSES and
          run['repository']['full_name'].lower() == e['repo'].lower(), 'run_mismatch')
     rows, total = [], None
     for page in range(1, MAX_PAGES + 1):
