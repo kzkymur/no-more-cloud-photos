@@ -717,6 +717,9 @@ func certifyRouteFamily(route certifyRoute) string {
 // validated result, the independent probe, and the requirement.
 func evaluateCertifyRun(run certifyRun, transformed certifyTransformFacts, probed certifyProbeFacts) error {
 	edge := run.Recipe.MaxLongEdge
+	reject := func(check string) error {
+		return certifyInputRejected(certifyFixtureLabel(run.Fixture)+"->"+string(run.OutputKind), check)
+	}
 	expectedMIME, codec, bitDepth := "image/avif", "av1", 8
 	switch run.OutputKind {
 	case profile.OutputAnimationWebP:
@@ -727,37 +730,37 @@ func evaluateCertifyRun(run certifyRun, transformed certifyTransformFacts, probe
 	t := transformed
 	if t.OutputMIME != expectedMIME || t.Setting != run.Setting || t.BitDepth != bitDepth || t.MaxLongEdge != edge ||
 		t.Width <= 0 || t.Height <= 0 || t.SourceWidth <= 0 || t.SourceHeight <= 0 {
-		return errCertifyEvidence
+		return reject("output_identity")
 	}
 	// Each fixture must exercise the certified edge: the output long edge IS the
 	// edge, with no upscale and the source aspect preserved.
 	sourceLong := max(t.SourceWidth, t.SourceHeight)
 	if sourceLong < edge || max(t.Width, t.Height) != edge || t.Width > t.SourceWidth || t.Height > t.SourceHeight {
-		return errCertifyEvidence
+		return reject("edge")
 	}
 	tolerance := int64(sourceLong)
 	if run.OutputKind == profile.OutputVideoAV1 {
 		tolerance *= 2
 		if t.Width%2 != 0 || t.Height%2 != 0 {
-			return errCertifyEvidence
+			return reject("even_dimensions")
 		}
 	}
 	skew := int64(t.Width)*int64(t.SourceHeight) - int64(t.Height)*int64(t.SourceWidth)
 	if skew < -tolerance || skew > tolerance {
-		return errCertifyEvidence
+		return reject("aspect")
 	}
 	p := probed
 	if p.Codec != codec || p.Width != t.Width || p.Height != t.Height || p.VideoStreams < 1 {
-		return errCertifyEvidence
+		return reject("probe_identity")
 	}
 	switch run.OutputKind {
 	case profile.OutputStillAVIF:
 		if p.AudioStreams != 0 {
-			return errCertifyEvidence
+			return reject("probe_audio")
 		}
 	case profile.OutputAnimationWebP:
 		if p.AudioStreams != 0 || p.FrameCount < 1 || p.FrameCount != t.FrameCount {
-			return errCertifyEvidence
+			return reject("probe_frames")
 		}
 	case profile.OutputVideoAV1:
 		audio := 0
@@ -766,10 +769,10 @@ func evaluateCertifyRun(run certifyRun, transformed certifyTransformFacts, probe
 		}
 		if p.VideoStreams != 1 || p.AudioStreams != audio || (audio == 1 && p.AudioCodec != "aac") ||
 			p.PixelFormat != "yuv420p10le" || !slices.Contains(strings.Split(p.Container, ","), "mp4") {
-			return errCertifyEvidence
+			return reject("probe_video_container")
 		}
 	default:
-		return errCertifyEvidence
+		return reject("output_kind")
 	}
 	return nil
 }
@@ -901,7 +904,7 @@ func certifyProfile(ctx context.Context, definition profile.Definition, ws *cert
 	for index, run := range runs {
 		receipt, err := executeCertifyRun(ctx, ws, rt, run, index)
 		if err != nil {
-			return nil, err
+			return nil, certifyTagValidation(err, certifyFixtureLabel(run.Fixture)+"->"+string(run.OutputKind), "run")
 		}
 		receipts = append(receipts, receipt)
 	}
