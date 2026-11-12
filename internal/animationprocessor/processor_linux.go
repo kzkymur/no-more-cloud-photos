@@ -92,6 +92,9 @@ type Config struct {
 	SRGBICC       string
 	SRGBICCSHA256 string
 	Policy        Policy
+	// RunAs drops helper processes to an unprivileged identity (see
+	// processrunner.Limits.RunAs); nil keeps the caller's identity (Worker).
+	RunAs *processrunner.RunAs
 }
 
 type Processor struct {
@@ -169,6 +172,7 @@ func New(config Config) (*Processor, error) {
 	runner, err := processrunner.New(config.Prlimit, processrunner.Limits{
 		Timeout: policy.Timeout, AddressSpaceBytes: policy.AddressSpaceBytes,
 		FileSizeBytes: uint64(policy.GeneratedOutputMaxBytes), OutputBytesPerStream: policy.LogBytesPerStream,
+		RunAs: config.RunAs,
 	})
 	if err != nil {
 		return nil, ErrInvalid

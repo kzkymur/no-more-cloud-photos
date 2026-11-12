@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -38,6 +39,16 @@ type Limits struct {
 	AddressSpaceBytes    uint64
 	FileSizeBytes        uint64
 	OutputBytesPerStream int64
+	// RunAs, when set, runs the supervisor, prlimit and the tool as this
+	// uid/gid with no supplementary groups (a root caller such as
+	// `nmcp-admin profile certify` must never decode untrusted input as root).
+	// Inputs and outputs are inherited descriptors, so no path access is needed.
+	RunAs *RunAs
+}
+
+// RunAs is an unprivileged identity for tool processes.
+type RunAs struct {
+	UID, GID uint32
 }
 
 type Command struct {
@@ -57,7 +68,8 @@ type Runner struct {
 }
 
 func New(prlimitPath string, limits Limits) (*Runner, error) {
-	if !cleanAbsolute(prlimitPath) || limits.Timeout <= 0 || limits.AddressSpaceBytes == 0 || limits.OutputBytesPerStream <= 0 {
+	if !cleanAbsolute(prlimitPath) || limits.Timeout <= 0 || limits.AddressSpaceBytes == 0 || limits.OutputBytesPerStream <= 0 ||
+		limits.RunAs != nil && (limits.RunAs.UID == 0 || limits.RunAs.GID == 0) {
 		return nil, ErrInvalid
 	}
 	return &Runner{prlimit: prlimitPath, limits: limits}, nil
@@ -94,6 +106,9 @@ func (r *Runner) Run(ctx context.Context, command Command) (Output, error) {
 	cmd.Env = []string{"LC_ALL=C", "LANG=C", "TZ=UTC"}
 	cmd.ExtraFiles = append([]*os.File{controlRead}, command.Files...)
 	cmd.SysProcAttr = &unix.SysProcAttr{Setpgid: true}
+	if r.limits.RunAs != nil {
+		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: r.limits.RunAs.UID, Gid: r.limits.RunAs.GID, Groups: []uint32{}}
+	}
 	exceededSignal := make(chan struct{}, 1)
 	stdout := &limitedBuffer{limit: r.limits.OutputBytesPerStream, signal: exceededSignal}
 	stderr := &limitedBuffer{limit: r.limits.OutputBytesPerStream, signal: exceededSignal}

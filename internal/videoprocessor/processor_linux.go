@@ -30,12 +30,16 @@ type Config struct {
 	SRGBICC       string
 	SRGBICCSHA256 string
 	Policy        Policy
+	// RunAs drops helper processes to an unprivileged identity (see
+	// processrunner.Limits.RunAs); nil keeps the caller's identity (Worker).
+	RunAs *processrunner.RunAs
 }
 
 type Processor struct {
 	helper, prlimit, srgbICC, iccSHA256 string
 	policy                              Policy
 	runner, thumbnailRunner             *processrunner.Runner
+	runAs                               *processrunner.RunAs
 }
 
 type InspectRequest struct {
@@ -160,6 +164,7 @@ func New(config Config) (*Processor, error) {
 	runner, err := processrunner.New(config.Prlimit, processrunner.Limits{
 		Timeout: policy.Timeout, AddressSpaceBytes: policy.AddressSpaceBytes,
 		FileSizeBytes: uint64(policy.GeneratedOutputMaxBytes), OutputBytesPerStream: policy.LogBytesPerStream,
+		RunAs: config.RunAs,
 	})
 	if err != nil {
 		return nil, ErrInvalid
@@ -167,11 +172,12 @@ func New(config Config) (*Processor, error) {
 	thumbnailRunner, err := processrunner.New(config.Prlimit, processrunner.Limits{
 		Timeout: policy.Timeout, AddressSpaceBytes: policy.AddressSpaceBytes,
 		FileSizeBytes: uint64(policy.ThumbnailOutputMaxBytes), OutputBytesPerStream: policy.LogBytesPerStream,
+		RunAs: config.RunAs,
 	})
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	return &Processor{helper: config.Helper, prlimit: config.Prlimit, srgbICC: config.SRGBICC, iccSHA256: config.SRGBICCSHA256, policy: policy, runner: runner, thumbnailRunner: thumbnailRunner}, nil
+	return &Processor{helper: config.Helper, prlimit: config.Prlimit, srgbICC: config.SRGBICC, iccSHA256: config.SRGBICCSHA256, policy: policy, runner: runner, thumbnailRunner: thumbnailRunner, runAs: config.RunAs}, nil
 }
 
 func (p *Processor) Capabilities(ctx context.Context) (Capabilities, error) {
@@ -279,7 +285,7 @@ func (p *Processor) Transform(ctx context.Context, request Request) (result Resu
 		return Result{}, ErrResourcePolicy
 	}
 	if kindLimit := limitForKind(p.policy, kind); remaining < kindLimit {
-		operationRunner, err = processrunner.New(p.prlimit, processrunner.Limits{Timeout: p.policy.Timeout, AddressSpaceBytes: p.policy.AddressSpaceBytes, FileSizeBytes: uint64(remaining), OutputBytesPerStream: p.policy.LogBytesPerStream})
+		operationRunner, err = processrunner.New(p.prlimit, processrunner.Limits{Timeout: p.policy.Timeout, AddressSpaceBytes: p.policy.AddressSpaceBytes, FileSizeBytes: uint64(remaining), OutputBytesPerStream: p.policy.LogBytesPerStream, RunAs: p.runAs})
 		if err != nil {
 			return Result{}, ErrInvalid
 		}

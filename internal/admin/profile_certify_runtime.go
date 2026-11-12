@@ -7,7 +7,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/user"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/animationprocessor"
@@ -34,25 +36,53 @@ const (
 	certifyProbeOutputBytes  = int64(1 << 20)
 )
 
+// certifyRunAs is the identity certify's helper and probe processes run as.
+// A root nmcp-admin (the documented owner invocation) must never decode
+// operator fixtures as root, so it drops them to the nmcp service user, the
+// identity the Worker runs them as; without that user it refuses. A
+// non-root caller keeps its own identity.
+var certifyEUID = os.Geteuid
+var certifyLookupUser = user.Lookup
+
+func certifyRunAs() (*processrunner.RunAs, error) {
+	if certifyEUID() != 0 {
+		return nil, nil
+	}
+	account, err := certifyLookupUser("nmcp")
+	if err != nil {
+		return nil, errors.Join(certifyInputRejected("runtime", "unprivileged_user"), err)
+	}
+	uid, uidErr := strconv.ParseUint(account.Uid, 10, 32)
+	gid, gidErr := strconv.ParseUint(account.Gid, 10, 32)
+	if uidErr != nil || gidErr != nil || uid == 0 || gid == 0 {
+		return nil, certifyInputRejected("runtime", "unprivileged_user")
+	}
+	return &processrunner.RunAs{UID: uint32(uid), GID: uint32(gid)}, nil
+}
+
 func newProductionCertifyRuntime(ws *certifyWorkspace) (certifyRuntime, error) {
+	runAs, err := certifyRunAs()
+	if err != nil {
+		return nil, err
+	}
 	prlimit, icc, digest := ws.helperPath("prlimit"), ws.helperPath("srgb_icc"), ws.helpers["srgb_icc"].sha256
 	still, err := stillprocessor.New(stillprocessor.Config{Helper: ws.helperPath("still_helper"), Prlimit: prlimit,
-		SRGBICC: icc, SRGBICCSHA256: digest, Policy: stillprocessor.DefaultPolicy()})
+		SRGBICC: icc, SRGBICCSHA256: digest, Policy: stillprocessor.DefaultPolicy(), RunAs: runAs})
 	if err != nil {
 		return nil, errors.Join(certifyInputRejected("still", "processor_config"), err)
 	}
 	animation, err := animationprocessor.New(animationprocessor.Config{Helper: ws.helperPath("animation_helper"), Prlimit: prlimit,
-		SRGBICC: icc, SRGBICCSHA256: digest, Policy: animationprocessor.DefaultPolicy()})
+		SRGBICC: icc, SRGBICCSHA256: digest, Policy: animationprocessor.DefaultPolicy(), RunAs: runAs})
 	if err != nil {
 		return nil, errors.Join(certifyInputRejected("animation", "processor_config"), err)
 	}
 	video, err := videoprocessor.New(videoprocessor.Config{Helper: ws.helperPath("video_helper"), Prlimit: prlimit,
-		SRGBICC: icc, SRGBICCSHA256: digest, Policy: videoprocessor.DefaultPolicy()})
+		SRGBICC: icc, SRGBICCSHA256: digest, Policy: videoprocessor.DefaultPolicy(), RunAs: runAs})
 	if err != nil {
 		return nil, errors.Join(certifyInputRejected("video", "processor_config"), err)
 	}
 	probe, err := processrunner.New(prlimit, processrunner.Limits{Timeout: certifyProbeTimeout, AddressSpaceBytes: certifyProbeAddressSpace,
-		FileSizeBytes: 1 << 20, OutputBytesPerStream: certifyProbeOutputBytes})
+		FileSizeBytes: 1 << 20, OutputBytesPerStream: certifyProbeOutputBytes, RunAs: runAs})
 	if err != nil {
 		return nil, errors.Join(certifyInputRejected("ffprobe", "processor_config"), err)
 	}

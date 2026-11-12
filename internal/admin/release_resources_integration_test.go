@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
+	"github.com/kzkymur/no-more-cloud-photos/internal/processrunner"
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 )
 
@@ -210,6 +211,19 @@ func TestReleaseGateResources(t *testing.T) {
 	decoded, err := DecodeCertifySpec(spec)
 	if err != nil {
 		t.Fatal("resource certify spec rejected")
+	}
+	// Root certify drops every helper and probe process to the nmcp user
+	// (review D2): prove the identity a real tool process gets on this host.
+	runAs, err := certifyRunAs()
+	if err != nil || runAs == nil || strconv.FormatUint(uint64(runAs.UID), 10) != runtimeUser.Uid {
+		t.Fatalf("root certify helper identity = %+v (%v), want nmcp uid %s", runAs, err, runtimeUser.Uid)
+	}
+	idRunner, err := processrunner.New("/usr/bin/prlimit", processrunner.Limits{Timeout: 10 * time.Second, AddressSpaceBytes: 1 << 30, OutputBytesPerStream: 1024, RunAs: runAs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := idRunner.Run(ctx, processrunner.Command{Executable: "/usr/bin/id", Arguments: []string{"-u"}}); err != nil || strings.TrimSpace(string(output.Stdout)) != runtimeUser.Uid {
+		t.Fatalf("certify-identity tool process ran as uid %q (%v), want nmcp %s", output.Stdout, err, runtimeUser.Uid)
 	}
 	if _, err := service.ProfileCertify(ctx, decoded); err != nil {
 		// Same sanitized result the CLI prints: reason, input, check, detail.

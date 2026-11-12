@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -992,5 +993,36 @@ func TestCertifyEvidenceIdentityIsStrict(t *testing.T) {
 		if certifyEvidenceIdentical(evidence, definition, requirement, identity) {
 			t.Errorf("%s counted as identical", name)
 		}
+	}
+}
+
+// TestCertifyRunAsDropsRootHelpers pins review D2: a root certify never runs
+// helper or probe processes as root.
+func TestCertifyRunAsDropsRootHelpers(t *testing.T) {
+	previousEUID, previousLookup := certifyEUID, certifyLookupUser
+	t.Cleanup(func() { certifyEUID, certifyLookupUser = previousEUID, previousLookup })
+	certifyEUID = func() int { return 1000 }
+	if runAs, err := certifyRunAs(); err != nil || runAs != nil {
+		t.Fatalf("non-root certify changed identity: %+v %v", runAs, err)
+	}
+	certifyEUID = func() int { return 0 }
+	certifyLookupUser = func(name string) (*user.User, error) {
+		if name != "nmcp" {
+			t.Fatalf("looked up %q", name)
+		}
+		return &user.User{Uid: "999", Gid: "998", Username: "nmcp"}, nil
+	}
+	if runAs, err := certifyRunAs(); err != nil || runAs == nil || runAs.UID != 999 || runAs.GID != 998 {
+		t.Fatalf("root certify did not drop to nmcp: %+v %v", runAs, err)
+	}
+	for name, account := range map[string]*user.User{"root-owned nmcp": {Uid: "0", Gid: "0"}, "unparsable": {Uid: "x", Gid: "1"}} {
+		certifyLookupUser = func(string) (*user.User, error) { return account, nil }
+		if runAs, err := certifyRunAs(); !errors.Is(err, ErrValidation) || runAs != nil {
+			t.Fatalf("%s accepted: %+v %v", name, runAs, err)
+		}
+	}
+	certifyLookupUser = func(string) (*user.User, error) { return nil, user.UnknownUserError("nmcp") }
+	if runAs, err := certifyRunAs(); !errors.Is(err, ErrValidation) || runAs != nil {
+		t.Fatalf("missing nmcp user did not refuse root certify: %+v %v", runAs, err)
 	}
 }
