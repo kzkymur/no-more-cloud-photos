@@ -415,71 +415,77 @@ Goal: files straight from your cameras and phones are accepted and converted.
 Report: per device: model class (e.g. "phone, 2024"), file types, accepted /
 refused (status + code), visual check PASS/FAIL. No personal media.
 
-## 8. Production-scale RPO/RTO [window]
-
-> **ON HOLD: do not run this item yet.** The steps below are being corrected:
-> stopping `nmcp.target` before the backup makes the online cutover's
-> preflight fail (it requires the API and Worker running), and a failed
-> cutover leaves the services stopped with no supported recovery today (#58).
-> Record item 8 as NOT_EXECUTED, reason "runbook item on hold", until this
-> banner is removed.
+## 8. RPO/RTO [window]
 
 Goal: real recovery point and recovery time with your data volume. CI only
 measured a small seeded dataset (`docs/release-gate.md`, "RPO/RTO"). Follow
 `docs/backup-operations.md`, "Operator restore boundary (acceptance still
 required)" and "Explicit cutover and separate resume".
 
-> **Read before starting.** On the production host a restore has only one
-> supported ending today: **cutover**. `restore` puts the source database into
-> `operator restore` maintenance, and there is currently no supported way to
-> return the source to normal service without cutting over (#58, a product gap
-> the team is fixing; see "Known limits and follow-ups"). Never start a restore on
-> production unless you intend to cut over. Cutover makes the restored
-> database authoritative: any write the source accepted after the backup's
-> snapshot cutoff (`started_at` in backup history) is **discarded**.
+> **Never cut over on the production host until #59 ships.** A production
+> cutover needs writes quiesced before the final backup, which has no
+> supported procedure yet (#59). Cutover makes the restored database
+> authoritative and **discards** every write accepted after the backup's
+> snapshot cutoff (`started_at` in backup history).
 >
-> If you only want numbers, run this item on a separate rehearsal host built
-> from the same release and fed a copy of a production backup artifact. Report
-> it as "rehearsal host", not production.
+> **Never stop `nmcp.target` before an online cutover.** Online cutover's
+> preflight requires `nmcp-migrate` active and the API and Worker running;
+> with them stopped the cutover fails into `cutover_failed` with the services
+> stopped.
+>
+> **If a restore or cutover step fails, stop and report.** Do not restart or
+> start units around a failed operation ("Explicit cutover and separate
+> resume"); there is no supported recovery from a stuck restore until #58.
 
-Choose one branch and record which.
+Record the dataset size first, in every branch: `du -sh /var/lib/nmcp/media`,
+media count from `GET /media`, and database size
+(`sudo -u postgres psql -Atc "SELECT pg_size_pretty(pg_database_size('nmcp'))"`).
 
-**A. Production, with cutover (planned downtime):**
+**A. Production cutover: NOT_EXECUTED.** Record it as NOT_EXECUTED, reason
+"planned production cutover requires #59".
 
-1. Record the dataset size: `du -sh /var/lib/nmcp/media`, media count from
-   `GET /media`, database size
-   (`sudo -u postgres psql -Atc "SELECT pg_size_pretty(pg_database_size('nmcp'))"`).
-2. Stop all writers **before** the backup, so nothing is accepted after its
-   cutoff: `sudo systemctl stop nmcp.target nmcp-backup.timer`. There is no
-   `maintenance enter` command; the backup unit needs only the database, so it
-   runs with `nmcp.target` stopped.
-3. Take the backup with `force_backup` (item 4) and note its `started_at`
-   (the snapshot cutoff). Start the RTO clock (monotonic) when the restore
-   begins.
-4. Restore into a fresh candidate, validate, cut over, then point
-   `check.dsn`/`repair.dsn` at the candidate as described in "Explicit cutover
-   and separate resume".
-5. **Resume explicitly**: the separate root post-restore
-   `maintenance resume --yes --json` from that section. Then start
-   `nmcp.target` and `nmcp-backup.timer`, check `/readyz` and one upload end
-   to end, and stop the RTO clock.
-6. The former source database is no longer used by the services. Keep it until
-   you are satisfied, then drop it as the PostgreSQL cluster administrator.
-   Retiring its restore ledger entry has no CLI yet (#58, see "Known limits and
-   follow-ups"); keep the ledger and receipt files.
+**B. Production validation-only drill (requires #58).** This measures backup
+and restore up to validation on your real data, then abandons the restore so
+production returns to normal service. It needs the abandon command from #58;
+until a release with #58 is deployed, record B as NOT_EXECUTED, reason
+"requires #58". With #58:
 
-**B. Rehearsal host (recommended for numbers only):** steps 1–5 of A on the
-rehearsal host. Afterwards, discard the whole rehearsal host or its database
-cluster; do not reuse it as production.
+1. Keep `nmcp.target` running. Take a backup with `force_backup` (item 4) and
+   note its `started_at`. Start a monotonic clock when the restore begins.
+2. Restore into a fresh candidate and run the validation in "Operator restore
+   boundary (acceptance still required)". The source enters `operator
+   restore` maintenance and stops accepting writes until step 3.
+3. Abandon the restore as root: `restore --operation-id <OP> --abandon`
+   (#58; use the exact form documented there). Expected: the abandonment is
+   recorded in the restore ledger and the source returns to normal after a
+   fresh check. Stop the clock when `/readyz` is 200 and one upload completes.
+4. Drop the unused candidate database as the PostgreSQL cluster administrator
+   (the API and Worker never point at it before cutover), and handle its
+   receipt as #58 documents.
 
-Expected: restore, validation, cutover and resume all succeed; RPO = time
-writers were stopped (A) or the simulated failure time (B), minus the
-snapshot cutoff; RTO = monotonic time from restore start to the first
-successful end-to-end upload after resume, with per-phase times.
+**C. Rehearsal host with cutover (for cutover RTO numbers).** On a separate
+host built from the same release and fed a copy of a production backup
+artifact, with `nmcp.target` **running** throughout:
 
-Report: branch (A production / B rehearsal), dataset size (media bytes,
-count, database bytes), RPO, RTO and the phase breakdown (restore,
-validation, cutover, resume).
+1. Backup with `force_backup`, note `started_at`, and start the clock at
+   restore start.
+2. Restore into a fresh candidate, validate, and cut over, keeping the API and
+   Worker running, then point `check.dsn`/`repair.dsn` at the candidate, all
+   as in "Explicit cutover and separate resume".
+3. Resume explicitly: the separate root post-restore
+   `maintenance resume --yes --json` from that section. Check `/readyz` and
+   one upload end to end, then stop the clock.
+4. Discard the rehearsal host or its cluster afterwards; never promote it to
+   production.
+
+Expected: B and C succeed step by step. RPO = the moment the drill treats as
+the failure, minus the snapshot cutoff. RTO = the monotonic time from restore
+start to the first successful end-to-end upload after resume (C) or after
+abandon (B), with per-phase times.
+
+Report: A NOT_EXECUTED (#59); B result or NOT_EXECUTED (#58); C result with
+the rehearsal host labelled as such; dataset size (media bytes, count,
+database bytes); RPO, RTO and the phase breakdown for each executed branch.
 
 ## 9. nmcp-admin on the host, profile certification, Worker restart
 
@@ -552,8 +558,9 @@ None blocks this runbook; note them when you interpret a result.
 | #53 | The upload metadata probe uses the distribution `/usr/bin/ffprobe`, while certification uses the pinned `/opt/nmcp/current/bin/ffprobe`. | A file the distribution probe cannot read is refused at upload (item 7) even if the pinned toolchain could convert it; report it with the status code. |
 | #54 | `nmcp-admin check` fails closed with `storage_scan_unstable` (exit 1) when storage changes during its scan, and does not retry by itself. | Common right after a Worker restart or during uploads. It is not a finding: wait briefly and rerun (the CI scenario allows up to 3 tries) before reporting item 9. |
 | #55 | Root `profile certify` runs helpers as `nmcp` with the Worker's limits, but not inside the Worker unit's systemd sandbox. | Certify only trusted fixtures (item 9). |
+| #59 | A planned production cutover needs writes quiesced before the final backup; there is no supported procedure yet. | Item 8 A is NOT_EXECUTED. Never cut over on production, and never stop `nmcp.target` before an online cutover. |
 | #57 | A backup that fails before its run is recorded (for example, database unreachable) writes no history and sends no notification; only exit 1 and a log line. | Item 4(b) is NOT_EXECUTED until a release with #57. Watch `nmcp-backup.service` failures in the journal meanwhile. |
-| #58 | A restore cannot yet be abandoned: without cutover, the source stays in `operator restore` maintenance and an unused candidate/ledger entry cannot be retired by a CLI. | Item 8 on production only with a planned cutover, or on a rehearsal host. Keep ledger and receipt files. After #58 ships (`restore --operation-id OP --abandon`), item 8 will add a validation-only production drill. |
+| #58 | A restore cannot yet be abandoned: without cutover, the source stays in `operator restore` maintenance and an unused candidate/ledger entry cannot be retired by a CLI. | Item 8 B (production validation-only drill) requires #58's `restore --operation-id OP --abandon`. Keep ledger and receipt files. |
 
 ## Reporting back
 
