@@ -798,6 +798,12 @@ func TestCertifyProfileAllOrNothingThroughSeam(t *testing.T) {
 			if err == nil || len(rows) != 0 {
 				t.Fatalf("partial certification accepted: rows=%d", len(rows))
 			}
+			if name == "decoder not advertised" {
+				failure, ok := certifyFailureResult(definition.ID, err).(CertifyFailure)
+				if !ok || failure.Reason != certifyReasonInputEvidence || failure.Check != "decoder_not_advertised" || !strings.HasPrefix(failure.Input, "fixture[") {
+					t.Fatalf("decoder refusal = %+v (%v)", failure, err)
+				}
+			}
 		})
 	}
 

@@ -357,7 +357,9 @@ installed helpers:
    setup or capability probe reports `reason` `input_evidence_rejected` with the
    failing `input` (for example `still_helper` or `fixture[3]:image/heic`) and
    `check` (`open`, `owner_mode`, `ancestor`, `digest`, `type_size`,
-   `processor_config`, `capabilities`, `requirements`), never a path.
+   `processor_config`, `capabilities`, `requirements`, `mime_not_in_profile`,
+   `mime_without_fixture`, `inspect`, `routing`, `decoder_not_advertised`),
+   never a path.
 
 A certification proves that **this host's exact helper binaries** transformed
 **the given fixtures** with the profile's recipes and that independently probed

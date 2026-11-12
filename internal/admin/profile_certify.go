@@ -516,13 +516,13 @@ func checkFixtureMIMEs(definition profile.Definition, fixtures []certifyVerified
 	present := map[string]bool{}
 	for _, fixture := range fixtures {
 		if !slices.Contains(definition.InputMIMETypes, fixture.mimeType) {
-			return ErrValidation
+			return certifyInputRejected(certifyFixtureLabel(fixture), "mime_not_in_profile")
 		}
 		present[fixture.mimeType] = true
 	}
 	for _, mimeType := range definition.InputMIMETypes {
 		if !present[mimeType] {
-			return ErrValidation
+			return certifyInputRejected("profile:"+mimeType, "mime_without_fixture")
 		}
 	}
 	return nil
@@ -548,6 +548,21 @@ const (
 
 func certifyInputRejected(input, check string) error {
 	return &certifyFailureError{reason: certifyReasonInputEvidence, input: input, check: check}
+}
+
+func certifyFixtureLabel(fixture certifyVerifiedFixture) string {
+	return fmt.Sprintf("fixture[%d]:%s", fixture.index, fixture.mimeType)
+}
+
+// certifyTagValidation names the input and check of an otherwise anonymous
+// validation refusal; operational errors and already-named refusals pass
+// through unchanged.
+func certifyTagValidation(err error, input, check string) error {
+	var named *certifyFailureError
+	if !errors.Is(err, ErrValidation) || errors.As(err, &named) {
+		return err
+	}
+	return errors.Join(certifyInputRejected(input, check), err)
 }
 
 func (e *certifyFailureError) Error() string { return "certification refused: " + e.reason }
@@ -861,16 +876,18 @@ func certifyProfile(ctx context.Context, definition profile.Definition, ws *cert
 		facts, err := rt.Inspect(ctx, fixture.mimeType, input)
 		_ = input.Close()
 		if err != nil {
-			return nil, err
+			return nil, certifyTagValidation(err, certifyFixtureLabel(fixture), "inspect")
 		}
 		fixtureRuns, err := certifyRunsFor(fixture, recipes[fixture.mimeType], facts)
 		if err != nil {
-			return nil, err
+			return nil, certifyTagValidation(err, certifyFixtureLabel(fixture), "routing")
 		}
 		for _, run := range fixtureRuns {
 			family, ok := identity[certifyRouteFamily(run.Route)]
 			if !ok || !slices.Contains(family.DecoderMIMETypes, fixture.mimeType) {
-				return nil, ErrValidation
+				// The helper does not advertise this input MIME, so the Worker
+				// would refuse it too; certification must not claim it.
+				return nil, certifyInputRejected(certifyFixtureLabel(fixture), "decoder_not_advertised")
 			}
 		}
 		runs = append(runs, fixtureRuns...)
