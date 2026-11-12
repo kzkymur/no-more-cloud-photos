@@ -1004,8 +1004,17 @@ class BootstrapRetry(unittest.TestCase):
         self.assertTrue((work / 'rootfs-failed-attempt-1').is_dir())
         self.assertTrue(any('Bootstrap attempt' in str(c) for c in printed.call_args_list))
 
-    def test_non_connect_or_late_phase_never_retried(self):
-        for outcome in [('DNS', 'download'), ('timeout', 'download'), ('connect', 'configure'), ('dpkg', 'unpack'), ('unknown', 'unknown')]:
+    def test_dns_in_download_is_retried(self):
+        result, calls, work, _ = self.run_attempts([('DNS', 'download'), None])
+        self.assertEqual(result, {'result': 'success'})
+        self.assertEqual(len(calls), 2)
+        self.assertTrue((work / 'rootfs-failed-attempt-1').is_dir())
+        result, calls, _, _ = self.run_attempts([('DNS', 'configure'), None])
+        self.assertIsInstance(result, MODULE.BootstrapFailure)
+        self.assertEqual(len(calls), 1)
+
+    def test_non_network_or_late_phase_never_retried(self):
+        for outcome in [('timeout', 'download'), ('connect', 'configure'), ('dpkg', 'unpack'), ('unknown', 'unknown')]:
             result, calls, _, _ = self.run_attempts([outcome, None])
             self.assertIsInstance(result, MODULE.BootstrapFailure, outcome)
             self.assertEqual(len(calls), 1, outcome)

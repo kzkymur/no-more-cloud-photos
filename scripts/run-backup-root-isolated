@@ -468,7 +468,7 @@ def root_has_mounts(root):
 def bootstrap_with_retry(argv_for, env, work, root, identity, timeout):
     """Bounded retry of transient connect failures inside ONE absolute deadline.
 
-    Only a failure classified `connect` during download/validate is retried, at
+    Only a failure classified `connect` or `DNS` during download/validate is retried, at
     most BOOTSTRAP_ATTEMPTS times. Every attempt shares the original deadline
     (never reset), reuses the same --cache-dir (each file re-verified against
     the freshly signed metadata), and starts from a fresh target: the failed
@@ -484,7 +484,9 @@ def bootstrap_with_retry(argv_for, env, work, root, identity, timeout):
         except BootstrapFailure as failure:
             summary = getattr(failure, 'summary', {})
             remaining = int(deadline - time.monotonic())
-            retry = (summary.get('error_class') == 'connect' and summary.get('phase') in ('download', 'validate')
+            # Transient network classes only (review n7: DNS resolution too),
+            # only before anything is extracted, within the shared deadline.
+            retry = (summary.get('error_class') in ('connect', 'DNS') and summary.get('phase') in ('download', 'validate')
                      and attempt < BOOTSTRAP_ATTEMPTS and remaining >= BOOTSTRAP_RETRY_MIN and not root_has_mounts(root))
             print('Bootstrap attempt: ' + json.dumps(dict(attempt=attempt, error_class=summary.get('error_class', 'unknown'),
                   phase=summary.get('phase', 'unknown'), remaining_seconds=max(0, remaining), retry=retry), sort_keys=True), flush=True)
