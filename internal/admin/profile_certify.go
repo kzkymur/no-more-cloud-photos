@@ -535,6 +535,7 @@ type certifyFailureError struct {
 	requirement certifyRequirement
 	input       string
 	check       string
+	detail      string
 }
 
 const (
@@ -548,6 +549,19 @@ const (
 
 func certifyInputRejected(input, check string) error {
 	return &certifyFailureError{reason: certifyReasonInputEvidence, input: input, check: check}
+}
+
+// certifySafeToken bounds a probe-reported name to [a-z0-9/_.,+-] for detail.
+func certifySafeToken(value string) string {
+	if len(value) > 48 {
+		value = value[:48]
+	}
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || strings.ContainsRune("/_.,+-", r) {
+			return r
+		}
+		return '?'
+	}, value)
 }
 
 func certifyFixtureLabel(fixture certifyVerifiedFixture) string {
@@ -575,6 +589,9 @@ type CertifyFailure struct {
 	Requirement certifyRequirement `json:"requirement"`
 	Input       string             `json:"input,omitempty"`
 	Check       string             `json:"check,omitempty"`
+	// Detail carries only the compared numbers and sanitized codec/format
+	// names of an output-evidence refusal; never paths or helper text.
+	Detail string `json:"detail,omitempty"`
 }
 
 func certifyFailureResult(profileID string, err error) any {
@@ -582,7 +599,7 @@ func certifyFailureResult(profileID string, err error) any {
 	if !errors.As(err, &failure) {
 		return nil
 	}
-	return CertifyFailure{ProfileID: profileID, Reason: failure.reason, Requirement: failure.requirement, Input: failure.input, Check: failure.check}
+	return CertifyFailure{ProfileID: profileID, Reason: failure.reason, Requirement: failure.requirement, Input: failure.input, Check: failure.check, Detail: failure.detail}
 }
 
 type certifyRoute string
@@ -718,7 +735,11 @@ func certifyRouteFamily(route certifyRoute) string {
 func evaluateCertifyRun(run certifyRun, transformed certifyTransformFacts, probed certifyProbeFacts) error {
 	edge := run.Recipe.MaxLongEdge
 	reject := func(check string) error {
-		return certifyInputRejected(certifyFixtureLabel(run.Fixture)+"->"+string(run.OutputKind), check)
+		return &certifyFailureError{reason: certifyReasonInputEvidence, input: certifyFixtureLabel(run.Fixture) + "->" + string(run.OutputKind), check: check,
+			detail: fmt.Sprintf("transform=%s %dx%d src=%dx%d edge=%d setting=%d depth=%d frames=%d probe=%s %dx%d video=%d audio=%d/%s frames=%d pix=%s container=%s",
+				certifySafeToken(transformed.OutputMIME), transformed.Width, transformed.Height, transformed.SourceWidth, transformed.SourceHeight, edge,
+				transformed.Setting, transformed.BitDepth, transformed.FrameCount, certifySafeToken(probed.Codec), probed.Width, probed.Height,
+				probed.VideoStreams, probed.AudioStreams, certifySafeToken(probed.AudioCodec), probed.FrameCount, certifySafeToken(probed.PixelFormat), certifySafeToken(probed.Container))}
 	}
 	expectedMIME, codec, bitDepth := "image/avif", "av1", 8
 	switch run.OutputKind {
