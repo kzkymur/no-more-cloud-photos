@@ -31,6 +31,8 @@ type harness struct {
 	deadline time.Time
 	apiHTTP  *http.Client
 	fileHTTP *http.Client
+	// lastReport is the sealed report the last assertReconciled asserted.
+	lastReport string
 }
 
 // newHarness reads the infra contract environment. Missing environment means

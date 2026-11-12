@@ -65,14 +65,18 @@ type residueFinding struct {
 	Kind, Actionability, SubjectType, Key, MediaID, SHA256 string
 }
 
-// latestFindings returns the latest report's findings keyed by kind, subject
-// type and relative key (or subject), so residue can be diffed per point.
+// latestFindings returns the findings of the last report assertReconciled
+// asserted (review K3: never "the newest row"), keyed by kind, subject type
+// and relative key (or subject), so residue can be diffed per point. That
+// report must exist and be sealed.
 func (h *harness) latestFindings() map[string]residueFinding {
 	h.t.Helper()
+	if h.lastReport == "" || h.dbRead(`SELECT count(*)::text FROM reconciliation_check_report_seals WHERE report_id='`+h.lastReport+`'`) != "1" {
+		h.t.Fatalf("residue baseline %q is not an asserted sealed report", h.lastReport)
+	}
 	rows := h.dbRead(`SELECT COALESCE(string_agg(concat_ws('|',f.kind,f.actionability,f.subject_type,
 			COALESCE(f.relative_key,f.subject_id::text,''),COALESCE(f.media_id::text,''),COALESCE(f.observed_sha256,'')),E'\n' ORDER BY f.ordinal),'')
-		FROM reconciliation_check_findings f WHERE f.report_id=(SELECT r.id FROM reconciliation_check_reports r
-		ORDER BY r.created_at DESC, r.id DESC LIMIT 1)`)
+		FROM reconciliation_check_findings f WHERE f.report_id='` + h.lastReport + `'`)
 	out := map[string]residueFinding{}
 	for _, line := range strings.Split(rows, "\n") {
 		if line == "" {
@@ -102,8 +106,9 @@ const (
 )
 
 // assertResidue checks the findings new since prev against the point's
-// expected residue. orphanMatch identifies "this media's" orphan.
-func (h *harness) assertResidue(point string, prev map[string]residueFinding, want residue, orphanMatch func(residueFinding) bool) {
+// expected residue. ours identifies a finding of this point's own upload or
+// media (its temp or its orphan).
+func (h *harness) assertResidue(point string, prev map[string]residueFinding, want residue, ours func(residueFinding) bool) {
 	h.t.Helper()
 	var added []residueFinding
 	for key, f := range h.latestFindings() {
@@ -118,17 +123,23 @@ func (h *harness) assertResidue(point string, prev map[string]residueFinding, wa
 			h.t.Fatalf("%s: new findings %+v, want none", point, added)
 		}
 	case residueTemp:
-		if len(added) > 1 {
-			h.t.Fatalf("%s: new findings %+v, want at most the interrupted attempt's temp", point, added)
-		}
+		// Review n5: the interrupted attempt's own temp must be there (at
+		// least one, tied to this upload or media), and nothing else.
+		mine := 0
 		for _, f := range added {
 			if f.Kind != "recent_or_live_temp" || f.Actionability != "non_actionable" ||
 				(f.SubjectType != "original_attempt_temp" && f.SubjectType != "rendition_attempt_temp") {
 				h.t.Fatalf("%s: new finding %+v, want only a non-actionable recent attempt temp", point, f)
 			}
+			if ours(f) {
+				mine++
+			}
+		}
+		if mine == 0 {
+			h.t.Fatalf("%s: new findings %+v include no temp of this point's upload or media", point, added)
 		}
 	case residueOrphan:
-		if len(added) != 1 || added[0].Kind != "final_orphan" || added[0].Actionability != "repairable" || !orphanMatch(added[0]) {
+		if len(added) != 1 || added[0].Kind != "final_orphan" || added[0].Actionability != "repairable" || !ours(added[0]) {
 			h.t.Fatalf("%s: new findings %+v, want exactly one repairable final_orphan of this media", point, added)
 		}
 	}
@@ -177,10 +188,10 @@ func TestReleaseGateFailpoints(t *testing.T) {
 			h.waitJob(created.Job.ID, "succeeded", 10*time.Minute)
 			h.assertExactlyOneCurrentPerTarget(created.Media.ID)
 			h.assertReconciled(c.point, crashResidueKinds)
-			// The crashed acceptance's original is this upload's bytes under
-			// an ID the retry never committed.
+			// The crashed acceptance's temp or original holds this upload's
+			// bytes under an attempt/ID the retry never committed.
 			h.assertResidue(c.point, prev, c.residue, func(f residueFinding) bool {
-				return f.SubjectType == "original" && f.SHA256 == sha(data)
+				return (f.SubjectType == "original" || f.SubjectType == "original_attempt_temp") && f.SHA256 == sha(data)
 			})
 			h.record("failpoint", map[string]any{"point": c.point, "media_id": created.Media.ID, "replayed": c.replay})
 		})
@@ -215,7 +226,7 @@ func TestReleaseGateFailpoints(t *testing.T) {
 			h.assertExactlyOneCurrentPerTarget(up.Media.ID)
 			h.assertReconciled(point, crashResidueKinds)
 			h.assertResidue(point, prev, c.residue, func(f residueFinding) bool {
-				return f.SubjectType == "rendition" && f.MediaID == up.Media.ID
+				return (f.SubjectType == "rendition" || f.SubjectType == "rendition_attempt_temp") && f.MediaID == up.Media.ID
 			})
 			h.record("failpoint", map[string]any{"point": point, "job_id": up.Job.ID, "attempts": done.Attempts})
 		})
