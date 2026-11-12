@@ -53,8 +53,21 @@ curl --fail --silent https://<TAILNET_HOSTNAME>:<API_TLS_PORT>/readyz -H 'Accept
 Expected: one release directory; all four `active`; `/readyz` returns 200
 `{"status":"ready"}`. Record the release SHA once; every later block refers to it.
 
+Then check that both bundled profiles are active (uploads create no transform
+job otherwise):
+
+```sh
+curl --fail --silent -H 'Accept: application/json' \
+  "https://<TAILNET_HOSTNAME>:<API_TLS_PORT>/profiles?status=active" | jq -r '.items[] | "\(.key)/v\(.version)"'
+```
+
+Expected: `standard/v1` and `thumbnail/v1`. If either is missing, do item 9
+first (certify, activate, restart the Worker), then return here.
+
 Helpers used below (paste into your shell on a Tailnet client; they print only
-IDs and statuses):
+IDs and statuses). If `upload` prints `-` as the job ID, no active profile
+accepted the file and nothing was converted: record that fixture as
+NOT_EXECUTED (and check the profiles above), not as PASS.
 
 ```sh
 API=https://<TAILNET_HOSTNAME>:<API_TLS_PORT>
@@ -77,6 +90,19 @@ wait_job() { # wait_job JOB_ID [TIMEOUT_SECONDS] -> prints final status
 }
 display_url() { curl --fail --silent -H 'Accept: application/json' "$API/media/$1/display" | jq -r .file_url; }
 ```
+
+## Recommended order
+
+Run the items in this order. The numbers match the #22 checklist, not the
+order:
+
+1. **0** preflight, then **9** (both `nmcp-admin` modes, certify, activate,
+   Worker restart). Item 9's `check` runs here, on a quiet system, before items
+   7 and 8 add uploads and restores (see #54).
+2. **1**, **2**, **3**, **5** (read-only or upload-only checks).
+3. **6** [window] installs the backup configuration with the notification
+   hook already set in `backup.env`, then **4** tests the notification.
+4. **7** (device files), then **8** [window] (RPO/RTO) last.
 
 ## 1. Viewer compatibility (AVIF, AV1 MP4, animated WebP)
 
@@ -190,28 +216,79 @@ and expiry", from an approved console **[window]**.
 Report: one block per probe origin (host, allowed device, denied identity,
 LAN, Internet) with PASS/FAIL per port and address family. No addresses.
 
-## 4. Backup failure notification delivery
+## 4. Backup failure notification delivery [window]
 
-Goal: a failed backup produces a notification that actually arrives, and a
-successful one does not. Follow `docs/backup-operations.md`, "Failure
-notifications and measurements".
+Goal: a failed backup produces exactly one notification that actually
+arrives, and a successful one produces none. Run this **after item 6**, which
+installs `backup.env` with `NMCP_BACKUP_NOTIFY_HOOK`. Follow
+`docs/backup-operations.md`, "Failure notifications and measurements".
 
-1. Install your reviewed hook at `/usr/local/libexec/nmcp/backup-notify`
-   (root:root 0755, no arguments, reads JSON on stdin) and set
-   `NMCP_BACKUP_NOTIFY_HOOK` in backup.env through item 6.
-2. Success case: run one manual backup as described in "Wake timer, manual
-   runs and results". Expected: structured outcome success, **no**
-   notification received.
-3. Failure case **[window]**: with API and Worker stopped
-   (`sudo systemctl stop nmcp.target`), stop the concrete PostgreSQL unit, run
-   the manual backup once, then start PostgreSQL and `nmcp.target` again and
-   check `/readyz`. This fails the backup without touching data. Expected: the
-   backup reports a failure (non-zero exit, failure recorded in history) and
-   your endpoint receives one notification whose backup ID matches.
+**Forcing a run.** The shipped service only does a due-check, so after item 6
+a manual start is usually `not_due`. "Wake timer, manual runs and results"
+requires a forced run to use the same hardened unit with only `ExecStart`
+changed. Do that with a runtime drop-in and remove it afterwards:
 
-Report: success run (no notification: PASS/FAIL); failure run: backup exit
-code, failure UTC, notification received UTC, delay in seconds, ID matched
-yes/no. Never paste the hook URL or message body.
+```sh
+force_backup() {
+  sudo mkdir -p /run/systemd/system/nmcp-backup.service.d
+  printf '[Service]\nExecStart=\nExecStart=/opt/nmcp/current/bin/nmcp-admin backup run --json\n' |
+    sudo tee /run/systemd/system/nmcp-backup.service.d/90-handoff-force.conf >/dev/null
+  sudo systemctl daemon-reload
+  sudo systemctl start nmcp-backup.service; echo "unit exit: $?"
+  sudo rm -f /run/systemd/system/nmcp-backup.service.d/90-handoff-force.conf
+  sudo systemctl daemon-reload
+  sudo journalctl -u nmcp-backup.service --since -10min -o cat | grep -E '"(status|outcome|error_code|notification_status)"' | tail -n 4
+}
+sudo systemctl stop nmcp-backup.timer        # no timer run during this item
+```
+
+1. **Success case.** `force_backup`. Expected: outcome success; your endpoint
+   receives **no** notification.
+2. **(a) Failure after the run is recorded.** Make the dump login unable to
+   log in, force one run, and restore it immediately:
+
+   ```sh
+   sudo -u postgres psql -d nmcp -c 'ALTER ROLE nmcp_backup_dump NOLOGIN'
+   force_backup
+   sudo -u postgres psql -d nmcp -c 'ALTER ROLE nmcp_backup_dump LOGIN'
+   ```
+
+   Expected: the unit fails (nmcp-admin exit 1); the run is recorded with status
+   `failed` and error code `prepare`; your endpoint receives exactly one
+   notification whose stdin was `{"backup_id":"<id>","phase":"prepare","status":"failed"}`
+   and whose `backup_id` matches the failed run; the run's
+   `notification_status` is `succeeded` if your hook exited 0, `failed`
+   otherwise. Nothing is dumped or published, and no data changes.
+
+   **Mandatory restore check**, before anything else:
+
+   ```sh
+   sudo -u postgres psql -d nmcp -Atc "SELECT rolcanlogin FROM pg_roles WHERE rolname='nmcp_backup_dump'"   # t
+   sudo scripts/validate-backup-install --installed                                                          # exit 0
+   sudo -u postgres psql -d nmcp -X -v ON_ERROR_STOP=1 -f /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql
+   ```
+
+   Expected: `t`, exit 0, and the role graph verifier succeeds. While the
+   login is disabled every backup fails at `prepare`, and a restore taken in
+   that window is refused (role graph mismatch); after the revert both are
+   normal again. The failed run stays in history; that is intended.
+3. **(b) Database unreachable (requires #57).** Today, if PostgreSQL is
+   unreachable, a backup fails before its run is recorded: **no history row,
+   no audit and no notification**, only exit code 1 and the log line
+   "administrative operation failed". This is a known limit (#57). After #57
+   ships, the same failure sends exactly one notification with no
+   `backup_id` and a `cause` class such as `db_unreachable`. Run this case
+   only on a release containing #57, with `nmcp.target` stopped, the concrete
+   PostgreSQL unit stopped for one `force_backup`, then PostgreSQL and
+   `nmcp.target` started again and `/readyz` checked. Until then, record it as
+   NOT_EXECUTED, reason "requires #57".
+4. `sudo systemctl start nmcp-backup.timer`.
+
+Report: success run (no notification: PASS/FAIL); case (a): unit exit,
+failure UTC, notification received UTC, delay in seconds, ID matched yes/no,
+`notification_status`, and the three restore-check results; case (b):
+NOT_EXECUTED (requires #57) or its result. Never paste the hook URL or
+message body.
 
 ## 5. Database backup and originals storage locations
 
@@ -239,25 +316,54 @@ the backup root is nmcp-backup 0700 outside media and outside Nginx.
 Report: a mapping like "media: disk 1; database: disk 1; backups: disk 2"
 (no device serials), and "same-disk risk accepted: yes/no".
 
-## 6. Real-host install-backup-config
+## 6. Real-host install-backup-config [window]
 
-Goal: the backup configuration installs and validates on your host. Follow
-`docs/backup-operations.md`, "Local installation prerequisites" and "Wake
-timer, manual runs and results".
+Goal: the backup configuration installs and validates on your host, with the
+notification hook already configured, so that item 4 can test it. Follow
+`docs/backup-operations.md`, "Local installation prerequisites", "Wake timer,
+manual runs and results" and "Failure notifications and measurements".
+
+What `scripts/install-backup-config` actually does, in order (so plan a window):
+
+1. Takes the deployment locks, and **stops** `nmcp-backup.timer` and
+   `nmcp-backup.service`.
+2. Captures your four input files and installs them root:root 0600:
+   `/etc/nmcp/backup.env`, `/etc/nmcp/backup.pg_service.conf` and the two
+   `.pgpass` files under `/etc/nmcp/credentials`. It also installs the
+   PostgreSQL dependency drop-in for `nmcp-backup.service`.
+3. Runs `validate-backup-install --installed`.
+4. Runs `configure-backup-source-hba`: it **rewrites the backup logins'
+   `pg_hba.conf` lines and reloads PostgreSQL** (`pg_reload_conf()`), then
+   checks the cluster identity did not change during the reload.
+5. Reloads systemd and validates again with `--fresh-manager`.
+6. **Starts `nmcp-backup.service` immediately** (a due-check wake: the first
+   install normally runs a backup now), then **enables `nmcp-backup.timer`**.
+
+Before running it, install your reviewed notification hook
+(`/usr/local/libexec/nmcp/backup-notify`, root:root 0755, no arguments, JSON
+on stdin) and put `NMCP_BACKUP_NOTIFY_HOOK=/usr/local/libexec/nmcp/backup-notify`
+in the `backup.env` you install here.
 
 ```sh
 sudo install -d -m 0700 /root/nmcp-backup-config
-# Create there, from the examples, root:root 0600:
-#   backup.env, backup.pg_service.conf, backup-dump.pgpass, backup-control.pgpass
+# Create there, from infra/ubuntu/env/backup.env.example and the docs, root:root 0600:
+#   backup.env (with NMCP_BACKUP_NOTIFY_HOOK), backup.pg_service.conf,
+#   backup-dump.pgpass, backup-control.pgpass
 sudo scripts/install-backup-config --config-dir /root/nmcp-backup-config
 sudo scripts/validate-backup-install --installed
+systemctl is-enabled nmcp-backup.timer
+sudo journalctl -u nmcp-backup.service --since -30min -o cat | grep -E '"(status|outcome)"' | tail -n 3
 ```
 
-Expected: both exit 0; the files are under `/etc/nmcp` and
-`/etc/nmcp/credentials` as root:root 0600; the timer is enabled only after the
-checks in "Wake timer, manual runs and results".
+Expected: both scripts exit 0 and print "No backup success claimed"; the timer
+is `enabled`; `/readyz` stays 200 after the PostgreSQL reload. The service's
+structured JSON outcome in the journal is a successful backup, or
+`not_due` (exit 4) if the database policy did not consider one due. Neither
+`not_due` nor unit success alone is a backup success (see "Wake timer, manual
+runs and results").
 
-Report: exit codes and `systemctl is-enabled nmcp-backup.timer`.
+Report: exit codes, the timer state, and the newest run's status and size
+(no paths or IDs needed).
 
 ## 7. Real-device HEIC/HEIF and video acceptance
 
@@ -293,28 +399,64 @@ Goal: files straight from your cameras and phones are accepted and converted.
 Report: per device: model class (e.g. "phone, 2024"), file types, accepted /
 refused (status + code), visual check PASS/FAIL. No personal media.
 
-## 8. Production-scale RPO/RTO
+## 8. Production-scale RPO/RTO [window]
 
 Goal: real recovery point and recovery time with your data volume. CI only
-measured a small seeded dataset (`docs/release-gate.md`, "RPO/RTO").
+measured a small seeded dataset (`docs/release-gate.md`, "RPO/RTO"). Follow
+`docs/backup-operations.md`, "Operator restore boundary (acceptance still
+required)" and "Explicit cutover and separate resume".
 
-Follow `docs/backup-operations.md`, "Operator restore boundary (acceptance
-still required)" and "Explicit cutover and separate resume" **[window]**:
+> **Read before starting.** On the production host a restore has only one
+> supported ending today: **cutover**. `restore` puts the source database into
+> `operator restore` maintenance, and there is currently no supported way to
+> return the source to normal service without cutting over (a product gap the
+> team is fixing; see "Known limits and follow-ups"). Never start a restore on
+> production unless you intend to cut over. Cutover makes the restored
+> database authoritative: any write the source accepted after the backup's
+> snapshot cutoff (`started_at` in backup history) is **discarded**.
+>
+> If you only want numbers, run this item on a separate rehearsal host built
+> from the same release and fed a copy of a production backup artifact. Report
+> it as "rehearsal host", not production.
+
+Choose one branch and record which.
+
+**A. Production, with cutover (planned downtime):**
 
 1. Record the dataset size: `du -sh /var/lib/nmcp/media`, media count from
    `GET /media`, database size
    (`sudo -u postgres psql -Atc "SELECT pg_size_pretty(pg_database_size('nmcp'))"`).
-2. Take a manual backup; note its snapshot cutoff.
-3. Restore into a new candidate database and validate it. Cut over only if
-   your window allows it; otherwise measure up to validation and say so.
-4. Resume and confirm `/readyz` and one new upload end to end.
+2. Stop all writers **before** the backup, so nothing is accepted after its
+   cutoff: `sudo systemctl stop nmcp.target nmcp-backup.timer`. There is no
+   `maintenance enter` command; the backup unit needs only the database, so it
+   runs with `nmcp.target` stopped.
+3. Take the backup with `force_backup` (item 4) and note its `started_at`
+   (the snapshot cutoff). Start the RTO clock (monotonic) when the restore
+   begins.
+4. Restore into a fresh candidate, validate, cut over, then point
+   `check.dsn`/`repair.dsn` at the candidate as described in "Explicit cutover
+   and separate resume".
+5. **Resume explicitly**: the separate root post-restore
+   `maintenance resume --yes --json` from that section. Then start
+   `nmcp.target` and `nmcp-backup.timer`, check `/readyz` and one upload end
+   to end, and stop the RTO clock.
+6. The former source database is no longer used by the services. Keep it until
+   you are satisfied, then drop it as the PostgreSQL cluster administrator.
+   Retiring its restore ledger entry has no CLI yet (see "Known limits and
+   follow-ups"); keep the ledger and receipt files.
 
-Expected: restore and validation succeed; RPO = time of failure (or test
-start) minus the snapshot cutoff; RTO = monotonic time from restore start to
-resumed service, with per-phase times.
+**B. Rehearsal host (recommended for numbers only):** steps 1–5 of A on the
+rehearsal host. Afterwards, discard the whole rehearsal host or its database
+cluster; do not reuse it as production.
 
-Report: dataset size (media bytes, count, database bytes), RPO, RTO and the
-phase breakdown, and whether cutover was included.
+Expected: restore, validation, cutover and resume all succeed; RPO = time
+writers were stopped (A) or the simulated failure time (B), minus the
+snapshot cutoff; RTO = monotonic time from restore start to the first
+successful end-to-end upload after resume, with per-phase times.
+
+Report: branch (A production / B rehearsal), dataset size (media bytes,
+count, database bytes), RPO, RTO and the phase breakdown (restore,
+validation, cutover, resume).
 
 ## 9. nmcp-admin on the host, profile certification, Worker restart
 
@@ -333,7 +475,9 @@ before activation".
      -p LoadCredential=repair.dsn:/etc/nmcp/credentials/repair.dsn \
      /opt/nmcp/current/bin/nmcp-admin check --scope all --json
    ```
-   Expected: exit 0, sealed report with 0 findings.
+   Expected: exit 0, sealed report with 0 findings. Exit 1 with
+   `storage_scan_unstable` means storage changed during the scan (for example
+   right after a Worker restart): wait briefly and rerun (#54).
 2. Owner mode (runs as root):
 
    ```sh
@@ -385,6 +529,8 @@ None blocks this runbook; note them when you interpret a result.
 | #53 | The upload metadata probe uses the distribution `/usr/bin/ffprobe`, while certification uses the pinned `/opt/nmcp/current/bin/ffprobe`. | A file the distribution probe cannot read is refused at upload (item 7) even if the pinned toolchain could convert it; report it with the status code. |
 | #54 | `nmcp-admin check` fails closed with `storage_scan_unstable` (exit 1) when storage changes during its scan, and does not retry by itself. | Common right after a Worker restart or during uploads. It is not a finding: wait briefly and rerun (the CI scenario allows up to 3 tries) before reporting item 9. |
 | #55 | Root `profile certify` runs helpers as `nmcp` with the Worker's limits, but not inside the Worker unit's systemd sandbox. | Certify only trusted fixtures (item 9). |
+| #57 | A backup that fails before its run is recorded (for example, database unreachable) writes no history and sends no notification; only exit 1 and a log line. | Item 4(b) is NOT_EXECUTED until a release with #57. Watch `nmcp-backup.service` failures in the journal meanwhile. |
+| pending | A restore cannot yet be abandoned: without cutover, the source stays in `operator restore` maintenance and an unused candidate/ledger entry cannot be retired by a CLI. | Item 8 on production only with a planned cutover, or on a rehearsal host. Keep ledger and receipt files. |
 
 ## Reporting back
 
