@@ -7,7 +7,6 @@ import (
 	"os"
 	"sync/atomic"
 	"syscall"
-	"time"
 )
 
 // EnvName selects at most one point per process: NAME or NAME@N, where N is a
@@ -135,8 +134,9 @@ func kill(point Point) {
 	_, _ = os.Stderr.WriteString("nmcp-failpoint fired " + Name(point) + "\n")
 	_ = syscall.Kill(syscall.Getpid(), syscall.SIGKILL)
 	// SIGKILL to the own thread group is fatal before the syscall returns to
-	// user space; never let the caller continue if it somehow does return.
-	for {
-		time.Sleep(time.Hour)
-	}
+	// user space, except for the init process of a PID namespace (a container
+	// entrypoint), which the kernel shields from its own signals. Then end the
+	// process with exit_group directly: still no deferred cleanup, flush or
+	// graceful shutdown, and the 128+SIGKILL status an external kill reports.
+	syscall.Exit(137)
 }
