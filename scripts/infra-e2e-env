@@ -405,7 +405,7 @@ remount_media() {
 
 fault() {
   [ $# -ge 2 ] || die "usage: fault media-readonly|media-full on|off [BYTES]"
-  local kind=$1 mode=$2 extra=${3:-0} used options
+  local kind=$1 mode=$2 extra=${3:-0} used options page target size
   case "$kind:$mode" in
     media-readonly:on)
       remount_media ro
@@ -420,11 +420,23 @@ fault() {
     media-full:on)
       case "$extra" in ''|*[!0-9]*) die "invalid BYTES: $extra" ;; esac
       used=$(df --block-size=1 --output=used "$media_mount" | tail -n1 | tr -d ' ')
-      remount_media "size=$((used + extra))"
+      page=$(getconf PAGESIZE)
+      # tmpfs treats size=0 as UNLIMITED, and an almost-empty media tree (only
+      # directories) reports 0 bytes used. Never request less than one page,
+      # and round up to whole pages, which is what tmpfs enforces.
+      target=$(( (used + extra + page - 1) / page * page ))
+      [ "$target" -ge "$page" ] || target=$page
+      remount_media "size=$target"
       df --block-size=1 --output=size,used,avail "$media_mount" >&2
+      size=$(df --block-size=1 --output=size "$media_mount" | tail -n1 | tr -d ' ')
+      if [ "$size" -le 0 ] || [ "$size" -gt "$target" ]; then
+        die "media-full did not take effect (size=$size, wanted $target)"
+      fi
       ;;
     media-full:off)
       remount_media "size=$(cat "$state_dir/media-size")"
+      size=$(df --block-size=1 --output=size "$media_mount" | tail -n1 | tr -d ' ')
+      [ "$size" -ge "$(cat "$state_dir/media-size")" ] || die "media-full off did not restore the size (size=$size)"
       ;;
     *) die "unknown fault: $kind $mode" ;;
   esac
