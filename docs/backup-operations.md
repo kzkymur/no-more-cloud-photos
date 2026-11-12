@@ -217,9 +217,29 @@ Install a reviewed root-owned 0755 executable
 `/usr/local/libexec/nmcp/backup-notify`, then add
 `NMCP_BACKUP_NOTIFY_HOOK=/usr/local/libexec/nmcp/backup-notify` to backup.env.
 It is a fixed executable with no arguments and no shell interpretation. The
-application sends bounded JSON metadata on stdin (backup ID, failure phase and
-status); no dump bytes, credentials or raw subprocess errors. It runs with a
-minimal nonsecret environment and a 10-second deadline; output is discarded.
+application sends bounded JSON metadata on stdin; no dump bytes, credentials,
+paths or raw subprocess errors. It runs with only `PATH=/usr/bin:/bin` and
+`LANG=C` in its environment and a 10-second deadline; output is discarded. The
+stdin document is exactly one of:
+
+- A run that failed after its history row exists (the row records the same
+  phase as `error_code`):
+  `{"backup_id":"<uuid>","phase":"<phase>","status":"failed"}`, where phase is
+  one of `running_commit`, `prepare`, `dump`, `publication_uncertain`,
+  `authority_lost_after_publish`, `history` or `abandoned`.
+- A run that failed before any history row exists (#57; for example
+  PostgreSQL is unreachable): there is no backup ID and nothing is written to
+  history. The hook is invoked exactly once per failed invocation with
+  `{"status":"failed","phase":"precondition","cause":"<cause>","at":"<RFC3339 UTC>"}`,
+  where cause is one of `db_unreachable`, `schema_not_ready`, `configuration`,
+  `artifact_store`, `recovery`, `maintenance` or `history`. The command also
+  logs one stderr line
+  `{"level":"ERROR","message":"backup failed before a history row existed","cause":…,"notification":"succeeded|failed|not_configured"}`
+  and exits non-zero. Because no row exists, a failed pre-history
+  notification is not retried by later runs.
+
+An overlapping run (`overlap_conflict`) and `--if-due` with nothing due
+(`not_due`) are not failures and notify nothing.
 Keep endpoint secrets outside argv and this routine environment, readable only
 through a separately reviewed notification mechanism compatible with the unit.
 A missing, timed-out or nonzero hook must persist a sanitized notification

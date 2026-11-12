@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/config"
@@ -246,32 +247,44 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if capabilityCommand(o.command) && !(o.command == "maintenance resume" && os.Geteuid() == 0) {
 		return runCapability(ctx, o, stdout, stderr)
 	}
+	// Issue #57: for `backup run`, a failure before the history row exists
+	// (here, before Backup is even reached) notifies the configured hook
+	// exactly once with a closed cause; there is no backup ID yet.
+	preRun := func(err error, cause string) int {
+		if o.command == "backup run" {
+			notifyBackupPreRun(ctx, os.Getenv("NMCP_BACKUP_NOTIFY_HOOK"), cause, time.Now(), stderr)
+		}
+		return finish(stdout, stderr, o.json, nil, err)
+	}
 	dsn, err := loadOwnerDSN(os.Getenv)
 	if err != nil {
-		return finish(stdout, stderr, o.json, nil, err)
+		return preRun(err, backupCauseConfiguration)
 	}
 	cfg, err := config.LoadAdminFrom(ownerGetenv(os.Getenv, dsn))
 	if err != nil {
-		return finish(stdout, stderr, o.json, nil, err)
+		return preRun(err, backupCauseConfiguration)
 	}
 	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		return finish(stdout, stderr, o.json, nil, err)
+		return preRun(err, backupCauseConfiguration)
 	}
 	defer pool.Close()
 	if err := refuseUnprivilegedOwner(ctx, pool); err != nil {
-		return finish(stdout, stderr, o.json, nil, err)
+		if errors.Is(err, ErrValidation) {
+			return preRun(err, backupCauseConfiguration)
+		}
+		return preRun(err, backupCauseDBUnreachable)
 	}
 	migrator, err := database.NewMigrator(pool)
 	if err != nil {
-		return finish(stdout, stderr, o.json, nil, err)
+		return preRun(err, backupCauseConfiguration)
 	}
 	status, err := migrator.Status(ctx)
-	if err != nil || !status.Ready() {
-		if err == nil {
-			err = ErrConflict
-		}
-		return finish(stdout, stderr, o.json, nil, err)
+	if err != nil {
+		return preRun(err, backupCauseDBUnreachable)
+	}
+	if !status.Ready() {
+		return preRun(ErrConflict, backupCauseSchema)
 	}
 	service := New(pool)
 	if o.command == "maintenance resume" {
@@ -330,8 +343,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "backup run":
 		var settings BackupSettings
 		settings, err = backupSettings()
-		if err == nil {
-			result, err = service.Backup(ctx, settings, o.ifDue)
+		if err != nil {
+			return preRun(err, backupCauseConfiguration)
+		}
+		result, err = service.Backup(ctx, settings, o.ifDue)
+		if cause, ok := backupPreRunCause(err); ok {
+			notifyBackupPreRun(ctx, settings.NotifyHook, cause, time.Now(), stderr)
 		}
 	case "config show":
 		result, err = service.ConfigShow(ctx)
