@@ -486,7 +486,58 @@ func TestBackupPG17ProductionRoles(t *testing.T) {
 	pg17FailureJournalOracles(t, f, source, service, b)
 	pg17LockLossNoRivalHistory(t, f, source, service, b)
 	pg17CommitUnknownAndRetention(t, f, source, service, b, run.ID)
+	pg17PreHistoryNotification(t, f, source, service, b)
 	t.Log("proof scope: real Backup, real dump/list/manifest, fresh real pg_restore, role negatives; full successful Service.Restore and production distinct-UID HBA isolation NOT proven")
+}
+
+// pg17PreHistoryNotification is issue #57 on the real cluster: an unopenable
+// artifact store, then PostgreSQL actually stopped. It restarts the cluster
+// before returning so the fixture's own stop and cleanup still hold.
+func pg17PreHistoryNotification(t *testing.T, f *pg17Fixture, source *pgxpool.Pool, service *Service, b BackupSettings) {
+	t.Helper()
+	ctx := f.ctx
+	// First an
+	// artifact store that cannot be opened, with PostgreSQL up: no row, the
+	// closed cause, the hook once.
+	runsBefore := pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM backup_runs`)
+	hook, calls := prerunHook(t, 0)
+	unopenable := b
+	unopenable.Root = filepath.Join(f.root, "absent-backup-root")
+	unopenable.NotifyHook = hook
+	if _, e := service.Backup(ctx, unopenable, false); e == nil {
+		t.Fatal("backup into an absent root succeeded")
+	} else if cause, ok := backupPreRunCause(e); !ok || cause != backupCauseArtifactStore {
+		t.Fatalf("absent backup root cause = %q, %v", cause, ok)
+	}
+	if pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM backup_runs`) != runsBefore {
+		t.Fatal("pre-history failure created a history row")
+	}
+	// Then the real outage: stop the actual PG17 cluster and run the shipped
+	// CLI path in-process with the production control login and the hook.
+	f.command("pg_ctl", nil, "-D", f.data, "-m", "fast", "-w", "stop")
+	if _, e := service.Backup(ctx, unopenable, false); e == nil {
+		t.Fatal("backup with PostgreSQL stopped succeeded")
+	} else if cause, ok := backupPreRunCause(e); !ok || cause != backupCauseDBUnreachable {
+		t.Fatalf("stopped PostgreSQL cause = %q, %v", cause, ok)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
+	t.Setenv("NMCP_ADMIN_DATABASE_URL_FILE", "")
+	t.Setenv("NMCP_DATABASE_URL", (&url.URL{Scheme: "postgres", User: url.UserPassword("nmcp_backup_control", f.passwords["nmcp_backup_control"]),
+		Path: "/source", RawQuery: "host=" + url.QueryEscape(f.socket) + "&port=6543&sslmode=disable&connect_timeout=5"}).String())
+	t.Setenv("NMCP_BACKUP_NOTIFY_HOOK", hook)
+	var cliOut, cliErr bytes.Buffer
+	if code := Run(ctx, []string{"backup", "run", "--json"}, &cliOut, &cliErr); code == 0 {
+		t.Fatal("CLI backup with PostgreSQL stopped exited 0")
+	}
+	recorded := prerunCalls(t, calls)
+	if len(recorded) != 1 || recorded[0].Stdin["cause"] != backupCauseDBUnreachable || recorded[0].Stdin["phase"] != "precondition" {
+		t.Fatalf("CLI hook calls with PostgreSQL stopped = %+v (the Service call above notifies nothing by itself)", recorded)
+	}
+	if strings.Contains(cliErr.String()+cliOut.String(), f.passwords["nmcp_backup_control"]) {
+		t.Fatal("CLI output leaked the control password")
+	}
+	t.Log("actual PG17 stopped: backup CLI exits non-zero, the hook ran exactly once with cause db_unreachable and no backup_id")
+	f.command("pg_ctl", nil, "-D", f.data, "-l", filepath.Join(f.root, "postgres.log"), "-w", "start")
 }
 
 func mustPG17Conn(t *testing.T, ctx context.Context, p *pgxpool.Pool) *pgx.Conn {
@@ -590,47 +641,6 @@ func pg17RestoreAttestationBoundary(t *testing.T, f *pg17Fixture, source, operat
 	}
 	t.Log("actual Service.Restore rejects unproven distinct-UID receipt; local routine-role and TCP negatives verified, not full production HBA equivalence")
 
-	// Issue #57: failures before any history row notify exactly once. First an
-	// artifact store that cannot be opened, with PostgreSQL up: no row, the
-	// closed cause, the hook once.
-	runsBefore := pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM backup_runs`)
-	hook, calls := prerunHook(t, 0)
-	unopenable := b
-	unopenable.Root = filepath.Join(f.root, "absent-backup-root")
-	unopenable.NotifyHook = hook
-	if _, e := service.Backup(ctx, unopenable, false); e == nil {
-		t.Fatal("backup into an absent root succeeded")
-	} else if cause, ok := backupPreRunCause(e); !ok || cause != backupCauseArtifactStore {
-		t.Fatalf("absent backup root cause = %q, %v", cause, ok)
-	}
-	if pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM backup_runs`) != runsBefore {
-		t.Fatal("pre-history failure created a history row")
-	}
-	// Then the real outage: stop the actual PG17 cluster and run the shipped
-	// CLI path in-process with the production control login and the hook.
-	f.command("pg_ctl", nil, "-D", f.data, "-m", "fast", "-w", "stop")
-	if _, e := service.Backup(ctx, unopenable, false); e == nil {
-		t.Fatal("backup with PostgreSQL stopped succeeded")
-	} else if cause, ok := backupPreRunCause(e); !ok || cause != backupCauseDBUnreachable {
-		t.Fatalf("stopped PostgreSQL cause = %q, %v", cause, ok)
-	}
-	t.Setenv("CREDENTIALS_DIRECTORY", "")
-	t.Setenv("NMCP_ADMIN_DATABASE_URL_FILE", "")
-	t.Setenv("NMCP_DATABASE_URL", (&url.URL{Scheme: "postgres", User: url.UserPassword("nmcp_backup_control", f.passwords["nmcp_backup_control"]),
-		Path: "/source", RawQuery: "host=" + url.QueryEscape(f.socket) + "&port=6543&sslmode=disable&connect_timeout=5"}).String())
-	t.Setenv("NMCP_BACKUP_NOTIFY_HOOK", hook)
-	var cliOut, cliErr bytes.Buffer
-	if code := Run(ctx, []string{"backup", "run", "--json"}, &cliOut, &cliErr); code == 0 {
-		t.Fatal("CLI backup with PostgreSQL stopped exited 0")
-	}
-	recorded := prerunCalls(t, calls)
-	if len(recorded) != 1 || recorded[0].Stdin["cause"] != backupCauseDBUnreachable || recorded[0].Stdin["phase"] != "precondition" {
-		t.Fatalf("CLI hook calls with PostgreSQL stopped = %+v (the Service call above notifies nothing by itself)", recorded)
-	}
-	if strings.Contains(cliErr.String()+cliOut.String(), f.passwords["nmcp_backup_control"]) {
-		t.Fatal("CLI output leaked the control password")
-	}
-	t.Log("actual PG17 stopped: backup CLI exits non-zero, the hook ran exactly once with cause db_unreachable and no backup_id")
 }
 
 // TestBackupPG17OperatorRestore is deliberately a separate root-only gate.
