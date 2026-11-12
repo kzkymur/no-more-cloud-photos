@@ -222,9 +222,19 @@ func TestReleaseGateChain(t *testing.T) {
 		h.assertFileBytes(fresh.FileURL, fresh.SHA256, fresh.MIMEType, fresh.SizeBytes)
 		h.expectJSON(h.do(http.MethodGet, "/renditions/"+old.ID, nil, nil), 200, nil) // superseded, retained until cleanup
 		// Zero-day retention means "due at the next scan": the Worker's
-		// automatic rendition cleanup sweeps every 30 s in production. (The
-		// manual `cleanup` CLI cannot delete here: the harness gives the admin
-		// one-shot a read-only media view by design.)
+		// automatic rendition cleanup sweeps every 30 s in production. The
+		// manual `cleanup` CLI (owner mode, read-only media view) never
+		// deletes itself: it authorizes the due rendition and awaits the
+		// Worker's sweep (review D1), so it must exit 0 with the row gone.
+		var cleaned struct {
+			Kind    string `json:"kind"`
+			Pending int    `json:"pending"`
+			Failed  int    `json:"failed"`
+		}
+		if err := json.Unmarshal(h.admin("cleanup", "--kind", "renditions", "--yes", "--json"), &cleaned); err != nil ||
+			cleaned.Kind != "renditions" || cleaned.Pending != 0 || cleaned.Failed != 0 {
+			t.Fatalf("manual rendition cleanup: %+v %v", cleaned, err)
+		}
 		h.eventually("superseded rendition cleanup by the Worker's automatic sweep", 3*time.Minute, func() bool {
 			return h.do(http.MethodGet, "/renditions/"+old.ID, nil, nil).Status == 404
 		})

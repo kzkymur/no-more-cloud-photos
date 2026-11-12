@@ -18,9 +18,15 @@ type cleanupItem struct {
 }
 
 // Cleanup automatically resumes an unfinished finite run of the same kind.
-// Its durable authorization fixes exact object IDs BEFORE any destructive call.
-// Native lifecycle journals prove effects after response loss or audit failure;
-// each completion receipt and its affected-ID audit commit atomically.
+// Its durable authorization fixes exact object IDs BEFORE any effect. The CLI
+// never deletes media files itself (review D1): owner commands see media
+// read-only, and the Worker is the only process that removes files. A run
+// re-validates each item, enqueues the exact purge job for due deleted media
+// (the Worker's purge executor claims it) or leaves a due superseded
+// rendition to the Worker's sweep, then awaits the native journals that prove
+// the effect. Each completion receipt and its affected-ID audit commit
+// atomically; an item the Worker has not finished by the wait deadline stays
+// pending in the run and the next invocation resumes it.
 func (s *Service) Cleanup(ctx context.Context, store *storage.Store, kind string, dry bool) (CleanupResult, error) {
 	result := CleanupResult{Kind: kind, DryRun: dry, IDs: []string{}}
 	if kind == "all" || kind == "backups" {
@@ -44,6 +50,7 @@ func (s *Service) Cleanup(ctx context.Context, store *storage.Store, kind string
 			result.Completed += child.Completed
 			result.Failed += child.Failed
 			result.Skipped += child.Skipped
+			result.Pending += child.Pending
 			result.IDs = append(result.IDs, child.IDs...)
 			result.MorePossible = result.MorePossible || child.MorePossible
 			if childErr != nil {
@@ -69,42 +76,90 @@ func (s *Service) Cleanup(ctx context.Context, store *storage.Store, kind string
 	if err != nil {
 		return result, err
 	}
+	awaiting := make([]cleanupItem, 0, len(items))
 	for _, item := range items {
-		completed, skipped, effectErr := s.cleanupOne(ctx, lifecycle, store, kind, runID, item)
-		if effectErr != nil {
+		done, skipped, effectErr := s.cleanupAuthorize(ctx, lifecycle, kind, runID, &item)
+		switch {
+		case effectErr != nil:
 			result.Failed++
-			continue
-		}
-		outcome := "completed"
-		if skipped {
-			outcome = "skipped"
-		}
-		if !completed && !skipped {
-			result.Failed++
-			continue
-		}
-		if err := s.cleanupReceipt(ctx, kind, runID, item, outcome); err != nil {
-			result.Failed++
-			continue
-		}
-		if skipped {
-			result.Skipped++
-		} else {
-			result.Completed++
-			result.IDs = append(result.IDs, item.id)
+		case done || skipped:
+			s.cleanupFinish(ctx, kind, runID, item, skipped, &result)
+		default:
+			awaiting = append(awaiting, item)
 		}
 	}
+	if len(awaiting) > 0 && s.cleanupWorker != nil {
+		s.cleanupWorker(ctx, store, kind, awaiting)
+	}
+	deadline := time.Now().Add(s.cleanupWait())
+	for len(awaiting) > 0 {
+		remaining := awaiting[:0]
+		for _, item := range awaiting {
+			done, proofErr := s.cleanupProof(ctx, kind, item)
+			switch {
+			case proofErr != nil:
+				result.Failed++
+			case done:
+				s.cleanupFinish(ctx, kind, runID, item, false, &result)
+			default:
+				remaining = append(remaining, item)
+			}
+		}
+		awaiting = remaining
+		if len(awaiting) == 0 || !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			result.Pending += len(awaiting)
+			return result, ctx.Err()
+		case <-time.After(cleanupPoll):
+		}
+	}
+	result.Pending += len(awaiting)
 	// Finite run completion is independent of newly-due work. Do not claim
 	// all cleanup done; another full100 snapshot may exist after this run.
-	result.MorePossible = len(items) == 100 || result.Failed > 0
+	result.MorePossible = len(items) == 100 || result.Failed > 0 || result.Pending > 0
 	if _, err := s.Pool.Exec(ctx, `UPDATE admin_cleanup_runs SET finished_at=clock_timestamp() WHERE id=$1
 		AND NOT EXISTS(SELECT 1 FROM admin_cleanup_items WHERE run_id=$1 AND outcome='pending')`, runID); err != nil {
 		return result, err
 	}
-	if result.Failed > 0 {
+	if result.Failed > 0 || result.Pending > 0 {
 		return result, ErrPartial
 	}
 	return result, nil
+}
+
+// cleanupPoll and defaultCleanupWait bound the wait for the Worker: its
+// rendition sweep runs every 30 s and its purge executor polls continuously.
+const (
+	cleanupPoll        = time.Second
+	defaultCleanupWait = 3 * time.Minute
+)
+
+func (s *Service) cleanupWait() time.Duration {
+	if s.cleanupWaitFor > 0 {
+		return s.cleanupWaitFor
+	}
+	return defaultCleanupWait
+}
+
+// cleanupFinish commits an item's receipt and folds it into the result.
+func (s *Service) cleanupFinish(ctx context.Context, kind, runID string, item cleanupItem, skipped bool, result *CleanupResult) {
+	outcome := "completed"
+	if skipped {
+		outcome = "skipped"
+	}
+	if err := s.cleanupReceipt(ctx, kind, runID, item, outcome); err != nil {
+		result.Failed++
+		return
+	}
+	if skipped {
+		result.Skipped++
+	} else {
+		result.Completed++
+		result.IDs = append(result.IDs, item.id)
+	}
 }
 
 func (s *Service) cleanupSelection(ctx context.Context, kind string, dry bool) ([]cleanupItem, string, error) {
@@ -207,8 +262,12 @@ func (s *Service) cleanupProof(ctx context.Context, kind string, item cleanupIte
 	return done, err
 }
 
-func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Service, store *storage.Store, kind, runID string, item cleanupItem) (bool, bool, error) {
-	if done, err := s.cleanupProof(ctx, kind, item); done || err != nil {
+// cleanupAuthorize re-validates one frozen item without touching files:
+// done when the native journal already proves the effect, skipped when the
+// item is no longer eligible, otherwise ready to await the Worker (a due
+// deleted media item first gets its exact purge job bound).
+func (s *Service) cleanupAuthorize(ctx context.Context, lifecycle *medialifecycle.Service, kind, runID string, item *cleanupItem) (bool, bool, error) {
+	if done, err := s.cleanupProof(ctx, kind, *item); done || err != nil {
 		return done, false, err
 	}
 	if kind == "renditions" {
@@ -225,26 +284,11 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 			AND NOT EXISTS(SELECT 1 FROM jobs purge_job WHERE purge_job.type='purge' AND purge_job.media_id_snapshot=r.media_id AND purge_job.started_at IS NOT NULL))`, item.id).Scan(&eligible); err != nil {
 			return false, false, err
 		}
-		if !eligible {
-			// Frozen membership is authorization, not permission to bypass the
-			// native current/provenance/version recheck. Stale work terminates.
-			return false, true, nil
-		}
-		_, err := lifecycle.CleanupNextRendition(ctx, item.id, nil, func(ctx context.Context, id, path string, size int64) (bool, error) {
-			key, err := storage.ParseRenditionKey(path)
-			if err != nil || key.RenditionID().String() != id {
-				return false, storage.ErrValidation
-			}
-			result, err := store.DeleteRendition(ctx, key, storage.DeleteExpectation{ExpectedSize: size})
-			return result.Missing, err
-		})
-		if err != nil {
-			return false, false, err
-		}
-		done, err := s.cleanupProof(ctx, kind, item)
-		return done, false, err
+		// Frozen membership is authorization, not permission to bypass the
+		// native current/provenance/version recheck. Stale work terminates.
+		return false, !eligible, nil
 	}
-	// A bound authorization may execute only that exact native job. Restore
+	// A bound authorization may await only that exact native job. Restore
 	// can cancel an unstarted J1; a later J2 needs a new cleanup_begin run.
 	if item.jobID != nil {
 		var cancelled bool
@@ -255,6 +299,7 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 		if cancelled {
 			return false, true, nil
 		}
+		return false, false, nil
 	}
 	var eligible bool
 	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM media WHERE id=$1 AND deleted_at IS NOT NULL AND purge_after<=clock_timestamp())`, item.id).Scan(&eligible); err != nil {
@@ -263,67 +308,19 @@ func (s *Service) cleanupOne(ctx context.Context, lifecycle *medialifecycle.Serv
 	if !eligible {
 		return false, true, nil
 	}
-	if item.jobID == nil {
-		enqueued, err := lifecycle.EnqueueDuePurge(ctx, item.mediaID)
-		if err != nil {
-			return false, false, err
-		}
-		// Read back the authoritative immutable binding, not the speculative
-		// enqueue response or a zero-row UPDATE result.
-		var jobID string
-		if err := s.Pool.QueryRow(ctx, `UPDATE admin_cleanup_items SET job_id=COALESCE(job_id,$3)
-			WHERE run_id=$1 AND object_id=$2 AND outcome='pending' RETURNING job_id::text`, runID, item.id, enqueued.Job.ID).Scan(&jobID); err != nil {
-			return false, false, err
-		}
-		item.jobID = &jobID
-	}
-	repository, err := medialifecycle.NewPostgresRepository(s.Pool, os.Getenv("NMCP_FILE_BASE_URL"))
+	enqueued, err := lifecycle.EnqueueDuePurge(ctx, item.mediaID)
 	if err != nil {
 		return false, false, err
 	}
-	// Exact-job native Media-first reclaim never touches unrelated jobs or
-	// steals a live token. Native retry backoff and attempt ceilings remain.
-	if err := repository.ReclaimExpiredPurge(ctx, *item.jobID); err != nil {
+	// Read back the authoritative immutable binding, not the speculative
+	// enqueue response or a zero-row UPDATE result.
+	var jobID string
+	if err := s.Pool.QueryRow(ctx, `UPDATE admin_cleanup_items SET job_id=COALESCE(job_id,$3)
+		WHERE run_id=$1 AND object_id=$2 AND outcome='pending' RETURNING job_id::text`, runID, item.id, enqueued.Job.ID).Scan(&jobID); err != nil {
 		return false, false, err
 	}
-	lease, err := lifecycle.StartPurge(ctx, *item.jobID)
-	if err != nil {
-		return false, false, err
-	}
-	completed, err := executeCleanupPurge(ctx, lifecycle, store, lease)
-	return completed, false, err
-}
-
-type cleanupPurgeExecutor interface {
-	HeartbeatPurge(context.Context, string, string) (time.Time, error)
-	RunPurgeFileStep(context.Context, string, string, medialifecycle.PurgeFileAction) (medialifecycle.PurgeStepResult, error)
-	FinalizePurge(context.Context, string, string) error
-	FinishPurgeAttempt(context.Context, string, string, string) error
-}
-
-func executeCleanupPurge(ctx context.Context, lifecycle cleanupPurgeExecutor, store *storage.Store, lease medialifecycle.PurgeLease) (bool, error) {
-	for {
-		if _, err := lifecycle.HeartbeatPurge(ctx, lease.JobID, lease.Token); err != nil {
-			return false, err
-		}
-		step, err := lifecycle.RunPurgeFileStep(ctx, lease.JobID, lease.Token, medialifecycle.StoragePurgeFileAction(store))
-		if err != nil {
-			// Release only a positively known storage failure. Never release on
-			// lost COMMIT acknowledgement, database/lease loss, or finalization
-			// uncertainty: expiry and native journals decide those outcomes.
-			if cleanupCanReleaseAttempt(err) {
-				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				releaseErr := lifecycle.FinishPurgeAttempt(releaseCtx, lease.JobID, lease.Token, "file_delete_failed")
-				cancel()
-				err = errors.Join(err, releaseErr)
-			}
-			return false, err
-		}
-		if step.Done {
-			err := lifecycle.FinalizePurge(ctx, lease.JobID, lease.Token)
-			return err == nil, err
-		}
-	}
+	item.jobID = &jobID
+	return false, false, nil
 }
 
 func (s *Service) cleanupReceipt(ctx context.Context, kind, runID string, item cleanupItem, outcome string) error {
@@ -343,15 +340,4 @@ func (s *Service) cleanupReceipt(ctx context.Context, kind, runID string, item c
 		return err
 	}
 	return tx.Commit(ctx)
-}
-
-// Physical uncertainty is not a known failure and must not shorten the lease.
-func cleanupCanReleaseAttempt(err error) bool {
-	var unknown *medialifecycle.CommitOutcomeUnknown
-	if errors.As(err, &unknown) || medialifecycle.IsKind(err, medialifecycle.KindDatabaseUnavailable) ||
-		errors.Is(err, medialifecycle.ErrPurgeLeaseLost) || errors.Is(err, storage.ErrOutcomeUncertain) || errors.Is(err, storage.ErrDurability) {
-		return false
-	}
-	return errors.Is(err, storage.ErrPermission) || errors.Is(err, storage.ErrNoSpace) || errors.Is(err, storage.ErrQuota) ||
-		errors.Is(err, storage.ErrReadOnly) || errors.Is(err, storage.ErrValidation) || errors.Is(err, storage.ErrSymlink) || errors.Is(err, storage.ErrUnexpectedType)
 }

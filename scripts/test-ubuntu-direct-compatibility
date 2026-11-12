@@ -60,7 +60,8 @@ class CurrentMigrationAssertionTests(unittest.TestCase):
                               (21, 'admin_repair_schema_compatibility'),
                               (22, 'backup_artifact_lifecycle'),
                               (23, 'backup_checker_schema_compatibility'),
-                              (24, 'profile_route_certification')]:
+                              (24, 'profile_route_certification'),
+                              (25, 'admin_capability_functions')]:
             sql = root / f'internal/database/migrations/{version:04d}_{name}.sql'
             migrations.append((version, name, hashlib.sha256(sql.read_bytes()).hexdigest(), 0))
         with tempfile.TemporaryDirectory() as temp:
@@ -71,7 +72,11 @@ class CurrentMigrationAssertionTests(unittest.TestCase):
                               ' print(c.execute(sys.argv[-1]).fetchone()[0])\n')
             with sqlite3.connect(db) as c:
                 c.execute('CREATE TABLE schema_migrations(version INTEGER,name TEXT,checksum TEXT,dirty INTEGER)')
-            cases = [([], True), (["UPDATE schema_migrations SET name='wrong' WHERE version=24"], False),
+            cases = [([], True), (["UPDATE schema_migrations SET name='wrong' WHERE version=25"], False),
+                     (["UPDATE schema_migrations SET checksum='wrong' WHERE version=25"], False),
+                     (["UPDATE schema_migrations SET dirty=1 WHERE version=25"], False),
+                     (["DELETE FROM schema_migrations WHERE version=25"], False),
+                     (["UPDATE schema_migrations SET name='wrong' WHERE version=24"], False),
                      (["UPDATE schema_migrations SET checksum='wrong' WHERE version=24"], False),
                      (["UPDATE schema_migrations SET dirty=1 WHERE version=24"], False),
                      (["DELETE FROM schema_migrations WHERE version=24"], False),
@@ -89,7 +94,7 @@ class CurrentMigrationAssertionTests(unittest.TestCase):
                      (["UPDATE schema_migrations SET dirty=1 WHERE version=20"], False),
                      (["UPDATE schema_migrations SET name='wrong' WHERE version=19"], False),
                      (["UPDATE schema_migrations SET checksum='wrong' WHERE version=20"], False),
-                     (["INSERT INTO schema_migrations VALUES(25,'future','unknown',0)"], False)]
+                     (["INSERT INTO schema_migrations VALUES(26,'future','unknown',0)"], False)]
             for changes, accepted in cases:
                 with self.subTest(changes=changes):
                     with sqlite3.connect(db) as c:

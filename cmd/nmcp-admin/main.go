@@ -13,7 +13,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kzkymur/no-more-cloud-photos/internal/admin"
-	"github.com/kzkymur/no-more-cloud-photos/internal/config"
 	"github.com/kzkymur/no-more-cloud-photos/internal/database"
 	"github.com/kzkymur/no-more-cloud-photos/internal/logging"
 )
@@ -48,7 +47,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	cfg, err := config.LoadAdmin()
+	cfg, err := admin.LoadOwnerConfig(os.Getenv)
 	if err != nil {
 		logger.Error("load configuration", slog.Any("error", err))
 		return exitFailure
@@ -65,6 +64,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitFailure
 	}
 	defer pool.Close()
+	if err := admin.RefuseUnprivilegedOwner(ctx, pool); err != nil {
+		logger.Error("owner credential refused outside root")
+		return exitUsage
+	}
 	migrator, err := database.NewMigrator(pool)
 	if err != nil {
 		logger.Error("configure migration runner", slog.Any("error", err))

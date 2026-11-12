@@ -115,7 +115,10 @@ func TestValidCapabilitySessionIdentityRule(t *testing.T) {
 // their capability credential is absent or unsafe, and never fall back to the
 // administrative credential.
 func TestCapabilityCommandsRequireTheirCredential(t *testing.T) {
-	t.Setenv("NMCP_DATABASE_URL", "postgres://nmcp_migrator:secret@127.0.0.1:1/nmcp?sslmode=disable&connect_timeout=1")
+	previousEUID := euid
+	euid = func() int { return 1000 }
+	t.Cleanup(func() { euid = previousEUID })
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
 	t.Setenv(checkCredential.env, "")
 	t.Setenv(repairCredential.env, "")
 	unsafe := writeCapabilityFile(t, validCapabilityDSN, 0o644)
@@ -239,6 +242,9 @@ func TestCapabilitySessionQueryOnPostgreSQL(t *testing.T) {
 // invocation: LoadCredential= delivers <name> in $CREDENTIALS_DIRECTORY and
 // takes precedence over the *_FILE variable.
 func TestLoadCapabilityDSNFromSystemdCredentials(t *testing.T) {
+	previousOwner := credentialsDirectoryOwner
+	credentialsDirectoryOwner = uint32(os.Geteuid())
+	t.Cleanup(func() { credentialsDirectoryOwner = previousOwner })
 	credentials := t.TempDir()
 	write := func(mode os.FileMode) {
 		t.Helper()
@@ -286,7 +292,9 @@ func TestLoadCapabilityDSNFromSystemdCredentials(t *testing.T) {
 	}
 	_ = os.Remove(filepath.Join(credentials, checkCredential.name))
 	fallback := writeCapabilityFile(t, validCapabilityDSN, 0o600)
-	if dsn, err := loadCapabilityDSN(checkCredential, func(key string) string {
+	// With $CREDENTIALS_DIRECTORY set the credential must be there: the file
+	// variable is a fallback only when systemd delivers no credentials.
+	if _, err := loadCapabilityDSN(checkCredential, func(key string) string {
 		if key == "CREDENTIALS_DIRECTORY" {
 			return credentials
 		}
@@ -294,9 +302,18 @@ func TestLoadCapabilityDSNFromSystemdCredentials(t *testing.T) {
 			return fallback
 		}
 		return ""
-	}); err != nil || dsn != validCapabilityDSN {
-		t.Fatalf("absent systemd credential did not fall back to the file variable: %v", err)
+	}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("absent systemd credential fell back to the file variable: %v", err)
 	}
+	if dsn, err := loadCapabilityDSN(checkCredential, envWith(checkCredential.env, fallback)); err != nil || dsn != validCapabilityDSN {
+		t.Fatalf("file fallback without CREDENTIALS_DIRECTORY refused: %v", err)
+	}
+	credentialsDirectoryOwner = uint32(os.Geteuid()) + 1
+	write(0o400)
+	if _, err := loadCapabilityDSN(checkCredential, getenv); !errors.Is(err, ErrValidation) {
+		t.Fatal("credentials directory not owned by root accepted")
+	}
+	credentialsDirectoryOwner = uint32(os.Geteuid())
 	if _, err := loadCapabilityDSN(checkCredential, func(key string) string {
 		if key == "CREDENTIALS_DIRECTORY" {
 			return "relative/dir"
@@ -304,5 +321,67 @@ func TestLoadCapabilityDSNFromSystemdCredentials(t *testing.T) {
 		return ""
 	}); !errors.Is(err, ErrValidation) {
 		t.Fatal("relative CREDENTIALS_DIRECTORY accepted")
+	}
+}
+
+// TestCapabilityCommandsNeverAcceptTheOwnerCredential pins review B2: a
+// capability command refuses (exit 2) when any owner DSN source is present,
+// even an empty NMCP_DATABASE_URL, and refuses to run as root.
+func TestCapabilityCommandsNeverAcceptTheOwnerCredential(t *testing.T) {
+	previousEUID := euid
+	t.Cleanup(func() { euid = previousEUID })
+	good := writeCapabilityFile(t, validCapabilityDSN, 0o600)
+	t.Setenv("CREDENTIALS_DIRECTORY", "")
+	t.Setenv(checkCredential.env, good)
+	t.Setenv(repairCredential.env, good)
+	for name, setup := range map[string]func(){
+		"migrator DSN in env":            func() { t.Setenv(ownerDSNEnv, "postgres://nmcp_migrator:secret@127.0.0.1:1/nmcp") },
+		"empty migrator DSN env":         func() { t.Setenv(ownerDSNEnv, "") },
+		"owner DSN file variable":        func() { t.Setenv(ownerDSNFileEnv, good) },
+		"capability command run as root": func() { euid = func() int { return 0 } },
+	} {
+		t.Run(name, func(t *testing.T) {
+			euid = func() int { return 1000 }
+			setup()
+			for _, args := range [][]string{{"check", "--scope", "all", "--json"}, {"repair", "--report", newID(), "--yes", "--json"}} {
+				var stdout, stderr bytes.Buffer
+				if code := Run(context.Background(), args, &stdout, &stderr); code != 2 {
+					t.Fatalf("%s: exit %d, want 2 (stderr=%s)", args[0], code, stderr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestLoadOwnerDSNSources(t *testing.T) {
+	previousOwner := credentialsDirectoryOwner
+	credentialsDirectoryOwner = uint32(os.Geteuid())
+	t.Cleanup(func() { credentialsDirectoryOwner = previousOwner })
+	credentials := t.TempDir()
+	if err := os.WriteFile(filepath.Join(credentials, ownerCredentialName), []byte("postgres://from-credential\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	file := writeCapabilityFile(t, "postgres://from-file", 0o600)
+	env := func(values map[string]string) func(string) string {
+		return func(key string) string { return values[key] }
+	}
+	for name, test := range map[string]struct {
+		values map[string]string
+		want   string
+		ok     bool
+	}{
+		"credential wins":                   {map[string]string{"CREDENTIALS_DIRECTORY": credentials, ownerDSNFileEnv: file, ownerDSNEnv: "postgres://env"}, "postgres://from-credential", true},
+		"file without credentials dir":      {map[string]string{ownerDSNFileEnv: file, ownerDSNEnv: "postgres://env"}, "postgres://from-file", true},
+		"legacy env":                        {map[string]string{ownerDSNEnv: "service=nmcp_backup_control"}, "service=nmcp_backup_control", true},
+		"file ignored with credentials dir": {map[string]string{"CREDENTIALS_DIRECTORY": t.TempDir(), ownerDSNFileEnv: file, ownerDSNEnv: "postgres://env"}, "postgres://env", true},
+		"group readable file":               {map[string]string{ownerDSNFileEnv: writeCapabilityFile(t, "postgres://x", 0o640)}, "", false},
+		"relative file":                     {map[string]string{ownerDSNFileEnv: "admin.dsn"}, "", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := loadOwnerDSN(env(test.values))
+			if (err == nil) != test.ok || got != test.want {
+				t.Fatalf("loadOwnerDSN = %q, %v; want %q ok=%t", got, err, test.want, test.ok)
+			}
+		})
 	}
 }

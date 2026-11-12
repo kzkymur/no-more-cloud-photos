@@ -44,8 +44,8 @@ func TestBackupCheckerCompatibilityPG17(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if full.migrations[len(full.migrations)-1].version != 24 {
-				t.Fatal("compatibility test requires explicit latest version 24")
+			if full.migrations[len(full.migrations)-1].version != 25 {
+				t.Fatal("compatibility test requires explicit latest version 25")
 			}
 			prefix := func(v int64) {
 				t.Helper()
@@ -107,14 +107,25 @@ func TestBackupCheckerCompatibilityPG17(t *testing.T) {
 				t.Fatalf("migration 24 changed reader identity/security/search_path/ACL: before=%s after=%s", boundary, got)
 			}
 			assertCheckerDefinerCatalog(t, ctx, pool)
+			// 0025 (admin capability functions) adds new definer functions only
+			// and re-admits version 25; every sealed, source, finding and
+			// repair-reader boundary must stay unchanged.
+			prefix(25)
+			if got := backupCompatEvidence(t, ctx, pool); got != before {
+				t.Fatal("migration 25 changed sealed/source/finding/repair evidence or old migration history")
+			}
+			if got := backupCompatBoundary(t, ctx, pool); got != boundary {
+				t.Fatalf("migration 25 changed reader identity/security/search_path/ACL: before=%s after=%s", boundary, got)
+			}
+			assertCheckerDefinerCatalog(t, ctx, pool)
 			if historical != "" {
 				// Replay must reuse the same durable old plan, including its old schema snapshot.
 				backupCompatPlan(t, ctx, url, schema, pool, store, historical, 21)
 				backupCompatPlan(t, ctx, url, schema, pool, store, report22, 22)
 			}
-			latest := backupCompatCheck(t, ctx, url, schema, pool, 24)
-			backupCompatPlan(t, ctx, url, schema, pool, store, latest, 24)
-			for v := int64(17); v <= 24; v++ {
+			latest := backupCompatCheck(t, ctx, url, schema, pool, 25)
+			backupCompatPlan(t, ctx, url, schema, pool, store, latest, 25)
+			for v := int64(17); v <= 25; v++ {
 				tx, err := pool.Begin(ctx)
 				if err != nil {
 					t.Fatal(err)
@@ -299,14 +310,14 @@ func backupCompatNegatives(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 		unsealed, sourceError, dirty bool
 	}{
 		{name: "old16", version: 16, drop: "migration_version"},
-		{name: "future25-with-matching-clean-history", version: 25},
-		{name: "unknown-report-format", version: 24, drop: "format_version", patch: map[string]any{"format_version": 2}},
-		{name: "unknown-classifier", version: 24, drop: "classifier_version", patch: map[string]any{"classifier_version": 2}},
-		{name: "wrong-name", version: 24, patch: map[string]any{"migration_name": "unknown"}},
-		{name: "wrong-checksum", version: 24, patch: map[string]any{"migration_checksum": strings.Repeat("0", 64)}},
-		{name: "unsealed", version: 24, unsealed: true},
-		{name: "source-error", version: 24, sourceError: true},
-		{name: "dirty-history", version: 24, dirty: true},
+		{name: "future26-with-matching-clean-history", version: 26},
+		{name: "unknown-report-format", version: 25, drop: "format_version", patch: map[string]any{"format_version": 2}},
+		{name: "unknown-classifier", version: 25, drop: "classifier_version", patch: map[string]any{"classifier_version": 2}},
+		{name: "wrong-name", version: 25, patch: map[string]any{"migration_name": "unknown"}},
+		{name: "wrong-checksum", version: 25, patch: map[string]any{"migration_checksum": strings.Repeat("0", 64)}},
+		{name: "unsealed", version: 25, unsealed: true},
+		{name: "source-error", version: 25, sourceError: true},
+		{name: "dirty-history", version: 25, dirty: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tx, err := pool.Begin(ctx)
@@ -314,8 +325,8 @@ func backupCompatNegatives(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 				t.Fatal(err)
 			}
 			defer tx.Rollback(context.Background())
-			if tc.version == 25 {
-				if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version,name,checksum,transactional,idempotent,dirty) VALUES(25,'future',repeat('a',64),true,false,false)`); err != nil {
+			if tc.version == 26 {
+				if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(version,name,checksum,transactional,idempotent,dirty) VALUES(26,'future',repeat('a',64),true,false,false)`); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -328,7 +339,7 @@ func backupCompatNegatives(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 			}
 			id := backupCompatClone(t, ctx, tx, source, tc.version, tc.patch, !tc.unsealed, tc.sourceError)
 			if tc.dirty {
-				if _, err := tx.Exec(ctx, `UPDATE schema_migrations SET dirty=true WHERE version=24`); err != nil {
+				if _, err := tx.Exec(ctx, `UPDATE schema_migrations SET dirty=true WHERE version=25`); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -341,7 +352,7 @@ func backupCompatNegatives(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 		})
 	}
 	// Check the seal's independent explicit boundary, not just reader admission.
-	for _, v := range []int64{16, 25} {
+	for _, v := range []int64{16, 26} {
 		t.Run(fmt.Sprintf("seal-rejects-%d", v), func(t *testing.T) {
 			tx, err := pool.Begin(ctx)
 			if err != nil {

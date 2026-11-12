@@ -50,21 +50,22 @@ var errCapabilityCredential = fmt.Errorf("%w: capability credential refused", Er
 // invoking user, with no group/other permission bits, holding exactly one DSN
 // line of at most 4 KiB. The path and contents are never echoed.
 func loadCapabilityDSN(c capabilityCredential, getenv func(string) string) (string, error) {
-	// A systemd credential takes precedence: the documented invocation runs
-	// nmcp-admin as the nmcp service user with LoadCredential=, so the DSN is
-	// never readable by nmcp at rest. systemd may deliver it root-owned 0440
-	// with an ACL for the user, so that private directory admits group read
-	// but still no write bits and no world access.
-	if directory := getenv("CREDENTIALS_DIRECTORY"); directory != "" && c.name != "" {
-		if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
-			return "", errCapabilityCredential
-		}
+	// A systemd credential (the documented invocation's LoadCredential=) is
+	// the primary source: the DSN is never nmcp-readable at rest. systemd may
+	// deliver it root-owned 0440 with an ACL for the user, so that private,
+	// root-owned directory admits group read but no write bits and no world
+	// access. The *_FILE variable is only a fallback without
+	// $CREDENTIALS_DIRECTORY (for example the Compose harness).
+	directory, err := credentialsDirectory(getenv)
+	if err != nil {
+		return "", err
+	}
+	if directory != "" {
 		path := filepath.Join(directory, c.name)
-		if _, err := os.Lstat(path); err == nil {
-			return readCapabilityDSN(path, 0o027)
-		} else if !errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Lstat(path); err != nil {
 			return "", errCapabilityCredential
 		}
+		return readCapabilityDSN(path, 0o027)
 	}
 	path := getenv(c.env)
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -177,13 +178,13 @@ func assertCapabilitySession(ctx context.Context, conn *pgx.Conn, c capabilityCr
 
 // openCapabilityPool connects with the capability login and re-proves its
 // identity on every pooled connection before any query can use it.
-func openCapabilityPool(ctx context.Context, c capabilityCredential, dsn string, database databaseIdentity) (*pgxpool.Pool, error) {
+func openCapabilityPool(ctx context.Context, c capabilityCredential, dsn string, database *databaseIdentity) (*pgxpool.Pool, error) {
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, errCapabilityCredential
 	}
 	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		return assertCapabilitySession(ctx, conn, c, capabilityForbiddenRoles, &database)
+		return assertCapabilitySession(ctx, conn, c, capabilityForbiddenRoles, database)
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {

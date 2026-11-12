@@ -130,6 +130,35 @@ func (m *Migrator) Status(ctx context.Context) (Status, error) {
 	return status, nil
 }
 
+// CapabilityStatus reports readiness for a capability login (nmcp_check /
+// nmcp_repair), which cannot read schema_migrations: it reads the same rows
+// through the narrow nmcp_admin_read_migration_history() definer (0025) and
+// applies the identical history validation. A schema without that function
+// is not ready for capability commands.
+func (m *Migrator) CapabilityStatus(ctx context.Context) (Status, error) {
+	status := Status{ExpectedVersion: expectedVersion(m.migrations)}
+	conn, err := m.pool.Acquire(ctx)
+	if err != nil {
+		return status, fmt.Errorf("acquire connection for migration status: %w", err)
+	}
+	defer conn.Release()
+	applied, err := readAppliedWith(ctx, conn, `
+		SELECT version, name, checksum, transactional, idempotent, dirty
+		FROM nmcp_admin_read_migration_history()`)
+	if err != nil {
+		return status, err
+	}
+	status.CurrentVersion = currentVersion(applied)
+	pending, err := validateHistory(m.migrations, applied)
+	if err != nil {
+		status.Drift = true
+		status.DriftReason = err.Error()
+		return status, nil
+	}
+	status.Pending = len(pending) > 0
+	return status, nil
+}
+
 // Up creates migration history infrastructure and applies all pending migrations.
 // One session-level advisory lock serializes the complete operation, including
 // migrations that PostgreSQL does not permit inside a transaction.
@@ -288,10 +317,14 @@ type queryer interface {
 }
 
 func readApplied(ctx context.Context, q queryer) ([]appliedMigration, error) {
-	rows, err := q.Query(ctx, `
+	return readAppliedWith(ctx, q, `
 		SELECT version, name, checksum, transactional, idempotent, dirty
 		FROM schema_migrations
 		ORDER BY version`)
+}
+
+func readAppliedWith(ctx context.Context, q queryer, query string) ([]appliedMigration, error) {
+	rows, err := q.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("read migration history: %w", err)
 	}

@@ -75,7 +75,7 @@ func integrationService(t *testing.T) *Service {
 	parsedURL.RawQuery = query.Encode()
 	t.Setenv("NMCP_DATABASE_URL", parsedURL.String())
 	t.Setenv("NMCP_FILE_BASE_URL", "https://files.example.test/files/")
-	return New(pool)
+	return withCleanupWorkerDouble(New(pool))
 }
 
 func certifiedProfile(t *testing.T, s *Service, key string, version int) profile.Definition {
@@ -625,7 +625,7 @@ func TestAdminIntegrationCleanupAuditFailureRecoversExactNativeReceipts(t *testi
 			if _, err := s.Pool.Exec(ctx, `DROP TRIGGER reject_cleanup_audit ON admin_audit`); err != nil {
 				t.Fatal(err)
 			}
-			resumed, err := New(s.Pool).Cleanup(ctx, store, kind, false)
+			resumed, err := withCleanupWorkerDouble(New(s.Pool)).Cleanup(ctx, store, kind, false)
 			if err != nil || resumed.RunID != first.RunID || resumed.Completed != 1 || len(resumed.IDs) != 1 || resumed.IDs[0] != objectID {
 				t.Fatalf("resumed=%+v err=%v", resumed, err)
 			}
@@ -783,6 +783,7 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 	t.Run("admin-receipts-20", func(t *testing.T) { checkAdmission(t, 20, false, false, true, false, true) })
 	t.Run("compatibility-21", func(t *testing.T) { checkAdmission(t, 21, false, false, true, false, true) })
 	t.Run("profile-route-24", func(t *testing.T) { checkAdmission(t, 24, false, false, true, false, true) })
+	t.Run("admin-capability-25", func(t *testing.T) { checkAdmission(t, 25, false, false, true, false, true) })
 	t.Run("unknown-version", func(t *testing.T) { checkAdmission(t, 999, true, true, true, false, false) })
 	t.Run("wrong-name", func(t *testing.T) { checkAdmission(t, 21, true, false, true, false, false) })
 	t.Run("wrong-checksum", func(t *testing.T) { checkAdmission(t, 21, false, true, true, false, false) })
@@ -792,10 +793,10 @@ func TestAdminIntegrationRepairReportCompatibilityRemainsClosed(t *testing.T) {
 		// Everything except the explicit supported-version whitelist matches:
 		// valid applied history/name/hash, sealed report, three clean sources.
 		if _, err := s.Pool.Exec(ctx, `INSERT INTO schema_migrations(version,name,checksum,transactional,idempotent,dirty)
-			VALUES(25,'future_compatibility_fixture',repeat('a',64),true,false,false)`); err != nil {
+			VALUES(26,'future_compatibility_fixture',repeat('a',64),true,false,false)`); err != nil {
 			t.Fatal(err)
 		}
-		checkAdmission(t, 25, false, false, true, false, false)
+		checkAdmission(t, 26, false, false, true, false, false)
 	})
 }
 

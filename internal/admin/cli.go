@@ -238,24 +238,19 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		}
 		return finish(stdout, stderr, o.json, result, settingsErr)
 	}
-	// check / maintenance resume (which runs the checker) and repair need their
-	// dedicated capability login; its credential file is validated before any
-	// database connection so a missing or unsafe credential fails closed early.
-	var capability *capabilityCredential
-	switch o.command {
-	case "check", "maintenance resume":
-		capability = &checkCredential
-	case "repair":
-		capability = &repairCredential
+	// Review B2: no uid-nmcp process ever holds the owner (migrator) DSN.
+	// check, repair and maintenance resume are capability commands: they run
+	// as uid nmcp with only the nmcp_check / nmcp_repair logins. Everything
+	// else is an owner command. The single exception is the post-restore
+	// resume, a root operator procedure that keeps the owner connection.
+	if capabilityCommand(o.command) && !(o.command == "maintenance resume" && os.Geteuid() == 0) {
+		return runCapability(ctx, o, stdout, stderr)
 	}
-	var capabilityDSN string
-	if capability != nil {
-		var dsnErr error
-		if capabilityDSN, dsnErr = loadCapabilityDSN(*capability, os.Getenv); dsnErr != nil {
-			return finish(stdout, stderr, o.json, nil, dsnErr)
-		}
+	dsn, err := loadOwnerDSN(os.Getenv)
+	if err != nil {
+		return finish(stdout, stderr, o.json, nil, err)
 	}
-	cfg, err := config.LoadAdmin()
+	cfg, err := config.LoadAdminFrom(ownerGetenv(os.Getenv, dsn))
 	if err != nil {
 		return finish(stdout, stderr, o.json, nil, err)
 	}
@@ -264,6 +259,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return finish(stdout, stderr, o.json, nil, err)
 	}
 	defer pool.Close()
+	if err := refuseUnprivilegedOwner(ctx, pool); err != nil {
+		return finish(stdout, stderr, o.json, nil, err)
+	}
 	migrator, err := database.NewMigrator(pool)
 	if err != nil {
 		return finish(stdout, stderr, o.json, nil, err)
@@ -276,20 +274,15 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return finish(stdout, stderr, o.json, nil, err)
 	}
 	service := New(pool)
-	if capability != nil {
-		database, identityErr := queryDatabaseIdentity(ctx, pool)
-		if identityErr != nil {
-			return finish(stdout, stderr, o.json, nil, identityErr)
+	if o.command == "maintenance resume" {
+		// The owner (root) resume is the post-restore operator procedure only;
+		// any other maintenance is resumed by the capability invocation.
+		state, stateErr := service.MaintenanceStatus(ctx)
+		if stateErr == nil && (state.Reason == nil || *state.Reason != "operator restore") {
+			stateErr = ErrConflict
 		}
-		capabilityPool, capabilityErr := openCapabilityPool(ctx, *capability, capabilityDSN, database)
-		if capabilityErr != nil {
-			return finish(stdout, stderr, o.json, nil, capabilityErr)
-		}
-		defer capabilityPool.Close()
-		if capability == &repairCredential {
-			service.RepairPool = capabilityPool
-		} else {
-			service.CheckPool = capabilityPool
+		if stateErr != nil {
+			return finish(stdout, stderr, o.json, nil, stateErr)
 		}
 	}
 	var result any

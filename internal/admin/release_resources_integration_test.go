@@ -343,7 +343,8 @@ func TestReleaseGateResources(t *testing.T) {
 	// retention then in force, so zero-day retention is set first; a second
 	// version of the measured profile (same recipes, existing certification
 	// rows) is activated, the Worker restarted to claim it, the RAW media
-	// regenerated, and the shipped CLI deletes the due superseded rendition.
+	// regenerated, and the shipped CLI (owner mode, media read-only to it)
+	// awaits the Worker's sweep of the due superseded rendition (review D1).
 	operator([]int{0}, "config", "set", "--name", "superseded_rendition_retention_days", "--value", "0", "--json")
 	var oldRendition, oldPath string
 	if err := migrator.QueryRow(ctx, `SELECT id::text, relative_path FROM renditions WHERE media_id=$1 AND is_current`, rawMediaID).Scan(&oldRendition, &oldPath); err != nil {
@@ -427,13 +428,15 @@ func TestReleaseGateResources(t *testing.T) {
 	if quarantined == 0 {
 		t.Fatal("repair quarantined nothing")
 	}
-	t.Log("actual operator CLI as nmcp via systemd-run + LoadCredential: manual rendition cleanup, check -> repair -> check -> resume; every media entry nmcp-owned")
+	t.Log("actual operator CLI via both documented systemd-run modes: owner cleanup awaits the Worker sweep; capability check -> repair -> check -> resume as nmcp; every media entry nmcp-owned")
 }
 
 // releaseOperatorCLI runs the shipped nmcp-admin exactly as the Ubuntu
-// deployment documents: a transient unit as the nmcp user, admin.env read by
-// PID 1, and the capability DSNs delivered as systemd credentials. It returns
-// stdout and fails unless the exit status is one of the allowed codes.
+// deployment documents ("Running nmcp-admin", review B2): capability
+// commands (check, repair, maintenance resume) as a transient unit of the
+// nmcp user with only check.dsn / repair.dsn; every other command as root
+// with only admin.dsn. capability.env is non-secret and read by PID 1. It
+// returns stdout and fails unless the exit status is one of the allowed codes.
 func releaseOperatorCLI(t *testing.T, f *liveCutoverFixture, admin *pgxpool.Pool) func(allowed []int, args ...string) []byte {
 	t.Helper()
 	for _, role := range []string{"nmcp_check", "nmcp_repair"} {
@@ -447,14 +450,27 @@ func releaseOperatorCLI(t *testing.T, f *liveCutoverFixture, admin *pgxpool.Pool
 		dsn := (&url.URL{Scheme: "postgres", Host: "127.0.0.1:5432", Path: "/source", User: url.UserPassword(role, f.passwords[role]), RawQuery: "sslmode=disable"}).String()
 		f.write("/etc/nmcp/credentials/"+leaf+".dsn", dsn+"\n", 0600)
 	}
+	owner := (&url.URL{Scheme: "postgres", Host: "127.0.0.1:5432", Path: "/source", User: url.UserPassword("nmcp_migrator", f.passwords["nmcp_migrator"]), RawQuery: "sslmode=disable"}).String()
+	f.write("/etc/nmcp/credentials/admin.dsn", owner+"\n", 0600)
+	f.write("/etc/nmcp/capability.env", "NMCP_STORAGE_ROOT=/var/lib/nmcp/media\nNMCP_BACKUP_ROOT=/var/lib/nmcp/backups\n"+
+		"NMCP_FILE_BASE_URL=https://files.example.test/files/\nNMCP_LOG_LEVEL=info\nNMCP_SHUTDOWN_TIMEOUT=30s\n", 0644)
 	return func(allowed []int, args ...string) []byte {
 		t.Helper()
-		command := append([]string{"--quiet", "--pipe", "--wait", "--collect",
-			"-p", "User=nmcp", "-p", "Group=nmcp",
-			"-p", "EnvironmentFile=/etc/nmcp/admin.env",
-			"-p", "LoadCredential=check.dsn:/etc/nmcp/credentials/check.dsn",
-			"-p", "LoadCredential=repair.dsn:/etc/nmcp/credentials/repair.dsn",
-			"/opt/nmcp/current/bin/nmcp-admin"}, args...)
+		mode := []string{"-p", "User=root",
+			"-p", "EnvironmentFile=/etc/nmcp/capability.env",
+			"-p", "LoadCredential=admin.dsn:/etc/nmcp/credentials/admin.dsn"}
+		name := args[0]
+		if len(args) > 1 && args[0] == "maintenance" {
+			name += " " + args[1]
+		}
+		if capabilityCommand(name) {
+			mode = []string{"-p", "User=nmcp", "-p", "Group=nmcp",
+				"-p", "EnvironmentFile=/etc/nmcp/capability.env",
+				"-p", "LoadCredential=check.dsn:/etc/nmcp/credentials/check.dsn",
+				"-p", "LoadCredential=repair.dsn:/etc/nmcp/credentials/repair.dsn"}
+		}
+		command := append(append([]string{"--quiet", "--pipe", "--wait", "--collect"}, mode...), "/opt/nmcp/current/bin/nmcp-admin")
+		command = append(command, args...)
 		c := exec.CommandContext(f.ctx, "/usr/bin/systemd-run", command...)
 		c.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
 		var stdout, stderr bytes.Buffer
