@@ -87,6 +87,24 @@ class Admission(unittest.TestCase):
         f=Fake();f.run['repository']['full_name']='evil/repo'
         with self.assertRaises(m.Refused):acquire(f)
 
+    def test_run_status_lag_bound_to_job(self):
+        # A run still reported queued (siblings waiting for runners) is
+        # admitted when THIS job's own record is in_progress...
+        for status in ('queued','pending','waiting','requested','in_progress'):
+            with self.subTest(status=status):
+                f=Fake();f.run['status']=status
+                acquire(f)
+        # ...but never when the run is finished, nor when the job itself is
+        # not running, whatever the run says.
+        f=Fake();f.run['status']='completed'
+        with self.assertRaises(m.Refused):acquire(f)
+        for job_status in ('queued','completed'):
+            with self.subTest(job_status=job_status):
+                f=Fake();f.run['status']='queued';f.detail['status']=job_status
+                with self.assertRaises(m.Refused):acquire(f)
+        f=Fake();f.run['status']='queued';f.run['head_sha']='b'*40
+        with self.assertRaises(m.Refused):acquire(f)
+
     def test_detail_identity_and_state(self):
         for k,v in [('id',32),('run_id',22),('run_attempt',1),('head_sha','b'*40),
                     ('runner_name','other'),('runner_id',0),('name','other'),
