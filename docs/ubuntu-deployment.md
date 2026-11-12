@@ -178,7 +178,7 @@ directory is present, as in the validation harness; production uses
 expected owner and no group/other access (systemd's own credential shape is
 accepted), and refuses any connection whose session user is not exactly the
 expected login. Both DSNs must name the
-same database as `NMCP_DATABASE_URL`; after a restore cutover, update them to the
+same database as the owner credential (`admin.dsn`); after a restore cutover, update them to the
 active candidate database (see `docs/backup-operations.md`). If you change the
 shape of these two logins (for example add a connection limit), restore's role
 graph comparison will refuse until the change is reviewed there too. The
@@ -323,7 +323,8 @@ No process running as the `nmcp` user ever receives the migrator credential.
 Operator `nmcp-admin` commands therefore run in one of exactly two documented
 modes, each a transient unit. nmcp-admin refuses a command in the wrong mode
 (capability commands refuse to run as root or with any migrator credential
-present; owner commands refuse to run as anything but root).
+present; owner commands refuse to use the migrator login unless the process
+is root).
 
 **Capability commands** (`check`, `repair` including `--dry-run`,
 `maintenance resume`) run as `nmcp` with only the reconciliation logins:
@@ -345,7 +346,8 @@ reconciliation functions).
 
 **Owner commands** (everything else: `config *`, `profile *`, `regenerate`,
 `jobs retry`, `cleanup`, other `maintenance` subcommands) run as root with the
-migrator credential, and never write under media or backups themselves:
+migrator credential, and never write under the media root;
+`cleanup --kind backups` deletes expired backup artifacts as root:
 
 ```sh
 sudo systemd-run --quiet --pipe --wait --collect \
