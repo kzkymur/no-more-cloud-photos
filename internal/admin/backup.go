@@ -25,6 +25,10 @@ import (
 )
 
 var errBackup = errors.New("backup operation failed")
+
+// errBackupRunAbsent: the run's row does not exist (its INSERT never
+// committed), so the failure is pre-history (issue #57).
+var errBackupRunAbsent = fmt.Errorf("%w: backup run row absent", errBackup)
 var serviceName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
 type BackupSettings struct {
@@ -127,8 +131,12 @@ func (s *Service) backupFailure(id, phase string, b BackupSettings) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		rollback(tx)
 		var status string
-		if s.Pool.QueryRow(ctx, `SELECT status FROM backup_runs WHERE id=$1`, id).Scan(&status) == nil && status == "succeeded" {
+		statusErr := s.Pool.QueryRow(ctx, `SELECT status FROM backup_runs WHERE id=$1`, id).Scan(&status)
+		if statusErr == nil && status == "succeeded" {
 			return nil
+		}
+		if errors.Is(statusErr, pgx.ErrNoRows) {
+			return errBackupRunAbsent
 		}
 		return errBackup
 	}
