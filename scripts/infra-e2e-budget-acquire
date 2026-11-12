@@ -16,12 +16,17 @@
 # Test hooks (scripts/test-infra-e2e-budget-acquire):
 #   NMCP_E2E_ADMISSION_HELPER  admission command (default: scripts/backup-ci-admission)
 #   NMCP_E2E_RETRY_BACKOFF     space-separated sleeps (default: "5 10 20 30"; the last repeats)
+#   NMCP_E2E_RETRY_MAX_ATTEMPTS  cap on helper calls (default 0 = no cap; only the
+#                                time window bounds production). Lets the test
+#                                count retries without depending on wall-clock time.
 set -euo pipefail
 
 required=${1:?usage: infra-e2e-budget-acquire REQUIRED_SECONDS}
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 helper=${NMCP_E2E_ADMISSION_HELPER:-$root/scripts/backup-ci-admission}
 window=${NMCP_E2E_BUDGET_RETRY_SECONDS:-180}
+max_attempts=${NMCP_E2E_RETRY_MAX_ATTEMPTS:-0}
+case "$max_attempts" in ''|*[!0-9]*) echo "invalid NMCP_E2E_RETRY_MAX_ATTEMPTS" >&2; exit 2 ;; esac
 read -r -a backoff <<<"${NMCP_E2E_RETRY_BACKOFF:-5 10 20 30}"
 case "$window" in ''|*[!0-9]*) echo "invalid NMCP_E2E_BUDGET_RETRY_SECONDS" >&2; exit 2 ;; esac
 receipt="$RUNNER_TEMP/.nmcp-e2e-budget.json"
@@ -55,6 +60,11 @@ while :; do
   fi
   index=$((attempt - 1)); [ "$index" -lt "${#backoff[@]}" ] || index=$((${#backoff[@]} - 1))
   pause=${backoff[$index]}
+  if [ "$retryable" = true ] && [ "$max_attempts" -gt 0 ] && [ "$attempt" -ge "$max_attempts" ]; then
+    echo "admission: retry attempts exhausted ($attempt)" >&2
+    rm -f -- "$receipt.tmp" "$receipt.err"
+    exit 1
+  fi
   if [ "$retryable" != true ] || [ $((SECONDS + pause)) -gt "$deadline" ]; then
     [ "$retryable" != true ] || echo "admission: run still queued after ${window}s retry window" >&2
     rm -f -- "$receipt.tmp" "$receipt.err"
