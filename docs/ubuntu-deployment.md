@@ -162,16 +162,21 @@ hardening/verifier, normal signal, or interrupted compatibility phase prevents
 service start. A power loss or SIGKILL can leave the database in compatibility
 mode, but the next mandatory wrapper attempt accepts only that exact interrupted
 state, reruns migration idempotently, and hardens before reporting readiness.
-`nmcp-admin check` and `nmcp-admin repair` never reuse the root migration
-credential for reconciliation. They read their capability DSN from a file named
-by `NMCP_CHECK_DATABASE_URL_FILE` / `NMCP_REPAIR_DATABASE_URL_FILE` in
-`/etc/nmcp/admin.env`. Create `/etc/nmcp/credentials` as root:root 0700, and
+`nmcp-admin check`, `repair` and `maintenance resume` never reuse the root
+migration credential for reconciliation; they connect as `nmcp_check` /
+`nmcp_repair`. Create `/etc/nmcp/credentials` as root:root 0700, and
 `check.dsn` / `repair.dsn` from `infra/ubuntu/credentials/*.dsn.example` as
 root:root 0600: one libpq connection string for `nmcp_check` / `nmcp_repair`,
 with the password set above. Restrict both logins to the `nmcp` database on
-loopback in `pg_hba.conf`, like the other credentials. nmcp-admin refuses a file
-that is not a regular, non-symlink, owner-only file, and refuses any connection
-whose session user is not exactly the expected login. Both DSNs must name the
+loopback in `pg_hba.conf`, like the other credentials. The operator invocation in
+[Running nmcp-admin](#running-nmcp-admin) hands both files to the process as
+systemd credentials, so they are never readable by the `nmcp` user at rest.
+`NMCP_CHECK_DATABASE_URL_FILE` / `NMCP_REPAIR_DATABASE_URL_FILE` in
+`admin.env` are only a fallback when no systemd credential is present.
+nmcp-admin refuses a credential that is not a regular, non-symlink file with the
+expected owner and no group/other access (systemd's own credential shape is
+accepted), and refuses any connection whose session user is not exactly the
+expected login. Both DSNs must name the
 same database as `NMCP_DATABASE_URL`; after a restore cutover, update them to the
 active candidate database (see `docs/backup-operations.md`). If you change the
 shape of these two logins (for example add a connection limit), restore's role
@@ -311,6 +316,43 @@ during activation. If compatible rollback activation fails, the installer stops
 all partial services, atomically restores the prior link, and restores its prior
 active/inactive service state; a failed restoration is left fully stopped.
 
+## Running nmcp-admin
+
+Every operator `nmcp-admin` command in this document (check, repair, cleanup,
+maintenance, regenerate, jobs retry, `profile *`, `config *`) runs as the
+`nmcp` service user through one transient unit:
+
+```sh
+sudo systemd-run --quiet --pipe --wait --collect \
+  -p User=nmcp -p Group=nmcp \
+  -p EnvironmentFile=/etc/nmcp/admin.env \
+  -p LoadCredential=check.dsn:/etc/nmcp/credentials/check.dsn \
+  -p LoadCredential=repair.dsn:/etc/nmcp/credentials/repair.dsn \
+  /opt/nmcp/current/bin/nmcp-admin <command> ...
+```
+
+- **Why `nmcp`:** repair and cleanup create, rename and remove entries under the
+  nmcp:nmcp 0700 media and backup roots. Running as root would leave
+  root-owned entries that the services cannot manage.
+- **Secrets stay root-only at rest:** systemd (PID 1) reads `admin.env` as root,
+  so it stays root:root 0600, and copies the two DSN files into the unit's
+  private `$CREDENTIALS_DIRECTORY`, where nmcp-admin reads them.
+- **Exit status and I/O:** `--wait` returns nmcp-admin's exit code. `--pipe`
+  connects stdin/stdout/stderr, so `--file -` (for example
+  `profile certify --file - < SPEC.json`) works.
+- **Input files must be readable by `nmcp`:** pass specs, fixtures and profile
+  files on stdin (`--file -`), or place them in an nmcp-owned directory outside
+  the storage root, for example
+  `sudo install -d -o nmcp -g nmcp -m 0700 /var/lib/nmcp/operator`. Files under
+  `/root` are not readable by `nmcp`.
+- **Backups:** `/var/lib/nmcp/backups` is nmcp:nmcp 0700, so
+  `cleanup --kind backups` uses the same invocation.
+- **Exceptions:** the root-only restore and cutover commands keep their own
+  documented procedure in `docs/backup-operations.md`, and `migrate` runs only
+  through the release installer's migration unit.
+
+Below, `nmcp-admin <command>` means this invocation.
+
 ## Profile certification before activation
 
 Migrations seed the bundled `standard/v1` (`60000000-0000-4000-8000-000000000001`)
@@ -328,7 +370,9 @@ installed helpers:
    output must reach exactly that edge. `image/webp` under `standard` needs a
    **static** WebP (the Worker's still path) and an **animated** WebP; GIF and
    video fixtures must be animated/real streams. Fixtures are evidence inputs,
-   not uploads; keep them outside the storage root.
+   not uploads; keep them outside the storage root, readable by `nmcp` (for
+   example under `/var/lib/nmcp/operator/fixtures`, nmcp:nmcp, see
+   [Running nmcp-admin](#running-nmcp-admin)).
 2. Write `SPEC.json` with absolute paths and the SHA-256 of each file, measured
    by the operator on this host (for example `sha256sum`), never copied from
    another host:
@@ -345,7 +389,7 @@ installed helpers:
        "srgb_icc": {"path": "/opt/nmcp/current/share/sRGB2014.icc", "sha256": "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"}
      },
      "fixtures": [
-       {"mime_type": "image/jpeg", "path": "/root/nmcp-fixtures/landscape.jpg", "sha256": "<64 hex>"}
+       {"mime_type": "image/jpeg", "path": "/var/lib/nmcp/operator/fixtures/landscape.jpg", "sha256": "<64 hex>"}
      ]
    }
    ```
@@ -353,15 +397,25 @@ installed helpers:
    Use the same helper, `prlimit`, and ICC paths as the Worker configuration.
    `ffprobe` is the independent output probe; prefer the distribution binary
    rather than the video helper's bundled toolchain.
-3. Run, with the administrative (`nmcp_migrator`) environment loaded the same
-   way as the other administrative commands and the database in normal mode:
+3. Run, through the operator invocation in
+   [Running nmcp-admin](#running-nmcp-admin), with the database in normal mode.
+   The spec is passed on stdin, so it can stay wherever the operator keeps it:
 
    ```sh
-   /opt/nmcp/current/bin/nmcp-admin profile certify --file /root/nmcp-certify-thumbnail.json --json
-   /opt/nmcp/current/bin/nmcp-admin profile activate --id 60000000-0000-4000-8000-000000000002 --json
+   run_admin() {
+     sudo systemd-run --quiet --pipe --wait --collect \
+       -p User=nmcp -p Group=nmcp \
+       -p EnvironmentFile=/etc/nmcp/admin.env \
+       -p LoadCredential=check.dsn:/etc/nmcp/credentials/check.dsn \
+       -p LoadCredential=repair.dsn:/etc/nmcp/credentials/repair.dsn \
+       /opt/nmcp/current/bin/nmcp-admin "$@"
+   }
+   sudo cat /root/nmcp-certify-thumbnail.json | run_admin profile certify --file - --json
+   run_admin profile activate --id 60000000-0000-4000-8000-000000000002 --json
    ```
 
-   `--file -` reads the spec from stdin instead. Certification does not activate;
+   The fixture paths inside the spec are opened by nmcp-admin itself, so they
+   must be readable by `nmcp`. Certification does not activate;
    activation stays a separate audited step and still enforces version order.
    Then restart the Worker (`systemctl restart nmcp-worker.service`). The
    Worker validates its capability envelope against the active profiles once at
