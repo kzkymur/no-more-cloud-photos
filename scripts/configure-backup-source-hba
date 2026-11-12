@@ -114,31 +114,56 @@ def candidate(data, database):
     return (text[:start] + block(database) + text[end:]).encode()
 
 
-def validate_prefix(prefix):
-    roles = 'nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator'
-    header = re.compile(r'# nmcp explicit cutover [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}; source remains fenced\n')
-    # Source-online cutover has source rejects then candidate allows/rejects;
-    # offline cutover has only candidate allows/rejects. Never accept free-form
-    # rules before the fallback on an idempotent update.
+# Cutover role lists exactly as internal/admin cutoverHBA writes them: the
+# current list adds the reconciliation capability logins (#21); the legacy
+# list is what an earlier release's cutover left in a live file. The exact
+# current grammar is pinned against the Go writer by
+# scripts/testdata/cutover-hba-prefix.txt (scripts/test-backup-source-hba and
+# TestCutoverHBAMatchesTheBackupSourceScriptGolden).
+CUTOVER_ROLES = 'nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair'
+LEGACY_CUTOVER_ROLES = 'nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator'
+
+
+def cutover_rules(roles):
     db = r'"([a-z][a-z0-9_]{0,62})"'
     reject = re.compile(r'local ' + db + ' ' + roles + r' reject\nhost "\1" ' + roles
                         + r' 0\.0\.0\.0/0 reject\nhost "\1" ' + roles + r' ::/0 reject\n')
     allow = re.compile(r'local ' + db + ' ' + roles + r' scram-sha-256\nhost "\1" ' + roles
                        + r' 127\.0\.0\.1/32 scram-sha-256\nhost "\1" ' + roles + r' ::1/128 scram-sha-256\n')
+    return reject, allow
+
+
+def cutover_block(prefix, roles):
+    """Length of one cutover block body in exactly one role grammar, or None."""
+    reject, allow = cutover_rules(roles)
+    offset = 0
+    source = reject.match(prefix)
+    if source:
+        offset = source.end()
+    permitted = allow.match(prefix, offset)
+    if permitted is None:
+        return None
+    denied = reject.match(prefix, permitted.end())
+    require(denied is not None and denied[1] == permitted[1]
+            and (not source or source[1] != permitted[1]), 'mutated cutover fence')
+    return denied.end()
+
+
+def validate_prefix(prefix):
+    header = re.compile(r'# nmcp explicit cutover [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}; source remains fenced\n')
+    # Source-online cutover has source rejects then candidate allows/rejects;
+    # offline cutover has only candidate allows/rejects. Each block uses one
+    # role grammar. Never accept free-form rules before the fallback on an
+    # idempotent update.
     while prefix:
         match = header.match(prefix)
         require(match is not None, 'unknown rules above owned block')
         prefix = prefix[match.end():]
-        source = reject.match(prefix)
-        if source:
-            prefix = prefix[source.end():]
-        permitted = allow.match(prefix)
-        require(permitted is not None, 'mutated cutover prefix')
-        prefix = prefix[permitted.end():]
-        denied = reject.match(prefix)
-        require(denied is not None and denied[1] == permitted[1]
-                and (not source or source[1] != permitted[1]), 'mutated cutover fence')
-        prefix = prefix[denied.end():]
+        length = cutover_block(prefix, CUTOVER_ROLES)
+        if length is None:
+            length = cutover_block(prefix, LEGACY_CUTOVER_ROLES)
+        require(length is not None, 'mutated cutover prefix')
+        prefix = prefix[length:]
 
 
 def digest(data):

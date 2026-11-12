@@ -520,3 +520,39 @@ func TestBackupSourceOnlyPolicyRetargetPreservesSingleBlock(t *testing.T) {
 		}
 	}
 }
+
+// cutoverHBAGoldenPath is the cross-language contract between cutoverHBA and
+// scripts/configure-backup-source-hba (review K2): the script's validator
+// must accept exactly what this writer prepends after any cutover, and its
+// test (scripts/test-backup-source-hba) loads the same file.
+const cutoverHBAGoldenPath = "../../scripts/testdata/cutover-hba-prefix.txt"
+
+func cutoverHBAGolden() string {
+	first := cutoverTestOperation()
+	first.ID = "11111111-1111-4111-8111-111111111111"
+	second := cutoverTestOperation()
+	second.ID = "22222222-2222-4222-8222-222222222222"
+	second.Source.DatabaseName, second.Candidate.DatabaseName = "candidate", "candidate2"
+	offline := cutoverTestOperation()
+	offline.ID = "33333333-3333-4333-8333-333333333333"
+	offline.SourceOffline = true
+	offline.Candidate.DatabaseName = "candidate3"
+	// Newest cutover first, as each cutover prepends to the live file.
+	return string(cutoverHBA(cutoverHBA(cutoverHBA(nil, first), second), offline))
+}
+
+func TestCutoverHBAMatchesTheBackupSourceScriptGolden(t *testing.T) {
+	got := cutoverHBAGolden()
+	if os.Getenv("NMCP_UPDATE_GOLDEN") == "1" {
+		if err := os.WriteFile(cutoverHBAGoldenPath, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(cutoverHBAGoldenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != string(want) {
+		t.Fatalf("cutoverHBA output drifted from %s (the backup source script validates that exact grammar); got:\n%s", cutoverHBAGoldenPath, got)
+	}
+}
