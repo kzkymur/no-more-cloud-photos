@@ -32,8 +32,8 @@ python3 - "$NMCP_E2E_ARTIFACT_DIR/selftest-media-ls.jsonl" <<'PY' || fail "media
 import json, sys
 entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
 paths = {e["path"] for e in entries}
-for required in ("originals", "renditions", "tmp", ".quarantine", "backups"):
-    assert required in paths, required
+# Exactly the checker's allowed top level; no validation-only backups/ or tmp/.
+assert {p for p in paths if "/" not in p} == {"originals", "renditions", ".quarantine"}, sorted(paths)
 assert all(e["type"] == "dir" for e in entries), entries
 PY
 
@@ -145,7 +145,7 @@ mounts=$(docker compose --project-name "$NMCP_E2E_PROJECT" \
     [ "$(stat -c %d /e2e/work)" != "$(stat -c %d /e2e/fixtures)" ] && echo work-separate
     [ "$NMCP_STORAGE_ROOT" = /var/lib/nmcp/media ] && echo storage-root
     [ -d /var/lib/nmcp/media/originals ] && echo media-visible
-    if touch /var/lib/nmcp/media/tmp/.e2e-admin-probe 2>/dev/null; then echo media-writable; fi') || fail "admin mount probe"
+    if touch /var/lib/nmcp/media/originals/.e2e-admin-probe 2>/dev/null; then echo media-writable; fi') || fail "admin mount probe"
 rm -f "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
 # admin -- uses the same `compose run --no-deps -T migrate` invocation; prove
 # that stdin reaches the one-shot process (certify reads its spec from -).
@@ -217,10 +217,10 @@ probe() {
 
 step "fault media-readonly: whole media filesystem rejects writes with EROFS"
 "$ctl" fault media-readonly on || fail "readonly on"
-out=$(probe 'touch /var/lib/nmcp/media/tmp/.e2e-probe' || true)
+out=$(probe 'touch /var/lib/nmcp/media/originals/.e2e-probe' || true)
 case "$out" in *"Read-only file system"*) ;; *) fail "expected EROFS, got: $out" ;; esac
 "$ctl" fault media-readonly off || fail "readonly off"
-probe 'touch /var/lib/nmcp/media/tmp/.e2e-probe && rm /var/lib/nmcp/media/tmp/.e2e-probe' >/dev/null ||
+probe 'touch /var/lib/nmcp/media/originals/.e2e-probe && rm /var/lib/nmcp/media/originals/.e2e-probe' >/dev/null ||
   fail "write after readonly off"
 
 step "fault media-full: shrink to used size gives ENOSPC; off restores"

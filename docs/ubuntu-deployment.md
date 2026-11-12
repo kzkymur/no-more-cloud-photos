@@ -171,7 +171,11 @@ root:root 0600: one libpq connection string for `nmcp_check` / `nmcp_repair`,
 with the password set above. Restrict both logins to the `nmcp` database on
 loopback in `pg_hba.conf`, like the other credentials. nmcp-admin refuses a file
 that is not a regular, non-symlink, owner-only file, and refuses any connection
-whose session user is not exactly the expected login. The
+whose session user is not exactly the expected login. Both DSNs must name the
+same database as `NMCP_DATABASE_URL`; after a restore cutover, update them to the
+active candidate database (see `docs/backup-operations.md`). If you change the
+shape of these two logins (for example add a connection limit), restore's role
+graph comparison will refuse until the change is reviewed there too. The
 bootstrap transfers database/schema ownership to `nmcp_migrator` and removes
 PUBLIC schema creation. Embedded migrations own all application object grants;
 the bootstrap deliberately does not grant table or function access after the
