@@ -18,10 +18,18 @@ install prefix and scratch directory. It verifies every direct source archive
 against `toolchain.lock` and builds libaom 3.8.2, lcms2 2.14, LibRaw 0.22.2,
 libheif 1.23.5, libwebp 1.6.0 (before libvips, so libvips never links the
 distro libwebp with the same SONAMEs), and libvips 8.18.7 using the recorded
-reduced feature set. Every pinned shared object gets `DT_RUNPATH=$prefix/lib`
-(linker flags, no patchelf), and a closure gate fails the build unless each one
-resolves every pinned SONAME from the prefix under an empty environment, as
-processrunner executes helpers.
+reduced feature set. Every pinned shared object gets `DT_RUNPATH=$prefix/lib`,
+and a closure gate fails the build unless each one resolves every pinned SONAME
+from the prefix under an empty environment, as processrunner executes helpers.
+The cmake and autotools libraries get RUNPATH from linker flags. libvips is the
+one deliberate exception: meson's install-time depfixer (seen with Ubuntu
+meson 1.3.2) deletes every rpath entry equal to an external dependency's
+library directory, and every pinned dependency lives in `$prefix/lib`, so a
+link-args rpath never survives `meson install`; meson has no setup option for
+`install_rpath`. The script therefore runs `patchelf --set-rpath` on exactly one
+installed `libvips.so.42.*.*` object (it fails if there is not exactly one), and
+the unchanged closure gate then verifies the result. Do not remove this step
+without proving the installed libvips still carries RUNPATH.
 System packages supply only the transitive build closure; pinning that complete
 closure and the deployment image is the explicit issue #20 boundary.
 The build also writes `share/nmcp/still-toolchain.manifest`, binding the verified

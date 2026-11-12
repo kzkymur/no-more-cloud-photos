@@ -13,11 +13,16 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import resource
+import shutil
 import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 MAX_BYTES = 64 << 20
+# Address-space cap per ffmpeg generator: a runaway filter graph must fail
+# closed here instead of exhausting the CI runner (which kills the runner agent).
+FFMPEG_AS_LIMIT = 2 << 30
 FFMPEG = ROOT / '.tools/ffmpeg-6.0.1-amd64-static/ffmpeg'
 
 # Deterministic generated inputs. Sizes exceed the 1920 px recipe ceiling so a
@@ -26,11 +31,14 @@ GENERATED = {
     'bmp-generated': ('image/bmp', 'bmp', ['-f', 'lavfi', '-i', 'testsrc2=size=2400x1600:rate=1', '-frames:v', '1', '-pix_fmt', 'bgr24']),
     'jpeg-generated': ('image/jpeg', 'jpg', ['-f', 'lavfi', '-i', 'testsrc2=size=2400x1600:rate=1', '-frames:v', '1', '-q:v', '3']),
     'png-generated': ('image/png', 'png', ['-f', 'lavfi', '-i', 'testsrc2=size=2400x1600:rate=1', '-frames:v', '1']),
-    'gif-generated-animated': ('image/gif', 'gif', ['-f', 'lavfi', '-i', 'testsrc2=size=2000x1500:rate=5', '-t', '1.6',
+    # palettegen emits only at end of input and split buffers every frame until
+    # then, so the duration MUST be on the lavfi source: an output -t never ends
+    # the infinite source, and memory grows until the runner VM dies.
+    'gif-generated-animated': ('image/gif', 'gif', ['-f', 'lavfi', '-i', 'testsrc2=size=2000x1500:rate=5:duration=1.6',
                                                    '-vf', 'split[a][b];[a]palettegen=max_colors=64[p];[b][p]paletteuse', '-loop', '0']),
-    'video-mp4-generated': ('video/mp4', 'mp4', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+    'video-mp4-generated': ('video/mp4', 'mp4', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24:duration=2', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
                                                  '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', '-f', 'mp4']),
-    'video-quicktime-generated': ('video/quicktime', 'mov', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24', '-t', '2',
+    'video-quicktime-generated': ('video/quicktime', 'mov', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24:duration=2', '-t', '2',
                                                              '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', '-f', 'mov']),
 }
 
@@ -69,6 +77,21 @@ def download(entry, target):
     return 'https'
 
 
+def limit_generator():
+    resource.setrlimit(resource.RLIMIT_AS, (FFMPEG_AS_LIMIT, FFMPEG_AS_LIMIT))
+
+
+def resources(out):
+    # One line per fixture so a CI log shows where disk or memory went.
+    meminfo = {}
+    with open('/proc/meminfo') as stream:
+        for line in stream:
+            key, value = line.split(':', 1)
+            meminfo[key] = int(value.split()[0]) // 1024
+    disk = shutil.disk_usage(out)
+    return 'mem_available=%dMiB disk_free=%dMiB' % (meminfo.get('MemAvailable', -1), disk.free >> 20)
+
+
 def generate(name, target):
     mime, _, args = GENERATED[name]
     if not FFMPEG.is_file():
@@ -77,7 +100,7 @@ def generate(name, target):
     if os.path.lexists(target):
         os.unlink(target)
     subprocess.run([str(FFMPEG), '-nostdin', '-hide_banner', '-loglevel', 'error', '-y', *args, str(target)],
-                   check=True, timeout=300, env={'PATH': '/usr/bin:/bin'})
+                   check=True, timeout=300, env={'PATH': '/usr/bin:/bin'}, preexec_fn=limit_generator)
     os.chmod(target, 0o644)
     return mime
 
@@ -89,6 +112,7 @@ def main():
     out = Path(args.out).resolve()
     out.mkdir(mode=0o755, parents=True, exist_ok=True)
     entries = json.loads((ROOT / 'test/e2e/testdata/fixtures.json').read_text())
+    print('start %s' % resources(out), flush=True)
     prepared = []
     for entry in entries:
         name = entry['name']
@@ -107,12 +131,14 @@ def main():
         prepared.append({'name': name, 'mime_type': entry['mime_type'], 'file': target.name, 'sha256': digest(target),
                          'size': os.path.getsize(target), 'origin': origin,
                          'certification': bool(entry.get('certification', entry['source'] == 'generate'))})
+        print('%s %s %d bytes %s' % (origin, name, os.path.getsize(target), resources(out)), flush=True)
     for name in GENERATED:
         if name not in {p['name'] for p in prepared}:
             target = out / ('%s.%s' % (name, GENERATED[name][1]))
             mime = generate(name, target)
             prepared.append({'name': name, 'mime_type': mime, 'file': target.name, 'sha256': digest(target),
                              'size': os.path.getsize(target), 'origin': 'generated', 'certification': True})
+            print('generated %s %d bytes %s' % (name, os.path.getsize(target), resources(out)), flush=True)
     (out / 'prepared.json').write_text(json.dumps(prepared, indent=1, sort_keys=True) + '\n')
     print('prepared %d fixtures in %s' % (len(prepared), out))
 
