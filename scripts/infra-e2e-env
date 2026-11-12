@@ -327,11 +327,16 @@ media_ls() {
       if [ -L "$path" ]; then type=symlink; elif [ -d "$path" ]; then type=dir; elif [ -f "$path" ]; then type=file; else type=other; fi
       size=$(stat -c %s "$path"); mode=$(stat -c %a "$path"); sum=""
       if [ "$type" = file ]; then sum=$(sha256sum "$path" | cut -c1-64); fi
-      printf "%s\t%s\t%s\t%s\t%s\n" "${path#./}" "$type" "$size" "$mode" "$sum"
+      printf "nmcp-media\t%s\t%s\t%s\t%s\t%s\n" "${path#./}" "$type" "$size" "$mode" "$sum"
     done' | python3 -c '
 import json, sys
 for line in sys.stdin:
-    path, kind, size, mode, digest = line.rstrip("\n").split("\t")
+    # Only marker lines are entries; anything else (compose notices) goes to
+    # stderr so it can never be mistaken for, or corrupt, the tree listing.
+    if not line.startswith("nmcp-media\t"):
+        sys.stderr.write("media-ls: ignored non-entry line: " + line)
+        continue
+    _, path, kind, size, mode, digest = line.rstrip("\n").split("\t")
     print(json.dumps({"path": path, "type": kind, "size": int(size), "mode": mode, "sha256": digest or None}, sort_keys=True))
 '
 }
@@ -418,6 +423,8 @@ up() {
   assert_owned
   mount_media
   if [ ! -d "$NMCP_E2E_FIXTURES_DIR" ]; then install -d -m 0755 "$NMCP_E2E_FIXTURES_DIR"; fi
+  # Build the profile-only observer now, so media-ls never builds mid-scenario.
+  compose --profile e2e build --quiet e2e-observer
   if ! compose up --build --detach --wait; then
     compose logs --no-color >&2 || true
     die "stack did not become ready"
@@ -474,7 +481,7 @@ verify_codec() {
     for helper in nmcp-still-helper nmcp-animation-helper nmcp-video-helper; do
       out=$(env -i LC_ALL=C LANG=C TZ=UTC "$prefix/bin/$helper" capabilities --protocol 1 --threads 1 --srgb-icc /proc/self/fd/3 3<"$icc") ||
         fail "$helper capabilities exited non-zero: $out"
-      printf "%s\t%s\n" "$helper" "$out"
+      printf "capability\t%s\t%s\n" "$helper" "$out"
     done
     if [ -e /usr/bin/ffmpeg ]; then echo "codec-closure: note /usr/bin/ffmpeg (distribution package) is present; the video helper uses its sibling $prefix/bin/ffmpeg"; fi
   ' >"$state_dir/codec-closure.txt" || { cat "$state_dir/codec-closure.txt" >&2; die "codec closure verification failed"; }
@@ -485,9 +492,9 @@ seen = set()
 for line in open(sys.argv[1], encoding="utf-8"):
     line = line.rstrip("\n")
     print(line)
-    if "\t" not in line:
+    if not line.startswith("capability\t"):
         continue
-    helper, payload = line.split("\t", 1)
+    _, helper, payload = line.split("\t", 2)
     doc = json.loads(payload)
     if doc.get("protocol") != 1 or doc.get("ok") is not True or not isinstance(doc.get("result"), dict):
         sys.exit(f"codec-closure: FAIL {helper} capabilities not ok: {payload}")
@@ -601,7 +608,8 @@ lane() {
     # Fail before any resource exists if the whole lane cannot be admitted.
     phase_budget "$up_cap" $((codec_cap + scenario_min + collect_reserve)) "$up_min" >/dev/null
   fi
-  trap 'lane_teardown "$artifacts"' EXIT
+  lane_artifacts=$artifacts
+  trap 'lane_teardown "$lane_artifacts"' EXIT
   trap 'exit 130' HUP INT TERM
   cleanup
   granted=$up_cap

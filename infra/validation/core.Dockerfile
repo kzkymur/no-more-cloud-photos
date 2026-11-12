@@ -23,7 +23,7 @@ ENV LD_LIBRARY_PATH=/opt/nmcp/lib:/opt/nmcp/lib64
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       autoconf automake build-essential ca-certificates cmake curl git libtool \
-      meson nasm ninja-build pkg-config xz-utils \
+      meson nasm ninja-build patchelf pkg-config xz-utils \
       libde265-dev libexif-dev libexpat1-dev libglib2.0-dev libjpeg-turbo8-dev libpng-dev \
       libwebp-dev zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*

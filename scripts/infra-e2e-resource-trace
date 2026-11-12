@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Run COMMAND while printing runner memory, disk and the largest processes
+# to the step log every NMCP_E2E_TRACE_INTERVAL seconds (default 5). The
+# samples go straight to stdout, so the log keeps them even if the runner VM
+# dies mid-step. Also reports the tail of kernel OOM messages afterwards.
+#
+# usage: scripts/infra-e2e-resource-trace [--reclaim-below-gib N] -- COMMAND [ARGS...]
+#   --reclaim-below-gib N  before COMMAND, if / has less than N GiB free,
+#                          remove large preinstalled toolchains this job does
+#                          not use (dotnet, android, ghc, CodeQL) and prune
+#                          unused docker build cache.
+set -euo pipefail
+
+reclaim_below=0
+if [ "${1:-}" = --reclaim-below-gib ]; then reclaim_below=${2:?}; shift 2; fi
+[ "${1:-}" = -- ] && shift
+[ $# -ge 1 ] || { echo "usage: infra-e2e-resource-trace [--reclaim-below-gib N] -- COMMAND..." >&2; exit 2; }
+interval=${NMCP_E2E_TRACE_INTERVAL:-5}
+
+# Diagnostics must never change the outcome: every probe tolerates failure.
+sample() {
+  local mem="" used="" avail="" rss pid comm
+  while read -r label _ used _ _ _ avail _; do
+    [ "$label" = Mem: ] && mem="used=${used} avail=${avail}"
+  done < <(free -m 2>/dev/null || true)
+  printf 'resource-trace %s mem(MiB) %s | root avail %s | tmp avail %s\n' "$(date -u +%T)" "$mem" \
+    "$(df -BG --output=avail / 2>/dev/null | tail -n1 | tr -d ' ' || true)" \
+    "$(df -BG --output=avail "${RUNNER_TEMP:-/tmp}" 2>/dev/null | tail -n1 | tr -d ' ' || true)"
+  while read -r rss pid comm; do
+    printf 'resource-trace   rss=%sMiB pid=%s %s\n' "$((rss / 1024))" "$pid" "$comm"
+  done < <(ps -eo rss=,pid=,comm= --sort=-rss 2>/dev/null | head -n 3 || true)
+  return 0
+}
+
+avail_gib=$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')
+echo "resource-trace start: root avail ${avail_gib}G, cpus $(nproc)"
+if [ "$reclaim_below" -gt 0 ] && [ "$avail_gib" -lt "$reclaim_below" ]; then
+  echo "resource-trace: reclaiming disk (below ${reclaim_below}G)"
+  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+  docker builder prune --force >/dev/null 2>&1 || true
+  echo "resource-trace: root avail now $(df -BG --output=avail / | tail -n1 | tr -d ' ')"
+fi
+sample || true
+( while sleep "$interval"; do sample || true; done ) &
+sampler=$!
+status=0
+"$@" || status=$?
+kill "$sampler" 2>/dev/null || true
+wait "$sampler" 2>/dev/null || true
+sample || true
+sudo dmesg 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -n 5 | sed 's/^/resource-trace dmesg: /' || true
+exit "$status"
