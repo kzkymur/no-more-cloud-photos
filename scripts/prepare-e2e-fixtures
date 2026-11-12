@@ -25,6 +25,8 @@ MAX_BYTES = 64 << 20
 FFMPEG_AS_LIMIT = 2 << 30
 FFMPEG = ROOT / '.tools/ffmpeg-6.0.1-amd64-static/ffmpeg'
 
+BT709 = ['-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709', '-color_range', 'tv']
+
 # Deterministic generated inputs. Sizes exceed the 1920 px recipe ceiling so a
 # certification run proves output at exactly the ceiling (no upscale).
 GENERATED = {
@@ -36,10 +38,13 @@ GENERATED = {
     # the infinite source, and memory grows until the runner VM dies.
     'gif-generated-animated': ('image/gif', 'gif', ['-f', 'lavfi', '-i', 'testsrc2=size=2000x1500:rate=5:duration=1.6',
                                                    '-vf', 'split[a][b];[a]palettegen=max_colors=64[p];[b][p]paletteuse', '-loop', '0']),
+    # The video helper refuses streams without explicit color signalling
+    # (range plus BT.709 or BT.2020 primaries/matrix), like untagged uploads,
+    # so generated video is tagged BT.709 limited range exactly as real cameras do.
     'video-mp4-generated': ('video/mp4', 'mp4', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24:duration=2', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
-                                                 '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', '-f', 'mp4']),
+                                                 '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', *BT709, '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', '-f', 'mp4']),
     'video-quicktime-generated': ('video/quicktime', 'mov', ['-f', 'lavfi', '-i', 'testsrc2=size=2560x1440:rate=24:duration=2', '-t', '2',
-                                                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', '-f', 'mov']),
+                                                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', *BT709, '-an', '-f', 'mov']),
 }
 
 
