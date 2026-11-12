@@ -1,0 +1,25 @@
+# Third overlay, used only by the #21 failpoint E2E lane
+# (NMCP_E2E_LANE=failpoints in scripts/infra-e2e-env). It builds Core with
+# the nmcp_failpoints tag and lets `control set-failpoint` recreate api or
+# worker with NMCP_FAILPOINT set. The release lane never loads this file.
+x-failpoint-build: &failpoint-build
+  context: ../..
+  dockerfile: infra/validation/core.Dockerfile
+  args:
+    GO_BUILD_TAGS: nmcp_failpoints
+
+services:
+  storage-init:
+    build: *failpoint-build
+  migrate:
+    build: *failpoint-build
+  e2e-observer:
+    build: *failpoint-build
+  api:
+    build: *failpoint-build
+    environment:
+      NMCP_FAILPOINT: "${NMCP_E2E_FAILPOINT_API:-}"
+  worker:
+    build: *failpoint-build
+    environment:
+      NMCP_FAILPOINT: "${NMCP_E2E_FAILPOINT_WORKER:-}"

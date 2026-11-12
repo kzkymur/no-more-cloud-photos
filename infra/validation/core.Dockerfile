@@ -6,9 +6,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/core-api ./cmd/core-api \
- && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/core-worker ./cmd/core-worker \
- && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/nmcp-admin ./cmd/nmcp-admin \
+# Empty for release images. Only the #21 failpoint E2E lane sets
+# nmcp_failpoints (scripts/infra-e2e-env, compose.failpoints.yaml).
+ARG GO_BUILD_TAGS=""
+RUN case "$GO_BUILD_TAGS" in ""|nmcp_failpoints) ;; *) echo "unsupported GO_BUILD_TAGS: $GO_BUILD_TAGS" >&2; exit 1 ;; esac \
+ && CGO_ENABLED=0 go build -trimpath -tags "$GO_BUILD_TAGS" -ldflags='-s -w' -o /out/core-api ./cmd/core-api \
+ && CGO_ENABLED=0 go build -trimpath -tags "$GO_BUILD_TAGS" -ldflags='-s -w' -o /out/core-worker ./cmd/core-worker \
+ && CGO_ENABLED=0 go build -trimpath -tags "$GO_BUILD_TAGS" -ldflags='-s -w' -o /out/nmcp-admin ./cmd/nmcp-admin \
  && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/nmcp-video-helper ./cmd/nmcp-video-helper
 
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS codec-build
