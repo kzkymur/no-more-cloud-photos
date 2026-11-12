@@ -296,10 +296,17 @@ Raster decode_bmp(const TransformArgs &args) {
   return raster;
 }
 
+// Capability claims are evidence-backed: every RAW type listed here has an
+// exact pinned real-camera fixture whose decoded AVIF pixels the native
+// integration test compares with the separately compiled LibRaw reference
+// (internal/stillprocessor/testdata/README.md). Add a type only with that
+// evidence.
+constexpr std::array<std::string_view, 8> kProvenRawMimes{
+    "image/dng",           "image/x-canon-cr2",   "image/x-canon-cr3",     "image/x-fuji-raf",
+    "image/x-nikon-nef",   "image/x-olympus-orf", "image/x-panasonic-rw2", "image/x-sony-arw"};
+
 bool raw_mime(std::string_view mime) {
-  // Capability claims are evidence-backed. Other registry RAW types remain
-  // candidates but are rejected until an exact pinned real fixture proves them.
-  return mime == "image/dng";
+  return std::find(kProvenRawMimes.begin(), kProvenRawMimes.end(), mime) != kProvenRawMimes.end();
 }
 
 std::string raw_decoder(std::string_view mime) {
@@ -639,8 +646,7 @@ std::map<std::string, std::string> library_versions() {
 std::vector<std::string> decoder_mime_types() {
   std::vector<std::string> result;
   result.emplace_back("image/bmp");
-  // Only DNG has exact-fixture output evidence in this release.
-  result.emplace_back("image/dng");
+  for (const auto mime : kProvenRawMimes) result.emplace_back(mime);
   const heif_decoder_descriptor *hevc[1]{};
   const heif_decoder_descriptor *av1[1]{};
   const bool has_hevc = heif_get_decoder_descriptors(heif_compression_HEVC, hevc, 1) == 1;

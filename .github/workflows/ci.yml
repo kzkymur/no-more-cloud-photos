@@ -113,6 +113,28 @@ jobs:
           printf '%s  %s\n' \
             f0d2fe47507fadf50008bddbc6bd2c5e39fddbe90cca6bca72dd360fa0e0eb38 \
             "${RUNNER_TEMP}/canon-a410.dng" | sha256sum --check
+          # The seven non-DNG camera RAW fixtures pinned (URL, size, SHA-256)
+          # in the release-gate manifest; each is the reference evidence for
+          # one advertised RAW decoder MIME (stillprocessor testdata README).
+          mkdir -m 0700 "${RUNNER_TEMP}/still-raw-fixtures"
+          python3 -I - "${GITHUB_WORKSPACE}/test/e2e/testdata/fixtures.json" "${RUNNER_TEMP}/still-raw-fixtures" <<'PY'
+          import hashlib, json, os, subprocess, sys
+          raw = {'image/x-canon-cr2', 'image/x-canon-cr3', 'image/x-fuji-raf', 'image/x-nikon-nef',
+                 'image/x-olympus-orf', 'image/x-panasonic-rw2', 'image/x-sony-arw'}
+          entries = [e for e in json.load(open(sys.argv[1])) if e['mime_type'] in raw]
+          assert sorted(e['mime_type'] for e in entries) == sorted(raw), entries
+          for e in entries:
+              assert e['source'] == 'download' and e['url'].startswith('https://') and e['size'] <= 64 << 20, e['name']
+              target = os.path.join(sys.argv[2], '%s.%s' % (e['name'], e['url'].rsplit('.', 1)[-1].lower()))
+              subprocess.run(['curl', '--fail', '--location', '--silent', '--show-error', '--proto', '=https',
+                              '--proto-redir', '=https', '--retry', '3', '--retry-all-errors', '--max-time', '300',
+                              '--max-filesize', str(64 << 20), '--output', target, e['url']], check=True)
+              data = open(target, 'rb').read()
+              if len(data) != e['size'] or hashlib.sha256(data).hexdigest() != e['sha256']:
+                  os.unlink(target)
+                  sys.exit('camera RAW fixture %s does not match its pin' % e['name'])
+          print('verified %d camera RAW fixtures' % len(entries))
+          PY
           # The production sandbox hides /home; native ELF paths must be /opt.
           test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
           sudo mkdir -m 0755 /opt/nmcp-native-ci
@@ -154,6 +176,7 @@ jobs:
             "${RUNNER_TEMP}/generated-heif-fixtures/icc-nclx.avif" \
             "${RUNNER_TEMP}/generated-heif-fixtures/invalid-icc.avif" \
             "${RUNNER_TEMP}/generated-heif-fixtures/collection-primary-second.avif" >> "${GITHUB_ENV}"
+          printf 'TEST_STILL_RAW_FIXTURES_DIR=%s\n' "${RUNNER_TEMP}/still-raw-fixtures" >> "${GITHUB_ENV}"
           printf 'LD_LIBRARY_PATH=%s\n' \
             "/opt/nmcp-native-ci/lib:/opt/nmcp-native-ci/lib64" >> "${GITHUB_ENV}"
       # Only after every archive passed its pinned SHA-256 in the step above, so a

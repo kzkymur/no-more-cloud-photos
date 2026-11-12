@@ -16,10 +16,13 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"maps"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
@@ -57,11 +60,17 @@ func TestRealStillHelper(t *testing.T) {
 	if capabilities.AVIFEncoder != "aom" || capabilities.Threads != 1 {
 		t.Fatalf("capabilities = %+v", capabilities)
 	}
+	// Every advertised RAW MIME must have a pinned real camera fixture below
+	// whose decoded pixels match the separately compiled LibRaw reference.
+	cameraRAW := readCameraRAWFixtures(t)
 	for _, mimeType := range capabilities.DecoderMIMETypes {
-		if len(mimeType) > 6 && (mimeType == "image/x-canon-cr2" || mimeType == "image/x-canon-cr3" ||
-			mimeType == "image/x-fuji-raf" || mimeType == "image/x-nikon-nef" || mimeType == "image/x-olympus-orf" ||
-			mimeType == "image/x-panasonic-rw2" || mimeType == "image/x-sony-arw") {
-			t.Fatalf("unproven RAW capability advertised: %s", mimeType)
+		if isRawMIME(mimeType) && mimeType != "image/dng" && cameraRAW[mimeType] == nil {
+			t.Fatalf("RAW capability advertised without reference evidence: %s", mimeType)
+		}
+	}
+	for mimeType := range cameraRAW {
+		if !slices.Contains(capabilities.DecoderMIMETypes, mimeType) {
+			t.Fatalf("proven RAW %s not advertised: %v", mimeType, capabilities.DecoderMIMETypes)
 		}
 	}
 	heic := readFixture(t, "TEST_STILL_HEIC_PATH", "7f8b363e4936c0666a25f64f3a92fda10bd8e5453be4592530b65a55dd98f3f2")
@@ -74,7 +83,7 @@ func TestRealStillHelper(t *testing.T) {
 	invalidICC := readGeneratedFixture(t, "TEST_STILL_INVALID_ICC_PATH")
 	heifCollection := readGeneratedFixture(t, "TEST_STILL_HEIF_COLLECTION_PATH")
 
-	for _, test := range []struct {
+	type realStillCase struct {
 		name, mime, alpha, inputColor, toneMap, rawProcessing string
 		width, height                                         int
 		input                                                 []byte
@@ -86,7 +95,8 @@ func TestRealStillHelper(t *testing.T) {
 		bmpReference                                          bool
 		thumbnail                                             bool
 		quality                                               int
-	}{
+	}
+	cases := []realStillCase{
 		{name: "JPEG odd opaque", mime: "image/jpeg", alpha: "opaque", width: 5, height: 3,
 			input: encodeJPEG(t, 5, 3)},
 		{name: "JPEG thumbnail 640 edge", mime: "image/jpeg", alpha: "opaque", width: 640, height: 497,
@@ -121,7 +131,15 @@ func TestRealStillHelper(t *testing.T) {
 			input: iccNCLX, inputColor: "embedded-icc", toneMap: "not-needed", referencePixel: []int{215, 93, 31}},
 		{name: "HEIF collection selects explicit primary", mime: "image/heif", alpha: "opaque", width: 16, height: 16,
 			input: heifCollection, referencePixel: []int{20, 220, 20}},
-	} {
+	}
+	for _, mimeType := range slices.Sorted(maps.Keys(cameraRAW)) {
+		// Same evidence standard as the DNG case: camera WB/matrix, 16-bit,
+		// no auto-bright, bounded downscale, and reference pixel comparison.
+		cases = append(cases, realStillCase{name: "real camera RAW " + mimeType, mime: mimeType, alpha: "opaque", input: cameraRAW[mimeType],
+			inputColor: "raw-camera-matrix", toneMap: "not-needed",
+			rawProcessing: "camera-wb-camera-matrix-16bit-no-auto-bright", largeRAW: true, rawReference: true})
+	}
+	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			inputPath := filepath.Join(t.TempDir(), "input")
 			if err := os.WriteFile(inputPath, test.input, 0o600); err != nil {
@@ -391,6 +409,52 @@ func assertOrientation6Pixels(t *testing.T, ffmpeg string, sourceJPEG []byte, ou
 			}
 		}
 	}
+}
+
+// readCameraRAWFixtures loads the non-DNG camera RAW fixtures pinned in the
+// repository's release-gate fixture manifest (URL, size and SHA-256 per
+// entry) from TEST_STILL_RAW_FIXTURES_DIR, where CI stores each verified
+// download as <name>.<ext>. Every RAW MIME must be present exactly once.
+func readCameraRAWFixtures(t *testing.T) map[string][]byte {
+	t.Helper()
+	dir := requiredTestPath(t, "TEST_STILL_RAW_FIXTURES_DIR")
+	manifest, err := os.ReadFile(filepath.Join("..", "..", "test", "e2e", "testdata", "fixtures.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []struct {
+		Name     string `json:"name"`
+		MIMEType string `json:"mime_type"`
+		Source   string `json:"source"`
+		URL      string `json:"url"`
+		SHA256   string `json:"sha256"`
+		Size     int64  `json:"size"`
+	}
+	if err := json.Unmarshal(manifest, &entries); err != nil {
+		t.Fatal(err)
+	}
+	out := map[string][]byte{}
+	for _, entry := range entries {
+		if !isRawMIME(entry.MIMEType) || entry.MIMEType == "image/dng" {
+			continue
+		}
+		if entry.Source != "download" || out[entry.MIMEType] != nil {
+			t.Fatalf("camera RAW manifest entry %s is not a unique pinned download", entry.Name)
+		}
+		ext := entry.URL[strings.LastIndex(entry.URL, ".")+1:]
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name+"."+strings.ToLower(ext)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if int64(len(data)) != entry.Size || fmt.Sprintf("%x", sha256.Sum256(data)) != entry.SHA256 {
+			t.Fatalf("camera RAW fixture %s does not match its pin", entry.Name)
+		}
+		out[entry.MIMEType] = data
+	}
+	if len(out) != 7 {
+		t.Fatalf("camera RAW fixtures = %d, want 7", len(out))
+	}
+	return out
 }
 
 func readFixture(t *testing.T, environment, expectedSHA256 string) []byte {
