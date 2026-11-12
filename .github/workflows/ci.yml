@@ -86,7 +86,7 @@ jobs:
         id: stillbuild
         run: |
           sudo apt-get install -y --no-install-recommends \
-            autoconf automake cmake libtool make meson nasm ninja-build pkg-config \
+            autoconf automake cmake libtool make meson nasm ninja-build patchelf pkg-config \
             libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev \
             libde265-dev zlib1g-dev
           curl --fail --location --silent --show-error \

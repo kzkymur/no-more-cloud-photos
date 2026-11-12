@@ -122,10 +122,18 @@ meson setup "$work/build/vips" "$work/source/vips-8.18.7" \
   -Dorc=disabled -Dpangocairo=disabled -Dpdfium=disabled -Dpng=enabled \
   -Dpoppler=disabled -Dquantizr=disabled -Draw=disabled -Drsvg=disabled \
   -Dspng=disabled -Dtiff=disabled -Dwebp=enabled -Dzlib=enabled \
-  -Dnsgif=false -Dppm=false -Danalyze=false -Dradiance=false \
-  -Dc_link_args="-Wl,--enable-new-dtags -Wl,-rpath,$prefix/lib"
+  -Dnsgif=false -Dppm=false -Danalyze=false -Dradiance=false
 meson compile -C "$work/build/vips" -j 2
 meson install -C "$work/build/vips"
+# meson's install-time depfixer deletes every rpath entry equal to an external
+# dependency's library directory, so -Wl,-rpath,$prefix/lib in link args never
+# survives into the installed libvips (all deps live in $prefix/lib). meson has
+# no setup option for install_rpath, so set DT_RUNPATH (patchelf's default,
+# not DT_RPATH) on the installed object; the closure gate below verifies it.
+vips_objects=("$prefix"/lib/libvips.so.42.*.*)
+[[ ${#vips_objects[@]} -eq 1 && -f "${vips_objects[0]}" && ! -L "${vips_objects[0]}" ]] ||
+  { printf 'expected exactly one installed libvips object\n' >&2; exit 1; }
+patchelf --set-rpath "$prefix/lib" "${vips_objects[0]}"
 
 pkg-config --modversion vips libheif libraw aom lcms2 libwebp
 
