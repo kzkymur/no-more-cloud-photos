@@ -519,10 +519,22 @@ var eightBitPixelFormats = map[string]bool{
 	"nv12": true, "nv21": true, "yuv411p": true, "yuv440p": true, "yuvj440p": true,
 }
 
+// sdInferenceFrame reports whether coded dimensions are a standard-definition
+// frame for untagged-color inference (review N4): anything at least 1280
+// wide or taller than 576 lines is HD (BT.709 matrix); the rest is SD
+// (BT.601 matrix). The processor's acceptance check uses the same rule.
+func sdInferenceFrame(width, height int) bool { return width < 1280 && height <= 576 }
+
+// fullRangePixelFormats are the JPEG-range (yuvj*) formats: their samples are
+// full range by definition, so an untagged one is never inferred as limited.
+var fullRangePixelFormats = map[string]bool{"yuvj420p": true, "yuvj422p": true, "yuvj444p": true, "yuvj440p": true}
+
 // inferSDRColor applies conventional SDR inference to a stream whose color
-// signalling is wholly or partly unspecified: height >= 720 is BT.709,
-// smaller is the BT.601 matrix (smpte170m; 525- and 625-line BT.601 share it)
-// with BT.709 primaries and transfer, and an unspecified range is limited.
+// signalling is wholly or partly unspecified: an HD frame (sdInferenceFrame
+// false) is BT.709, an SD frame the BT.601 matrix (smpte170m; 525- and
+// 625-line BT.601 share it) with BT.709 primaries and transfer, and an
+// unspecified range is limited, except for a yuvj* format, which is full
+// (a yuvj* stream declaring limited range is contradictory and refused).
 // Every specified field must equal the inferred value (a declared range is
 // kept). A fully tagged stream, a stream that is not provably 8-bit, PQ/HLG,
 // BT.2020, or HDR side data is refused, so tagged input keeps exactly the
@@ -532,7 +544,7 @@ func inferSDRColor(stream probeStream, frameHDR hdrEvidence) (string, string, st
 	if !colorUnspecified(stream.ColorPrimaries) && !colorUnspecified(stream.ColorTransfer) && !colorUnspecified(stream.ColorSpace) && !colorUnspecified(stream.ColorRange) {
 		return "", "", "", "", refuse
 	}
-	if !eightBitPixelFormats[stream.PixFmt] || stream.BitsPerRaw != "" && stream.BitsPerRaw != "8" || stream.Height <= 0 {
+	if !eightBitPixelFormats[stream.PixFmt] || stream.BitsPerRaw != "" && stream.BitsPerRaw != "8" || stream.Height <= 0 || stream.Width <= 0 {
 		return "", "", "", "", refuse
 	}
 	if frameHDR.present || frameHDR.invalid {
@@ -542,7 +554,7 @@ func inferSDRColor(stream probeStream, frameHDR hdrEvidence) (string, string, st
 		return "", "", "", "", refuse
 	}
 	primaries, transfer, matrix := "bt709", "bt709", "bt709"
-	if stream.Height < 720 {
+	if sdInferenceFrame(stream.Width, stream.Height) {
 		matrix = "smpte170m"
 	}
 	for _, field := range []struct{ declared, inferred string }{
@@ -553,9 +565,12 @@ func inferSDRColor(stream probeStream, frameHDR hdrEvidence) (string, string, st
 		}
 	}
 	colorRange := "limited"
+	if fullRangePixelFormats[stream.PixFmt] {
+		colorRange = "full"
+	}
 	if !colorUnspecified(stream.ColorRange) {
 		declared, ok := map[string]string{"tv": "limited", "mpeg": "limited", "pc": "full", "jpeg": "full"}[stream.ColorRange]
-		if !ok {
+		if !ok || fullRangePixelFormats[stream.PixFmt] && declared != "full" {
 			return "", "", "", "", refuse
 		}
 		colorRange = declared

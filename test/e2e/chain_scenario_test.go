@@ -5,6 +5,8 @@ package e2e
 import (
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -176,6 +178,43 @@ func TestReleaseGateChain(t *testing.T) {
 			t.Fatalf("tombstone is not last: %s", kinds)
 		}
 		h.record("changes", kinds)
+	})
+
+	t.Run("untagged SD video color inference", func(t *testing.T) {
+		// Review N4: an untagged 640x480 8-bit stream is SD (narrower than
+		// 1280, at most 576 lines), so the real helper infers the BT.601
+		// matrix with limited range and the real zscale converts it; the
+		// assumption is persisted in every video rendition's audit.
+		var chosen preparedFixture
+		for _, f := range h.preparedFixtures() {
+			if f.Name == "video-mp4-untagged-sd-generated" {
+				chosen = f
+			}
+		}
+		if chosen.File == "" || chosen.Certification {
+			t.Fatalf("untagged SD fixture missing or marked for certification: %+v", chosen)
+		}
+		data, err := os.ReadFile(filepath.Join(os.Getenv("NMCP_E2E_FIXTURES_DIR"), "prepared", chosen.File))
+		if err != nil || sha(data) != chosen.SHA256 {
+			t.Fatal("untagged SD fixture unreadable or changed")
+		}
+		var up struct {
+			Media media `json:"media"`
+			Job   *job  `json:"job"`
+		}
+		h.expectJSON(h.upload("e2e-untagged-sd-"+chosen.SHA256[:16], chosen.File, chosen.MIMEType, data), 201, &up)
+		if up.Job == nil {
+			t.Fatal("untagged SD upload created no job")
+		}
+		h.waitJob(up.Job.ID, "succeeded", 10*time.Minute)
+		h.assertExactlyOneCurrentPerTarget(up.Media.ID)
+		counts := h.dbRead(`SELECT count(*)::text||'|'||count(*) FILTER (WHERE processor_audit::text LIKE '%"inferred:bt709/bt709/smpte170m/limited"%')::text
+			FROM renditions WHERE media_id='` + up.Media.ID + `' AND is_current`)
+		total, inferred, _ := strings.Cut(counts, "|")
+		if total == "0" || inferred != total {
+			t.Fatalf("untagged SD renditions %s, inferred BT.601 limited %s", total, inferred)
+		}
+		h.record("untagged_sd", map[string]any{"media_id": up.Media.ID, "renditions": total})
 	})
 
 	t.Run("regenerate current cleanup", func(t *testing.T) {

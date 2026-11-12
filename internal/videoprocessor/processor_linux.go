@@ -475,12 +475,16 @@ func validateInspection(i Inspection, p Policy) error {
 	return nil
 }
 
+// sdInferenceFrame mirrors the helper's untagged-color rule (review N4):
+// SD is narrower than 1280 and at most 576 lines; everything else is HD.
+func sdInferenceFrame(width, height int) bool { return width < 1280 && height <= 576 }
+
 func safeColor(i Inspection) bool {
 	if i.ColorInferred {
 		// Inference only ever yields SDR BT.709 primaries/transfer with the
 		// BT.709 (HD) or BT.601 smpte170m (SD) matrix.
 		return !i.HDR && i.ColorPrimaries == "bt709" && i.ColorTransfer == "bt709" &&
-			(i.ColorMatrix == "bt709" && i.CodedHeight >= 720 || i.ColorMatrix == "smpte170m" && i.CodedHeight < 720) && oneOf(i.ColorRange, "limited", "full")
+			(i.ColorMatrix == "bt709" && !sdInferenceFrame(i.CodedWidth, i.CodedHeight) || i.ColorMatrix == "smpte170m" && sdInferenceFrame(i.CodedWidth, i.CodedHeight)) && oneOf(i.ColorRange, "limited", "full")
 	}
 	return oneOf(i.ColorPrimaries, "bt709", "bt2020") && oneOf(i.ColorTransfer, "bt709", "smpte2084", "arib-std-b67") && oneOf(i.ColorMatrix, "bt709", "bt2020nc", "bt2020c") && oneOf(i.ColorRange, "limited", "full")
 }

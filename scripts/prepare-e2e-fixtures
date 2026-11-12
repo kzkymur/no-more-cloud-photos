@@ -50,6 +50,12 @@ GENERATED = {
     # (color_inferred) rather than refuse. Deliberately NOT tagged.
     'video-mp4-untagged-generated': ('video/mp4', 'mp4', ['-f', 'lavfi', '-i', 'testsrc2=size=1920x1080:rate=24:duration=2', '-t', '2',
                                                           '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', '-f', 'mp4']),
+    # Review N4: an untagged 640x480 8-bit SD stream must be inferred as the
+    # BT.601 matrix (smpte170m) with limited range and converted by the real
+    # zscale. Below the recipe edge, so it is uploaded by the chain scenario,
+    # never a certification input (fixtures.json marks it so).
+    'video-mp4-untagged-sd-generated': ('video/mp4', 'mp4', ['-f', 'lavfi', '-i', 'testsrc2=size=640x480:rate=24:duration=2', '-t', '2',
+                                                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', '-f', 'mp4']),
 }
 
 

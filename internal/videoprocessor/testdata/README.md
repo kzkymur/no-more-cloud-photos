@@ -30,10 +30,13 @@ HDR10+, or real-device performance. Those broader interoperability and
 performance claims remain issue #21.
 
 Issue #21 color inference is proven by `internal/videohelper` unit tests
-(untagged 1080p 8-bit -> BT.709 limited inferred, untagged SD -> BT.601 matrix,
+(untagged 1080p 8-bit -> BT.709 limited inferred, untagged SD (width < 1280
+and height <= 576) -> BT.601 matrix, untagged `yuvj*` -> full range,
 untagged 10-bit, HDR side data and conflicting partial tags refused, tagged
 input unchanged) and the processor/executor tests for the mirrored filter,
 audit marker and Worker log. The release-gate E2E matrix
 (`test/e2e/testdata/fixtures.json`, `scripts/prepare-e2e-fixtures`) keeps one
 untagged 1080p MP4 as a regression input beside the BT.709-tagged ones; both are
-certified and transformed through the real helper.
+certified and transformed through the real helper. A non-certification untagged
+640x480 MP4 is uploaded by the chain scenario and must transform through the real
+zscale with the persisted `inferred:bt709/bt709/smpte170m/limited` input color.

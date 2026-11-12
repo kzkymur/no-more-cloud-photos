@@ -334,5 +334,19 @@
     "certification": true,
     "width": 1080,
     "height": 2160
+  },
+  {
+    "mime_type": "video/mp4",
+    "name": "video-mp4-untagged-sd-generated",
+    "source": "generate",
+    "url": null,
+    "sha256": null,
+    "size": null,
+    "license": "n/a (synthesized at test time)",
+    "notes": "Review N4 regression input: 640x480 8-bit H.264 with no color signalling. Must be inferred as BT.709 primaries/transfer, BT.601 smpte170m matrix, limited range, and transformed through the real zscale. Below the 1920 px recipe edge, so it is not a certification input.",
+    "attribution": null,
+    "certification": false,
+    "width": 640,
+    "height": 480
   }
 ]

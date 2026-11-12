@@ -47,11 +47,14 @@ conventional SDR inference instead of being refused, and only then:
 - the stream must be provably 8-bit (an 8-bit `pix_fmt`, `bits_per_raw_sample`
   absent or `8`); untagged 10-bit or deeper video may be HDR and stays refused,
   as does any stream with HDR mastering/content-light side data;
-- coded height >= 720 assumes BT.709 primaries, transfer and matrix; smaller
-  frames assume the BT.601 matrix (`smpte170m`, shared by 525- and 625-line
-  BT.601) with BT.709 primaries and transfer, because the helper does not
-  distinguish the 525/625 primaries;
-- an unspecified range is limited; a declared range is kept;
+- an HD frame (coded width >= 1280 or coded height > 576) assumes BT.709
+  primaries, transfer and matrix; an SD frame (narrower than 1280 and at most
+  576 lines) assumes the BT.601 matrix (`smpte170m`, shared by 525- and
+  625-line BT.601) with BT.709 primaries and transfer, because the helper does
+  not distinguish the 525/625 primaries;
+- an unspecified range is limited, except for a JPEG-range `yuvj*` format,
+  which is full by definition (a `yuvj*` stream declaring limited range is
+  refused); any other declared range is kept;
 - every declared primaries/transfer/matrix value must equal the inferred one,
   so a partial PQ, HLG, BT.2020 or mismatching matrix tag is still refused.
 
