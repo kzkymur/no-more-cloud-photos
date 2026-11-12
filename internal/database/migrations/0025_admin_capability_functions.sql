@@ -28,8 +28,16 @@ CREATE FUNCTION nmcp_admin_repair_enter_maintenance(
 ) RETURNS text LANGUAGE plpgsql SECURITY DEFINER AS $$
 DECLARE current_mode text;
 BEGIN
-    IF actor IS NULL OR actor='' OR host IS NULL OR host='' OR started IS NULL THEN
+    IF report IS NULL OR actor IS NULL OR actor='' OR host IS NULL OR host='' OR started IS NULL THEN
         RAISE EXCEPTION 'invalid repair actor' USING ERRCODE='22023';
+    END IF;
+    -- Review K1: only a sealed, error-free full report (the repair admission
+    -- rule) may disable the service; anything else changes nothing.
+    IF NOT EXISTS(SELECT 1 FROM reconciliation_check_reports AS r
+        JOIN reconciliation_check_report_seals AS seal ON seal.report_id=r.id
+        WHERE r.id=report
+          AND (SELECT count(*) FROM reconciliation_check_source_results AS src WHERE src.report_id=r.id AND src.result='complete')=3) THEN
+        RAISE EXCEPTION 'repair requires a sealed error-free report' USING ERRCODE='23514';
     END IF;
     BEGIN
         SELECT s.mode INTO current_mode FROM maintenance_state AS s WHERE s.id=1 FOR UPDATE NOWAIT;
@@ -56,6 +64,15 @@ BEGIN
     IF result_outcome NOT IN ('succeeded','partial') OR actor IS NULL OR actor='' OR host IS NULL OR host='' OR started IS NULL THEN
         RAISE EXCEPTION 'invalid repair result audit' USING ERRCODE='22023';
     END IF;
+    -- Review K1: the audited run must be a run of this report, already
+    -- executed (its native result row exists) and with an outcome that is
+    -- consistent with the claimed one.
+    IF NOT EXISTS(SELECT 1 FROM reconciliation_repair_runs AS rr
+        JOIN reconciliation_repair_results AS res ON res.run_id=rr.id
+        WHERE rr.id=run AND rr.source_report_id=report
+          AND (result_outcome='partial' OR res.result='succeeded')) THEN
+        RAISE EXCEPTION 'repair result audit does not match an executed run of this report' USING ERRCODE='23514';
+    END IF;
     INSERT INTO admin_audit(id,command,actor,host,sanitized_arguments,outcome,affected_ids,started_at,finished_at)
     VALUES(audit_id,'repair_result',actor,host,jsonb_build_object('report_id',report::text),result_outcome,ARRAY[run],started,clock_timestamp());
 END;
@@ -77,18 +94,31 @@ $$;
 CREATE FUNCTION nmcp_admin_resume_maintenance(
     report nmcp_uuid_v4,check_result jsonb,audit_id nmcp_uuid_v4,actor text,host text,started timestamptz
 ) RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER AS $$
-DECLARE current_mode text; authorized boolean;
+DECLARE current_mode text; current_reason text; current_entered timestamptz; authorized boolean;
 BEGIN
     IF check_result IS NULL OR jsonb_typeof(check_result)<>'object' OR actor IS NULL OR actor='' OR host IS NULL OR host='' OR started IS NULL THEN
         RAISE EXCEPTION 'invalid resume request' USING ERRCODE='22023';
     END IF;
-    SELECT s.mode INTO current_mode FROM maintenance_state AS s WHERE s.id=1 FOR UPDATE NOWAIT;
+    SELECT s.mode,s.reason,s.entered_at INTO current_mode,current_reason,current_entered
+    FROM maintenance_state AS s WHERE s.id=1 FOR UPDATE NOWAIT;
     IF current_mode<>'maintenance' THEN
         RAISE EXCEPTION 'resume requires maintenance mode' USING ERRCODE='55000';
+    END IF;
+    -- Review K1: this function is the database-side resume gate. A
+    -- post-restore maintenance is resumed only by the root operator procedure
+    -- (its external ledger is not visible here).
+    IF current_reason='operator restore' THEN
+        RAISE EXCEPTION 'restore maintenance requires the operator resume' USING ERRCODE='55000';
+    END IF;
+    -- The report must be fresh (created after maintenance was entered) and be
+    -- exactly the one the caller's check result describes.
+    IF check_result->>'ReportID' IS DISTINCT FROM report::text THEN
+        RETURN false;
     END IF;
     SELECT EXISTS(SELECT 1 FROM reconciliation_check_reports r
         JOIN reconciliation_check_report_seals seal ON seal.report_id=r.id
         WHERE r.id=report AND r.scope='all' AND seal.finding_count=0
+        AND current_entered IS NOT NULL AND r.created_at>current_entered
         AND (SELECT count(*) FROM reconciliation_check_source_results src WHERE src.report_id=r.id AND src.result='complete')=3)
         AND NOT EXISTS(SELECT 1 FROM reconciliation_repair_runs run WHERE NOT EXISTS
         (SELECT 1 FROM reconciliation_repair_results result WHERE result.run_id=run.id))
