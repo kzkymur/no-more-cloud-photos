@@ -4,21 +4,35 @@
 #
 # usage: scripts/infra-e2e-budget-acquire REQUIRED_SECONDS
 #
-# The only tolerated refusal is admission_refused:run_mismatch while the
-# run-attempt API has not yet reported this run as in_progress (the first job
-# of a run can start before that). It is retried for at most 60s, printing the
-# API-reported status each time. Every other refusal fails immediately.
+# scripts/backup-ci-admission binds admission to THIS job's own record and
+# accepts a run that GitHub still reports as `queued` (siblings waiting for
+# runners), so a lagging run status no longer refuses. As a bounded defence,
+# admission_refused:run_mismatch is still retried with backoff for at most
+# NMCP_E2E_BUDGET_RETRY_SECONDS (default 180) while the API reports THIS run
+# (same head and attempt) as `queued` or the API call fails, printing the
+# API-reported status each time. A run_mismatch while the API reports any
+# other status, and every other refusal, fails immediately.
+#
+# Test hooks (scripts/test-infra-e2e-budget-acquire):
+#   NMCP_E2E_ADMISSION_HELPER  admission command (default: scripts/backup-ci-admission)
+#   NMCP_E2E_RETRY_BACKOFF     space-separated sleeps (default: "5 10 20 30"; the last repeats)
 set -euo pipefail
 
 required=${1:?usage: infra-e2e-budget-acquire REQUIRED_SECONDS}
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+helper=${NMCP_E2E_ADMISSION_HELPER:-$root/scripts/backup-ci-admission}
+window=${NMCP_E2E_BUDGET_RETRY_SECONDS:-180}
+read -r -a backoff <<<"${NMCP_E2E_RETRY_BACKOFF:-5 10 20 30}"
+case "$window" in ''|*[!0-9]*) echo "invalid NMCP_E2E_BUDGET_RETRY_SECONDS" >&2; exit 2 ;; esac
 receipt="$RUNNER_TEMP/.nmcp-e2e-budget.json"
 [ ! -e "$receipt" ] || { echo "receipt already exists; never re-acquire" >&2; exit 1; }
-deadline=$((SECONDS + 60))
+deadline=$((SECONDS + window))
 umask 077
+attempt=0
 while :; do
+  attempt=$((attempt + 1))
   status=0
-  python3 -I "$root/scripts/backup-ci-admission" acquire --repo "$GITHUB_REPOSITORY" \
+  python3 -I "$helper" acquire --repo "$GITHUB_REPOSITORY" \
     --sha "${NMCP_E2E_BUDGET_RUN_SHA:?}" --job-name "${NMCP_E2E_BUDGET_JOB_NAME:?}" \
     --runner-name "$RUNNER_NAME" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
     --job-seconds "${NMCP_E2E_BUDGET_JOB_SECONDS:?}" \
@@ -27,17 +41,28 @@ while :; do
     --required-seconds "$required" >"$receipt.tmp" 2>"$receipt.err" || status=$?
   if [ "$status" -eq 0 ]; then break; fi
   cat "$receipt.err" >&2
-  observed=$(GH_TOKEN=$GITHUB_TOKEN timeout 20 gh api \
+  observed=$(GH_TOKEN=${GITHUB_TOKEN:-} timeout 20 gh api \
     "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
     --jq '"status=\(.status) head_sha=\(.head_sha) attempt=\(.run_attempt)"' 2>&1 || true)
-  echo "admission diagnostics: $observed" >&2
-  if ! grep -qx 'admission_refused:run_mismatch' "$receipt.err" || [ "$SECONDS" -ge "$deadline" ]; then
+  echo "admission diagnostics (attempt $attempt): $observed" >&2
+  retryable=false
+  if grep -qx 'admission_refused:run_mismatch' "$receipt.err"; then
+    case "$observed" in
+      "status=queued head_sha=$NMCP_E2E_BUDGET_RUN_SHA attempt=$GITHUB_RUN_ATTEMPT") retryable=true ;;
+      status=*) ;;  # the API reports another state: a real identity mismatch
+      *) retryable=true ;;  # API unavailable: the helper itself still fails closed
+    esac
+  fi
+  index=$((attempt - 1)); [ "$index" -lt "${#backoff[@]}" ] || index=$((${#backoff[@]} - 1))
+  pause=${backoff[$index]}
+  if [ "$retryable" != true ] || [ $((SECONDS + pause)) -gt "$deadline" ]; then
+    [ "$retryable" != true ] || echo "admission: run still queued after ${window}s retry window" >&2
     rm -f -- "$receipt.tmp" "$receipt.err"
     exit 1
   fi
-  sleep 10
+  sleep "$pause"
 done
 rm -f -- "$receipt.err"
 mv -- "$receipt.tmp" "$receipt"
 echo "NMCP_E2E_BUDGET_RECEIPT=$receipt" >>"$GITHUB_ENV"
-echo "budget receipt acquired (required ${required}s)"
+echo "budget receipt acquired (required ${required}s, attempt $attempt)"
