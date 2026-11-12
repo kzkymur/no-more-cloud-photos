@@ -111,6 +111,12 @@ func certifySpec(profileID string, digests map[string]string, fixtures []prepare
 	return spec
 }
 
+// bundledProfilesActive records which of this stack's bundled profiles are
+// certified and active. Tests in one binary share one stack and database, and
+// certify is append-only (an identical second certification exits 4), so the
+// first test to reach a profile performs it and later tests reuse it.
+var bundledProfilesActive = map[string]bool{}
+
 // activateBundledProfiles certifies the bundled thumbnail/v1 and standard/v1
 // drafts on this stack's exact helpers through `nmcp-admin profile certify`
 // (real transforms, independent probes, one audited transaction), then
@@ -121,6 +127,9 @@ func (h *harness) activateBundledProfiles() {
 	digests := h.helperDigests()
 	h.record("helper_digests", digests)
 	for _, id := range []string{thumbnailProfileID, standardProfileID} {
+		if bundledProfilesActive[id] {
+			continue
+		}
 		stdout, stderr, err := h.runResult(string(certifySpec(id, digests, fixtures)), "admin", "--", "profile", "certify", "--file", "-", "--json")
 		var result struct {
 			Status             string `json:"status"`
@@ -137,6 +146,7 @@ func (h *harness) activateBundledProfiles() {
 			h.t.Fatalf("certify %s failed: err=%v result=%s stderr=%s", id, err, truncate([]byte(stdout)), lastLine(stderr))
 		}
 		h.admin("profile", "activate", "--id", id, "--json")
+		bundledProfilesActive[id] = true
 	}
 	var profiles struct {
 		Items []struct {
