@@ -161,7 +161,7 @@ func (s *Service) RestoreCutover(ctx context.Context, operationID string, c Rest
 	if os.Geteuid() != 0 || c.validate() != nil {
 		return op, ErrValidation
 	}
-	op, e := LoadRestoreOperation(c.LedgerRoot, operationID)
+	op, e := loadUsableRestoreOperation(c.LedgerRoot, operationID)
 	if e != nil {
 		return op, errCutover
 	}

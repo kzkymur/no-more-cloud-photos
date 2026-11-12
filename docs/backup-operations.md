@@ -301,6 +301,16 @@ it exits `4` and changes nothing. It then
 3. returns the source to normal in one audited transaction
    (`restore_abandon`), and exits `0` with the maintenance status.
 
+If the fresh check is not clean, abandon exits `4` **after** recording
+`abandoned` and keeps the source in its restore maintenance (reason and
+owner unchanged). The way out is the normal reconciliation path: run the
+capability `check`, then `repair --report ID` (entering maintenance while
+already in maintenance changes neither its reason nor its owner), and then
+rerun the same `restore --operation-id OP --abandon`, which resumes an
+interrupted abandon. Once `abandoned` is recorded, cutover and the
+post-restore `maintenance resume` refuse the operation permanently, whatever
+later phase files exist.
+
 It starts and stops no units (prepare stopped none) and never touches the
 candidate: drop the unused candidate database as the cluster administrator
 and keep the ledger and receipt files as the record. A new `restore` is

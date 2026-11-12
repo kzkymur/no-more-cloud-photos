@@ -790,7 +790,9 @@ func TestBackupPG17OperatorRestore(t *testing.T) {
 	if e != nil {
 		t.Fatal("source owner identity")
 	}
-	checkPool, e := openCapabilityPool(ctx, checkCredential, f.dsn("nmcp_check", "source"), &ownerIdentity)
+	// The fixture has no passfile for nmcp_check; the password goes inline.
+	checkDSN := "host=" + quoteConnValue(f.socket) + " port=6543 dbname=source user=nmcp_check sslmode=disable password=" + quoteConnValue(f.passwords["nmcp_check"])
+	checkPool, e := openCapabilityPool(ctx, checkCredential, checkDSN, &ownerIdentity)
 	if e != nil {
 		t.Fatalf("nmcp_check on the source: %v", e)
 	}
@@ -809,9 +811,30 @@ func TestBackupPG17OperatorRestore(t *testing.T) {
 	if latest, e := LoadRestoreOperation(settings.LedgerRoot, op.ID); e != nil || latest.Phase != "validated" {
 		t.Fatal("refused abandons changed the ledger")
 	}
+	// Review n-b: an unclean check refuses after recording abandoned and
+	// keeps the maintenance; once the finding is gone, rerunning abandon (an
+	// interrupted abandon) completes.
+	orphanID := newID()
+	orphan := filepath.Join(settings.StorageRoot, "originals", orphanID[:2], orphanID, "original.jpg")
+	if e := os.MkdirAll(filepath.Dir(orphan), 0o700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(orphan, []byte("unreferenced"), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := abandoner.RestoreAbandon(ctx, op.ID, abandonSettings); !errors.Is(e, ErrConflict) {
+		t.Fatalf("abandon with an unclean check: %v", e)
+	}
+	if latest, e := LoadRestoreOperation(settings.LedgerRoot, op.ID); e != nil || latest.Phase != "abandoned" ||
+		pg17Scalar(t, ctx, source, `SELECT mode||'/'||reason||'/'||owner FROM maintenance_state WHERE id=1`) != "maintenance/operator restore/"+op.ID {
+		t.Fatal("unclean abandon did not record abandoned while keeping the restore maintenance")
+	}
+	if e := os.Remove(orphan); e != nil {
+		t.Fatal(e)
+	}
 	state, e := abandoner.RestoreAbandon(ctx, op.ID, abandonSettings)
 	if e != nil || state.Mode != "normal" || len(state.SuccessfulCheck) == 0 {
-		t.Fatalf("abandon of a validated restore: %+v %v", state, e)
+		t.Fatalf("rerun of an interrupted abandon: %+v %v", state, e)
 	}
 	if latest, e := LoadRestoreOperation(settings.LedgerRoot, op.ID); e != nil || latest.Phase != "abandoned" {
 		t.Fatal("abandon was not recorded durably in the ledger")

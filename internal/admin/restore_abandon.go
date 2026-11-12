@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +47,29 @@ func restoreLedgerPhases(root, id string) ([]string, error) {
 	}
 	return phases, nil
 }
+
+// loadUsableRestoreOperation loads an operation for cutover or the
+// post-restore resume. An operation with ANY recorded `abandoned` phase is
+// refused, whatever its latest phase by UpdatedAt (review X2: a clock step
+// back must never revive an abandoned operation).
+func loadUsableRestoreOperation(root, id string) (RestoreOperation, error) {
+	op, err := LoadRestoreOperation(root, id)
+	if err != nil {
+		return op, err
+	}
+	phases, err := restoreLedgerPhases(root, id)
+	if err != nil {
+		return RestoreOperation{}, err
+	}
+	for _, phase := range phases {
+		if phase == "abandoned" {
+			return RestoreOperation{}, errRestoreAbandoned
+		}
+	}
+	return op, nil
+}
+
+var errRestoreAbandoned = errors.New("restore operation was abandoned")
 
 // restoreAbandonAuthorized decides from the ledger alone: never any cutover
 // phase, never an offline operation, and the latest phase is a prepare phase,

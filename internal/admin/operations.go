@@ -144,7 +144,7 @@ func (s *Service) MaintenanceResume(ctx context.Context, store *storage.Store) (
 		if owner == nil {
 			return nil, ErrConflict
 		}
-		op, err := LoadRestoreOperation(os.Getenv("NMCP_RESTORE_LEDGER_ROOT"), *owner)
+		op, err := loadUsableRestoreOperation(os.Getenv("NMCP_RESTORE_LEDGER_ROOT"), *owner)
 		if err != nil || op.Phase != "cutover_verified" {
 			return nil, ErrConflict
 		}

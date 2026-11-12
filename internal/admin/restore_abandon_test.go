@@ -130,3 +130,60 @@ func TestAdminIntegrationRestoreAbandonRefusesWithoutTouchingTheSource(t *testin
 		}
 	}
 }
+
+// TestRestoreAbandonedOperationNeverRevived pins review X2: once an
+// `abandoned` phase is recorded, cutover and the root post-restore resume
+// refuse the operation even when a later phase file carries a later
+// UpdatedAt (a clock step back), so "latest" is not abandoned.
+func TestRestoreAbandonedOperationNeverRevived(t *testing.T) {
+	ledger := privateTestDir(t)
+	op := restoreTestOperation()
+	base := time.Now()
+	for i, phase := range []string{"prepared", "abandoned", "validated"} {
+		op.Phase, op.UpdatedAt = phase, base.Add(time.Duration(i)*time.Second)
+		if err := SaveRestoreOperation(ledger, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if latest, err := LoadRestoreOperation(ledger, op.ID); err != nil || latest.Phase != "validated" {
+		t.Fatalf("fixture latest phase = %+v %v", latest, err)
+	}
+	if _, err := loadUsableRestoreOperation(ledger, op.ID); !errors.Is(err, errRestoreAbandoned) {
+		t.Fatalf("cutover/resume load of an abandoned operation: %v", err)
+	}
+	clean := restoreTestOperation()
+	clean.Phase = "validated"
+	if err := SaveRestoreOperation(ledger, clean); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadUsableRestoreOperation(ledger, clean.ID); err != nil {
+		t.Fatalf("operation without abandon refused: %v", err)
+	}
+}
+
+// TestAdminIntegrationRootResumeRefusesAbandonedOperation: the root
+// post-restore resume refuses an abandoned operation even when its latest
+// phase (by UpdatedAt) is cutover_verified.
+func TestAdminIntegrationRootResumeRefusesAbandonedOperation(t *testing.T) {
+	s := integrationService(t)
+	ctx := context.Background()
+	ledger := privateTestDir(t)
+	t.Setenv("NMCP_RESTORE_LEDGER_ROOT", ledger)
+	op := restoreTestOperation()
+	base := time.Now()
+	for i, phase := range []string{"validated", "abandoned", "cutover_verified"} {
+		op.Phase, op.UpdatedAt = phase, base.Add(time.Duration(i)*time.Second)
+		if err := SaveRestoreOperation(ledger, op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE maintenance_state SET mode='maintenance',reason='operator restore',owner=$1,entered_at=clock_timestamp() WHERE id=1`, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MaintenanceResume(ctx, nil); !errors.Is(err, ErrConflict) {
+		t.Fatalf("root resume of an abandoned operation: %v", err)
+	}
+	if state, err := s.MaintenanceStatus(ctx); err != nil || state.Mode != "maintenance" {
+		t.Fatalf("refused resume changed maintenance: %+v %v", state, err)
+	}
+}
