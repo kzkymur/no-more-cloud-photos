@@ -48,7 +48,7 @@ func (h *harness) assertReconciled(when string, allowed map[string]bool) {
 	h.t.Helper()
 	stdout, stderr, err := h.runResult("", "admin", "--", "check", "--scope", "all", "--json")
 	report := h.dbRead(`SELECT id::text || '|' || (SELECT count(*) FROM reconciliation_check_report_seals s WHERE s.report_id=r.id)::text
-		FROM reconciliation_check_reports r ORDER BY r.started_at DESC LIMIT 1`)
+		FROM reconciliation_check_reports r ORDER BY r.created_at DESC, r.id DESC LIMIT 1`)
 	id, sealed, _ := strings.Cut(report, "|")
 	kinds := h.dbRead(`SELECT COALESCE(string_agg(kind || ':' || actionability, ',' ORDER BY kind), '') FROM reconciliation_check_findings WHERE report_id='` + id + `'`)
 	h.record("check", map[string]any{"when": when, "exit_error": errText(err), "report_id": id, "findings": kinds, "result": json.RawMessage(nonEmptyJSON(stdout))})
