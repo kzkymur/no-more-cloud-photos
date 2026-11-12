@@ -141,13 +141,22 @@ pkg-config --modversion vips libheif libraw aom lcms2 libwebp
 # every pinned shared object must carry RUNPATH=$prefix/lib and resolve each
 # pinned SONAME from the prefix. Distro copies with the same SONAME are a
 # failure, not a fallback.
+# Each pinned library must resolve to exactly one regular (non-symlink)
+# versioned object; counting all matches would let SONAME symlinks mask a
+# missing library.
+pinned_objects=()
 shopt -s nullglob
-pinned_objects=("$prefix"/lib/lib{aom,lcms2,raw,raw_r,heif,webp,webpmux,webpdemux,sharpyuv,vips}.so.*.*.* \
-  "$prefix"/lib/lib{aom,lcms2,raw,raw_r,heif,webp,webpmux,webpdemux,sharpyuv,vips}.so.*.*)
+for library in aom lcms2 raw raw_r heif webp webpmux webpdemux sharpyuv vips; do
+  regular=()
+  for candidate in "$prefix"/lib/lib"$library".so.*; do
+    [[ -f "$candidate" && ! -L "$candidate" ]] && regular+=("$candidate")
+  done
+  [[ ${#regular[@]} -eq 1 ]] ||
+    { printf 'pinned library lib%s: want exactly one regular object, found %d\n' "$library" "${#regular[@]}" >&2; exit 1; }
+  pinned_objects+=("${regular[0]}")
+done
 shopt -u nullglob
-[[ ${#pinned_objects[@]} -ge 10 ]] || { printf 'pinned shared objects missing\n' >&2; exit 1; }
 for object in "${pinned_objects[@]}"; do
-  [[ -L "$object" ]] && continue
   runpath=$(readelf -d "$object" | sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p')
   # libtool may repeat the entry; every entry must be exactly the prefix.
   [[ -n "$runpath" && -z "$(tr ':' '\n' <<<"$runpath" | grep -vFx "$prefix/lib")" ]] ||
