@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -112,7 +113,8 @@ func releasePostMedia(t *testing.T, ctx context.Context, data []byte, name, key 
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusCreated || json.Unmarshal(body, &out) != nil || out.Job == nil {
-		t.Fatalf("upload %s: status=%d", name, resp.StatusCode)
+		// The API's error envelope carries only a code and message, never paths.
+		t.Fatalf("upload %s: status=%d body=%.512s", name, resp.StatusCode, body)
 	}
 	return out.Media.ID, out.Job.ID
 }
@@ -172,6 +174,16 @@ func TestReleaseGateResources(t *testing.T) {
 		_ = exec.Command("/usr/bin/umount", "/var/lib/nmcp/media").Run()
 	})
 	f.installLiveUnits(artifacts, prefix, video, icc)
+	// The API's upload metadata probe runs /usr/bin/ffprobe for video (the
+	// production host and the Compose image install Ubuntu's ffmpeg). The
+	// isolated guest omits that package to bound its bootstrap, so provide the
+	// pinned, closure-checked ffprobe at the fixed path; without it every video
+	// upload is 422 invalid_media.
+	if _, err := os.Lstat("/usr/bin/ffprobe"); errors.Is(err, os.ErrNotExist) {
+		f.run("/usr/bin/install", "-o", "root", "-g", "root", "-m", "0755", filepath.Join(prefix, "bin/ffprobe"), "/usr/bin/ffprobe")
+	} else if err != nil {
+		t.Fatal("inspect /usr/bin/ffprobe")
+	}
 
 	// A narrow standard-shaped profile for exactly the measured inputs,
 	// certified on this guest's exact helpers through the production command.
