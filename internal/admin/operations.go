@@ -69,7 +69,11 @@ func (s *Service) Operational(ctx context.Context, o options) (any, error) {
 }
 
 func (s *Service) Check(ctx context.Context, store *storage.Store, scope reconciliation.Scope) (reconciliation.Result, error) {
-	repository, err := reconciliation.NewPostgresRepository(s.Pool)
+	pool := s.Pool
+	if s.CheckPool != nil {
+		pool = s.CheckPool
+	}
+	repository, err := reconciliation.NewPostgresRepository(pool)
 	if err != nil {
 		return reconciliation.Result{}, err
 	}
@@ -186,7 +190,11 @@ func repairError(err error) error {
 }
 
 func (s *Service) Repair(ctx context.Context, store *storage.Store, report string, dry bool) (any, error) {
-	repository, err := reconciliation.NewRepairPostgresRepository(s.Pool)
+	pool := s.Pool
+	if s.RepairPool != nil {
+		pool = s.RepairPool
+	}
+	repository, err := reconciliation.NewRepairPostgresRepository(pool)
 	if err != nil {
 		return nil, err
 	}

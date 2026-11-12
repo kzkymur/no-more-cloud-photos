@@ -728,7 +728,11 @@ jobs:
           set -euo pipefail
           tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-closure.tar.gz" -C "$RUNNER_TEMP"
           test ! -e /opt/nmcp-native-ci && test ! -L /opt/nmcp-native-ci
-          sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-toolchain.tar.gz" -C /opt
+          # Root-owned like the production /opt/nmcp install: profile certify
+          # refuses helpers (and ancestors) owned by anyone but root or the
+          # invoking user, and root-run tar would keep the runner's numeric UID.
+          sudo tar --no-same-owner -xzf "$RUNNER_TEMP/backup-live-inputs/backup-native-toolchain.tar.gz" -C /opt
+          sudo chown root:root /opt/nmcp-native-ci
           test ! -e /opt/nmcp-pg17-ci
           sudo tar -xzf "$RUNNER_TEMP/backup-live-inputs/backup-pg17-closure.tar.gz" -C /opt
           test "$(cat "$RUNNER_TEMP/native-build-prefix.txt")" = "$RUNNER_TEMP"

@@ -351,12 +351,35 @@ The binary is `nmcp-admin` using Go `flag`. All commands accept `--json`; human-
 | `profile retire --id UUID [--json]` | Retire an active profile; historical targets remain valid. |
 | `regenerate --profile KEY (--media-id UUID OR --all) [--batch-size N] [--resume TOKEN] [--dry-run] [--yes] [--json]` | Create paged transform jobs pinned to the active profile version. `--all` requires `--yes` unless dry-run. Persisted batch state makes `--resume` safe and prevents duplicate target work. |
 | `jobs retry (--job-id UUID OR --status failed) [--type TYPE] [--additional-attempts N] [--batch-size N] [--resume TOKEN] [--dry-run] [--yes] [--json]` | Requeue the same failed job and only failed/pending targets; succeeded targets are immutable. `--additional-attempts` is a positive integer, defaults to 3, and atomically sets `max_attempts = max(max_attempts, attempts + N)` before requeue so an exhausted job is claimable without erasing its attempt history. Bulk retry requires confirmation. |
-| `check [--scope VALUE] [--json]` | `--scope` accepts `files`, `db`, or `all`. Read-only reconciliation classifies temporary, orphan, missing, checksum mismatch, and invariant violations. Never deletes. |
-| `repair --report UUID [--dry-run] --yes [--json]` | Apply an explicit saved check report under maintenance lock. Ambiguous/orphan files are quarantined only beneath canonical `${NMCP_STORAGE_ROOT}/.quarantine`, not immediately deleted. |
+| `check [--scope VALUE] [--json]` | `--scope` accepts `files`, `db`, or `all`. Read-only reconciliation classifies temporary, orphan, missing, checksum mismatch, and invariant violations. Never deletes. Runs the checker only as the dedicated `nmcp_check` login, whose libpq connection string is read from the file named by `NMCP_CHECK_DATABASE_URL_FILE` (see "Reconciliation capability credentials" below); `NMCP_DATABASE_URL` stays the administrative connection for schema readiness only. |
+| `repair --report UUID [--dry-run] --yes [--json]` | Apply an explicit saved check report under maintenance lock. Ambiguous/orphan files are quarantined only beneath canonical `${NMCP_STORAGE_ROOT}/.quarantine`, not immediately deleted. Runs the repair repository only as the dedicated `nmcp_repair` login from `NMCP_REPAIR_DATABASE_URL_FILE`; maintenance state, the advisory lock and audit stay on the administrative connection. |
 | `cleanup [--kind VALUE] [--dry-run] --yes [--json]` | `--kind` accepts `renditions`, `media`, `backups`, or `all`. Run due cleanup using the same locks/rechecks as automatic cleanup. |
 | `backup run [--json]` / `backup list [--json]` | Run one database backup or list persistent history. |
 | `restore --backup-id UUID --yes [--json]` | Enter maintenance, restore and validate into the configured database, run DB/file reconciliation, and remain in maintenance until `maintenance resume`. |
 | `maintenance status [--json]` / `maintenance resume --yes [--json]` | Inspect or explicitly leave maintenance after successful checks. |
+
+### Reconciliation capability credentials
+
+`check`, `maintenance resume` (which runs the checker before resuming) and
+`repair` never use the administrative credential for reconciliation. Each reads
+one libpq connection string from the file named by its variable,
+`NMCP_CHECK_DATABASE_URL_FILE` (check, maintenance resume) or
+`NMCP_REPAIR_DATABASE_URL_FILE` (repair); no other command reads them. The
+variable must hold an absolute, clean path to a regular file, opened without
+following a final symlink, owned by root or the invoking user, with no
+group/other permission bits, containing exactly one connection string of at
+most 4 KiB (one trailing newline allowed). Every pooled connection then proves,
+before any query, that `session_user` and `current_user` are exactly
+`nmcp_check` / `nmcp_repair`, that it is not a superuser, that its capability
+role (`nmcp_check_runtime` / `nmcp_repair_runtime`) is usable through
+inheritance, and that it is not a member of any other managed role (migrator,
+API, Worker, runtimes, the other capability, function owners, backup roles).
+A missing, unsafe or mismatching credential, including the migrator's, exits
+`2` before reconciliation starts; the path and contents are never printed. An
+unreachable database or failed authentication stays exit `1`. The roles,
+memberships and credential files are provisioned by the deployment
+([Ubuntu deployment](../ubuntu-deployment.md)). The restore cutover keeps
+running its target-side check through the restore operator connection.
 
 Mutating commands take a named PostgreSQL advisory lock appropriate to their operation. A conflicting operation fails rather than running concurrently. Every mutation writes an admin audit record containing command, actor/host, sanitized arguments, timestamps, result, and affected IDs. Batch order is stable by Media ID; checkpoint and active profile ID are persisted, so activation during a batch cannot change its pinned version.
 
