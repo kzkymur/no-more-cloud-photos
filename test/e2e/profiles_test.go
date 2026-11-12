@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
 )
 
 // Fixed production-shaped helper locations inside the core image. Their
@@ -192,4 +194,33 @@ func nonEmptyJSON(s string) string {
 		return strings.TrimSpace(s)
 	}
 	return "null"
+}
+
+// standardV2ProfileID is the scenario's second standard version.
+const standardV2ProfileID = "60000000-0000-4000-8000-000000000021"
+
+// activateStandardV2 creates standard/v2 with standard/v1's exact parameters,
+// activates it (version order and certification coverage are enforced by
+// nmcp-admin), and restarts the Worker so it claims the new version.
+func (h *harness) activateStandardV2() {
+	h.t.Helper()
+	if bundledProfilesActive[standardV2ProfileID] {
+		return
+	}
+	v1 := profile.StandardV1()
+	document, err := json.Marshal(map[string]any{
+		"id": standardV2ProfileID, "key": v1.Key, "version": v1.Version + 1, "input_mime_types": v1.InputMIMETypes,
+		"processor": v1.Processor, "parameters_schema_version": v1.ParametersSchemaVersion, "parameters": v1.Parameters,
+	})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if stdout, stderr, err := h.runResult(string(document), "admin", "--", "profile", "create", "--file", "/dev/stdin", "--json"); err != nil {
+		h.t.Fatalf("create standard/v2: err=%v result=%s stderr=%s", err, truncate([]byte(stdout)), lastLine(stderr))
+	}
+	if stdout, stderr, err := h.runResult("", "admin", "--", "profile", "activate", "--id", standardV2ProfileID, "--json"); err != nil {
+		h.t.Fatalf("activate standard/v2 on the existing certification registry: err=%v result=%s stderr=%s", err, truncate([]byte(stdout)), lastLine(stderr))
+	}
+	bundledProfilesActive[standardV2ProfileID] = true
+	h.run("", "control", "restart", "worker")
 }

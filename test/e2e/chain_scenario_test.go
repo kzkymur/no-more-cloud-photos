@@ -188,6 +188,11 @@ func TestReleaseGateChain(t *testing.T) {
 		h.waitJob(up.Job.ID, "succeeded", 10*time.Minute)
 		before, _ := h.getMedia(up.Media.ID)
 		old := currentByKey(before)["standard"]
+		// regenerate brings media up to a NEWLY active profile version: it selects
+		// only media with no target for the active version. Publish standard/v2
+		// with v1's exact recipes; the append-only certification registry already
+		// covers every requirement, so activation needs no new certification.
+		h.activateStandardV2()
 		var regen struct {
 			Status    string `json:"status"`
 			Total     int64  `json:"total"`
