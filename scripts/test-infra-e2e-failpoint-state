@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Offline test for scripts/infra-e2e-failpoint-state.sh (no Docker needed).
+set -euo pipefail
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+state_dir=$(mktemp -d)
+trap 'rm -rf -- "$state_dir"' EXIT
+# shellcheck source=scripts/infra-e2e-failpoint-state.sh
+. "$root/scripts/infra-e2e-failpoint-state.sh"
+expect() { [ "$(failpoint_get api)|$(failpoint_get worker)" = "$1" ] || { echo "FAIL $2: got $(failpoint_get api)|$(failpoint_get worker), want $1" >&2; exit 1; }; }
+expect "|" "initially none"
+failpoint_set api upload.after_db_commit; expect "upload.after_db_commit|" "api set"
+failpoint_set api ""; expect "|" "api cleared"
+# The regression: api none, worker set must not shift into api.
+failpoint_set worker rendition.before_file_publish; expect "|rendition.before_file_publish" "api none, worker set"
+failpoint_set api upload.before_original_publish@2; expect "upload.before_original_publish@2|rendition.before_file_publish" "both set"
+failpoint_set worker ""; expect "upload.before_original_publish@2|" "worker cleared keeps api"
+failpoint_clear_all; expect "|" "clear all"
+if failpoint_set files x 2>/dev/null; then echo "FAIL unknown service accepted" >&2; exit 1; fi
+echo "failpoint state: 8 cases PASS"

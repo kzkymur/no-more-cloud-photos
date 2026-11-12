@@ -83,6 +83,8 @@ api_port=${NMCP_E2E_API_PORT:-19080}
 files_port=${NMCP_E2E_FILES_PORT:-19443}
 state_dir=${NMCP_E2E_STATE_DIR:-${RUNNER_TEMP:-/tmp}/$project}
 media_mount="$state_dir/media"
+# shellcheck source=scripts/infra-e2e-failpoint-state.sh
+. "$root/scripts/infra-e2e-failpoint-state.sh"
 media_bytes=${NMCP_E2E_MEDIA_BYTES:-1073741824}
 mount_source="nmcp-e2e-$owner_short"
 services="api worker files postgres"
@@ -117,10 +119,9 @@ build_compose_cmd() {
   if [ "$failpoints" = 1 ]; then
     # Interpolation inputs for compose.failpoints.yaml persist across calls,
     # so recreating one service never silently changes the other.
-    local api_point="" worker_point=""
-    if [ -f "$state_dir/failpoints" ]; then
-      IFS=' ' read -r api_point worker_point <"$state_dir/failpoints" || true
-    fi
+    local api_point worker_point
+    api_point=$(failpoint_get api)
+    worker_point=$(failpoint_get worker)
     compose_cmd=(env "NMCP_E2E_FAILPOINT_API=$api_point" "NMCP_E2E_FAILPOINT_WORKER=$worker_point"
       docker compose --project-name "$project" --file "$base_file" --file "$overlay_file"
       --file "$failpoint_file")
@@ -138,13 +139,12 @@ compose() {
 set_failpoint() {
   [ "$failpoints" = 1 ] || { echo "infra-e2e: set-failpoint is refused outside the failpoint lane" >&2; exit 2; }
   [ $# -eq 2 ] || die "usage: control set-failpoint api|worker NAME[@N]|none"
-  local service=$1 point=$2 api_point="" worker_point="" id pid
+  local service=$1 point=$2 id pid
   case "$service" in api|worker) ;; *) die "set-failpoint is limited to api and worker" ;; esac
   if [ "$point" = none ]; then point=""
   elif ! printf '%s' "$point" | grep -Eqx '[a-z0-9_.-]{1,64}(@[0-9]{1,6})?'; then die "invalid failpoint: $point"; fi
-  if [ -f "$state_dir/failpoints" ]; then IFS=' ' read -r api_point worker_point <"$state_dir/failpoints" || true; fi
-  if [ "$service" = api ]; then api_point=$point; else worker_point=$point; fi
-  printf '%s %s\n' "$api_point" "$worker_point" >"$state_dir/failpoints"
+  failpoint_set "$service" "$point"
+  [ "$(failpoint_get "$service")" = "$point" ] || die "failpoint state for $service did not persist"
   compose up --detach --no-deps --no-build --force-recreate "$service"
   wait_ready "$service"
   id=$(container_id "$service")
@@ -670,7 +670,7 @@ lane() {
   timeout --kill-after=10s "${granted}s" "$script" up || die "stack bring-up failed or exceeded ${granted}s"
   granted=$codec_cap
   if budget_enabled; then granted=$(phase_budget "$codec_cap" $((scenario_min + collect_reserve)) 60); fi
-  rm -f -- "$state_dir/failpoints"
+  failpoint_clear_all
   release_binary_gate "$artifacts"
   local codec_status=0
   timeout --kill-after=10s "${granted}s" "$script" verify-codec 2>&1 | tee "$artifacts/codec-closure.log" || codec_status=$?
