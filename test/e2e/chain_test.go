@@ -299,13 +299,24 @@ func (h *harness) mediaTreeHas(url, wantSHA string) {
 	h.t.Fatalf("media volume lacks published key %s", key)
 }
 
+// mediaTreeLacks requires that no file of any kind (regular, symlink, other)
+// for the media remains: purge removes every original and rendition file
+// (state-and-storage contract). Empty per-media directories may remain; the
+// contract does not remove them and reconciliation accepts them, so they are
+// recorded as evidence rather than failed on.
 func (h *harness) mediaTreeLacks(fragment string) {
 	h.t.Helper()
-	for path := range h.mediaTree() {
-		if strings.Contains(path, fragment) {
-			h.t.Fatalf("media volume still contains %s", path)
+	var directories []string
+	for path, entry := range h.mediaTree() {
+		if !strings.Contains(path, fragment) {
+			continue
 		}
+		if entry.Type != "dir" {
+			h.t.Fatalf("media volume still contains %s %s", entry.Type, path)
+		}
+		directories = append(directories, path)
 	}
+	h.record("purge_leftover_directories", directories)
 }
 
 func (h *harness) original(mediaID string) original {
