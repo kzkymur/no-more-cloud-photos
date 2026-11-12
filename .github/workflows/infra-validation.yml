@@ -53,7 +53,7 @@ jobs:
           cache: true
       - name: Lint harness scripts
         run: |
-          shellcheck scripts/infra-e2e-env scripts/infra-e2e-budget-acquire infra/validation/e2e-selftest.sh
+          shellcheck scripts/infra-e2e-env scripts/infra-e2e-budget-acquire scripts/infra-e2e-resource-trace infra/validation/e2e-selftest.sh
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
       - name: Acquire identity-bound job budget receipt
         env:
@@ -156,7 +156,10 @@ jobs:
         run: |
           set -euo pipefail
           test -f scripts/prepare-e2e-fixtures || { echo "scripts/prepare-e2e-fixtures is required by ./test/e2e" >&2; exit 1; }
-          timeout --kill-after=10s 600s python3 -I scripts/prepare-e2e-fixtures --out test/e2e/testdata/prepared
+          # The runner died ~58s into this step in three runs; the trace streams
+          # memory/disk/top-RSS samples to this log so the cause survives.
+          NMCP_E2E_TRACE_INTERVAL=2 scripts/infra-e2e-resource-trace --reclaim-below-gib 20 -- \
+            timeout --kill-after=10s 600s python3 -I scripts/prepare-e2e-fixtures --out test/e2e/testdata/prepared
       - name: Save prepared E2E fixture cache
         if: steps.scenario.outputs.present == 'true' && steps.fixturecache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -246,7 +249,10 @@ jobs:
         run: |
           set -euo pipefail
           test -f scripts/prepare-e2e-fixtures || { echo "scripts/prepare-e2e-fixtures is required by ./test/e2e" >&2; exit 1; }
-          timeout --kill-after=10s 600s python3 -I scripts/prepare-e2e-fixtures --out test/e2e/testdata/prepared
+          # The runner died ~58s into this step in three runs; the trace streams
+          # memory/disk/top-RSS samples to this log so the cause survives.
+          NMCP_E2E_TRACE_INTERVAL=2 scripts/infra-e2e-resource-trace --reclaim-below-gib 20 -- \
+            timeout --kill-after=10s 600s python3 -I scripts/prepare-e2e-fixtures --out test/e2e/testdata/prepared
       - name: Save prepared E2E fixture cache
         if: steps.scenario.outputs.present == 'true' && steps.fixturecache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
