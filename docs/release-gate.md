@@ -70,7 +70,10 @@ Real-binary faults (release lane, `TestReleaseGateFaults`). After every case,
 residue the storage contract keeps: a recent attempt temporary file
 (`recent_or_live_temp`) or an unreferenced published final (`final_orphan`).
 Any reference-level finding (missing, size/sha mismatch, invalid current or
-provenance, unexpected path or type) fails the case. Each target must have
+provenance, unexpected path or type) fails the case. A check whose storage
+scan was stopped by its mutation fence (source error `storage_scan_unstable`,
+for example while a just-restarted Worker starts up) is the only unsealed
+report the gate retries, at most three times; every retry is recorded. Each target must have
 exactly one current rendition served byte-exactly:
 - Worker SIGKILL during an AV1 transform, reclaimed after the real 2-minute
   lease.

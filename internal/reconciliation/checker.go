@@ -139,6 +139,11 @@ func (checker *Checker) Check(ctx context.Context, scope Scope) (returned Result
 	}
 	if scanErr != nil {
 		failureCode = "storage_scan"
+		if errors.Is(scanErr, storage.ErrUnstableScan) {
+			// The scan's mutation fence saw a concurrent namespace change: a
+			// retryable observation conflict, not a storage fault.
+			failureCode = "storage_scan_unstable"
+		}
 		return result, scanErr
 	}
 	scanEnded, err := checker.repository.DatabaseNow(ctx)

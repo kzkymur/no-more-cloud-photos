@@ -48,10 +48,29 @@ var crashResidueKinds = map[string]bool{"recent_or_live_temp": true, "final_orph
 // assertConsistent) and none of them repairable-by-mistake references.
 func (h *harness) assertReconciled(when string, allowed map[string]bool) {
 	h.t.Helper()
-	stdout, stderr, err := h.runResult("", "admin", "--", "check", "--scope", "all", "--json")
-	report := h.dbRead(`SELECT id::text || '|' || (SELECT count(*) FROM reconciliation_check_report_seals s WHERE s.report_id=r.id)::text
-		FROM reconciliation_check_reports r ORDER BY r.created_at DESC, r.id DESC LIMIT 1`)
-	id, sealed, _ := strings.Cut(report, "|")
+	var stdout, stderr, id, sealed string
+	var err error
+	// The checker's storage scan fails closed (storage_scan_unstable) when the
+	// media tree changes while it runs, for example while a just-restarted
+	// Worker starts up. Only that recorded cause is retried, at most three
+	// times; any other unsealed report fails at once.
+	for attempt := 1; ; attempt++ {
+		stdout, stderr, err = h.runResult("", "admin", "--", "check", "--scope", "all", "--json")
+		report := h.dbRead(`SELECT id::text || '|' || (SELECT count(*) FROM reconciliation_check_report_seals s WHERE s.report_id=r.id)::text
+			|| '|' || COALESCE((SELECT error_code FROM reconciliation_check_source_results x WHERE x.report_id=r.id AND x.source='storage_scan'),'')
+			FROM reconciliation_check_reports r ORDER BY r.created_at DESC, r.id DESC LIMIT 1`)
+		parts := strings.SplitN(report, "|", 3)
+		if len(parts) != 3 {
+			h.t.Fatalf("unparseable latest report %q", report)
+		}
+		var scanError string
+		id, sealed, scanError = parts[0], parts[1], parts[2]
+		if sealed == "1" || scanError != "storage_scan_unstable" || attempt == 3 {
+			break
+		}
+		h.record("check_retry", map[string]any{"when": when, "attempt": attempt, "report_id": id, "storage_scan": scanError})
+		time.Sleep(5 * time.Second)
+	}
 	kinds := h.dbRead(`SELECT COALESCE(string_agg(kind || ':' || actionability, ',' ORDER BY kind), '') FROM reconciliation_check_findings WHERE report_id='` + id + `'`)
 	h.record("check", map[string]any{"when": when, "exit_error": errText(err), "report_id": id, "findings": kinds, "result": json.RawMessage(nonEmptyJSON(stdout))})
 	if sealed != "1" {
