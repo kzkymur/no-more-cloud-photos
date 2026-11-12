@@ -354,7 +354,7 @@ func prepareCertifyWorkspace(spec CertifySpec) (_ *certifyWorkspace, returnErr e
 		return nil, errors.New("private certification directory is not 0700")
 	}
 	for index, fixture := range spec.Fixtures {
-		copied, err := copyCertifyFixture(fixture, filepath.Join(dir, fmt.Sprintf("input-%02d", index)))
+		copied, err := copyCertifyFixture(fixture, fmt.Sprintf("fixture[%d]:%s", index, fixture.MIMEType), filepath.Join(dir, fmt.Sprintf("input-%02d", index)))
 		if err != nil {
 			return nil, err
 		}
@@ -366,20 +366,20 @@ func prepareCertifyWorkspace(spec CertifySpec) (_ *certifyWorkspace, returnErr e
 func verifyCertifyHelper(named certifyNamedRef, euid int) (certifyVerifiedFile, error) {
 	file, info, err := openNoFollow(named.ref.Path)
 	if err != nil {
-		return certifyVerifiedFile{}, errCertifyEvidence
+		return certifyVerifiedFile{}, certifyInputRejected(named.name, "open")
 	}
 	defer file.Close()
 	if !certifyOwnerAcceptable(info, euid, named.executable) {
-		return certifyVerifiedFile{}, errCertifyEvidence
+		return certifyVerifiedFile{}, certifyInputRejected(named.name, "owner_mode")
 	}
 	resolved, err := filepath.EvalSymlinks(filepath.Dir(named.ref.Path))
 	if err != nil {
-		return certifyVerifiedFile{}, errCertifyEvidence
+		return certifyVerifiedFile{}, certifyInputRejected(named.name, "ancestor")
 	}
 	for current := resolved; ; current = filepath.Dir(current) {
 		dirInfo, err := os.Lstat(current)
 		if err != nil || !certifyDirectoryAcceptable(dirInfo, euid) {
-			return certifyVerifiedFile{}, errCertifyEvidence
+			return certifyVerifiedFile{}, certifyInputRejected(named.name, "ancestor")
 		}
 		if current == "/" || current == filepath.Dir(current) {
 			break
@@ -390,7 +390,7 @@ func verifyCertifyHelper(named certifyNamedRef, euid int) (certifyVerifiedFile, 
 		return certifyVerifiedFile{}, err
 	}
 	if hex.EncodeToString(digest.Sum(nil)) != named.ref.SHA256 {
-		return certifyVerifiedFile{}, errCertifyEvidence
+		return certifyVerifiedFile{}, certifyInputRejected(named.name, "digest")
 	}
 	stat := info.Sys().(*syscall.Stat_t)
 	return certifyVerifiedFile{name: named.name, path: named.ref.Path, sha256: named.ref.SHA256, dev: uint64(stat.Dev), ino: stat.Ino}, nil
@@ -410,14 +410,14 @@ func (ws *certifyWorkspace) reverifyHelpers() error {
 	return nil
 }
 
-func copyCertifyFixture(fixture CertifyFixture, destination string) (string, error) {
+func copyCertifyFixture(fixture CertifyFixture, label, destination string) (string, error) {
 	source, info, err := openNoFollow(fixture.Path)
 	if err != nil {
-		return "", errCertifyEvidence
+		return "", certifyInputRejected(label, "open")
 	}
 	defer source.Close()
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > certifyMaxFixtureBytes {
-		return "", errCertifyEvidence
+		return "", certifyInputRejected(label, "type_size")
 	}
 	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -429,8 +429,11 @@ func copyCertifyFixture(fixture CertifyFixture, destination string) (string, err
 	if copyErr != nil || closeErr != nil {
 		return "", errors.Join(copyErr, closeErr)
 	}
-	if size <= 0 || size > certifyMaxFixtureBytes || hex.EncodeToString(digest.Sum(nil)) != fixture.SHA256 {
-		return "", errCertifyEvidence
+	if size <= 0 || size > certifyMaxFixtureBytes {
+		return "", certifyInputRejected(label, "type_size")
+	}
+	if hex.EncodeToString(digest.Sum(nil)) != fixture.SHA256 {
+		return "", certifyInputRejected(label, "digest")
 	}
 	if err := os.Chmod(destination, 0o400); err != nil {
 		return "", err
@@ -530,9 +533,22 @@ func checkFixtureMIMEs(definition profile.Definition, fixtures []certifyVerified
 type certifyFailureError struct {
 	reason      string
 	requirement certifyRequirement
+	input       string
+	check       string
 }
 
-const certifyReasonRequirementUncovered = "requirement_not_covered"
+const (
+	certifyReasonRequirementUncovered = "requirement_not_covered"
+	// certifyReasonInputEvidence names which spec input failed which fixed
+	// self-authentication check, so a refused run is diagnosable without
+	// paths: input is a helper name or "fixture[N]:<mime>", check is one of
+	// open, owner_mode, ancestor, digest, type_size.
+	certifyReasonInputEvidence = "input_evidence_rejected"
+)
+
+func certifyInputRejected(input, check string) error {
+	return &certifyFailureError{reason: certifyReasonInputEvidence, input: input, check: check}
+}
 
 func (e *certifyFailureError) Error() string { return "certification refused: " + e.reason }
 func (e *certifyFailureError) Unwrap() error { return ErrValidation }
@@ -542,6 +558,8 @@ type CertifyFailure struct {
 	ProfileID   string             `json:"profile_id"`
 	Reason      string             `json:"reason"`
 	Requirement certifyRequirement `json:"requirement"`
+	Input       string             `json:"input,omitempty"`
+	Check       string             `json:"check,omitempty"`
 }
 
 func certifyFailureResult(profileID string, err error) any {
@@ -549,7 +567,7 @@ func certifyFailureResult(profileID string, err error) any {
 	if !errors.As(err, &failure) {
 		return nil
 	}
-	return CertifyFailure{ProfileID: profileID, Reason: failure.reason, Requirement: failure.requirement}
+	return CertifyFailure{ProfileID: profileID, Reason: failure.reason, Requirement: failure.requirement, Input: failure.input, Check: failure.check}
 }
 
 type certifyRoute string
@@ -1166,6 +1184,9 @@ func (s *Service) prepareProfileCertification(ctx context.Context, spec CertifyS
 	}
 	requirements, _, err := certificationRequirements(loaded.definition)
 	if err != nil {
+		if errors.Is(err, ErrValidation) {
+			return loaded, nil, errors.Join(certifyInputRejected("profile", "requirements"), err)
+		}
 		return loaded, nil, err
 	}
 	// Read-only early refusal; the transaction repeats it under the lock.

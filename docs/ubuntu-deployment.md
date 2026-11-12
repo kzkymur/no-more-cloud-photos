@@ -353,7 +353,11 @@ installed helpers:
    profile operation holds the lock; `1` is an operational helper or database
    failure. Every non-zero exit inserts nothing. A refused requirement reports a
    fixed `reason` (`requirement_not_covered`) and the exact
-   requirement in the JSON result.
+   requirement in the JSON result. A refused helper, ICC, fixture, processor
+   setup or capability probe reports `reason` `input_evidence_rejected` with the
+   failing `input` (for example `still_helper` or `fixture[3]:image/heic`) and
+   `check` (`open`, `owner_mode`, `ancestor`, `digest`, `type_size`,
+   `processor_config`, `capabilities`, `requirements`), never a path.
 
 A certification proves that **this host's exact helper binaries** transformed
 **the given fixtures** with the profile's recipes and that independently probed

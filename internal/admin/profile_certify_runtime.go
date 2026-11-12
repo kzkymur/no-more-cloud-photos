@@ -39,22 +39,22 @@ func newProductionCertifyRuntime(ws *certifyWorkspace) (certifyRuntime, error) {
 	still, err := stillprocessor.New(stillprocessor.Config{Helper: ws.helperPath("still_helper"), Prlimit: prlimit,
 		SRGBICC: icc, SRGBICCSHA256: digest, Policy: stillprocessor.DefaultPolicy()})
 	if err != nil {
-		return nil, errors.Join(ErrValidation, err)
+		return nil, errors.Join(certifyInputRejected("still", "processor_config"), err)
 	}
 	animation, err := animationprocessor.New(animationprocessor.Config{Helper: ws.helperPath("animation_helper"), Prlimit: prlimit,
 		SRGBICC: icc, SRGBICCSHA256: digest, Policy: animationprocessor.DefaultPolicy()})
 	if err != nil {
-		return nil, errors.Join(ErrValidation, err)
+		return nil, errors.Join(certifyInputRejected("animation", "processor_config"), err)
 	}
 	video, err := videoprocessor.New(videoprocessor.Config{Helper: ws.helperPath("video_helper"), Prlimit: prlimit,
 		SRGBICC: icc, SRGBICCSHA256: digest, Policy: videoprocessor.DefaultPolicy()})
 	if err != nil {
-		return nil, errors.Join(ErrValidation, err)
+		return nil, errors.Join(certifyInputRejected("video", "processor_config"), err)
 	}
 	probe, err := processrunner.New(prlimit, processrunner.Limits{Timeout: certifyProbeTimeout, AddressSpaceBytes: certifyProbeAddressSpace,
 		FileSizeBytes: 1 << 20, OutputBytesPerStream: certifyProbeOutputBytes})
 	if err != nil {
-		return nil, errors.Join(ErrValidation, err)
+		return nil, errors.Join(certifyInputRejected("ffprobe", "processor_config"), err)
 	}
 	return &productionCertifyRuntime{still: still, animation: animation, video: video, probe: probe, ffprobe: ws.helperPath("ffprobe")}, nil
 }
@@ -78,18 +78,28 @@ func certifyProcessorError(err error) error {
 	return err
 }
 
+// certifyCapabilityError names the processor whose capability probe refused,
+// keeping operational failures (timeouts, resources) unchanged.
+func certifyCapabilityError(processor string, err error) error {
+	mapped := certifyProcessorError(err)
+	if errors.Is(mapped, ErrValidation) {
+		return errors.Join(certifyInputRejected(processor, "capabilities"), err)
+	}
+	return mapped
+}
+
 func (r *productionCertifyRuntime) Identity(ctx context.Context) (map[string]certifyProcessorIdentity, error) {
 	still, err := r.still.Capabilities(ctx)
 	if err != nil {
-		return nil, certifyProcessorError(err)
+		return nil, certifyCapabilityError("still", err)
 	}
 	animation, err := r.animation.Capabilities(ctx)
 	if err != nil {
-		return nil, certifyProcessorError(err)
+		return nil, certifyCapabilityError("animation", err)
 	}
 	video, err := r.video.Capabilities(ctx)
 	if err != nil {
-		return nil, certifyProcessorError(err)
+		return nil, certifyCapabilityError("video", err)
 	}
 	return map[string]certifyProcessorIdentity{
 		"still": {HelperVersion: still.HelperVersion, LibraryVersions: still.LibraryVersions,

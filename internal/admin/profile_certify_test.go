@@ -268,6 +268,22 @@ func TestCertifyWorkspaceRejectsTamperedEvidence(t *testing.T) {
 		t.Fatal("workspace not removed")
 	}
 
+	// Each refusal names the spec input and the fixed check, never a path.
+	wantRejection := map[string][2]string{
+		"helper sha mismatch":          {"still_helper", "digest"},
+		"helper content changed":       {"video_helper", "digest"},
+		"fixture sha mismatch":         {"fixture[0]:image/jpeg", "digest"},
+		"icc changed":                  {"srgb_icc", "digest"},
+		"helper symlink":               {"prlimit", "open"},
+		"fixture symlink":              {"fixture[0]:image/jpeg", "open"},
+		"helper group writable":        {"animation_helper", "owner_mode"},
+		"icc world writable":           {"srgb_icc", "owner_mode"},
+		"helper not executable":        {"ffprobe", "owner_mode"},
+		"helper in writable directory": {"ffprobe", "ancestor"},
+		"fixture is a directory":       {"fixture[0]:image/jpeg", "type_size"},
+		"fixture is a fifo":            {"fixture[0]:image/jpeg", "type_size"},
+		"fixture missing":              {"fixture[0]:image/jpeg", "open"},
+	}
 	cases := map[string]func(t *testing.T, spec *CertifySpec){
 		"helper sha mismatch": func(t *testing.T, spec *CertifySpec) {
 			spec.Helpers.StillHelper.SHA256 = certifyDigest([]byte("other"))
@@ -351,6 +367,14 @@ func TestCertifyWorkspaceRejectsTamperedEvidence(t *testing.T) {
 			ws, err := prepareCertifyWorkspace(spec)
 			if !errors.Is(err, ErrValidation) || ws != nil {
 				t.Fatalf("tampered evidence accepted: %v", err)
+			}
+			failure, ok := certifyFailureResult(spec.ProfileID, err).(CertifyFailure)
+			want := wantRejection[name]
+			if !ok || failure.Reason != certifyReasonInputEvidence || failure.Input != want[0] || failure.Check != want[1] {
+				t.Fatalf("rejection = %+v, want input %q check %q", failure, want[0], want[1])
+			}
+			if encoded, _ := json.Marshal(failure); bytes.Contains(encoded, []byte(filepath.Dir(env.spec.Helpers.StillHelper.Path))) {
+				t.Fatalf("rejection leaks a path: %s", encoded)
 			}
 		})
 	}
