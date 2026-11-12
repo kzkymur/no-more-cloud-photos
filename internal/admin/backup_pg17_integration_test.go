@@ -830,6 +830,85 @@ func TestBackupPG17OperatorRestore(t *testing.T) {
 		t.Fatal("full Restore did not keep source and candidate fenced")
 	}
 	t.Logf("actual Service.Restore validated: root peer operator, routine UID/HBA/TCP negatives, actual nmcp_api HTTP proof, all-owner equality; rpo_ms=%d rto_ms=%d", op.RPO.Milliseconds(), op.RTO.Milliseconds())
+
+	// Issue #58 drill: decide not to cut over. Abandon runs on the SOURCE's
+	// owner (migrator) connection with a real nmcp_check pool pinned to it.
+	var checkSecret [32]byte
+	if _, e := rand.Read(checkSecret[:]); e != nil {
+		t.Fatal(e)
+	}
+	f.passwords["nmcp_check"] = hex.EncodeToString(checkSecret[:])
+	f.sql(operator, "ALTER ROLE nmcp_check PASSWORD '"+f.passwords["nmcp_check"]+"'")
+	ownerIdentity, e := queryDatabaseIdentity(ctx, migrator)
+	if e != nil {
+		t.Fatal("source owner identity")
+	}
+	// The fixture has no passfile for nmcp_check; the password goes inline.
+	checkDSN := "host=" + quoteConnValue(f.socket) + " port=6543 dbname=source user=nmcp_check sslmode=disable password=" + quoteConnValue(f.passwords["nmcp_check"])
+	checkPool, e := openCapabilityPool(ctx, checkCredential, checkDSN, &ownerIdentity)
+	if e != nil {
+		t.Fatalf("nmcp_check on the source: %v", e)
+	}
+	defer checkPool.Close()
+	abandoner := New(migrator)
+	abandoner.CheckPool = checkPool
+	abandonSettings := RestoreSettings{LedgerRoot: settings.LedgerRoot, StorageRoot: settings.StorageRoot}
+	if _, e := abandoner.RestoreAbandon(ctx, newID(), abandonSettings); !errors.Is(e, ErrConflict) {
+		t.Fatalf("abandon of an unknown operation: %v", e)
+	}
+	onCandidate := New(restored)
+	onCandidate.CheckPool = checkPool
+	if _, e := onCandidate.RestoreAbandon(ctx, op.ID, abandonSettings); !errors.Is(e, ErrConflict) {
+		t.Fatalf("abandon against the candidate: %v", e)
+	}
+	if latest, e := LoadRestoreOperation(settings.LedgerRoot, op.ID); e != nil || latest.Phase != "validated" {
+		t.Fatal("refused abandons changed the ledger")
+	}
+	// Review n-b: an unclean check refuses after recording abandoned and
+	// keeps the maintenance; once the finding is gone, rerunning abandon (an
+	// interrupted abandon) completes.
+	orphanID := newID()
+	orphan := filepath.Join(settings.StorageRoot, "originals", orphanID[:2], orphanID, "original.jpg")
+	if e := os.MkdirAll(filepath.Dir(orphan), 0o700); e != nil {
+		t.Fatal(e)
+	}
+	if e := os.WriteFile(orphan, []byte("unreferenced"), 0o600); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := abandoner.RestoreAbandon(ctx, op.ID, abandonSettings); !errors.Is(e, ErrConflict) {
+		t.Fatalf("abandon with an unclean check: %v", e)
+	}
+	if latest, e := LoadRestoreOperation(settings.LedgerRoot, op.ID); e != nil || latest.Phase != "abandoned" ||
+		pg17Scalar(t, ctx, source, `SELECT mode||'/'||reason||'/'||owner FROM maintenance_state WHERE id=1`) != "maintenance/operator restore/"+op.ID {
+		t.Fatal("unclean abandon did not record abandoned while keeping the restore maintenance")
+	}
+	if e := os.Remove(orphan); e != nil {
+		t.Fatal(e)
+	}
+	state, e := abandoner.RestoreAbandon(ctx, op.ID, abandonSettings)
+	if e != nil || state.Mode != "normal" || len(state.SuccessfulCheck) == 0 {
+		t.Fatalf("rerun of an interrupted abandon: %+v %v", state, e)
+	}
+	if latest, e := LoadRestoreOperation(settings.LedgerRoot, op.ID); e != nil || latest.Phase != "abandoned" {
+		t.Fatal("abandon was not recorded durably in the ledger")
+	}
+	if pg17Scalar(t, ctx, source, `SELECT count(*)::text FROM admin_audit WHERE command='restore_abandon' AND outcome='succeeded' AND $1::uuid=ANY(affected_ids)`, op.ID) != "1" {
+		t.Fatal("abandon not audited")
+	}
+	// The source is writable again: a real backup (refused in maintenance)
+	// succeeds, and the candidate was left untouched in maintenance.
+	if again, e := New(control).Backup(ctx, b, false); e != nil || again.Status != "succeeded" {
+		t.Fatal("backup on the abandoned source failed")
+	}
+	if pg17Scalar(t, ctx, restored, `SELECT mode FROM maintenance_state WHERE id=1`) != "maintenance" {
+		t.Fatal("abandon touched the candidate")
+	}
+	// A new restore is admitted again (its maintenance entry used to be
+	// refused while the old operation owned the source).
+	if e := New(source).RestoreMaintenanceEnter(ctx, newID()); e != nil {
+		t.Fatalf("new restore maintenance entry after abandon: %v", e)
+	}
+	t.Log("actual #58 drill: restore validated -> abandon (ledger abandoned, fresh nmcp_check check, audited normal) -> real backup succeeds -> new restore admitted; unknown operation and candidate identity refused")
 }
 
 func pg17CommitUnknownAndRetention(t *testing.T, f *pg17Fixture, source *pgxpool.Pool, service *Service, b BackupSettings, oldID string) {

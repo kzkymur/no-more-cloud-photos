@@ -40,6 +40,7 @@ type options struct {
 	offlineSource    bool
 	offlineAuthority string
 	cutover          bool
+	abandon          bool
 	ifDue            bool
 	definitionData   []byte
 	certifySpec      CertifySpec
@@ -100,6 +101,7 @@ func parse(args []string) (options, error) {
 		flags.StringVar(&o.id, "backup-id", "", "backup UUIDv4")
 		flags.StringVar(&o.operationID, "operation-id", "", "validated restore operation UUIDv4")
 		flags.BoolVar(&o.cutover, "cutover", false, "explicit operator cutover; never resumes maintenance")
+		flags.BoolVar(&o.abandon, "abandon", false, "root decision not to cut over: return the source to normal (#58)")
 		flags.BoolVar(&o.offlineSource, "offline-source", false, "explicit root/operator recovery without source SQL")
 		flags.StringVar(&o.offlineAuthority, "offline-authority", "", "root-private external offline authorization file")
 	default:
@@ -152,8 +154,8 @@ func parse(args []string) (options, error) {
 		if o.offlineAuthority != "" && !o.offlineSource {
 			return o, ErrValidation
 		}
-		if o.cutover {
-			if !uuidPattern.MatchString(o.operationID) || o.id != "" {
+		if o.cutover || o.abandon {
+			if o.cutover && o.abandon || !uuidPattern.MatchString(o.operationID) || o.id != "" || o.abandon && (o.offlineSource || o.offlineAuthority != "") {
 				return o, ErrValidation
 			}
 		} else if !uuidPattern.MatchString(o.id) || o.operationID != "" {
@@ -247,6 +249,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if capabilityCommand(o.command) && !(o.command == "maintenance resume" && os.Geteuid() == 0) {
 		return runCapability(ctx, o, stdout, stderr)
 	}
+	if o.command == "restore" && o.abandon && euid() != 0 {
+		// Abandon (#58) is root-only, like cutover: it ends the operator's
+		// restore maintenance on the source. Refused before any connection.
+		return finish(stdout, stderr, o.json, nil, ErrValidation)
+	}
 	// Issue #57: for `backup run`, a failure before the history row exists
 	// (here, before Backup is even reached) notifies the configured hook
 	// exactly once with a closed cause; there is no backup ID yet.
@@ -287,11 +294,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return preRun(ErrConflict, backupCauseSchema)
 	}
 	service := New(pool)
-	if o.command == "maintenance resume" {
+	if o.command == "maintenance resume" || o.command == "restore" && o.abandon {
 		// The owner (root) resume is the post-restore operator procedure only;
 		// any other maintenance is resumed by the capability invocation.
 		state, stateErr := service.MaintenanceStatus(ctx)
-		if stateErr == nil && (state.Reason == nil || *state.Reason != "operator restore") {
+		if stateErr == nil && o.command == "maintenance resume" && (state.Reason == nil || *state.Reason != "operator restore") {
 			stateErr = ErrConflict
 		}
 		if stateErr != nil {
@@ -319,6 +326,13 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	switch o.command {
 	case "restore":
 		var settings RestoreSettings
+		if o.abandon {
+			settings, err = restoreAbandonSettings()
+			if err == nil {
+				result, err = service.RestoreAbandon(ctx, o.operationID, settings)
+			}
+			break
+		}
 		settings, err = restoreSettings()
 		if err == nil {
 			if o.cutover {
