@@ -26,31 +26,27 @@ type probeDocument struct {
 }
 
 type probeStream struct {
-	Index          int    `json:"index"`
-	CodecName      string `json:"codec_name"`
-	CodecType      string `json:"codec_type"`
-	Profile        string `json:"profile"`
-	Width          int    `json:"width"`
-	Height         int    `json:"height"`
-	PixFmt         string `json:"pix_fmt"`
-	BitsPerRaw     string `json:"bits_per_raw_sample"`
-	SampleAspect   string `json:"sample_aspect_ratio"`
-	TimeBase       string `json:"time_base"`
-	DurationTicks  int64  `json:"duration_ts"`
-	ColorPrimaries string `json:"color_primaries"`
-	ColorTransfer  string `json:"color_transfer"`
-	ColorSpace     string `json:"color_space"`
-	ColorRange     string `json:"color_range"`
-	Channels       int    `json:"channels"`
-	ChannelLayout  string `json:"channel_layout"`
-	SampleRate     string `json:"sample_rate"`
-	Disposition    struct {
-		Default         int `json:"default"`
-		AttachedPic     int `json:"attached_pic"`
-		TimedThumbnails int `json:"timed_thumbnails"`
-	} `json:"disposition"`
-	Tags         map[string]string        `json:"tags"`
-	SideDataList []map[string]interface{} `json:"side_data_list"`
+	Index          int                      `json:"index"`
+	CodecName      string                   `json:"codec_name"`
+	CodecType      string                   `json:"codec_type"`
+	Profile        string                   `json:"profile"`
+	Width          int                      `json:"width"`
+	Height         int                      `json:"height"`
+	PixFmt         string                   `json:"pix_fmt"`
+	BitsPerRaw     string                   `json:"bits_per_raw_sample"`
+	SampleAspect   string                   `json:"sample_aspect_ratio"`
+	TimeBase       string                   `json:"time_base"`
+	DurationTicks  int64                    `json:"duration_ts"`
+	ColorPrimaries string                   `json:"color_primaries"`
+	ColorTransfer  string                   `json:"color_transfer"`
+	ColorSpace     string                   `json:"color_space"`
+	ColorRange     string                   `json:"color_range"`
+	Channels       int                      `json:"channels"`
+	ChannelLayout  string                   `json:"channel_layout"`
+	SampleRate     string                   `json:"sample_rate"`
+	Disposition    streamDisposition        `json:"disposition"`
+	Tags           map[string]string        `json:"tags"`
+	SideDataList   []map[string]interface{} `json:"side_data_list"`
 }
 
 type mediaProbe struct {
@@ -378,18 +374,49 @@ func parseJSONInt(value json.RawMessage) (int64, error) {
 	return strconv.ParseInt(text, 10, 64)
 }
 
+// streamDisposition is the ffprobe disposition subset stream selection uses.
+type streamDisposition struct {
+	Default         int `json:"default"`
+	AttachedPic     int `json:"attached_pic"`
+	StillImage      int `json:"still_image"`
+	TimedThumbnails int `json:"timed_thumbnails"`
+}
+
+// selectStream picks the primary stream of a kind. For video it is exactly
+// the upload probe's rule (internal/metadata primaryVideoStream, review N7):
+// only non-auxiliary streams with positive dimensions, then default
+// disposition first, then the largest area, then the lowest index. Audio is
+// default first, then the lowest index.
 func selectStream(streams []probeStream, kind string) (int, bool) {
-	selected, found, selectedDefault := 0, false, false
+	var selected probeStream
+	found := false
 	for _, stream := range streams {
-		if stream.Index < 0 || stream.CodecType != kind || kind == "video" && auxiliaryVideoStream(stream) {
+		if stream.Index < 0 || stream.CodecType != kind {
 			continue
 		}
-		isDefault := stream.Disposition.Default != 0
-		if !found || isDefault && !selectedDefault || isDefault == selectedDefault && stream.Index < selected {
-			selected, found, selectedDefault = stream.Index, true, isDefault
+		if kind == "video" && (auxiliaryVideoStream(stream) || stream.Width <= 0 || stream.Height <= 0) {
+			continue
+		}
+		if !found || preferStream(stream, selected, kind == "video") {
+			selected, found = stream, true
 		}
 	}
-	return selected, found
+	return selected.Index, found
+}
+
+func preferStream(candidate, current probeStream, byArea bool) bool {
+	candidateDefault, currentDefault := candidate.Disposition.Default != 0, current.Disposition.Default != 0
+	if candidateDefault != currentDefault {
+		return candidateDefault
+	}
+	if byArea {
+		candidateArea := uint64(candidate.Width) * uint64(candidate.Height)
+		currentArea := uint64(current.Width) * uint64(current.Height)
+		if candidateArea != currentArea {
+			return candidateArea > currentArea
+		}
+	}
+	return candidate.Index < current.Index
 }
 
 func validVideoStream(streams []probeStream, index int) bool {
@@ -398,7 +425,7 @@ func validVideoStream(streams []probeStream, index int) bool {
 }
 
 func auxiliaryVideoStream(stream probeStream) bool {
-	return stream.Disposition.AttachedPic != 0 || stream.Disposition.TimedThumbnails != 0
+	return stream.Disposition.AttachedPic != 0 || stream.Disposition.StillImage != 0 || stream.Disposition.TimedThumbnails != 0
 }
 
 func streamByIndex(streams []probeStream, index int) (probeStream, bool) {

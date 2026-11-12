@@ -90,15 +90,37 @@ func TestParseLimitsExactPlusOneAndOverflow(t *testing.T) {
 	}
 }
 
-func TestPrimarySelectionDefaultThenIndexExcludesAttachedPicture(t *testing.T) {
-	streams := []probeStream{
-		{Index: 0, CodecType: "video", Disposition: disposition(1, 1)},
-		{Index: 4, CodecType: "video", Disposition: disposition(1, 0)},
-		{Index: 2, CodecType: "video", Disposition: disposition(1, 0)},
-		{Index: 1, CodecType: "video"},
+// TestPrimaryVideoSelectionMatchesUploadRule pins review N7: the helper picks
+// exactly the stream internal/metadata primaryVideoStream records at upload.
+func TestPrimaryVideoSelectionMatchesUploadRule(t *testing.T) {
+	video := func(index, width, height int, d streamDisposition) probeStream {
+		return probeStream{Index: index, CodecType: "video", Width: width, Height: height, Disposition: d}
 	}
-	if got, ok := selectStream(streams, "video"); !ok || got != 2 {
-		t.Fatalf("selected %d, %t", got, ok)
+	for _, test := range []struct {
+		name    string
+		streams []probeStream
+		want    int
+		ok      bool
+	}{
+		{"default before index", []probeStream{video(0, 1920, 1080, disposition(1, 1)), video(4, 640, 480, disposition(1, 0)),
+			video(2, 640, 480, disposition(1, 0)), video(1, 1920, 1080, disposition(0, 0))}, 2, true},
+		{"default beats a larger non-default", []probeStream{video(0, 3840, 2160, disposition(0, 0)), video(1, 640, 480, disposition(1, 0))}, 1, true},
+		{"larger area among equal defaults", []probeStream{video(0, 640, 480, disposition(0, 0)), video(1, 1920, 1080, disposition(0, 0))}, 1, true},
+		{"lowest index among equal area", []probeStream{video(3, 1280, 720, disposition(0, 0)), video(1, 1280, 720, disposition(0, 0))}, 1, true},
+		{"still_image is auxiliary", []probeStream{video(0, 4000, 3000, streamDisposition{Default: 1, StillImage: 1}), video(1, 640, 480, disposition(0, 0))}, 1, true},
+		{"timed thumbnails are auxiliary", []probeStream{video(0, 4000, 3000, streamDisposition{Default: 1, TimedThumbnails: 1}), video(2, 640, 480, disposition(0, 0))}, 2, true},
+		{"zero dimensions are skipped", []probeStream{video(0, 0, 0, disposition(1, 0)), video(1, 640, 480, disposition(0, 0))}, 1, true},
+		{"only auxiliary streams", []probeStream{video(0, 640, 480, disposition(1, 1))}, 0, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, ok := selectStream(test.streams, "video"); ok != test.ok || ok && got != test.want {
+				t.Fatalf("selected %d, %t; want %d, %t", got, ok, test.want, test.ok)
+			}
+		})
+	}
+	audio := []probeStream{{Index: 5, CodecType: "audio"}, {Index: 3, CodecType: "audio", Disposition: disposition(1, 0)}, {Index: 2, CodecType: "audio"}}
+	if got, ok := selectStream(audio, "audio"); !ok || got != 3 {
+		t.Fatalf("audio selected %d, %t; want default 3", got, ok)
 	}
 }
 
@@ -506,16 +528,8 @@ func probeJSON(codec, pixFmt string, width, height int, audio bool) []byte {
 	return encoded
 }
 
-func disposition(defaultValue, attached int) struct {
-	Default         int `json:"default"`
-	AttachedPic     int `json:"attached_pic"`
-	TimedThumbnails int `json:"timed_thumbnails"`
-} {
-	return struct {
-		Default         int `json:"default"`
-		AttachedPic     int `json:"attached_pic"`
-		TimedThumbnails int `json:"timed_thumbnails"`
-	}{defaultValue, attached, 0}
+func disposition(defaultValue, attached int) streamDisposition {
+	return streamDisposition{Default: defaultValue, AttachedPic: attached}
 }
 
 func intPointer(value int) *int { return &value }
