@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Offline test for scripts/infra-e2e-budget-acquire (no GitHub, no Docker).
+# A fake admission helper refuses with run_mismatch for the first N calls; a
+# fake `gh` reports the run status the case wants.
+set -euo pipefail
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+mkdir -p "$work/bin"
+cat >"$work/helper.py" <<'PY'
+import os, sys
+count_file = os.environ["FAKE_COUNT"]
+n = int(open(count_file).read()) + 1 if os.path.exists(count_file) else 1
+open(count_file, "w").write(str(n))
+if n <= int(os.environ.get("FAKE_MISMATCHES", "0")):
+    sys.stderr.write("admission_refused:" + os.environ.get("FAKE_CODE", "run_mismatch") + "\n")
+    sys.exit(3)
+print('{"receipt": "ok"}')
+PY
+cat >"$work/bin/gh" <<'SH'
+#!/bin/sh
+[ -n "${FAKE_GH_STATUS:-}" ] || { echo "gh: unavailable" >&2; exit 1; }
+printf 'status=%s head_sha=%s attempt=%s\n' "$FAKE_GH_STATUS" "${FAKE_GH_SHA:-$NMCP_E2E_BUDGET_RUN_SHA}" "$GITHUB_RUN_ATTEMPT"
+SH
+chmod +x "$work/bin/gh"
+export PATH="$work/bin:$PATH" NMCP_E2E_ADMISSION_HELPER="$work/helper.py"
+export GITHUB_REPOSITORY=o/r GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RUNNER_NAME=r GITHUB_TOKEN=t
+export NMCP_E2E_BUDGET_RUN_SHA=0123456789abcdef0123456789abcdef01234567 NMCP_E2E_BUDGET_JOB_NAME=j
+export NMCP_E2E_BUDGET_JOB_SECONDS=2700 NMCP_E2E_BUDGET_CLEANUP_SECONDS=300 NMCP_E2E_BUDGET_MARGIN_SECONDS=60
+# Deterministic: no real waiting (backoff 0) and a generous time window, so
+# retry counts are bounded only by NMCP_E2E_RETRY_MAX_ATTEMPTS; the time
+# window itself is tested with a 0 s window, which allows exactly one call
+# regardless of runner speed.
+export NMCP_E2E_RETRY_BACKOFF="0" NMCP_E2E_BUDGET_RETRY_SECONDS=600
+pass=0
+run_case() { # name expected_exit expected_calls [env...]
+  local name=$1 want=$2 calls=$3; shift 3
+  local case_dir="$work/$name" rc=0
+  mkdir -p "$case_dir"
+  env RUNNER_TEMP="$case_dir" GITHUB_ENV="$case_dir/env" FAKE_COUNT="$case_dir/count" "$@" \
+    "$root/scripts/infra-e2e-budget-acquire" 1500 >"$case_dir/out" 2>"$case_dir/err" || rc=$?
+  local got_calls; got_calls=$(cat "$case_dir/count" 2>/dev/null || echo 0)
+  if [ "$rc" != "$want" ] || [ "$got_calls" != "$calls" ]; then
+    echo "FAIL $name: exit $rc (want $want), helper calls $got_calls (want $calls)" >&2
+    sed 's/^/  /' "$case_dir/err" >&2; exit 1
+  fi
+  pass=$((pass + 1))
+}
+# Queued run that becomes visible within the window: acquired on the 4th call.
+run_case queued-then-ok 0 4 FAKE_MISMATCHES=3 FAKE_GH_STATUS=queued
+if [ ! -s "$work/queued-then-ok/.nmcp-e2e-budget.json" ] || ! grep -q NMCP_E2E_BUDGET_RECEIPT "$work/queued-then-ok/env"; then
+  echo "FAIL queued-then-ok: no receipt exported" >&2; exit 1
+fi
+grep -q 'admission diagnostics (attempt 3): status=queued' "$work/queued-then-ok/err" ||
+  { echo "FAIL: API status not printed on refusal" >&2; exit 1; }
+# Still queued when the time window ends: with a 0 s window and a 1 s backoff
+# the next retry never fits, so exactly one call, whatever the runner speed.
+run_case queued-window-exhausted 1 1 FAKE_MISMATCHES=99 FAKE_GH_STATUS=queued NMCP_E2E_BUDGET_RETRY_SECONDS=0 NMCP_E2E_RETRY_BACKOFF=1
+grep -q 'still queued after 0s' "$work/queued-window-exhausted/err" || { echo "FAIL: no window message" >&2; exit 1; }
+# Retries stop at the attempt cap (deterministic count).
+run_case queued-attempts-exhausted 1 3 FAKE_MISMATCHES=99 FAKE_GH_STATUS=queued NMCP_E2E_RETRY_MAX_ATTEMPTS=3
+grep -q 'retry attempts exhausted (3)' "$work/queued-attempts-exhausted/err" || { echo "FAIL: no attempts message" >&2; exit 1; }
+# The longer default window admits a lag well beyond the old 60 s, without waiting for it here:
+# the default is 180 s unless overridden.
+grep -q 'NMCP_E2E_BUDGET_RETRY_SECONDS:-180' "$root/scripts/infra-e2e-budget-acquire" || { echo "FAIL: default window is not 180s" >&2; exit 1; }
+# run_mismatch while the API already reports in_progress is a real mismatch: no retry.
+run_case mismatch-in-progress 1 1 FAKE_MISMATCHES=99 FAKE_GH_STATUS=in_progress
+# run_mismatch while queued for a DIFFERENT head is a real mismatch: no retry.
+run_case mismatch-other-head 1 1 FAKE_MISMATCHES=99 FAKE_GH_STATUS=queued FAKE_GH_SHA=ffffffffffffffffffffffffffffffffffffffff
+# Any other refusal fails immediately, even while queued.
+run_case other-refusal 1 1 FAKE_MISMATCHES=99 FAKE_CODE=job_mismatch FAKE_GH_STATUS=queued
+# API unavailable: retried (the helper itself still fails closed), then bounded.
+run_case api-unavailable 1 3 FAKE_MISMATCHES=99 NMCP_E2E_RETRY_MAX_ATTEMPTS=3
+# An existing receipt is never overwritten.
+mkdir -p "$work/existing"; : >"$work/existing/.nmcp-e2e-budget.json"
+run_case existing 1 0 FAKE_MISMATCHES=0
+echo "infra-e2e-budget-acquire: $pass cases PASS"

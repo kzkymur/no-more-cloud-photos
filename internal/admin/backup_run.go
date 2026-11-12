@@ -17,18 +17,21 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 	result = BackupRun{Outcome: "failed"}
 	// One pinned lock session plus an independent failure journal connection
 	// are mandatory. Reject a one-slot pool before any history or lock mutation.
+	// Every failure before the backup_runs row exists returns a
+	// backupPreRunError with a closed cause, which the CLI notifies exactly
+	// once (issue #57); conflicts and not-due are not failures.
 	if s.Pool == nil || s.Pool.Config().MaxConns < 2 {
-		return result, ErrValidation
+		return result, backupPreRun(backupCauseConfiguration, ErrValidation)
 	}
 	// This precise acquired session must still own the lock at the final commit.
 	conn, err := s.Pool.Acquire(ctx)
 	if err != nil {
-		return result, errBackup
+		return result, backupPreRun(backupCauseDBUnreachable, nil)
 	}
 	defer conn.Release()
 	var locked bool
 	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtextextended('backup',1818))`).Scan(&locked); err != nil {
-		return result, errBackup
+		return result, backupPreRun(backupCauseDBUnreachable, nil)
 	}
 	if !locked {
 		result.Outcome = "overlap_conflict"
@@ -52,32 +55,32 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 			result.Outcome = "overlap_conflict"
 			return result, ErrConflict
 		}
-		return result, errBackup
+		return result, backupPreRun(backupCauseArtifactStore, nil)
 	}
 	defer store.Close()
 	// A previous holder cannot still be running after we obtain the same lock.
 	abandoned, err := s.Pool.Query(ctx, `SELECT id::text FROM backup_runs WHERE status='running' OR (status='failed' AND (notification_status='pending' OR failure_audit_pending)) ORDER BY started_at`)
 	if err != nil {
-		return result, errBackup
+		return result, backupPreRun(backupCauseRecovery, nil)
 	}
 	ids := []string{}
 	for abandoned.Next() {
 		var id string
 		if abandoned.Scan(&id) != nil {
 			abandoned.Close()
-			return result, errBackup
+			return result, backupPreRun(backupCauseRecovery, nil)
 		}
 		ids = append(ids, id)
 	}
 	err = abandoned.Err()
 	abandoned.Close()
 	if err != nil {
-		return result, errBackup
+		return result, backupPreRun(backupCauseRecovery, nil)
 	}
 	for _, id := range ids {
 		var status string
 		if s.Pool.QueryRow(ctx, `SELECT status FROM backup_runs WHERE id=$1`, id).Scan(&status) != nil {
-			return result, errBackup
+			return result, backupPreRun(backupCauseRecovery, nil)
 		}
 		if status == "running" {
 			_ = s.backupFailure(id, "abandoned", b)
@@ -86,20 +89,29 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 		}
 		_ = s.retryBackupFailureAudit(ctx, id)
 		if s.Pool.QueryRow(ctx, `SELECT status FROM backup_runs WHERE id=$1`, id).Scan(&status) != nil || status == "running" {
-			return result, errBackup
+			return result, backupPreRun(backupCauseRecovery, nil)
 		}
 	}
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return result, errBackup
+		return result, backupPreRun(backupCauseDBUnreachable, nil)
 	}
 	defer rollback(tx)
 	if err = backupNormal(ctx, tx); err != nil {
-		return result, err
+		if errors.Is(err, ErrConflict) {
+			// Keyed on this maintenance's entry so it notifies once per entry.
+			pre := &backupPreRunError{cause: backupCauseMaintenance, err: err}
+			var entered *time.Time
+			if s.Pool.QueryRow(ctx, `SELECT entered_at FROM maintenance_state WHERE id=1`).Scan(&entered) == nil && entered != nil {
+				pre.key = entered.UTC().Format(time.RFC3339Nano)
+			}
+			return result, pre
+		}
+		return result, backupPreRun(backupCauseDBUnreachable, err)
 	}
 	cfg, cutoff, due, err := backupDue(ctx, tx, ifDue)
 	if err != nil {
-		return result, errBackup
+		return result, backupPreRun(backupCauseDBUnreachable, nil)
 	}
 	if !due {
 		result.Outcome = "not_due"
@@ -108,16 +120,24 @@ func (s *Service) Backup(ctx context.Context, b BackupSettings, ifDue bool) (res
 	result = BackupRun{ID: newID(), Status: "running", StartedAt: cutoff, Notification: "pending", Outcome: "started"}
 	configJSON, err := json.Marshal(cfg)
 	if err != nil {
-		return result, errBackup
+		return result, backupPreRun(backupCauseConfiguration, nil)
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO backup_runs(id,status,started_at,config_snapshot) VALUES($1,'running',$2,$3)`, result.ID, cutoff, configJSON)
 	if err != nil {
-		return result, errBackup
+		return result, backupPreRun(backupCauseHistory, nil)
 	}
 	phase := "running_commit"
 	defer func() {
 		if err != nil {
-			if s.backupFailure(result.ID, phase, b) == nil {
+			failErr := s.backupFailure(result.ID, phase, b)
+			if errors.Is(failErr, errBackupRunAbsent) {
+				// The running row never committed (lost INSERT commit): there is
+				// no history to journal, so this is a pre-history failure.
+				result = BackupRun{Outcome: "failed", Status: "failed"}
+				err = backupPreRun(backupCauseHistory, nil)
+				return
+			}
+			if failErr == nil {
 				// A commit acknowledgement was lost, but the committed success is real.
 				result.Status = "succeeded"
 				result.Outcome = "succeeded"
