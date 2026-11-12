@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 
 	"github.com/kzkymur/no-more-cloud-photos/internal/profile"
@@ -105,6 +106,18 @@ func TestAdminIntegrationProfileCertifyThenActivate(t *testing.T) {
 	}
 	if certifyAuditCount(t, s, "failed", definition.ID) != 1 {
 		t.Fatal("refused certification not audited")
+	}
+	// Review N6: the status check precedes any fixture copy. A non-draft
+	// profile is refused as a conflict even when the fixtures would fail
+	// their digest, proving no fixture was read.
+	tampered := certifyIntegrationSpec(t, definition.ID, map[string][]string{"image/jpeg": {"a"}, "image/png": {"b"}})
+	for _, fixture := range tampered.Fixtures {
+		if err := os.WriteFile(fixture.Path, []byte("not the declared fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.ProfileCertify(ctx, tampered); !errors.Is(err, ErrConflict) {
+		t.Fatalf("non-draft certify with tampered fixtures: %v (fixtures were read before the status check)", err)
 	}
 	if _, err := s.ProfileCertify(ctx, certifyIntegrationSpec(t, newID(), map[string][]string{"image/jpeg": {"a"}})); !errors.Is(err, ErrConflict) {
 		t.Fatalf("unknown profile: %v", err)

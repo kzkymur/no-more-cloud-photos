@@ -32,14 +32,16 @@ import (
 // one audited transaction whose final validator check must pass.
 
 const (
-	certifySpecMaxBytes     = 1 << 20
-	certifyMaxFixtures      = 64
-	certifyMaxFixtureBytes  = int64(2 << 30)
-	certifyReceiptSchema    = "nmcp-profile-certification-receipt/1"
-	certifyReceiptScope     = "proves only that this host's exact helper binaries and sRGB ICC transformed the listed fixtures with this recipe and the outputs passed an independent probe; it is not evidence for every possible input"
-	certifyStatusCertified  = "certified"
-	certifyAuditCommand     = "profile_certify"
-	certifyProfileLockClass = 1313686352
+	certifySpecMaxBytes    = 1 << 20
+	certifyMaxFixtures     = 64
+	certifyMaxFixtureBytes = int64(2 << 30)
+	// certifyMaxTotalFixtureBytes bounds all copies of one spec together.
+	certifyMaxTotalFixtureBytes = int64(4 << 30)
+	certifyReceiptSchema        = "nmcp-profile-certification-receipt/1"
+	certifyReceiptScope         = "proves only that this host's exact helper binaries and sRGB ICC transformed the listed fixtures with this recipe and the outputs passed an independent probe; it is not evidence for every possible input"
+	certifyStatusCertified      = "certified"
+	certifyAuditCommand         = "profile_certify"
+	certifyProfileLockClass     = 1313686352
 )
 
 var (
@@ -330,7 +332,22 @@ func (ws *certifyWorkspace) helperDigests() map[string]string {
 // prepareCertifyWorkspace verifies every trusted helper and copies every
 // fixture into a private 0700 directory, binding each copy to its declared
 // SHA-256. Any mismatch is tampered evidence and creates nothing durable.
-func prepareCertifyWorkspace(spec CertifySpec) (_ *certifyWorkspace, returnErr error) {
+func prepareCertifyWorkspace(spec CertifySpec) (*certifyWorkspace, error) {
+	ws, err := newCertifyWorkspace(spec)
+	if err != nil {
+		return nil, err
+	}
+	if err := ws.copyFixtures(spec); err != nil {
+		_ = ws.Close()
+		return nil, err
+	}
+	return ws, nil
+}
+
+// newCertifyWorkspace verifies the trusted helpers only. Fixture copies (up
+// to certifyMaxTotalFixtureBytes) wait until the cheap profile status and
+// duplicate checks have passed (review N6).
+func newCertifyWorkspace(spec CertifySpec) (*certifyWorkspace, error) {
 	ws := &certifyWorkspace{euid: os.Geteuid(), helpers: map[string]certifyVerifiedFile{}}
 	for _, named := range spec.helperRefs() {
 		verified, err := verifyCertifyHelper(named, ws.euid)
@@ -339,28 +356,33 @@ func prepareCertifyWorkspace(spec CertifySpec) (_ *certifyWorkspace, returnErr e
 		}
 		ws.helpers[named.name] = verified
 	}
+	return ws, nil
+}
+
+// copyFixtures copies every fixture into a fresh private 0700 directory,
+// refusing before and during the copy once the total exceeds
+// certifyMaxTotalFixtureBytes.
+func (ws *certifyWorkspace) copyFixtures(spec CertifySpec) error {
 	dir, err := os.MkdirTemp("", "nmcp-profile-certify-")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	ws.dir = dir
-	defer func() {
-		if returnErr != nil {
-			_ = ws.Close()
-		}
-	}()
 	info, err := os.Lstat(dir)
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
-		return nil, errors.New("private certification directory is not 0700")
+		return errors.New("private certification directory is not 0700")
 	}
+	remaining := certifyMaxTotalFixtureBytes
 	for index, fixture := range spec.Fixtures {
-		copied, err := copyCertifyFixture(fixture, fmt.Sprintf("fixture[%d]:%s", index, fixture.MIMEType), filepath.Join(dir, fmt.Sprintf("input-%02d", index)))
+		label := fmt.Sprintf("fixture[%d]:%s", index, fixture.MIMEType)
+		copied, size, err := copyCertifyFixture(fixture, label, filepath.Join(dir, fmt.Sprintf("input-%02d", index)), remaining)
 		if err != nil {
-			return nil, err
+			return err
 		}
+		remaining -= size
 		ws.fixtures = append(ws.fixtures, certifyVerifiedFixture{index: index, mimeType: fixture.MIMEType, sha256: fixture.SHA256, path: copied})
 	}
-	return ws, nil
+	return nil
 }
 
 func verifyCertifyHelper(named certifyNamedRef, euid int) (certifyVerifiedFile, error) {
@@ -410,35 +432,42 @@ func (ws *certifyWorkspace) reverifyHelpers() error {
 	return nil
 }
 
-func copyCertifyFixture(fixture CertifyFixture, label, destination string) (string, error) {
+func copyCertifyFixture(fixture CertifyFixture, label, destination string, budget int64) (string, int64, error) {
 	source, info, err := openNoFollow(fixture.Path)
 	if err != nil {
-		return "", certifyInputRejected(label, "open")
+		return "", 0, certifyInputRejected(label, "open")
 	}
 	defer source.Close()
 	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > certifyMaxFixtureBytes {
-		return "", certifyInputRejected(label, "type_size")
+		return "", 0, certifyInputRejected(label, "type_size")
 	}
+	if info.Size() > budget {
+		return "", 0, certifyInputRejected(label, "total_size")
+	}
+	limit := min(certifyMaxFixtureBytes, budget)
 	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	digest := sha256.New()
-	size, copyErr := io.Copy(io.MultiWriter(output, digest), io.LimitReader(source, certifyMaxFixtureBytes+1))
+	size, copyErr := io.Copy(io.MultiWriter(output, digest), io.LimitReader(source, limit+1))
 	closeErr := output.Close()
 	if copyErr != nil || closeErr != nil {
-		return "", errors.Join(copyErr, closeErr)
+		return "", 0, errors.Join(copyErr, closeErr)
 	}
 	if size <= 0 || size > certifyMaxFixtureBytes {
-		return "", certifyInputRejected(label, "type_size")
+		return "", 0, certifyInputRejected(label, "type_size")
+	}
+	if size > budget {
+		return "", 0, certifyInputRejected(label, "total_size")
 	}
 	if hex.EncodeToString(digest.Sum(nil)) != fixture.SHA256 {
-		return "", certifyInputRejected(label, "digest")
+		return "", 0, certifyInputRejected(label, "digest")
 	}
 	if err := os.Chmod(destination, 0o400); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return destination, nil
+	return destination, size, nil
 }
 
 // certifyRequirement is one exact row the activation validator needs.
@@ -1213,7 +1242,7 @@ func (s *Service) ProfileCertify(ctx context.Context, spec CertifySpec) (Certify
 }
 
 func (s *Service) prepareProfileCertification(ctx context.Context, spec CertifySpec) (certifyLoadedProfile, []certifyRow, error) {
-	ws, err := prepareCertifyWorkspace(spec)
+	ws, err := newCertifyWorkspace(spec)
 	if err != nil {
 		return certifyLoadedProfile{}, nil, err
 	}
@@ -1238,6 +1267,11 @@ func (s *Service) prepareProfileCertification(ctx context.Context, spec CertifyS
 	}
 	// Read-only early refusal; the transaction repeats it under the lock.
 	if err := certifyDuplicate(ctx, s.Pool, loaded.definition, requirements, loaded.identity); err != nil {
+		return loaded, nil, err
+	}
+	// Only now copy the fixtures (review N6): a non-draft or already
+	// certified profile never costs up to 64 x 2 GiB of copying.
+	if err := ws.copyFixtures(spec); err != nil {
 		return loaded, nil, err
 	}
 	newRuntime := s.newCertifyRuntime

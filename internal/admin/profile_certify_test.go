@@ -1026,3 +1026,26 @@ func TestCertifyRunAsDropsRootHelpers(t *testing.T) {
 		t.Fatalf("missing nmcp user did not refuse root certify: %+v %v", runAs, err)
 	}
 }
+
+// TestCertifyFixtureCopyHonorsTotalBudget pins review N6's total cap: a
+// fixture larger than the remaining budget is refused before any copy.
+func TestCertifyFixtureCopyHonorsTotalBudget(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "fixture")
+	if err := os.WriteFile(source, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("0123456789"))
+	fixture := CertifyFixture{Path: source, SHA256: hex.EncodeToString(digest[:]), MIMEType: "image/jpeg"}
+	destination := filepath.Join(dir, "copy")
+	if _, _, err := copyCertifyFixture(fixture, "fixture[0]:image/jpeg", destination, 9); err == nil ||
+		certifyFailureResult("p", err).(CertifyFailure).Check != "total_size" {
+		t.Fatalf("over-budget fixture: %v", err)
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("over-budget fixture was copied")
+	}
+	if _, size, err := copyCertifyFixture(fixture, "fixture[0]:image/jpeg", destination, 10); err != nil || size != 10 {
+		t.Fatalf("in-budget fixture: size=%d err=%v", size, err)
+	}
+}
