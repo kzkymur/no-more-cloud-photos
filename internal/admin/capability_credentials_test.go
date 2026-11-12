@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -242,10 +243,8 @@ func TestCapabilitySessionQueryOnPostgreSQL(t *testing.T) {
 // invocation: LoadCredential= delivers <name> in $CREDENTIALS_DIRECTORY and
 // takes precedence over the *_FILE variable.
 func TestLoadCapabilityDSNFromSystemdCredentials(t *testing.T) {
-	previousOwner := credentialsDirectoryOwner
-	credentialsDirectoryOwner = uint32(os.Geteuid())
-	t.Cleanup(func() { credentialsDirectoryOwner = previousOwner })
-	credentials := t.TempDir()
+	newCredentials := testCredentialsDirectories(t)
+	credentials := newCredentials()
 	write := func(mode os.FileMode) {
 		t.Helper()
 		path := filepath.Join(credentials, checkCredential.name)
@@ -354,10 +353,8 @@ func TestCapabilityCommandsNeverAcceptTheOwnerCredential(t *testing.T) {
 }
 
 func TestLoadOwnerDSNSources(t *testing.T) {
-	previousOwner := credentialsDirectoryOwner
-	credentialsDirectoryOwner = uint32(os.Geteuid())
-	t.Cleanup(func() { credentialsDirectoryOwner = previousOwner })
-	credentials := t.TempDir()
+	newCredentials := testCredentialsDirectories(t)
+	credentials := newCredentials()
 	if err := os.WriteFile(filepath.Join(credentials, ownerCredentialName), []byte("postgres://from-credential\n"), 0o400); err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +370,7 @@ func TestLoadOwnerDSNSources(t *testing.T) {
 		"credential wins":                   {map[string]string{"CREDENTIALS_DIRECTORY": credentials, ownerDSNFileEnv: file, ownerDSNEnv: "postgres://env"}, "postgres://from-credential", true},
 		"file without credentials dir":      {map[string]string{ownerDSNFileEnv: file, ownerDSNEnv: "postgres://env"}, "postgres://from-file", true},
 		"legacy env":                        {map[string]string{ownerDSNEnv: "service=nmcp_backup_control"}, "service=nmcp_backup_control", true},
-		"file ignored with credentials dir": {map[string]string{"CREDENTIALS_DIRECTORY": t.TempDir(), ownerDSNFileEnv: file, ownerDSNEnv: "postgres://env"}, "postgres://env", true},
+		"file ignored with credentials dir": {map[string]string{"CREDENTIALS_DIRECTORY": newCredentials(), ownerDSNFileEnv: file, ownerDSNEnv: "postgres://env"}, "postgres://env", true},
 		"group readable file":               {map[string]string{ownerDSNFileEnv: writeCapabilityFile(t, "postgres://x", 0o640)}, "", false},
 		"relative file":                     {map[string]string{ownerDSNFileEnv: "admin.dsn"}, "", false},
 	} {
@@ -383,5 +380,43 @@ func TestLoadOwnerDSNSources(t *testing.T) {
 				t.Fatalf("loadOwnerDSN = %q, %v; want %q ok=%t", got, err, test.want, test.ok)
 			}
 		})
+	}
+}
+
+// testCredentialsDirectories stands in for systemd's /run/credentials: it
+// points the parent and owner rules at a private temporary tree and returns
+// a maker of per-unit directories below it.
+func testCredentialsDirectories(t *testing.T) func() string {
+	t.Helper()
+	previousOwner, previousParent := credentialsDirectoryOwner, credentialsDirectoryParent
+	parent := t.TempDir()
+	credentialsDirectoryOwner, credentialsDirectoryParent = uint32(os.Geteuid()), parent
+	t.Cleanup(func() { credentialsDirectoryOwner, credentialsDirectoryParent = previousOwner, previousParent })
+	count := 0
+	return func() string {
+		count++
+		dir := filepath.Join(parent, fmt.Sprintf("unit-%d.service", count))
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+}
+
+// TestCredentialsDirectoryMustBeSystemdUnitDirectory pins review n4.
+func TestCredentialsDirectoryMustBeSystemdUnitDirectory(t *testing.T) {
+	newCredentials := testCredentialsDirectories(t)
+	unit := newCredentials()
+	if got, err := credentialsDirectory(func(string) string { return unit }); err != nil || got != unit {
+		t.Fatalf("unit directory refused: %q %v", got, err)
+	}
+	nested := filepath.Join(unit, "nested")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, dir := range map[string]string{"outside /run/credentials": t.TempDir(), "nested below a unit": nested, "the parent itself": credentialsDirectoryParent} {
+		if _, err := credentialsDirectory(func(string) string { return dir }); !errors.Is(err, ErrValidation) {
+			t.Fatalf("%s accepted: %v", name, err)
+		}
 	}
 }

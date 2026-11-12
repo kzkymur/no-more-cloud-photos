@@ -703,18 +703,29 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 		stale.Close()
 		t.Fatal("nmcp_check reached the fenced source after cutover")
 	}
-	checkPool, e := openCapabilityPool(ctx, checkCredential, f.dsnLive("nmcp_check", op.Candidate.DatabaseName), &identity)
-	if e != nil {
-		t.Fatalf("nmcp_check cannot reach the cutover candidate: %v", e)
+	// Review n3: resume through the shipped CLI, exactly the documented root
+	// post-restore invocation: a transient root unit whose only database
+	// credentials are admin.dsn (candidate migrator) and check.dsn
+	// (nmcp_check on the candidate), with the external ledger root.
+	f.write("/etc/nmcp/credentials/live-resume-admin.dsn", f.dsnLive("nmcp_migrator", op.Candidate.DatabaseName)+"\n", 0600)
+	f.write("/etc/nmcp/credentials/live-resume-check.dsn", f.dsnLive("nmcp_check", op.Candidate.DatabaseName)+"\n", 0600)
+	f.write("/etc/nmcp/live-resume.env", "NMCP_STORAGE_ROOT="+settings.StorageRoot+"\nNMCP_RESTORE_LEDGER_ROOT="+settings.LedgerRoot+
+		"\nNMCP_FILE_BASE_URL="+settings.FileBaseURL+"\nNMCP_LOG_LEVEL=info\nNMCP_SHUTDOWN_TIMEOUT=30s\n", 0644)
+	resume := exec.CommandContext(ctx, "/usr/bin/systemd-run", "--quiet", "--pipe", "--wait", "--collect",
+		"-p", "User=root", "-p", "EnvironmentFile=/etc/nmcp/live-resume.env",
+		"-p", "LoadCredential=admin.dsn:/etc/nmcp/credentials/live-resume-admin.dsn",
+		"-p", "LoadCredential=check.dsn:/etc/nmcp/credentials/live-resume-check.dsn",
+		"/opt/nmcp/current/bin/nmcp-admin", "maintenance", "resume", "--yes", "--json")
+	resume.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C"}
+	var resumeOut, resumeErr bytes.Buffer
+	resume.Stdout, resume.Stderr = &resumeOut, &resumeErr
+	if e := resume.Run(); e != nil {
+		t.Fatalf("operator CLI post-restore maintenance resume failed: %v stdout=%.512s stderr=%.512s", e, resumeOut.String(), resumeErr.String())
 	}
-	resumer := New(candidate)
-	resumer.CheckPool = checkPool
-	_, resumeErr := resumer.MaintenanceResume(ctx, store)
-	// Close at once, like the one-shot CLI exiting: a later cutover requires
-	// zero live nmcp_check sessions and would otherwise refuse.
-	checkPool.Close()
-	if resumeErr != nil {
-		t.Fatal("separate actual candidate MaintenanceResume failed")
+	// The one-shot exited, so no nmcp_check session outlives it (a later
+	// cutover requires zero), and its fresh check ran as nmcp_check.
+	if pg17Scalar(t, ctx, candidate, `SELECT count(*)::text FROM pg_stat_activity WHERE usename='nmcp_check'`) != "0" {
+		t.Fatal("resume left an nmcp_check session behind")
 	}
 	var checkedAs string
 	if candidate.QueryRow(ctx, `SELECT r.id::text FROM maintenance_state m JOIN reconciliation_check_reports r ON r.id::text=m.successful_check_report->>'ReportID' WHERE m.id=1`).Scan(&checkedAs) != nil || checkedAs == "" {

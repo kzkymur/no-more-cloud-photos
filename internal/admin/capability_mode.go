@@ -29,22 +29,27 @@ const (
 var euid = os.Geteuid
 
 // credentialsDirectoryOwner is the uid systemd's credential directory must
-// have (root); tests substitute their own uid.
-var credentialsDirectoryOwner uint32 = 0
+// have (root), and credentialsDirectoryParent the directory systemd creates it
+// in (/run/credentials/<unit>, review n4); tests substitute their own.
+var (
+	credentialsDirectoryOwner  uint32 = 0
+	credentialsDirectoryParent        = "/run/credentials"
+)
 
 func capabilityCommand(command string) bool {
 	return command == "check" || command == "repair" || command == "maintenance resume"
 }
 
-// credentialsDirectory returns $CREDENTIALS_DIRECTORY after proving it is an
-// absolute, root-owned directory not writable by group or others (systemd's
-// /run/credentials/<unit>), or "" when unset.
+// credentialsDirectory returns $CREDENTIALS_DIRECTORY after proving it is
+// exactly one level below /run/credentials (systemd's /run/credentials/<unit>)
+// and a root-owned directory not writable by group or others, or "" when
+// unset.
 func credentialsDirectory(getenv func(string) string) (string, error) {
 	directory := getenv("CREDENTIALS_DIRECTORY")
 	if directory == "" {
 		return "", nil
 	}
-	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory || filepath.Dir(directory) != credentialsDirectoryParent {
 		return "", errCapabilityCredential
 	}
 	info, err := os.Lstat(directory)

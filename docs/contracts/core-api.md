@@ -383,7 +383,8 @@ invocations):
 
 A capability login's libpq connection string comes from the systemd
 credential `check.dsn` / `repair.dsn` in `$CREDENTIALS_DIRECTORY` (which must
-be an absolute, root-owned directory without group/other write; the credential
+be systemd's `/run/credentials/<unit>`: exactly one level below
+`/run/credentials`, root-owned, without group/other write; the credential
 file may be root-owned 0440 as systemd delivers it). Only without
 `$CREDENTIALS_DIRECTORY` does the file named by `NMCP_CHECK_DATABASE_URL_FILE`
 / `NMCP_REPAIR_DATABASE_URL_FILE` apply, which must be an absolute, clean path
