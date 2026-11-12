@@ -425,8 +425,14 @@ installed helpers:
    upload metadata probe still uses the distribution `/usr/bin/ffprobe`; that
    version skew is a recorded known limit (release-gate deviation table).
    Running as root, certify starts every helper and probe as uid/gid `nmcp`
-   (no supplementary groups) under the same sandbox and `prlimit` envelope the
-   Worker uses, so certification never decodes untrusted fixtures as root.
+   (no supplementary groups) with the Worker's `prlimit` limits, so it never
+   decodes untrusted fixtures as root. It does not reproduce the Worker unit's
+   systemd sandbox (ProtectSystem, PrivateTmp, RestrictAddressFamilies,
+   `nmcp.slice`, …), but the helper processes run with `no_new_privs` set.
+   While a helper runs, its output file is group-writable by `nmcp`, so
+   another uid-`nmcp` process could alter it before certify probes and
+   digests it. This is a recorded known limit (release-gate deviation table).
+   Use only fixtures you trust.
 3. Run, as owner commands (see [Running nmcp-admin](#running-nmcp-admin)),
    with the database in normal mode. The spec is passed on stdin:
 

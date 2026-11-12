@@ -164,3 +164,16 @@ func TestRunnerRunAsDropsIdentity(t *testing.T) {
 		t.Fatalf("tool uid = %q, %v", output.Stdout, err)
 	}
 }
+
+// TestRunnerToolHasNoNewPrivs pins review K4: every tool process runs with
+// no_new_privs set by the supervisor.
+func TestRunnerToolHasNoNewPrivs(t *testing.T) {
+	runner, err := New("/usr/bin/prlimit", Limits{Timeout: 10 * time.Second, AddressSpaceBytes: 1 << 30, OutputBytesPerStream: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := runner.Run(context.Background(), Command{Executable: "/usr/bin/grep", Arguments: []string{"^NoNewPrivs:", "/proc/self/status"}})
+	if err != nil || strings.Join(strings.Fields(string(output.Stdout)), " ") != "NoNewPrivs: 1" {
+		t.Fatalf("tool status = %q, %v", output.Stdout, err)
+	}
+}
