@@ -59,13 +59,18 @@ it, the change is recorded here once, with its decision, code and evidence, so
   last.
 - Regenerate produces a new current rendition and URL. Cleanup of the
   superseded rendition at retention 0 removes the old rendition and file,
-  and never the current one.
+  and never the current one: the owner-mode `cleanup --kind renditions`
+  exits 0 with nothing pending once the Worker's sweep has removed it.
 
 ## L2: faults
 
 Real-binary faults (release lane, `TestReleaseGateFaults`). After every case,
-`nmcp-admin check --scope all` must seal with zero findings, and each target
-must have exactly one current rendition served byte-exactly:
+`nmcp-admin check --scope all` must seal, and every finding must be crash
+residue the storage contract keeps: a recent attempt temporary file
+(`recent_or_live_temp`) or an unreferenced published final (`final_orphan`).
+Any reference-level finding (missing, size/sha mismatch, invalid current or
+provenance, unexpected path or type) fails the case. Each target must have
+exactly one current rendition served byte-exactly:
 - Worker SIGKILL during an AV1 transform, reclaimed after the real 2-minute
   lease.
 - Worker SIGSTOP past lease expiry, then SIGCONT, with no double publish.
@@ -76,8 +81,13 @@ must have exactly one current rendition served byte-exactly:
 
 Deterministic crash points (failpoint lane): every named upload, rendition
 publish and purge point (listed in [development](development.md)) is fired
-by an instrumented API or Worker that SIGKILLs itself. Only the failpoint
-lane image contains these points; the release lane proves their absence.
+by an instrumented API or Worker that SIGKILLs itself. Each point's residue
+is diffed against the previous sealed report: a `before_*_publish` point may
+add only the interrupted attempt's temporary file (non-actionable); an
+`after_*_publish` point adds exactly one repairable `final_orphan` of that
+upload (matched by its SHA-256) or media; `after_db_commit` and every purge
+point add nothing. Only the failpoint lane image contains these points; the
+release lane proves their absence.
 The in-process crash-point suites in `internal/storage`, `internal/upload`
 and the purge/cleanup durability tests are supporting evidence only. They
 do not replace this lane.
