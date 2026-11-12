@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail unless every given release binary contains no failpoint code.
 
-Usage: check-release-no-failpoints [--go GO] [--source-root DIR] BINARY...
+Usage: check-release-no-failpoints [--go GO | --bytes-only] [--source-root DIR] BINARY...
 
 A binary built without -tags nmcp_failpoints inlines failpoint.Hit to nothing
 and the linker drops internal/failpoint entirely. This gate rejects a binary if
@@ -13,6 +13,11 @@ any of the following holds:
     also covers stripped release binaries;
   * `go tool nm` lists any internal/failpoint symbol. A stripped binary has no
     symbol table; that is reported and the pclntab byte scan stands in for it.
+
+--bytes-only skips `go tool nm` for hosts without a Go toolchain (the release
+installer on a production host). It keeps every byte check, including the
+pclntab package-path scan, which is the check that applies to the stripped
+(-s -w) release binaries anyway.
 
 Point names are read from internal/failpoint/failpoint_on.go and must cover
 exactly the Point constants of internal/failpoint/points.go.
@@ -92,8 +97,10 @@ def check(binary, names, go):
         raise GateError(f'cannot read {binary}: {error}') from error
     findings = [f'contains {marker.decode()!r}' for marker in FIXED_MARKERS if marker in data]
     findings += [f'contains point name {name!r}' for name in names if name.encode() in data]
-    symbols = symbol_findings(go, binary)
-    if symbols is None:
+    symbols = None if go is None else symbol_findings(go, binary)
+    if go is None:
+        note = 'bytes-only: strings, point names and pclntab package-path scan'
+    elif symbols is None:
         note = 'stripped: no symbol table, pclntab package-path scan applies'
     else:
         note = f'{len(symbols)} internal/failpoint symbols'
@@ -103,14 +110,17 @@ def check(binary, names, go):
 
 def main(argv):
     parser = argparse.ArgumentParser(description='Reject release binaries containing failpoint code.')
-    parser.add_argument('--go', help='go command used for `go tool nm` (default: $GO or go on PATH)')
+    tool = parser.add_mutually_exclusive_group()
+    tool.add_argument('--go', help='go command used for `go tool nm` (default: $GO or go on PATH)')
+    tool.add_argument('--bytes-only', action='store_true',
+                      help='skip `go tool nm` (no Go toolchain); byte and pclntab checks still apply')
     parser.add_argument('--source-root', default=str(Path(__file__).resolve().parent.parent),
                         help='repository root holding internal/failpoint (default: this checkout)')
     parser.add_argument('binaries', nargs='+')
     arguments = parser.parse_args(argv)
     try:
         names = point_names(arguments.source_root)
-        go = go_tool(arguments.go)
+        go = None if arguments.bytes_only else go_tool(arguments.go)
         failed = False
         for binary in arguments.binaries:
             findings, note = check(binary, names, go)

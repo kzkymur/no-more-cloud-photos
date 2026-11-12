@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Bounded, retrying host package install for CI provisioner steps.
+#
+# usage: scripts/infra-apt-install [--no-update] PACKAGE...
+#
+# `apt-get update` exits 0 even when every index fetch failed (for example
+# "Could not resolve 'archive.ubuntu.com'"), which then surfaces later as
+# "Unable to locate package". This helper makes update fail on any fetch error
+# (--error-on=any), treats update/install failures (DNS, connect, mirror,
+# dpkg lock) as retryable, and bounds everything:
+#   NMCP_APT_ATTEMPTS          default 3
+#   NMCP_APT_ATTEMPT_SECONDS   default 150 (per update+install attempt)
+#   NMCP_APT_DEADLINE_SECONDS  default 360 (whole call, including backoff)
+# apt itself also retries each fetch (Acquire::Retries) with per-connection
+# timeouts, and waits for a held dpkg lock only for a bounded time.
+set -euo pipefail
+
+update=1
+if [ "${1:-}" = --no-update ]; then update=0; shift; fi
+[ $# -ge 1 ] || { echo "usage: infra-apt-install [--no-update] PACKAGE..." >&2; exit 2; }
+attempts=${NMCP_APT_ATTEMPTS:-3}
+per_attempt=${NMCP_APT_ATTEMPT_SECONDS:-150}
+deadline=$((SECONDS + ${NMCP_APT_DEADLINE_SECONDS:-360}))
+apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+  -o DPkg::Lock::Timeout=60)
+
+attempt=1
+while :; do
+  remaining=$((deadline - SECONDS))
+  [ "$remaining" -gt 0 ] || { echo "infra-apt-install: deadline exhausted" >&2; exit 1; }
+  limit=$per_attempt; [ "$limit" -le "$remaining" ] || limit=$remaining
+  status=0
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  sudo env DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s "${limit}s" bash -c '
+    set -euo pipefail
+    update=$1; shift
+    nopts=$1; shift
+    opts=("${@:1:$nopts}"); shift "$nopts"
+    if [ "$update" = 1 ]; then apt-get "${opts[@]}" update --error-on=any; fi
+    apt-get "${opts[@]}" install --yes --no-install-recommends "$@"
+  ' _ "$update" "${#apt_opts[@]}" "${apt_opts[@]}" "$@" || status=$?
+  [ "$status" -ne 0 ] || { echo "infra-apt-install: installed on attempt $attempt: $*"; exit 0; }
+  echo "infra-apt-install: attempt $attempt/$attempts failed (exit $status)" >&2
+  [ "$attempt" -lt "$attempts" ] || exit "$status"
+  backoff=$((attempt * 10))
+  [ $((SECONDS + backoff)) -lt "$deadline" ] || { echo "infra-apt-install: no time left for a retry" >&2; exit "$status"; }
+  sleep "$backoff"
+  attempt=$((attempt + 1))
+  # A later attempt always refreshes the index (the failure may have been a
+  # stale or partial one).
+  update=1
+done

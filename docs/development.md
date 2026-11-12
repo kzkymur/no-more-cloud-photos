@@ -189,10 +189,13 @@ graceful shutdown. Restart the process without `NMCP_FAILPOINT` (or with a
 different point) to observe recovery. Untagged builds compile `failpoint.Hit`
 to an empty inlined function and the linker drops the package, so release
 binaries carry no point names, environment read or exit path.
-`scripts/check-release-no-failpoints api worker admin` gates release binaries
+`scripts/check-release-no-failpoints [--go GO | --bytes-only] [--source-root DIR] BINARY...`
+(for example `bin/core-api bin/core-worker bin/nmcp-admin`) gates release binaries
 (strings, point names, the package path in pclntab, which survives `-s -w`, and
 `go tool nm` symbols); `scripts/test-check-release-no-failpoints` proves it
-accepts untagged and rejects tagged `core-api` builds.
+accepts untagged and rejects tagged `core-api` builds. `--bytes-only` skips `go tool
+nm` for hosts without Go; `scripts/install-ubuntu-release` runs it on the
+shipped `bin/` in both `stage` and `activate`/`rollback`.
 
 | Point | Process | Exact boundary |
 | --- | --- | --- |

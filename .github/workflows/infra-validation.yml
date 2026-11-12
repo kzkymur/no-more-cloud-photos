@@ -120,8 +120,10 @@ jobs:
         id: scenario
         run: |
           if [ ! -d test/e2e ]; then
-            echo "::notice title=#21 scenario absent::./test/e2e does not exist yet; this job ran nothing and is NOT #21 acceptance."
+            # Reviewer N11b: an absent scenario must fail, never look green.
+            echo "::error title=#21 scenario absent::./test/e2e does not exist; this job cannot provide #21 acceptance."
             echo "present=false" >>"$GITHUB_OUTPUT"
+            exit 1
           else
             echo "present=true" >>"$GITHUB_OUTPUT"
           fi
@@ -213,8 +215,10 @@ jobs:
         id: scenario
         run: |
           if [ ! -d test/e2e ]; then
-            echo "::notice title=#21 scenario absent::./test/e2e does not exist yet; this job ran nothing and is NOT #21 failpoint acceptance."
+            # Reviewer N11b: an absent scenario must fail, never look green.
+            echo "::error title=#21 scenario absent::./test/e2e does not exist; this job cannot provide #21 failpoint acceptance."
             echo "present=false" >>"$GITHUB_OUTPUT"
+            exit 1
           else
             echo "present=true" >>"$GITHUB_OUTPUT"
           fi

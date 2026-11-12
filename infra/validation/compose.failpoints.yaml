@@ -15,6 +15,10 @@ services:
     build: *failpoint-build
   e2e-observer:
     build: *failpoint-build
+  admin-owner:
+    build: *failpoint-build
+  admin-capability:
+    build: *failpoint-build
   api:
     build: *failpoint-build
     environment:

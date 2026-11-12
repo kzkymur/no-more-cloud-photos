@@ -47,7 +47,14 @@ BEGIN
         SELECT 1 FROM pg_catalog.pg_roles
         WHERE rolname IN ('nmcp_check','nmcp_repair')
           AND (NOT rolcanlogin OR NOT rolinherit OR rolsuper OR rolcreatedb
-               OR rolcreaterole OR rolreplication OR rolbypassrls)
+               OR rolcreaterole OR rolreplication OR rolbypassrls
+               OR rolconnlimit <> -1 OR rolconfig IS NOT NULL)
+    ) OR EXISTS (
+        -- Per-database role settings (ALTER ROLE ... IN DATABASE ... SET) are
+        -- not visible in rolconfig; reject them in every database.
+        SELECT 1 FROM pg_catalog.pg_db_role_setting AS setting
+        JOIN pg_catalog.pg_roles AS r ON r.oid=setting.setrole
+        WHERE r.rolname IN ('nmcp_check','nmcp_repair')
     ) THEN
         RAISE EXCEPTION 'unsafe operational check/repair login attributes';
     END IF;

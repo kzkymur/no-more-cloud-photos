@@ -58,6 +58,16 @@ SQL
 nmcp_repair_runtime>nmcp_repair:falsetruefalse" ] || fail "unexpected check/repair edges: $edges"
 privs=$(printf "SELECT has_function_privilege('nmcp_check','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE'), has_function_privilege('nmcp_repair','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE'), has_function_privilege('nmcp_check','public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer)','EXECUTE'), has_function_privilege('nmcp_repair','public.nmcp_begin_check_report(nmcp_uuid_v4,text,smallint,timestamptz,timestamptz,timestamptz,timestamptz)','EXECUTE');\n" | pg -At)
 [ "$privs" = "t|t|f|f" ] || fail "check/repair effective EXECUTE is not exactly own-capability: $privs"
+admin_api=$(pg -At <<'SQL'
+SELECT has_function_privilege('nmcp_check','public.nmcp_admin_read_migration_history()','EXECUTE'),
+       has_function_privilege('nmcp_repair','public.nmcp_admin_read_migration_history()','EXECUTE'),
+       has_function_privilege('nmcp_repair','public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_check','public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_check','public.nmcp_admin_resume_maintenance(nmcp_uuid_v4,jsonb,nmcp_uuid_v4,text,text,timestamptz)','EXECUTE'),
+       has_function_privilege('nmcp_api','public.nmcp_admin_read_migration_history()','EXECUTE');
+SQL
+)
+[ "$admin_api" = "t|t|t|f|f|f" ] || fail "0025 admin API EXECUTE is not exactly as contracted: $admin_api"
 # Negatives: each mutation runs with a verifier in ONE transaction that is
 # always rolled back, and the verifier must reject it.
 negative() {
@@ -75,13 +85,23 @@ negative "check edge removed" "REVOKE nmcp_check_runtime FROM nmcp_check;" "$gra
 negative "nmcp_check CREATEROLE" "ALTER ROLE nmcp_check CREATEROLE;" "$graph"
 negative "check capability granted to nmcp_repair" "GRANT nmcp_check_runtime TO nmcp_repair;" "$graph"
 negative "migrator granted to nmcp_check" "GRANT nmcp_migrator TO nmcp_check;" "$graph"
+negative "nmcp_check connection limit" "ALTER ROLE nmcp_check CONNECTION LIMIT 5;" "$graph"
+negative "nmcp_repair per-database setting" "ALTER ROLE nmcp_repair IN DATABASE nmcp SET work_mem='64MB';" "$graph"
+negative "0025 enter-maintenance executable by the check capability" \
+  "GRANT EXECUTE ON FUNCTION public.nmcp_admin_repair_enter_maintenance(nmcp_uuid_v4,nmcp_uuid_v4,text,text,timestamptz) TO nmcp_check_runtime;" "$roles"
+negative "0025 migration-history reader executable by PUBLIC" \
+  "GRANT EXECUTE ON FUNCTION public.nmcp_admin_read_migration_history() TO PUBLIC;" "$roles"
+negative "check owner may update maintenance_state" \
+  "GRANT UPDATE ON public.maintenance_state TO nmcp_check_function_owner;" "$roles"
+negative "repair owner may write check-report evidence" \
+  "GRANT INSERT ON public.reconciliation_check_reports TO nmcp_repair_function_owner;" "$roles"
 negative "stray EXECUTE on a repair function for nmcp_check" \
   "GRANT EXECUTE ON FUNCTION public.nmcp_read_repairable_findings(nmcp_uuid_v4,bigint,integer) TO nmcp_check;" "$roles"
 [ "$(echo "SELECT count(*) FROM pg_auth_members a JOIN pg_roles m ON m.oid=a.member WHERE m.rolname IN ('nmcp_check','nmcp_repair');" | pg -At)" = 2 ] ||
   fail "role negatives leaked a membership change"
 # The provisioned credential file logs in as exactly its login, inheriting
 # only its capability.
-dsn=$(sudo cat "$NMCP_E2E_STATE_DIR/credentials/check.dsn") || fail "read check.dsn"
+dsn=$(sudo cat "$NMCP_E2E_STATE_DIR/credentials/capability/check.dsn") || fail "read check.dsn"
 who=$(docker container exec "$pg_id" psql "${dsn/@postgres:/@127.0.0.1:}" --no-psqlrc -XAt -c \
   "SELECT session_user, pg_has_role(session_user,'nmcp_check_runtime','USAGE'), pg_has_role(session_user,'nmcp_repair_runtime','MEMBER'), pg_has_role(session_user,'nmcp_migrator','MEMBER')") ||
   fail "check credential login"
@@ -119,11 +139,24 @@ bad=$(printf '%s\n' "$trust" | while read -r uid mode path; do
 done)
 [ -z "$bad" ] || fail "untrusted owner/mode in image: $bad"
 
-step "admin runs nmcp-admin as nmcp_migrator"
+step "admin owner mode: nmcp-admin as root with only the migrator DSN file"
 "$ctl" admin -- migrate status --json >"$NMCP_E2E_ARTIFACT_DIR/selftest-admin.json" ||
-  fail "nmcp-admin migrate status"
+  fail "nmcp-admin migrate status (owner mode)"
+status=0; "$ctl" admin --capability -- migrate status --json >/dev/null 2>&1 || status=$?
+[ "$status" = 2 ] || fail "admin --capability for an owner command returned $status, want 2"
+status=0; "$ctl" admin --owner -- check --scope all >/dev/null 2>&1 || status=$?
+[ "$status" = 2 ] || fail "admin --owner for a capability command returned $status, want 2"
 
-step "admin one-shot mounts: fixtures and media read-only, private /e2e/work outside media"
+oneshot() {
+  # Run a probe in an admin one-shot exactly as `admin --` would (same
+  # service, user, environment and mounts), but with a shell entrypoint.
+  local service=$1 entrypoint=$2; shift 2
+  docker compose --project-name "$NMCP_E2E_PROJECT" \
+    --file "$NMCP_E2E_ROOT/infra/validation/compose.yaml" --file "$NMCP_E2E_ROOT/infra/validation/compose.e2e.yaml" \
+    --profile e2e run --rm --no-deps -T --entrypoint "$entrypoint" "$service" "$@"
+}
+
+step "admin one-shots: identity, credentials, mounts, no migrator DSN in any environment"
 # The self-test owns its fixture dir (the workflow points NMCP_E2E_FIXTURES_DIR
 # at an empty runner-temp dir), so writing a marker never touches real
 # scenario fixtures such as test/e2e/testdata.
@@ -135,31 +168,47 @@ marker="selftest-$$"
 printf '%s' "$marker" >"$NMCP_E2E_FIXTURES_DIR/selftest.marker"
 chmod 0644 "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
 # shellcheck disable=SC2016 # expanded by the container shell
-mounts=$(docker compose --project-name "$NMCP_E2E_PROJECT" \
-  --file "$NMCP_E2E_ROOT/infra/validation/compose.yaml" --file "$NMCP_E2E_ROOT/infra/validation/compose.e2e.yaml" \
-  run --rm --no-deps -T --entrypoint sh migrate -eu -c '
+owner=$(oneshot admin-owner sh -eu -c '
+    id -u
+    if env | grep -q "^NMCP_DATABASE_URL="; then echo migrator-url-present; fi
+    ls /run/nmcp-credentials
+    stat -c "%a %u" /run/nmcp-credentials/admin.dsn
     cat /e2e/fixtures/selftest.marker; echo
     if touch /e2e/fixtures/x 2>/dev/null; then echo fixtures-writable; fi
     echo w >/e2e/work/probe && rm /e2e/work/probe && echo work-writable
-    stat -c "%a %u" /e2e/work
     [ "$(stat -c %d /e2e/work)" != "$(stat -c %d /e2e/fixtures)" ] && echo work-separate
-    [ "$NMCP_STORAGE_ROOT" = /var/lib/nmcp/media ] && echo storage-root
     [ -d /var/lib/nmcp/media/originals ] && echo media-visible
-    if touch /var/lib/nmcp/media/originals/.e2e-admin-probe 2>/dev/null; then echo media-writable; fi') || fail "admin mount probe"
+    if touch /var/lib/nmcp/media/originals/.e2e-admin-probe 2>/dev/null; then echo media-writable; fi') ||
+  fail "owner one-shot probe"
 rm -f "$NMCP_E2E_FIXTURES_DIR/selftest.marker"
-# admin -- uses the same `compose run --no-deps -T migrate` invocation; prove
-# that stdin reaches the one-shot process (certify reads its spec from -).
-echoed=$(printf 'spec-%s' "$marker" | docker compose --project-name "$NMCP_E2E_PROJECT" \
-  --file "$NMCP_E2E_ROOT/infra/validation/compose.yaml" --file "$NMCP_E2E_ROOT/infra/validation/compose.e2e.yaml" \
-  run --rm --no-deps -T --entrypoint /usr/bin/timeout migrate 30s cat) || fail "stdin probe"
-[ "$echoed" = "spec-$marker" ] || fail "stdin not forwarded to the admin one-shot: $echoed"
-expected="$marker
+expected="0
+admin.dsn
+600 0
+$marker
 work-writable
-700 10001
 work-separate
-storage-root
 media-visible"
-[ "$mounts" = "$expected" ] || fail "admin mounts: $mounts"
+[ "$owner" = "$expected" ] || fail "owner one-shot: $owner"
+# shellcheck disable=SC2016 # expanded by the container shell
+capability=$(oneshot admin-capability sh -eu -c '
+    id -u
+    if env | grep -q "^NMCP_DATABASE_URL="; then echo migrator-url-present; fi
+    if env | grep -q "^NMCP_ADMIN_DATABASE_URL_FILE="; then echo admin-file-present; fi
+    ls /run/nmcp-credentials
+    stat -c "%a %u" /run/nmcp-credentials/check.dsn /run/nmcp-credentials/repair.dsn
+    if [ -e /e2e/fixtures ]; then echo fixtures-mounted; fi
+    touch /var/lib/nmcp/media/originals/.e2e-admin-probe && rm /var/lib/nmcp/media/originals/.e2e-admin-probe && echo media-writable') ||
+  fail "capability one-shot probe"
+expected="10001
+check.dsn
+repair.dsn
+600 10001
+600 10001
+media-writable"
+[ "$capability" = "$expected" ] || fail "capability one-shot: $capability"
+# Owner commands such as `profile certify --file -` read their spec on stdin.
+echoed=$(printf 'spec-%s' "$marker" | oneshot admin-owner /usr/bin/timeout 30s cat) || fail "stdin probe"
+[ "$echoed" = "spec-$marker" ] || fail "stdin not forwarded to the admin one-shot: $echoed"
 
 step "release lane: set-failpoint is refused and the lane is reported"
 if [ "${NMCP_E2E_LANE:-}" != release ] || [ "${NMCP_E2E_FAILPOINTS:-}" != 0 ]; then
