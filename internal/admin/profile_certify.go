@@ -1096,6 +1096,9 @@ func (s *Service) ProfileCertify(ctx context.Context, spec CertifySpec) (Certify
 		// Failures before the mutation transaction still leave a sanitized audit.
 		if failure, ok := certifyFailureResult(spec.ProfileID, err).(CertifyFailure); ok {
 			args["failure_reason"] = failure.Reason
+			if failure.Input != "" {
+				args["failure_input"], args["failure_check"] = failure.Input, failure.Check
+			}
 		}
 		if s.Pool != nil {
 			_ = s.recordAudit(ctx, certifyAuditCommand, args, []string{spec.ProfileID}, "failed")
