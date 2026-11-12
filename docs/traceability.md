@@ -4,6 +4,8 @@ This matrix covers the published Core architecture and Worker design requirement
 
 Contract links: [HTTP API and CLI](contracts/core-api.md), [state, storage, workers, and operations](contracts/state-and-storage.md).
 
+Behaviour changed against the immutable design snapshot by #21 decisions is listed once in [release gate: deviations from the design snapshot](release-gate.md#deviations-from-the-design-snapshot).
+
 ## Architecture and API
 
 | ID | Published requirement | Contract | Issue(s) | Required tests/evidence |
