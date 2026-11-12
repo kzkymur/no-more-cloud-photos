@@ -1049,3 +1049,27 @@ func TestCertifyFixtureCopyHonorsTotalBudget(t *testing.T) {
 		t.Fatalf("in-budget fixture: size=%d err=%v", size, err)
 	}
 }
+
+// TestCertifyWorkspaceSharesCopiesWithTheDroppedGroup pins the D2 file
+// contract: helpers dropped to nmcp reopen /proc/self/fd/N, so each fixture
+// copy is root-owned 0440 with the helper's group, never owner-writable by it.
+func TestCertifyWorkspaceSharesCopiesWithTheDroppedGroup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "input-00")
+	if err := os.WriteFile(path, []byte("fixture"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	gid := os.Getgid()
+	ws := &certifyWorkspace{dir: dir, fixtures: []certifyVerifiedFixture{{path: path}}}
+	if err := ws.shareWithGroup(gid); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	if info.Mode().Perm() != 0o440 || int(stat.Gid) != gid || int(stat.Uid) != os.Geteuid() || ws.outputGID == nil || *ws.outputGID != gid {
+		t.Fatalf("fixture mode=%v uid=%d gid=%d outputGID=%v", info.Mode().Perm(), stat.Uid, stat.Gid, ws.outputGID)
+	}
+}

@@ -308,6 +308,24 @@ type certifyWorkspace struct {
 	euid     int
 	helpers  map[string]certifyVerifiedFile
 	fixtures []certifyVerifiedFixture
+	// outputGID, when set, is the group (the dropped helper identity's) that
+	// may read and write each run's output file.
+	outputGID *int
+}
+
+// shareWithGroup grants the dropped helper group read access to every fixture
+// copy (root-owned 0440) and read/write access to outputs created later.
+func (ws *certifyWorkspace) shareWithGroup(gid int) error {
+	for _, fixture := range ws.fixtures {
+		if err := os.Chown(fixture.path, -1, gid); err != nil {
+			return err
+		}
+		if err := os.Chmod(fixture.path, 0o440); err != nil {
+			return err
+		}
+	}
+	ws.outputGID = &gid
+	return nil
 }
 
 func (ws *certifyWorkspace) Close() error {
@@ -1003,6 +1021,14 @@ func executeCertifyRun(ctx context.Context, ws *certifyWorkspace, rt certifyRunt
 		_ = output.Close()
 		_ = os.Remove(outputPath)
 	}()
+	if ws.outputGID != nil {
+		if err := output.Chown(-1, *ws.outputGID); err != nil {
+			return certifyRunReceipt{}, err
+		}
+		if err := output.Chmod(0o660); err != nil {
+			return certifyRunReceipt{}, err
+		}
+	}
 	transformed, err := rt.Transform(ctx, run, input, output)
 	if err != nil {
 		return certifyRunReceipt{}, err

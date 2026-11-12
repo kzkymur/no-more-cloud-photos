@@ -65,6 +65,15 @@ func newProductionCertifyRuntime(ws *certifyWorkspace) (certifyRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	if runAs != nil {
+		// The helpers reopen /proc/self/fd/3 and /fd/4, which re-checks the
+		// file mode against the dropped identity. The root-owned copies get
+		// group nmcp read (outputs read/write) so nmcp can use but never chmod,
+		// replace or retarget them; the workspace directory stays root 0700.
+		if err := ws.shareWithGroup(int(runAs.GID)); err != nil {
+			return nil, err
+		}
+	}
 	prlimit, icc, digest := ws.helperPath("prlimit"), ws.helperPath("srgb_icc"), ws.helpers["srgb_icc"].sha256
 	still, err := stillprocessor.New(stillprocessor.Config{Helper: ws.helperPath("still_helper"), Prlimit: prlimit,
 		SRGBICC: icc, SRGBICCSHA256: digest, Policy: stillprocessor.DefaultPolicy(), RunAs: runAs})
