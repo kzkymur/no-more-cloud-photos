@@ -59,8 +59,7 @@ jobs:
       - name: Install metadata probe tools
         run: |
           mkdir -p .tools
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends util-linux xz-utils
+          scripts/infra-apt-install util-linux xz-utils
           curl --fail --location --silent --show-error \
             https://github.com/exiftool/exiftool/archive/refs/tags/13.36.tar.gz \
             --output .tools/exiftool-13.36.tar.gz
@@ -85,7 +84,7 @@ jobs:
       - name: Build native still-image helper smoke target
         id: stillbuild
         run: |
-          sudo apt-get install -y --no-install-recommends \
+          scripts/infra-apt-install --no-update \
             autoconf automake cmake libtool make meson nasm ninja-build patchelf pkg-config \
             libglib2.0-dev libjpeg-turbo8-dev libpng-dev libwebp-dev libexif-dev \
             libde265-dev zlib1g-dev
@@ -460,8 +459,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
+          scripts/infra-apt-install \
             bison flex make gcc zlib1g-dev postgresql-common util-linux
           mkdir -p "$RUNNER_TEMP/backup-pg17"
           curl --fail --location --silent --show-error \
@@ -563,8 +561,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
+          scripts/infra-apt-install debootstrap systemd-container util-linux
           bash -n scripts/run-backup-root-isolated
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
@@ -693,8 +690,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
+          scripts/infra-apt-install debootstrap systemd-container util-linux
           bash -n scripts/run-backup-root-isolated
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
@@ -858,8 +854,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends debootstrap systemd-container util-linux
+          scripts/infra-apt-install debootstrap systemd-container util-linux
           bash -n scripts/run-backup-root-isolated
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-run-backup-root-isolated
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission

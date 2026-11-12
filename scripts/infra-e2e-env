@@ -157,27 +157,27 @@ set_failpoint() {
 # Release lane: the Core binaries in the image under test carry no build tags
 # and no failpoint code. Binaries are copied out of the worker container.
 release_binary_gate() {
-  local dir=${1:?artifact dir} id binary
+  local dir=${1:?artifact dir} id binary service
+  local -a copied=()
   [ "$failpoints" = 0 ] || return 0
   command -v go >/dev/null 2>&1 || die "go is required for the release binary gate"
-  mkdir -p "$dir/release-binaries"
-  id=$(container_id worker); [ -n "$id" ] || die "worker container not found"
-  for binary in core-api core-worker nmcp-admin; do
-    docker container cp "$id:/usr/local/bin/$binary" "$dir/release-binaries/$binary" >/dev/null
-    go version -m "$dir/release-binaries/$binary" >"$dir/release-binaries/$binary.buildinfo"
-    if grep -E '^\s+build\s+-tags=' "$dir/release-binaries/$binary.buildinfo"; then
-      die "release $binary was built with tags"
-    fi
+  [ -x "$root/scripts/check-release-no-failpoints" ] || die "scripts/check-release-no-failpoints is required"
+  # The api and worker images are built separately, so gate each container's
+  # own copies (the api's core-api is the binary actually serving requests).
+  for service in worker api; do
+    mkdir -p "$dir/release-binaries/$service"
+    id=$(container_id "$service"); [ -n "$id" ] || die "$service container not found"
+    for binary in core-api core-worker nmcp-admin; do
+      docker container cp "$id:/usr/local/bin/$binary" "$dir/release-binaries/$service/$binary" >/dev/null
+      go version -m "$dir/release-binaries/$service/$binary" >"$dir/release-binaries/$service/$binary.buildinfo"
+      if grep -E '^\s+build\s+-tags=' "$dir/release-binaries/$service/$binary.buildinfo"; then
+        die "release $service/$binary was built with tags"
+      fi
+      copied+=("$dir/release-binaries/$service/$binary")
+    done
   done
-  if [ -x "$root/scripts/check-release-no-failpoints" ]; then
-    "$root/scripts/check-release-no-failpoints" "$dir/release-binaries/core-api" \
-      "$dir/release-binaries/core-worker" "$dir/release-binaries/nmcp-admin"
-  elif [ -d "$root/test/e2e" ]; then
-    die "scripts/check-release-no-failpoints is required once ./test/e2e exists"
-  else
-    log "release gate: check-release-no-failpoints not present yet; build-tag check only"
-  fi
-  log "release binary gate PASS (no build tags)"
+  "$root/scripts/check-release-no-failpoints" "${copied[@]}"
+  log "release binary gate PASS (worker and api images: no build tags, no failpoint code)"
 }
 
 require_tools() {
