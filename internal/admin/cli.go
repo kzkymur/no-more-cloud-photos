@@ -277,7 +277,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	service := New(pool)
 	if capability != nil {
-		capabilityPool, capabilityErr := openCapabilityPool(ctx, *capability, capabilityDSN)
+		database, identityErr := queryDatabaseIdentity(ctx, pool)
+		if identityErr != nil {
+			return finish(stdout, stderr, o.json, nil, identityErr)
+		}
+		capabilityPool, capabilityErr := openCapabilityPool(ctx, *capability, capabilityDSN, database)
 		if capabilityErr != nil {
 			return finish(stdout, stderr, o.json, nil, capabilityErr)
 		}

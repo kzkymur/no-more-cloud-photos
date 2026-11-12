@@ -81,6 +81,28 @@ func loadCapabilityDSN(c capabilityCredential, getenv func(string) string) (stri
 	return dsn, nil
 }
 
+// databaseIdentity pins one database on one running server: name, OID and
+// the postmaster start time (two clusters, even with equal names and OIDs,
+// never share a running postmaster).
+type databaseIdentity struct {
+	name      string
+	oid       uint32
+	startedAt string
+}
+
+const databaseIdentityQuery = `SELECT current_database()::text, d.oid::oid, pg_catalog.pg_postmaster_start_time()::text
+	FROM pg_catalog.pg_database AS d WHERE d.datname=current_database()`
+
+func queryDatabaseIdentity(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}) (databaseIdentity, error) {
+	var id databaseIdentity
+	if err := q.QueryRow(ctx, databaseIdentityQuery).Scan(&id.name, &id.oid, &id.startedAt); err != nil {
+		return databaseIdentity{}, err
+	}
+	return id, nil
+}
+
 // capabilitySession is what a capability connection must prove about itself.
 type capabilitySession struct {
 	sessionUser, currentUser string
@@ -107,7 +129,16 @@ const capabilitySessionQuery = `SELECT session_user::text, current_user::text, r
 
 // assertCapabilitySession proves the connection's identity with one catalog
 // query; any query failure is a refusal.
-func assertCapabilitySession(ctx context.Context, conn *pgx.Conn, c capabilityCredential, forbidden []string) error {
+func assertCapabilitySession(ctx context.Context, conn *pgx.Conn, c capabilityCredential, forbidden []string, database *databaseIdentity) error {
+	if database != nil {
+		// A stale credential (for example still naming the pre-cutover source)
+		// must never check or repair a database other than the administrative
+		// connection's.
+		got, err := queryDatabaseIdentity(ctx, conn)
+		if err != nil || got != *database {
+			return errCapabilityCredential
+		}
+	}
 	var s capabilitySession
 	if err := conn.QueryRow(ctx, capabilitySessionQuery, c.role, forbidden).Scan(
 		&s.sessionUser, &s.currentUser, &s.superuser, &s.hasCapability, &s.forbiddenMember); err != nil {
@@ -121,13 +152,13 @@ func assertCapabilitySession(ctx context.Context, conn *pgx.Conn, c capabilityCr
 
 // openCapabilityPool connects with the capability login and re-proves its
 // identity on every pooled connection before any query can use it.
-func openCapabilityPool(ctx context.Context, c capabilityCredential, dsn string) (*pgxpool.Pool, error) {
+func openCapabilityPool(ctx context.Context, c capabilityCredential, dsn string, database databaseIdentity) (*pgxpool.Pool, error) {
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, errCapabilityCredential
 	}
 	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		return assertCapabilitySession(ctx, conn, c, capabilityForbiddenRoles)
+		return assertCapabilitySession(ctx, conn, c, capabilityForbiddenRoles, &database)
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {

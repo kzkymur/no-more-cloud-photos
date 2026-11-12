@@ -194,16 +194,38 @@ func TestCapabilitySessionQueryOnPostgreSQL(t *testing.T) {
 				t.Fatal(err)
 			}
 		}()
-		return assertCapabilitySession(ctx, conn, credential, []string{forbidden, capability, "nmcp_role_that_does_not_exist"})
+		return assertCapabilitySession(ctx, conn, credential, []string{forbidden, capability, "nmcp_role_that_does_not_exist"}, nil)
 	}
 	if err := check(login); err != nil {
 		t.Fatalf("exact INHERIT TRUE capability login refused: %v", err)
 	}
-	if err := assertCapabilitySession(ctx, conn, credential, nil); !errors.Is(err, ErrValidation) {
+	if err := assertCapabilitySession(ctx, conn, credential, nil, nil); !errors.Is(err, ErrValidation) {
 		t.Fatalf("superuser session accepted: %v", err)
 	}
 	if err := check(inheritless); !errors.Is(err, ErrValidation) {
 		t.Fatalf("other login with INHERIT FALSE membership accepted: %v", err)
+	}
+	// The database pin: this connection's identity passes, another database's
+	// (same server, different name/OID) is refused.
+	here, err := queryDatabaseIdentity(ctx, conn)
+	if err != nil || here.name == "" || here.oid == 0 || here.startedAt == "" {
+		t.Fatalf("database identity = %+v, %v", here, err)
+	}
+	if _, err := conn.Exec(ctx, "SET SESSION AUTHORIZATION "+ident(login)); err != nil {
+		t.Fatal(err)
+	}
+	pinned := assertCapabilitySession(ctx, conn, credential, []string{forbidden}, &here)
+	other := here
+	other.name, other.oid = here.name+"_candidate", here.oid+1
+	stale := assertCapabilitySession(ctx, conn, credential, []string{forbidden}, &other)
+	restarted := here
+	restarted.startedAt = "1970-01-01 00:00:00+00"
+	otherServer := assertCapabilitySession(ctx, conn, credential, []string{forbidden}, &restarted)
+	if _, err := conn.Exec(ctx, "RESET SESSION AUTHORIZATION"); err != nil {
+		t.Fatal(err)
+	}
+	if pinned != nil || !errors.Is(stale, ErrValidation) || !errors.Is(otherServer, ErrValidation) {
+		t.Fatalf("database pin: same=%v other database=%v other server=%v", pinned, stale, otherServer)
 	}
 	if _, err := conn.Exec(ctx, "GRANT "+ident(forbidden)+" TO "+ident(login)); err != nil {
 		t.Fatal(err)
