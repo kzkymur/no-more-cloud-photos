@@ -409,8 +409,8 @@ required)" and "Explicit cutover and separate resume".
 > **Read before starting.** On the production host a restore has only one
 > supported ending today: **cutover**. `restore` puts the source database into
 > `operator restore` maintenance, and there is currently no supported way to
-> return the source to normal service without cutting over (a product gap the
-> team is fixing; see "Known limits and follow-ups"). Never start a restore on
+> return the source to normal service without cutting over (#58, a product gap
+> the team is fixing; see "Known limits and follow-ups"). Never start a restore on
 > production unless you intend to cut over. Cutover makes the restored
 > database authoritative: any write the source accepted after the backup's
 > snapshot cutoff (`started_at` in backup history) is **discarded**.
@@ -442,7 +442,7 @@ Choose one branch and record which.
    to end, and stop the RTO clock.
 6. The former source database is no longer used by the services. Keep it until
    you are satisfied, then drop it as the PostgreSQL cluster administrator.
-   Retiring its restore ledger entry has no CLI yet (see "Known limits and
+   Retiring its restore ledger entry has no CLI yet (#58, see "Known limits and
    follow-ups"); keep the ledger and receipt files.
 
 **B. Rehearsal host (recommended for numbers only):** steps 1–5 of A on the
@@ -530,7 +530,7 @@ None blocks this runbook; note them when you interpret a result.
 | #54 | `nmcp-admin check` fails closed with `storage_scan_unstable` (exit 1) when storage changes during its scan, and does not retry by itself. | Common right after a Worker restart or during uploads. It is not a finding: wait briefly and rerun (the CI scenario allows up to 3 tries) before reporting item 9. |
 | #55 | Root `profile certify` runs helpers as `nmcp` with the Worker's limits, but not inside the Worker unit's systemd sandbox. | Certify only trusted fixtures (item 9). |
 | #57 | A backup that fails before its run is recorded (for example, database unreachable) writes no history and sends no notification; only exit 1 and a log line. | Item 4(b) is NOT_EXECUTED until a release with #57. Watch `nmcp-backup.service` failures in the journal meanwhile. |
-| pending | A restore cannot yet be abandoned: without cutover, the source stays in `operator restore` maintenance and an unused candidate/ledger entry cannot be retired by a CLI. | Item 8 on production only with a planned cutover, or on a rehearsal host. Keep ledger and receipt files. |
+| #58 | A restore cannot yet be abandoned: without cutover, the source stays in `operator restore` maintenance and an unused candidate/ledger entry cannot be retired by a CLI. | Item 8 on production only with a planned cutover, or on a rehearsal host. Keep ledger and receipt files. After #58 ships (`restore --operation-id OP --abandon`), item 8 will add a validation-only production drill. |
 
 ## Reporting back
 
