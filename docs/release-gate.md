@@ -20,6 +20,9 @@ it, the change is recorded here once, with its decision, code and evidence, so
 | Untagged SDR video is accepted with conventional color inference (8-bit only; height >= 720 BT.709, smaller BT.601 matrix `smpte170m` with BT.709 primaries; unspecified range limited; partial tags must agree; untagged 10-bit+, PQ/HLG, BT.2020 or HDR side data still refused). Recorded as `color_inferred`, an `inferred:` rendition audit `input_color`, and a Worker log line; tagged input is unchanged. | Customer decision 2026-11-12 (option 1) | [`internal/videohelper/probe.go`](../internal/videohelper/probe.go) (`inferSDRColor`), [`internal/videoprocessor/processor_linux.go`](../internal/videoprocessor/processor_linux.go), [`internal/transformexecutor/executor_linux.go`](../internal/transformexecutor/executor_linux.go) | [video helper README, "Source color"](../internal/videoprocessor/helper/README.md#source-color); [video testdata README](../internal/videoprocessor/testdata/README.md); untagged 1080p MP4 in the E2E certification matrix |
 | The still helper advertises seven more camera RAW formats (CR2, CR3, RAF, NEF, ORF, RW2, ARW) beside DNG, each proven against the separately compiled LibRaw reference at the DNG pixel standard. Before this, the bundled profiles listed MIMEs the helper refused and could never be certified. | Leader decision 2026-11-12 (option A; no profile descope) | [`internal/stillprocessor/helper/src/image_pipeline.cpp`](../internal/stillprocessor/helper/src/image_pipeline.cpp) (`kProvenRawMimes`), [`internal/stillprocessor/processor_integration_linux_test.go`](../internal/stillprocessor/processor_integration_linux_test.go) | [still testdata README](../internal/stillprocessor/testdata/README.md); pins in [`test/e2e/testdata/fixtures.json`](../test/e2e/testdata/fixtures.json) |
 | Profile certification requirements follow the Worker's executable routes: a probe-animation MIME other than `image/webp` under an all-frames recipe needs no still output, because the Worker always produces animated WebP there. | Leader decision 2026-11-11 (D1: no substitute route; fix the derivation) | [`internal/database/migrations/0024_profile_route_certification.sql`](../internal/database/migrations/0024_profile_route_certification.sql), [`internal/admin/profile_certify.go`](../internal/admin/profile_certify.go) | [`profile certify` contract](contracts/core-api.md) |
+| A HEIF whose `ftyp` carries both still (`mif1`/`heic`) and sequence (`msf1`/`hevc`) brands is classified as a still image (its primary item), not refused as an image sequence; a still brand mixed with MP4 video brands (`mp42`/`isom`, e.g. nokiatech C049) stays refused. | #21 finding, leader decision 2026-11-11 | [`internal/metadata/detector.go`](../internal/metadata/detector.go) | [`docs/development.md`](development.md) (C049 note); `heif-libheif-example-mixed-brands` in [`test/e2e/testdata/fixtures.json`](../test/e2e/testdata/fixtures.json) |
+| Activating a profile takes effect for transform claims only when the Worker next starts: it binds its claimable profiles to the capability envelope validated at startup, so jobs for a newly activated profile stay `queued` until a Worker restart. Documented as an operator step; live re-evaluation is a tracked follow-up. | #21 finding, leader decision 2026-11-12 | [`cmd/core-worker/main.go`](../cmd/core-worker/main.go) (`BindTransformClaims`) | [`profile activate` contract](contracts/core-api.md); [Ubuntu deployment, certification steps](ubuntu-deployment.md) |
+| Known limit, not a behaviour change: profile certification probes outputs with the pinned `/opt/nmcp/current/bin/ffprobe`, while the API's upload metadata probe uses the distribution `/usr/bin/ffprobe` (the L3 guest provides the pinned binary at that path because it omits Ubuntu's ffmpeg). The two versions can differ in edge-case container parsing. | Reviewer B5, leader decision 2026-11-12 | [`internal/metadata/probe_linux.go`](../internal/metadata/probe_linux.go) (`DefaultToolPaths`) | [Ubuntu deployment, certification spec](ubuntu-deployment.md) |
 
 ## Lanes
 
@@ -89,10 +92,18 @@ below 4 GiB and the `memory.events` oom/oom_kill/oom_group_kill counters
 are unchanged. Per-unit peaks, `cpu.stat` and elapsed times are recorded,
 not asserted. One real-unit ENOSPC case runs on a sized tmpfs media root.
 
+Measured (CI PR run 43155480640, L3 job 130986308816, head 4c509de): the
+CR3 (6000x4000) and 2560x1440 MP4 to AV1 transforms ran under one
+`nmcp.slice` (CPUQuota 200%, MemoryMax 4G) with `memory.peak` 0.61 GiB and
+no oom/oom_kill/oom_group_kill events; CPU was throttled once (1.9 ms). The
+OOM counters are the gate; `memory.peak < MemoryMax` is recorded as headroom
+evidence only, since the kernel enforces MemoryMax itself.
+
 ## RPO/RTO
 
-The live cutover lane seeds 3000 distinct BMP originals through the real API
-before the first backup and logs RPO and end-to-end RTO with the dataset
+The live cutover lane seeds 3000 distinct BMP originals (about 37 MB; a
+sized CI dataset, not production scale) through the real API before the
+first backup and logs RPO and end-to-end RTO with the dataset
 size: media, jobs and database bytes. The offline lane logs its own RPO/RTO.
 These numbers come from the CI runner and the seeded dataset size.
 Real-hardware figures are #22 evidence.

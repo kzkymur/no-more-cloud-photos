@@ -206,11 +206,6 @@ func TestOfflineAuthorityRejectsUnknownJSONAndRoutineUID(t *testing.T) {
 	}
 }
 
-// This is a real, destructive, root/systemd PG17 fixture entry point, NOT a
-// component-test substitute or evidence of a completed run. The formal lane
-// must preprovision two dedicated clusters, successful dump + DBFS, root-private
-// receipt/authority/service/pass inputs, and stopped application fixture units.
-// It must not point at production. UID1001 cannot execute this authorization.
 // These root-only production-entrypoint negatives run against the real empty
 // candidate BEFORE the positive fixture. A missing operation ID proves rejection
 // precedes reservation, system actions and pg_restore, not just eventual failure.

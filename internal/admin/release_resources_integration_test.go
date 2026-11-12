@@ -321,9 +321,7 @@ func TestReleaseGateResources(t *testing.T) {
 		t.Fatalf("same key after ENOSPC recovery: status %d, want 201 (transient failures are never stored)", got)
 	}
 	operator := releaseOperatorCLI(t, f, admin)
-	if out := operator([]int{0}, "check", "--scope", "all", "--json"); !releaseCheckClean(out) {
-		t.Fatalf("reconciliation after real-unit ENOSPC not clean: %s", out)
-	}
+	releaseCheckResult(t, ctx, migrator, operator([]int{0}, "check", "--scope", "all", "--json"), false)
 	t.Log("actual real-unit ENOSPC: upload refused without acceptance, same key accepted after recovery, DB/FS reconciliation clean")
 
 	// Manual rendition cleanup through the documented operator invocation.
@@ -380,14 +378,12 @@ func TestReleaseGateResources(t *testing.T) {
 	}
 	orphan := filepath.Join(orphanDir, "original.bmp")
 	f.run("/usr/bin/install", "-o", runtimeUser.Username, "-g", runtimeUser.Username, "-m", "0600", orphanSource, orphan)
-	report := releaseCheckReport(t, operator([]int{4}, "check", "--scope", "all", "--json"))
+	report := releaseCheckResult(t, ctx, migrator, operator([]int{4}, "check", "--scope", "all", "--json"), true)
 	operator([]int{0}, "repair", "--report", report, "--yes", "--json")
 	if _, err := os.Lstat(orphan); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("repair left the planted orphan in place")
 	}
-	if out := operator([]int{0}, "check", "--scope", "all", "--json"); !releaseCheckClean(out) {
-		t.Fatalf("reconciliation after repair not clean: %s", out)
-	}
+	releaseCheckResult(t, ctx, migrator, operator([]int{0}, "check", "--scope", "all", "--json"), false)
 	operator([]int{0}, "maintenance", "resume", "--yes", "--json")
 
 	// Nothing the operator commands created or renamed may be root-owned:
@@ -467,26 +463,40 @@ func releaseOperatorCLI(t *testing.T, f *liveCutoverFixture, admin *pgxpool.Pool
 	}
 }
 
-func releaseCheckReport(t *testing.T, out []byte) string {
+// releaseCheckResult decodes check's stdout (bare result on exit 0, the
+// {"result":...,"exit_code":4} envelope when findings exist) and proves the
+// reported ReportID, seal and finding count against the stored report.
+func releaseCheckResult(t *testing.T, ctx context.Context, migrator *pgxpool.Pool, out []byte, wantFindings bool) string {
 	t.Helper()
-	var envelope struct {
-		Result struct {
-			ReportID string
-			Sealed   bool
-		} `json:"result"`
-	}
-	if json.Unmarshal(out, &envelope) != nil || !envelope.Result.Sealed || !uuidPattern.MatchString(envelope.Result.ReportID) {
-		t.Fatalf("check with findings did not report a sealed report: %s", out)
-	}
-	return envelope.Result.ReportID
-}
-
-func releaseCheckClean(out []byte) bool {
-	var result struct {
+	type result struct {
+		ReportID     string
 		Sealed       bool
 		FindingCount int64
 	}
-	return json.Unmarshal(out, &result) == nil && result.Sealed && result.FindingCount == 0
+	var got result
+	if wantFindings {
+		var envelope struct {
+			Result   result `json:"result"`
+			ExitCode int    `json:"exit_code"`
+		}
+		if json.Unmarshal(out, &envelope) != nil || envelope.ExitCode != 4 {
+			t.Fatalf("check with findings: unexpected output %s", out)
+		}
+		got = envelope.Result
+	} else if json.Unmarshal(out, &got) != nil {
+		t.Fatalf("clean check: unexpected output %s", out)
+	}
+	if !uuidPattern.MatchString(got.ReportID) || !got.Sealed || (got.FindingCount > 0) != wantFindings {
+		t.Fatalf("check result %+v, want sealed with findings=%t", got, wantFindings)
+	}
+	var stored int64
+	var sealed bool
+	if err := migrator.QueryRow(ctx, `SELECT (SELECT count(*) FROM reconciliation_check_findings WHERE report_id=r.id),
+		EXISTS(SELECT 1 FROM reconciliation_check_report_seals s WHERE s.report_id=r.id)
+		FROM reconciliation_check_reports r WHERE r.id=$1`, got.ReportID).Scan(&stored, &sealed); err != nil || !sealed || stored != got.FindingCount {
+		t.Fatalf("stored report %s: sealed=%t findings=%d, CLI said %d (%v)", got.ReportID, sealed, stored, got.FindingCount, err)
+	}
+	return got.ReportID
 }
 
 func releaseUploadStatus(t *testing.T, ctx context.Context, data []byte, name, key string) int {

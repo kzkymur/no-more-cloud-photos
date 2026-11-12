@@ -1368,7 +1368,8 @@ func liveStackInputs(t *testing.T) (bin, prefix, video, icc string, artifacts ma
 	return bin, prefix, video, icc, artifacts, mediaBytes
 }
 
-// liveSizedMedia is the #21 production-scale RPO/RTO dataset: real API
+// liveSizedMedia is the #21 sized RPO/RTO dataset (about 37 MB; not
+// production scale, real-hardware RPO/RTO is #22): real API
 // uploads of distinct BMP originals, which no active fixture profile accepts,
 // so they add DB rows, change events and original files without transform
 // jobs. It is bounded by the live lane's job budget; real-hardware figures

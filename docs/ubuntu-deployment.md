@@ -385,7 +385,7 @@ installed helpers:
        "animation_helper": {"path": "/opt/nmcp/current/bin/nmcp-animation-helper", "sha256": "<64 hex>"},
        "video_helper": {"path": "/opt/nmcp/current/bin/nmcp-video-helper", "sha256": "<64 hex>"},
        "prlimit": {"path": "/usr/bin/prlimit", "sha256": "<64 hex>"},
-       "ffprobe": {"path": "/usr/bin/ffprobe", "sha256": "<64 hex>"},
+       "ffprobe": {"path": "/opt/nmcp/current/bin/ffprobe", "sha256": "<64 hex>"},
        "srgb_icc": {"path": "/opt/nmcp/current/share/sRGB2014.icc", "sha256": "384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a"}
      },
      "fixtures": [
@@ -395,8 +395,10 @@ installed helpers:
    ```
 
    Use the same helper, `prlimit`, and ICC paths as the Worker configuration.
-   `ffprobe` is the independent output probe; prefer the distribution binary
-   rather than the video helper's bundled toolchain.
+   `ffprobe` is the independent output probe: use the pinned
+   `/opt/nmcp/current/bin/ffprobe` (the version CI certifies with). The API's
+   upload metadata probe still uses the distribution `/usr/bin/ffprobe`; that
+   version skew is a recorded known limit (release-gate deviation table).
 3. Run, through the operator invocation in
    [Running nmcp-admin](#running-nmcp-admin), with the database in normal mode.
    The spec is passed on stdin, so it can stay wherever the operator keeps it:
