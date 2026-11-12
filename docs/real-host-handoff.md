@@ -268,8 +268,10 @@ Goal: files straight from your cameras and phones are accepted and converted.
    camera RAW. Use `upload` and `wait_job` from item 0.
 
    Expected: `201` and job `succeeded`, then view the display rendition as in
-   item 1. Videos without colour tags are converted with inferred BT.709/BT.601
-   SDR colour (#21 review N4); check that they do not look washed out.
+   item 1. Untagged 8-bit SDR videos are accepted with inferred colour (HD
+   BT.709, SD BT.601 matrix; see `docs/release-gate.md`, "Deviations from the
+   design snapshot"); check that they do not look washed out. Untagged 10-bit,
+   PQ/HLG, BT.2020 or HDR video is still refused by design.
    A rejection is not automatically a bug: record the HTTP status and error
    code (for example `415 unsupported_media_type`, `422 invalid_media`, or a
    failed job's error code), and the device/app that made the file.
@@ -358,11 +360,31 @@ before activation".
    ```
    Expected: certify and activate exit 0. After the Worker restart, a new
    upload's job reaches `succeeded` (jobs for a newly activated profile stay
-   `queued` until the Worker restarts).
+   `queued` until the Worker restarts, #50).
+
+   Certify decodes your fixtures with the real helpers as uid `nmcp`, but not
+   inside the Worker's systemd sandbox (#55): **use only fixtures you trust**.
+   Re-certify after any release that changes a helper digest; certification
+   rows are not yet bound to the running Worker's digests (#52).
 
 Report: exit codes, profile IDs and versions activated, and the post-restart
 upload result. Keep the certification JSON and evidence receipts privately
 with your deployment record.
+
+## Known limits and follow-ups
+
+These are recorded in `docs/release-gate.md`, "Deviations from the design
+snapshot" and "Limits (never counted as passed)", and tracked as open issues.
+None blocks this runbook; note them when you interpret a result.
+
+| Issue | Limit | What you may see / what to do |
+| --- | --- | --- |
+| #50 | A newly activated profile is picked up only after a Worker restart. | Jobs stay `queued` after `profile activate` until `systemctl restart nmcp-worker.service` (item 9). |
+| #51 | Per-media directories emptied by purge are not removed. | Empty directories may remain under `originals/` and `renditions/` after purge (item 5 inventory). Not data loss. |
+| #52 | Certification evidence is not bound to the running Worker's helper digests. | Re-run item 9 after every release that changes a helper, and keep the certification receipts with the deployment record. |
+| #53 | The upload metadata probe uses the distribution `/usr/bin/ffprobe`, while certification uses the pinned `/opt/nmcp/current/bin/ffprobe`. | A file the distribution probe cannot read is refused at upload (item 7) even if the pinned toolchain could convert it; report it with the status code. |
+| #54 | `nmcp-admin check` fails closed with `storage_scan_unstable` (exit 1) when storage changes during its scan, and does not retry by itself. | Common right after a Worker restart or during uploads. It is not a finding: wait briefly and rerun (the CI scenario allows up to 3 tries) before reporting item 9. |
+| #55 | Root `profile certify` runs helpers as `nmcp` with the Worker's limits, but not inside the Worker unit's systemd sandbox. | Certify only trusted fixtures (item 9). |
 
 ## Reporting back
 
