@@ -22,11 +22,14 @@ type capabilityCredential struct {
 	env   string
 	login string
 	role  string
+	// name is the systemd credential name (LoadCredential=NAME:PATH) the
+	// documented operator invocation delivers in $CREDENTIALS_DIRECTORY.
+	name string
 }
 
 var (
-	checkCredential  = capabilityCredential{env: "NMCP_CHECK_DATABASE_URL_FILE", login: "nmcp_check", role: "nmcp_check_runtime"}
-	repairCredential = capabilityCredential{env: "NMCP_REPAIR_DATABASE_URL_FILE", login: "nmcp_repair", role: "nmcp_repair_runtime"}
+	checkCredential  = capabilityCredential{env: "NMCP_CHECK_DATABASE_URL_FILE", login: "nmcp_check", role: "nmcp_check_runtime", name: "check.dsn"}
+	repairCredential = capabilityCredential{env: "NMCP_REPAIR_DATABASE_URL_FILE", login: "nmcp_repair", role: "nmcp_repair_runtime", name: "repair.dsn"}
 )
 
 // Roles a capability login must never reach, directly or transitively.
@@ -47,10 +50,32 @@ var errCapabilityCredential = fmt.Errorf("%w: capability credential refused", Er
 // invoking user, with no group/other permission bits, holding exactly one DSN
 // line of at most 4 KiB. The path and contents are never echoed.
 func loadCapabilityDSN(c capabilityCredential, getenv func(string) string) (string, error) {
+	// A systemd credential takes precedence: the documented invocation runs
+	// nmcp-admin as the nmcp service user with LoadCredential=, so the DSN is
+	// never readable by nmcp at rest. systemd may deliver it root-owned 0440
+	// with an ACL for the user, so that private directory admits group read
+	// but still no write bits and no world access.
+	if directory := getenv("CREDENTIALS_DIRECTORY"); directory != "" && c.name != "" {
+		if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+			return "", errCapabilityCredential
+		}
+		path := filepath.Join(directory, c.name)
+		if _, err := os.Lstat(path); err == nil {
+			return readCapabilityDSN(path, 0o027)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", errCapabilityCredential
+		}
+	}
 	path := getenv(c.env)
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return "", errCapabilityCredential
 	}
+	return readCapabilityDSN(path, 0o077)
+}
+
+// readCapabilityDSN applies the trusted-file rule with the given forbidden
+// permission bits.
+func readCapabilityDSN(path string, forbidden os.FileMode) (string, error) {
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", errCapabilityCredential
@@ -62,7 +87,7 @@ func loadCapabilityDSN(c capabilityCredential, getenv func(string) string) (stri
 		return "", errCapabilityCredential
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !info.Mode().IsRegular() || stat.Uid != 0 && int(stat.Uid) != os.Geteuid() || info.Mode().Perm()&0o077 != 0 ||
+	if !ok || !info.Mode().IsRegular() || stat.Uid != 0 && int(stat.Uid) != os.Geteuid() || info.Mode().Perm()&forbidden != 0 ||
 		info.Size() <= 0 || info.Size() > capabilityDSNMaxBytes {
 		return "", errCapabilityCredential
 	}

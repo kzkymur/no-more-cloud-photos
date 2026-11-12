@@ -234,3 +234,75 @@ func TestCapabilitySessionQueryOnPostgreSQL(t *testing.T) {
 		t.Fatalf("login with an extra managed-role membership accepted: %v", err)
 	}
 }
+
+// TestLoadCapabilityDSNFromSystemdCredentials covers the documented
+// invocation: LoadCredential= delivers <name> in $CREDENTIALS_DIRECTORY and
+// takes precedence over the *_FILE variable.
+func TestLoadCapabilityDSNFromSystemdCredentials(t *testing.T) {
+	credentials := t.TempDir()
+	write := func(mode os.FileMode) {
+		t.Helper()
+		path := filepath.Join(credentials, checkCredential.name)
+		_ = os.Remove(path)
+		if err := os.WriteFile(path, []byte(validCapabilityDSN+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unreadableFallback := filepath.Join(t.TempDir(), "absent.dsn")
+	getenv := func(key string) string {
+		switch key {
+		case "CREDENTIALS_DIRECTORY":
+			return credentials
+		case checkCredential.env:
+			return unreadableFallback
+		}
+		return ""
+	}
+	for _, mode := range []os.FileMode{0o400, 0o440, 0o600} {
+		write(mode)
+		if dsn, err := loadCapabilityDSN(checkCredential, getenv); err != nil || dsn != validCapabilityDSN {
+			t.Fatalf("systemd credential %o refused: %v", mode, err)
+		}
+	}
+	for _, mode := range []os.FileMode{0o444, 0o460, 0o602} {
+		write(mode)
+		if _, err := loadCapabilityDSN(checkCredential, getenv); !errors.Is(err, ErrValidation) {
+			t.Fatalf("systemd credential %o accepted", mode)
+		}
+	}
+	write(0o400)
+	if _, err := loadCapabilityDSN(repairCredential, getenv); !errors.Is(err, ErrValidation) {
+		t.Fatal("check credential satisfied repair")
+	}
+	_ = os.Remove(filepath.Join(credentials, checkCredential.name))
+	if err := os.Symlink(writeCapabilityFile(t, validCapabilityDSN, 0o600), filepath.Join(credentials, checkCredential.name)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCapabilityDSN(checkCredential, getenv); !errors.Is(err, ErrValidation) {
+		t.Fatal("symlinked systemd credential accepted")
+	}
+	_ = os.Remove(filepath.Join(credentials, checkCredential.name))
+	fallback := writeCapabilityFile(t, validCapabilityDSN, 0o600)
+	if dsn, err := loadCapabilityDSN(checkCredential, func(key string) string {
+		if key == "CREDENTIALS_DIRECTORY" {
+			return credentials
+		}
+		if key == checkCredential.env {
+			return fallback
+		}
+		return ""
+	}); err != nil || dsn != validCapabilityDSN {
+		t.Fatalf("absent systemd credential did not fall back to the file variable: %v", err)
+	}
+	if _, err := loadCapabilityDSN(checkCredential, func(key string) string {
+		if key == "CREDENTIALS_DIRECTORY" {
+			return "relative/dir"
+		}
+		return ""
+	}); !errors.Is(err, ErrValidation) {
+		t.Fatal("relative CREDENTIALS_DIRECTORY accepted")
+	}
+}
