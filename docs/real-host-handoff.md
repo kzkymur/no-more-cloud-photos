@@ -435,7 +435,14 @@ required)" and "Explicit cutover and separate resume".
 >
 > **If a restore or cutover step fails, stop and report.** Do not restart or
 > start units around a failed operation ("Explicit cutover and separate
-> resume"); there is no supported recovery from a stuck restore until #58.
+> resume"). A failed cutover (`cutover_failed`) leaves the timer, backup, API
+> and Worker stopped and the source fenced in maintenance, with no supported
+> recovery today, not even after #58 (which abandons only a prepared or
+> validated restore).
+>
+> The offline restore mode (`--offline-source`) needs the source and the
+> candidate in two different PostgreSQL 17 clusters; it is not the path on a
+> standard single-cluster host.
 
 Record the dataset size first, in every branch: `du -sh /var/lib/nmcp/media`,
 media count from `GET /media`, and database size
@@ -450,15 +457,21 @@ production returns to normal service. It needs the abandon command from #58;
 until a release with #58 is deployed, record B as NOT_EXECUTED, reason
 "requires #58". With #58:
 
-1. Keep `nmcp.target` running. Take a backup with `force_backup` (item 4) and
-   note its `started_at`. Start a monotonic clock when the restore begins.
-2. Restore into a fresh candidate and run the validation in "Operator restore
-   boundary (acceptance still required)". The source enters `operator
-   restore` maintenance and stops accepting writes until step 3.
+1. Keep `nmcp.target` running. Stop `nmcp-backup.timer`, take a backup with
+   `force_backup` (item 4) and note its `started_at`. Start a monotonic clock
+   when the restore begins.
+2. Prepare the candidate and its receipt as described in "Operator restore
+   boundary (acceptance still required)" (the receipt must be less than an
+   hour old), then run the restore prepare (an owner command, with the restore
+   environment that section lists) and its validation. On entry the source
+   goes into `operator restore` maintenance and refuses every write (503)
+   until step 3. Prepare does not drain: if a write was in flight at that
+   instant, prepare fails without entering maintenance; simply run it again.
 3. Abandon the restore as root: `restore --operation-id <OP> --abandon`
    (#58; use the exact form documented there). Expected: the abandonment is
    recorded in the restore ledger and the source returns to normal after a
-   fresh check. Stop the clock when `/readyz` is 200 and one upload completes.
+   fresh check. Start `nmcp-backup.timer` again. Stop the clock when
+   `/readyz` is 200 and one upload completes.
 4. Drop the unused candidate database as the PostgreSQL cluster administrator
    (the API and Worker never point at it before cutover), and handle its
    receipt as #58 documents.
@@ -467,14 +480,20 @@ until a release with #58 is deployed, record B as NOT_EXECUTED, reason
 host built from the same release and fed a copy of a production backup
 artifact, with `nmcp.target` **running** throughout:
 
-1. Backup with `force_backup`, note `started_at`, and start the clock at
-   restore start.
-2. Restore into a fresh candidate, validate, and cut over, keeping the API and
-   Worker running, then point `check.dsn`/`repair.dsn` at the candidate, all
-   as in "Explicit cutover and separate resume".
+1. Stop `nmcp-backup.timer`, back up with `force_backup`, note `started_at`,
+   and start the clock at restore start.
+2. Prepare and validate as in B step 2, then cut over as root
+   (`restore --operation-id <OP> --cutover --yes --json`, see "Explicit
+   cutover and separate resume") with the API and Worker running: its
+   preflight requires `nmcp-migrate` active and both services running. The
+   cutover itself stops the timer, backup, API and Worker, switches
+   configuration, and starts only the API and Worker. Then point
+   `check.dsn`/`repair.dsn` at the candidate.
 3. Resume explicitly: the separate root post-restore
-   `maintenance resume --yes --json` from that section. Check `/readyz` and
-   one upload end to end, then stop the clock.
+   `maintenance resume --yes --json` from that section. Start
+   `nmcp-backup.timer` again (cutover leaves it off). Check `/readyz` and one
+   upload end to end, then stop the clock. If the cutover fails, record it
+   and discard the rehearsal host.
 4. Discard the rehearsal host or its cluster afterwards; never promote it to
    production.
 
