@@ -192,6 +192,12 @@ func TestReleaseGateChain(t *testing.T) {
 		// only media with no target for the active version. Publish standard/v2
 		// with v1's exact recipes; the append-only certification registry already
 		// covers every requirement, so activation needs no new certification.
+		// A superseded rendition's purge_after is fixed in the publication
+		// transaction from the retention configured at that moment (null =
+		// never automatically), so the zero-day retention must be in force
+		// before regeneration supersedes the old rendition.
+		h.admin("config", "set", "--name", "superseded_rendition_retention_days", "--value", "0", "--json")
+		defer h.admin("config", "set", "--name", "superseded_rendition_retention_days", "--value", "null", "--json")
 		h.activateStandardV2()
 		var regen struct {
 			Status    string `json:"status"`
@@ -215,7 +221,8 @@ func TestReleaseGateChain(t *testing.T) {
 		}
 		h.assertFileBytes(fresh.FileURL, fresh.SHA256, fresh.MIMEType, fresh.SizeBytes)
 		h.expectJSON(h.do(http.MethodGet, "/renditions/"+old.ID, nil, nil), 200, nil) // superseded, retained until cleanup
-		h.admin("config", "set", "--name", "superseded_rendition_retention_days", "--value", "0", "--json")
+		// Zero-day retention means "due at the next scan": the documented
+		// manual cleanup runs that scan with the automatic path's locks.
 		h.admin("cleanup", "--kind", "renditions", "--yes", "--json")
 		h.eventually("superseded rendition cleanup", 2*time.Minute, func() bool {
 			return h.do(http.MethodGet, "/renditions/"+old.ID, nil, nil).Status == 404

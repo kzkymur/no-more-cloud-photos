@@ -160,19 +160,24 @@ func (h *harness) activateBundledProfiles() {
 		bundledProfilesActive[id] = true
 		activated = true
 	}
+	// Exactly one active version per bundled key: later scenario steps may
+	// legitimately activate a newer version (standard/v2), which retires v1.
 	var profiles struct {
 		Items []struct {
 			ID     string `json:"id"`
+			Key    string `json:"key"`
 			Status string `json:"status"`
 		} `json:"items"`
 	}
 	h.expectJSON(h.do("GET", "/profiles?status=active", nil, nil), 200, &profiles)
-	active := map[string]bool{}
+	activeByKey := map[string][]string{}
 	for _, p := range profiles.Items {
-		active[p.ID] = p.Status == "active"
+		if p.Status == "active" {
+			activeByKey[p.Key] = append(activeByKey[p.Key], p.ID)
+		}
 	}
-	if !active[standardProfileID] || !active[thumbnailProfileID] {
-		h.t.Fatalf("bundled profiles not active after certification: %v", active)
+	if len(activeByKey["standard"]) != 1 || len(activeByKey["thumbnail"]) != 1 {
+		h.t.Fatalf("bundled profile keys not exactly once active after certification: %v", activeByKey)
 	}
 }
 

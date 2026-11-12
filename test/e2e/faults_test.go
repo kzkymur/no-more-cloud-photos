@@ -18,17 +18,19 @@ const reclaimWait = 4 * time.Minute
 
 func (h *harness) ensureProfilesActive() {
 	h.t.Helper()
+	// Any active version of each bundled key will do: the chain may already
+	// have moved standard to v2 on this shared stack.
 	var profiles struct {
 		Items []struct {
-			ID string `json:"id"`
+			Key string `json:"key"`
 		} `json:"items"`
 	}
 	h.expectJSON(h.do(http.MethodGet, "/profiles?status=active", nil, nil), 200, &profiles)
 	active := map[string]bool{}
 	for _, p := range profiles.Items {
-		active[p.ID] = true
+		active[p.Key] = true
 	}
-	if !active[standardProfileID] || !active[thumbnailProfileID] {
+	if !active["standard"] || !active["thumbnail"] {
 		h.activateBundledProfiles()
 	}
 }
