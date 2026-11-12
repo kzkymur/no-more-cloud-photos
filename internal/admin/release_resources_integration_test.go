@@ -501,7 +501,7 @@ func releaseOperatorCLI(t *testing.T, f *liveCutoverFixture, admin *pgxpool.Pool
 	}
 	owner := (&url.URL{Scheme: "postgres", Host: "127.0.0.1:5432", Path: "/source", User: url.UserPassword("nmcp_migrator", f.passwords["nmcp_migrator"]), RawQuery: "sslmode=disable"}).String()
 	f.write("/etc/nmcp/credentials/admin.dsn", owner+"\n", 0600)
-	f.write("/etc/nmcp/capability.env", "NMCP_STORAGE_ROOT=/var/lib/nmcp/media\nNMCP_BACKUP_ROOT=/var/lib/nmcp/backups\n"+
+	f.write("/etc/nmcp/capability.env", "NMCP_STORAGE_ROOT=/var/lib/nmcp/media\nNMCP_BACKUP_ROOT=/var/lib/nmcp-backup\n"+
 		"NMCP_FILE_BASE_URL=https://files.example.test/files/\nNMCP_LOG_LEVEL=info\nNMCP_SHUTDOWN_TIMEOUT=30s\n", 0644)
 	return func(allowed []int, args ...string) []byte {
 		t.Helper()
