@@ -98,7 +98,12 @@ export NMCP_E2E_FIXTURES_DIR
 log() { printf 'infra-e2e: %s\n' "$*" >&2; }
 die() { printf 'infra-e2e: error: %s\n' "$*" >&2; exit 1; }
 
-compose() {
+# Fill the global array compose_cmd with the complete, exec-able compose
+# command line (an `env` prefix carries the failpoint interpolation inputs).
+# Use "${compose_cmd[@]}" wherever a real executable is required, e.g. under
+# timeout(1), which cannot run shell functions such as compose().
+compose_cmd=()
+build_compose_cmd() {
   if [ "$failpoints" = 1 ]; then
     # Interpolation inputs for compose.failpoints.yaml persist across calls,
     # so recreating one service never silently changes the other.
@@ -106,12 +111,17 @@ compose() {
     if [ -f "$state_dir/failpoints" ]; then
       IFS=' ' read -r api_point worker_point <"$state_dir/failpoints" || true
     fi
-    NMCP_E2E_FAILPOINT_API=$api_point NMCP_E2E_FAILPOINT_WORKER=$worker_point \
-      docker compose --project-name "$project" --file "$base_file" --file "$overlay_file" \
-      --file "$failpoint_file" "$@"
+    compose_cmd=(env "NMCP_E2E_FAILPOINT_API=$api_point" "NMCP_E2E_FAILPOINT_WORKER=$worker_point"
+      docker compose --project-name "$project" --file "$base_file" --file "$overlay_file"
+      --file "$failpoint_file")
   else
-    docker compose --project-name "$project" --file "$base_file" --file "$overlay_file" "$@"
+    compose_cmd=(docker compose --project-name "$project" --file "$base_file" --file "$overlay_file")
   fi
+}
+
+compose() {
+  build_compose_cmd
+  "${compose_cmd[@]}" "$@"
 }
 
 # control set-failpoint SERVICE NAME[@N]|none (failpoint lane only)
@@ -376,8 +386,9 @@ admin() {
   fi
   # The in-container timeout bounds nmcp-admin itself; the host timeout is a
   # backstop for the compose client. --rm and lane teardown remove leftovers.
+  build_compose_cmd
   timeout --kill-after=10s "$((limit + 20))s" \
-    compose run --rm --no-deps -T migrate \
+    "${compose_cmd[@]}" run --rm --no-deps -T migrate \
     /usr/bin/timeout --kill-after=5s "${limit}s" nmcp-admin "$@"
 }
 
