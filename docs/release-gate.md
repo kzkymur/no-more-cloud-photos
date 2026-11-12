@@ -107,10 +107,12 @@ below 4 GiB and the `memory.events` oom/oom_kill/oom_group_kill counters
 are unchanged. Per-unit peaks, `cpu.stat` and elapsed times are recorded,
 not asserted. One real-unit ENOSPC case runs on a sized tmpfs media root.
 
-Measured (CI PR run 43155480640, L3 job 130986308816, head 4c509de): the
-CR3 (6000x4000) and 2560x1440 MP4 to AV1 transforms ran under one
-`nmcp.slice` (CPUQuota 200%, MemoryMax 4G) with `memory.peak` 0.61 GiB and
-no oom/oom_kill/oom_group_kill events; CPU was throttled once (1.9 ms). The
+Measured (CI PR run 43177126008, L3 job 131057788148, head a050fa8; the
+same 0.61 GiB was first measured at 4c509de, job 130986308816): the CR3
+(6000x4000) and 2560x1440 MP4 to AV1 transforms ran under one `nmcp.slice`
+(CPUQuota 200%, MemoryMax 4G) with `memory.peak` 0.61 GiB and no
+oom/oom_kill/oom_group_kill events; CPU was throttled 3 times (29 ms in
+total). The
 OOM counters are the gate; `memory.peak < MemoryMax` is recorded as headroom
 evidence only, since the kernel enforces MemoryMax itself.
 
