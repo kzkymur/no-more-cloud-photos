@@ -54,8 +54,10 @@ jobs:
       - name: Lint harness scripts
         run: |
           shellcheck -x scripts/infra-e2e-env scripts/infra-e2e-failpoint-state.sh scripts/test-infra-e2e-failpoint-state \
+            scripts/test-infra-e2e-budget-acquire \
             scripts/infra-e2e-budget-acquire scripts/infra-e2e-resource-trace infra/validation/e2e-selftest.sh
           scripts/test-infra-e2e-failpoint-state
+          scripts/test-infra-e2e-budget-acquire
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-backup-ci-admission
       - name: Acquire identity-bound job budget receipt
         env:
