@@ -505,7 +505,7 @@ func restorePool(ctx context.Context, c RestoreSettings, service string) (*pgxpo
 // cluster may lack them (bootstrapped before they existed) or have them, so
 // the role graph ignores exactly them in their exact provisioned shape: a
 // LOGIN INHERIT role with no other attribute, no connection limit and no
-// per-role config, holding only its capability edge with ADMIN FALSE,
+// per-role config (global or per-database), holding only its capability edge with ADMIN FALSE,
 // INHERIT TRUE, SET FALSE. Any deviation (other attributes, other edges, other
 // options, or any edge into or out of them) stays in the hash and refuses.
 var restoreOptionalLogins = []struct{ login, capability string }{
@@ -524,7 +524,8 @@ func restoreRoleGraph(ctx context.Context, p *pgxpool.Pool) (string, error) {
 const restoreRoleGraphRolesQuery = `SELECT COALESCE(jsonb_agg(jsonb_build_array(rolname,rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcanlogin,rolreplication,rolbypassrls,rolconnlimit,rolconfig) ORDER BY rolname),'[]'::jsonb)
 	FROM pg_roles WHERE starts_with(rolname,$1)
 	AND NOT (rolname=ANY($2::text[]) AND rolcanlogin AND rolinherit AND NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb
-	         AND NOT rolreplication AND NOT rolbypassrls AND rolconnlimit=-1 AND rolconfig IS NULL)`
+	         AND NOT rolreplication AND NOT rolbypassrls AND rolconnlimit=-1 AND rolconfig IS NULL
+	         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting AS s WHERE s.setrole=pg_roles.oid))`
 
 const restoreRoleGraphMembersQuery = `SELECT COALESCE(jsonb_agg(jsonb_build_array(r.rolname,m.rolname,g.rolname,a.admin_option,a.inherit_option,a.set_option) ORDER BY r.rolname,m.rolname,g.rolname),'[]'::jsonb)
 	FROM pg_auth_members a JOIN pg_roles r ON r.oid=a.roleid JOIN pg_roles m ON m.oid=a.member JOIN pg_roles g ON g.oid=a.grantor

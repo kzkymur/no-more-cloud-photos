@@ -685,8 +685,37 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if _, e := New(source).MaintenanceResume(ctx, store); e == nil {
 		t.Fatal("source permanent maintenance fence could be resumed")
 	}
-	if _, e := New(candidate).MaintenanceResume(ctx, store); e != nil {
+	// Review B1: the post-cutover resume's fresh check runs as nmcp_check,
+	// exactly as the root CLI resume wires it (check.dsn pinned to the owner
+	// connection's database), reaching the candidate only through the explicit
+	// cutover CONNECT grant and HBA; the fenced source stays unreachable.
+	var checkSecret [32]byte
+	if _, e := rand.Read(checkSecret[:]); e != nil {
+		t.Fatal(e)
+	}
+	f.passwords["nmcp_check"] = hex.EncodeToString(checkSecret[:])
+	f.sql(admin, "ALTER ROLE nmcp_check PASSWORD '"+f.passwords["nmcp_check"]+"'")
+	identity, e := queryDatabaseIdentity(ctx, candidate)
+	if e != nil {
+		t.Fatal("candidate identity")
+	}
+	if stale, e := openCapabilityPool(ctx, checkCredential, f.dsnLive("nmcp_check", "source"), &identity); e == nil {
+		stale.Close()
+		t.Fatal("nmcp_check reached the fenced source after cutover")
+	}
+	checkPool, e := openCapabilityPool(ctx, checkCredential, f.dsnLive("nmcp_check", op.Candidate.DatabaseName), &identity)
+	if e != nil {
+		t.Fatalf("nmcp_check cannot reach the cutover candidate: %v", e)
+	}
+	defer checkPool.Close()
+	resumer := New(candidate)
+	resumer.CheckPool = checkPool
+	if _, e := resumer.MaintenanceResume(ctx, store); e != nil {
 		t.Fatal("separate actual candidate MaintenanceResume failed")
+	}
+	var checkedAs string
+	if candidate.QueryRow(ctx, `SELECT r.id::text FROM maintenance_state m JOIN reconciliation_check_reports r ON r.id::text=m.successful_check_report->>'ReportID' WHERE m.id=1`).Scan(&checkedAs) != nil || checkedAs == "" {
+		t.Fatal("resume recorded no successful check report")
 	}
 	liveUploadAfterResume(t, ctx, 1)
 	// Stabilize the positive fixture before its next DB-only snapshot. This does

@@ -317,8 +317,9 @@ manifest to match committed success history in the pinned source database.
 A valid-looking orphan or an artifact from another DB is not implicit restore
 authority; retain it for explicit operator investigation rather than inventing
 success history. Candidate PUBLIC CONNECT remains revoked. Explicit cutover
-opens CONNECT only for the five fixed intended logins, behind the maintenance
-and HBA fences; it never grants CREATEDB, role membership or PUBLIC access.
+opens CONNECT only for the five fixed intended logins plus `nmcp_check` /
+`nmcp_repair` when present (so the post-cutover resume can check the
+candidate), behind the maintenance and HBA fences; it never grants CREATEDB, role membership or PUBLIC access.
 
 ## Source-only database login boundary
 

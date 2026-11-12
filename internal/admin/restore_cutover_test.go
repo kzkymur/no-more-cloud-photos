@@ -219,7 +219,7 @@ func TestCutoverHBAPrependsPermanentSourceFence(t *testing.T) {
 	op := cutoverTestOperation()
 	old := "local all all peer\nhost all all 0.0.0.0/0 trust\n"
 	b := string(cutoverHBA([]byte(old), op))
-	for _, line := range []string{`local "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator 0.0.0.0/0 reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator ::/0 reject`, `host "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator 127.0.0.1/32 scram-sha-256`, `local "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator scram-sha-256`} {
+	for _, line := range []string{`local "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair 0.0.0.0/0 reject`, `host "source" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair ::/0 reject`, `host "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair 127.0.0.1/32 scram-sha-256`, `local "candidate" nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair scram-sha-256`} {
 		if !strings.Contains(b, line) {
 			t.Fatal("missing gate", line)
 		}
@@ -408,6 +408,12 @@ func TestCutoverCandidateGrantsAreClosedAndQuoted(t *testing.T) {
 	sql, err := cutoverTargetGrants("all")
 	if err != nil || !strings.Contains(sql, `DATABASE "all"`) || !strings.Contains(sql, "FROM PUBLIC") || !strings.Contains(sql, "TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump") {
 		t.Fatal("candidate CONNECT grant is not closed and quoted")
+	}
+	// Review B1: the optional capability logins get CONNECT when present.
+	for _, login := range []string{"nmcp_check", "nmcp_repair"} {
+		if !strings.Contains(sql, "rolname='"+login+"') THEN EXECUTE 'GRANT CONNECT ON DATABASE \"all\" TO "+login+"'") {
+			t.Fatalf("candidate grants omit %s: %s", login, sql)
+		}
 	}
 	for _, name := range []string{"", "x;DROP DATABASE source", "other db", strings.Repeat("x", 64)} {
 		if _, err := cutoverTargetGrants(name); err == nil {

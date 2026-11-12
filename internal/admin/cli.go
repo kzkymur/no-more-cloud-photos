@@ -284,6 +284,23 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if stateErr != nil {
 			return finish(stdout, stderr, o.json, nil, stateErr)
 		}
+		// Its fresh check still runs only as nmcp_check (review B1/D3), on a
+		// connection pinned to the owner connection's database, so a check.dsn
+		// still naming the old source refuses instead of checking it.
+		identity, identityErr := queryDatabaseIdentity(ctx, pool)
+		if identityErr != nil {
+			return finish(stdout, stderr, o.json, nil, identityErr)
+		}
+		checkDSN, credentialErr := loadCapabilityDSN(checkCredential, os.Getenv)
+		if credentialErr != nil {
+			return finish(stdout, stderr, o.json, nil, credentialErr)
+		}
+		checkPool, poolErr := openCapabilityPool(ctx, checkCredential, checkDSN, &identity)
+		if poolErr != nil {
+			return finish(stdout, stderr, o.json, nil, poolErr)
+		}
+		defer checkPool.Close()
+		service.CheckPool = checkPool
 	}
 	var result any
 	switch o.command {

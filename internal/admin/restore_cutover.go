@@ -634,7 +634,7 @@ func rewriteCutoverPassTo(b []byte, source, candidate, role, host string, port u
 }
 
 func cutoverHBA(b []byte, op RestoreOperation) []byte {
-	roles := "nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator"
+	roles := "nmcp_api,nmcp_worker,nmcp_backup_dump,nmcp_backup_control,nmcp_migrator,nmcp_check,nmcp_repair"
 	var out strings.Builder
 	fmt.Fprintf(&out, "# nmcp explicit cutover %s; source remains fenced\n", op.ID)
 	databases := []string{op.Source.DatabaseName, op.Candidate.DatabaseName}
@@ -1231,7 +1231,16 @@ func cutoverTargetGrants(database string) (string, error) {
 		return "", errCutover
 	}
 	name := pgx.Identifier{database}.Sanitize()
-	return "REVOKE CONNECT,TEMPORARY ON DATABASE " + name + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + name + " TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump", nil
+	// The reconciliation capability logins (review B1) are optional in a
+	// cluster (restoreOptionalLogins), so they get CONNECT only when present;
+	// without it check, repair and maintenance resume could never reach the
+	// restored database.
+	optional := ""
+	for _, login := range restoreOptionalLogins {
+		optional += " IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname='" + login.login + "') THEN EXECUTE " +
+			"'GRANT CONNECT ON DATABASE " + strings.ReplaceAll(name, "'", "''") + " TO " + login.login + "'; END IF;"
+	}
+	return "REVOKE CONNECT,TEMPORARY ON DATABASE " + name + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + name + " TO nmcp_api,nmcp_worker,nmcp_migrator,nmcp_backup_control,nmcp_backup_dump; DO $nmcp_cutover$ BEGIN" + optional + " END $nmcp_cutover$", nil
 }
 
 // Runtime processes must use the same FS namespace that Restore actually
