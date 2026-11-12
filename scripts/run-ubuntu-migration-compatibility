@@ -82,7 +82,9 @@ trap on_term TERM
 "$role_mode" compatibility
 
 set +e
-/usr/bin/setsid /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs \
+# Runs as root (#21 B2): nmcp-admin refuses a migrator session unless euid is 0,
+# so no uid-nmcp process ever holds the migrator credential. No new privileges.
+/usr/bin/setsid /usr/bin/setpriv --no-new-privs \
   "$admin" "$@" &
 child_pid=$!
 wait "$child_pid"

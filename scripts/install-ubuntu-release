@@ -169,7 +169,9 @@ run_admin() {
     admin_command=(/usr/local/libexec/nmcp/run-ubuntu-migration-compatibility
       "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json)
   else
-    admin_command=(/usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs
+    # Root, no new privileges (#21 B2): the migrator credential never reaches
+    # a uid-nmcp process, and nmcp-admin refuses it unless euid is 0.
+    admin_command=(/usr/bin/setpriv --no-new-privs
       "$admin_release/bin/nmcp-admin" "$operation" "$subcommand" --json)
   fi
   /usr/local/libexec/nmcp/handoff-ubuntu-migration-lock run-tracked "$$" "$owner_start" "$handoff" \

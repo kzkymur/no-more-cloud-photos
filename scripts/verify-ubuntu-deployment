@@ -6264,7 +6264,7 @@ def validate_fd_wrappers(migration_wrapper: str, role_mode: str) -> None:
         'if [[ $admin =~ ^/proc/self/fd/[0-9]+$ ]]; then',
         '[[ -f $admin && -x $admin ]]',
         'migration_status=0\nsignal_status=0\nfinalized=false\nchild_pid=',
-        '/usr/bin/setsid /usr/bin/setpriv --reuid=nmcp --regid=nmcp --init-groups --no-new-privs',
+        '/usr/bin/setsid /usr/bin/setpriv --no-new-privs \\\n  "$admin" "$@" &',
         '/usr/bin/kill -s "$signal" -- "-$child_pid" 2>/dev/null || true',
         '/usr/bin/kill -KILL -- "-$child_pid" 2>/dev/null || true',
         'signal_status=130\n  stop_child INT\n  exit 130',
@@ -10520,9 +10520,11 @@ def main() -> int:
     release_installer = text(ROOT / "scripts" / "install-ubuntu-release")
     require(
         "run-ubuntu-migration-compatibility" in migration_runner
-        and "setpriv --reuid=nmcp --regid=nmcp" in migration_compatibility
+        and "/usr/bin/setsid /usr/bin/setpriv --no-new-privs" in migration_compatibility
+        and "--reuid" not in migration_compatibility
+        and "--reuid" not in release_installer
         and 'trap \'finalize "$?"\' EXIT' in migration_compatibility,
-        "migration compatibility wrapper does not drop to nmcp and harden on exit",
+        "migration must run as root without new privileges (never as nmcp) and harden on exit",
     )
     require(
         "postgresql-role-bootstrap.sha256" in role_mode
