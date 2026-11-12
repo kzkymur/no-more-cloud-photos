@@ -707,10 +707,13 @@ func TestBackupPG17LiveCutover(t *testing.T) {
 	if e != nil {
 		t.Fatalf("nmcp_check cannot reach the cutover candidate: %v", e)
 	}
-	defer checkPool.Close()
 	resumer := New(candidate)
 	resumer.CheckPool = checkPool
-	if _, e := resumer.MaintenanceResume(ctx, store); e != nil {
+	_, resumeErr := resumer.MaintenanceResume(ctx, store)
+	// Close at once, like the one-shot CLI exiting: a later cutover requires
+	// zero live nmcp_check sessions and would otherwise refuse.
+	checkPool.Close()
+	if resumeErr != nil {
 		t.Fatal("separate actual candidate MaintenanceResume failed")
 	}
 	var checkedAs string
