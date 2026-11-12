@@ -198,7 +198,9 @@ func TestReleaseGateResources(t *testing.T) {
 		t.Fatal("resource certify spec rejected")
 	}
 	if _, err := service.ProfileCertify(ctx, decoded); err != nil {
-		t.Fatalf("certify resource profile on real helpers: %v", err)
+		// Same sanitized result the CLI prints: reason, input, check, detail.
+		failure, _ := json.Marshal(certifyFailureResult(definition.ID, err))
+		t.Fatalf("certify resource profile on real helpers: %v result=%s", err, failure)
 	}
 	if err := service.ProfileTransition(ctx, definition.ID, true); err != nil {
 		t.Fatalf("activate resource profile: sqlstate=%s", fixtureSQLState(err))
