@@ -114,6 +114,9 @@ GRANT SELECT ON reconciliation_check_reports,reconciliation_check_report_seals,r
 DO $$
 DECLARE target_schema text:=current_schema(); signature text;
 BEGIN
+    -- ALTER ... OWNER requires the new owner to hold CREATE on the schema;
+    -- grant it only for the transfer, exactly as 0018/0019 do.
+    EXECUTE format('GRANT USAGE,CREATE ON SCHEMA %I TO nmcp_check_function_owner,nmcp_repair_function_owner',target_schema);
     EXECUTE format('ALTER FUNCTION %I.nmcp_admin_read_migration_history() OWNER TO nmcp_check_function_owner',target_schema);
     FOREACH signature IN ARRAY ARRAY[
         'nmcp_admin_read_maintenance_state()',
@@ -124,6 +127,7 @@ BEGIN
     ] LOOP
         EXECUTE format('ALTER FUNCTION %I.%s OWNER TO nmcp_repair_function_owner',target_schema,signature);
     END LOOP;
+    EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM nmcp_check_function_owner,nmcp_repair_function_owner',target_schema);
     FOREACH signature IN ARRAY ARRAY[
         'nmcp_admin_read_migration_history()',
         'nmcp_admin_read_maintenance_state()',

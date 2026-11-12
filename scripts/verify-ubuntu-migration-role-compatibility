@@ -59,7 +59,7 @@ assert_migration() {
 }
 assert_current_migration() {
   # Current boundary: exactly version 25 and nothing newer or dirty.
-  assert_migration 25 admin_capability_functions 995bfaf6863629542149c9b98493deb0c09cac36ae01aaa266a0d1009b4e798c
+  assert_migration 25 admin_capability_functions 6b5cb317a7ff24caac97c585501a15fd2e2db53756ed5c12fbcf61a77f6f6bf0
   # Retain exact historical evidence rather than replacing the old assertion
   # with an unconstrained max(version) check. Future/dirty versions still fail.
   [[ $(psql_root --tuples-only --no-align --command \
