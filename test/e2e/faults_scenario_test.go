@@ -75,26 +75,26 @@ func TestReleaseGateFaults(t *testing.T) {
 			h.run("", "fault", fault.on, "on")
 			data := fixtureImage(t, "png", 1200, 900)
 			key := "e2e-" + fault.on + "-" + sha(data)[:16]
-			r := h.upload(key, "f.png", "image/png", data)
+			name := fault.on + ".png"
+			r := h.upload(key, name, "image/png", data)
 			h.run("", "fault", fault.off, "off")
 			if r.Status != 500 && r.Status != 503 {
 				t.Fatalf("upload during %s: status %d, want 500/503", fault.name, r.Status)
 			}
-			var none struct {
-				Items []media `json:"items"`
-			}
-			h.expectJSON(h.do(http.MethodGet, "/media?deleted=include&limit=200", nil, nil), 200, &none)
-			for _, m := range none.Items {
-				if m.SizeBytes == int64(len(data)) && m.OriginalFilename != nil && *m.OriginalFilename == "f.png" {
-					t.Fatal("failed upload left an accepted media row")
-				}
+			// Match exactly this upload: its bytes among the originals and its
+			// idempotency key. (Size plus filename collided with the previous
+			// subtest's recovered upload: the salted PNGs can encode to the
+			// same length.)
+			if accepted := h.dbRead(`SELECT (SELECT count(*) FROM originals WHERE sha256='` + sha(data) + `')::text || '/' ||
+				(SELECT count(*) FROM idempotency_requests WHERE key='` + key + `')::text`); accepted != "0/0" {
+				t.Fatalf("failed upload during %s left an accepted original/idempotency row (%s)", fault.name, accepted)
 			}
 			h.assertReconciled(fault.name, crashResidueKinds)
 			var up struct {
 				Media media `json:"media"`
 				Job   *job  `json:"job"`
 			}
-			h.expectJSON(h.upload(key, "f.png", "image/png", data), 201, &up)
+			h.expectJSON(h.upload(key, name, "image/png", data), 201, &up)
 			h.waitJob(up.Job.ID, "succeeded", 5*time.Minute)
 			h.assertExactlyOneCurrentPerTarget(up.Media.ID)
 			h.assertReconciled(fault.name+" recovered", crashResidueKinds)
