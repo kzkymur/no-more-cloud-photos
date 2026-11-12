@@ -606,6 +606,13 @@ func TestEvaluateCertifyRunFailsClosed(t *testing.T) {
 			"zero output":        func(tf *certifyTransformFacts, _ *certifyProbeFacts) { tf.Width = 0 },
 			"processor mismatch": func(tf *certifyTransformFacts, _ *certifyProbeFacts) { tf.SourceHeight = 0 },
 		}
+		// The pinned FFmpeg 9 ffprobe reports animated WebP as webp_anim; that
+		// name is accepted for animated WebP output only.
+		animTransformed, animProbed := certifyGoodFacts(run)
+		animProbed.Codec = "webp_anim"
+		if err := evaluateCertifyRun(run, animTransformed, animProbed); (err == nil) != (kind == profile.OutputAnimationWebP) {
+			t.Fatalf("%s with probe codec webp_anim: %v", kind, err)
+		}
 		switch kind {
 		case profile.OutputAnimationWebP:
 			mutations["frame count"] = func(_ *certifyTransformFacts, p *certifyProbeFacts) { p.FrameCount = 2 }

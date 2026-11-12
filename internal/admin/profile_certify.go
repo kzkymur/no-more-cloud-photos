@@ -771,7 +771,10 @@ func evaluateCertifyRun(run certifyRun, transformed certifyTransformFacts, probe
 		return reject("aspect")
 	}
 	p := probed
-	if p.Codec != codec || p.Width != t.Width || p.Height != t.Height || p.VideoStreams < 1 {
+	// The pinned FFmpeg 9 ffprobe names animated WebP's decoder webp_anim (older
+	// ffprobe: webp); the RIFF ANIM/ANMF walk in Probe proves animation either way.
+	codecMatches := p.Codec == codec || run.OutputKind == profile.OutputAnimationWebP && p.Codec == "webp_anim"
+	if !codecMatches || p.Width != t.Width || p.Height != t.Height || p.VideoStreams < 1 {
 		return reject("probe_identity")
 	}
 	switch run.OutputKind {
