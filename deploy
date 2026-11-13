@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+# One-command deployment of this checkout onto an Ubuntu 26.04 amd64 host.
+#
+#   sudo ./deploy --check     preflight and plan only; changes nothing
+#   sudo ./deploy             preflight, then apply the plan
+#
+# Reads one config file (default /etc/nmcp/deploy.conf, see
+# infra/ubuntu/deploy.conf.example). Idempotent: every step first checks
+# whether its result already exists and is skipped if so. Fail-closed: any
+# preflight blocker stops before the first change, and the deploy never
+# guesses a value it cannot verify (it never formats or mounts disks, never
+# changes the UFW default policy, and never touches `tailscale serve`,
+# Funnel, or port 443).
+set -euo pipefail
+umask 0077
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+scripts=$repo/scripts
+config=/etc/nmcp/deploy.conf
+mode=apply
+usage() {
+  printf 'usage: sudo ./deploy [--check] [--config FILE]\n' >&2
+  exit 2
+}
+while (($#)); do
+  case "$1" in
+    --check) mode=check; shift ;;
+    --config) (($# >= 2)) || usage; config=$2; shift 2 ;;
+    -h|--help) usage ;;
+    *) usage ;;
+  esac
+done
+
+state=/etc/nmcp/deploy                 # root-only generated secrets and inputs
+pg_unit=postgresql@17-main.service
+pgdg_list=/etc/apt/sources.list.d/pgdg.sources
+pgdg_key=/usr/share/keyrings/nmcp-pgdg.asc
+# apt.postgresql.org signing key (ACCC4CF8), as published by the PostgreSQL project.
+pgdg_fingerprint=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+
+blockers=()
+plan=()
+log() { printf '==> %s\n' "$*"; }
+note() { printf '    %s\n' "$*"; }
+block() { blockers+=("$*"); }
+todo() { plan+=("$*"); }
+die() { printf 'deploy: error: %s\n' "$*" >&2; exit 1; }
+git_() { git -c safe.directory="$repo" -C "$repo" "$@"; }
+
+# ---------------------------------------------------------------- config ----
+read_config() {
+  [[ -f $config && ! -L $config ]] || die "config $config not found (copy infra/ubuntu/deploy.conf.example)"
+  [[ $(stat -c '%U:%a' "$config") == root:600 || $(stat -c '%U:%a' "$config") == root:644 ]] \
+    || die "$config must be owned by root, mode 0600 or 0644"
+  local key value line
+  declare -gA cfg=(
+    [NMCP_TAILNET_HOSTNAME]='' [NMCP_DATA_MOUNT]='' [NMCP_API_PORT]=8443
+    [NMCP_FILES_PORT]=8444 [NMCP_TAILSCALE_AUTHKEY_FILE]='' [NMCP_BUILD_JOBS]=2
+  )
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ $line =~ ^([A-Z_]+)=([^[:space:]\"\'\\\$\`]*)$ ]] || die "config: unparseable line: $line"
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    [[ -v cfg[$key] ]] || die "config: unknown key $key"
+    cfg[$key]=$value
+  done <"$config"
+  hostname=${cfg[NMCP_TAILNET_HOSTNAME]}
+  data_mount=${cfg[NMCP_DATA_MOUNT]}
+  api_port=${cfg[NMCP_API_PORT]}
+  files_port=${cfg[NMCP_FILES_PORT]}
+  authkey_file=${cfg[NMCP_TAILSCALE_AUTHKEY_FILE]}
+  jobs=${cfg[NMCP_BUILD_JOBS]}
+  [[ $hostname =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+    || die "config: NMCP_TAILNET_HOSTNAME must be the host's full Tailnet DNS name"
+  [[ $data_mount == /* && $data_mount != / ]] || die "config: NMCP_DATA_MOUNT must be an absolute mount point"
+  local port
+  for port in "$api_port" "$files_port"; do
+    if ! [[ $port =~ ^[1-9][0-9]{0,4}$ ]] || ((port > 65535)); then die "config: invalid port $port"; fi
+    case $port in
+      80|443) die "config: port $port is reserved for the host's existing publishing" ;;
+      5432|8080) die "config: port $port is used internally by the deployment" ;;
+    esac
+  done
+  [[ $api_port != "$files_port" ]] || die "config: API and files ports must differ"
+  [[ $jobs =~ ^[1-9][0-9]?$ ]] || die "config: NMCP_BUILD_JOBS must be 1..99"
+}
+
+# ------------------------------------------------------------- preflight ----
+listeners_on() { # PORT -> "addr pid-info" lines of TCP listeners on PORT
+  ss -ltnpH "sport = :$1" 2>/dev/null || true
+}
+unit_pids() { # UNIT -> PIDs in its cgroup
+  local cg
+  cg=$(systemctl show -p ControlGroup --value -- "$1" 2>/dev/null || true)
+  if [[ -n $cg && -r /sys/fs/cgroup$cg/cgroup.procs ]]; then cat "/sys/fs/cgroup$cg/cgroup.procs"; fi
+}
+port_owned_by() { # PORT UNIT -> 0 if every listener on PORT belongs to UNIT
+  local lines pids pid
+  lines=$(listeners_on "$1")
+  [[ -n $lines ]] || return 0
+  pids=$(unit_pids "$2")
+  [[ -n $pids ]] || return 1
+  while read -r pid; do
+    grep -qx "$pid" <<<"$pids" || return 1
+  done < <(grep -o 'pid=[0-9]*' <<<"$lines" | cut -d= -f2 | sort -u)
+}
+
+preflight() {
+  log "preflight ($mode mode, config $config)"
+  [[ $EUID -eq 0 ]] || die "run as root (sudo ./deploy)"
+  local os_id os_version
+  # shellcheck disable=SC1091
+  os_id=$(. /etc/os-release && printf '%s' "$ID")
+  # shellcheck disable=SC1091
+  os_version=$(. /etc/os-release && printf '%s' "$VERSION_ID")
+  [[ $os_id == ubuntu && $os_version == 26.04 ]] \
+    || die "only Ubuntu 26.04 is supported (found $os_id $os_version)"
+  [[ $(dpkg --print-architecture) == amd64 ]] || die "only amd64 is supported"
+  [[ -z $(git_ status --porcelain --untracked-files=normal) ]] \
+    || die "the checkout has local changes; deploy only a clean, reviewed commit"
+  head=$(git_ rev-parse HEAD)
+  release_id=$(TZ=UTC git_ show -s --date=format-local:%Y%m%d --format=%cd HEAD)-${head:0:7}
+  note "commit $head -> release $release_id"
+  read_config
+
+  # Data disk: verify only. /var/lib/nmcp and /var/lib/nmcp-backup must already
+  # live on the mounted data filesystem (directly or via a bind mount).
+  local fstype dev path
+  if ! fstype=$(findmnt -nro FSTYPE --mountpoint "$data_mount" 2>/dev/null) || [[ -z $fstype ]]; then
+    block "NMCP_DATA_MOUNT $data_mount is not a mount point; mount the HDD there first (deploy never mounts or formats)"
+  else
+    case $fstype in tmpfs|ramfs|overlay|squashfs) block "$data_mount is $fstype, not a durable disk" ;; esac
+    dev=$(stat -c %d "$data_mount")
+    for path in /var/lib/nmcp /var/lib/nmcp-backup; do
+      if [[ ! -d $path || -L $path ]]; then
+        block "$path does not exist; create it on the HDD and bind-mount it, e.g. fstab: $data_mount/${path##*/} $path none bind 0 0"
+      elif [[ $(stat -c %d "$path") != "$dev" ]]; then
+        block "$path is not on $data_mount's filesystem; bind-mount it from the HDD (fstab: $data_mount/${path##*/} $path none bind 0 0)"
+      fi
+    done
+    note "data disk $data_mount ($fstype) $(df -h --output=avail "$data_mount" | tail -1 | tr -d ' ') free"
+  fi
+
+  # Tailscale: joined, the configured name is this node, Funnel/serve leave our ports alone.
+  tailnet_ip=''
+  if ! command -v tailscale >/dev/null; then
+    block "tailscale is not installed"
+  else
+    local ts ts_json serve_json
+    ts_json=$(tailscale status --json 2>/dev/null) || ts_json=''
+    ts=$(TS_JSON=$ts_json python3 -I - <<'PY' || true
+import json, os
+try:
+    s = json.loads(os.environ["TS_JSON"])
+except ValueError:
+    print("unreachable - -"); raise SystemExit
+state = s.get("BackendState")
+me = s.get("Self") or {}
+name = (me.get("DNSName") or "").rstrip(".")
+v4 = [a for a in me.get("TailscaleIPs") or [] if ":" not in a]
+print(state, name or "-", v4[0] if v4 else "-")
+PY
+)
+    read -r ts_state ts_name ts_ip <<<"$ts"
+    if [[ $ts_state == unreachable || -z $ts_state ]]; then
+      block "cannot read 'tailscale status --json' (is tailscaled running?)"
+    elif [[ $ts_state == Running ]]; then
+      [[ $ts_name == "$hostname" ]] \
+        || block "this node's Tailnet name is $ts_name, not NMCP_TAILNET_HOSTNAME=$hostname"
+      tailnet_ip=$ts_ip
+      note "tailscale joined as $ts_name (up is skipped)"
+    elif [[ -n $authkey_file ]]; then
+      [[ -f $authkey_file && ! -L $authkey_file && $(stat -c '%U:%a' "$authkey_file") == root:600 ]] \
+        || block "NMCP_TAILSCALE_AUTHKEY_FILE must be a root-owned 0600 file"
+      todo "tailscale up --auth-key=file:$authkey_file (not joined yet)"
+    else
+      block "tailscale is not joined and NMCP_TAILSCALE_AUTHKEY_FILE is not set"
+    fi
+    local conflicts
+    if ! serve_json=$(tailscale serve status --json 2>/dev/null); then
+      block "cannot read 'tailscale serve status --json'; refusing to guess which ports it uses"
+      serve_json='{}'
+    fi
+    conflicts=$(TS_JSON=$serve_json python3 -I - "$api_port" "$files_port" <<'PY' || echo "unreadable serve config"
+import json, os, sys
+ports = set(sys.argv[1:])
+cfg = json.loads(os.environ["TS_JSON"].strip() or "{}") or {}
+bad = sorted(p for p in (cfg.get("TCP") or {}) if p in ports)
+bad += sorted(k for k, on in (cfg.get("AllowFunnel") or {}).items()
+              if on and k.rsplit(":", 1)[-1] in ports)
+print(" ".join(bad))
+PY
+)
+    [[ -z $conflicts ]] || block "tailscale serve/Funnel already claims the configured port(s): $conflicts"
+    note "existing tailscale serve/Funnel configuration (including 443) is left untouched"
+  fi
+
+  # Ports: free, or already held by this deployment's own units.
+  local port
+  for port in "$api_port" "$files_port"; do
+    if ! port_owned_by "$port" nmcp-files.service; then
+      block "port $port is already in use: $(listeners_on "$port" | tr -s ' ' | head -1)"
+    fi
+  done
+  port_owned_by 8080 nmcp-api.service || block "127.0.0.1:8080 is already in use by another process"
+  port_owned_by 5432 "$pg_unit" || block "port 5432 is in use by something other than $pg_unit"
+
+  # Firewall: UFW must already be active with default-deny incoming. The deploy
+  # adds only the two Tailnet-interface rules and never changes the policy.
+  if ! command -v ufw >/dev/null; then
+    block "ufw is not installed; install it, allow your management access, set 'ufw default deny incoming' and 'ufw enable' from a console"
+  else
+    local ufw_status ufw_added rule tmp
+    ufw_status=$(ufw status verbose 2>/dev/null || true)
+    ufw_added=$(ufw show added 2>/dev/null || true)
+    if ! grep -qE '^Status: +active' <<<"$ufw_status" || ! grep -qE '^Default: +deny \(incoming\)' <<<"$ufw_status"; then
+      block "UFW must already be active with 'Default: deny (incoming)'; set it up from a console with your management allow first"
+    elif [[ -n $tailnet_ip ]]; then
+      for port in "$api_port" "$files_port"; do
+        rule="ufw allow in on tailscale0 to $tailnet_ip port $port proto tcp"
+        if ! tr -s ' ' <<<"$ufw_added" | grep -qxF "$rule"; then
+          todo "add firewall rule: $rule"
+          ufw_added+=$'\n'"$rule"
+        fi
+      done
+      tmp=$(mktemp -d)
+      printf '%s\n' "$ufw_status" >"$tmp/status"
+      printf '%s\n' "$ufw_added" >"$tmp/added"
+      "$scripts/verify-ubuntu-firewall" --tailnet-ip "$tailnet_ip" --api-port "$api_port" \
+        --files-port "$files_port" --status-file "$tmp/status" --added-file "$tmp/added" >/dev/null 2>"$tmp/err" \
+        || block "UFW rules would not pass verify-ubuntu-firewall: $(cat "$tmp/err")"
+      rm -rf -- "$tmp"
+    fi
+  fi
+
+  # Packages.
+  local pkg missing=()
+  mapfile -t packages < <(grep -vE '^\s*(#|$)' "$repo/infra/ubuntu/packages.txt")
+  for pkg in "${packages[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || missing+=("$pkg")
+  done
+  [[ -f $pgdg_list ]] || todo "add the PGDG apt repository (resolute-pgdg, key $pgdg_fingerprint)"
+  if ((${#missing[@]})); then
+    todo "install packages: ${missing[*]}"
+    if [[ " ${missing[*]} " == *" nginx-core "* ]] && ! systemctl cat nginx.service >/dev/null 2>&1; then
+      todo "mask the distribution nginx.service before installing nginx-core (only nmcp-files.service runs Nginx)"
+    fi
+  fi
+  if dpkg-query -W -f='${Status}' postgresql-18 2>/dev/null | grep -q 'install ok installed'; then
+    block "postgresql-18 is installed; the backup tools must resolve to PostgreSQL 17 (remove 18 or review manually)"
+  fi
+
+  # PostgreSQL cluster and database.
+  if [[ $(systemctl show -p LoadState --value "$pg_unit" 2>/dev/null) != loaded ]]; then
+    todo "create/start the PostgreSQL 17 cluster ($pg_unit)"
+  elif ! runuser -u postgres -- psql -XAtq -d nmcp -c 'select 1' >/dev/null 2>&1; then
+    todo "create database nmcp"
+  fi
+  todo "run the role bootstrap and set generated role passwords (idempotent)"
+
+  # Release.
+  if [[ -d /opt/nmcp/releases/$release_id ]]; then
+    note "release $release_id already installed; build is skipped"
+  else
+    todo "build release $release_id on this host (first build takes ~40 min, $jobs jobs)"
+    local avail
+    avail=$(df --output=avail -B1G /var/tmp | tail -1 | tr -d ' ')
+    ((avail >= 15)) || block "/var/tmp needs >= 15 GiB free for the build (has ${avail} GiB)"
+  fi
+  if [[ $(readlink -f /opt/nmcp/current 2>/dev/null) == "/opt/nmcp/releases/$release_id" ]]; then
+    note "release $release_id is already active"
+  else
+    todo "stage and activate release $release_id"
+  fi
+  todo "install host assets (units, Nginx on $tailnet_ip:$api_port and :$files_port, TLS from 'tailscale cert') if changed"
+  todo "install backup configuration and wake timer if changed"
+  todo "verify services, readiness and firewall"
+}
+
+print_plan() {
+  local item
+  log "plan"
+  for item in "${plan[@]}"; do note "- $item"; done
+  if ((${#blockers[@]})); then
+    log "BLOCKED: fix these and rerun (nothing was changed)"
+    for item in "${blockers[@]}"; do printf '    ! %s\n' "$item" >&2; done
+    return 1
+  fi
+  log "preflight passed"
+}
+
+acl_snippet() {
+  cat <<EOF
+==> Tailscale ACL (apply manually in the admin console; deploy has no API token):
+    {"action": "accept", "src": ["<your devices or group>"],
+     "dst": ["<this node or tag>:$api_port", "<this node or tag>:$files_port"]}
+EOF
+}
+
+# --------------------------------------------------------------- apply ------
+secret() { # NAME -> prints a generated secret, created once and reused
+  local file=$state/secrets/$1
+  if [[ ! -s $file ]]; then
+    install -d -m 0700 "$state/secrets"
+    python3 -I -c 'import secrets; print(secrets.token_urlsafe(32))' >"$file.new"
+    chmod 0600 "$file.new"
+    mv -f -- "$file.new" "$file"
+  fi
+  cat -- "$file"
+}
+
+write_if_changed() { # PATH MODE <stdin> -> returns 0 if changed
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX")
+  cat >"$tmp"
+  chmod "$2" "$tmp"
+  if [[ -f $1 ]] && cmp -s "$tmp" "$1"; then rm -f -- "$tmp"; return 1; fi
+  mv -f -- "$tmp" "$1"
+}
+
+psql_admin() { runuser -u postgres -- psql -X --set=ON_ERROR_STOP=1 --dbname=nmcp "$@"; }
+
+step_packages() {
+  log "packages"
+  if [[ ! -f $pgdg_list ]]; then
+    local tmp
+    tmp=$(mktemp -d)
+    curl --fail --location --silent --show-error --proto '=https' \
+      https://www.postgresql.org/media/keys/ACCC4CF8.asc -o "$tmp/key.asc"
+    gpg --batch --quiet --with-colons --import-options show-only --import "$tmp/key.asc" \
+      | grep -q "^fpr:::::::::$pgdg_fingerprint:" || die "PGDG signing key fingerprint mismatch"
+    install -m 0644 "$tmp/key.asc" "$pgdg_key"
+    rm -rf -- "$tmp"
+    printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: resolute-pgdg\nComponents: main\nSigned-By: %s\n' \
+      "$pgdg_key" | write_if_changed "$pgdg_list" 0644 || true
+  fi
+  if ! dpkg-query -W -f='${Status}' nginx-core 2>/dev/null | grep -q 'install ok installed' \
+    && ! systemctl cat nginx.service >/dev/null 2>&1; then
+    systemctl mask nginx.service
+  fi
+  "$scripts/infra-apt-install" "${packages[@]}"
+  # Deployment evidence: where PostgreSQL 17 came from and which key signed it.
+  install -d -m 0700 /var/lib/nmcp/deployment
+  {
+    printf 'pgdg_source=%s\n' "$pgdg_list"
+    printf 'pgdg_signing_key_fingerprint=%s\n' "$pgdg_fingerprint"
+    cat -- "$pgdg_list"
+    apt-cache policy postgresql-17 postgresql-client-17
+  } | write_if_changed /var/lib/nmcp/deployment/postgresql-source.txt 0600 || true
+}
+
+step_postgresql() {
+  log "PostgreSQL 17 cluster and roles"
+  if [[ $(systemctl show -p LoadState --value "$pg_unit") != loaded ]] || ! pg_lsclusters -h | grep -q '^17 main '; then
+    pg_createcluster 17 main
+  fi
+  systemctl enable --now "$pg_unit"
+  psql_admin -d postgres -XAtq -c 'select 1' >/dev/null
+  if ! psql_admin -XAtq -c 'select 1' >/dev/null 2>&1; then
+    runuser -u postgres -- createdb --encoding=UTF8 nmcp
+  fi
+  psql_admin --set=nmcp_migration_compatibility=0 --file=- <"$repo/infra/ubuntu/postgresql-roles.sql" >/dev/null
+  # Passwords travel only as SCRAM verifiers on stdin: never argv, env or logs.
+  local role
+  for role in migrator api worker check repair backup_control backup_dump; do
+    secret "$role" >/dev/null
+  done
+  python3 -I - "$state/secrets" <<'PY' | psql_admin -q >/dev/null
+import base64, hashlib, hmac, os, sys
+def scram(password: str) -> str:
+    salt, n = os.urandom(16), 4096
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, n)
+    client = hmac.new(salted, b"Client Key", "sha256").digest()
+    server = hmac.new(salted, b"Server Key", "sha256").digest()
+    b64 = lambda b: base64.b64encode(b).decode()
+    return f"SCRAM-SHA-256${n}:{b64(salt)}${b64(hashlib.sha256(client).digest())}:{b64(server)}"
+for role in ("migrator", "api", "worker", "check", "repair", "backup_control", "backup_dump"):
+    with open(os.path.join(sys.argv[1], role), encoding="ascii") as f:
+        password = f.read().strip()
+    print(f"ALTER ROLE nmcp_{role} PASSWORD '{scram(password)}';")
+PY
+}
+
+dsn() { printf 'postgres://nmcp_%s:%s@127.0.0.1:5432/nmcp?sslmode=disable' "$1" "$(secret "$1")"; }
+
+render_config() {
+  local host_dir=$state/host-config base_url="https://$hostname:$files_port/files/"
+  install -d -m 0700 "$state" "$host_dir" /etc/nmcp /etc/nmcp/credentials
+  sed -e "s|^NMCP_DATABASE_URL=.*|NMCP_DATABASE_URL=$(dsn migrator)|" \
+    "$repo/infra/ubuntu/env/admin.env.example" | write_if_changed "$host_dir/admin.env" 0600 || true
+  sed -e "s|^NMCP_DATABASE_URL=.*|NMCP_DATABASE_URL=$(dsn api)|" \
+    -e "s|^NMCP_FILE_BASE_URL=.*|NMCP_FILE_BASE_URL=$base_url|" \
+    -e "s|^NMCP_CURSOR_HMAC_KEY=.*|NMCP_CURSOR_HMAC_KEY=$(secret cursor_hmac)|" \
+    "$repo/infra/ubuntu/env/api.env.example" | write_if_changed "$host_dir/api.env" 0600 || true
+  sed -e "s|^NMCP_DATABASE_URL=.*|NMCP_DATABASE_URL=$(dsn worker)|" \
+    -e "s|^NMCP_FILE_BASE_URL=.*|NMCP_FILE_BASE_URL=$base_url|" \
+    "$repo/infra/ubuntu/env/worker.env.example" | write_if_changed "$host_dir/worker.env" 0600 || true
+  sed -e "s|^NMCP_FILE_BASE_URL=.*|NMCP_FILE_BASE_URL=$base_url|" \
+    "$repo/infra/ubuntu/env/capability.env.example" | write_if_changed /etc/nmcp/capability.env 0600 || true
+  local name role
+  for name in admin check repair; do
+    role=$name
+    [[ $name == admin ]] && role=migrator
+    { dsn "$role"; printf '\n'; } | write_if_changed "/etc/nmcp/credentials/$name.dsn" 0600 || true
+  done
+  # TLS from tailscale cert, renewed when missing or within 14 days of expiry.
+  install -d -m 0700 "$state/tls"
+  if [[ ! -s $state/tls/cert.pem ]] || ! openssl x509 -checkend $((14 * 86400)) -noout -in "$state/tls/cert.pem" >/dev/null; then
+    tailscale cert --cert-file "$state/tls/cert.pem" --key-file "$state/tls/key.pem" "$hostname"
+    chmod 0600 "$state/tls/cert.pem" "$state/tls/key.pem"
+  fi
+  # Host inputs digest: repo assets + rendered inputs (TLS handled separately).
+  local digest
+  digest=$( { git_ rev-parse HEAD:infra/ubuntu HEAD:scripts; cat "$host_dir"/*.env;
+    printf '%s %s %s %s\n' "$tailnet_ip" "$api_port" "$files_port" "$hostname"; } | sha256sum | cut -d' ' -f1)
+  host_digest=$digest
+  host_dirty=false
+  [[ $(cat "$state/host-digest" 2>/dev/null) == "$digest" && -e /etc/systemd/system/nmcp.target ]] \
+    || host_dirty=true
+}
+
+step_firewall() {
+  log "firewall"
+  local port
+  for port in "$api_port" "$files_port"; do
+    ufw allow in on tailscale0 to "$tailnet_ip" port "$port" proto tcp >/dev/null
+  done
+  "$scripts/verify-ubuntu-firewall" --tailnet-ip "$tailnet_ip" --api-port "$api_port" --files-port "$files_port"
+}
+
+step_release_build() {
+  if [[ -d /opt/nmcp/releases/$release_id ]]; then return; fi
+  log "build release $release_id"
+  # Same budget as nmcp.slice (2 CPUs, 4 GiB), low CPU/IO priority, so the
+  # build cannot starve other workloads on the host.
+  systemd-run --scope --quiet --collect --unit="nmcp-release-build-${release_id//./-}" \
+    -p CPUQuota=200% -p MemoryMax=4G -p MemorySwapMax=1G \
+    /usr/bin/env NMCP_BUILD_JOBS="$jobs" /usr/bin/nice -n 10 /usr/bin/ionice -c 3 \
+    "$scripts/build-ubuntu-release" --install-build-deps
+  log "stage release $release_id"
+  "$scripts/install-ubuntu-release" stage "/var/lib/nmcp-build/releases/$release_id" "$release_id"
+  rm -rf -- "/var/lib/nmcp-build/releases/${release_id:?}"
+}
+
+step_host() {
+  local tls_current
+  tls_current=$(readlink -f /etc/nmcp/tls-current 2>/dev/null || true)
+  if $host_dirty; then
+    log "install host assets"
+    systemctl stop nmcp.target nmcp-files.service 2>/dev/null || true
+    "$scripts/install-ubuntu-host" --config-dir "$state/host-config" \
+      --api-listen "$tailnet_ip:$api_port" --files-listen "$tailnet_ip:$files_port" \
+      --tailnet-hostname "$hostname" --postgresql-unit "$pg_unit" \
+      --tls-cert "$state/tls/cert.pem" --tls-key "$state/tls/key.pem"
+    printf '%s\n' "$host_digest" >"$state/host-digest"
+    host_reinstalled=true
+  elif [[ -n $tls_current ]] && ! cmp -s "$tls_current/cert.pem" "$state/tls/cert.pem"; then
+    log "renew TLS certificate"
+    /usr/local/libexec/nmcp/renew-ubuntu-tls "$state/tls/cert.pem" "$state/tls/key.pem"
+  fi
+}
+
+step_activate() {
+  if [[ $(readlink -f /opt/nmcp/current 2>/dev/null) == "/opt/nmcp/releases/$release_id" ]]; then
+    if $host_reinstalled; then
+      log "restart services on the reinstalled host assets"
+      systemctl start nmcp.target
+    fi
+    return
+  fi
+  log "activate release $release_id"
+  "$scripts/install-ubuntu-release" activate "$release_id"
+}
+
+step_backup() {
+  log "backup configuration"
+  psql_admin --set=nmcp_migration_compatibility=0 --set=nmcp_backup_grants_after_migration=1 \
+    --file=- <"$repo/infra/ubuntu/postgresql-roles.sql" >/dev/null
+  local dir=$state/backup-config changed=false role
+  install -d -m 0700 "$dir"
+  sed -e '/^# Notification is required/,$d' "$repo/infra/ubuntu/env/backup.env.example" \
+    | { cat; printf 'NMCP_BACKUP_NOTIFY_HOOK=/usr/local/libexec/nmcp/backup-notify\n'; } \
+    | write_if_changed "$dir/backup.env" 0600 && changed=true
+  for role in control dump; do
+    [[ $role == control ]] || printf '\n'
+    printf '[nmcp_backup_%s]\nhost=/var/run/postgresql\nport=5432\ndbname=nmcp\nuser=nmcp_backup_%s\nsslmode=disable\n' \
+      "$role" "$role"
+  done | write_if_changed "$dir/backup.pg_service.conf" 0600 && changed=true
+  for role in dump control; do
+    printf 'localhost:5432:nmcp:nmcp_backup_%s:%s\n/var/run/postgresql:5432:nmcp:nmcp_backup_%s:%s\n' \
+      "$role" "$(secret "backup_$role")" "$role" "$(secret "backup_$role")" \
+      | write_if_changed "$dir/backup-$role.pgpass" 0600 && changed=true
+  done
+  install -o root -g root -m 0755 "$repo/infra/ubuntu/backup-notify" /usr/local/libexec/nmcp/backup-notify
+  if $changed || $host_reinstalled || ! systemctl is-enabled --quiet nmcp-backup.timer; then
+    "$scripts/install-backup-config" --config-dir "$dir"
+  fi
+}
+
+step_verify() {
+  log "verify"
+  local unit
+  for unit in "$pg_unit" nmcp-api.service nmcp-worker.service nmcp-files.service nmcp-backup.timer nmcp-tls-expiry.timer; do
+    systemctl is-active --quiet "$unit" || die "$unit is not active"
+  done
+  curl --fail --silent --show-error http://127.0.0.1:8080/readyz >/dev/null || die "API readiness failed"
+  "$scripts/verify-ubuntu-firewall" --tailnet-ip "$tailnet_ip" --api-port "$api_port" --files-port "$files_port" >/dev/null
+  log "deployed release $release_id"
+  note "API:   https://$hostname:$api_port/"
+  note "Files: https://$hostname:$files_port/files/"
+}
+
+# ---------------------------------------------------------------- main -----
+lock=/run/nmcp-deploy-cli.lock
+exec 9>"$lock"
+flock -n 9 || die "another deploy is running"
+preflight
+if [[ $mode == check ]]; then
+  print_plan || exit 1
+  acl_snippet
+  log "check mode: nothing was changed"
+  exit 0
+fi
+print_plan || exit 1
+host_dirty=true host_reinstalled=false host_digest=''
+if [[ -z $tailnet_ip ]]; then
+  log "join the Tailnet"
+  tailscale up --auth-key="file:$authkey_file"
+  exec 9>&-
+  exec "$0" --config "$config"
+fi
+step_packages
+step_postgresql
+render_config
+step_firewall
+step_release_build
+step_host
+step_activate
+step_backup
+step_verify
+acl_snippet
