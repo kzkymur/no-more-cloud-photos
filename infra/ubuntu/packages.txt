@@ -17,3 +17,15 @@ postgresql-client-17
 tzdata
 ufw
 util-linux
+# System half of the release's native library closure (the pinned codecs ship
+# inside the release). scripts/build-ubuntu-release prints the exact list as
+# "closure: system runtime packages"; keep this block equal to it.
+libde265-0
+libexif12
+libexpat1
+libgcc-s1
+libglib2.0-0t64
+libjpeg-turbo8
+libpng16-16t64
+libstdc++6
+zlib1g
