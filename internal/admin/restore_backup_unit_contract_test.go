@@ -21,8 +21,11 @@ func backupContractCommand(t *testing.T, args []string) any {
 	return []any{args[0], args, []string{}, uint64(123), uint64(456), uint64(789), uint64(800), uint32(42), int32(1), int32(0)}
 }
 func backupContractFixture(t *testing.T) map[string]json.RawMessage {
+	return backupContractFixtureFor(t, backupManager255)
+}
+func backupContractFixtureFor(t *testing.T, m backupManager) map[string]json.RawMessage {
 	p := map[string]json.RawMessage{}
-	for _, spec := range backupUnitServiceProperties() {
+	for _, spec := range backupUnitServiceProperties(m) {
 		if spec.want != nil {
 			p[spec.name] = backupContractJSON(t, spec.want)
 		} else {
@@ -38,22 +41,22 @@ func backupContractFixture(t *testing.T) map[string]json.RawMessage {
 }
 func TestBackupUnitEffectiveContract(t *testing.T) {
 	p := backupContractFixture(t)
-	if e := validateBackupUnitEffective(p, false); e != nil {
+	if e := validateBackupUnitEffective(p, false, backupManager255); e != nil {
 		t.Fatal(e)
 	}
 	// Every required safety property must be present and non-null.
-	for _, spec := range backupUnitServiceProperties() {
+	for _, spec := range backupUnitServiceProperties(backupManager255) {
 		t.Run("missing-"+spec.name, func(t *testing.T) {
 			q := backupContractFixture(t)
 			delete(q, spec.name)
-			if validateBackupUnitEffective(q, false) == nil {
+			if validateBackupUnitEffective(q, false, backupManager255) == nil {
 				t.Fatal("missing property accepted")
 			}
 		})
 		t.Run("null-"+spec.name, func(t *testing.T) {
 			q := backupContractFixture(t)
 			q[spec.name] = json.RawMessage(`null`)
-			if validateBackupUnitEffective(q, false) == nil {
+			if validateBackupUnitEffective(q, false, backupManager255) == nil {
 				t.Fatal("null property accepted")
 			}
 		})
@@ -77,19 +80,19 @@ func TestBackupUnitEffectiveContract(t *testing.T) {
 		t.Run("unsafe-"+c.name, func(t *testing.T) {
 			q := backupContractFixture(t)
 			q[c.name] = backupContractJSON(t, c.value)
-			if validateBackupUnitEffective(q, false) == nil {
+			if validateBackupUnitEffective(q, false, backupManager255) == nil {
 				t.Fatal("unsafe property accepted")
 			}
 		})
 	}
 	binds := []any{[]any{"/opt/nmcp-native-ci", "/opt/nmcp-native-ci", false, 16384}, []any{"/opt/nmcp-pg17-ci", "/opt/nmcp-pg17-ci", false, 16384}}
 	p["BindReadOnlyPaths"] = backupContractJSON(t, binds)
-	if validateBackupUnitEffective(p, false) == nil || validateBackupUnitEffective(p, true) != nil {
+	if validateBackupUnitEffective(p, false, backupManager255) == nil || validateBackupUnitEffective(p, true, backupManager255) != nil {
 		t.Fatal("exact independently-attested read-only bind contract")
 	}
 	for _, bad := range []any{[]any{}, binds[:1], []any{binds[0], binds[0]}, []any{[]any{"/opt/nmcp-native-ci", "/run/nmcp-backup", false, 16384}, binds[1]}, []any{[]any{"/opt/nmcp-native-ci", "/opt/nmcp-native-ci", true, 16384}, binds[1]}, []any{[]any{"/opt/nmcp-native-ci", "/opt/nmcp-native-ci", false, 0}, binds[1]}, []any{[]any{"/opt/nmcp-native-ci", "/opt/nmcp-native-ci", false, 16385}, binds[1]}} {
 		p["BindReadOnlyPaths"] = backupContractJSON(t, bad)
-		if validateBackupUnitEffective(p, true) == nil {
+		if validateBackupUnitEffective(p, true, backupManager255) == nil {
 			t.Fatal("unattested/remapped/weak/duplicate bind accepted")
 		}
 	}
@@ -132,7 +135,7 @@ func TestBackupUnitProductionTemplateContract(t *testing.T) {
 		}
 		p[pair[1]] = backupContractJSON(t, rows)
 	}
-	for _, spec := range backupUnitServiceProperties() {
+	for _, spec := range backupUnitServiceProperties(backupManager255) {
 		values, ok := fields[spec.name]
 		if !ok || len(values) != 1 {
 			continue
@@ -154,7 +157,7 @@ func TestBackupUnitProductionTemplateContract(t *testing.T) {
 		}
 		p[key] = backupContractJSON(t, n)
 	}
-	if e := validateBackupUnitEffective(p, false); e != nil {
+	if e := validateBackupUnitEffective(p, false, backupManager255); e != nil {
 		t.Fatal(e)
 	}
 }
@@ -266,7 +269,7 @@ func TestBackupPGDependencyEffectiveTargets(t *testing.T) {
 		t.Fatal("file-derived authority substituted")
 	}
 	found := map[string]string{}
-	for _, p := range backupUnitIdentityProperties() {
+	for _, p := range backupUnitIdentityProperties(backupManager255) {
 		found[p.name] = p.signature
 	}
 	if found["Requires"] != "as" || found["After"] != "as" {

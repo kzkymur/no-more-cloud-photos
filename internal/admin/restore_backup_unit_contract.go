@@ -21,6 +21,17 @@ import (
 	"unicode"
 )
 
+// backupManager is the systemd manager major whose semantics an allow-set
+// encodes. Each supported major has its own exact sets, re-derived from that
+// release's sources and proven on a real manager; any other version fails
+// closed rather than being validated against the wrong rules.
+type backupManager int
+
+const (
+	backupManager255 backupManager = 255 // Ubuntu 24.04
+	backupManager259 backupManager = 259 // Ubuntu 26.04
+)
+
 type backupUnitProperty struct {
 	name, signature string
 	want            any
@@ -52,18 +63,38 @@ var backupUnitEdgeProperties = []string{
 	"PropagatesReloadTo", "ReloadPropagatedFrom", "PropagatesStopTo", "StopPropagatedFrom", "JoinsNamespaceOf",
 }
 
-// The canonical unit's RequiresMountsFor set in systemd v255: the explicit
-// RequiresMountsFor=/var/lib/nmcp-backup, /var/tmp from PrivateTmp=yes and
-// /run/nmcp-backup from RuntimeDirectory= (unit_add_exec_dependencies).
-var backupUnitMountPaths = []string{"/var/lib/nmcp-backup", "/var/tmp", "/run/nmcp-backup"}
+// The canonical unit's RequiresMountsFor set. In both releases the explicit
+// RequiresMountsFor=/var/lib/nmcp-backup and /run/nmcp-backup from
+// RuntimeDirectory= (unit_add_exec_dependencies) are required. PrivateTmp=yes
+// adds /var/tmp to RequiresMountsFor in v255 (unit_require_mounts_for), while
+// v259 adds /tmp and /var/tmp to WantsMountsFor instead (unit_add_mounts_for
+// UNIT_MOUNT_WANTS, PRIVATE_TMP_CONNECTED; path_simplify drops the slash).
+func backupUnitRequiredMountPaths(m backupManager) []string {
+	if m == backupManager259 {
+		return []string{"/var/lib/nmcp-backup", "/run/nmcp-backup"}
+	}
+	return []string{"/var/lib/nmcp-backup", "/var/tmp", "/run/nmcp-backup"}
+}
 
-func backupUnitIdentityProperties() []backupUnitProperty {
+// backupUnitWantedMountPaths is the v259 WantsMountsFor set (v255 has none).
+func backupUnitWantedMountPaths(m backupManager) []string {
+	if m == backupManager259 {
+		return []string{"/tmp", "/var/tmp"}
+	}
+	return nil
+}
+
+func backupUnitIdentityProperties(m backupManager) []backupUnitProperty {
 	p := []backupUnitProperty{
 		{"Id", "s", "nmcp-backup.service"}, {"LoadState", "s", "loaded"},
 		{"FragmentPath", "s", backupUnitFragment}, {"SourcePath", "s", ""}, {"Transient", "b", false},
 		{"NeedDaemonReload", "b", false}, {"DropInPaths", "as", nil}, {"DefaultDependencies", "b", true},
 		{"RequiresMountsFor", "as", nil},
 		{"Conditions", "a(sbbsi)", []any{}}, {"Asserts", "a(sbbsi)", []any{}},
+	}
+	if m == backupManager259 {
+		// New in v256: mount prerequisites that are only wanted.
+		p = append(p, backupUnitProperty{"WantsMountsFor", "as", nil})
 	}
 	for _, name := range backupUnitEdgeProperties {
 		// Edges whose canonical set is empty are also rejected at the wire layer.
@@ -104,10 +135,10 @@ func backupMountUnitName(path string) string {
 // path. systemd v255 unit_add_mount_dependencies/mount_add_mount_dependencies
 // add After= only for a loaded mount unit and Requires= only when it also has
 // a fragment, so these are host-dependent: exact names, any subset.
-func backupUnitPathMounts() []string {
+func backupUnitPathMounts(paths []string) []string {
 	seen := map[string]bool{}
 	var out []string
-	for _, path := range backupUnitMountPaths {
+	for _, path := range paths {
 		for prefix := path; ; prefix = filepath.Dir(prefix) {
 			name := backupMountUnitName(prefix)
 			if !seen[name] {
@@ -125,28 +156,41 @@ func backupUnitPathMounts() []string {
 type backupUnitEdges struct{ required, optional []string }
 
 // Exact allow-sets derived from the canonical fragment, its 10-postgresql.conf
-// drop-in and systemd v255 implicit dependencies (see the report rationale):
-//   - service_add_default_dependencies: Requires/After sysinit.target,
-//     After basic.target, Before/Conflicts shutdown.target;
+// drop-in and the manager's implicit dependencies (see the report rationale):
+//   - service_add_default_dependencies (unchanged 255..259): Requires/After
+//     sysinit.target, After basic.target, Before/Conflicts shutdown.target;
 //   - unit_add_slice_dependencies: Requires/After Slice=nmcp.slice;
-//   - unit_add_exec_dependencies: PrivateTmp Wants/After tmp.mount and After
-//     systemd-tmpfiles-setup.service; journal stdout After
-//     systemd-journald.socket; LoadCredential= After the credential mount;
+//   - unit_add_exec_dependencies: PrivateTmp After
+//     systemd-tmpfiles-setup.service and journal stdout After
+//     systemd-journald.socket in both; v255 also adds Wants/After tmp.mount
+//     and, for LoadCredential=, After the credential mount
+//     (unit_add_default_credential_dependencies, removed by v259); v259 only
+//     wants the /tmp and /var/tmp mount prefixes;
+//   - unit_add_mount_dependencies: After each loaded prefix mount unit, plus
+//     Requires (required paths) or Wants (wanted paths) when it has a
+//     fragment, so these are host-dependent: exact names, any subset;
 //   - fragment: After=nmcp-migrate.service, PartOf=nmcp.target;
 //   - nmcp-backup.timer Unit= adds Before+Triggers on the timer, i.e. After
 //     and TriggeredBy here whenever the timer is loaded.
-func backupUnitDependencyContract(pgUnit string) (map[string]backupUnitEdges, error) {
-	if !backupPGUnitPattern.MatchString(pgUnit) {
+func backupUnitDependencyContract(m backupManager, pgUnit string) (map[string]backupUnitEdges, error) {
+	if !backupPGUnitPattern.MatchString(pgUnit) || m != backupManager255 && m != backupManager259 {
 		return nil, errCutover
 	}
-	mounts := func(extra ...string) []string { return append(backupUnitPathMounts(), extra...) }
+	required, wanted := backupUnitPathMounts(backupUnitRequiredMountPaths(m)), backupUnitPathMounts(backupUnitWantedMountPaths(m))
+	all := backupUnitPathMounts(append(backupUnitRequiredMountPaths(m), backupUnitWantedMountPaths(m)...))
 	c := map[string]backupUnitEdges{}
 	for _, name := range backupUnitEdgeProperties {
 		c[name] = backupUnitEdges{}
 	}
-	c["Requires"] = backupUnitEdges{[]string{"sysinit.target", "nmcp.slice", pgUnit}, mounts()}
-	c["Wants"] = backupUnitEdges{[]string{"tmp.mount"}, nil}
-	c["After"] = backupUnitEdges{[]string{"sysinit.target", "basic.target", "nmcp.slice", "nmcp-migrate.service", pgUnit, "tmp.mount", "systemd-tmpfiles-setup.service", "systemd-journald.socket", `run-credentials-nmcp\x2dbackup.service.mount`}, mounts("nmcp-backup.timer")}
+	c["Requires"] = backupUnitEdges{[]string{"sysinit.target", "nmcp.slice", pgUnit}, required}
+	after := []string{"sysinit.target", "basic.target", "nmcp.slice", "nmcp-migrate.service", pgUnit, "systemd-tmpfiles-setup.service", "systemd-journald.socket"}
+	if m == backupManager255 {
+		c["Wants"] = backupUnitEdges{[]string{"tmp.mount"}, nil}
+		after = append(after, "tmp.mount", `run-credentials-nmcp\x2dbackup.service.mount`)
+	} else {
+		c["Wants"] = backupUnitEdges{nil, wanted}
+	}
+	c["After"] = backupUnitEdges{after, append(all, "nmcp-backup.timer")}
 	c["Before"] = backupUnitEdges{[]string{"shutdown.target"}, nil}
 	c["Conflicts"] = backupUnitEdges{[]string{"shutdown.target"}, nil}
 	c["PartOf"] = backupUnitEdges{[]string{"nmcp.target"}, nil}
@@ -178,7 +222,7 @@ func backupUnitGuardError(step string) error {
 // a hashmap keyed by Unit pointer, and an unreferenced inactive unit may be
 // collected and reloaded between two reads. Compare membership, exactly.
 func backupUnitIsSetProperty(name string) bool {
-	if name == "RequiresMountsFor" {
+	if name == "RequiresMountsFor" || name == "WantsMountsFor" {
 		return true
 	}
 	for _, edge := range backupUnitEdgeProperties {
@@ -256,9 +300,9 @@ func backupUnitEdgeSet(raw json.RawMessage, e backupUnitEdges) (map[string]bool,
 
 // validateBackupUnitDependencies is the backup-only effective edge contract.
 // The loose migrate/offline helper validateBackupUnitDependencySet is unchanged.
-func validateBackupUnitDependencies(p map[string]json.RawMessage, pgUnit string) error {
+func validateBackupUnitDependencies(p map[string]json.RawMessage, pgUnit string, m backupManager) error {
 	bad := func(name string) error { return fmt.Errorf("backup unit %s contract: %w", name, errCutover) }
-	contract, err := backupUnitDependencyContract(pgUnit)
+	contract, err := backupUnitDependencyContract(m, pgUnit)
 	if err != nil {
 		return bad("dependency authority")
 	}
@@ -270,17 +314,24 @@ func validateBackupUnitDependencies(p map[string]json.RawMessage, pgUnit string)
 		}
 		sets[name] = set
 	}
-	// A required mount is always also ordered; the timer adds both edges at once.
-	for unit := range sets["Requires"] {
-		if !sets["After"][unit] {
-			return bad("Requires")
+	// A required or wanted unit is always also ordered (mount prefixes get
+	// After before Requires/Wants; v255 adds Wants+After tmp.mount together);
+	// the timer adds both of its edges at once.
+	for _, edge := range []string{"Requires", "Wants"} {
+		for unit := range sets[edge] {
+			if !sets["After"][unit] {
+				return bad(edge)
+			}
 		}
 	}
 	if sets["After"]["nmcp-backup.timer"] != sets["TriggeredBy"]["nmcp-backup.timer"] {
 		return bad("TriggeredBy")
 	}
-	if !backupUnitStringSet(p["RequiresMountsFor"], backupUnitMountPaths) {
+	if !backupUnitStringSet(p["RequiresMountsFor"], backupUnitRequiredMountPaths(m)) {
 		return bad("RequiresMountsFor")
+	}
+	if m == backupManager259 && !backupUnitStringSet(p["WantsMountsFor"], backupUnitWantedMountPaths(m)) {
+		return bad("WantsMountsFor")
 	}
 	for _, name := range []string{"Conditions", "Asserts"} {
 		if !equalBackupUnitJSON(p[name], []any{}) {
@@ -299,7 +350,7 @@ func validateBackupUnitFragment(body []byte) error {
 	}
 	return nil
 }
-func backupUnitServiceProperties() []backupUnitProperty {
+func backupUnitServiceProperties(m backupManager) []backupUnitProperty {
 	p := []backupUnitProperty{
 		{"Type", "s", "oneshot"}, {"RemainAfterExit", "b", false}, {"KillMode", "s", "control-group"},
 		{"Restart", "s", "no"}, {"SendSIGKILL", "b", true}, {"KillSignal", "i", 15}, {"FinalKillSignal", "i", 9},
@@ -334,6 +385,22 @@ func backupUnitServiceProperties() []backupUnitProperty {
 	for _, name := range []string{"ExecConditionEx", "ExecStartPreEx", "ExecStartEx", "ExecStartPostEx", "ExecReloadEx", "ExecStopEx", "ExecStopPostEx"} {
 		p = append(p, backupUnitProperty{name, "a(sasasttttuii)", nil})
 	}
+	if m == backupManager259 {
+		// Since v257 the PrivateTmp, ProtectControlGroups and ProtectHostname
+		// booleans only say "not no" (dbus-execute.c property_get_private_tmp
+		// and friends): pin the exact modes, plus the namespace/credential
+		// settings added after v255, to the canonical fragment's values.
+		p = append(p,
+			backupUnitProperty{"PrivateTmpEx", "s", "connected"},
+			backupUnitProperty{"ProtectControlGroupsEx", "s", "yes"},
+			backupUnitProperty{"ProtectHostnameEx", "(ss)", []any{"yes", ""}},
+			backupUnitProperty{"PrivateUsersEx", "s", "no"},
+			backupUnitProperty{"PrivatePIDs", "s", "no"},
+			backupUnitProperty{"PrivateBPF", "s", "no"},
+			backupUnitProperty{"ImportCredentialEx", "a(ss)", []any{}},
+			backupUnitProperty{"UserNamespacePath", "s", ""},
+		)
+	}
 	return p
 }
 func backupUnitArray(raw json.RawMessage, out any) bool {
@@ -358,11 +425,11 @@ func backupUnitStringSet(raw json.RawMessage, want []string) bool {
 	}
 	return true
 }
-func validateBackupUnitEffective(p map[string]json.RawMessage, artifactBind bool) error {
+func validateBackupUnitEffective(p map[string]json.RawMessage, artifactBind bool, m backupManager) error {
 	bad := func(name string) error { return fmt.Errorf("backup unit %s contract: %w", name, errCutover) }
 	// Validate every fixed value here too, so parser-independent policy tests
 	// cannot accidentally omit a safety property.
-	for _, spec := range backupUnitServiceProperties() {
+	for _, spec := range backupUnitServiceProperties(m) {
 		raw, ok := p[spec.name]
 		if !ok || (spec.want != nil && !equalBackupUnitJSON(raw, spec.want)) {
 			return bad(spec.name)
@@ -475,13 +542,26 @@ func validateBackupPGDependencyBodies(backup, migrate []byte, expected string) e
 	return nil
 }
 
-// The effective-unit allow-sets above are derived from systemd v255 semantics
-// (Ubuntu 24.04, the only supported production manager). Any other manager
-// version fails closed rather than being validated against the wrong rules.
-var backupManagerVersionPattern = regexp.MustCompile(`^255(\.[0-9]{1,4})?([-~+][A-Za-z0-9.+~-]{1,64})?$`)
+// The effective-unit allow-sets above are derived per manager major: v255
+// (Ubuntu 24.04) and v259 (Ubuntu 26.04). Any other manager version fails
+// closed rather than being validated against the wrong rules.
+var backupManagerVersionPatterns = map[backupManager]*regexp.Regexp{
+	backupManager255: regexp.MustCompile(`^255(\.[0-9]{1,4})?([-~+][A-Za-z0-9.+~-]{1,64})?$`),
+	backupManager259: regexp.MustCompile(`^259(\.[0-9]{1,4})?([-~+][A-Za-z0-9.+~-]{1,64})?$`),
+}
+
+func backupManagerFor(version string) (backupManager, bool) {
+	for m, pattern := range backupManagerVersionPatterns {
+		if pattern.MatchString(version) {
+			return m, true
+		}
+	}
+	return 0, false
+}
 
 func supportedBackupManagerVersion(version string) bool {
-	return backupManagerVersionPattern.MatchString(version)
+	_, ok := backupManagerFor(version)
+	return ok
 }
 
 var backupManagerVersion = func(ctx context.Context) (string, error) {
@@ -517,10 +597,11 @@ func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) err
 	if err != nil {
 		return err
 	}
-	if !supportedBackupManagerVersion(version) {
-		return backupUnitGuardError("systemd manager version unsupported (" + backupUnitDiagnosticName(version) + "; supported: 255)")
+	manager, ok := backupManagerFor(version)
+	if !ok {
+		return backupUnitGuardError("systemd manager version unsupported (" + backupUnitDiagnosticName(version) + "; supported: 255, 259)")
 	}
-	before, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
+	before, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties(manager))
 	if err != nil {
 		return err
 	}
@@ -528,7 +609,7 @@ func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) err
 	if err != nil {
 		return backupUnitGuardError("drop-in set")
 	}
-	if err = validateBackupUnitDependencies(before, expectedPGUnit); err != nil {
+	if err = validateBackupUnitDependencies(before, expectedPGUnit, manager); err != nil {
 		return err
 	}
 	snapshots := []cutoverFile{}
@@ -555,14 +636,14 @@ func validateLoadedBackupUnit(parent context.Context, expectedPGUnit string) err
 		}
 		snapshots = append(snapshots, file)
 	}
-	props, err := queryBackupUnitProperties(ctx, "Service", backupUnitServiceProperties())
+	props, err := queryBackupUnitProperties(ctx, "Service", backupUnitServiceProperties(manager))
 	if err != nil {
 		return err
 	}
-	if err = validateBackupUnitEffective(props, artifactBind); err != nil {
+	if err = validateBackupUnitEffective(props, artifactBind, manager); err != nil {
 		return err
 	}
-	after, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
+	after, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties(manager))
 	if err != nil {
 		return err
 	}

@@ -1304,7 +1304,13 @@ func liveUploadAfterResume(t *testing.T, ctx context.Context, cycles ...int) {
 // membership across spaced reads. It logs property names only and asserts nothing.
 func logBackupUnitReadStability(t *testing.T, ctx context.Context) {
 	t.Helper()
-	first, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
+	version, err := backupManagerVersion(ctx)
+	manager, ok := backupManagerFor(version)
+	if err != nil || !ok {
+		t.Logf("backup unit read stability: unsupported or unreadable manager version")
+		return
+	}
+	first, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties(manager))
 	if err != nil {
 		t.Logf("backup unit read stability: first read unavailable: %v", err)
 		return
@@ -1312,7 +1318,7 @@ func logBackupUnitReadStability(t *testing.T, ctx context.Context) {
 	order, membership := map[string]bool{}, map[string]bool{}
 	for i := 0; i < 8; i++ {
 		time.Sleep(150 * time.Millisecond)
-		next, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties())
+		next, err := queryBackupUnitProperties(ctx, "Unit", backupUnitIdentityProperties(manager))
 		if err != nil {
 			t.Logf("backup unit read stability: read %d unavailable: %v", i+2, err)
 			return

@@ -20,8 +20,15 @@ const backupDependencyTestPG = "postgresql@17-main.service"
 // The manager-shaped Unit-interface fixture for the canonical installed unit.
 // mounts/timer select the host-dependent optional edges.
 func backupDependencyFixture(t *testing.T, mounts []string, timer bool) map[string]json.RawMessage {
+	return backupDependencyFixtureFor(t, backupManager255, mounts, timer)
+}
+
+// backupDependencyFixtureFor builds the fixture for one manager major. Each
+// given mount unit is treated as loaded with a fragment: ordered, and required
+// or wanted exactly as unit_add_mount_dependencies would for its path set.
+func backupDependencyFixtureFor(t *testing.T, m backupManager, mounts []string, timer bool) map[string]json.RawMessage {
 	t.Helper()
-	contract, err := backupUnitDependencyContract(backupDependencyTestPG)
+	contract, err := backupUnitDependencyContract(m, backupDependencyTestPG)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,13 +43,42 @@ func backupDependencyFixture(t *testing.T, mounts []string, timer bool) map[stri
 		}
 		p[name] = backupContractJSON(t, append(got, units...))
 	}
-	add("Requires", mounts...)
-	add("After", mounts...)
+	in := func(list []string, s string) bool {
+		for _, x := range list {
+			if x == s {
+				return true
+			}
+		}
+		return false
+	}
+	required, wanted := backupUnitPathMounts(backupUnitRequiredMountPaths(m)), backupUnitPathMounts(backupUnitWantedMountPaths(m))
+	var after []string
+	for _, unit := range mounts {
+		if in(required, unit) {
+			add("Requires", unit)
+		}
+		if in(wanted, unit) {
+			var got []string
+			_ = json.Unmarshal(p["Wants"], &got)
+			if !in(got, unit) {
+				add("Wants", unit)
+			}
+		}
+		var got []string
+		_ = json.Unmarshal(p["After"], &got)
+		if !in(got, unit) && !in(after, unit) {
+			after = append(after, unit)
+		}
+	}
+	add("After", after...)
 	if timer {
 		add("After", "nmcp-backup.timer")
 		add("TriggeredBy", "nmcp-backup.timer")
 	}
-	p["RequiresMountsFor"] = backupContractJSON(t, []string{"/run/nmcp-backup", "/var/lib/nmcp-backup", "/var/tmp"})
+	p["RequiresMountsFor"] = backupContractJSON(t, backupUnitRequiredMountPaths(m))
+	if m == backupManager259 {
+		p["WantsMountsFor"] = backupContractJSON(t, backupUnitWantedMountPaths(m))
+	}
 	p["Conditions"] = json.RawMessage(`[]`)
 	p["Asserts"] = json.RawMessage(`[]`)
 	p["DefaultDependencies"] = json.RawMessage(`true`)
@@ -63,7 +99,7 @@ func backupDependencyWith(t *testing.T, p map[string]json.RawMessage, name strin
 }
 
 func TestBackupUnitPathDerivedMountNames(t *testing.T) {
-	got := backupUnitPathMounts()
+	got := backupUnitPathMounts(backupUnitRequiredMountPaths(backupManager255))
 	want := []string{`var-lib-nmcp\x2dbackup.mount`, "var-lib.mount", "var.mount", "-.mount", "var-tmp.mount", `run-nmcp\x2dbackup.mount`, "run.mount"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("path-derived mounts %q", got)
@@ -76,25 +112,25 @@ func TestBackupUnitPathDerivedMountNames(t *testing.T) {
 }
 
 func TestBackupUnitEffectiveDependencyContract(t *testing.T) {
-	all := backupUnitPathMounts()
+	all := backupUnitPathMounts(backupUnitRequiredMountPaths(backupManager255))
 	for _, tc := range []struct {
 		name   string
 		mounts []string
 		timer  bool
 	}{{"minimal", nil, false}, {"timer", nil, true}, {"all-host-mounts", all, true}, {"root-only", []string{"-.mount"}, true}} {
-		if err := validateBackupUnitDependencies(backupDependencyFixture(t, tc.mounts, tc.timer), backupDependencyTestPG); err != nil {
+		if err := validateBackupUnitDependencies(backupDependencyFixture(t, tc.mounts, tc.timer), backupDependencyTestPG, backupManager255); err != nil {
 			t.Fatalf("canonical %s rejected: %v", tc.name, err)
 		}
 	}
 	// A loaded mount without a fragment is ordered but not required.
 	p := backupDependencyWith(t, backupDependencyFixture(t, nil, true), "After", "var.mount", "run.mount")
-	if validateBackupUnitDependencies(p, backupDependencyTestPG) != nil {
+	if validateBackupUnitDependencies(p, backupDependencyTestPG, backupManager255) != nil {
 		t.Fatal("ordering-only path mount rejected")
 	}
 	base := backupDependencyFixture(t, []string{"-.mount"}, true)
 	reject := func(label string, q map[string]json.RawMessage) {
 		t.Helper()
-		if validateBackupUnitDependencies(q, backupDependencyTestPG) == nil {
+		if validateBackupUnitDependencies(q, backupDependencyTestPG, backupManager255) == nil {
 			t.Fatalf("%s accepted", label)
 		}
 	}
@@ -153,7 +189,7 @@ func TestBackupUnitEffectiveDependencyContract(t *testing.T) {
 	q = backupDependencyWith(t, base, "Requires")
 	q["DefaultDependencies"] = json.RawMessage(`false`)
 	reject("DefaultDependencies=no", q)
-	if validateBackupUnitDependencies(base, "postgresql@17-other.service") == nil || validateBackupUnitDependencies(base, "evil.service") == nil {
+	if validateBackupUnitDependencies(base, "postgresql@17-other.service", backupManager255) == nil || validateBackupUnitDependencies(base, "evil.service", backupManager255) == nil {
 		t.Fatal("different dependency authority accepted")
 	}
 }
@@ -161,7 +197,7 @@ func TestBackupUnitEffectiveDependencyContract(t *testing.T) {
 // Wire-level: the manager reply is rejected before policy for any non-empty
 // condition/assert list or an edge whose canonical set is empty.
 func TestBackupUnitIdentityWireRejectsConditionsAndEmptyEdges(t *testing.T) {
-	props := backupUnitIdentityProperties()
+	props := backupUnitIdentityProperties(backupManager255)
 	signatures := map[string]string{}
 	for _, p := range props {
 		if _, dup := signatures[p.name]; dup {
@@ -191,7 +227,7 @@ func TestBackupUnitIdentityWireRejectsConditionsAndEmptyEdges(t *testing.T) {
 		return b.Bytes()
 	}
 	decoded, err := decodeBackupUnitProperties(encode(values), props)
-	if err != nil || validateBackupUnitDependencies(decoded, backupDependencyTestPG) != nil {
+	if err != nil || validateBackupUnitDependencies(decoded, backupDependencyTestPG, backupManager255) != nil {
 		t.Fatalf("canonical wire rejected: %v", err)
 	}
 	for name, value := range map[string]string{
@@ -267,7 +303,7 @@ func TestBackupUnitDependencyContractMatchesCanonicalFragment(t *testing.T) {
 	if !reflect.DeepEqual(unitKeys, []string{"After", "Description", "Documentation", "PartOf", "RequiresMountsFor"}) || len(fields) != 2 {
 		t.Fatalf("canonical [Unit] directives changed: %q", unitKeys)
 	}
-	contract, err := backupUnitDependencyContract(backupDependencyTestPG)
+	contract, err := backupUnitDependencyContract(backupManager255, backupDependencyTestPG)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +321,7 @@ func TestBackupUnitDependencyContractMatchesCanonicalFragment(t *testing.T) {
 	if !reflect.DeepEqual(fields["[Unit]"]["PartOf"], contract["PartOf"].required) {
 		t.Fatal("fragment PartOf= mismatch")
 	}
-	if !reflect.DeepEqual(fields["[Unit]"]["RequiresMountsFor"], []string{"/var/lib/nmcp-backup"}) || !has(backupUnitMountPaths, "/var/lib/nmcp-backup") {
+	if !reflect.DeepEqual(fields["[Unit]"]["RequiresMountsFor"], []string{"/var/lib/nmcp-backup"}) || !has(backupUnitRequiredMountPaths(backupManager255), "/var/lib/nmcp-backup") {
 		t.Fatal("fragment RequiresMountsFor= mismatch")
 	}
 	service := fields["[Service]"]
@@ -297,10 +333,10 @@ func TestBackupUnitDependencyContractMatchesCanonicalFragment(t *testing.T) {
 	if !has(contract["Requires"].required, "nmcp.slice") || !has(contract["After"].required, "nmcp.slice") {
 		t.Fatal("Slice= edges")
 	}
-	if !has(contract["Wants"].required, "tmp.mount") || !has(contract["After"].required, "tmp.mount") || !has(contract["After"].required, "systemd-tmpfiles-setup.service") || !has(backupUnitMountPaths, "/var/tmp") {
+	if !has(contract["Wants"].required, "tmp.mount") || !has(contract["After"].required, "tmp.mount") || !has(contract["After"].required, "systemd-tmpfiles-setup.service") || !has(backupUnitRequiredMountPaths(backupManager255), "/var/tmp") {
 		t.Fatal("PrivateTmp= edges")
 	}
-	if !has(backupUnitMountPaths, "/run/"+service["RuntimeDirectory"][0]) {
+	if !has(backupUnitRequiredMountPaths(backupManager255), "/run/"+service["RuntimeDirectory"][0]) {
 		t.Fatal("RuntimeDirectory= mount path")
 	}
 	if len(service["LoadCredential"]) == 0 || !has(contract["After"].required, `run-credentials-nmcp\x2dbackup.service.mount`) {
@@ -365,12 +401,12 @@ func TestBackupUnitIdentityDriftComparesSetsByMembershipOnly(t *testing.T) {
 func TestBackupUnitDependencyDiagnosticNamesRejection(t *testing.T) {
 	p := backupDependencyFixture(t, nil, false)
 	inject := backupDependencyWith(t, p, "Wants", `evil\x2dunit.service`)
-	err := validateBackupUnitDependencies(inject, backupDependencyTestPG)
+	err := validateBackupUnitDependencies(inject, backupDependencyTestPG, backupManager255)
 	if !errors.Is(err, errCutover) || !strings.Contains(err.Error(), `backup unit Wants (unexpected evil\x2dunit.service) contract`) {
 		t.Fatalf("diagnostic = %v", err)
 	}
 	secret := backupDependencyWith(t, p, "Wants", "password=CANARY-secret value")
-	err = validateBackupUnitDependencies(secret, backupDependencyTestPG)
+	err = validateBackupUnitDependencies(secret, backupDependencyTestPG, backupManager255)
 	if !errors.Is(err, errCutover) || strings.Contains(err.Error(), "CANARY") || !strings.Contains(err.Error(), "<invalid>") {
 		t.Fatalf("unsanitized diagnostic = %v", err)
 	}
@@ -379,7 +415,7 @@ func TestBackupUnitDependencyDiagnosticNamesRejection(t *testing.T) {
 		missing[k] = v
 	}
 	missing["Conflicts"] = json.RawMessage(`[]`)
-	err = validateBackupUnitDependencies(missing, backupDependencyTestPG)
+	err = validateBackupUnitDependencies(missing, backupDependencyTestPG, backupManager255)
 	if !errors.Is(err, errCutover) || !strings.Contains(err.Error(), "missing shutdown.target") {
 		t.Fatalf("missing diagnostic = %v", err)
 	}
