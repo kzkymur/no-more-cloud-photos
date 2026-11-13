@@ -7,7 +7,7 @@ usage() {
 usage: install-ubuntu-host --config-dir DIR --api-listen IP:PORT \
   --files-listen IP:PORT --tailnet-hostname NAME \
   --postgresql-unit postgresql@VERSION-CLUSTER.service \
-  --tls-cert FILE --tls-key FILE
+  [--postgresql-port PORT] --tls-cert FILE --tls-key FILE
 
 Installs (but does not start) Ubuntu system assets. Inputs must be below
 root-owned, non-group/world-writable paths. UFW must already be active with
@@ -22,6 +22,7 @@ api_listen=''
 files_listen=''
 tailnet_hostname=''
 postgresql_unit=''
+postgresql_port=5432
 tls_cert=''
 tls_key=''
 while (($#)); do
@@ -31,6 +32,7 @@ while (($#)); do
     --files-listen) (($# >= 2)) || usage; files_listen=$2; shift 2 ;;
     --tailnet-hostname) (($# >= 2)) || usage; tailnet_hostname=$2; shift 2 ;;
     --postgresql-unit) (($# >= 2)) || usage; postgresql_unit=$2; shift 2 ;;
+    --postgresql-port) (($# >= 2)) || usage; postgresql_port=$2; shift 2 ;;
     --tls-cert) (($# >= 2)) || usage; tls_cert=$2; shift 2 ;;
     --tls-key) (($# >= 2)) || usage; tls_key=$2; shift 2 ;;
     -h|--help) usage ;;
@@ -91,6 +93,10 @@ print(values["VERSION_ID"])
 PY
 )
 
+if ! [[ $postgresql_port =~ ^[1-9][0-9]{3,4}$ ]] || ((postgresql_port > 65535)); then
+  printf 'install-ubuntu-host: --postgresql-port must be 1024-65535\n' >&2
+  exit 1
+fi
 [[ $postgresql_unit =~ ^postgresql@[A-Za-z0-9_.-]+\.service$ \
   && $postgresql_unit != postgresql@.service ]] || {
   printf 'install-ubuntu-host: PostgreSQL dependency must name one concrete cluster unit\n' >&2
@@ -114,7 +120,8 @@ trap cleanup EXIT
   "$config_dir/admin.env" admin.env "$config_dir/api.env" api.env \
   "$config_dir/worker.env" worker.env "$tls_cert" cert.pem "$tls_key" key.pem
 "$script_dir/validate-ubuntu-config" --config-dir "$capture" \
-  --tailnet-hostname "$tailnet_hostname" --files-listen "$files_listen"
+  --tailnet-hostname "$tailnet_hostname" --files-listen "$files_listen" \
+  --database-port "$postgresql_port"
 
 read -r tailnet_ip api_port files_port < <(/usr/bin/python3 - "$api_listen" "$files_listen" <<'PY'
 import ipaddress, sys
@@ -145,6 +152,10 @@ done
 /usr/bin/printf '%s\n' "$postgresql_unit" > /etc/nmcp/postgresql-unit
 /usr/bin/chown root:root /etc/nmcp/tailnet-hostname /etc/nmcp/postgresql-unit
 /usr/bin/chmod 0600 /etc/nmcp/tailnet-hostname /etc/nmcp/postgresql-unit
+# Non-secret: the runtime-role, migration and backup helpers read it.
+/usr/bin/printf '%s\n' "$postgresql_port" > /etc/nmcp/postgresql-port
+/usr/bin/chown root:root /etc/nmcp/postgresql-port
+/usr/bin/chmod 0644 /etc/nmcp/postgresql-port
 
 tls_id=$(/usr/bin/sha256sum "$capture/cert.pem" "$capture/key.pem" | /usr/bin/sha256sum | /usr/bin/cut -d' ' -f1)
 tls_release=/etc/nmcp/tls-releases/$tls_id
@@ -196,10 +207,20 @@ done
 /usr/bin/install -d -o root -g root -m 0755 /etc/systemd/system/nmcp-migrate.service.d
 "$script_dir/render-ubuntu-postgresql-dependency" --unit "$postgresql_unit" \
   --output /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf
-/usr/bin/install -d -o root -g root -m 0755 /etc/systemd/system/postgresql@.service.d
+# Slice only the nmcp cluster's own instance. A template-wide
+# postgresql@.service.d drop-in would also move every other cluster on the
+# host into nmcp.slice; remove one left by an earlier install only if it is
+# byte-identical to ours, and never touch any other file there.
+/usr/bin/install -d -o root -g root -m 0755 "/etc/systemd/system/$postgresql_unit.d"
 /usr/bin/install -o root -g root -m 0644 \
   "$repo_root/infra/ubuntu/systemd/postgresql@.service.d/10-nmcp-slice.conf" \
-  /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf
+  "/etc/systemd/system/$postgresql_unit.d/10-nmcp-slice.conf"
+legacy_slice=/etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf
+if [[ -f $legacy_slice && ! -L $legacy_slice ]] \
+  && /usr/bin/cmp -s "$legacy_slice" "$repo_root/infra/ubuntu/systemd/postgresql@.service.d/10-nmcp-slice.conf"; then
+  /usr/bin/rm -f -- "$legacy_slice"
+  /usr/bin/rmdir --ignore-fail-on-non-empty /etc/systemd/system/postgresql@.service.d
+fi
 /usr/bin/install -d -o root -g root -m 0755 /usr/local/libexec/nmcp /usr/share/doc/nmcp
 for script in check-ubuntu-services check-ubuntu-tls-expiry renew-ubuntu-tls \
   acquire-ubuntu-deployment-locks capture-trusted-inputs handoff-ubuntu-migration-lock \

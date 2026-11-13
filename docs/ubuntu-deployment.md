@@ -48,8 +48,9 @@ What `./deploy` does, in order:
 - Adds the PGDG repository with the signing key vendored in the repository
   (`infra/ubuntu/pgdg-ACCC4CF8.asc`, pinned by SHA-256 and fingerprint) and installs
   `infra/ubuntu/packages.txt`.
-- Creates the PostgreSQL 17 cluster (`postgresql@17-main.service`) and the
-  `nmcp` database, then runs the role bootstrap. Every login gets a generated
+- Creates a dedicated PostgreSQL 17 cluster `17/nmcp`
+  (`postgresql@17-nmcp.service`, loopback port `NMCP_PG_PORT`, default 5433)
+  and the `nmcp` database, then runs the role bootstrap. Every login gets a generated
   password, stored only under root-only `/etc/nmcp/deploy`; passwords reach
   PostgreSQL only as SCRAM verifiers.
 - Builds the release with `scripts/build-ubuntu-release`.
@@ -62,7 +63,16 @@ The default backup failure hook (`infra/ubuntu/backup-notify`) only writes to
 the journal at priority `err`. Replace it if nothing monitors the journal.
 
 What deploy never touches: port 443, the existing `tailscale serve` and Funnel
-configuration, the UFW default policy, and disks. It stops with an error if a
+configuration, the UFW default policy, disks, and any other PostgreSQL on the
+host. `--check` lists what owns 5432 and `NMCP_PG_PORT`, every existing
+cluster and every installed PostgreSQL package with its origin, and simulates
+the exact apt transaction: it stops if any installed package would be
+upgraded, downgraded or removed, or if anything cannot be determined. An apt
+pin lets PGDG provide only `postgresql-17` and `postgresql-client-17`, now and
+in later upgrades; package scripts may not create a default cluster or start
+services during the install; the resource-cap drop-in applies to
+`postgresql@17-nmcp.service` only. A newer `postgresql-client-NN` already
+installed stops the deploy, because `/usr/bin/pg_dump` must resolve to 17. It stops with an error if a
 configured port is already in use or claimed by `tailscale serve`/Funnel.
 
 The rest of this document is the reference for what deploy automates: the

@@ -79,7 +79,12 @@ def main() -> int:
     parser.add_argument("--config-dir", required=True, type=pathlib.Path)
     parser.add_argument("--tailnet-hostname", required=True)
     parser.add_argument("--files-listen", required=True)
+    # The nmcp cluster's loopback port (deploy uses a dedicated cluster; CI
+    # and pre-existing hosts use 5432). Every DSN must name exactly this port.
+    parser.add_argument("--database-port", type=int, default=5432)
     args = parser.parse_args()
+    if not 1024 <= args.database_port <= 65535:
+        raise ValueError("--database-port must be 1024-65535")
     values = {name: parse_env(args.config_dir / name) for name in EXPECTED}
 
     api, worker, admin = values["api.env"], values["worker.env"], values["admin.env"]
@@ -115,7 +120,7 @@ def main() -> int:
             or database.hostname not in ("127.0.0.1", "::1")
             or "," in database.netloc
             or "%" in (database.hostname or "")
-            or database_port != 5432
+            or database_port != args.database_port
             or database.path != "/nmcp"
             or decoded_user != required_database_users[process]
             or not decoded_password

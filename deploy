@@ -32,7 +32,15 @@ while (($#)); do
 done
 
 state=/etc/nmcp/deploy                 # root-only generated secrets and inputs
-pg_unit=postgresql@17-main.service
+# A dedicated cluster for nmcp. Any other PostgreSQL on the host (another
+# cluster, another major, a container) is never stopped, restarted,
+# reconfigured, upgraded or connected to.
+pg_cluster=nmcp
+pg_unit=postgresql@17-$pg_cluster.service
+pg_marker=/etc/nmcp/deploy/cluster-17-$pg_cluster   # written when deploy created it
+pgdg_pin=/etc/apt/preferences.d/nmcp-pgdg
+createcluster_conf=/etc/postgresql-common/createcluster.d/50-nmcp-no-main-cluster.conf
+policy_rc=/usr/sbin/policy-rc.d
 pgdg_list=/etc/apt/sources.list.d/pgdg.sources
 pgdg_key=/usr/share/keyrings/nmcp-pgdg.asc
 # The apt.postgresql.org signing key (ACCC4CF8) is vendored in the repository and
@@ -92,6 +100,7 @@ read_config() {
   declare -gA cfg=(
     [NMCP_TAILNET_HOSTNAME]='' [NMCP_DATA_MOUNT]='' [NMCP_API_PORT]=8443
     [NMCP_FILES_PORT]=8444 [NMCP_TAILSCALE_AUTHKEY_FILE]='' [NMCP_BUILD_JOBS]=2
+    [NMCP_PG_PORT]=5433
   )
   while IFS= read -r line || [[ -n $line ]]; do
     [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
@@ -106,6 +115,7 @@ read_config() {
   files_port=${cfg[NMCP_FILES_PORT]}
   authkey_file=${cfg[NMCP_TAILSCALE_AUTHKEY_FILE]}
   jobs=${cfg[NMCP_BUILD_JOBS]}
+  pg_port=${cfg[NMCP_PG_PORT]}
   [[ $hostname =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
     || die "config: NMCP_TAILNET_HOSTNAME must be the host's full Tailnet DNS name"
   [[ $data_mount == /* && $data_mount != / ]] || die "config: NMCP_DATA_MOUNT must be an absolute mount point"
@@ -114,10 +124,16 @@ read_config() {
     if ! [[ $port =~ ^[1-9][0-9]{0,4}$ ]] || ((port > 65535)); then die "config: invalid port $port"; fi
     case $port in
       80|443) die "config: port $port is reserved for the host's existing publishing" ;;
-      5432|8080) die "config: port $port is used internally by the deployment" ;;
+      5432|8080|"$pg_port") die "config: port $port is reserved for PostgreSQL or the API loopback" ;;
     esac
   done
   [[ $api_port != "$files_port" ]] || die "config: API and files ports must differ"
+  if ! [[ $pg_port =~ ^[1-9][0-9]{3,4}$ ]] || ((pg_port > 65535)); then
+    die "config: NMCP_PG_PORT must be 1024-65535"
+  fi
+  case $pg_port in
+    "$api_port"|"$files_port"|8080) die "config: NMCP_PG_PORT $pg_port collides with another deployment port" ;;
+  esac
   [[ $jobs =~ ^[1-9][0-9]?$ ]] || die "config: NMCP_BUILD_JOBS must be 1..99"
 }
 
@@ -240,7 +256,7 @@ PY
     fi
   done
   port_owned_by 8080 nmcp-api.service || block "127.0.0.1:8080 is already in use by another process"
-  port_owned_by 5432 "$pg_unit" || block "port 5432 is in use by something other than $pg_unit"
+  port_owned_by "$pg_port" "$pg_unit" || block "NMCP_PG_PORT $pg_port is in use by something other than $pg_unit"
 
   # Firewall: UFW must already be active with default-deny incoming. The deploy
   # adds only the two Tailnet-interface rules and never changes the policy.
@@ -293,15 +309,16 @@ PY
       todo "mask the distribution nginx.service before installing nginx-core (only nmcp-files.service runs Nginx)"
     fi
   fi
-  if dpkg-query -W -f='${Status}' postgresql-18 2>/dev/null | grep -q 'install ok installed'; then
-    block "postgresql-18 is installed; the backup tools must resolve to PostgreSQL 17 (remove 18 or review manually)"
+  inventory_postgresql
+  if ((${#missing[@]})); then
+    simulate_apt "${missing[@]}"
   fi
 
   # PostgreSQL cluster and database.
-  if [[ $(systemctl show -p LoadState --value "$pg_unit" 2>/dev/null) != loaded ]]; then
-    todo "create/start the PostgreSQL 17 cluster ($pg_unit)"
-  elif ! runuser -u postgres -- psql -XAtq -d nmcp -c 'select 1' >/dev/null 2>&1; then
-    todo "create database nmcp"
+  if [[ ! -f $pg_marker ]]; then
+    todo "create the dedicated PostgreSQL 17 cluster 17/$pg_cluster on 127.0.0.1:$pg_port ($pg_unit)"
+  elif ! psql_admin -XAtq -c 'select 1' >/dev/null 2>&1; then
+    todo "create database nmcp in 17/$pg_cluster"
   fi
   todo "run the role bootstrap and set generated role passwords (idempotent)"
 
@@ -341,6 +358,143 @@ check_build_space() {
     ((avail >= need_by_dev[$dev])) \
       || block "the build needs ${need_by_dev[$dev]} GiB free for ${where_by_dev[$dev]} (that filesystem has ${avail} GiB)"
   done
+}
+
+# --- PostgreSQL already on the host: read-only inventory ---------------------
+listener_owner() { # PID -> "unit (comm)" or "container ID (comm)"; empty if unknown
+  local pid=$1 cg unit comm
+  [[ -r /proc/$pid/cgroup ]] || return 0
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')
+  cg=$(grep -m1 '^0::' "/proc/$pid/cgroup" 2>/dev/null | cut -d: -f3-)
+  if [[ $cg =~ docker-([0-9a-f]{12})[0-9a-f]*\.scope || $cg =~ /docker/([0-9a-f]{12}) ]]; then
+    printf 'container %s (%s)' "${BASH_REMATCH[1]}" "$comm"; return
+  fi
+  unit=${cg##*/}
+  [[ -n $unit ]] && printf '%s (%s)' "$unit" "$comm"
+}
+inventory_postgresql() {
+  log "PostgreSQL already on this host (read-only; deploy never touches it)"
+  local port lines pid owner
+  for port in 5432 "$pg_port"; do
+    if ! lines=$(ss -ltnpH "sport = :$port" 2>&1); then
+      block "cannot list listeners on port $port: $lines"; continue
+    fi
+    if [[ -z $lines ]]; then note "port $port: free"; continue; fi
+    while read -r pid; do
+      owner=$(listener_owner "$pid")
+      if [[ -z $owner ]]; then
+        block "port $port: cannot determine the owner of listener pid $pid"
+      else
+        note "port $port: pid $pid, $owner"
+      fi
+    done < <(grep -o 'pid=[0-9]*' <<<"$lines" | cut -d= -f2 | sort -u)
+    grep -q 'pid=' <<<"$lines" || block "port $port: in use, but the owning process is not visible"
+  done
+  if command -v pg_lsclusters >/dev/null; then
+    local clusters
+    clusters=$(pg_lsclusters --no-header 2>&1) || { block "pg_lsclusters failed: $clusters"; clusters=''; }
+    if [[ -z $clusters ]]; then note "Debian-managed clusters: none"; fi
+    local ver name cport _rest
+    while read -r ver name cport _rest; do
+      [[ -n $ver ]] || continue
+      note "cluster $ver/$name on port $cport"
+      if [[ $ver/$name == 17/$pg_cluster ]]; then
+        [[ -f $pg_marker ]] || block "a cluster 17/$pg_cluster exists that this deploy did not create; refusing to use or change it"
+      elif [[ $cport == "$pg_port" ]]; then
+        block "cluster $ver/$name already uses NMCP_PG_PORT $pg_port; choose another NMCP_PG_PORT"
+      fi
+    done <<<"$clusters"
+  else
+    note "postgresql-common is not installed: no Debian-managed clusters"
+  fi
+  local units
+  units=$(systemctl list-units --all --no-legend --plain 'postgresql*' 2>&1) \
+    || { block "cannot list postgresql units: $units"; units=''; }
+  [[ -z $units ]] || while read -r unit _rest; do note "unit $unit"; done <<<"$units"
+  local pkgs
+  if ! pkgs=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'postgresql*' 'libpq*' 2>/dev/null); then
+    pkgs=''
+  fi
+  local status pkg version origin
+  while read -r status pkg version; do
+    [[ $status == ii ]] || continue
+    origin=$(apt-cache policy "$pkg" 2>/dev/null | grep -A1 -m1 '^ *\*\*\*' | tail -1 | xargs | cut -d' ' -f2-3)
+    note "package $pkg $version (from ${origin:-unknown})"
+  done <<<"$pkgs"
+  if [[ -e $policy_rc || -L $policy_rc ]]; then
+    block "$policy_rc already exists; deploy needs to install its own service-start guard and will not replace another one"
+  fi
+  # /usr/bin/pg_dump and pg_restore (pg_wrapper) must resolve to 17 for backups.
+  local newer
+  newer=''
+  while read -r status pkg; do
+    [[ $status == ii && $pkg =~ ^postgresql-client-([0-9]+)$ ]] || continue
+    ((BASH_REMATCH[1] > 17)) && newer+="$pkg "
+  done < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'postgresql-client-[0-9]*' 2>/dev/null || true)
+  newer=${newer% }
+  [[ -z $newer ]] || block "$newer installed: /usr/bin/pg_dump would not resolve to PostgreSQL 17 for nmcp backups (deploy will not remove another PostgreSQL)"
+}
+
+# The exact apt transaction, simulated against a throwaway apt state (the
+# host's sources plus the pinned PGDG source; nothing on the host changes).
+# Any upgrade, downgrade or removal of an installed package blocks.
+pgdg_pin_text() {
+  cat <<'EOF'
+# nmcp deploy: only PostgreSQL 17 server and client come from PGDG. PGDG must
+# never replace, upgrade or add any other package (for example a PostgreSQL
+# the host already runs), now or in later upgrades.
+Package: postgresql-17 postgresql-client-17
+Pin: origin "apt.postgresql.org"
+Pin-Priority: 500
+
+Package: *
+Pin: origin "apt.postgresql.org"
+Pin-Priority: -1
+EOF
+}
+simulate_apt() { # PACKAGE... ; blocks on any change to an installed package
+  local d out line
+  d=$(mktemp -d)
+  mkdir -p "$d/lists/partial" "$d/cache/archives/partial" "$d/sources.d" "$d/prefs.d"
+  : >"$d/sources.list"
+  if [[ -f /etc/apt/sources.list ]]; then cp /etc/apt/sources.list "$d/sources.list"; fi
+  find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) \
+    ! -path "$pgdg_list" -exec cp -t "$d/sources.d" {} + 2>/dev/null || true
+  find /etc/apt/preferences.d -maxdepth 1 -type f ! -path "$pgdg_pin" -exec cp -t "$d/prefs.d" {} + 2>/dev/null || true
+  printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: resolute-pgdg\nComponents: main\nSigned-By: %s\n' \
+    "$pgdg_key_src" >"$d/sources.d/nmcp-pgdg.sources"
+  pgdg_pin_text >"$d/prefs.d/nmcp-pgdg"
+  local opts=(-o "Dir::Etc::SourceList=$d/sources.list" -o "Dir::Etc::SourceParts=$d/sources.d"
+    -o "Dir::Etc::PreferencesParts=$d/prefs.d" -o "Dir::State::Lists=$d/lists"
+    -o "Dir::Cache=$d/cache" -o Debug::NoLocking=1 -o APT::Sandbox::User=root)
+  if ! out=$(timeout 300 apt-get "${opts[@]}" -qq update 2>&1); then
+    block "apt simulation: could not read package indexes: $(grep -v 'apt.conf.d' <<<"$out" | tail -1)"
+  elif ! out=$(apt-get "${opts[@]}" -s install --no-install-recommends "$@" 2>&1); then
+    block "apt simulation: the packages cannot be installed without changing existing ones: $(grep -m3 -E '^E:|^ ' <<<"$out" | tr -s ' \n' ' ')"
+  else
+    # "Inst NAME [OLDVERSION] (NEWVERSION ...)" is an upgrade or downgrade of an
+    # installed package; "Remv NAME" a removal. (A trailing " []" is not.)
+    local changes=() upgrade_re='^Inst [^ ]+ \[[^]]+\] \('
+    while IFS= read -r line; do
+      if [[ $line =~ $upgrade_re ]]; then
+        changes+=("${line#Inst }")
+      elif [[ $line == "Remv "* ]]; then
+        changes+=("remove ${line#Remv }")
+      fi
+    done <<<"$out"
+    if ((${#changes[@]})); then
+      block "apt would change installed packages (refusing): ${changes[*]}"
+    else
+      note "apt simulation: only new packages would be installed ($(grep -c '^Inst ' <<<"$out") packages); nothing installed changes"
+    fi
+    while IFS= read -r line; do
+      case $line in
+        "Inst postgresql-17 "*|"Inst postgresql-client-17 "*) ;;
+        "Inst "*resolute-pgdg*|"Inst "*apt.postgresql.org*) block "apt would take another package from PGDG: ${line#Inst }" ;;
+      esac
+    done <<<"$out"
+  fi
+  rm -rf -- "$d"
 }
 
 print_plan() {
@@ -384,7 +538,12 @@ write_if_changed() { # PATH MODE <stdin> -> returns 0 if changed
   mv -f -- "$tmp" "$1"
 }
 
-psql_admin() { runuser -u postgres -- psql -X --set=ON_ERROR_STOP=1 --dbname=nmcp "$@"; }
+# Always our own cluster, by explicit socket directory and port: never the
+# host's default cluster.
+psql_admin() {
+  runuser -u postgres -- psql -X --host=/var/run/postgresql --port="$pg_port" \
+    --set=ON_ERROR_STOP=1 --dbname=nmcp "$@"
+}
 
 step_packages() {
   log "packages"
@@ -395,13 +554,42 @@ step_packages() {
     && ! systemctl cat nginx.service >/dev/null 2>&1; then
     systemctl mask nginx.service
   fi
-  "$scripts/infra-apt-install" "${packages[@]}"
+  # PGDG may only provide postgresql-17/postgresql-client-17, now and in later
+  # upgrades; no package script may create a default cluster or start any
+  # service (that would also start every other auto-start cluster).
+  pgdg_pin_text | write_if_changed "$pgdg_pin" 0644 || true
+  install -d -m 0755 "${createcluster_conf%/*}"
+  printf '# nmcp deploy: packages never create a default cluster; deploy creates 17/%s itself.\ncreate_main_cluster = false\n' \
+    "$pg_cluster" | write_if_changed "$createcluster_conf" 0644 || true
+  local missing_now=() pkg before_clusters after_clusters
+  for pkg in "${packages[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || missing_now+=("$pkg")
+  done
+  if ((${#missing_now[@]})); then
+    blockers=()
+    simulate_apt "${missing_now[@]}"
+    ((${#blockers[@]} == 0)) || die "apt re-check before installing: ${blockers[*]}"
+    before_clusters=$(pg_lsclusters --no-header 2>/dev/null | cut -d' ' -f1-2 || true)
+    [[ ! -e $policy_rc && ! -L $policy_rc ]] || die "$policy_rc appeared; refusing to replace it"
+    printf '#!/bin/sh\n# nmcp deploy: no package may start services during its install.\nexit 101\n' >"$policy_rc"
+    chmod 0755 "$policy_rc"
+    policy_rc_ours=true
+    "$scripts/infra-apt-install" "${missing_now[@]}"
+    rm -f -- "$policy_rc"
+    policy_rc_ours=false
+    after_clusters=$(pg_lsclusters --no-header 2>/dev/null | cut -d' ' -f1-2 || true)
+    if [[ $after_clusters != "$before_clusters" ]]; then
+      die "the package install created a cluster on its own ($(diff <(printf '%s\n' "$before_clusters") <(printf '%s\n' "$after_clusters") | grep '^>' | xargs)); deploy leaves it untouched for review"
+    fi
+  fi
   # Deployment evidence: where PostgreSQL 17 came from and which key signed it.
   install -d -m 0700 /var/lib/nmcp/deployment
   {
     printf 'pgdg_source=%s\n' "$pgdg_list"
     printf 'pgdg_signing_key_fingerprint=%s\n' "$pgdg_fingerprint"
     printf 'pgdg_signing_key_file_sha256=%s\n' "$pgdg_key_sha256"
+    printf 'pgdg_pin=%s\n' "$pgdg_pin"
+    cat -- "$pgdg_pin"
     cat -- "$pgdg_list"
     apt-cache policy postgresql-17 postgresql-client-17
   } | write_if_changed /var/lib/nmcp/deployment/postgresql-source.txt 0600 || true
@@ -409,13 +597,22 @@ step_packages() {
 
 step_postgresql() {
   log "PostgreSQL 17 cluster and roles"
-  if [[ $(systemctl show -p LoadState --value "$pg_unit") != loaded ]] || ! pg_lsclusters -h | grep -q '^17 main '; then
-    pg_createcluster 17 main
+  if [[ ! -f $pg_marker ]]; then
+    # Never adopt a cluster this deploy did not create (preflight blocks too).
+    if pg_lsclusters --no-header 2>/dev/null | grep -q "^17 $pg_cluster "; then
+      die "cluster 17/$pg_cluster exists but was not created by deploy"
+    fi
+    pg_createcluster 17 "$pg_cluster" --port "$pg_port" --start-conf=auto
+    install -d -m 0700 "${pg_marker%/*}"
+    printf 'created=%s port=%s\n' "$(date -u +%FT%TZ)" "$pg_port" >"$pg_marker"
   fi
-  systemctl enable --now "$pg_unit"
+  [[ $(pg_lsclusters --no-header 2>/dev/null | grep "^17 $pg_cluster " | tr -s ' ' | cut -d' ' -f3) == "$pg_port" ]] \
+    || die "cluster 17/$pg_cluster does not listen on NMCP_PG_PORT $pg_port"
+  # Only our own instance; never postgresql.service or another cluster.
+  systemctl start "$pg_unit"
   psql_admin -d postgres -XAtq -c 'select 1' >/dev/null
   if ! psql_admin -XAtq -c 'select 1' >/dev/null 2>&1; then
-    runuser -u postgres -- createdb --encoding=UTF8 nmcp
+    runuser -u postgres -- createdb --host=/var/run/postgresql --port="$pg_port" --encoding=UTF8 nmcp
   fi
   psql_admin --set=nmcp_migration_compatibility=0 --file=- <"$repo/infra/ubuntu/postgresql-roles.sql" >/dev/null
   # Passwords travel only as SCRAM verifiers on stdin: never argv, env or logs.
@@ -439,7 +636,7 @@ for role in ("migrator", "api", "worker", "check", "repair", "backup_control", "
 PY
 }
 
-dsn() { printf 'postgres://nmcp_%s:%s@127.0.0.1:5432/nmcp?sslmode=disable' "$1" "$(secret "$1")"; }
+dsn() { printf 'postgres://nmcp_%s:%s@127.0.0.1:%s/nmcp?sslmode=disable' "$1" "$(secret "$1")" "$pg_port"; }
 
 render_config() {
   local host_dir=$state/host-config base_url="https://$hostname:$files_port/files/"
@@ -511,7 +708,7 @@ step_host() {
     systemctl stop nmcp.target nmcp-files.service 2>/dev/null || true
     "$scripts/install-ubuntu-host" --config-dir "$state/host-config" \
       --api-listen "$tailnet_ip:$api_port" --files-listen "$tailnet_ip:$files_port" \
-      --tailnet-hostname "$hostname" --postgresql-unit "$pg_unit" \
+      --tailnet-hostname "$hostname" --postgresql-unit "$pg_unit" --postgresql-port "$pg_port" \
       --tls-cert "$state/tls/cert.pem" --tls-key "$state/tls/key.pem"
     printf '%s\n' "$host_digest" >"$state/host-digest"
     host_reinstalled=true
@@ -546,12 +743,12 @@ step_backup() {
     | write_if_changed "$dir/backup.env" 0600 && changed=true
   for role in control dump; do
     [[ $role == control ]] || printf '\n'
-    printf '[nmcp_backup_%s]\nhost=/var/run/postgresql\nport=5432\ndbname=nmcp\nuser=nmcp_backup_%s\nsslmode=disable\n' \
-      "$role" "$role"
+    printf '[nmcp_backup_%s]\nhost=/var/run/postgresql\nport=%s\ndbname=nmcp\nuser=nmcp_backup_%s\nsslmode=disable\n' \
+      "$role" "$pg_port" "$role"
   done | write_if_changed "$dir/backup.pg_service.conf" 0600 && changed=true
   for role in dump control; do
-    printf 'localhost:5432:nmcp:nmcp_backup_%s:%s\n/var/run/postgresql:5432:nmcp:nmcp_backup_%s:%s\n' \
-      "$role" "$(secret "backup_$role")" "$role" "$(secret "backup_$role")" \
+    printf 'localhost:%s:nmcp:nmcp_backup_%s:%s\n/var/run/postgresql:%s:nmcp:nmcp_backup_%s:%s\n' \
+      "$pg_port" "$role" "$(secret "backup_$role")" "$pg_port" "$role" "$(secret "backup_$role")" \
       | write_if_changed "$dir/backup-$role.pgpass" 0600 && changed=true
   done
   install -o root -g root -m 0755 "$repo/infra/ubuntu/backup-notify" /usr/local/libexec/nmcp/backup-notify
@@ -587,8 +784,10 @@ if [[ $mode == check ]]; then
 fi
 print_plan || exit 1
 host_dirty=true host_reinstalled=false host_digest='' services_stopped=false
+policy_rc_ours=false
 on_exit() {
   local status=$?
+  if $policy_rc_ours; then rm -f -- "$policy_rc"; fi
   if ((status != 0)) && $services_stopped; then
     printf '%s\n' "deploy: nmcp services were stopped for the host install and are still stopped." \
       "deploy: fix the error above and rerun 'sudo ./deploy'; the rerun reinstalls and restarts them." >&2

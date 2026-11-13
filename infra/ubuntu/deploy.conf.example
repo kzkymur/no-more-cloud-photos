@@ -19,6 +19,12 @@ NMCP_DATA_MOUNT=/REPLACE/hdd
 NMCP_API_PORT=8443
 NMCP_FILES_PORT=8444
 
+# Loopback port of the dedicated PostgreSQL 17 cluster 17/nmcp that deploy
+# creates. Any other PostgreSQL on the host (other clusters, other versions,
+# containers) is never stopped, restarted, reconfigured, upgraded or used;
+# deploy stops if this port is taken.
+NMCP_PG_PORT=5433
+
 # Only used when the host is not yet joined to the Tailnet: a root-owned 0600
 # file containing a Tailscale auth key. Leave empty on an already joined host.
 NMCP_TAILSCALE_AUTHKEY_FILE=
