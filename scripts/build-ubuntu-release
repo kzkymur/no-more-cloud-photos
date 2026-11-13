@@ -98,6 +98,7 @@ GO_VERSION=1.27.1
 GO_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
 GO_ROOT=/opt/nmcp-build/go$GO_VERSION
 ICC_SHA256=384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
+staged_bin=$work/bin   # Go binaries from the compile phase
 
 compile_steps() {
 # --- native toolchains and helpers ------------------------------------------
@@ -116,7 +117,6 @@ step "pinned video toolchain (SVT-AV1, zimg, FFmpeg)"
 "$repo/internal/videoprocessor/helper/build-pinned-toolchain.sh" "$prefix" "$work/video-toolchain"
 
 step "Go binaries and video helper"
-staged_bin=$work/bin
 install -d -m 0755 "$staged_bin"
 # Keep Go's VCS stamping (vcs.revision/vcs.modified in the build info) so every
 # binary is traceable to the same commit as the release ID. Go runs git itself;
@@ -205,6 +205,9 @@ fi
 # yasm: libaom 3.8.2's CMake check cannot parse nasm 3.x (Ubuntu 26.04) help
 # output ("Unsupported nasm: multipass optimization not supported"); aom
 # prefers yasm when it is installed.
+# Root later copies build-user outputs; this kernel setting stops the build
+# user from hardlinking files it cannot write (for example root-only files).
+[ "$(cat /proc/sys/fs/protected_hardlinks 2>/dev/null)" = 1 ] || die "fs.protected_hardlinks must be 1"
 for tool in cc c++ cmake meson ninja nasm yasm pkg-config patchelf curl git setpriv useradd pkill pgrep; do
   command -v "$tool" >/dev/null || die "missing build tool $tool (use --install-build-deps)"
 done
@@ -251,9 +254,29 @@ run_as_builder env NMCP_BUILD_JOBS="$jobs" NMCP_BUILD_STEP="$step_no" NMCP_BUILD
   bash "$src/scripts/build-ubuntu-release" --compile-phase
 stop_builder_processes
 step_no=$((step_no + 6))
-# From here on root works on the outputs: take ownership first.
+# Root keeps executing and reading only the original, root-verified checkout
+# ($repo); $src (build-user-writable during the compile) is never used by root
+# again, not even through git.
+#
+# Before root reads any build output (no build-user process is alive now, so
+# nothing can change underneath): no symlink anywhere root copies from, and
+# every exact input is a regular file owned by the build user (lstat, no
+# dereference). fs.protected_hardlinks=1, asserted earlier, stops the build
+# user from hardlinking files it cannot write.
+build_inputs=("$prefix/bin/ffmpeg" "$prefix/bin/ffprobe"
+  "$work/still-helper/bin/nmcp-still-helper" "$work/animation-helper/bin/nmcp-animation-helper"
+  "$work/sRGB2014.icc" "$staged_bin/core-api" "$staged_bin/core-worker" "$staged_bin/nmcp-admin"
+  "$staged_bin/nmcp-video-helper")
+planted=$(find "$prefix/bin" "$prefix/share" "$staged_bin" "$work/still-helper/bin" \
+  "$work/animation-helper/bin" -type l -print -quit)
+[ -z "$planted" ] || die "the build produced a symlink where root copies files: $planted"
+for input in "${build_inputs[@]}"; do
+  if [ -L "$input" ] || [ "$(stat -c '%F %U' -- "$input" 2>/dev/null)" != "regular file $build_user" ]; then
+    die "build output is not a regular file owned by $build_user: $input"
+  fi
+done
+# Then take ownership: chown -R does not follow symlinks.
 chown -R root:root "$prefix" "$work"
-repo=$src
 
 # --- reduce the prefix to the release layout --------------------------------
 step "assemble the release layout"
@@ -263,7 +286,8 @@ install -d -m 0755 "$keep_bin"
 install -m 0755 "$prefix/bin/ffmpeg" "$prefix/bin/ffprobe" "$keep_bin/"
 install -m 0755 "$work/still-helper/bin/nmcp-still-helper" "$keep_bin/"
 install -m 0755 "$work/animation-helper/bin/nmcp-animation-helper" "$keep_bin/"
-install -m 0755 "$staged_bin"/* "$keep_bin/"
+install -m 0755 "$staged_bin/core-api" "$staged_bin/core-worker" "$staged_bin/nmcp-admin" \
+  "$staged_bin/nmcp-video-helper" "$keep_bin/"
 rm -rf -- "${prefix:?}/bin"
 install -d -m 0755 "$prefix/bin"
 for binary in "${release_bins[@]}"; do install -m 0755 "$keep_bin/$binary" "$prefix/bin/$binary"; done
