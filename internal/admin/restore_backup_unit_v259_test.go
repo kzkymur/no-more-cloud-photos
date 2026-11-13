@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
 	"testing"
 )
@@ -128,8 +129,14 @@ func TestBackupUnitV259ServiceModes(t *testing.T) {
 	if validateBackupUnitEffective(backupContractFixture(t), false, m) == nil {
 		t.Fatal("v255 property set (no mode pins) accepted under v259 rules")
 	}
+	// v255 rules ignore the v259-only properties; RuntimeDirectorySymlink is
+	// the one shared property whose value differs (v256+ lists directories).
+	p["RuntimeDirectorySymlink"] = json.RawMessage(`[]`)
 	if validateBackupUnitEffective(p, false, backupManager255) != nil {
 		t.Fatal("v255 rules must ignore the v259-only mode properties")
+	}
+	if validateBackupUnitEffective(p, false, m) == nil {
+		t.Fatal("v259 accepted a RuntimeDirectorySymlink without the runtime directory entry")
 	}
 }
 
@@ -156,5 +163,72 @@ func TestBackupUnitV259IdentityQueriesWantsMountsFor(t *testing.T) {
 	b["WantsMountsFor"] = json.RawMessage(`["/tmp"]`)
 	if drift := backupUnitIdentityDrift(a, b); len(drift) != 1 {
 		t.Fatalf("membership change not drift: %v", drift)
+	}
+}
+
+// TestBackupUnitContractAcceptsRealSystemd259Manager runs the production
+// validators over the properties a real systemd 259.5 manager reported for
+// the canonical unit (testdata/systemd259-nmcp-backup-unit.json, see its
+// "source"), with and without nmcp-backup.timer loaded: every queried
+// property is present with its exact D-Bus signature, the v259 sets accept
+// it, and the v255 sets refuse it.
+func TestBackupUnitContractAcceptsRealSystemd259Manager(t *testing.T) {
+	raw, err := os.ReadFile("testdata/systemd259-nmcp-backup-unit.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type typed struct {
+		Type string          `json:"type"`
+		Data json.RawMessage `json:"data"`
+	}
+	var dump map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &dump); err != nil {
+		t.Fatal(err)
+	}
+	for _, variant := range []string{"no-timer", "with-timer"} {
+		var v struct {
+			Manager map[string]typed `json:"manager"`
+			Unit    map[string]typed `json:"unit"`
+			Service map[string]typed `json:"service"`
+		}
+		if err := json.Unmarshal(dump[variant], &v); err != nil {
+			t.Fatal(err)
+		}
+		var version string
+		if err := json.Unmarshal(v.Manager["Version"].Data, &version); err != nil {
+			t.Fatal(err)
+		}
+		m, ok := backupManagerFor(version)
+		if !ok || m != backupManager259 {
+			t.Fatalf("%s: manager %q not selected as 259", variant, version)
+		}
+		props := func(specs []backupUnitProperty, got map[string]typed) map[string]json.RawMessage {
+			out := map[string]json.RawMessage{}
+			for _, spec := range specs {
+				value, ok := got[spec.name]
+				if !ok || value.Type != spec.signature {
+					t.Fatalf("%s: %s missing or signature %q (want %q)", variant, spec.name, value.Type, spec.signature)
+				}
+				out[spec.name] = value.Data
+			}
+			return out
+		}
+		unit := props(backupUnitIdentityProperties(m), v.Unit)
+		service := props(backupUnitServiceProperties(m), v.Service)
+		if bind, err := backupUnitDropins(unit["DropInPaths"]); err != nil || bind {
+			t.Fatalf("%s: real drop-in set %s: %v %v", variant, unit["DropInPaths"], bind, err)
+		}
+		if err := validateBackupUnitDependencies(unit, "postgresql@17-main.service", m); err != nil {
+			t.Fatalf("%s: real 259 unit rejected: %v", variant, err)
+		}
+		if err := validateBackupUnitEffective(service, false, m); err != nil {
+			t.Fatalf("%s: real 259 service rejected: %v", variant, err)
+		}
+		if validateBackupUnitDependencies(unit, "postgresql@17-main.service", backupManager255) == nil {
+			t.Fatalf("%s: real 259 unit accepted under v255 rules", variant)
+		}
+		if validateBackupUnitEffective(service, false, backupManager255) == nil {
+			t.Fatalf("%s: real 259 service accepted under v255 rules", variant)
+		}
 	}
 }

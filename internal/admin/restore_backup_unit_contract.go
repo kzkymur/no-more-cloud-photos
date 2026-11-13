@@ -350,6 +350,18 @@ func validateBackupUnitFragment(body []byte) error {
 	}
 	return nil
 }
+
+// backupRuntimeDirectorySymlinks: since v256 the property lists every
+// RuntimeDirectory= entry with its (empty) symlink targets and flags, so the
+// canonical single directory reads [["nmcp-backup","",0]]; v255 lists only
+// symlinks and reads [].
+func backupRuntimeDirectorySymlinks(m backupManager) any {
+	if m == backupManager259 {
+		return []any{[]any{"nmcp-backup", "", 0}}
+	}
+	return []any{}
+}
+
 func backupUnitServiceProperties(m backupManager) []backupUnitProperty {
 	p := []backupUnitProperty{
 		{"Type", "s", "oneshot"}, {"RemainAfterExit", "b", false}, {"KillMode", "s", "control-group"},
@@ -363,7 +375,7 @@ func backupUnitServiceProperties(m backupManager) []backupUnitProperty {
 		// This deprecated property is hidden from GetAll; explicitly query it.
 		{"PermissionsStartOnly", "b", false}, {"RootDirectoryStartOnly", "b", false},
 		{"RuntimeDirectory", "as", []string{"nmcp-backup"}}, {"RuntimeDirectoryMode", "u", 448},
-		{"RuntimeDirectoryPreserve", "s", "no"}, {"RuntimeDirectorySymlink", "a(sst)", []any{}},
+		{"RuntimeDirectoryPreserve", "s", "no"}, {"RuntimeDirectorySymlink", "a(sst)", backupRuntimeDirectorySymlinks(m)},
 		{"UMask", "u", 63}, {"Environment", "as", nil}, {"LoadCredential", "a(ss)", nil},
 		{"EnvironmentFiles", "a(sb)", []any{[]any{"/etc/nmcp/backup.env", false}}},
 		{"PassEnvironment", "as", []string{}}, {"UnsetEnvironment", "as", []string{}},
@@ -399,6 +411,10 @@ func backupUnitServiceProperties(m backupManager) []backupUnitProperty {
 			backupUnitProperty{"PrivateBPF", "s", "no"},
 			backupUnitProperty{"ImportCredentialEx", "a(ss)", []any{}},
 			backupUnitProperty{"UserNamespacePath", "s", ""},
+			// Unset DelegateNamespaces= is all ones (NAMESPACE_FLAGS_INITIAL);
+			// both values observed on a real 259.5 manager.
+			backupUnitProperty{"DelegateNamespaces", "t", uint64(18446744073709551615)},
+			backupUnitProperty{"BindLogSockets", "b", false},
 		)
 	}
 	return p
