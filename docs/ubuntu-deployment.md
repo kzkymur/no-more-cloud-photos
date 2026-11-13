@@ -48,8 +48,9 @@ What `./deploy` does, in order:
 - Adds the PGDG repository with the signing key vendored in the repository
   (`infra/ubuntu/pgdg-ACCC4CF8.asc`, pinned by SHA-256 and fingerprint) and installs
   `infra/ubuntu/packages.txt`.
-- Creates the PostgreSQL 17 cluster (`postgresql@17-main.service`) and the
-  `nmcp` database, then runs the role bootstrap. Every login gets a generated
+- Creates a dedicated PostgreSQL 17 cluster `17/nmcp`
+  (`postgresql@17-nmcp.service`, loopback port `NMCP_PG_PORT`, default 5433)
+  and the `nmcp` database, then runs the role bootstrap. Every login gets a generated
   password, stored only under root-only `/etc/nmcp/deploy`; passwords reach
   PostgreSQL only as SCRAM verifiers.
 - Builds the release with `scripts/build-ubuntu-release`.
@@ -62,7 +63,26 @@ The default backup failure hook (`infra/ubuntu/backup-notify`) only writes to
 the journal at priority `err`. Replace it if nothing monitors the journal.
 
 What deploy never touches: port 443, the existing `tailscale serve` and Funnel
-configuration, the UFW default policy, and disks. It stops with an error if a
+configuration, the UFW default policy, disks, and any other PostgreSQL on the
+host. `--check` lists what owns 5432 and `NMCP_PG_PORT`, every existing
+cluster and every installed PostgreSQL package with its origin, and simulates
+the exact apt transaction: it stops if any installed package would be
+upgraded, downgraded or removed, or if anything cannot be determined. An apt
+pin lets PGDG provide only `postgresql-17` and `postgresql-client-17`, now and
+in later upgrades. Only for the duration of its own package install, deploy
+installs `/usr/sbin/policy-rc.d` (no package script may start a service) and
+a `postgresql-common` `createcluster.d` file (no default cluster), and removes
+both right after, also on failure; it refuses to run if either already exists.
+While that guard is in place, no `invoke-rc.d` start on the host succeeds;
+the window is the length of the apt run. The simulation reads the host's apt
+configuration with every update/dpkg hook cleared, so `--check` runs no host
+apt hook. The resource-cap drop-in applies to `postgresql@17-nmcp.service`
+only; a template-wide drop-in from an older install is removed if it is
+byte-identical to ours, and any other cluster it had already moved into
+`nmcp.slice` stays there until that cluster's next restart (deploy never
+restarts it). Backups call
+`/usr/lib/postgresql/17/bin/pg_dump` and `pg_restore` by full path, so a newer
+PostgreSQL client on the host is reported but not in the way. It stops with an error if a
 configured port is already in use or claimed by `tailscale serve`/Funnel.
 
 The rest of this document is the reference for what deploy automates: the

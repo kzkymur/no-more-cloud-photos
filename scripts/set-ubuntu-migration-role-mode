@@ -38,11 +38,28 @@ if [[ -z ${NMCP_RUNTIME_ROLES:-} && -z ${NMCP_VERIFY_ROLE_GRAPH:-} ]]; then
   }
 fi
 
+# The nmcp cluster's port, recorded by install-ubuntu-host. Absent only on
+# hosts installed before the port was configurable, which all used 5432.
+pg_port=5432
+port_record=/etc/nmcp/postgresql-port
+if [[ -e $port_record || -L $port_record ]]; then
+  if ! [[ -f $port_record && ! -L $port_record \
+    && $(/usr/bin/stat -c '%U:%G:%a' "$port_record") == root:root:644 ]]; then
+    printf '%s: unsafe PostgreSQL port record\n' "${0##*/}" >&2
+    exit 1
+  fi
+  pg_port=$(<"$port_record")
+  if ! [[ $pg_port =~ ^[1-9][0-9]{3,4}$ ]] || ((pg_port > 65535)); then
+    printf '%s: invalid PostgreSQL port record\n' "${0##*/}" >&2
+    exit 1
+  fi
+fi
+
 compatibility=FALSE
 [[ $mode == hardened ]] || compatibility=TRUE
 psql_local() {
   /usr/bin/env -i /usr/sbin/runuser -u postgres -- \
-    /usr/bin/psql --no-psqlrc --host=/var/run/postgresql --port=5432 \
+    /usr/bin/psql --no-psqlrc --host=/var/run/postgresql --port="$pg_port" \
     --username=postgres --dbname=nmcp "$@"
 }
 psql_local \

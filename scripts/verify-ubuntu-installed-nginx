@@ -16,7 +16,8 @@ for path in /etc/nmcp /etc/nmcp-nginx /var/lib/nmcp /srv/nmcp /run/nmcp-deploy \
   /etc/systemd/system/nmcp.target \
   /etc/systemd/system/nmcp-tls-expiry.service /etc/systemd/system/nmcp-tls-expiry.timer \
   /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf \
-  /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf; do
+  /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf \
+  /etc/systemd/system/postgresql@nmcp-test.service.d/10-nmcp-slice.conf; do
   [[ ! -e $path ]] || { printf 'refusing to replace existing test-host path: %s\n' "$path" >&2; exit 1; }
 done
 cleanup() {
@@ -35,6 +36,7 @@ cleanup() {
     /etc/systemd/system/nmcp-tls-expiry.timer \
     /etc/systemd/system/nmcp-migrate.service.d/10-postgresql.conf \
     /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf \
+    /etc/systemd/system/postgresql@nmcp-test.service.d/10-nmcp-slice.conf \
     /etc/tmpfiles.d/nmcp.conf /etc/sysusers.d/nmcp.conf
   /usr/bin/rm -rf "/run/nmcp-test-restart.$$"
   /usr/bin/rm -f "/usr/local/share/ca-certificates/nmcp-test-$$.crt"
@@ -286,6 +288,13 @@ for path in /usr/local/libexec/nmcp/run-ubuntu-migration-compatibility \
   /usr/local/libexec/nmcp/set-ubuntu-migration-role-mode; do
   [[ $(/usr/bin/stat -c '%U:%G:%a' "$path") == root:root:755 ]]
 done
+# The slice drop-in is instance-only (never template-wide, which would move
+# every other PostgreSQL cluster on the host into nmcp.slice), and the
+# default cluster port is recorded for the helpers.
+[[ -f /etc/systemd/system/postgresql@nmcp-test.service.d/10-nmcp-slice.conf \
+  && ! -e /etc/systemd/system/postgresql@.service.d/10-nmcp-slice.conf ]]
+[[ $(/usr/bin/stat -c '%U:%G:%a' /etc/nmcp/postgresql-port) == root:root:644 \
+  && $(</etc/nmcp/postgresql-port) == 5432 ]]
 for path in /usr/local/libexec/nmcp/postgresql/runtime-roles.sql \
   /usr/local/libexec/nmcp/postgresql/verify-runtime-role-graph.sql; do
   [[ $(/usr/bin/stat -c '%U:%G:%a' "$path") == root:root:644 ]]

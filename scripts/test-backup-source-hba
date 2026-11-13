@@ -37,6 +37,25 @@ def cutover(source='source', candidate='candidate', roles=None):
 
 
 class SourceHBA(unittest.TestCase):
+    def test_recorded_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = Path(tmp) / 'postgresql-port'
+            with patch.object(hba, 'PORT_RECORD', record):
+                self.assertEqual(hba.recorded_port(), '5432')  # absent: pre-port hosts
+                record.write_bytes(b'5433\n')
+                fake = types.SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0)
+                with patch.object(Path, 'lstat', return_value=fake):
+                    self.assertEqual(hba.recorded_port(), '5433')
+                    for bad in [b'0\n', b'99999\n', b'5433 \n', b'54a3\n', b'', b'5433\n5434\n']:
+                        record.write_bytes(bad)
+                        with self.assertRaises(ValueError):
+                            hba.recorded_port()
+                for unsafe in [types.SimpleNamespace(st_mode=stat.S_IFREG | 0o664, st_uid=0, st_gid=0),
+                               types.SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=1000, st_gid=0),
+                               types.SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0, st_gid=0)]:
+                    with patch.object(Path, 'lstat', return_value=unsafe), self.assertRaises(ValueError):
+                        hba.recorded_port()
+
     def test_services_closed(self):
         self.assertEqual(hba.service_database(services()), 'source')
         for role in hba.ROLES.split(','):

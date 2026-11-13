@@ -410,7 +410,11 @@ def validate_runtime_helper(source: str) -> None:
         source.count("/usr/bin/psql") == 1
         and "exec /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C HOME=/var/lib/postgresql" in source
         and "/usr/sbin/runuser -u postgres -- /usr/bin/psql --no-psqlrc" in source
-        and "--host=/var/run/postgresql --port=5432 --username=postgres --dbname=nmcp" in source
+        and "--host=/var/run/postgresql --port=\"$pg_port\" --username=postgres --dbname=nmcp" in source
+        and source.count("pg_port=") == 2 and "pg_port=5432\n" in source
+        and "port_record=/etc/nmcp/postgresql-port\n" in source
+        and "== root:root:644 ]]" in source
+        and "! [[ $pg_port =~ ^[1-9][0-9]{3,4}$ ]] || ((pg_port > 65535))" in source
         and "--set=ON_ERROR_STOP=1 <&\"$sql_fd\"" in source,
         "runtime helper must execute the SQL descriptor with fixed peer-authenticated psql arguments",
     )
@@ -10530,7 +10534,9 @@ def main() -> int:
         "postgresql-role-bootstrap.sha256" in role_mode
         and "/usr/bin/env -i /usr/sbin/runuser -u postgres" in role_mode
         and "--host=/var/run/postgresql" in role_mode
-        and "--port=5432" in role_mode
+        and "--port=\"$pg_port\"" in role_mode
+        and "port_record=/etc/nmcp/postgresql-port\n" in role_mode
+        and "! [[ $pg_port =~ ^[1-9][0-9]{3,4}$ ]] || ((pg_port > 65535))" in role_mode
         and "--username=postgres" in role_mode
         and "verify-runtime-role-graph.sql" in role_mode
         and "systemctl stop nmcp-migrate.service" in release_installer,
