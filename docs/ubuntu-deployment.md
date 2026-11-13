@@ -37,11 +37,16 @@ commit to deploy:
    The first run builds the release on the host (about 40 minutes; capped at
    2 CPUs / 4 GiB with low priority). Later runs of the same commit skip the
    build, and steps whose result already exists are skipped.
+
+   If a run fails after it has stopped the services for the host install,
+   they stay stopped (deploy says so). Fix the reported error and rerun
+   `sudo ./deploy`: the rerun reinstalls the host assets and starts them.
 5. Apply the Tailscale ACL snippet that deploy prints, in the admin console.
 
 What `./deploy` does, in order:
 
-- Adds the PGDG repository (fingerprint-checked) and installs
+- Adds the PGDG repository with the signing key vendored in the repository
+  (`infra/ubuntu/pgdg-ACCC4CF8.asc`, pinned by SHA-256 and fingerprint) and installs
   `infra/ubuntu/packages.txt`.
 - Creates the PostgreSQL 17 cluster (`postgresql@17-main.service`) and the
   `nmcp` database, then runs the role bootstrap. Every login gets a generated

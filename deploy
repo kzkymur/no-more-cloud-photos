@@ -35,7 +35,10 @@ state=/etc/nmcp/deploy                 # root-only generated secrets and inputs
 pg_unit=postgresql@17-main.service
 pgdg_list=/etc/apt/sources.list.d/pgdg.sources
 pgdg_key=/usr/share/keyrings/nmcp-pgdg.asc
-# apt.postgresql.org signing key (ACCC4CF8), as published by the PostgreSQL project.
+# The apt.postgresql.org signing key (ACCC4CF8) is vendored in the repository and
+# pinned twice: by file digest, and as exactly one primary key with this fingerprint.
+pgdg_key_src=$repo/infra/ubuntu/pgdg-ACCC4CF8.asc
+pgdg_key_sha256=0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76
 pgdg_fingerprint=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
 
 blockers=()
@@ -46,6 +49,39 @@ block() { blockers+=("$*"); }
 todo() { plan+=("$*"); }
 die() { printf 'deploy: error: %s\n' "$*" >&2; exit 1; }
 git_() { git -c safe.directory="$repo" -C "$repo" "$@"; }
+
+pgdg_sources_text() {
+  printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: resolute-pgdg\nComponents: main\nSigned-By: %s\n' "$pgdg_key"
+}
+verify_pgdg_key_source() { # the vendored key: exact bytes, one primary key, pinned fingerprint
+  [[ $(sha256sum <"$pgdg_key_src" | cut -d' ' -f1) == "$pgdg_key_sha256" ]] \
+    || die "vendored PGDG key $pgdg_key_src does not match its pinned SHA-256"
+  local gnupg listing
+  gnupg=$(mktemp -d)
+  listing=$(GNUPGHOME=$gnupg gpg --batch --quiet --with-colons --import-options show-only \
+    --import "$pgdg_key_src" 2>/dev/null)
+  rm -rf -- "$gnupg"
+  [[ $(grep -c '^pub:' <<<"$listing") == 1 ]] || die "vendored PGDG key must hold exactly one primary key"
+  [[ $(grep -A1 '^pub:' <<<"$listing" | sed -n 's/^fpr:::::::::\([0-9A-F]*\):$/\1/p') == "$pgdg_fingerprint" ]] \
+    || die "vendored PGDG key fingerprint is not $pgdg_fingerprint"
+}
+
+# Render an env template with builtins only, so generated secrets never reach
+# the argv of an external process (visible to other local users in /proc).
+render_env() { # TEMPLATE [KEY VALUE]... -> stdout
+  local template=$1 line key
+  shift
+  local -A over=()
+  while (($#)); do over[$1]=$2; shift 2; done
+  while IFS= read -r line || [[ -n $line ]]; do
+    key=${line%%=*}
+    if [[ $line != \#* && $line == *=* && -v over[$key] ]]; then
+      printf '%s=%s\n' "$key" "${over[$key]}"
+    else
+      printf '%s\n' "$line"
+    fi
+  done <"$template"
+}
 
 # ---------------------------------------------------------------- config ----
 read_config() {
@@ -188,6 +224,7 @@ cfg = json.loads(os.environ["TS_JSON"].strip() or "{}") or {}
 bad = sorted(p for p in (cfg.get("TCP") or {}) if p in ports)
 bad += sorted(k for k, on in (cfg.get("AllowFunnel") or {}).items()
               if on and k.rsplit(":", 1)[-1] in ports)
+bad += sorted(k for k in (cfg.get("Web") or {}) if k.rsplit(":", 1)[-1] in ports)
 print(" ".join(bad))
 PY
 )
@@ -239,7 +276,17 @@ PY
   for pkg in "${packages[@]}"; do
     dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || missing+=("$pkg")
   done
-  [[ -f $pgdg_list ]] || todo "add the PGDG apt repository (resolute-pgdg, key $pgdg_fingerprint)"
+  verify_pgdg_key_source
+  if [[ -e $pgdg_list || -e $pgdg_key ]]; then
+    if [[ $(cat -- "$pgdg_list" 2>/dev/null) != "$(pgdg_sources_text)" ]] || ! cmp -s "$pgdg_key" "$pgdg_key_src"; then
+      block "$pgdg_list or $pgdg_key exists but differs from the pinned PGDG source/key; review and remove it"
+    fi
+  else
+    todo "add the PGDG apt repository (resolute-pgdg, vendored key $pgdg_fingerprint)"
+  fi
+  local other_pgdg
+  other_pgdg=$(grep -rlsF apt.postgresql.org /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null | grep -vxF "$pgdg_list" || true)
+  [[ -z $other_pgdg ]] || block "another apt source for apt.postgresql.org exists ($other_pgdg); remove it so only the pinned one is trusted"
   if ((${#missing[@]})); then
     todo "install packages: ${missing[*]}"
     if [[ " ${missing[*]} " == *" nginx-core "* ]] && ! systemctl cat nginx.service >/dev/null 2>&1; then
@@ -263,9 +310,7 @@ PY
     note "release $release_id already installed; build is skipped"
   else
     todo "build release $release_id on this host (first build takes ~40 min, $jobs jobs)"
-    local avail
-    avail=$(df --output=avail -B1G /var/tmp | tail -1 | tr -d ' ')
-    ((avail >= 15)) || block "/var/tmp needs >= 15 GiB free for the build (has ${avail} GiB)"
+    check_build_space
   fi
   if [[ $(readlink -f /opt/nmcp/current 2>/dev/null) == "/opt/nmcp/releases/$release_id" ]]; then
     note "release $release_id is already active"
@@ -275,6 +320,27 @@ PY
   todo "install host assets (units, Nginx on $tailnet_ip:$api_port and :$files_port, TLS from 'tailscale cert') if changed"
   todo "install backup configuration and wake timer if changed"
   todo "verify services, readiness and firewall"
+}
+
+# Free space where the build really writes: the work tree (/var/tmp/nmcp-build),
+# the final prefix (/opt/nmcp/releases/ID, required by the RPATH contract) and
+# the staged copy (/var/lib/nmcp-build/releases). Paths on one filesystem add up.
+check_build_space() {
+  local -A need_by_dev=() where_by_dev=()
+  local entry path need probe dev avail
+  for entry in /var/tmp/nmcp-build:15 /opt/nmcp/releases:2 /var/lib/nmcp-build:2; do
+    path=${entry%%:*} need=${entry##*:} probe=$path
+    while [[ ! -e $probe ]]; do probe=$(dirname -- "$probe"); done
+    dev=$(stat -c %d -- "$probe")
+    need_by_dev[$dev]=$(( ${need_by_dev[$dev]:-0} + need ))
+    where_by_dev[$dev]="${where_by_dev[$dev]:+${where_by_dev[$dev]}, }$path"
+    where_by_dev[$dev.probe]=$probe
+  done
+  for dev in "${!need_by_dev[@]}"; do
+    avail=$(df --output=avail -B1G -- "${where_by_dev[$dev.probe]}" | tail -1 | tr -d ' ')
+    ((avail >= need_by_dev[$dev])) \
+      || block "the build needs ${need_by_dev[$dev]} GiB free for ${where_by_dev[$dev]} (that filesystem has ${avail} GiB)"
+  done
 }
 
 print_plan() {
@@ -306,7 +372,7 @@ secret() { # NAME -> prints a generated secret, created once and reused
     chmod 0600 "$file.new"
     mv -f -- "$file.new" "$file"
   fi
-  cat -- "$file"
+  printf '%s\n' "$(<"$file")"
 }
 
 write_if_changed() { # PATH MODE <stdin> -> returns 0 if changed
@@ -322,18 +388,9 @@ psql_admin() { runuser -u postgres -- psql -X --set=ON_ERROR_STOP=1 --dbname=nmc
 
 step_packages() {
   log "packages"
-  if [[ ! -f $pgdg_list ]]; then
-    local tmp
-    tmp=$(mktemp -d)
-    curl --fail --location --silent --show-error --proto '=https' \
-      https://www.postgresql.org/media/keys/ACCC4CF8.asc -o "$tmp/key.asc"
-    gpg --batch --quiet --with-colons --import-options show-only --import "$tmp/key.asc" \
-      | grep -q "^fpr:::::::::$pgdg_fingerprint:" || die "PGDG signing key fingerprint mismatch"
-    install -m 0644 "$tmp/key.asc" "$pgdg_key"
-    rm -rf -- "$tmp"
-    printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: resolute-pgdg\nComponents: main\nSigned-By: %s\n' \
-      "$pgdg_key" | write_if_changed "$pgdg_list" 0644 || true
-  fi
+  verify_pgdg_key_source
+  install -o root -g root -m 0644 "$pgdg_key_src" "$pgdg_key"
+  pgdg_sources_text | write_if_changed "$pgdg_list" 0644 || true
   if ! dpkg-query -W -f='${Status}' nginx-core 2>/dev/null | grep -q 'install ok installed' \
     && ! systemctl cat nginx.service >/dev/null 2>&1; then
     systemctl mask nginx.service
@@ -344,6 +401,7 @@ step_packages() {
   {
     printf 'pgdg_source=%s\n' "$pgdg_list"
     printf 'pgdg_signing_key_fingerprint=%s\n' "$pgdg_fingerprint"
+    printf 'pgdg_signing_key_file_sha256=%s\n' "$pgdg_key_sha256"
     cat -- "$pgdg_list"
     apt-cache policy postgresql-17 postgresql-client-17
   } | write_if_changed /var/lib/nmcp/deployment/postgresql-source.txt 0600 || true
@@ -386,17 +444,16 @@ dsn() { printf 'postgres://nmcp_%s:%s@127.0.0.1:5432/nmcp?sslmode=disable' "$1" 
 render_config() {
   local host_dir=$state/host-config base_url="https://$hostname:$files_port/files/"
   install -d -m 0700 "$state" "$host_dir" /etc/nmcp /etc/nmcp/credentials
-  sed -e "s|^NMCP_DATABASE_URL=.*|NMCP_DATABASE_URL=$(dsn migrator)|" \
-    "$repo/infra/ubuntu/env/admin.env.example" | write_if_changed "$host_dir/admin.env" 0600 || true
-  sed -e "s|^NMCP_DATABASE_URL=.*|NMCP_DATABASE_URL=$(dsn api)|" \
-    -e "s|^NMCP_FILE_BASE_URL=.*|NMCP_FILE_BASE_URL=$base_url|" \
-    -e "s|^NMCP_CURSOR_HMAC_KEY=.*|NMCP_CURSOR_HMAC_KEY=$(secret cursor_hmac)|" \
-    "$repo/infra/ubuntu/env/api.env.example" | write_if_changed "$host_dir/api.env" 0600 || true
-  sed -e "s|^NMCP_DATABASE_URL=.*|NMCP_DATABASE_URL=$(dsn worker)|" \
-    -e "s|^NMCP_FILE_BASE_URL=.*|NMCP_FILE_BASE_URL=$base_url|" \
-    "$repo/infra/ubuntu/env/worker.env.example" | write_if_changed "$host_dir/worker.env" 0600 || true
-  sed -e "s|^NMCP_FILE_BASE_URL=.*|NMCP_FILE_BASE_URL=$base_url|" \
-    "$repo/infra/ubuntu/env/capability.env.example" | write_if_changed /etc/nmcp/capability.env 0600 || true
+  local env_dir=$repo/infra/ubuntu/env
+  render_env "$env_dir/admin.env.example" NMCP_DATABASE_URL "$(dsn migrator)" \
+    | write_if_changed "$host_dir/admin.env" 0600 || true
+  render_env "$env_dir/api.env.example" NMCP_DATABASE_URL "$(dsn api)" \
+    NMCP_FILE_BASE_URL "$base_url" NMCP_CURSOR_HMAC_KEY "$(secret cursor_hmac)" \
+    | write_if_changed "$host_dir/api.env" 0600 || true
+  render_env "$env_dir/worker.env.example" NMCP_DATABASE_URL "$(dsn worker)" NMCP_FILE_BASE_URL "$base_url" \
+    | write_if_changed "$host_dir/worker.env" 0600 || true
+  render_env "$env_dir/capability.env.example" NMCP_FILE_BASE_URL "$base_url" \
+    | write_if_changed /etc/nmcp/capability.env 0600 || true
   local name role
   for name in admin check repair; do
     role=$name
@@ -447,6 +504,10 @@ step_host() {
   tls_current=$(readlink -f /etc/nmcp/tls-current 2>/dev/null || true)
   if $host_dirty; then
     log "install host assets"
+    # install-ubuntu-host requires the File Server stopped. If anything fails
+    # from here on, services stay stopped (fail-closed); rerunning ./deploy
+    # reinstalls (the host digest is only recorded on success) and restarts them.
+    services_stopped=true
     systemctl stop nmcp.target nmcp-files.service 2>/dev/null || true
     "$scripts/install-ubuntu-host" --config-dir "$state/host-config" \
       --api-listen "$tailnet_ip:$api_port" --files-listen "$tailnet_ip:$files_port" \
@@ -462,14 +523,16 @@ step_host() {
 
 step_activate() {
   if [[ $(readlink -f /opt/nmcp/current 2>/dev/null) == "/opt/nmcp/releases/$release_id" ]]; then
-    if $host_reinstalled; then
-      log "restart services on the reinstalled host assets"
+    # Also covers a previous run that stopped services and died before restart.
+    if $host_reinstalled || ! systemctl is-active --quiet nmcp.target; then
+      log "start services on release $release_id"
       systemctl start nmcp.target
     fi
-    return
+  else
+    log "activate release $release_id"
+    "$scripts/install-ubuntu-release" activate "$release_id"
   fi
-  log "activate release $release_id"
-  "$scripts/install-ubuntu-release" activate "$release_id"
+  services_stopped=false
 }
 
 step_backup() {
@@ -511,8 +574,9 @@ step_verify() {
 }
 
 # ---------------------------------------------------------------- main -----
-lock=/run/nmcp-deploy-cli.lock
-exec 9>"$lock"
+# Serialize deploys on the script itself: no lock file is created, so --check
+# leaves nothing behind.
+exec 9<"$repo/deploy"
 flock -n 9 || die "another deploy is running"
 preflight
 if [[ $mode == check ]]; then
@@ -522,7 +586,15 @@ if [[ $mode == check ]]; then
   exit 0
 fi
 print_plan || exit 1
-host_dirty=true host_reinstalled=false host_digest=''
+host_dirty=true host_reinstalled=false host_digest='' services_stopped=false
+on_exit() {
+  local status=$?
+  if ((status != 0)) && $services_stopped; then
+    printf '%s\n' "deploy: nmcp services were stopped for the host install and are still stopped." \
+      "deploy: fix the error above and rerun 'sudo ./deploy'; the rerun reinstalls and restarts them." >&2
+  fi
+}
+trap on_exit EXIT
 if [[ -z $tailnet_ip ]]; then
   log "join the Tailnet"
   tailscale up --auth-key="file:$authkey_file"
