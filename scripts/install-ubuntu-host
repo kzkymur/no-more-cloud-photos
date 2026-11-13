@@ -76,16 +76,20 @@ for command in /usr/sbin/nginx /usr/sbin/ufw /usr/bin/systemd-analyze \
   /usr/bin/systemd-sysusers /usr/bin/systemd-tmpfiles /usr/bin/openssl /usr/bin/python3; do
   [[ -x $command ]] || { printf 'install-ubuntu-host: missing %s\n' "$command" >&2; exit 1; }
 done
-/usr/bin/python3 - <<'PY'
+os_version_id=$(/usr/bin/python3 - <<'PY'
 values = {}
 with open("/etc/os-release", encoding="utf-8") as source:
     for line in source:
         if "=" in line:
             key, value = line.rstrip("\n").split("=", 1)
             values[key] = value.strip('"')
-if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "24.04":
-    raise SystemExit("install-ubuntu-host: only Ubuntu 24.04 is supported")
+# 26.04 is the production target (./deploy refuses anything else); 24.04 is
+# kept because the hosted CI lanes install onto ubuntu-24.04 runners.
+if values.get("ID") != "ubuntu" or values.get("VERSION_ID") not in ("24.04", "26.04"):
+    raise SystemExit("install-ubuntu-host: only Ubuntu 26.04 (production) or 24.04 (CI) is supported")
+print(values["VERSION_ID"])
 PY
+)
 
 [[ $postgresql_unit =~ ^postgresql@[A-Za-z0-9_.-]+\.service$ \
   && $postgresql_unit != postgresql@.service ]] || {
@@ -223,8 +227,15 @@ bootstrap_checksums=$(/usr/bin/mktemp /var/lib/nmcp/deployment/postgresql-role-b
 /usr/bin/install -o root -g root -m 0644 "$repo_root/docs/ubuntu-deployment.md" /usr/share/doc/nmcp/ubuntu-deployment.md
 /usr/bin/install -o root -g root -m 0644 "$repo_root/docs/backup-operations.md" /usr/share/doc/nmcp/backup-operations.md
 
-/usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' \
-  ca-certificates curl ffmpeg libimage-exiftool-perl nginx-core postgresql tzdata ufw util-linux \
+# Evidence of the exact runtime package versions. On the 26.04 production
+# target that is all of infra/ubuntu/packages.txt (a missing package fails the
+# install); the 24.04 CI hosts keep their distribution PostgreSQL.
+if [[ $os_version_id == 26.04 ]]; then
+  mapfile -t runtime_packages < <(/usr/bin/grep -vE '^[[:space:]]*(#|$)' "$repo_root/infra/ubuntu/packages.txt")
+else
+  runtime_packages=(ca-certificates curl ffmpeg libimage-exiftool-perl nginx-core postgresql tzdata ufw util-linux)
+fi
+/usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' "${runtime_packages[@]}" \
   > /var/lib/nmcp/deployment/runtime-packages.txt
 /usr/bin/chown root:root /var/lib/nmcp/deployment/runtime-packages.txt
 /usr/bin/chmod 0600 /var/lib/nmcp/deployment/runtime-packages.txt

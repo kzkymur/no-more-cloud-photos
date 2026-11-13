@@ -106,6 +106,12 @@ passed.
 
 ## Image and package policy
 
+The production target is Ubuntu 26.04 LTS (resolute) amd64
+(`docs/ubuntu-deployment.md`). Validation deliberately stays on Ubuntu 24.04
+images, runners and guests: no CI lane installs onto 26.04. Evidence for a real
+26.04 install comes only from the host itself, recorded with
+`docs/real-host-handoff.md`; never cite these lanes as a substitute.
+
 The validation inputs are Go `1.27.1`, Ubuntu `24.04`, PostgreSQL
 `17-alpine`, and Nginx `1.28-alpine`; every base image is pinned by its
 multi-platform manifest digest. Ubuntu/APK package patch versions are resolved

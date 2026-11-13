@@ -1,12 +1,39 @@
-# Ubuntu 24.04 runtime packages. Record the exact installed versions in the
-# deployment evidence; this file deliberately does not claim repository-wide
-# versions that the project does not control.
+# Ubuntu 26.04 LTS (resolute) amd64 runtime packages. Record the exact
+# installed versions in the deployment evidence; this file deliberately does not
+# claim repository-wide versions that the project does not control.
+#
+# postgresql-17 and postgresql-client-17 come from the PostgreSQL Global
+# Development Group (PGDG) apt repository for resolute (apt.postgresql.org,
+# suite resolute-pgdg). Ubuntu 26.04 itself ships only PostgreSQL 18, and the
+# backup/restore contract requires the server and client tools to be major 17.
+# The cluster unit is postgresql@17-main.service.
 ca-certificates
 curl
 ffmpeg
 libimage-exiftool-perl
 nginx-core
-postgresql
+postgresql-17
+postgresql-client-17
 tzdata
 ufw
 util-linux
+# System half of the release's native library closure (the pinned codecs ship
+# inside the release), exactly as printed by scripts/build-ubuntu-release under
+# "closure: system runtime packages" (trial run 43453858084, Ubuntu 26.04).
+# Keep this block equal to that output.
+libatomic1
+libblkid1
+libc6
+libde265-0
+libexif12
+libexpat1
+libffi8
+libgcc-s1
+libglib2.0-0t64
+libjpeg-turbo8
+libmount1
+libpcre2-8-0
+libpng16-16t64
+libselinux1
+libstdc++6
+zlib1g
