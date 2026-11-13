@@ -41,8 +41,17 @@ type BackupSettings struct {
 	NotifyHook  string
 }
 
+// PostgreSQL 17 client tools are addressed by their PGDG/Debian per-major
+// path, never through /usr/bin (Debian pg_wrapper selects a major from the
+// host's clusters, which may be another PostgreSQL) or PATH. The major-match
+// check against the connected server still runs on every backup.
+const (
+	PostgreSQL17PgDump    = "/usr/lib/postgresql/17/bin/pg_dump"
+	PostgreSQL17PgRestore = "/usr/lib/postgresql/17/bin/pg_restore"
+)
+
 func backupSettings() (BackupSettings, error) {
-	b := BackupSettings{Root: os.Getenv("NMCP_BACKUP_ROOT"), DumpService: os.Getenv("NMCP_BACKUP_DUMP_SERVICE"), ServiceFile: os.Getenv("PGSERVICEFILE"), PassFile: os.Getenv("NMCP_BACKUP_DUMP_PASSFILE"), DumpTool: "/usr/bin/pg_dump", RestoreTool: "/usr/bin/pg_restore", NotifyHook: os.Getenv("NMCP_BACKUP_NOTIFY_HOOK")}
+	b := BackupSettings{Root: os.Getenv("NMCP_BACKUP_ROOT"), DumpService: os.Getenv("NMCP_BACKUP_DUMP_SERVICE"), ServiceFile: os.Getenv("PGSERVICEFILE"), PassFile: os.Getenv("NMCP_BACKUP_DUMP_PASSFILE"), DumpTool: PostgreSQL17PgDump, RestoreTool: PostgreSQL17PgRestore, NotifyHook: os.Getenv("NMCP_BACKUP_NOTIFY_HOOK")}
 	if !filepath.IsAbs(b.Root) || !serviceName.MatchString(b.DumpService) || !filepath.IsAbs(b.ServiceFile) || !filepath.IsAbs(b.PassFile) {
 		return b, ErrValidation
 	}
