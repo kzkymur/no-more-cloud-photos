@@ -194,7 +194,18 @@ def acquire(e, policy, required, api, now=time.monotonic, boot=None, previous=No
             break
     need(len(rows) == total and len({positive_id(j['id']) for j in rows}) == total,
          'pagination_duplicate')
-    candidates = [j for j in rows if j['name'] == e['job_name'] and j['runner_name'] == e['runner_name']]
+    named = [j for j in rows if j['name'] == e['job_name']]
+    candidates = [j for j in named if j['runner_name'] == e['runner_name']]
+    need(len(candidates) <= 1, 'ambiguous_job')
+    if not candidates:
+        # In a job's first seconds GitHub can list it before recording its
+        # runner (runner_name empty, status queued). Only that is transient:
+        # the caller may retry job_runner_pending for a bounded time. A job
+        # that is absent, or listed under another runner, is refused for good.
+        pending = [j for j in named if j['runner_name'] in (None, '')
+                   and j['status'] in ('queued', 'in_progress')]
+        need(pending, 'job_not_found')
+        raise Refused('job_runner_pending')
     need(len(candidates) == 1, 'ambiguous_job')
     listed = candidates[0]
     detail = api.get(base + '/jobs/' + str(positive_id(listed['id'])))

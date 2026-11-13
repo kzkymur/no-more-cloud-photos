@@ -117,6 +117,30 @@ class Admission(unittest.TestCase):
         for rows in ([job(),job(32)], [job(32,'other')]):
             with self.assertRaises(m.Refused):acquire(Fake(rows))
 
+    def refusal(self, rows):
+        with self.assertRaises(m.Refused) as caught:
+            acquire(Fake(rows))
+        return str(caught.exception)
+
+    def test_runner_pending_is_distinct_and_narrow(self):
+        def pending(status='queued', runner=None, name=None):
+            j = job(name=name); j['runner_name'] = runner; j['status'] = status; return j
+        # This job listed but its runner not recorded yet: transient.
+        for runner in (None, ''):
+            for status in ('queued', 'in_progress'):
+                with self.subTest(runner=runner, status=status):
+                    self.assertEqual(self.refusal([pending(status, runner)]), 'job_runner_pending')
+        # Absent, other name only, another runner, or a finished job: final.
+        self.assertEqual(self.refusal([job(32, 'other')]), 'job_not_found')
+        other = job(); other['runner_name'] = 'runner-two'
+        self.assertEqual(self.refusal([other]), 'job_not_found')
+        self.assertEqual(self.refusal([pending('completed')]), 'job_not_found')
+        self.assertEqual(self.refusal([pending(name='other')]), 'job_not_found')
+        # More than one match stays final even if another sibling is pending.
+        self.assertEqual(self.refusal([job(), job(32), dict(pending(), id=33)]), 'ambiguous_job')
+        # One exact match admits as before, even next to a pending sibling.
+        acquire(Fake([job(), dict(pending(), id=33)]))
+
     def test_duplicate_page_ids(self):
         with self.assertRaises(m.Refused):acquire(Fake([job(),job()]))
 
