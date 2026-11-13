@@ -36,7 +36,7 @@ it, the change is recorded here once, with its decision, code and evidence, so
 | `Release gate / RAW and AV1 under one nmcp.slice` (CI root lane) | Isolated systemd 255 guest (nspawn) with the production units and sandbox | Release binaries | `TestReleaseGateResources` (L3) plus one real-unit ENOSPC case |
 | `Backup / actual systemd all-pool cutover and separate resume` (CI root lane) | Same guest | Release binaries | Live backup/restore/cutover/resume with a second independent cycle, plus the sized RPO/RTO dataset |
 | `Backup / offline two-cluster source-stop recovery and separate resume` (CI root lane) | Same guest, two PG17 clusters | Release binaries | Offline source-down recovery, external authorization, HBA promotion and real Go-timeout cleanup |
-| Ubuntu deployment (PR-only) | Hosted Ubuntu 24.04 (static/fixture checks; the production target is Ubuntu 26.04, whose install CI does not exercise) | Release scripts and units | Production install, configuration, firewall, TLS, systemd, migration/role compatibility (current = 25) |
+| Ubuntu deployment (PR-only) | Hosted Ubuntu 24.04 (real install on the runner; the Ubuntu 26.04 production target is not exercised in CI) | Release scripts and units | Production install, configuration, firewall, TLS, systemd, migration/role compatibility (current = 25) |
 
 ## L1: end-to-end chain (release binaries)
 
