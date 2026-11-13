@@ -121,8 +121,8 @@ def env(path, example=False):
         'NMCP_DATABASE_URL': 'service=nmcp_backup_control',
         'NMCP_BACKUP_ROOT': '/var/lib/nmcp-backup',
         'NMCP_BACKUP_DUMP_SERVICE': 'nmcp_backup_dump',
-        'NMCP_BACKUP_PG_DUMP': '/usr/bin/pg_dump',
-        'NMCP_BACKUP_PG_RESTORE': '/usr/bin/pg_restore',
+        'NMCP_BACKUP_PG_DUMP': '/usr/lib/postgresql/17/bin/pg_dump',
+        'NMCP_BACKUP_PG_RESTORE': '/usr/lib/postgresql/17/bin/pg_restore',
         'NMCP_LOG_LEVEL': 'info', 'NMCP_SHUTDOWN_TIMEOUT': '30s',
     }
     for key, value in expected.items():
@@ -392,8 +392,9 @@ def host():
     units(Path('/etc/systemd/system'))
     installed_unit_contract(fresh_manager)
     versions = []
-    for tool in ('/usr/bin/pg_dump', '/usr/bin/pg_restore'):
-        # Ubuntu pg_wrapper may be a package-owned symlink; inspect canonical target.
+    for tool in ('/usr/lib/postgresql/17/bin/pg_dump', '/usr/lib/postgresql/17/bin/pg_restore'):
+        # Fixed PGDG per-major path, never /usr/bin pg_wrapper (it may select
+        # another installed major). Inspect the canonical target if packaged as a link.
         safe(Path(tool).resolve(), 0)
         result = subprocess.run([tool, '--version'], check=True, capture_output=True, text=True, timeout=10)
         match = re.fullmatch(r'pg_(?:dump|restore) \(PostgreSQL\) (\d+)(?:\.[^\n]+)?\n?', result.stdout)

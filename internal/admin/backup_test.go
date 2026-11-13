@@ -72,7 +72,7 @@ func TestBackupSettingsPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.DumpTool != "/usr/bin/pg_dump" || settings.RestoreTool != "/usr/bin/pg_restore" {
+	if settings.DumpTool != "/usr/lib/postgresql/17/bin/pg_dump" || settings.RestoreTool != "/usr/lib/postgresql/17/bin/pg_restore" {
 		t.Fatal("unexpected tool defaults")
 	}
 	for _, test := range []struct{ key, value string }{{"NMCP_BACKUP_ROOT", "relative"}, {"PGSERVICEFILE", "relative"}, {"NMCP_BACKUP_DUMP_PASSFILE", "relative"}, {"NMCP_BACKUP_DUMP_SERVICE", "dump password=secret"}, {"NMCP_BACKUP_DUMP_SERVICE", "dump\nuser=operator"}, {"NMCP_BACKUP_PG_DUMP", "pg_dump"}, {"NMCP_BACKUP_PG_RESTORE", "pg_restore"}} {
@@ -190,5 +190,25 @@ func TestBackupDumpPassfileSecurityBeforeConnect(t *testing.T) {
 				t.Fatalf("unsafe passfile returned %v", err)
 			}
 		})
+	}
+}
+
+// The PostgreSQL 17 client tools are never resolved through /usr/bin
+// (Debian pg_wrapper picks a major from the host's clusters) or PATH.
+func TestPostgreSQLClientToolsArePinnedToMajor17Directory(t *testing.T) {
+	for _, tool := range []string{PostgreSQL17PgDump, PostgreSQL17PgRestore} {
+		if filepath.Dir(tool) != "/usr/lib/postgresql/17/bin" || filepath.Clean(tool) != tool {
+			t.Fatalf("tool %q is not pinned to the PostgreSQL 17 directory", tool)
+		}
+	}
+	t.Setenv("PATH", "")
+	t.Setenv("NMCP_BACKUP_PG_RESTORE", "")
+	c, _ := restoreSettings() // only the tool default matters here
+	if c.RestoreTool != PostgreSQL17PgRestore {
+		t.Fatalf("restore default = %q", c.RestoreTool)
+	}
+	var r restoreConnections
+	if cmd := r.command(context.Background(), RestoreSettings{Service: "s"}); cmd.Path != PostgreSQL17PgRestore {
+		t.Fatalf("restore command path = %q", cmd.Path)
 	}
 }

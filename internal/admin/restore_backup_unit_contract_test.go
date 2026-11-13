@@ -162,11 +162,11 @@ func TestBackupUnitProductionTemplateContract(t *testing.T) {
 	}
 }
 func TestCutoverBackupEnvironmentCannotOverrideCredentialRoute(t *testing.T) {
-	good := "NMCP_DATABASE_URL=service=nmcp_backup_control\nNMCP_BACKUP_DUMP_SERVICE=nmcp_backup_dump\nNMCP_BACKUP_ROOT=/var/lib/nmcp-backup\nNMCP_BACKUP_PG_DUMP=/usr/bin/pg_dump\n"
+	good := "NMCP_DATABASE_URL=service=nmcp_backup_control\nNMCP_BACKUP_DUMP_SERVICE=nmcp_backup_dump\nNMCP_BACKUP_ROOT=/var/lib/nmcp-backup\nNMCP_BACKUP_PG_DUMP=/usr/lib/postgresql/17/bin/pg_dump\n"
 	if validateCutoverBackupEnvironment([]byte(good)) != nil {
 		t.Fatal("canonical environment rejected")
 	}
-	for _, extra := range []string{"PGPASSFILE=/tmp/private", "PGSERVICEFILE=/tmp/service", "PGHOST=evil", "NMCP_BACKUP_DUMP_PASSFILE=/tmp/private", "NMCP_CONFIG_FILE=/tmp/override", "LD_PRELOAD=/tmp/library", "NMCP_BACKUP_ROOT=/var/lib/nmcp-backup", "NMCP_LOG_LEVEL=info bad", "NMCP_LOG_LEVEL=\"info\"", "NMCP_BACKUP_NOTIFY_HOOK=relative", "NMCP_BACKUP_PG_RESTORE=/usr/bin/../bin/pg_restore"} {
+	for _, extra := range []string{"PGPASSFILE=/tmp/private", "PGSERVICEFILE=/tmp/service", "PGHOST=evil", "NMCP_BACKUP_DUMP_PASSFILE=/tmp/private", "NMCP_CONFIG_FILE=/tmp/override", "LD_PRELOAD=/tmp/library", "NMCP_BACKUP_ROOT=/var/lib/nmcp-backup", "NMCP_LOG_LEVEL=info bad", "NMCP_LOG_LEVEL=\"info\"", "NMCP_BACKUP_NOTIFY_HOOK=relative", "NMCP_BACKUP_PG_RESTORE=/usr/lib/postgresql/17/bin/../bin/pg_restore"} {
 		if validateCutoverBackupEnvironment([]byte(good+extra+"\n")) == nil {
 			t.Fatalf("override admitted for %s", strings.Split(extra, "=")[0])
 		}

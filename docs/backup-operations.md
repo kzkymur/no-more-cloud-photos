@@ -67,10 +67,13 @@ the deployment configuration, not the `postgresql.service` meta-unit. Do not
 use the migration oneshot as an uncoordinated backup startup dependency.
 
 Install `infra/ubuntu/env/backup.env.example` as `/etc/nmcp/backup.env`,
-root:root 0600. Tool paths are fixed `/usr/bin/pg_dump` and `/usr/bin/pg_restore`;
-install PostgreSQL 17 clients and verify the actual selected versions. A generic
-Ubuntu wrapper selecting another major is not sufficient. No passwords or
-operator restore credentials belong in this environment.
+root:root 0600. Tool paths are fixed `/usr/lib/postgresql/17/bin/pg_dump` and
+`/usr/lib/postgresql/17/bin/pg_restore` (PGDG `postgresql-client-17`); they are
+never resolved through `/usr/bin` or `PATH`, because the Debian `pg_wrapper`
+there may select another installed major (for example a platform PostgreSQL
+18). The tools must be root:root without writable parents, report major 17, and
+every backup still checks that the client major matches the connected server.
+No passwords or operator restore credentials belong in this environment.
 
 Create `/etc/nmcp/backup.pg_service.conf` root:root 0600 with exactly:
 

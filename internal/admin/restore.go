@@ -51,7 +51,7 @@ func restoreSettings() (RestoreSettings, error) {
 	c := RestoreSettings{Root: os.Getenv("NMCP_BACKUP_ROOT"), LedgerRoot: os.Getenv("NMCP_RESTORE_LEDGER_ROOT"), ReceiptFile: os.Getenv("NMCP_RESTORE_RECEIPT"), Service: os.Getenv("NMCP_RESTORE_SERVICE"), APIService: os.Getenv("NMCP_RESTORE_API_SERVICE"), ServiceFile: os.Getenv("PGSERVICEFILE"), PassFile: os.Getenv("NMCP_RESTORE_PASSFILE"), StorageRoot: os.Getenv("NMCP_STORAGE_ROOT"), FileBaseURL: os.Getenv("NMCP_FILE_BASE_URL")}
 	c.RestoreTool = os.Getenv("NMCP_BACKUP_PG_RESTORE")
 	if c.RestoreTool == "" {
-		c.RestoreTool = "/usr/bin/pg_restore"
+		c.RestoreTool = PostgreSQL17PgRestore
 	}
 	return c, c.validate()
 }
@@ -479,7 +479,7 @@ func resolveRestoreConnections(c RestoreSettings) (*restoreConnections, error) {
 func (r *restoreConnections) command(ctx context.Context, c RestoreSettings) *exec.Cmd {
 	tool := c.RestoreTool
 	if tool == "" {
-		tool = "/usr/bin/pg_restore"
+		tool = PostgreSQL17PgRestore
 	}
 	cmd := exec.CommandContext(ctx, tool, "--no-password", "--single-transaction", "--exit-on-error", "--dbname=service="+c.Service)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "PGSERVICE=" + c.Service, "PGSERVICEFILE=/proc/self/fd/3", "PGPASSFILE=/proc/self/fd/4"}
