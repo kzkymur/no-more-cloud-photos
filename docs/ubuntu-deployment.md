@@ -1,6 +1,8 @@
 # Ubuntu production deployment
 
 This runbook installs the repository's production contract on Ubuntu 26.04 LTS (resolute) amd64.
+CI validates these assets on Ubuntu 24.04 only and does not exercise a 26.04
+install; record real-host evidence with `docs/real-host-handoff.md`.
 It intentionally requires real host values; example addresses, credentials, and
 certificates are never promoted to production defaults.
 
