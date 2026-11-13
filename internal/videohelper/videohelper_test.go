@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -295,7 +296,11 @@ func TestRuntimeClosureRequiresPinnedAOMObjectAndNonFallbackRPATH(t *testing.T) 
 	symlink(t, "libavcodec.so.62", filepath.Join(libDir, "libavcodec.so"))
 	ffmpeg := filepath.Join(binDir, "ffmpeg")
 	runCC(t, "-Wl,--disable-new-dtags,-rpath,"+libDir, "-Wl,-rpath-link,"+libDir, "-L"+libDir, "-o", ffmpeg, mainSource, "-lavcodec")
-	if err := validateAOMDependency(ffmpeg, prefix, aomObject); err != nil {
+	aomDigest, err := digestFile(aomObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAOMDependency(ffmpeg, prefix, aomObject, aomDigest); err != nil {
 		t.Fatalf("valid pinned closure rejected: %v", err)
 	}
 	alternateAOM := filepath.Join(libDir, "libaom-alternate.so.3.8.2")
@@ -304,7 +309,7 @@ func TestRuntimeClosureRequiresPinnedAOMObjectAndNonFallbackRPATH(t *testing.T) 
 		t.Fatal(err)
 	}
 	symlink(t, filepath.Base(alternateAOM), filepath.Join(libDir, "libaom.so.3"))
-	if err := validateAOMDependency(ffmpeg, prefix, aomObject); err == nil {
+	if err := validateAOMDependency(ffmpeg, prefix, aomObject, aomDigest); err == nil {
 		t.Fatal("substituted libaom SONAME target was accepted")
 	}
 	if err := os.Remove(filepath.Join(libDir, "libaom.so.3")); err != nil {
@@ -313,8 +318,180 @@ func TestRuntimeClosureRequiresPinnedAOMObjectAndNonFallbackRPATH(t *testing.T) 
 	symlink(t, filepath.Base(aomObject), filepath.Join(libDir, "libaom.so.3"))
 	hostFallback := filepath.Join(binDir, "ffmpeg-runpath")
 	runCC(t, "-Wl,-rpath,"+libDir, "-Wl,-rpath-link,"+libDir, "-L"+libDir, "-o", hostFallback, mainSource, "-lavcodec")
-	if err := validateAOMDependency(hostFallback, prefix, aomObject); err == nil {
+	if err := validateAOMDependency(hostFallback, prefix, aomObject, aomDigest); err == nil {
 		t.Fatal("RUNPATH host fallback was accepted")
+	}
+}
+
+// TestRuntimeClosureAOMContentIdentity covers the release layout, where the
+// libaom SONAME is a regular copy of the pinned object (install-ubuntu-release
+// refuses symlinks), alongside the symlinked build/validation-image layout.
+func TestRuntimeClosureAOMContentIdentity(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("cc is unavailable")
+	}
+	type layout struct {
+		prefix, libDir, aomObject, ffmpeg, digest string
+	}
+	build := func(t *testing.T, flattened bool) layout {
+		t.Helper()
+		prefix := t.TempDir()
+		libDir := filepath.Join(prefix, "lib")
+		binDir := filepath.Join(prefix, "bin")
+		for _, dir := range []string{libDir, binDir} {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		aomSource := writeNamedTemp(t, prefix, "aom.c", "int nmcp_aom(void) { return 1; }\n")
+		codecSource := writeNamedTemp(t, prefix, "codec.c", "extern int nmcp_aom(void); int nmcp_codec(void) { return nmcp_aom(); }\n")
+		mainSource := writeNamedTemp(t, prefix, "main.c", "extern int nmcp_codec(void); int main(void) { return nmcp_codec() == 1 ? 0 : 1; }\n")
+		aomObject := filepath.Join(libDir, "libaom.so.3.8.2")
+		runCC(t, "-shared", "-fPIC", "-Wl,-soname,libaom.so.3", "-o", aomObject, aomSource)
+		symlink(t, "libaom.so.3.8.2", filepath.Join(libDir, "libaom.so.3"))
+		symlink(t, "libaom.so.3", filepath.Join(libDir, "libaom.so"))
+		codecObject := filepath.Join(libDir, "libavcodec.so.62.0.0")
+		runCC(t, "-shared", "-fPIC", "-Wl,-soname,libavcodec.so.62", "-Wl,--disable-new-dtags,-rpath,"+libDir, "-L"+libDir, "-o", codecObject, codecSource, "-laom")
+		symlink(t, "libavcodec.so.62.0.0", filepath.Join(libDir, "libavcodec.so.62"))
+		symlink(t, "libavcodec.so.62", filepath.Join(libDir, "libavcodec.so"))
+		ffmpeg := filepath.Join(binDir, "ffmpeg")
+		runCC(t, "-Wl,--disable-new-dtags,-rpath,"+libDir, "-Wl,-rpath-link,"+libDir, "-L"+libDir, "-o", ffmpeg, mainSource, "-lavcodec")
+		if flattened {
+			for _, name := range []string{"libaom.so.3", "libaom.so"} {
+				copyRegular(t, aomObject, filepath.Join(libDir, name))
+			}
+		}
+		digest, err := digestFile(aomObject)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return layout{prefix, libDir, aomObject, ffmpeg, digest}
+	}
+	check := func(l layout) error { return validateAOMDependency(l.ffmpeg, l.prefix, l.aomObject, l.digest) }
+
+	t.Run("symlink layout accepted", func(t *testing.T) {
+		if err := check(build(t, false)); err != nil {
+			t.Fatalf("symlinked closure rejected: %v", err)
+		}
+	})
+	t.Run("flattened regular SONAME accepted", func(t *testing.T) {
+		l := build(t, true)
+		if err := check(l); err != nil {
+			t.Fatalf("flattened closure rejected: %v", err)
+		}
+		// Prove the flattened layout is the one actually loaded.
+		if out, err := exec.Command(l.ffmpeg).CombinedOutput(); err != nil {
+			t.Fatalf("flattened ffmpeg did not run: %v %s", err, out)
+		}
+	})
+	t.Run("only SONAME and object present accepted", func(t *testing.T) {
+		l := build(t, true)
+		if err := os.Remove(filepath.Join(l.libDir, "libaom.so")); err != nil {
+			t.Fatal(err)
+		}
+		if err := check(l); err != nil {
+			t.Fatalf("minimal flattened closure rejected: %v", err)
+		}
+	})
+
+	negatives := map[string]func(t *testing.T, l layout){
+		"missing SONAME": func(t *testing.T, l layout) {
+			mustRemove(t, filepath.Join(l.libDir, "libaom.so.3"))
+		},
+		"dangling SONAME symlink": func(t *testing.T, l layout) {
+			mustRemove(t, filepath.Join(l.libDir, "libaom.so.3"))
+			symlink(t, "libaom.so.3.8.1", filepath.Join(l.libDir, "libaom.so.3"))
+		},
+		"SONAME symlink outside prefix": func(t *testing.T, l layout) {
+			outside := filepath.Join(t.TempDir(), "libaom.so.3.8.2")
+			copyRegular(t, l.aomObject, outside)
+			mustRemove(t, filepath.Join(l.libDir, "libaom.so.3"))
+			symlink(t, outside, filepath.Join(l.libDir, "libaom.so.3"))
+		},
+		"SONAME symlink to identical copy": func(t *testing.T, l layout) {
+			// Same bytes but not the pinned object: symlinks must
+			// resolve to the pinned object itself.
+			other := filepath.Join(l.libDir, "libaom-copy.so.3.8.2")
+			copyRegular(t, l.aomObject, other)
+			mustRemove(t, filepath.Join(l.libDir, "libaom.so.3"))
+			symlink(t, filepath.Base(other), filepath.Join(l.libDir, "libaom.so.3"))
+		},
+		"flattened SONAME digest mismatch": func(t *testing.T, l layout) {
+			appendByte(t, filepath.Join(l.libDir, "libaom.so.3"))
+		},
+		"flattened dev link digest mismatch": func(t *testing.T, l layout) {
+			appendByte(t, filepath.Join(l.libDir, "libaom.so"))
+		},
+		"SONAME is a directory": func(t *testing.T, l layout) {
+			mustRemove(t, filepath.Join(l.libDir, "libaom.so.3"))
+			if err := os.Mkdir(filepath.Join(l.libDir, "libaom.so.3"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"extra versioned libaom candidate": func(t *testing.T, l layout) {
+			copyRegular(t, l.aomObject, filepath.Join(l.libDir, "libaom.so.3.9.0"))
+		},
+		"extra libaom candidate symlink": func(t *testing.T, l layout) {
+			symlink(t, "libaom.so.3.8.2", filepath.Join(l.libDir, "libaom.so.4"))
+		},
+	}
+	for name, mutate := range negatives {
+		for _, flattened := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/flattened=%v", name, flattened), func(t *testing.T) {
+				l := build(t, flattened)
+				mutate(t, l)
+				if err := check(l); err == nil {
+					t.Fatal("tampered libaom closure was accepted")
+				}
+			})
+		}
+	}
+	t.Run("manifest digest mismatch", func(t *testing.T) {
+		for _, flattened := range []bool{false, true} {
+			l := build(t, flattened)
+			l.digest = strings.Repeat("0", 64)
+			if err := check(l); err == nil {
+				t.Fatalf("flattened=%v: wrong manifest digest accepted", flattened)
+			}
+		}
+	})
+	t.Run("invalid manifest digest", func(t *testing.T) {
+		l := build(t, true)
+		l.digest = strings.ToUpper(l.digest)
+		if err := check(l); err == nil {
+			t.Fatal("non-canonical manifest digest accepted")
+		}
+	})
+}
+
+func copyRegular(t *testing.T, from, to string) {
+	t.Helper()
+	data, err := os.ReadFile(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(to)
+	if err := os.WriteFile(to, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendByte(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte{0}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRemove(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
 	}
 }
 
