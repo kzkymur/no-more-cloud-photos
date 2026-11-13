@@ -6,8 +6,9 @@ import (
 	"time"
 )
 
-// systemd 255 emits JobRemoved before synchronously destroying runtime data.
-// A completed start/stop job therefore is not itself an absence observation.
+// systemd 255 emits JobRemoved before synchronously destroying runtime data,
+// so a completed start/stop job is not itself an absence observation. The
+// wait below polls for absence and so does not depend on that ordering.
 // Wait only for removal by the manager: never stop a unit or delete a path here.
 func waitBackupRuntimeCredentialsAbsent(parent context.Context) error {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)

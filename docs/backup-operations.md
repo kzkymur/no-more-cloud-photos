@@ -147,15 +147,33 @@ same-path recursive read-only binds; exact root-owned file bytes and effective
 bind tuples must agree. Privileged concurrent edits remain an operator
 coordination boundary. Environment files cannot override credential routes.
 
-The supported service manager is systemd v255 (Ubuntu 24.04). The effective-unit
-allow-sets (every dependency list, path-derived mounts, conditions/asserts and
-the canonical fragment digest) are derived from v255 semantics and were proven on
-a real 255.4 manager. Before trusting any unit property, cutover reads the
-manager `Version` over D-Bus and fails closed with
-`systemd manager version unsupported` for any other major version; supporting
-another release requires re-deriving and re-proving those sets, not relaxing
-the check. Edge lists are compared by exact membership because the manager
-emits them in hash order that can change when an idle unit is reloaded.
+The supported service managers are systemd v255 (Ubuntu 24.04) and v259
+(Ubuntu 26.04), each with its own exact effective-unit allow-sets (every
+dependency list, path-derived mounts, conditions/asserts, service properties
+and the canonical fragment digest), re-derived from that release's sources.
+The v255 sets were proven on a real 255.4 manager. Differences in v259:
+
+- `PrivateTmp=yes` makes `/tmp` and `/var/tmp` *wanted* mount paths
+  (`WantsMountsFor`) instead of requiring `/var/tmp` and adding an explicit
+  `Wants`/`After` on `tmp.mount`, so `RequiresMountsFor` is
+  `/var/lib/nmcp-backup`, `/run/nmcp-backup` and `tmp.mount` is only an
+  optional mount edge;
+- `LoadCredential=` no longer orders the service after its credentials mount
+  (`run-credentials-nmcp\x2dbackup.service.mount`);
+- the `PrivateTmp`, `ProtectControlGroups` and `ProtectHostname` booleans are
+  true for every non-`no` mode, so the exact modes (`PrivateTmpEx=connected`,
+  `ProtectControlGroupsEx=yes`, `ProtectHostnameEx=yes`) and the newer
+  namespace settings (`PrivateUsersEx`, `PrivatePIDs`, `PrivateBPF`,
+  `ImportCredentialEx`, `UserNamespacePath`) are pinned as well.
+
+Default and slice dependencies, the drop-in lookup and the credentials
+directory are unchanged. Before trusting any unit property, cutover reads the
+manager `Version` over D-Bus, selects the set for exactly 255.x or 259.x, and
+fails closed with `systemd manager version unsupported` for any other version;
+supporting another release requires re-deriving and re-proving its sets, not
+relaxing the check. Edge lists are compared by exact membership because the
+manager emits them in hash order that can change when an idle unit is
+reloaded.
 
 ## Wake timer, manual runs and results
 

@@ -160,9 +160,16 @@ func newPG17Fixture(t *testing.T, bin string) *pg17Fixture {
 			return
 		}
 		// Independently probe the PID captured at startup, not just a removed file.
+		// pg_ctl -w returns once postmaster.pid is gone; the process itself may
+		// still be exiting (or awaiting its reaper) for a moment, so absence is
+		// awaited within a bound, never assumed.
 		if raw, e := os.ReadFile(filepath.Join(root, "owned.pid")); e == nil {
 			pid, e := strconv.Atoi(string(raw))
-			if e != nil || syscall.Kill(pid, 0) != syscall.ESRCH {
+			gone := func() bool { return syscall.Kill(pid, 0) == syscall.ESRCH }
+			for deadline := time.Now().Add(5 * time.Second); e == nil && !gone() && time.Now().Before(deadline); {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if e != nil || !gone() {
 				safeToRemove = false
 				t.Error("PG17 owned postmaster still exists")
 				return

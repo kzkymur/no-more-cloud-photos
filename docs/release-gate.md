@@ -133,6 +133,7 @@ Real-hardware figures are #22 evidence.
   deliberately rejected HEIF+MP4 brand mix (#22 checklist).
 - Production-host `profile certify` of the bundled profiles on the real
   helpers before activation (#22).
-- systemd versions other than 255. The backup unit gate fails closed on any
-  other manager version, so a different version needs re-derived allow-sets.
+- systemd versions other than 255 and 259. The backup unit gate fails closed
+  on any other manager version, so a different version needs re-derived
+  allow-sets.
 - Hosted-runner performance numbers are not production capacity.

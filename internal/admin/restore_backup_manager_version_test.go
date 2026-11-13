@@ -7,10 +7,11 @@ import (
 	"testing"
 )
 
-func TestSupportedBackupManagerVersionIsV255Only(t *testing.T) {
+func TestSupportedBackupManagerVersionIs255Or259(t *testing.T) {
 	for version, want := range map[string]bool{
 		"255": true, "255.4": true, "255.4-1ubuntu8": true, "255.4-1ubuntu8.6": true, "255~rc1": true,
 		"254": false, "254.10-1": false, "256": false, "256.1-2": false, "257.9": false, "2550": false,
+		"259": true, "259.5-0ubuntu3.4": true, "258": false, "260": false,
 		"25": false, "": false, " 255": false, "255 ": false, "255.4-1ubuntu8\n": false, "v255": false,
 	} {
 		if got := supportedBackupManagerVersion(version); got != want {
@@ -20,7 +21,7 @@ func TestSupportedBackupManagerVersionIsV255Only(t *testing.T) {
 }
 
 // The gate runs before any unit property is trusted: an unsupported manager
-// fails closed with a sanitized reason and never reaches the v255 allow-sets.
+// fails closed with a sanitized reason and never reaches any allow-set.
 func TestValidateLoadedBackupUnitRefusesOtherManagerVersion(t *testing.T) {
 	saved := backupManagerVersion
 	defer func() { backupManagerVersion = saved }()

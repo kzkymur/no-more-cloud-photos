@@ -1,0 +1,1238 @@
+{
+ "no-timer": {
+  "manager": {
+   "Version": {
+    "data": "259.5-0ubuntu3",
+    "type": "s"
+   }
+  },
+  "service": {
+   "AmbientCapabilities": {
+    "data": 0,
+    "type": "t"
+   },
+   "BindLogSockets": {
+    "data": false,
+    "type": "b"
+   },
+   "BindPaths": {
+    "data": [],
+    "type": "a(ssbt)"
+   },
+   "BindReadOnlyPaths": {
+    "data": [],
+    "type": "a(ssbt)"
+   },
+   "CapabilityBoundingSet": {
+    "data": 0,
+    "type": "t"
+   },
+   "DelegateNamespaces": {
+    "data": 18446744073709551615,
+    "type": "t"
+   },
+   "DynamicUser": {
+    "data": false,
+    "type": "b"
+   },
+   "Environment": {
+    "data": [
+     "PGPASSFILE=/run/nmcp-backup/control.pgpass",
+     "PGSERVICEFILE=/run/credentials/nmcp-backup.service/pg_service.conf",
+     "NMCP_BACKUP_DUMP_PASSFILE=/run/nmcp-backup/dump.pgpass"
+    ],
+    "type": "as"
+   },
+   "EnvironmentFiles": {
+    "data": [
+     [
+      "/etc/nmcp/backup.env",
+      false
+     ]
+    ],
+    "type": "a(sb)"
+   },
+   "ExecConditionEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecReloadEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStartEx": {
+    "data": [
+     [
+      "/opt/nmcp/current/bin/nmcp-admin",
+      [
+       "/opt/nmcp/current/bin/nmcp-admin",
+       "backup",
+       "run",
+       "--if-due",
+       "--json"
+      ],
+      [],
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    ],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStartPostEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStartPreEx": {
+    "data": [
+     [
+      "/usr/bin/install",
+      [
+       "/usr/bin/install",
+       "-T",
+       "-m",
+       "0600",
+       "/run/credentials/nmcp-backup.service/control.pgpass",
+       "/run/nmcp-backup/control.pgpass"
+      ],
+      [],
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     [
+      "/usr/bin/install",
+      [
+       "/usr/bin/install",
+       "-T",
+       "-m",
+       "0600",
+       "/run/credentials/nmcp-backup.service/dump.pgpass",
+       "/run/nmcp-backup/dump.pgpass"
+      ],
+      [],
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    ],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStopEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStopPostEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExtensionDirectories": {
+    "data": [],
+    "type": "as"
+   },
+   "ExtensionImages": {
+    "data": [],
+    "type": "a(sba(ss))"
+   },
+   "FinalKillSignal": {
+    "data": 9,
+    "type": "i"
+   },
+   "Group": {
+    "data": "nmcp-backup",
+    "type": "s"
+   },
+   "ImportCredential": {
+    "data": [],
+    "type": "as"
+   },
+   "ImportCredentialEx": {
+    "data": [],
+    "type": "a(ss)"
+   },
+   "KillMode": {
+    "data": "control-group",
+    "type": "s"
+   },
+   "KillSignal": {
+    "data": 15,
+    "type": "i"
+   },
+   "LoadCredential": {
+    "data": [
+     [
+      "dump.pgpass",
+      "/etc/nmcp/credentials/backup-dump.pgpass"
+     ],
+     [
+      "control.pgpass",
+      "/etc/nmcp/credentials/backup-control.pgpass"
+     ],
+     [
+      "pg_service.conf",
+      "/etc/nmcp/backup.pg_service.conf"
+     ]
+    ],
+    "type": "a(ss)"
+   },
+   "LoadCredentialEncrypted": {
+    "data": [],
+    "type": "a(ss)"
+   },
+   "LockPersonality": {
+    "data": true,
+    "type": "b"
+   },
+   "MemoryDenyWriteExecute": {
+    "data": true,
+    "type": "b"
+   },
+   "MountImages": {
+    "data": [],
+    "type": "a(ssba(ss))"
+   },
+   "NoNewPrivileges": {
+    "data": true,
+    "type": "b"
+   },
+   "PassEnvironment": {
+    "data": [],
+    "type": "as"
+   },
+   "PermissionsStartOnly": {
+    "data": false,
+    "type": "b"
+   },
+   "PrivateBPF": {
+    "data": "no",
+    "type": "s"
+   },
+   "PrivateDevices": {
+    "data": true,
+    "type": "b"
+   },
+   "PrivatePIDs": {
+    "data": "no",
+    "type": "s"
+   },
+   "PrivateTmp": {
+    "data": true,
+    "type": "b"
+   },
+   "PrivateTmpEx": {
+    "data": "connected",
+    "type": "s"
+   },
+   "PrivateUsersEx": {
+    "data": "no",
+    "type": "s"
+   },
+   "ProcSubset": {
+    "data": "pid",
+    "type": "s"
+   },
+   "ProtectClock": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectControlGroups": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectControlGroupsEx": {
+    "data": "yes",
+    "type": "s"
+   },
+   "ProtectHome": {
+    "data": "yes",
+    "type": "s"
+   },
+   "ProtectHostname": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectHostnameEx": {
+    "data": [
+     "yes",
+     ""
+    ],
+    "type": "(ss)"
+   },
+   "ProtectKernelModules": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectKernelTunables": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectProc": {
+    "data": "invisible",
+    "type": "s"
+   },
+   "ProtectSystem": {
+    "data": "strict",
+    "type": "s"
+   },
+   "ReadWritePaths": {
+    "data": [
+     "/var/lib/nmcp-backup"
+    ],
+    "type": "as"
+   },
+   "RemainAfterExit": {
+    "data": false,
+    "type": "b"
+   },
+   "Restart": {
+    "data": "no",
+    "type": "s"
+   },
+   "RestartForceExitStatus": {
+    "data": [
+     [],
+     []
+    ],
+    "type": "(aiai)"
+   },
+   "RestrictAddressFamilies": {
+    "data": [
+     true,
+     [
+      "AF_INET",
+      "AF_INET6",
+      "AF_UNIX"
+     ]
+    ],
+    "type": "(bas)"
+   },
+   "RestrictSUIDSGID": {
+    "data": true,
+    "type": "b"
+   },
+   "RootDirectory": {
+    "data": "",
+    "type": "s"
+   },
+   "RootDirectoryStartOnly": {
+    "data": false,
+    "type": "b"
+   },
+   "RootEphemeral": {
+    "data": false,
+    "type": "b"
+   },
+   "RootImage": {
+    "data": "",
+    "type": "s"
+   },
+   "RuntimeDirectory": {
+    "data": [
+     "nmcp-backup"
+    ],
+    "type": "as"
+   },
+   "RuntimeDirectoryMode": {
+    "data": 448,
+    "type": "u"
+   },
+   "RuntimeDirectoryPreserve": {
+    "data": "no",
+    "type": "s"
+   },
+   "RuntimeDirectorySymlink": {
+    "data": [
+     [
+      "nmcp-backup",
+      "",
+      0
+     ]
+    ],
+    "type": "a(sst)"
+   },
+   "SendSIGKILL": {
+    "data": true,
+    "type": "b"
+   },
+   "SetCredential": {
+    "data": [],
+    "type": "a(say)"
+   },
+   "SetCredentialEncrypted": {
+    "data": [],
+    "type": "a(say)"
+   },
+   "SuccessExitStatus": {
+    "data": [
+     [
+      4
+     ],
+     []
+    ],
+    "type": "(aiai)"
+   },
+   "SupplementaryGroups": {
+    "data": [],
+    "type": "as"
+   },
+   "SystemCallArchitectures": {
+    "data": [
+     "native"
+    ],
+    "type": "as"
+   },
+   "TemporaryFileSystem": {
+    "data": [],
+    "type": "a(ss)"
+   },
+   "TimeoutStartUSec": {
+    "data": 21600000000,
+    "type": "t"
+   },
+   "TimeoutStopUSec": {
+    "data": 60000000,
+    "type": "t"
+   },
+   "Type": {
+    "data": "oneshot",
+    "type": "s"
+   },
+   "UMask": {
+    "data": 63,
+    "type": "u"
+   },
+   "UnsetEnvironment": {
+    "data": [],
+    "type": "as"
+   },
+   "User": {
+    "data": "nmcp-backup",
+    "type": "s"
+   },
+   "UserNamespacePath": {
+    "data": "",
+    "type": "s"
+   }
+  },
+  "unit": {
+   "After": {
+    "data": [
+     "basic.target",
+     "postgresql@17-main.service",
+     "nmcp-migrate.service",
+     "nmcp.slice",
+     "sysinit.target",
+     "-.mount",
+     "systemd-journald.socket",
+     "systemd-tmpfiles-setup.service",
+     "tmp.mount"
+    ],
+    "type": "as"
+   },
+   "Asserts": {
+    "data": [],
+    "type": "a(sbbsi)"
+   },
+   "Before": {
+    "data": [
+     "shutdown.target"
+    ],
+    "type": "as"
+   },
+   "BindsTo": {
+    "data": [],
+    "type": "as"
+   },
+   "BoundBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Conditions": {
+    "data": [],
+    "type": "a(sbbsi)"
+   },
+   "ConflictedBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Conflicts": {
+    "data": [
+     "shutdown.target"
+    ],
+    "type": "as"
+   },
+   "ConsistsOf": {
+    "data": [],
+    "type": "as"
+   },
+   "DefaultDependencies": {
+    "data": true,
+    "type": "b"
+   },
+   "DropInPaths": {
+    "data": [
+     "/etc/systemd/system/nmcp-backup.service.d/10-postgresql.conf"
+    ],
+    "type": "as"
+   },
+   "FragmentPath": {
+    "data": "/etc/systemd/system/nmcp-backup.service",
+    "type": "s"
+   },
+   "Id": {
+    "data": "nmcp-backup.service",
+    "type": "s"
+   },
+   "JoinsNamespaceOf": {
+    "data": [],
+    "type": "as"
+   },
+   "LoadState": {
+    "data": "loaded",
+    "type": "s"
+   },
+   "NeedDaemonReload": {
+    "data": false,
+    "type": "b"
+   },
+   "OnFailure": {
+    "data": [],
+    "type": "as"
+   },
+   "OnFailureOf": {
+    "data": [],
+    "type": "as"
+   },
+   "OnSuccess": {
+    "data": [],
+    "type": "as"
+   },
+   "OnSuccessOf": {
+    "data": [],
+    "type": "as"
+   },
+   "PartOf": {
+    "data": [
+     "nmcp.target"
+    ],
+    "type": "as"
+   },
+   "PropagatesReloadTo": {
+    "data": [],
+    "type": "as"
+   },
+   "PropagatesStopTo": {
+    "data": [],
+    "type": "as"
+   },
+   "ReloadPropagatedFrom": {
+    "data": [],
+    "type": "as"
+   },
+   "RequiredBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Requires": {
+    "data": [
+     "nmcp.slice",
+     "postgresql@17-main.service",
+     "sysinit.target"
+    ],
+    "type": "as"
+   },
+   "RequiresMountsFor": {
+    "data": [
+     "/run/nmcp-backup",
+     "/var/lib/nmcp-backup"
+    ],
+    "type": "as"
+   },
+   "Requisite": {
+    "data": [],
+    "type": "as"
+   },
+   "RequisiteOf": {
+    "data": [],
+    "type": "as"
+   },
+   "SourcePath": {
+    "data": "",
+    "type": "s"
+   },
+   "StopPropagatedFrom": {
+    "data": [],
+    "type": "as"
+   },
+   "Transient": {
+    "data": false,
+    "type": "b"
+   },
+   "TriggeredBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Triggers": {
+    "data": [],
+    "type": "as"
+   },
+   "UpheldBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Upholds": {
+    "data": [],
+    "type": "as"
+   },
+   "WantedBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Wants": {
+    "data": [
+     "tmp.mount"
+    ],
+    "type": "as"
+   },
+   "WantsMountsFor": {
+    "data": [
+     "/tmp",
+     "/var/tmp"
+    ],
+    "type": "as"
+   }
+  }
+ },
+ "source": "infra branch infra/v259-unit-dump, run 43448413308 (8236168): debootstrap resolute minbase + systemd 259.5-0ubuntu3 under nspawn, canonical nmcp-backup.service + 10-postgresql.conf (postgresql@17-main.service); busctl GetAll, filtered to the properties the contract queries",
+ "with-timer": {
+  "manager": {
+   "Version": {
+    "data": "259.5-0ubuntu3",
+    "type": "s"
+   }
+  },
+  "service": {
+   "AmbientCapabilities": {
+    "data": 0,
+    "type": "t"
+   },
+   "BindLogSockets": {
+    "data": false,
+    "type": "b"
+   },
+   "BindPaths": {
+    "data": [],
+    "type": "a(ssbt)"
+   },
+   "BindReadOnlyPaths": {
+    "data": [],
+    "type": "a(ssbt)"
+   },
+   "CapabilityBoundingSet": {
+    "data": 0,
+    "type": "t"
+   },
+   "DelegateNamespaces": {
+    "data": 18446744073709551615,
+    "type": "t"
+   },
+   "DynamicUser": {
+    "data": false,
+    "type": "b"
+   },
+   "Environment": {
+    "data": [
+     "PGPASSFILE=/run/nmcp-backup/control.pgpass",
+     "PGSERVICEFILE=/run/credentials/nmcp-backup.service/pg_service.conf",
+     "NMCP_BACKUP_DUMP_PASSFILE=/run/nmcp-backup/dump.pgpass"
+    ],
+    "type": "as"
+   },
+   "EnvironmentFiles": {
+    "data": [
+     [
+      "/etc/nmcp/backup.env",
+      false
+     ]
+    ],
+    "type": "a(sb)"
+   },
+   "ExecConditionEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecReloadEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStartEx": {
+    "data": [
+     [
+      "/opt/nmcp/current/bin/nmcp-admin",
+      [
+       "/opt/nmcp/current/bin/nmcp-admin",
+       "backup",
+       "run",
+       "--if-due",
+       "--json"
+      ],
+      [],
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    ],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStartPostEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStartPreEx": {
+    "data": [
+     [
+      "/usr/bin/install",
+      [
+       "/usr/bin/install",
+       "-T",
+       "-m",
+       "0600",
+       "/run/credentials/nmcp-backup.service/control.pgpass",
+       "/run/nmcp-backup/control.pgpass"
+      ],
+      [],
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     [
+      "/usr/bin/install",
+      [
+       "/usr/bin/install",
+       "-T",
+       "-m",
+       "0600",
+       "/run/credentials/nmcp-backup.service/dump.pgpass",
+       "/run/nmcp-backup/dump.pgpass"
+      ],
+      [],
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    ],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStopEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExecStopPostEx": {
+    "data": [],
+    "type": "a(sasasttttuii)"
+   },
+   "ExtensionDirectories": {
+    "data": [],
+    "type": "as"
+   },
+   "ExtensionImages": {
+    "data": [],
+    "type": "a(sba(ss))"
+   },
+   "FinalKillSignal": {
+    "data": 9,
+    "type": "i"
+   },
+   "Group": {
+    "data": "nmcp-backup",
+    "type": "s"
+   },
+   "ImportCredential": {
+    "data": [],
+    "type": "as"
+   },
+   "ImportCredentialEx": {
+    "data": [],
+    "type": "a(ss)"
+   },
+   "KillMode": {
+    "data": "control-group",
+    "type": "s"
+   },
+   "KillSignal": {
+    "data": 15,
+    "type": "i"
+   },
+   "LoadCredential": {
+    "data": [
+     [
+      "control.pgpass",
+      "/etc/nmcp/credentials/backup-control.pgpass"
+     ],
+     [
+      "pg_service.conf",
+      "/etc/nmcp/backup.pg_service.conf"
+     ],
+     [
+      "dump.pgpass",
+      "/etc/nmcp/credentials/backup-dump.pgpass"
+     ]
+    ],
+    "type": "a(ss)"
+   },
+   "LoadCredentialEncrypted": {
+    "data": [],
+    "type": "a(ss)"
+   },
+   "LockPersonality": {
+    "data": true,
+    "type": "b"
+   },
+   "MemoryDenyWriteExecute": {
+    "data": true,
+    "type": "b"
+   },
+   "MountImages": {
+    "data": [],
+    "type": "a(ssba(ss))"
+   },
+   "NoNewPrivileges": {
+    "data": true,
+    "type": "b"
+   },
+   "PassEnvironment": {
+    "data": [],
+    "type": "as"
+   },
+   "PermissionsStartOnly": {
+    "data": false,
+    "type": "b"
+   },
+   "PrivateBPF": {
+    "data": "no",
+    "type": "s"
+   },
+   "PrivateDevices": {
+    "data": true,
+    "type": "b"
+   },
+   "PrivatePIDs": {
+    "data": "no",
+    "type": "s"
+   },
+   "PrivateTmp": {
+    "data": true,
+    "type": "b"
+   },
+   "PrivateTmpEx": {
+    "data": "connected",
+    "type": "s"
+   },
+   "PrivateUsersEx": {
+    "data": "no",
+    "type": "s"
+   },
+   "ProcSubset": {
+    "data": "pid",
+    "type": "s"
+   },
+   "ProtectClock": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectControlGroups": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectControlGroupsEx": {
+    "data": "yes",
+    "type": "s"
+   },
+   "ProtectHome": {
+    "data": "yes",
+    "type": "s"
+   },
+   "ProtectHostname": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectHostnameEx": {
+    "data": [
+     "yes",
+     ""
+    ],
+    "type": "(ss)"
+   },
+   "ProtectKernelModules": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectKernelTunables": {
+    "data": true,
+    "type": "b"
+   },
+   "ProtectProc": {
+    "data": "invisible",
+    "type": "s"
+   },
+   "ProtectSystem": {
+    "data": "strict",
+    "type": "s"
+   },
+   "ReadWritePaths": {
+    "data": [
+     "/var/lib/nmcp-backup"
+    ],
+    "type": "as"
+   },
+   "RemainAfterExit": {
+    "data": false,
+    "type": "b"
+   },
+   "Restart": {
+    "data": "no",
+    "type": "s"
+   },
+   "RestartForceExitStatus": {
+    "data": [
+     [],
+     []
+    ],
+    "type": "(aiai)"
+   },
+   "RestrictAddressFamilies": {
+    "data": [
+     true,
+     [
+      "AF_INET",
+      "AF_INET6",
+      "AF_UNIX"
+     ]
+    ],
+    "type": "(bas)"
+   },
+   "RestrictSUIDSGID": {
+    "data": true,
+    "type": "b"
+   },
+   "RootDirectory": {
+    "data": "",
+    "type": "s"
+   },
+   "RootDirectoryStartOnly": {
+    "data": false,
+    "type": "b"
+   },
+   "RootEphemeral": {
+    "data": false,
+    "type": "b"
+   },
+   "RootImage": {
+    "data": "",
+    "type": "s"
+   },
+   "RuntimeDirectory": {
+    "data": [
+     "nmcp-backup"
+    ],
+    "type": "as"
+   },
+   "RuntimeDirectoryMode": {
+    "data": 448,
+    "type": "u"
+   },
+   "RuntimeDirectoryPreserve": {
+    "data": "no",
+    "type": "s"
+   },
+   "RuntimeDirectorySymlink": {
+    "data": [
+     [
+      "nmcp-backup",
+      "",
+      0
+     ]
+    ],
+    "type": "a(sst)"
+   },
+   "SendSIGKILL": {
+    "data": true,
+    "type": "b"
+   },
+   "SetCredential": {
+    "data": [],
+    "type": "a(say)"
+   },
+   "SetCredentialEncrypted": {
+    "data": [],
+    "type": "a(say)"
+   },
+   "SuccessExitStatus": {
+    "data": [
+     [
+      4
+     ],
+     []
+    ],
+    "type": "(aiai)"
+   },
+   "SupplementaryGroups": {
+    "data": [],
+    "type": "as"
+   },
+   "SystemCallArchitectures": {
+    "data": [
+     "native"
+    ],
+    "type": "as"
+   },
+   "TemporaryFileSystem": {
+    "data": [],
+    "type": "a(ss)"
+   },
+   "TimeoutStartUSec": {
+    "data": 21600000000,
+    "type": "t"
+   },
+   "TimeoutStopUSec": {
+    "data": 60000000,
+    "type": "t"
+   },
+   "Type": {
+    "data": "oneshot",
+    "type": "s"
+   },
+   "UMask": {
+    "data": 63,
+    "type": "u"
+   },
+   "UnsetEnvironment": {
+    "data": [],
+    "type": "as"
+   },
+   "User": {
+    "data": "nmcp-backup",
+    "type": "s"
+   },
+   "UserNamespacePath": {
+    "data": "",
+    "type": "s"
+   }
+  },
+  "unit": {
+   "After": {
+    "data": [
+     "basic.target",
+     "nmcp-migrate.service",
+     "nmcp-backup.timer",
+     "-.mount",
+     "nmcp.slice",
+     "tmp.mount",
+     "postgresql@17-main.service",
+     "systemd-tmpfiles-setup.service",
+     "systemd-journald.socket",
+     "sysinit.target"
+    ],
+    "type": "as"
+   },
+   "Asserts": {
+    "data": [],
+    "type": "a(sbbsi)"
+   },
+   "Before": {
+    "data": [
+     "shutdown.target"
+    ],
+    "type": "as"
+   },
+   "BindsTo": {
+    "data": [],
+    "type": "as"
+   },
+   "BoundBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Conditions": {
+    "data": [],
+    "type": "a(sbbsi)"
+   },
+   "ConflictedBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Conflicts": {
+    "data": [
+     "shutdown.target"
+    ],
+    "type": "as"
+   },
+   "ConsistsOf": {
+    "data": [],
+    "type": "as"
+   },
+   "DefaultDependencies": {
+    "data": true,
+    "type": "b"
+   },
+   "DropInPaths": {
+    "data": [
+     "/etc/systemd/system/nmcp-backup.service.d/10-postgresql.conf"
+    ],
+    "type": "as"
+   },
+   "FragmentPath": {
+    "data": "/etc/systemd/system/nmcp-backup.service",
+    "type": "s"
+   },
+   "Id": {
+    "data": "nmcp-backup.service",
+    "type": "s"
+   },
+   "JoinsNamespaceOf": {
+    "data": [],
+    "type": "as"
+   },
+   "LoadState": {
+    "data": "loaded",
+    "type": "s"
+   },
+   "NeedDaemonReload": {
+    "data": false,
+    "type": "b"
+   },
+   "OnFailure": {
+    "data": [],
+    "type": "as"
+   },
+   "OnFailureOf": {
+    "data": [],
+    "type": "as"
+   },
+   "OnSuccess": {
+    "data": [],
+    "type": "as"
+   },
+   "OnSuccessOf": {
+    "data": [],
+    "type": "as"
+   },
+   "PartOf": {
+    "data": [
+     "nmcp.target"
+    ],
+    "type": "as"
+   },
+   "PropagatesReloadTo": {
+    "data": [],
+    "type": "as"
+   },
+   "PropagatesStopTo": {
+    "data": [],
+    "type": "as"
+   },
+   "ReloadPropagatedFrom": {
+    "data": [],
+    "type": "as"
+   },
+   "RequiredBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Requires": {
+    "data": [
+     "sysinit.target",
+     "nmcp.slice",
+     "postgresql@17-main.service"
+    ],
+    "type": "as"
+   },
+   "RequiresMountsFor": {
+    "data": [
+     "/run/nmcp-backup",
+     "/var/lib/nmcp-backup"
+    ],
+    "type": "as"
+   },
+   "Requisite": {
+    "data": [],
+    "type": "as"
+   },
+   "RequisiteOf": {
+    "data": [],
+    "type": "as"
+   },
+   "SourcePath": {
+    "data": "",
+    "type": "s"
+   },
+   "StopPropagatedFrom": {
+    "data": [],
+    "type": "as"
+   },
+   "Transient": {
+    "data": false,
+    "type": "b"
+   },
+   "TriggeredBy": {
+    "data": [
+     "nmcp-backup.timer"
+    ],
+    "type": "as"
+   },
+   "Triggers": {
+    "data": [],
+    "type": "as"
+   },
+   "UpheldBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Upholds": {
+    "data": [],
+    "type": "as"
+   },
+   "WantedBy": {
+    "data": [],
+    "type": "as"
+   },
+   "Wants": {
+    "data": [
+     "tmp.mount"
+    ],
+    "type": "as"
+   },
+   "WantsMountsFor": {
+    "data": [
+     "/tmp",
+     "/var/tmp"
+    ],
+    "type": "as"
+   }
+  }
+ }
+}
