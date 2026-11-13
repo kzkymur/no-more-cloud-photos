@@ -421,10 +421,14 @@ inventory_postgresql() {
     origin=$(apt-cache policy "$pkg" 2>/dev/null | grep -A1 -m1 '^ *\*\*\*' | tail -1 | xargs | cut -d' ' -f2-3)
     note "package $pkg $version (from ${origin:-unknown})"
   done <<<"$pkgs"
+  if [[ -e $createcluster_conf || -L $createcluster_conf ]]; then
+    block "$createcluster_conf already exists; deploy only creates it for the duration of its own install"
+  fi
   if [[ -e $policy_rc || -L $policy_rc ]]; then
     block "$policy_rc already exists; deploy needs to install its own service-start guard and will not replace another one"
   fi
-  # /usr/bin/pg_dump and pg_restore (pg_wrapper) must resolve to 17 for backups.
+  # Backups call /usr/lib/postgresql/17/bin/pg_dump and pg_restore directly,
+  # so a newer PostgreSQL on the host is only reported, never in the way.
   local newer
   newer=''
   while read -r status pkg; do
@@ -432,7 +436,7 @@ inventory_postgresql() {
     ((BASH_REMATCH[1] > 17)) && newer+="$pkg "
   done < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'postgresql-client-[0-9]*' 2>/dev/null || true)
   newer=${newer% }
-  [[ -z $newer ]] || block "$newer installed: /usr/bin/pg_dump would not resolve to PostgreSQL 17 for nmcp backups (deploy will not remove another PostgreSQL)"
+  [[ -z $newer ]] || note "also installed: $newer (left untouched; nmcp backups use the PostgreSQL 17 binaries by full path)"
 }
 
 # The exact apt transaction, simulated against a throwaway apt state (the
@@ -455,7 +459,19 @@ EOF
 simulate_apt() { # PACKAGE... ; blocks on any change to an installed package
   local d out line
   d=$(mktemp -d)
-  mkdir -p "$d/lists/partial" "$d/cache/archives/partial" "$d/sources.d" "$d/prefs.d"
+  chmod 0755 "$d"   # readable by apt's unprivileged _apt fetcher (sandbox stays on)
+  mkdir -p "$d/lists/partial" "$d/cache/archives/partial" "$d/sources.d" "$d/prefs.d" "$d/conf.d"
+  # The host's apt configuration (proxies, etc.) but with every hook cleared,
+  # so update/simulate run no host script (no command-not-found or esm
+  # refresh writing outside the throwaway state).
+  if [[ -f /etc/apt/apt.conf ]]; then cp /etc/apt/apt.conf "$d/conf.d/00-host-apt.conf"; fi
+  find /etc/apt/apt.conf.d -maxdepth 1 -type f -exec cp -t "$d/conf.d" {} + 2>/dev/null || true
+  local hook
+  for hook in APT::Update::Pre-Invoke APT::Update::Post-Invoke APT::Update::Post-Invoke-Success \
+    APT::Install::Pre-Invoke APT::Install::Post-Invoke DPkg::Pre-Invoke DPkg::Post-Invoke \
+    DPkg::Pre-Install-Pkgs DPkg::Post-Install-Pkgs; do
+    printf '#clear %s;\n' "$hook"
+  done >"$d/conf.d/zzzz-nmcp-no-hooks"
   : >"$d/sources.list"
   if [[ -f /etc/apt/sources.list ]]; then cp /etc/apt/sources.list "$d/sources.list"; fi
   find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) \
@@ -464,12 +480,22 @@ simulate_apt() { # PACKAGE... ; blocks on any change to an installed package
   printf 'Types: deb\nURIs: https://apt.postgresql.org/pub/repos/apt\nSuites: resolute-pgdg\nComponents: main\nSigned-By: %s\n' \
     "$pgdg_key_src" >"$d/sources.d/nmcp-pgdg.sources"
   pgdg_pin_text >"$d/prefs.d/nmcp-pgdg"
-  local opts=(-o "Dir::Etc::SourceList=$d/sources.list" -o "Dir::Etc::SourceParts=$d/sources.d"
-    -o "Dir::Etc::PreferencesParts=$d/prefs.d" -o "Dir::State::Lists=$d/lists"
-    -o "Dir::Cache=$d/cache" -o Debug::NoLocking=1 -o APT::Sandbox::User=root)
-  if ! out=$(timeout 300 apt-get "${opts[@]}" -qq update 2>&1); then
+  # APT_CONFIG is read before apt loads its configuration directory, so it
+  # can redirect that directory (a -o option is applied too late for this).
+  cat >"$d/apt.conf" <<EOF
+Dir::Etc::Main "/dev/null";
+Dir::Etc::Parts "$d/conf.d";
+Dir::Etc::SourceList "$d/sources.list";
+Dir::Etc::SourceParts "$d/sources.d";
+Dir::Etc::PreferencesParts "$d/prefs.d";
+Dir::State::Lists "$d/lists";
+Dir::Cache "$d/cache";
+Debug::NoLocking "true";
+EOF
+  chmod -R a+rX "$d"
+  if ! out=$(APT_CONFIG=$d/apt.conf timeout 300 apt-get -qq update 2>&1); then
     block "apt simulation: could not read package indexes: $(grep -v 'apt.conf.d' <<<"$out" | tail -1)"
-  elif ! out=$(apt-get "${opts[@]}" -s install --no-install-recommends "$@" 2>&1); then
+  elif ! out=$(APT_CONFIG=$d/apt.conf apt-get -s install --no-install-recommends "$@" 2>&1); then
     block "apt simulation: the packages cannot be installed without changing existing ones: $(grep -m3 -E '^E:|^ ' <<<"$out" | tr -s ' \n' ' ')"
   else
     # "Inst NAME [OLDVERSION] (NEWVERSION ...)" is an upgrade or downgrade of an
@@ -558,9 +584,6 @@ step_packages() {
   # upgrades; no package script may create a default cluster or start any
   # service (that would also start every other auto-start cluster).
   pgdg_pin_text | write_if_changed "$pgdg_pin" 0644 || true
-  install -d -m 0755 "${createcluster_conf%/*}"
-  printf '# nmcp deploy: packages never create a default cluster; deploy creates 17/%s itself.\ncreate_main_cluster = false\n' \
-    "$pg_cluster" | write_if_changed "$createcluster_conf" 0644 || true
   local missing_now=() pkg before_clusters after_clusters
   for pkg in "${packages[@]}"; do
     dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed' || missing_now+=("$pkg")
@@ -571,17 +594,30 @@ step_packages() {
     ((${#blockers[@]} == 0)) || die "apt re-check before installing: ${blockers[*]}"
     before_clusters=$(pg_lsclusters --no-header 2>/dev/null | cut -d' ' -f1-2 || true)
     [[ ! -e $policy_rc && ! -L $policy_rc ]] || die "$policy_rc appeared; refusing to replace it"
+    # Both guards exist only for this install transaction and are removed
+    # right after it (and by the exit trap): no lasting host-wide change.
     printf '#!/bin/sh\n# nmcp deploy: no package may start services during its install.\nexit 101\n' >"$policy_rc"
     chmod 0755 "$policy_rc"
     policy_rc_ours=true
+    [[ ! -e $createcluster_conf && ! -L $createcluster_conf ]] || die "$createcluster_conf exists; refusing to replace it"
+    [[ -d ${createcluster_conf%/*} ]] || { install -d -m 0755 "${createcluster_conf%/*}"; createcluster_dir_ours=true; }
+    printf '# nmcp deploy (transient): no default cluster during this install.\ncreate_main_cluster = false\n' >"$createcluster_conf"
+    createcluster_ours=true
     "$scripts/infra-apt-install" "${missing_now[@]}"
-    rm -f -- "$policy_rc"
-    policy_rc_ours=false
+    remove_install_guards
     after_clusters=$(pg_lsclusters --no-header 2>/dev/null | cut -d' ' -f1-2 || true)
     if [[ $after_clusters != "$before_clusters" ]]; then
       die "the package install created a cluster on its own ($(diff <(printf '%s\n' "$before_clusters") <(printf '%s\n' "$after_clusters") | grep '^>' | xargs)); deploy leaves it untouched for review"
     fi
   fi
+  # Backups call the PostgreSQL 17 client binaries by full path (never the
+  # /usr/bin pg_wrapper, which follows a newer major if the host has one).
+  local tool
+  for tool in /usr/lib/postgresql/17/bin/pg_dump /usr/lib/postgresql/17/bin/pg_restore; do
+    [[ -f $tool && ! -L $tool && -x $tool && $(stat -c '%U:%G' "$tool") == root:root ]] \
+      || die "$tool is missing or not a root-owned regular executable"
+    [[ $("$tool" --version) =~ ^pg_(dump|restore)\ \(PostgreSQL\)\ 17\. ]] || die "$tool is not PostgreSQL 17"
+  done
   # Deployment evidence: where PostgreSQL 17 came from and which key signed it.
   install -d -m 0700 /var/lib/nmcp/deployment
   {
@@ -784,10 +820,17 @@ if [[ $mode == check ]]; then
 fi
 print_plan || exit 1
 host_dirty=true host_reinstalled=false host_digest='' services_stopped=false
-policy_rc_ours=false
+policy_rc_ours=false createcluster_ours=false createcluster_dir_ours=false
+remove_install_guards() {
+  if $policy_rc_ours; then rm -f -- "$policy_rc"; policy_rc_ours=false; fi
+  if $createcluster_ours; then rm -f -- "$createcluster_conf"; createcluster_ours=false; fi
+  if $createcluster_dir_ours; then
+    rmdir --ignore-fail-on-non-empty -- "${createcluster_conf%/*}"; createcluster_dir_ours=false
+  fi
+}
 on_exit() {
   local status=$?
-  if $policy_rc_ours; then rm -f -- "$policy_rc"; fi
+  remove_install_guards
   if ((status != 0)) && $services_stopped; then
     printf '%s\n' "deploy: nmcp services were stopped for the host install and are still stopped." \
       "deploy: fix the error above and rerun 'sudo ./deploy'; the rerun reinstalls and restarts them." >&2
