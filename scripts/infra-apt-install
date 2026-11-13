@@ -24,6 +24,9 @@ deadline=$((SECONDS + ${NMCP_APT_DEADLINE_SECONDS:-360}))
 apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
   -o DPkg::Lock::Timeout=60)
 
+# Already root (for example inside a container without sudo): run apt directly.
+as_root=()
+[ "$(id -u)" -eq 0 ] || as_root=(sudo)
 attempt=1
 while :; do
   remaining=$((deadline - SECONDS))
@@ -31,7 +34,7 @@ while :; do
   limit=$per_attempt; [ "$limit" -le "$remaining" ] || limit=$remaining
   status=0
   # shellcheck disable=SC2016 # expanded by the inner shell
-  sudo env DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s "${limit}s" bash -c '
+  ${as_root[@]+"${as_root[@]}"} env DEBIAN_FRONTEND=noninteractive timeout --kill-after=10s "${limit}s" bash -c '
     set -euo pipefail
     update=$1; shift
     nopts=$1; shift
