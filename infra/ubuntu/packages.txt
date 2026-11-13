@@ -18,14 +18,22 @@ tzdata
 ufw
 util-linux
 # System half of the release's native library closure (the pinned codecs ship
-# inside the release). scripts/build-ubuntu-release prints the exact list as
-# "closure: system runtime packages"; keep this block equal to it.
+# inside the release), exactly as printed by scripts/build-ubuntu-release under
+# "closure: system runtime packages" (trial run 43453858084, Ubuntu 26.04).
+# Keep this block equal to that output.
+libatomic1
+libblkid1
+libc6
 libde265-0
 libexif12
 libexpat1
+libffi8
 libgcc-s1
 libglib2.0-0t64
 libjpeg-turbo8
+libmount1
+libpcre2-8-0
 libpng16-16t64
+libselinux1
 libstdc++6
 zlib1g
