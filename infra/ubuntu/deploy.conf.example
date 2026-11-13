@@ -1,0 +1,29 @@
+# Copy to /etc/nmcp/deploy.conf (root:root 0600) and edit, then run
+#   sudo ./deploy --check   # preflight and plan, changes nothing
+#   sudo ./deploy
+# One KEY=VALUE per line; no quotes or spaces.
+
+# This host's full Tailnet DNS name (tailscale status --json: Self.DNSName).
+NMCP_TAILNET_HOSTNAME=REPLACE.tailnet-name.ts.net
+
+# Mount point of the already-mounted data HDD. deploy never mounts or formats.
+# /var/lib/nmcp and /var/lib/nmcp-backup must already be on this filesystem,
+# for example via fstab bind mounts:
+#   <mount>/nmcp         /var/lib/nmcp         none bind 0 0
+#   <mount>/nmcp-backup  /var/lib/nmcp-backup  none bind 0 0
+NMCP_DATA_MOUNT=/REPLACE/hdd
+
+# Tailnet-only TLS ports for the API and the file server. Port 443 and the
+# existing `tailscale serve` configuration are never touched; deploy stops if
+# either port is already in use.
+NMCP_API_PORT=8443
+NMCP_FILES_PORT=8444
+
+# Only used when the host is not yet joined to the Tailnet: a root-owned 0600
+# file containing a Tailscale auth key. Leave empty on an already joined host.
+NMCP_TAILSCALE_AUTHKEY_FILE=
+
+# Parallel build jobs for the on-host release build. The build always runs in
+# a transient scope capped at 2 CPUs / 4 GiB with low CPU and IO priority, so
+# other workloads on the host keep running.
+NMCP_BUILD_JOBS=2

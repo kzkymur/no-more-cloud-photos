@@ -1,5 +1,75 @@
 # Ubuntu production deployment
 
+## Quick start
+
+On an Ubuntu 26.04 LTS (resolute) amd64 host, from a clean checkout of the
+commit to deploy:
+
+1. **Before the first run** (deploy checks these and never does them for you):
+   - Mount the data HDD and bind-mount `/var/lib/nmcp` and
+     `/var/lib/nmcp-backup` from it (see `infra/ubuntu/deploy.conf.example`).
+     deploy never formats or mounts disks.
+   - Install UFW, keep your management access allowed (for example
+     `ufw allow 22/tcp`), then `ufw default deny incoming` and `ufw enable`
+     from a console. deploy only adds the two Tailnet-interface rules.
+   - Join the Tailnet, or put an auth key in a root-only 0600 file and name it
+     in the config.
+2. Create the config:
+
+   ```sh
+   sudo install -m 0600 infra/ubuntu/deploy.conf.example /etc/nmcp/deploy.conf
+   sudoedit /etc/nmcp/deploy.conf   # Tailnet DNS name, HDD mount point, ports
+   ```
+
+3. Dry run. This prints the preflight and the plan and changes nothing:
+
+   ```sh
+   sudo ./deploy --check
+   ```
+
+   Fix every line marked `!` and rerun until it reports `preflight passed`.
+4. Deploy:
+
+   ```sh
+   sudo ./deploy
+   ```
+
+   The first run builds the release on the host (about 40 minutes; capped at
+   2 CPUs / 4 GiB with low priority). Later runs of the same commit skip the
+   build, and steps whose result already exists are skipped.
+
+   If a run fails after it has stopped the services for the host install,
+   they stay stopped (deploy says so). Fix the reported error and rerun
+   `sudo ./deploy`: the rerun reinstalls the host assets and starts them.
+5. Apply the Tailscale ACL snippet that deploy prints, in the admin console.
+
+What `./deploy` does, in order:
+
+- Adds the PGDG repository with the signing key vendored in the repository
+  (`infra/ubuntu/pgdg-ACCC4CF8.asc`, pinned by SHA-256 and fingerprint) and installs
+  `infra/ubuntu/packages.txt`.
+- Creates the PostgreSQL 17 cluster (`postgresql@17-main.service`) and the
+  `nmcp` database, then runs the role bootstrap. Every login gets a generated
+  password, stored only under root-only `/etc/nmcp/deploy`; passwords reach
+  PostgreSQL only as SCRAM verifiers.
+- Builds the release with `scripts/build-ubuntu-release`.
+- Gets the TLS certificate with `tailscale cert` and adds the UFW rules.
+- Runs `install-ubuntu-host` and `install-ubuntu-release` stage/activate, then
+  installs the backup configuration and its timer.
+- Checks services, readiness and the firewall.
+
+The default backup failure hook (`infra/ubuntu/backup-notify`) only writes to
+the journal at priority `err`. Replace it if nothing monitors the journal.
+
+What deploy never touches: port 443, the existing `tailscale serve` and Funnel
+configuration, the UFW default policy, and disks. It stops with an error if a
+configured port is already in use or claimed by `tailscale serve`/Funnel.
+
+The rest of this document is the reference for what deploy automates: the
+contracts, and the manual procedure it replaces.
+
+## Reference
+
 This runbook installs the repository's production contract on Ubuntu 26.04 LTS (resolute) amd64.
 CI validates these assets on Ubuntu 24.04 only and does not exercise a 26.04
 install; record real-host evidence with `docs/real-host-handoff.md`.

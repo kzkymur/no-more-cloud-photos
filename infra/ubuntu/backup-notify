@@ -1,0 +1,10 @@
+#!/bin/sh
+# Default backup failure notification installed by ./deploy as
+# /usr/local/libexec/nmcp/backup-notify (root:root 0755). nmcp-admin sends one
+# bounded JSON document on stdin (docs/backup-operations.md, "Failure
+# notifications"); this hook records it in the journal at priority err so the
+# host's normal alerting can pick it up. Replace it with a reviewed hook that
+# reaches an operator if journal monitoring is not in place.
+set -eu
+exec /usr/bin/head -c 4096 | /usr/bin/tr -d '\000-\010\013-\037' \
+  | /usr/bin/logger --tag nmcp-backup-notify --priority user.err
