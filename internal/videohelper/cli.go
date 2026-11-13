@@ -293,7 +293,7 @@ func (e *engine) validateRuntimeClosure() error {
 	if err != nil || actualDigest != digest {
 		return errors.New("libaom digest mismatch")
 	}
-	return validateAOMDependency(e.ffmpeg, e.prefix, objectPath)
+	return validateAOMDependency(e.ffmpeg, e.prefix, objectPath, digest)
 }
 
 func parseToolchainManifest(manifest string) (string, string, error) {
@@ -349,7 +349,7 @@ func validSHA256(value string) bool {
 	return err == nil && value == strings.ToLower(value)
 }
 
-func validateAOMDependency(ffmpegPath, prefix, aomPath string) error {
+func validateAOMDependency(ffmpegPath, prefix, aomPath, aomDigest string) error {
 	ffmpeg, err := elf.Open(ffmpegPath)
 	if err != nil {
 		return err
@@ -394,14 +394,12 @@ func validateAOMDependency(ffmpegPath, prefix, aomPath string) error {
 	if err != nil || len(sonames) != 1 {
 		return errors.New("invalid libaom SONAME")
 	}
-	loadedAOMPath, err := filepath.EvalSymlinks(filepath.Join(pinnedLibDir, sonames[0]))
-	if err != nil || filepath.Clean(loadedAOMPath) != filepath.Clean(aomPath) {
-		return errors.New("libaom SONAME does not resolve to pinned object")
+	soname := sonames[0]
+	if !strings.HasPrefix(soname, "libaom.so.") || strings.ContainsRune(soname, '/') {
+		return errors.New("invalid libaom SONAME")
 	}
-	loadedInfo, err := os.Stat(loadedAOMPath)
-	pinnedInfo, pinnedErr := os.Stat(aomPath)
-	if err != nil || pinnedErr != nil || !os.SameFile(pinnedInfo, loadedInfo) {
-		return errors.New("libaom SONAME identity mismatch")
+	if err := requirePinnedAOMCandidates(pinnedLibDir, aomPath, aomDigest, soname); err != nil {
+		return err
 	}
 	codecNeeded, err := libavcodec.ImportedLibraries()
 	if err != nil {
@@ -413,6 +411,75 @@ func validateAOMDependency(ffmpegPath, prefix, aomPath string) error {
 		}
 	}
 	return errors.New("libavcodec does not require pinned libaom SONAME")
+}
+
+// requirePinnedAOMCandidates fails closed unless every libaom candidate the
+// dynamic loader could pick from the pinned RPATH directory is the pinned
+// object. The SONAME entry must exist and is accepted either as a symlink that
+// resolves to the pinned object itself (build-tree / validation-image layout)
+// or as a regular file whose SHA-256 equals the manifest digest (release
+// layout, where install-ubuntu-release refuses symlinks and the builder copies
+// the SONAME as a regular file). Any other libaom.so* entry in the directory,
+// or a known entry with different content, is rejected.
+func requirePinnedAOMCandidates(pinnedLibDir, aomPath, aomDigest, soname string) error {
+	if !validSHA256(aomDigest) {
+		return errors.New("invalid libaom digest")
+	}
+	allowed := map[string]bool{soname: true, "libaom.so": true}
+	if filepath.Dir(filepath.Clean(aomPath)) == filepath.Clean(pinnedLibDir) {
+		allowed[filepath.Base(aomPath)] = true
+	}
+	entries, err := os.ReadDir(pinnedLibDir)
+	if err != nil {
+		return err
+	}
+	sawSONAME := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "libaom.so") {
+			continue
+		}
+		if !allowed[name] {
+			return errors.New("unexpected libaom candidate " + name)
+		}
+		if err := requirePinnedAOMEntry(filepath.Join(pinnedLibDir, name), aomPath, aomDigest); err != nil {
+			return err
+		}
+		if name == soname {
+			sawSONAME = true
+		}
+	}
+	if !sawSONAME {
+		return errors.New("libaom SONAME missing from pinned prefix")
+	}
+	return nil
+}
+
+func requirePinnedAOMEntry(path, aomPath, aomDigest string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	content := path
+	if info.Mode()&os.ModeSymlink != 0 {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil || filepath.Clean(resolved) != filepath.Clean(aomPath) {
+			return errors.New("libaom SONAME does not resolve to pinned object")
+		}
+		loadedInfo, err := os.Stat(resolved)
+		pinnedInfo, pinnedErr := os.Lstat(aomPath)
+		if err != nil || pinnedErr != nil || !pinnedInfo.Mode().IsRegular() || !os.SameFile(pinnedInfo, loadedInfo) {
+			return errors.New("libaom SONAME identity mismatch")
+		}
+		content = aomPath
+	} else if !info.Mode().IsRegular() {
+		return errors.New("libaom candidate is not a regular file")
+	}
+	digest, err := digestFile(content)
+	if err != nil || digest != aomDigest {
+		return errors.New("libaom candidate digest mismatch")
+	}
+	return nil
 }
 
 func requirePinnedRPATH(file *elf.File, pinnedLibDir string) error {
