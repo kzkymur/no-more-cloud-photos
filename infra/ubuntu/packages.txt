@@ -1,12 +1,19 @@
-# Ubuntu 24.04 runtime packages. Record the exact installed versions in the
-# deployment evidence; this file deliberately does not claim repository-wide
-# versions that the project does not control.
+# Ubuntu 26.04 LTS (resolute) amd64 runtime packages. Record the exact
+# installed versions in the deployment evidence; this file deliberately does not
+# claim repository-wide versions that the project does not control.
+#
+# postgresql-17 and postgresql-client-17 come from the PostgreSQL Global
+# Development Group (PGDG) apt repository for resolute (apt.postgresql.org,
+# suite resolute-pgdg). Ubuntu 26.04 itself ships only PostgreSQL 18, and the
+# backup/restore contract requires the server and client tools to be major 17.
+# The cluster unit is postgresql@17-main.service.
 ca-certificates
 curl
 ffmpeg
 libimage-exiftool-perl
 nginx-core
-postgresql
+postgresql-17
+postgresql-client-17
 tzdata
 ufw
 util-linux

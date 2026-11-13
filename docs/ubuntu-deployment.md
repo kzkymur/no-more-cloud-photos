@@ -1,6 +1,6 @@
 # Ubuntu production deployment
 
-This runbook installs the repository's production contract on Ubuntu 24.04.
+This runbook installs the repository's production contract on Ubuntu 26.04 LTS (resolute) amd64.
 It intentionally requires real host values; example addresses, credentials, and
 certificates are never promoted to production defaults.
 
@@ -83,12 +83,12 @@ unsafe owner/mode, or separate filesystem mounted at canonical `.quarantine`.
 
 ## Host prerequisites
 
-1. Install Ubuntu 24.04 runtime packages listed in
+1. Install Ubuntu 26.04 runtime packages listed in
    `infra/ubuntu/packages.txt`. Do not use `latest` as evidence: preserve
    `dpkg-query` package/version output with the deployment record.
 2. Provision PostgreSQL with the documented role split and an `nmcp` database.
    Keep PostgreSQL on literal loopback; do not expose port 5432. Record the
-   concrete Ubuntu cluster unit (for example `postgresql@16-main.service`); the
+   concrete Ubuntu cluster unit (for example `postgresql@17-main.service`); the
    `postgresql.service` meta-unit is not an acceptable dependency.
 3. Mount the durable HDD at the operator-approved location before creating or
    bind-mounting `/var/lib/nmcp`. Confirm filesystem, capacity, boot-time mount

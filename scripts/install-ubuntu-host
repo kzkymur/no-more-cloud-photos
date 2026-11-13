@@ -83,8 +83,8 @@ with open("/etc/os-release", encoding="utf-8") as source:
         if "=" in line:
             key, value = line.rstrip("\n").split("=", 1)
             values[key] = value.strip('"')
-if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "24.04":
-    raise SystemExit("install-ubuntu-host: only Ubuntu 24.04 is supported")
+if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "26.04":
+    raise SystemExit("install-ubuntu-host: only Ubuntu 26.04 is supported")
 PY
 
 [[ $postgresql_unit =~ ^postgresql@[A-Za-z0-9_.-]+\.service$ \
@@ -224,7 +224,7 @@ bootstrap_checksums=$(/usr/bin/mktemp /var/lib/nmcp/deployment/postgresql-role-b
 /usr/bin/install -o root -g root -m 0644 "$repo_root/docs/backup-operations.md" /usr/share/doc/nmcp/backup-operations.md
 
 /usr/bin/dpkg-query -W -f='${binary:Package}\t${Version}\n' \
-  ca-certificates curl ffmpeg libimage-exiftool-perl nginx-core postgresql tzdata ufw util-linux \
+  ca-certificates curl ffmpeg libimage-exiftool-perl nginx-core postgresql-17 postgresql-client-17 tzdata ufw util-linux \
   > /var/lib/nmcp/deployment/runtime-packages.txt
 /usr/bin/chown root:root /var/lib/nmcp/deployment/runtime-packages.txt
 /usr/bin/chmod 0600 /var/lib/nmcp/deployment/runtime-packages.txt

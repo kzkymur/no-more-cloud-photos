@@ -145,7 +145,9 @@ def safe(path, uid=0, mode=None, directory=False):
     require(mode is None or stat.S_IMODE(st.st_mode) == mode, 'unsafe file permissions')
     return st
 
-# v255 lookup contract: src/shared/dropin.c, src/basic/unit-file.c and
+# systemd v255/v259 lookup contract: src/shared/dropin.c, unit-file.c and
+# path-lookup.c (src/basic in v255, src/shared in v259; suffixes and UnitPath
+# order unchanged, confirmed against a live 259.5 manager) and
 # src/core/dbus-manager.c. This is a conservative installed metadata policy,
 # NOT an effective execution/runtime inspector. Never reload or start a unit.
 # v255 fixed-object property reads may lazily load unit metadata (dbus.c find_unit);
