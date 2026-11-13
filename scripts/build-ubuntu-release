@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+# Build a production release directory on the Ubuntu 26.04 amd64 host itself,
+# from this git checkout.
+#
+# usage: sudo scripts/build-ubuntu-release [--install-build-deps] [--staging-dir DIR]
+#
+# The release ID is <YYYYMMDD>-<sha7> of the checkout's HEAD (commit date, UTC).
+# The pinned native toolchains are compiled with their final install path as
+# prefix, /opt/nmcp/releases/<ID>: the video helper requires ffmpeg's RPATH to
+# equal exactly <its resolved release directory>/lib (internal/videohelper),
+# so a release can only run from the path it was built for.
+#
+# Steps: build all three pinned toolchains, the three media helpers and the
+# three Go binaries into that prefix; reduce it to the release layout (bin/,
+# lib/, share/nmcp, share/sRGB2014.icc; symlinks flattened into regular files;
+# no headers, pkg-config, static or libtool files); run the gates at the final
+# path; write MANIFEST.sha256; move the finished tree to
+# <staging-dir>/<ID> for `install-ubuntu-release stage <staging-dir>/<ID> <ID>`,
+# which copies it back to /opt/nmcp/releases/<ID> and re-verifies it.
+#
+# Privileges: root installs build dependencies, creates the unprivileged
+# system user nmcp-build and the prefix, and clones exactly HEAD into the work
+# tree. Every download and compile (steps 2-7) runs as nmcp-build (setpriv:
+# no new privileges, no supplementary groups, clean environment), as do the
+# ldd and helper probes in the gates. Before root touches those outputs, all
+# nmcp-build processes are killed and the trees are chowned to root.
+#
+# Gates (all fail closed):
+#   - scripts/check-release-no-failpoints --bytes-only on the three Go binaries;
+#   - closure: every ELF resolves all libraries with an empty environment, and
+#     every library that exists in the release resolves from the release;
+#   - capabilities: each media helper answers `capabilities` ok, threads=1,
+#     canonical ICC digest, with processrunner's empty environment;
+#   - tree: no symlinks or special files, modes 0755 (dirs, bin/*) / 0644,
+#     root:root, required entries present, MANIFEST covers every file.
+#
+# Idempotent: if <staging-dir>/<ID> is complete (its manifest verifies) or
+# /opt/nmcp/releases/<ID> already exists, nothing is rebuilt (exit 0).
+# A failed build removes only the partial prefix it created itself.
+# The first build takes about 40 minutes. NMCP_BUILD_JOBS (default 2) caps
+# compile parallelism; deploy also runs the builder inside a CPU/memory-capped
+# transient unit so a build never starves other workloads on the host.
+set -euo pipefail
+umask 022
+
+die() { printf 'build-ubuntu-release: error: %s\n' "$*" >&2; exit 1; }
+build_user=nmcp-build
+
+# Internal: steps 2-7 (all compilation and downloads) run unprivileged as
+# $build_user, re-executed by the root phase below from the clean clone.
+if [ "${1:-}" = --compile-phase ]; then
+  [ "$(id -un)" = "$build_user" ] || die "--compile-phase runs only as $build_user"
+  compile_phase=true
+else
+  compile_phase=false
+  [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
+fi
+
+install_deps=false
+staging_root=/var/lib/nmcp-build/releases
+$compile_phase && shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --install-build-deps) install_deps=true; shift ;;
+    --staging-dir) staging_root=${2:?--staging-dir needs a directory}; shift 2 ;;
+    *) die "usage: build-ubuntu-release [--install-build-deps] [--staging-dir DIR]" ;;
+  esac
+done
+case "$staging_root" in /*) ;; *) die "--staging-dir must be absolute" ;; esac
+
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+# shellcheck source=/dev/null
+. /etc/os-release
+if [ "${ID:-}" != ubuntu ] || [ "${VERSION_ID:-}" != 26.04 ]; then
+  die "Ubuntu 26.04 is required (found ${PRETTY_NAME:-unknown})"
+fi
+[ "$(dpkg --print-architecture)" = amd64 ] || die "amd64 is required"
+
+git_() { git -c safe.directory="$repo" -C "$repo" "$@"; }
+[ -z "$(git_ status --porcelain --untracked-files=no)" ] ||
+  die "the checkout has uncommitted changes; a release must match its commit"
+sha=$(git_ rev-parse HEAD)
+release_id=$(TZ=UTC date -d "@$(git_ log -1 --format=%ct HEAD)" +%Y%m%d)-${sha:0:7}
+[[ $release_id =~ ^[0-9]{8}-[0-9a-f]{7}$ ]] || die "unexpected release ID $release_id"
+prefix=/opt/nmcp/releases/$release_id
+out=$staging_root/$release_id
+marker=$prefix/.nmcp-build-in-progress
+work=/var/tmp/nmcp-build/$release_id
+jobs=${NMCP_BUILD_JOBS:-2}
+[[ $jobs =~ ^[1-9][0-9]?$ ]] || die "NMCP_BUILD_JOBS must be 1-99"
+
+start=$SECONDS
+step_no=0
+step() { step_no=$((step_no + 1)); printf '\n[%s/%s] %s (elapsed %dm%02ds)\n' "$step_no" 11 "$*" \
+  $(((SECONDS - start) / 60)) $(((SECONDS - start) % 60)); }
+
+GO_VERSION=1.27.1
+GO_SHA256=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
+GO_ROOT=/opt/nmcp-build/go$GO_VERSION
+ICC_SHA256=384b832de3412066743b52a75ee906b6fb9fb8d9e09e936fc2c43223815c6e0a
+
+compile_steps() {
+# --- native toolchains and helpers ------------------------------------------
+step "pinned still-image toolchain (libaom, lcms2, LibRaw, libheif, libwebp, libvips)"
+"$repo/internal/stillprocessor/helper/build-pinned-toolchain.sh" "$prefix" "$work/still-toolchain"
+step "still helper"
+cmake -S "$repo/internal/stillprocessor/helper" -B "$work/still-helper" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_PREFIX_PATH="$prefix" >/dev/null
+cmake --build "$work/still-helper" --parallel "$jobs"
+step "pinned animation codecs and animation helper"
+"$repo/internal/animationprocessor/helper/build-pinned-codecs.sh" "$prefix" "$work/animation-toolchain"
+cmake -S "$repo/internal/animationprocessor/helper" -B "$work/animation-helper" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DNMCP_PINNED_PREFIX="$prefix" >/dev/null
+cmake --build "$work/animation-helper" --parallel "$jobs"
+step "pinned video toolchain (SVT-AV1, zimg, FFmpeg)"
+"$repo/internal/videoprocessor/helper/build-pinned-toolchain.sh" "$prefix" "$work/video-toolchain"
+
+step "Go binaries and video helper"
+staged_bin=$work/bin
+install -d -m 0755 "$staged_bin"
+# Keep Go's VCS stamping (vcs.revision/vcs.modified in the build info) so every
+# binary is traceable to the same commit as the release ID. Go runs git itself;
+# a root build of a checkout owned by another user needs that one directory
+# marked safe, scoped to these git invocations only (no global git config).
+(cd "$repo" && for binary in core-api core-worker nmcp-admin nmcp-video-helper; do
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$repo" \
+    CGO_ENABLED=0 go build -trimpath -buildvcs=true -ldflags='-s -w' \
+    -o "$staged_bin/$binary" "./cmd/$binary"
+done)
+for binary in core-api core-worker nmcp-admin nmcp-video-helper; do
+  info=$(go version -m "$staged_bin/$binary")
+  if ! grep -qxF $'\tbuild\tvcs.revision='"$sha" <<<"$info" \
+    || ! grep -qxF $'\tbuild\tvcs.modified=false' <<<"$info"; then
+    die "$binary build info does not record clean commit $sha"
+  fi
+done
+
+step "sRGB ICC profile"
+curl --fail --location --silent --show-error --proto '=https' \
+  https://registry.color.org/rgb-registry/profiles/sRGB2014.icc -o "$work/sRGB2014.icc"
+echo "$ICC_SHA256  $work/sRGB2014.icc" | sha256sum --check --strict
+}
+
+if $compile_phase; then
+  set -o errtrace
+  trap 'echo "build-ubuntu-release (compile, $build_user): error: command failed (exit $?) at line $LINENO: $BASH_COMMAND" >&2' ERR
+  step_no=${NMCP_BUILD_STEP:?}
+  start=$((SECONDS - ${NMCP_BUILD_ELAPSED:-0}))
+  [ "$(go env GOVERSION)" = "go$GO_VERSION" ] || die "Go $GO_VERSION is required, found $(go env GOVERSION)"
+  export GOTOOLCHAIN=local GOFLAGS=-mod=readonly
+  export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig"
+  export LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64"
+  compile_steps
+  exit 0
+fi
+
+echo "release ID $release_id (commit $sha)"
+if [ -e "/opt/nmcp/releases/$release_id" ] && [ ! -e "$marker" ]; then
+  echo "release $release_id is already installed at /opt/nmcp/releases/$release_id; nothing to build"
+  exit 0
+fi
+if [ -f "$out/MANIFEST.sha256" ] && (cd "$out" && sha256sum --check --strict --quiet MANIFEST.sha256); then
+  echo "release $release_id is already built at $out; nothing to build"
+  exit 0
+fi
+if [ -e "$prefix" ]; then
+  [ -e "$marker" ] || die "$prefix exists and was not created by this builder"
+  echo "removing an interrupted build at $prefix"
+  rm -rf -- "$prefix"
+fi
+[ ! -e "$out" ] || { echo "removing an incomplete staged tree at $out"; rm -rf -- "$out"; }
+
+cleanup() {
+  status=$?
+  pkill -KILL -u "$build_user" 2>/dev/null || true
+  if [ "$status" -ne 0 ] && [ -e "$marker" ]; then
+    echo "build failed (exit $status); removing the partial build at $prefix" >&2
+    rm -rf -- "$prefix"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+# No step may stop silently: name the failing command and line (set -e exit).
+set -o errtrace
+trap 'echo "build-ubuntu-release: error: command failed (exit $?) at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+# --- build dependencies -----------------------------------------------------
+step "build dependencies"
+if [ "$install_deps" = true ]; then
+  "$repo/scripts/infra-apt-install" \
+    autoconf automake build-essential ca-certificates cmake curl git libtool \
+    meson nasm ninja-build patchelf pkg-config procps xz-utils yasm \
+    libde265-dev libexif-dev libexpat1-dev libglib2.0-dev libjpeg-turbo8-dev libpng-dev \
+    libwebp-dev zlib1g-dev
+  if [ ! -x "$GO_ROOT/bin/go" ]; then
+    tmp=$(mktemp -d)
+    curl --fail --location --silent --show-error --proto '=https' \
+      "https://go.dev/dl/go$GO_VERSION.linux-amd64.tar.gz" -o "$tmp/go.tar.gz"
+    echo "$GO_SHA256  $tmp/go.tar.gz" | sha256sum --check --strict
+    install -d -m 0755 "$GO_ROOT"
+    tar -xzf "$tmp/go.tar.gz" -C "$GO_ROOT" --strip-components=1
+    rm -rf -- "$tmp"
+  fi
+fi
+# yasm: libaom 3.8.2's CMake check cannot parse nasm 3.x (Ubuntu 26.04) help
+# output ("Unsupported nasm: multipass optimization not supported"); aom
+# prefers yasm when it is installed.
+for tool in cc c++ cmake meson ninja nasm yasm pkg-config patchelf curl git setpriv useradd pkill pgrep; do
+  command -v "$tool" >/dev/null || die "missing build tool $tool (use --install-build-deps)"
+done
+if [ -x "$GO_ROOT/bin/go" ]; then export PATH="$GO_ROOT/bin:$PATH"; fi
+command -v go >/dev/null || die "missing Go $GO_VERSION (use --install-build-deps)"
+[ "$(go env GOVERSION)" = "go$GO_VERSION" ] || die "Go $GO_VERSION is required, found $(go env GOVERSION)"
+export GOTOOLCHAIN=local GOFLAGS=-mod=readonly
+
+install -d -m 0755 /opt/nmcp /opt/nmcp/releases "$prefix"
+: >"$marker"
+# A previous attempt's work tree is never reused (no build-user process may
+# still be writing to it).
+pkill -KILL -u "$build_user" 2>/dev/null || true
+rm -rf -- "$work"
+install -d -m 0700 "$work"
+export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig"
+export LD_LIBRARY_PATH="$prefix/lib:$prefix/lib64"
+
+# --- compile as the unprivileged build user --------------------------------
+run_as_builder() { # COMMAND... as $build_user: no new privileges, no groups, clean env
+  setpriv --reuid="$build_user" --regid="$build_user" --clear-groups --no-new-privs --reset-env \
+    env PATH="$GO_ROOT/bin:/usr/local/bin:/usr/bin:/bin" HOME="$work/home" LC_ALL=C.UTF-8 \
+    GOCACHE="$work/go-cache" GOMODCACHE="$work/go-mod" GOPATH="$work/gopath" "$@"
+}
+stop_builder_processes() { # nothing the build user started may outlive its phase
+  pkill -KILL -u "$build_user" 2>/dev/null || true
+  local tries=0
+  while pgrep -u "$build_user" >/dev/null 2>&1; do
+    tries=$((tries + 1)); [ "$tries" -le 50 ] || die "processes of $build_user did not exit"
+    sleep 0.1
+  done
+}
+getent passwd "$build_user" >/dev/null || useradd --system --user-group --home-dir /nonexistent \
+  --no-create-home --shell /usr/sbin/nologin "$build_user"
+# The compile reads a fresh clone of exactly HEAD (with .git, so Go's VCS stamp
+# still records the commit), never the caller's checkout.
+src=$work/src
+git -c safe.directory="$repo" clone --quiet --no-hardlinks "$repo" "$src"
+[ "$(git -C "$src" rev-parse HEAD)" = "$sha" ] || die "the build clone is not at $sha"
+install -d -m 0700 "$work/home"
+chown -R "$build_user:$build_user" "$work" "$prefix"
+chown root:root "$marker"
+run_as_builder env NMCP_BUILD_JOBS="$jobs" NMCP_BUILD_STEP="$step_no" NMCP_BUILD_ELAPSED=$((SECONDS - start)) \
+  bash "$src/scripts/build-ubuntu-release" --compile-phase
+stop_builder_processes
+step_no=$((step_no + 6))
+# From here on root works on the outputs: take ownership first.
+chown -R root:root "$prefix" "$work"
+repo=$src
+
+# --- reduce the prefix to the release layout --------------------------------
+step "assemble the release layout"
+release_bins=(core-api core-worker nmcp-admin nmcp-still-helper nmcp-animation-helper nmcp-video-helper ffmpeg ffprobe)
+keep_bin=$work/keep-bin
+install -d -m 0755 "$keep_bin"
+install -m 0755 "$prefix/bin/ffmpeg" "$prefix/bin/ffprobe" "$keep_bin/"
+install -m 0755 "$work/still-helper/bin/nmcp-still-helper" "$keep_bin/"
+install -m 0755 "$work/animation-helper/bin/nmcp-animation-helper" "$keep_bin/"
+install -m 0755 "$staged_bin"/* "$keep_bin/"
+rm -rf -- "${prefix:?}/bin"
+install -d -m 0755 "$prefix/bin"
+for binary in "${release_bins[@]}"; do install -m 0755 "$keep_bin/$binary" "$prefix/bin/$binary"; done
+# share/: only what the helpers read.
+keep_share=$work/keep-share
+rm -rf -- "$keep_share"; install -d -m 0755 "$keep_share"
+cp -a "$prefix/share/nmcp" "$keep_share/nmcp"
+rm -rf -- "$prefix/share"
+install -d -m 0755 "$prefix/share"
+cp -a "$keep_share/nmcp" "$prefix/share/nmcp"
+install -m 0644 "$work/sRGB2014.icc" "$prefix/share/sRGB2014.icc"
+# Everything else at the top level (include/, man pages, cmake files) goes.
+for entry in "$prefix"/* "$prefix"/.[!.]*; do
+  [ -e "$entry" ] || continue
+  case "${entry##*/}" in bin|lib|lib64|share|.nmcp-build-in-progress) ;; *) rm -rf -- "$entry" ;; esac
+done
+# lib*/: shared objects only, as regular files. A SONAME symlink becomes a copy
+# of its target, because the installer refuses symlinks in a release.
+for libdir in "$prefix/lib" "$prefix/lib64"; do
+  [ -d "$libdir" ] || continue
+  find "$libdir" -mindepth 1 -maxdepth 1 -type d -exec rm -rf -- {} +
+  find "$libdir" -maxdepth 1 \( -name '*.a' -o -name '*.la' \) -delete
+  while IFS= read -r -d '' link; do
+    target=$(readlink -f -- "$link")
+    case "$target" in "$prefix"/lib/*|"$prefix"/lib64/*) ;; *) die "library link escapes the release: $link -> $target" ;; esac
+    [ -f "$target" ] || die "dangling library link: $link"
+    cp --remove-destination -- "$target" "$link"
+  done < <(find "$libdir" -maxdepth 1 -type l -print0)
+  find "$libdir" -maxdepth 1 -type f ! -name '*.so*' -delete
+done
+[ -z "$(find "$prefix" -type l -print -quit)" ] || die "symlinks remain in the release"
+chown -R root:root "$prefix"
+find "$prefix" -type d -exec chmod 0755 {} +
+find "$prefix" -type f -exec chmod 0644 {} +
+chmod 0755 "$prefix"/bin/*
+
+# --- gates at the final path -------------------------------------------------
+step "gate: no failpoint code in the Go binaries"
+python3 -I "$repo/scripts/check-release-no-failpoints" --bytes-only --source-root "$repo" \
+  "$prefix/bin/core-api" "$prefix/bin/core-worker" "$prefix/bin/nmcp-admin"
+
+step "gate: library closure with an empty environment"
+# Only the library directories the build produced (lib64 usually does not
+# exist; find on a missing path exits non-zero and pipefail would abort here).
+lib_dirs=()
+for libdir in "$prefix/lib" "$prefix/lib64"; do [ -d "$libdir" ] && lib_dirs+=("$libdir"); done
+((${#lib_dirs[@]})) || die "closure: the release has no lib directory"
+pinned=$(find "${lib_dirs[@]}" -maxdepth 1 -type f -name '*.so*' -printf '%f\n' | sort -u)
+closure_failed=false
+system_libs=()
+while IFS= read -r -d '' elf; do
+  head -c 4 "$elf" | grep -q $'^\x7fELF' || continue
+  if ! out_ldd=$(run_as_builder env -i LC_ALL=C ldd "$elf" 2>&1); then
+    case "$out_ldd" in *"not a dynamic executable"*|*"statically linked"*) continue ;; esac
+    echo "closure: ldd failed for ${elf#"$prefix"/}: $out_ldd" >&2; closure_failed=true; continue
+  fi
+  if grep -q 'not found' <<<"$out_ldd"; then
+    echo "closure: unresolved libraries in ${elf#"$prefix"/}:" >&2; grep 'not found' <<<"$out_ldd" >&2
+    closure_failed=true
+  fi
+  while read -r name arrow resolved _; do
+    [ "$arrow" = "=>" ] || continue
+    if grep -qxF -- "$name" <<<"$pinned"; then
+      case "$resolved" in "$prefix"/*) ;; *) echo "closure: ${elf#"$prefix"/} resolves pinned $name from $resolved" >&2; closure_failed=true ;; esac
+    else
+      case "$resolved" in "$prefix"/*) ;; /*) system_libs+=("$resolved") ;; esac
+    fi
+  done <<<"$out_ldd"
+done < <(find "$prefix/bin" "${lib_dirs[@]}" -type f -print0)
+[ "$closure_failed" = false ] || die "library closure gate failed"
+echo "closure: all ELF files resolve inside the release or from the system, none from outside for pinned libraries"
+# The system half of the closure, by owning package: these must stay installed
+# at runtime (infra/ubuntu/packages.txt).
+if ((${#system_libs[@]})); then
+  echo "closure: system runtime packages:"
+  printf '%s\n' "${system_libs[@]}" | sort -u | while IFS= read -r lib; do
+    dpkg -S "$(readlink -f "$lib")" 2>/dev/null | cut -d: -f1 || echo "(unowned: $lib)"
+  done | sort -u | sed 's/^/closure:   /'
+fi
+
+step "gate: media helper capabilities"
+for helper in nmcp-still-helper nmcp-animation-helper nmcp-video-helper; do
+  response=$(run_as_builder env -i LC_ALL=C LANG=C TZ=UTC "$prefix/bin/$helper" capabilities --protocol 1 --threads 1 \
+    --srgb-icc /proc/self/fd/3 3<"$prefix/share/sRGB2014.icc") || die "$helper capabilities exited non-zero"
+  # The checks every Worker processor applies to a capabilities response
+  # (protocol/ok envelope, threads, exact ICC digest, decoder list).
+  if ! python3 -I - "$helper" "$response" "$ICC_SHA256" <<'PY'; then
+import json, sys
+helper, raw, icc = sys.argv[1:]
+doc = json.loads(raw)
+result = doc.get("result")
+problems = []
+if doc.get("protocol") != 1 or doc.get("ok") is not True or doc.get("error_code") or not isinstance(result, dict):
+    problems.append("envelope is not protocol 1 / ok with a result")
+    result = {}
+if result.get("threads") != 1:
+    problems.append(f"threads={result.get('threads')!r}, want 1")
+if result.get("icc_sha256") != icc:
+    problems.append(f"icc_sha256={result.get('icc_sha256')!r}, want {icc}")
+mimes = result.get("decoder_mime_types")
+if not isinstance(mimes, list) or not mimes or mimes != sorted(set(mimes)):
+    problems.append(f"decoder_mime_types must be a non-empty sorted unique list, got {mimes!r}")
+if not isinstance(result.get("helper_version"), str) or not result.get("helper_version"):
+    problems.append("helper_version missing")
+if problems:
+    for problem in problems:
+        print(f"capabilities: {helper}: {problem}", file=sys.stderr)
+    print(f"capabilities: {helper}: response {raw}", file=sys.stderr)
+    sys.exit(1)
+print(f"capabilities: {helper} ok ({len(mimes)} decoder MIME types, helper {result['helper_version']})")
+PY
+    # Diagnostics for the helper's runtime-closure checks (it reports only an
+    # error code): the dynamic sections and the library layout it inspects.
+    {
+      echo "diagnostics for $helper:"
+      ls -l "$prefix"/lib/libaom* "$prefix"/lib/libavcodec* 2>&1 || true
+      cat "$prefix/share/nmcp/video-toolchain.manifest" 2>&1 || true
+      for elf in "$prefix/bin/ffmpeg" "$prefix/bin/ffprobe" "$prefix"/lib/libavcodec.so.*; do
+        [ -f "$elf" ] || continue
+        echo "--- ${elf#"$prefix"/}"
+        readelf -d "$elf" 2>&1 | grep -E 'RPATH|RUNPATH|NEEDED|SONAME' || true
+      done
+    } >&2
+    die "$helper capabilities rejected"
+  fi
+done
+
+stop_builder_processes
+
+step "manifest and tree rules"
+rm -f -- "$marker"
+(cd "$prefix" && find . -type f ! -name MANIFEST.sha256 -printf '%P\0' | LC_ALL=C sort -z | xargs -0 sha256sum) \
+  >"$work/MANIFEST.sha256"
+install -m 0644 "$work/MANIFEST.sha256" "$prefix/MANIFEST.sha256"
+: >"$marker"   # still ours until it is moved out below
+python3 -I - "$prefix" <<'PY'
+import os, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1])
+listed = []
+for line in (root / "MANIFEST.sha256").read_text(encoding="ascii").splitlines():
+    digest, path = line.split("  ", 1)
+    assert len(digest) == 64 and not path.startswith("/") and ".." not in path.split("/"), line
+    listed.append(path)
+actual = []
+for base, dirs, files in os.walk(root, followlinks=False):
+    for name in dirs + files:
+        p = pathlib.Path(base, name)
+        rel = p.relative_to(root)
+        st = p.lstat()
+        if rel.as_posix() == ".nmcp-build-in-progress":
+            continue
+        assert not stat.S_ISLNK(st.st_mode) and (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)), rel
+        want = 0o755 if stat.S_ISDIR(st.st_mode) or rel.parts[0] == "bin" else 0o644
+        assert stat.S_IMODE(st.st_mode) == want, f"{rel}: mode {oct(stat.S_IMODE(st.st_mode))}"
+        assert st.st_uid == 0 and st.st_gid == 0, f"{rel}: not root:root"
+    for name in files:
+        rel = pathlib.Path(base, name).relative_to(root).as_posix()
+        if rel not in ("MANIFEST.sha256", ".nmcp-build-in-progress"):
+            actual.append(rel)
+assert sorted(actual) == sorted(listed), "MANIFEST does not cover exactly the release files"
+for required in ("bin/core-api", "bin/core-worker", "bin/nmcp-admin", "bin/nmcp-still-helper",
+                 "bin/nmcp-animation-helper", "bin/nmcp-video-helper", "bin/ffmpeg", "bin/ffprobe",
+                 "share/sRGB2014.icc", "share/nmcp/video-toolchain.manifest"):
+    assert required in listed, f"missing {required}"
+print(f"tree: {len(listed)} files, layout and modes OK")
+PY
+
+step "hand off to staging"
+install -d -m 0700 "$staging_root"
+rm -f -- "$marker"
+cp -a "$prefix" "$out"
+(cd "$out" && sha256sum --check --strict --quiet MANIFEST.sha256) || die "staged copy does not verify"
+rm -rf -- "$prefix"
+trap - EXIT
+rm -rf -- "$work"
+printf '\nrelease %s built in %dm%02ds: %s\n' "$release_id" $((SECONDS / 60)) $((SECONDS % 60)) "$out"
+printf 'install it with: sudo scripts/install-ubuntu-release stage %s %s\n' "$out" "$release_id"
