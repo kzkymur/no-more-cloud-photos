@@ -11,7 +11,13 @@
 # NMCP_E2E_BUDGET_RETRY_SECONDS (default 180) while the API reports THIS run
 # (same head and attempt) as `queued` or the API call fails, printing the
 # API-reported status each time. A run_mismatch while the API reports any
-# other status, and every other refusal, fails immediately.
+# other status fails immediately.
+#
+# admission_refused:job_runner_pending (GitHub already lists THIS job but has
+# not recorded its runner yet, normal in a job's first seconds) is retried
+# with the same backoff for at most NMCP_E2E_RUNNER_PENDING_SECONDS (default
+# 60). The helper still requires exactly one job matching name and runner
+# before it admits; every other refusal fails immediately.
 #
 # Test hooks (scripts/test-infra-e2e-budget-acquire):
 #   NMCP_E2E_ADMISSION_HELPER  admission command (default: scripts/backup-ci-admission)
@@ -29,9 +35,12 @@ max_attempts=${NMCP_E2E_RETRY_MAX_ATTEMPTS:-0}
 case "$max_attempts" in ''|*[!0-9]*) echo "invalid NMCP_E2E_RETRY_MAX_ATTEMPTS" >&2; exit 2 ;; esac
 read -r -a backoff <<<"${NMCP_E2E_RETRY_BACKOFF:-5 10 20 30}"
 case "$window" in ''|*[!0-9]*) echo "invalid NMCP_E2E_BUDGET_RETRY_SECONDS" >&2; exit 2 ;; esac
+pending_window=${NMCP_E2E_RUNNER_PENDING_SECONDS:-60}
+case "$pending_window" in ''|*[!0-9]*) echo "invalid NMCP_E2E_RUNNER_PENDING_SECONDS" >&2; exit 2 ;; esac
 receipt="$RUNNER_TEMP/.nmcp-e2e-budget.json"
 [ ! -e "$receipt" ] || { echo "receipt already exists; never re-acquire" >&2; exit 1; }
 deadline=$((SECONDS + window))
+pending_deadline=$((SECONDS + pending_window))
 umask 077
 attempt=0
 while :; do
@@ -51,7 +60,11 @@ while :; do
     --jq '"status=\(.status) head_sha=\(.head_sha) attempt=\(.run_attempt)"' 2>&1 || true)
   echo "admission diagnostics (attempt $attempt): $observed" >&2
   retryable=false
-  if grep -qx 'admission_refused:run_mismatch' "$receipt.err"; then
+  limit=$deadline
+  if grep -qx 'admission_refused:job_runner_pending' "$receipt.err"; then
+    retryable=true
+    limit=$pending_deadline
+  elif grep -qx 'admission_refused:run_mismatch' "$receipt.err"; then
     case "$observed" in
       "status=queued head_sha=$NMCP_E2E_BUDGET_RUN_SHA attempt=$GITHUB_RUN_ATTEMPT") retryable=true ;;
       status=*) ;;  # the API reports another state: a real identity mismatch
@@ -65,8 +78,14 @@ while :; do
     rm -f -- "$receipt.tmp" "$receipt.err"
     exit 1
   fi
-  if [ "$retryable" != true ] || [ $((SECONDS + pause)) -gt "$deadline" ]; then
-    [ "$retryable" != true ] || echo "admission: run still queued after ${window}s retry window" >&2
+  if [ "$retryable" != true ] || [ $((SECONDS + pause)) -gt "$limit" ]; then
+    if [ "$retryable" = true ]; then
+      if [ "$limit" = "$pending_deadline" ]; then
+        echo "admission: job runner still not recorded after ${pending_window}s" >&2
+      else
+        echo "admission: run still queued after ${window}s retry window" >&2
+      fi
+    fi
     rm -f -- "$receipt.tmp" "$receipt.err"
     exit 1
   fi

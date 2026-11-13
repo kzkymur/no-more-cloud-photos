@@ -73,5 +73,14 @@ run_case other-refusal 1 1 FAKE_MISMATCHES=99 FAKE_CODE=job_mismatch FAKE_GH_STA
 run_case api-unavailable 1 3 FAKE_MISMATCHES=99 NMCP_E2E_RETRY_MAX_ATTEMPTS=3
 # An existing receipt is never overwritten.
 mkdir -p "$work/existing"; : >"$work/existing/.nmcp-e2e-budget.json"
+# job_runner_pending: retried (bounded), then admitted; or exhausted; never
+# confused with the run_mismatch window.
+run_case runner-pending-then-ok 0 3 FAKE_MISMATCHES=2 FAKE_CODE=job_runner_pending FAKE_GH_STATUS=in_progress
+run_case runner-pending-window-exhausted 1 1 FAKE_MISMATCHES=99 FAKE_CODE=job_runner_pending FAKE_GH_STATUS=in_progress NMCP_E2E_RUNNER_PENDING_SECONDS=0 NMCP_E2E_RETRY_BACKOFF=1
+grep -q 'job runner still not recorded after 0s' "$work/runner-pending-window-exhausted/err"
+run_case runner-pending-attempts-exhausted 1 4 FAKE_MISMATCHES=99 FAKE_CODE=job_runner_pending FAKE_GH_STATUS=queued NMCP_E2E_RETRY_MAX_ATTEMPTS=4
+# ambiguous_job and job_not_found are final.
+run_case ambiguous-final 1 1 FAKE_MISMATCHES=99 FAKE_CODE=ambiguous_job FAKE_GH_STATUS=queued
+run_case not-found-final 1 1 FAKE_MISMATCHES=99 FAKE_CODE=job_not_found FAKE_GH_STATUS=queued
 run_case existing 1 0 FAKE_MISMATCHES=0
 echo "infra-e2e-budget-acquire: $pass cases PASS"
