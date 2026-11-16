@@ -1,0 +1,107 @@
+name: Mobile Android
+
+# Builds the release-signed Android APK of the mobile app (mobile/).
+# Signing secrets (repository secrets, never printed):
+#   NMCP_ANDROID_KEYSTORE_BASE64   base64 of the PKCS12 release keystore
+#   NMCP_ANDROID_KEYSTORE_PASSWORD store password (also the key password)
+#   NMCP_ANDROID_KEY_ALIAS         key alias inside the keystore
+# The key is permanent: every published APK must be signed with it so that
+# installs can be updated in place. There is no debug-signed fallback.
+
+on:
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-android.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Generate native Android project
+        run: npx expo prebuild --platform android --no-install --clean
+
+      - name: Decode release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.NMCP_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::NMCP_ANDROID_KEYSTORE_BASE64 is not available (fork PR or missing secret); refusing to build an unsigned/debug-signed release."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/nmcp-release.p12"
+          echo "NMCP_UPLOAD_STORE_FILE=$RUNNER_TEMP/nmcp-release.p12" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        working-directory: mobile/android
+        env:
+          NMCP_UPLOAD_STORE_PASSWORD: ${{ secrets.NMCP_ANDROID_KEYSTORE_PASSWORD }}
+          NMCP_UPLOAD_KEY_PASSWORD: ${{ secrets.NMCP_ANDROID_KEYSTORE_PASSWORD }}
+          NMCP_UPLOAD_KEY_ALIAS: ${{ secrets.NMCP_ANDROID_KEY_ALIAS }}
+        run: ./gradlew --no-daemon assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a
+
+      - name: Verify signature
+        run: |
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
+          # Must be the permanent release key, never the Android debug key.
+          if grep -q 'CN=Android Debug' "$RUNNER_TEMP/certs.txt"; then
+            echo "::error::APK is debug-signed"; exit 1
+          fi
+          grep -qi 'Signer #1 certificate SHA-256 digest: 119ef3c6b5ed68922be29feebff4701cbd880504bac73df347b98548c424cd90' "$RUNNER_TEMP/certs.txt" \
+            || { echo "::error::APK is not signed with the NMCP release key"; exit 1; }
+          version=$(node -p "require('./app.json').expo.version")
+          mkdir -p dist
+          cp "$apk" "dist/nmcp-photos-${version}-${GITHUB_SHA::7}.apk"
+          sha256sum dist/*.apk
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/nmcp-release.p12"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nmcp-photos-android
+          path: mobile/dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
