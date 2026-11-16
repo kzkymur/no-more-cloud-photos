@@ -45,11 +45,17 @@ class UploadWorker(context: Context, params: WorkerParameters) : CoroutineWorker
       config.lastRunError = "Photo library permission is missing"
       return Result.success()
     }
+    if (!MediaPermissions.mediaLocation(applicationContext)) {
+      // Paused, not failed: requestPermissions() re-applies the schedule once granted.
+      config.lastRunError = MediaUploader.LOCATION_REQUIRED
+      return Result.success()
+    }
 
     LiveStatus.running = true
     tryForeground("Checking library…", 0, 0)
     val runStartedAt = System.currentTimeMillis()
     var stopError: String? = null
+    var needsUser = false
     try {
       store.recoverInterrupted()
       scan(applicationContext)
@@ -86,7 +92,11 @@ class UploadWorker(context: Context, params: WorkerParameters) : CoroutineWorker
             }
           }
         } catch (e: CancellationException) {
-          store.markPending(item.id)
+          // Stopped mid-transfer (constraint lost, ~10 min limit without a foreground
+          // service, user cancel). Uploads restart from byte 0, so the item moves behind
+          // every item that has not been interrupted as often: a huge video can never
+          // starve the rest of the queue.
+          store.markInterrupted(item.id)
           throw e
         } catch (e: Exception) {
           UploadOutcome.Transient(null, "Unexpected error: ${e.javaClass.simpleName}: ${e.message}")
@@ -99,6 +109,12 @@ class UploadWorker(context: Context, params: WorkerParameters) : CoroutineWorker
           is UploadOutcome.Unreachable -> {
             store.markPending(item.id)
             stopError = outcome.message
+            break
+          }
+          is UploadOutcome.NeedsUser -> {
+            store.markPending(item.id)
+            stopError = outcome.message
+            needsUser = true
             break
           }
         }
@@ -117,8 +133,9 @@ class UploadWorker(context: Context, params: WorkerParameters) : CoroutineWorker
       config.lastRunError = stopError
       cancelNotification()
     }
-    // Server unreachable: let WorkManager back off and try again.
-    return if (stopError != null) Result.retry() else Result.success()
+    // Server unreachable: let WorkManager back off and try again. Problems only the
+    // user can fix (URL, permission) wait for the next trigger instead of retrying.
+    return if (stopError != null && !needsUser) Result.retry() else Result.success()
   }
 
   private suspend fun tryForeground(text: String, done: Int, total: Int) {

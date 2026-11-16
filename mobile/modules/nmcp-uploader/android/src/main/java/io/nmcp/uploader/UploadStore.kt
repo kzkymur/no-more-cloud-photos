@@ -27,7 +27,7 @@ data class StoreCounts(val total: Int, val uploaded: Int, val pending: Int, val 
  * unless the file itself changes (size or modification time).
  */
 class UploadStore private constructor(context: Context) :
-  SQLiteOpenHelper(context.applicationContext, "nmcp_uploader.db", null, 1) {
+  SQLiteOpenHelper(context.applicationContext, "nmcp_uploader.db", null, 2) {
 
   override fun onCreate(db: SQLiteDatabase) {
     db.execSQL(
@@ -47,6 +47,7 @@ class UploadStore private constructor(context: Context) :
         content_sha TEXT,
         media_id TEXT,
         seen_scan INTEGER NOT NULL DEFAULT 0,
+        interrupts INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL
       )
       """.trimIndent()
@@ -54,7 +55,9 @@ class UploadStore private constructor(context: Context) :
     db.execSQL("CREATE INDEX items_state ON items(state, permanent, taken)")
   }
 
-  override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+  override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+    if (oldVersion < 2) db.execSQL("ALTER TABLE items ADD COLUMN interrupts INTEGER NOT NULL DEFAULT 0")
+  }
 
   /** Snapshot of the scan-relevant columns of every row. */
   fun loadIndex(): Map<String, Triple<Long, Long, Int>> {
@@ -91,6 +94,7 @@ class UploadStore private constructor(context: Context) :
           values.put("size", row.size); values.put("modified", row.modified); values.put("taken", row.taken)
           if (state != STATE_UPLOADING) {
             values.put("state", STATE_PENDING); values.put("attempts", 0); values.put("permanent", 0)
+            values.put("interrupts", 0)
             values.putNull("last_error"); values.put("updated_at", now)
           }
         }
@@ -104,13 +108,17 @@ class UploadStore private constructor(context: Context) :
     }
   }
 
-  /** Next item to send: pending first (newest first), then transient failures not yet retried in this run. */
+  /**
+   * Next item to send. Items interrupted fewer times go first (so one huge file
+   * that keeps getting cut off cannot block the queue); then pending before
+   * transient failures; then newest first. Failures are retried at most once per run.
+   */
   fun nextCandidate(runStartedAt: Long): UploadItem? {
     val sql = """
       SELECT id, uri, name, mime, size, modified, state, attempts, last_error, permanent FROM items
       WHERE state = $STATE_PENDING
          OR (state = $STATE_FAILED AND permanent = 0 AND attempts < $MAX_ATTEMPTS AND updated_at < ?)
-      ORDER BY state ASC, taken DESC LIMIT 1
+      ORDER BY interrupts ASC, state ASC, taken DESC LIMIT 1
     """.trimIndent()
     readableDatabase.rawQuery(sql, arrayOf(runStartedAt.toString())).use { c ->
       if (!c.moveToFirst()) return null
@@ -136,7 +144,15 @@ class UploadStore private constructor(context: Context) :
     )
   }
 
-  /** Returns an interrupted item to the queue without counting an attempt. */
+  /** Stopped mid-transfer: back to the queue, behind items interrupted fewer times. */
+  fun markInterrupted(id: String) {
+    writableDatabase.execSQL(
+      "UPDATE items SET state = $STATE_PENDING, interrupts = interrupts + 1, updated_at = ? WHERE id = ?",
+      arrayOf<Any?>(System.currentTimeMillis(), id),
+    )
+  }
+
+  /** Returns an item to the queue without counting an attempt. */
   fun markPending(id: String) = update(id, ContentValues().apply { put("state", STATE_PENDING) })
 
   /** Items left in STATE_UPLOADING by a killed process go back to the queue. */
@@ -146,7 +162,7 @@ class UploadStore private constructor(context: Context) :
 
   fun retryAllFailed() {
     writableDatabase.execSQL(
-      "UPDATE items SET state = $STATE_PENDING, attempts = 0, permanent = 0 WHERE state = $STATE_FAILED"
+      "UPDATE items SET state = $STATE_PENDING, attempts = 0, permanent = 0, interrupts = 0 WHERE state = $STATE_FAILED"
     )
   }
 

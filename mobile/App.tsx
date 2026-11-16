@@ -237,10 +237,12 @@ function Dashboard(props: {
       )}
       {!perm.mediaLocation && (
         <Warn
-          text="位置情報へのアクセスが許可されていないため、写真の撮影場所（GPS）が削除された状態で送信されます。"
+          text="アップロードを一時停止しています。写真の位置情報へのアクセスが許可されていないと、Android が撮影場所（GPS）を削除した状態でしか写真を読めないため、原本として送れません。"
           action="許可する"
           onAction={async () => {
-            await Uploader.requestPermissions();
+            const next = await Uploader.requestPermissions();
+            // Denied with "don't ask again": only the settings page can grant it.
+            if (!next.mediaLocation) await Uploader.openSettings();
             await props.onPermRefresh();
           }}
         />

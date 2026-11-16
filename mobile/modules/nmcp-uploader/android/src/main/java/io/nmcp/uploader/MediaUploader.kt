@@ -9,7 +9,6 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 import java.security.MessageDigest
 import java.security.SecureRandom
 
@@ -23,26 +22,20 @@ sealed class UploadOutcome {
   /** Worth retrying later (timeouts, 5xx, 429). */
   data class Transient(val contentSha: String?, val message: String) : UploadOutcome()
 
-  /** The server could not be reached at all; the whole run should stop. */
+  /** The server could not be reached at all; the whole run should stop and back off. */
   data class Unreachable(val message: String) : UploadOutcome()
+
+  /**
+   * Nothing will work until the user changes something (server URL, permission):
+   * stop the run without backoff retries; the next trigger or the UI starts again.
+   */
+  data class NeedsUser(val message: String) : UploadOutcome()
 }
 
 /**
  * Sends one original to the Core API. The bytes are streamed unmodified from
- * MediaStore (with setRequireOriginal so GPS EXIF is not redacted) inside a
- * single-part multipart/form-data body:
- *
- *   --B\r\n
- *   Content-Disposition: form-data; name="file"; filename="<ascii>"; filename*=UTF-8''<pct>\r\n
- *   Content-Type: <mime>\r\n
- *   \r\n
- *   <bytes>\r\n
- *   --B--\r\n
- *
- * Idempotency-Key = "nmcp1-" + hex(SHA-256("android|<itemId>|<content sha256 hex>")).
- * The same file always gets the same key, so a retry after a lost response is
- * replayed by the server instead of creating a duplicate; an edited file gets a
- * new key because its content hash differs.
+ * MediaStore through MediaStore.setRequireOriginal (so GPS EXIF is never
+ * redacted) inside the single-part body described in [MultipartFormat].
  */
 class MediaUploader(private val context: Context, private val serverUrl: String) {
 
@@ -52,7 +45,9 @@ class MediaUploader(private val context: Context, private val serverUrl: String)
   }
 
   fun upload(item: UploadItem, progress: Progress): UploadOutcome {
-    val source = sourceUri(item)
+    // Never send location-redacted bytes: they would be stored as the "original"
+    // and the ledger would never send the real one.
+    val source = sourceUri(item) ?: return UploadOutcome.NeedsUser(LOCATION_REQUIRED)
 
     // Pass 1: exact length and content hash of the bytes we are going to send.
     val (contentSha, length) = try {
@@ -64,15 +59,10 @@ class MediaUploader(private val context: Context, private val serverUrl: String)
     }
     if (length == 0L) return UploadOutcome.Rejected(contentSha, "File is empty")
 
-    val key = "nmcp1-" + sha256Hex("android|${item.id}|$contentSha".toByteArray(Charsets.UTF_8))
+    val key = MultipartFormat.idempotencyKey(MultipartFormat.PLATFORM, item.id, contentSha, item.name)
     val boundary = "nmcp-" + randomHex(16)
-    val head = buildString {
-      append("--").append(boundary).append("\r\n")
-      append("Content-Disposition: form-data; name=\"file\"; filename=\"")
-      append(asciiFallback(item.name)).append("\"; filename*=UTF-8''").append(rfc5987(item.name)).append("\r\n")
-      append("Content-Type: ").append(sanitizeMime(item.mime)).append("\r\n\r\n")
-    }.toByteArray(Charsets.UTF_8)
-    val tail = "\r\n--$boundary--\r\n".toByteArray(Charsets.US_ASCII)
+    val head = MultipartFormat.head(boundary, item.name, item.mime).toByteArray(Charsets.UTF_8)
+    val tail = MultipartFormat.tail(boundary).toByteArray(Charsets.US_ASCII)
     val total = head.size + length + tail.size
 
     val connection: HttpURLConnection
@@ -89,7 +79,9 @@ class MediaUploader(private val context: Context, private val serverUrl: String)
         setRequestProperty("Idempotency-Key", key)
       }
     } catch (e: IOException) {
-      return UploadOutcome.Unreachable("Invalid server URL: ${e.message}")
+      return UploadOutcome.NeedsUser("Invalid server URL: ${e.message}")
+    } catch (e: IllegalArgumentException) {
+      return UploadOutcome.NeedsUser("Invalid server URL: ${e.message}")
     }
 
     try {
@@ -162,22 +154,21 @@ class MediaUploader(private val context: Context, private val serverUrl: String)
     return when {
       // Not about this file: wrong URL / proxy in front of the API. Stop instead of failing every item.
       status == 401 || status == 403 || status == 404 || status == 405 ->
-        UploadOutcome.Unreachable("Check the server URL ($text)")
+        UploadOutcome.NeedsUser("Check the server URL ($text)")
       // Server busy or down: stop the run so queued items do not burn attempts.
       status == 429 || status == 502 || status == 503 || status == 504 ->
         UploadOutcome.Unreachable("Server busy or unavailable ($text)")
-      status == 408 || status == 429 || status >= 500 -> UploadOutcome.Transient(contentSha, text)
+      status == 408 || status >= 500 -> UploadOutcome.Transient(contentSha, text)
       else -> UploadOutcome.Rejected(contentSha, text)
     }
   }
 
-  private fun sourceUri(item: UploadItem): Uri {
+  /** Unredacted URI, or null when Android would redact location (no ACCESS_MEDIA_LOCATION). */
+  private fun sourceUri(item: UploadItem): Uri? {
     val uri = Uri.parse(item.uri)
-    // Without this MediaStore strips location metadata from the returned bytes.
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && MediaPermissions.mediaLocation(context)) {
-      return MediaStore.setRequireOriginal(uri)
-    }
-    return uri
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return uri // no redaction before Android 10
+    if (!MediaPermissions.mediaLocation(context)) return null
+    return MediaStore.setRequireOriginal(uri)
   }
 
   private fun open(uri: Uri): InputStream =
@@ -202,37 +193,14 @@ class MediaUploader(private val context: Context, private val serverUrl: String)
   }
 
   companion object {
+    const val LOCATION_REQUIRED =
+      "Uploads paused: allow access to photo locations, otherwise Android removes GPS data from the originals"
     private const val BUFFER = 256 * 1024
     private const val REPORT_EVERY = 1L shl 20
     private val random = SecureRandom()
 
-    fun sha256Hex(bytes: ByteArray): String = hex(MessageDigest.getInstance("SHA-256").digest(bytes))
-
-    fun hex(bytes: ByteArray): String {
-      val chars = "0123456789abcdef"
-      val sb = StringBuilder(bytes.size * 2)
-      for (b in bytes) {
-        val v = b.toInt() and 0xff
-        sb.append(chars[v ushr 4]).append(chars[v and 0x0f])
-      }
-      return sb.toString()
-    }
+    private fun hex(bytes: ByteArray): String = MultipartFormat.hex(bytes)
 
     private fun randomHex(bytes: Int): String = ByteArray(bytes).also { random.nextBytes(it) }.let(::hex)
-
-    /** Quoted-string safe fallback for clients that ignore filename*. */
-    fun asciiFallback(name: String): String = buildString {
-      for (ch in name) append(if (ch.code in 0x20..0x7e && ch != '"' && ch != '\\') ch else '_')
-    }
-
-    /** RFC 5987 value-chars: attr-char stays, everything else is percent-encoded UTF-8. */
-    fun rfc5987(name: String): String =
-      URLEncoder.encode(name, "UTF-8").replace("+", "%20").replace("*", "%2A").replace("%7E", "~")
-
-    private fun sanitizeMime(mime: String): String {
-      val m = mime.trim()
-      val ok = m.matches(Regex("^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$"))
-      return if (ok && !m.startsWith("multipart/", ignoreCase = true)) m else "application/octet-stream"
-    }
   }
 }

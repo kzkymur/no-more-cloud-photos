@@ -583,7 +583,8 @@ final class UploadEngine: NSObject, URLSessionDataDelegate, @unchecked Sendable 
     request.httpMethod = "POST"
     request.setValue(body.contentType, forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
-    request.setValue(Multipart.idempotencyKey(itemId: item.id, contentSha256: body.contentSha256),
+    request.setValue(MultipartFormat.idempotencyKey(
+      itemId: item.id, contentSha256: body.contentSha256, filename: body.name),
                      forHTTPHeaderField: "Idempotency-Key")
     // Mirrors the session policy; request-level flags can only restrict further.
     request.allowsCellularAccess = !config.wifiOnly

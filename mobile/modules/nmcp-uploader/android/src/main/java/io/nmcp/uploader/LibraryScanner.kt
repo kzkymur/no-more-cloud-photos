@@ -30,12 +30,12 @@ object LibraryScanner {
     } else {
       MediaStore.Video.Media.EXTERNAL_CONTENT_URI
     }
-    query(context, images, "img", "image/jpeg", out)
-    query(context, videos, "vid", "video/mp4", out)
+    query(context, images, "img", out)
+    query(context, videos, "vid", out)
     return out
   }
 
-  private fun query(context: Context, collection: Uri, prefix: String, defaultMime: String, out: MutableList<ScannedMedia>) {
+  private fun query(context: Context, collection: Uri, prefix: String, out: MutableList<ScannedMedia>) {
     val projection = arrayOf(
       MediaStore.MediaColumns._ID,
       MediaStore.MediaColumns.DISPLAY_NAME,
@@ -61,7 +61,8 @@ object LibraryScanner {
           id = "$prefix:$id",
           uri = ContentUris.withAppendedId(collection, id).toString(),
           name = c.getString(nameCol) ?: "$prefix-$id",
-          mime = c.getString(mimeCol) ?: defaultMime,
+          // Unknown type: let the server sniff the bytes rather than guessing.
+          mime = c.getString(mimeCol) ?: "application/octet-stream",
           size = size,
           modified = c.getLong(modCol),
           taken = c.getLong(addedCol),

@@ -14,7 +14,7 @@
         "UIBackgroundModes": ["fetch", "processing"],
         "BGTaskSchedulerPermittedIdentifiers": ["io.nmcp.uploader.refresh", "io.nmcp.uploader.processing"],
         "PHPhotoLibraryPreventAutomaticLimitedAccessAlert": true,
-        "NSAppTransportSecurity": { "NSAllowsArbitraryLoads": true }
+        "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
       }
     },
     "android": {
