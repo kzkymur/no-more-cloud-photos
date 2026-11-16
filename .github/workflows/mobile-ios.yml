@@ -1,0 +1,56 @@
+name: Mobile iOS compile
+
+# Compile-only check of the iOS app (Swift upload core + RN) for the simulator.
+# No signing, no artifact: iOS distribution is decided separately.
+
+on:
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-ios.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-ios.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  simulator-build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Generate native iOS project
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Build for simulator (unsigned)
+        working-directory: mobile/ios
+        run: |
+          workspace=$(ls -d *.xcworkspace | head -1)
+          scheme=$(basename "$workspace" .xcworkspace)
+          set -o pipefail
+          xcodebuild -workspace "$workspace" -scheme "$scheme" -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E 'error:|warning: .*NmcpUploader|BUILD (SUCCEEDED|FAILED)' || true
+          grep -q 'BUILD SUCCEEDED' "$RUNNER_TEMP/xcodebuild.log"

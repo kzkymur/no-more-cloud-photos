@@ -160,6 +160,12 @@ class MediaUploader(private val context: Context, private val serverUrl: String)
     }
     val text = "HTTP $status${if (code.isNotEmpty()) " $code" else ""}: $message"
     return when {
+      // Not about this file: wrong URL / proxy in front of the API. Stop instead of failing every item.
+      status == 401 || status == 403 || status == 404 || status == 405 ->
+        UploadOutcome.Unreachable("Check the server URL ($text)")
+      // Server busy or down: stop the run so queued items do not burn attempts.
+      status == 429 || status == 502 || status == 503 || status == 504 ->
+        UploadOutcome.Unreachable("Server busy or unavailable ($text)")
       status == 408 || status == 429 || status >= 500 -> UploadOutcome.Transient(contentSha, text)
       else -> UploadOutcome.Rejected(contentSha, text)
     }

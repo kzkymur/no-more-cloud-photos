@@ -59,7 +59,10 @@ paired video).
    - `2xx`: uploaded.
    - `409 duplicate_media`: the same bytes are already on the server, so the
      item counts as uploaded.
-   - `408`, `429`, `5xx`, connection drop mid-transfer: transient failure,
+   - `401`/`403`/`404`/`405` (wrong URL or a proxy in front of the API) and
+     `429`/`502`/`503`/`504` (server busy or down): the run stops. The item stays
+     pending without using up an attempt, and the error is shown on the dashboard.
+   - `408`, other `5xx`, connection drop mid-transfer: transient failure,
      retried automatically on later runs (up to 10 attempts).
    - other `4xx` (e.g. `415 unsupported_media_type`, `422 invalid_media`,
      `413`): marked "rejected by server". It is not retried automatically,
@@ -106,6 +109,9 @@ paired video).
 - `BGTaskScheduler` refresh/processing tasks and a photo library change
   observer pick up new photos. The app also syncs when it comes to the
   foreground.
+- Workflow **Mobile iOS compile** (`.github/workflows/mobile-ios.yml`)
+  builds the app for the simulator without signing, so every change to the
+  Swift code is compiled in CI.
 - Build and distribution for iOS are decided separately (Apple Developer
   account required).
 
