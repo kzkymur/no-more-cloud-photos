@@ -68,8 +68,8 @@ jobs:
             exit 1
           fi
           umask 077
-          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/nmcp-release.p12"
-          echo "NMCP_UPLOAD_STORE_FILE=$RUNNER_TEMP/nmcp-release.p12" >> "$GITHUB_ENV"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release-keystore.p12"
+          echo "NMCP_UPLOAD_STORE_FILE=$RUNNER_TEMP/release-keystore.p12" >> "$GITHUB_ENV"
 
       - name: Build release APK
         working-directory: mobile/android
@@ -88,7 +88,7 @@ jobs:
           if grep -q 'CN=Android Debug' "$RUNNER_TEMP/certs.txt"; then
             echo "::error::APK is debug-signed"; exit 1
           fi
-          grep -qi 'Signer #1 certificate SHA-256 digest: 119ef3c6b5ed68922be29feebff4701cbd880504bac73df347b98548c424cd90' "$RUNNER_TEMP/certs.txt" \
+          grep -Eqi '^(V[0-9.]+ )?Signer( #1)?: certificate SHA-256 digest: 119ef3c6b5ed68922be29feebff4701cbd880504bac73df347b98548c424cd90' "$RUNNER_TEMP/certs.txt" \
             || { echo "::error::APK is not signed with the NMCP release key"; exit 1; }
           version=$(node -p "require('./app.json').expo.version")
           mkdir -p dist
@@ -97,7 +97,7 @@ jobs:
 
       - name: Remove keystore
         if: always()
-        run: rm -f "$RUNNER_TEMP/nmcp-release.p12"
+        run: rm -f "$RUNNER_TEMP/release-keystore.p12"
 
       - uses: actions/upload-artifact@v4
         with:
