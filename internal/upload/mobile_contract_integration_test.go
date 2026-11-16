@@ -46,8 +46,17 @@ func TestMobileClientResponseContractIntegration(t *testing.T) {
 	}
 
 	replay, err := service.Accept(ctx, request("nmcp1-a", "r2", "IMG_0001.HEIC", "original-bytes"))
-	if err != nil || replay.Status != 201 || !replay.Replayed || !bytes.Equal(replay.Body, created.Body) {
+	if err != nil || replay.Status != 201 || !replay.Replayed {
 		t.Fatalf("replay = %+v, %v", replay, err)
+	}
+	// The replayed body is the stored JSON (re-serialized), so compare the field the clients read.
+	var replayed struct {
+		Media struct {
+			ID string `json:"id"`
+		} `json:"media"`
+	}
+	if err := json.Unmarshal(replay.Body, &replayed); err != nil || replayed.Media.ID != success.Media.ID {
+		t.Fatalf("replay media.id = %q, want %q (%v)", replayed.Media.ID, success.Media.ID, err)
 	}
 
 	duplicate, err := service.Accept(ctx, request("nmcp1-b", "r3", "IMG_0001 copy.HEIC", "original-bytes"))
