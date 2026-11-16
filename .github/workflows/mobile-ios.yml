@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   simulator-build:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 90
     defaults:
       run:
@@ -37,6 +37,12 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: mobile/package-lock.json
+
+      - name: Select newest Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
 
       - name: Install JS dependencies
         run: npm ci
@@ -53,4 +59,15 @@ jobs:
           xcodebuild -workspace "$workspace" -scheme "$scheme" -configuration Debug \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E 'error:|warning: .*NmcpUploader|BUILD (SUCCEEDED|FAILED)' || true
-          grep -q 'BUILD SUCCEEDED' "$RUNNER_TEMP/xcodebuild.log"
+          if ! grep -q 'BUILD SUCCEEDED' "$RUNNER_TEMP/xcodebuild.log"; then
+            echo "---- last 150 lines of xcodebuild output ----"
+            tail -150 "$RUNNER_TEMP/xcodebuild.log"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          retention-days: 7
