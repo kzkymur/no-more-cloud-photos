@@ -19,10 +19,11 @@ final class ContractVectorTests: XCTestCase {
   /// tests/swift/Tests/NmcpCoreTests/<this file> -> nmcp-uploader/testdata/contract-vectors.json
   static var vectorsURL: URL {
     URL(fileURLWithPath: #filePath)
-      .deletingLastPathComponent() // NmcpCoreTests
-      .deletingLastPathComponent() // Tests
-      .deletingLastPathComponent() // swift
-      .deletingLastPathComponent() // tests
+      .deletingLastPathComponent() // -> Tests/NmcpCoreTests
+      .deletingLastPathComponent() // -> Tests
+      .deletingLastPathComponent() // -> swift
+      .deletingLastPathComponent() // -> tests
+      .deletingLastPathComponent() // -> nmcp-uploader
       .appendingPathComponent("testdata/contract-vectors.json")
   }
 
