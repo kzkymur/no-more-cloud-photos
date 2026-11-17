@@ -62,7 +62,9 @@ for _ in $(seq 50); do curl -fs "http://localhost:$PORT/readyz" >/dev/null && br
 
 log "simulator"
 RUNTIME=$(xcrun simctl list runtimes -j | python3 -I -c 'import json,sys; r=[x for x in json.load(sys.stdin)["runtimes"] if x["platform"]=="iOS" and x["isAvailable"]]; print(sorted(r,key=lambda x:[int(p) for p in x["version"].split(".")])[-1]["identifier"])')
-DEVICE=$(xcrun simctl list devicetypes -j | python3 -I -c 'import json,sys; d=[x["identifier"] for x in json.load(sys.stdin)["devicetypes"] if x["name"].startswith("iPhone") and "SE" not in x["name"]]; print(d[-1])')
+# A device type the runtime supports: take it from the runner's preinstalled devices.
+DEVICE=$(xcrun simctl list devices available -j | python3 -I -c 'import json,sys; d=json.load(sys.stdin)["devices"].get(sys.argv[1],[]); i=[x["deviceTypeIdentifier"] for x in d if "iPhone" in x["name"] and "SE" not in x["name"]]; print(i[0] if i else "")' "$RUNTIME")
+[ -n "$DEVICE" ] || DEVICE=com.apple.CoreSimulator.SimDeviceType.iPhone-16
 UDID=$(xcrun simctl create nmcp-e2e "$DEVICE" "$RUNTIME")
 echo "runtime=$RUNTIME device=$DEVICE udid=$UDID"
 xcrun simctl boot "$UDID"
