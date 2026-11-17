@@ -64,7 +64,12 @@ jobs:
 
       - name: Swift unit tests (XCTest, macOS host)
         working-directory: mobile/modules/nmcp-uploader/tests/swift
-        run: swift test
+        run: |
+          # TEMP until the SwiftPM package lands in this PR: fall back to the swiftc runner.
+          if [ -f Package.swift ]; then swift test; else
+            swiftc -O -o "$RUNNER_TEMP/contract-test" ../../ios/MultipartFormat.swift main.swift
+            "$RUNNER_TEMP/contract-test" ../../testdata/contract-vectors.json
+          fi
 
       - name: Install JS dependencies
         run: npm ci
