@@ -148,13 +148,29 @@ enum NmcpPaths {
     supportDirectory.appendingPathComponent("uploader.sqlite", isDirectory: false)
   }
 
-  static func exportFile() -> URL {
-    stagingDirectory.appendingPathComponent("export-\(UUID().uuidString)", isDirectory: false)
-  }
-
   /// Deterministic per item so it can be found (and deleted) after a relaunch.
   static func bodyFile(forItemId itemId: String) -> URL {
     stagingDirectory.appendingPathComponent("body-\(Hex.sha256(itemId)).bin", isDirectory: false)
+  }
+
+  /// File protection that still allows background access while the device
+  /// is locked after the first unlock (uploads run with the screen locked).
+  /// Empty on macOS (unit tests), where data protection classes do not apply.
+  static var fileProtectionAttributes: [FileAttributeKey: Any]? {
+    #if os(iOS)
+    return [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+    #else
+    return nil
+    #endif
+  }
+
+  /// Applies `fileProtectionAttributes` to an existing file (no-op if absent).
+  static func applyFileProtection(_ url: URL) {
+    #if os(iOS)
+    guard FileManager.default.fileExists(atPath: url.path) else { return }
+    try? FileManager.default.setAttributes(
+      [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
+    #endif
   }
 
   /// Creates `url` (and parents) with a file protection class that still
@@ -162,11 +178,7 @@ enum NmcpPaths {
   static func ensureDirectory(_ url: URL, excludeFromBackup: Bool) throws {
     let fm = FileManager.default
     if !fm.fileExists(atPath: url.path) {
-      try fm.createDirectory(
-        at: url,
-        withIntermediateDirectories: true,
-        attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
-      )
+      try fm.createDirectory(at: url, withIntermediateDirectories: true, attributes: fileProtectionAttributes)
     }
     if excludeFromBackup {
       var mutableURL = url

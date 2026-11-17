@@ -28,6 +28,8 @@ struct UploadItem {
   let contentSha: String?
   let mediaId: String?
   let taskId: Int?
+  /// Times this item was cut off (staging or transfer) before a result.
+  let interrupts: Int
 }
 
 /// One original resource found by the library scanner.
@@ -51,19 +53,52 @@ struct SQLiteError: Error, CustomStringConvertible {
   let code: Int32
   let message: String
   var description: String { "SQLite error \(code): \(message)" }
+
+  /// SQLITE_CORRUPT / SQLITE_NOTADB (primary code).
+  var isCorruption: Bool {
+    let primary = code & 0xFF
+    return primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB
+  }
 }
 
 /// SQLite-backed upload queue. Every public method hops onto one private
 /// serial queue (`queue.sync`), so the single connection is never used
 /// concurrently. Methods must not be called re-entrantly from that queue.
+///
+/// Schema versions (`PRAGMA user_version`):
+/// - 1: initial `items` table.
+/// - 2: `interrupts` column (queue ordering, see `nextCandidate`).
 final class UploadStore: @unchecked Sendable {
-  static let shared = UploadStore()
+  static let shared = UploadStore(databaseURL: NmcpPaths.databaseFile)
+  static let schemaVersion: Int64 = 2
 
+  let databaseURL: URL
   private let queue = DispatchQueue(label: "io.nmcp.uploader.store")
   private var db: OpaquePointer?
 
   private static let columns =
-    "id, asset_id, resource_type, name, mime, modified, state, attempts, last_error, permanent, content_sha, media_id, task_id"
+    "id, asset_id, resource_type, name, mime, modified, state, attempts, last_error, permanent, content_sha, media_id, " +
+    "task_id, interrupts"
+
+  init(databaseURL: URL) {
+    self.databaseURL = databaseURL
+  }
+
+  deinit {
+    if let db {
+      sqlite3_close_v2(db)
+    }
+  }
+
+  /// Closes the connection; the next call reopens it. For tests.
+  func close() {
+    queue.sync {
+      if let db {
+        sqlite3_close_v2(db)
+        self.db = nil
+      }
+    }
+  }
 
   private enum Value {
     case text(String)
@@ -151,21 +186,20 @@ final class UploadStore: @unchecked Sendable {
     }
   }
 
-  /// Next item to upload: newest pending first, then retryable failures that
-  /// were not already attempted in the current run (`updated_at < failedBefore`).
+  /// Next item to upload. Candidates are pending rows and retryable failures
+  /// that were not already tried in the current run (`updated_at < failedBefore`).
+  /// Order (same as Android): items interrupted fewer times first, so one huge
+  /// file that keeps getting cut off cannot block the queue; then pending
+  /// before failed; then newest first.
   func nextCandidate(failedBefore: Double, maxAttempts: Int) -> UploadItem? {
     withDB(nil) { db in
-      if let pending = try queryItems(
-        db, "SELECT \(Self.columns) FROM items WHERE state = 0 ORDER BY modified DESC LIMIT 1", []
-      ).first {
-        return pending
-      }
-      return try queryItems(
+      try queryItems(
         db,
         """
         SELECT \(Self.columns) FROM items
-        WHERE state = 3 AND permanent = 0 AND attempts < ? AND updated_at < ?
-        ORDER BY updated_at ASC LIMIT 1
+        WHERE state = 0
+           OR (state = 3 AND permanent = 0 AND attempts < ? AND updated_at < ?)
+        ORDER BY interrupts ASC, state ASC, modified DESC, id ASC LIMIT 1
         """,
         [.int(Int64(maxAttempts)), .double(failedBefore)]
       ).first
@@ -186,9 +220,30 @@ final class UploadStore: @unchecked Sendable {
     }
   }
 
+  /// Staging (export + body) starts. Counted pessimistically as an
+  /// interrupt: if iOS suspends or kills the app mid-staging there is no
+  /// chance to record anything, and the item must still move back in the
+  /// queue. `markStagingEnded` undoes it when staging reaches a result.
+  func markStagingStarted(id: String) {
+    update("UPDATE items SET interrupts = interrupts + 1 WHERE id = ? AND state IN (0, 3)", [.text(id)])
+  }
+
+  /// Staging reached a result (staged, failed, or the run stopped for a
+  /// reason unrelated to this item). Not called when it was cut off.
+  func markStagingEnded(id: String) {
+    update("UPDATE items SET interrupts = MAX(interrupts - 1, 0) WHERE id = ?", [.text(id)])
+  }
+
+  /// A new content hash means the original changed: its interrupt history
+  /// no longer applies.
   func markUploading(id: String, taskId: Int, contentSha: String) {
-    update("UPDATE items SET state = 1, task_id = ?, content_sha = ?, updated_at = ? WHERE id = ?",
-           [.int(Int64(taskId)), .text(contentSha), .double(now()), .text(id)])
+    update(
+      """
+      UPDATE items SET state = 1, task_id = ?, content_sha = ?, updated_at = ?,
+        interrupts = CASE WHEN content_sha IS NOT NULL AND content_sha <> ? THEN 0 ELSE interrupts END
+      WHERE id = ? AND state <> 2
+      """,
+      [.int(Int64(taskId)), .text(contentSha), .double(now()), .text(contentSha), .text(id)])
   }
 
   func markUploaded(id: String, mediaId: String?) {
@@ -200,34 +255,66 @@ final class UploadStore: @unchecked Sendable {
       [mediaId.map { Value.text($0) } ?? Value.null, .double(now()), .text(id)])
   }
 
-  func markFailed(id: String, error: String, permanent: Bool, countAttempt: Bool) {
+  /// Uploaded rows are never downgraded. With `taskId`, only applies while the
+  /// row is still uploading through that task (a late event of an older task
+  /// must not clobber a newer attempt).
+  func markFailed(id: String, error: String, permanent: Bool, countAttempt: Bool, taskId: Int? = nil) {
+    let (guardSQL, guardValues) = Self.taskGuard(taskId)
     update(
       """
       UPDATE items SET state = 3, last_error = ?, permanent = ?, attempts = attempts + ?, task_id = NULL, updated_at = ?
-      WHERE id = ?
+      WHERE id = ? AND state <> 2\(guardSQL)
       """,
-      [.text(error), .int(permanent ? 1 : 0), .int(countAttempt ? 1 : 0), .double(now()), .text(id)])
+      [.text(error), .int(permanent ? 1 : 0), .int(countAttempt ? 1 : 0), .double(now()), .text(id)] + guardValues)
   }
 
-  /// Back to pending without counting an attempt (cancellation, stale task).
-  /// Uploaded rows are never downgraded.
-  func markPending(id: String) {
-    update("UPDATE items SET state = 0, task_id = NULL, updated_at = ? WHERE id = ? AND state <> 2",
-           [.double(now()), .text(id)])
+  /// Back to pending without counting an attempt (run stopped for a
+  /// server-wide reason). Uploaded rows are never downgraded.
+  func markPending(id: String, taskId: Int? = nil) {
+    let (guardSQL, guardValues) = Self.taskGuard(taskId)
+    update("UPDATE items SET state = 0, task_id = NULL, updated_at = ? WHERE id = ? AND state <> 2\(guardSQL)",
+           [.double(now()), .text(id)] + guardValues)
+  }
+
+  /// Cut off mid-transfer: back to pending behind items interrupted fewer
+  /// times. `attempts` is unchanged.
+  func markInterrupted(id: String, taskId: Int? = nil) {
+    let (guardSQL, guardValues) = Self.taskGuard(taskId)
+    update(
+      """
+      UPDATE items SET state = 0, task_id = NULL, interrupts = interrupts + 1, updated_at = ?
+      WHERE id = ? AND state <> 2\(guardSQL)
+      """,
+      [.double(now()), .text(id)] + guardValues)
+  }
+
+  private static func taskGuard(_ taskId: Int?) -> (String, [Value]) {
+    guard let taskId else {
+      return ("", [])
+    }
+    return (" AND state = 1 AND (task_id IS NULL OR task_id = ?)", [.int(Int64(taskId))])
   }
 
   func delete(id: String) {
     update("DELETE FROM items WHERE id = ? AND state <> 2", [.text(id)])
   }
 
-  /// Resets rows stuck in `uploading` whose URLSession task no longer exists.
-  func resetUploading(exceptItemIds keep: Set<String>) {
-    withDB(()) { db in
-      let rows = try queryItems(db, "SELECT \(Self.columns) FROM items WHERE state = 1", [])
-      for row in rows where !keep.contains(row.id) {
-        try execute(db, "UPDATE items SET state = 0, task_id = NULL, updated_at = ? WHERE id = ?",
-                    [.double(now()), .text(row.id)])
+  /// Resets rows stuck in `uploading` whose URLSession task no longer exists
+  /// (force quit, crash, session invalidated). They were cut off, so they
+  /// count as interrupted; `attempts` is unchanged. Returns the reset count.
+  @discardableResult
+  func resetUploading(exceptItemIds keep: Set<String>) -> Int {
+    withDB(0) { db in
+      var reset = 0
+      try transaction(db) {
+        let rows = try queryItems(db, "SELECT \(Self.columns) FROM items WHERE state = 1", [])
+        for row in rows where !keep.contains(row.id) {
+          try execute(db, "UPDATE items SET state = 0, task_id = NULL, interrupts = interrupts + 1, updated_at = ? WHERE id = ?",
+                      [.double(now()), .text(row.id)])
+          reset += 1
+        }
       }
+      return reset
     }
   }
 
@@ -262,10 +349,12 @@ final class UploadStore: @unchecked Sendable {
     }
   }
 
-  /// retryFailed(): every failed row (including permanent ones) back to pending.
+  /// retryFailed(): every failed row (including permanent ones) back to
+  /// pending with a clean slate (attempts and interrupts reset).
   func requeueAllFailed() {
-    update("UPDATE items SET state = 0, attempts = 0, permanent = 0, task_id = NULL, updated_at = ? WHERE state = 3",
-           [.double(now())])
+    update(
+      "UPDATE items SET state = 0, attempts = 0, permanent = 0, interrupts = 0, task_id = NULL, updated_at = ? WHERE state = 3",
+      [.double(now())])
   }
 
   // MARK: - Connection
@@ -275,33 +364,74 @@ final class UploadStore: @unchecked Sendable {
       return db
     }
     do {
-      try NmcpPaths.ensureDirectory(NmcpPaths.supportDirectory, excludeFromBackup: true)
+      try NmcpPaths.ensureDirectory(databaseURL.deletingLastPathComponent(), excludeFromBackup: true)
     } catch {
       storeLog.error("Cannot create support directory: \(error.localizedDescription, privacy: .public)")
       return nil
     }
+    switch openAndMigrate() {
+    case .success(let handle):
+      db = handle
+      return handle
+    case .failure(let failure) where failure.isCorruption:
+      // A corrupt ledger would stop every run forever. Starting over is safe:
+      // already uploaded items are re-sent and answered with
+      // 409 duplicate_media (counted as uploaded), nothing is duplicated.
+      storeLog.error("Database is corrupt (\(failure.description, privacy: .public)); starting a new one")
+      quarantineDatabaseFiles()
+      if case .success(let handle) = openAndMigrate() {
+        db = handle
+        return handle
+      }
+      return nil
+    case .failure:
+      // Typically data protection before the first unlock: retried on the next call.
+      return nil
+    }
+  }
+
+  private func openAndMigrate() -> Result<OpaquePointer, SQLiteError> {
     var handle: OpaquePointer?
     let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
-    let rc = sqlite3_open_v2(NmcpPaths.databaseFile.path, &handle, flags, nil)
+    let rc = sqlite3_open_v2(databaseURL.path, &handle, flags, nil)
     guard rc == SQLITE_OK, let handle else {
       let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
       storeLog.error("sqlite3_open_v2 failed (\(rc)): \(message, privacy: .public)")
       if let handle {
-        sqlite3_close(handle)
+        sqlite3_close_v2(handle)
       }
-      return nil
+      return .failure(SQLiteError(code: rc, message: message))
     }
     do {
+      // Wait instead of failing if another connection briefly holds a lock.
+      sqlite3_busy_timeout(handle, 5_000)
       try exec(handle, "PRAGMA journal_mode = WAL")
       try exec(handle, "PRAGMA synchronous = NORMAL")
       try migrate(handle)
     } catch {
       storeLog.error("Database setup failed: \(String(describing: error), privacy: .public)")
-      sqlite3_close(handle)
-      return nil
+      sqlite3_close_v2(handle)
+      return .failure(error as? SQLiteError ?? SQLiteError(code: SQLITE_ERROR, message: String(describing: error)))
     }
-    db = handle
-    return handle
+    // The -wal/-shm files are created on first use; make sure all three stay
+    // readable in the background while the device is locked.
+    for suffix in ["", "-wal", "-shm"] {
+      NmcpPaths.applyFileProtection(URL(fileURLWithPath: databaseURL.path + suffix))
+    }
+    return .success(handle)
+  }
+
+  private func quarantineDatabaseFiles() {
+    let fm = FileManager.default
+    let stamp = Int(Date().timeIntervalSince1970)
+    for suffix in ["", "-wal", "-shm"] {
+      let path = databaseURL.path + suffix
+      guard fm.fileExists(atPath: path) else { continue }
+      let target = databaseURL.path + ".corrupt-\(stamp)" + suffix
+      if (try? fm.moveItem(atPath: path, toPath: target)) == nil {
+        try? fm.removeItem(atPath: path)
+      }
+    }
   }
 
   private func migrate(_ db: OpaquePointer) throws {
@@ -333,6 +463,39 @@ final class UploadStore: @unchecked Sendable {
         try exec(db, "CREATE INDEX IF NOT EXISTS idx_items_asset ON items (asset_id)")
         try exec(db, "PRAGMA user_version = 1")
       }
+      version = 1
+    }
+    if version < 2 {
+      try transaction(db) {
+        // Guarded so a half-applied migration (column added, version not
+        // bumped) can be completed.
+        if try !hasColumn(db, table: "items", column: "interrupts") {
+          try exec(db, "ALTER TABLE items ADD COLUMN interrupts INTEGER NOT NULL DEFAULT 0")
+        }
+        try exec(db, "CREATE INDEX IF NOT EXISTS idx_items_queue ON items (state, interrupts, modified)")
+        try exec(db, "PRAGMA user_version = 2")
+      }
+    }
+  }
+
+  private func hasColumn(_ db: OpaquePointer, table: String, column: String) throws -> Bool {
+    var found = false
+    try query(db, "PRAGMA table_info(\(table))", []) { stmt in
+      if columnText(stmt, 1) == column {
+        found = true
+      }
+    }
+    return found
+  }
+
+  /// `PRAGMA user_version` of the open database. For tests.
+  func userVersion() -> Int64 {
+    withDB(-1) { db in
+      var version: Int64 = -1
+      try query(db, "PRAGMA user_version", []) { stmt in
+        version = sqlite3_column_int64(stmt, 0)
+      }
+      return version
     }
   }
 
@@ -459,7 +622,8 @@ final class UploadStore: @unchecked Sendable {
         permanent: sqlite3_column_int64(stmt, 9) != 0,
         contentSha: columnText(stmt, 10),
         mediaId: columnText(stmt, 11),
-        taskId: sqlite3_column_type(stmt, 12) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, 12))
+        taskId: sqlite3_column_type(stmt, 12) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, 12)),
+        interrupts: Int(sqlite3_column_int64(stmt, 13))
       ))
     }
     return items
