@@ -93,7 +93,9 @@ xcrun simctl bootstatus "$UDID" -b >/dev/null
 xcrun simctl addmedia "$UDID" "$F"/nmcp-e2e-*
 xcrun simctl install "$UDID" "$APP"
 grant_photos() {
+  xcrun simctl help privacy 2>&1 | sed -n '/service/,$p' | head -30 || true
   xcrun simctl privacy "$UDID" grant photos "$BUNDLE" || true
+  xcrun simctl privacy "$UDID" grant all "$BUNDLE" || true
   local tcc
   tcc="$(xcrun simctl getenv "$UDID" HOME 2>/dev/null || true)"
   tcc="${tcc:-$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data}/Library/TCC/TCC.db"
