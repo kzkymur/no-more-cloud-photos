@@ -182,7 +182,10 @@ paired video).
   - job `testflight` (`main` push / dispatch on `main`, environment
     `ios-release`) archives with automatic signing through an App Store
     Connect API key and uploads to TestFlight.
-- Distribution: TestFlight. Customer setup: `docs/ios-testflight-setup.md`.
+- Distribution: TestFlight. Customer setup: `docs/ios-testflight-setup.md`;
+  on-device acceptance checklist: `docs/ios-acceptance.md`. The simulator E2E is
+  currently non-blocking (iOS 26 simulators cannot be granted full Photos access
+  without UI; follow-up #76).
   The bundle id comes from `NMCP_IOS_BUNDLE_ID` (`app.config.js`).
 
 ## Android build

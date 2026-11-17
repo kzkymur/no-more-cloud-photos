@@ -101,8 +101,8 @@ jobs:
         # Non-blocking for now: on the iOS 26 simulator runtimes of macos-26 runners,
         # `simctl privacy grant photos` only yields add-only access, so PhotoKit shows
         # its full-access sheet, which CI cannot answer (the app itself behaves correctly).
-        # The upload path is verified on device via TestFlight. Follow-up: drive the
-        # sheet with an XCUITest, or a runner image with an iOS 18 runtime.
+        # The upload path is verified on device via TestFlight (mobile/docs/ios-acceptance.md).
+        # Follow-up to make it required again: issue #76.
         continue-on-error: true
         run: |
           brew list exiftool >/dev/null 2>&1 || brew install exiftool
@@ -192,8 +192,11 @@ jobs:
         if: steps.cfg.outputs.ok == 'true'
         env:
           NMCP_IOS_BUNDLE_ID: ${{ vars.NMCP_IOS_BUNDLE_ID }}
-          NMCP_BUILD_NUMBER: ${{ github.run_number }}
         run: |
+          # Unique across re-runs: App Store Connect rejects a reused build number.
+          export NMCP_BUILD_NUMBER=$(( GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT ))
+          echo "NMCP_BUILD_NUMBER=$NMCP_BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "CFBundleVersion $NMCP_BUILD_NUMBER"
           npm ci
           npx expo prebuild --platform ios --clean
 
@@ -252,16 +255,24 @@ jobs:
           </dict>
           </plist>
           EOF
-          set -o pipefail
+          set +e
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/NMCPPhotos.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER" \
-            2>&1 | tee "$RUNNER_TEMP/export.log" | grep -E 'error|Upload|EXPORT' || true
-          grep -qE 'EXPORT SUCCEEDED|Upload succeeded|Uploaded' "$RUNNER_TEMP/export.log" \
-            || { tail -80 "$RUNNER_TEMP/export.log"; exit 1; }
-          echo "Uploaded build ${{ github.run_number }} to App Store Connect; it appears in TestFlight after processing (5-30 min)."
+            > "$RUNNER_TEMP/export.log" 2>&1
+          status=$?
+          set -e
+          grep -E 'error|Upload|EXPORT' "$RUNNER_TEMP/export.log" || true
+          if [ "$status" -ne 0 ]; then
+            tail -80 "$RUNNER_TEMP/export.log"
+            echo "::error::xcodebuild -exportArchive failed with exit code $status"
+            exit "$status"
+          fi
+          echo "Uploaded build $NMCP_BUILD_NUMBER to App Store Connect; it appears in TestFlight after processing (5-30 min)."
 
       - name: Remove App Store Connect key
         if: always()
+        # The checkout (and with it mobile/) is skipped when secrets are missing.
+        working-directory: .
         run: rm -rf "$RUNNER_TEMP/asc"

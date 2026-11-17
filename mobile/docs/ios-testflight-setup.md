@@ -46,7 +46,7 @@ https://github.com/kzkymur/no-more-cloud-photos/settings/environments を開き�
 ### 5-1. environment `ios-release`
 1. 「New environment」→ 名前 `ios-release` で作成します。
 2. **Deployment branches and tags**: 「Selected branches and tags」→ `main` を追加します。
-3. **Required reviewers**: お客様ご自身を追加します（ビルドのたびに承認ボタンを押す形になります。不要なら外しても動きます）。
+3. **Required reviewers**: お客様ご自身を追加します（ビルドのたびに承認ボタンを押す形になります。不要なら外しても動きます）。ここで設定すると、手順 6-2 で承認が必要になります。
 4. **Environment secrets** に次の 4 つを追加します。
 
    | 名前 | 値 |
@@ -73,9 +73,15 @@ https://github.com/kzkymur/no-more-cloud-photos/settings/environments を開き�
 1. https://github.com/kzkymur/no-more-cloud-photos/actions/workflows/mobile-ios.yml を開き、「Run workflow」→ ブランチ `main` で実行します。
 2. 承認を求められたら「Review deployments」→ `ios-release` →「Approve」を押します。
 3. 20〜40 分ほどで完了します。その後、Apple 側の処理に 5〜30 分かかり、App Store Connect の「TestFlight」タブにビルドが表示されます。
-4. 初回だけ「輸出コンプライアンス」の質問が出ることがあります。暗号化は「使用していない（標準の HTTPS のみ）」として回答してください（アプリにも設定済みです）。
+4. 輸出コンプライアンス: アプリに `ITSAppUsesNonExemptEncryption = NO`（標準の HTTPS 以外の暗号化は使っていない）を設定済みなので、通常は質問されません。万一ビルドに「輸出コンプライアンス情報がありません」と出た場合は、「暗号化を使用していない（標準の HTTPS のみ）」と回答してください。
 
-## 7. iPhone に入れる
+## 7. サーバ側の準備（HTTPS）
+iPhone 版は、セキュリティのため **https の URL** でサーバにつなぎます。Tailscale の HTTPS 証明書を使えるようにしてください。
+1. Tailscale の管理画面 https://login.tailscale.com/admin/dns で **MagicDNS** と **HTTPS Certificates** を有効にします。
+2. 自宅サーバの `./deploy`（`docs/ubuntu-deployment.md`）は `tailscale cert` で証明書を取得し、Core API を HTTPS で公開します。アプリに入れるサーバ URL は、deploy で設定した Tailnet の DNS 名とポートを使った `https://<ホスト名>.<tailnet>.ts.net[:ポート]` です。
+3. iPhone を Tailscale に接続した状態で、Safari から `<サーバ URL>/readyz` を開きます。`{"status":"ok"}` のような応答が出れば準備完了です。http の URL や証明書のエラーが出る URL は、iPhone 版では使えません。
+
+## 8. iPhone に入れる
 1. App Store Connect の「TestFlight」→「内部テスト」でグループを作り、ご自身の Apple ID を追加します。
 2. iPhone に App Store から **TestFlight** アプリを入れ、同じ Apple ID でサインインします。
 3. TestFlight に「NMCP Photos」が表示されるので「インストール」を押します。
