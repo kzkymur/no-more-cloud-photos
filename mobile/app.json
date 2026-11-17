@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "NMCP Photos",
+    "slug": "nmcp-photos",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "io.nmcp.photos",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "NMCP Photos uploads the original photos and videos in your library to your own home server.",
+        "UIBackgroundModes": ["fetch", "processing"],
+        "BGTaskSchedulerPermittedIdentifiers": ["io.nmcp.uploader.refresh", "io.nmcp.uploader.processing"],
+        "PHPhotoLibraryPreventAutomaticLimitedAccessAlert": true,
+        "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
+      }
+    },
+    "android": {
+      "package": "io.nmcp.photos",
+      "versionCode": 1,
+      "allowBackup": false,
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": { "usesCleartextTraffic": true }
+        }
+      ],
+      "./plugins/withReleaseSigning"
+    ]
+  }
+}

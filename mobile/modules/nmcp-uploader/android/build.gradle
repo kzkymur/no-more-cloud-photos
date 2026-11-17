@@ -1,0 +1,27 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'io.nmcp.uploader'
+version = '1.0.0'
+
+android {
+  namespace "io.nmcp.uploader"
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+  }
+  lintOptions {
+    abortOnError false
+  }
+}
+
+dependencies {
+  implementation "androidx.work:work-runtime-ktx:2.11.2"
+  implementation "androidx.core:core-ktx:1.16.0"
+
+  // JVM unit tests: the wire format against ../testdata/contract-vectors.json
+  testImplementation "junit:junit:4.13.2"
+  testImplementation "org.json:json:20250517"
+}

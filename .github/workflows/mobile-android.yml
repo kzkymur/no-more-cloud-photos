@@ -1,0 +1,156 @@
+name: Mobile Android
+
+# Two jobs:
+#   check    (pull requests and pushes): unit tests + a debug-key release build,
+#            no secrets, no artifact.
+#   release  (push to main, or manual dispatch on main only): builds the APK signed
+#            with the permanent release key and publishes it as an artifact.
+#            Runs in the protected environment "android-release", which holds the
+#            signing secrets (never printed):
+#              NMCP_ANDROID_KEYSTORE_BASE64   base64 of the PKCS12 release keystore
+#              NMCP_ANDROID_KEYSTORE_PASSWORD store password (also the key password)
+#              NMCP_ANDROID_KEY_ALIAS         key alias inside the keystore
+# Every distributed APK must be signed with this one key so installs can be
+# updated in place. Unreviewed branch code never sees it.
+
+on:
+  pull_request:
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-android.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ABIS: arm64-v8a,armeabi-v7a
+
+jobs:
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Contract vectors are up to date
+        run: |
+          python3 -I modules/nmcp-uploader/testdata/generate_vectors.py > "$RUNNER_TEMP/vectors.json"
+          diff -u modules/nmcp-uploader/testdata/contract-vectors.json "$RUNNER_TEMP/vectors.json"
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Generate native Android project
+        run: npx expo prebuild --platform android --no-install --clean
+
+      - name: Unit tests (uploader module)
+        working-directory: mobile/android
+        run: ./gradlew --no-daemon :nmcp-uploader:testDebugUnitTest
+
+      - name: Build release APK with the debug key (not distributed)
+        working-directory: mobile/android
+        run: ./gradlew --no-daemon assembleRelease -PreactNativeArchitectures=$ABIS
+
+  release:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: android-release
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Generate native Android project
+        run: npx expo prebuild --platform android --no-install --clean
+
+      - name: Unit tests (uploader module)
+        working-directory: mobile/android
+        run: ./gradlew --no-daemon :nmcp-uploader:testDebugUnitTest
+
+      - name: Decode release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.NMCP_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::NMCP_ANDROID_KEYSTORE_BASE64 is not available; refusing to build a release that is not signed with the release key."
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release-keystore.p12"
+          echo "NMCP_UPLOAD_STORE_FILE=$RUNNER_TEMP/release-keystore.p12" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        working-directory: mobile/android
+        env:
+          NMCP_UPLOAD_STORE_PASSWORD: ${{ secrets.NMCP_ANDROID_KEYSTORE_PASSWORD }}
+          NMCP_UPLOAD_KEY_PASSWORD: ${{ secrets.NMCP_ANDROID_KEYSTORE_PASSWORD }}
+          NMCP_UPLOAD_KEY_ALIAS: ${{ secrets.NMCP_ANDROID_KEY_ALIAS }}
+        run: ./gradlew --no-daemon assembleRelease -PreactNativeArchitectures=$ABIS
+
+      - name: Remove keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release-keystore.p12"
+
+      - name: Verify signature
+        run: |
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$apksigner" verify --print-certs "$apk" | tee "$RUNNER_TEMP/certs.txt"
+          if grep -q 'CN=Android Debug' "$RUNNER_TEMP/certs.txt"; then
+            echo "::error::APK is debug-signed"; exit 1
+          fi
+          grep -Eqi '^(V[0-9.]+ )?Signer( #1)?: certificate SHA-256 digest: 119ef3c6b5ed68922be29feebff4701cbd880504bac73df347b98548c424cd90' "$RUNNER_TEMP/certs.txt" \
+            || { echo "::error::APK is not signed with the NMCP release key"; exit 1; }
+          version=$(node -p "require('./app.json').expo.version")
+          mkdir -p dist
+          cp "$apk" "dist/nmcp-photos-${version}-${GITHUB_SHA::7}.apk"
+          sha256sum dist/*.apk
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nmcp-photos-android
+          path: mobile/dist/*.apk
+          if-no-files-found: error
+          retention-days: 90
