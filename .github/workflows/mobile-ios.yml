@@ -72,7 +72,11 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
-      - name: Generate native iOS project
+      - name: Generate native iOS project (E2E build)
+        env:
+          # E2E-only: lets the app reach the http://localhost stub. TestFlight builds
+          # are generated in the testflight job without it.
+          NMCP_E2E: '1'
         run: npx expo prebuild --platform ios --clean
 
       - name: Build Release for simulator (unsigned)

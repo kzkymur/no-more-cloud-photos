@@ -83,7 +83,28 @@ xcrun simctl boot "$UDID"
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 xcrun simctl addmedia "$UDID" "$F"/nmcp-e2e-*
 xcrun simctl install "$UDID" "$APP"
-xcrun simctl privacy "$UDID" grant photos "$BUNDLE"
+grant_photos() {
+  xcrun simctl privacy "$UDID" grant photos "$BUNDLE" || true
+  xcrun simctl privacy "$UDID" grant photos-add "$BUNDLE" || true
+  # simctl privacy has not always reached PhotoKit's read-write check on new runtimes:
+  # make sure TCC holds "allowed" (auth_value 2) for kTCCServicePhotos, then restart tccd.
+  local tcc
+  tcc="$(xcrun simctl getenv "$UDID" HOME 2>/dev/null || true)"
+  tcc="${tcc:-$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data}/Library/TCC/TCC.db"
+  if [ -f "$tcc" ]; then
+    echo "TCC before: $(sqlite3 "$tcc" "select service||'='||auth_value from access where client='$BUNDLE'" | tr '\n' ' ')"
+    if [ "$(sqlite3 "$tcc" "select count(*) from access where client='$BUNDLE' and service='kTCCServicePhotos' and auth_value=2")" = 0 ]; then
+      sqlite3 "$tcc" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) values ('kTCCServicePhotos', '$BUNDLE', 0, 2, 2, 1, 0, strftime('%s','now'))" \
+        || { echo "TCC insert failed; schema:"; sqlite3 "$tcc" ".schema access"; }
+      xcrun simctl spawn "$UDID" launchctl kill TERM system/com.apple.tccd 2>/dev/null || true
+      sleep 2
+    fi
+    echo "TCC after:  $(sqlite3 "$tcc" "select service||'='||auth_value from access where client='$BUNDLE'" | tr '\n' ' ')"
+  else
+    echo "TCC.db not found at $tcc"
+  fi
+}
+grant_photos
 
 launch() {
   xcrun simctl terminate "$UDID" "$BUNDLE" >/dev/null 2>&1 || true
