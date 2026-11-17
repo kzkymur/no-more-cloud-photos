@@ -11,11 +11,21 @@
       "supportsTablet": false,
       "infoPlist": {
         "NSPhotoLibraryUsageDescription": "NMCP Photos uploads the original photos and videos in your library to your own home server.",
-        "UIBackgroundModes": ["fetch", "processing"],
-        "BGTaskSchedulerPermittedIdentifiers": ["io.nmcp.uploader.refresh", "io.nmcp.uploader.processing"],
+        "UIBackgroundModes": [
+          "fetch",
+          "processing"
+        ],
+        "BGTaskSchedulerPermittedIdentifiers": [
+          "io.nmcp.uploader.refresh",
+          "io.nmcp.uploader.processing"
+        ],
         "PHPhotoLibraryPreventAutomaticLimitedAccessAlert": true,
-        "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
-      }
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        },
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "buildNumber": "1"
     },
     "android": {
       "package": "io.nmcp.photos",
@@ -33,7 +43,9 @@
       [
         "expo-build-properties",
         {
-          "android": { "usesCleartextTraffic": true }
+          "android": {
+            "usesCleartextTraffic": true
+          }
         }
       ],
       "./plugins/withReleaseSigning"
