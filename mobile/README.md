@@ -70,8 +70,10 @@ paired video).
      PostgreSQL.
    - Kotlin: `android/src/test/.../MultipartFormatTest.kt`
      (`:nmcp-uploader:testDebugUnitTest`).
-   - Swift: `tests/swift/main.swift`, compiled with `ios/MultipartFormat.swift`
-     in the iOS workflow.
+   - Swift: XCTest package `tests/swift` (`swift test` on the macOS host; its
+     sources are symlinks to the real `ios/` files). It also covers the
+     multipart body writer, the response classifier, and the SQLite ledger
+     (queue order, interrupts, v1→v2 migration, corrupt-file recovery).
 4. How responses are handled:
    - `2xx`: uploaded.
    - `409 duplicate_media`: the same bytes are already on the server, so the
@@ -129,11 +131,25 @@ paired video).
 - Scan: PhotoKit. Only the original resources are sent: `.photo` (plus
   `.alternatePhoto` for RAW+JPEG), `.pairedVideo` for Live Photos, and
   `.video`. Edits (`fullSize*`) are never sent.
-- Export: `PHAssetResourceManager.writeData` with `isNetworkAccessAllowed`,
-  so iCloud-only originals are downloaded first.
-- The multipart body is written to a temporary file and sent with a
-  background `URLSession` upload task, which continues while the app is
-  suspended.
+- Staging is a single copy: `PHAssetResourceManager.requestData` (with
+  `isNetworkAccessAllowed`, so iCloud-only originals are downloaded) streams
+  straight into the multipart body file while hashing. A body is used only
+  when the request completed without error, so a partial download is never
+  sent. The body is sent with a background `URLSession` upload task, which
+  continues while the app is suspended.
+- Interruptions are counted like on Android (`interrupts`, ledger v2). Each of
+  these returns the item to the queue behind less-interrupted items, without
+  using an attempt:
+  - background time expiring while staging;
+  - a kill or suspension mid-staging (counted before staging starts);
+  - a cancelled or lost background transfer;
+  - an unreachable server.
+
+  Stop-run responses (401/403/404/405/429/502/503/504) also keep the item
+  pending without using an attempt.
+- iCloud download problems (offline, stalled for 120 s, storage full) fail the
+  item for that run only, also without using an attempt. Five in a row stop the
+  run with "Uploads will resume later".
 - `BGTaskScheduler` refresh/processing tasks and a photo library change
   observer pick up new photos. The app also syncs when it comes to the
   foreground.
@@ -154,11 +170,23 @@ paired video).
   - Live Photo still and video are uploaded as two separate media. The server
     does not pair them yet (follow-up issue), but both files keep the Apple
     content identifier, so the pairing can be rebuilt later.
-- Workflow **Mobile iOS compile** (`.github/workflows/mobile-ios.yml`) runs
-  the Swift contract test and builds the app for the simulator without
-  signing, so every change to the Swift code is compiled in CI.
-- Build and distribution for iOS are decided separately (Apple Developer
-  account required).
+- Workflow **Mobile iOS** (`.github/workflows/mobile-ios.yml`):
+  - job `test` (PRs and `main`) runs:
+    - the XCTest package;
+    - an unsigned Release build for the simulator;
+    - the simulator end-to-end test (`e2e/run_ios_simulator_e2e.sh` against
+      `e2e/stub_core_api.py`). It imports GPS-tagged JPEG/HEIC into Photos and
+      checks four things: originals arrive byte-identical with GPS, a lost
+      response is replayed with the same key, an identical copy settles as
+      `duplicate_media`, and nothing is re-sent after relaunch.
+  - job `testflight` (`main` push / dispatch on `main`, environment
+    `ios-release`) archives with automatic signing through an App Store
+    Connect API key and uploads to TestFlight.
+- Distribution: TestFlight. Customer setup: `docs/ios-testflight-setup.md`;
+  on-device acceptance checklist: `docs/ios-acceptance.md`. The simulator E2E is
+  currently non-blocking (iOS 26 simulators cannot be granted full Photos access
+  without UI; follow-up #76).
+  The bundle id comes from `NMCP_IOS_BUNDLE_ID` (`app.config.js`).
 
 ## Android build
 

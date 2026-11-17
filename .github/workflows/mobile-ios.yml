@@ -1,7 +1,20 @@
-name: Mobile iOS compile
+name: Mobile iOS
 
-# Swift contract unit test + compile-only check of the iOS app (Swift upload core + RN) for the simulator.
-# No signing, no artifact: iOS distribution is decided separately.
+# Jobs:
+#   test        (pull requests, main pushes, dispatch): Swift unit tests (XCTest on the
+#               macOS host), contract vectors, unsigned Release simulator build, and the
+#               simulator end-to-end test against a Core API stub. No secrets.
+#   testflight  (push to main touching mobile/, or manual dispatch on main): archive,
+#               sign with Xcode automatic signing via an App Store Connect API key
+#               (cloud-managed certificates, -allowProvisioningUpdates) and upload to
+#               TestFlight. Runs in the protected environment "ios-release":
+#                 secrets    ASC_KEY_P8_BASE64  base64 of AuthKey_<id>.p8 (Admin role)
+#                            ASC_KEY_ID         key id
+#                            ASC_ISSUER_ID      issuer id
+#                            APPLE_TEAM_ID      10-character team id
+#                 variables  NMCP_IOS_BUNDLE_ID bundle id registered in that team
+#               Until they exist the job reports a warning and uploads nothing.
+# Customer setup: mobile/docs/ios-testflight-setup.md
 
 on:
   pull_request:
@@ -23,7 +36,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  simulator-build:
+  test:
     runs-on: macos-26
     timeout-minutes: 90
     defaults:
@@ -44,36 +57,222 @@ jobs:
           sudo xcode-select -s "$xcode"
           xcodebuild -version
 
-      - name: Swift contract test (MultipartFormat.swift vs shared vectors)
-        working-directory: mobile/modules/nmcp-uploader
+      - name: Contract vectors are up to date
         run: |
-          swiftc -O -o "$RUNNER_TEMP/contract-test" ios/MultipartFormat.swift tests/swift/main.swift
-          "$RUNNER_TEMP/contract-test" testdata/contract-vectors.json
+          python3 -I modules/nmcp-uploader/testdata/generate_vectors.py > "$RUNNER_TEMP/vectors.json"
+          diff -u modules/nmcp-uploader/testdata/contract-vectors.json "$RUNNER_TEMP/vectors.json"
+
+      - name: Swift unit tests (XCTest, macOS host)
+        working-directory: mobile/modules/nmcp-uploader/tests/swift
+        run: swift test
 
       - name: Install JS dependencies
         run: npm ci
 
-      - name: Generate native iOS project
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Generate native iOS project (E2E build)
+        env:
+          # E2E-only: lets the app reach the http://localhost stub. TestFlight builds
+          # are generated in the testflight job without it.
+          NMCP_E2E: '1'
         run: npx expo prebuild --platform ios --clean
 
-      - name: Build for simulator (unsigned)
+      - name: Build Release for simulator (unsigned)
         working-directory: mobile/ios
         run: |
           workspace=$(ls -d *.xcworkspace | head -1)
           scheme=$(basename "$workspace" .xcworkspace)
+          echo "SCHEME=$scheme" >> "$GITHUB_ENV"
           set -o pipefail
-          xcodebuild -workspace "$workspace" -scheme "$scheme" -configuration Debug \
+          xcodebuild -workspace "$workspace" -scheme "$scheme" -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
-            CODE_SIGNING_ALLOWED=NO build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E 'error:|warning: .*NmcpUploader|BUILD (SUCCEEDED|FAILED)' || true
-          if ! grep -q 'BUILD SUCCEEDED' "$RUNNER_TEMP/xcodebuild.log"; then
-            echo "---- last 150 lines of xcodebuild output ----"
-            tail -150 "$RUNNER_TEMP/xcodebuild.log"
-            exit 1
+            -derivedDataPath "$RUNNER_TEMP/dd" CODE_SIGNING_ALLOWED=NO build \
+            > "$RUNNER_TEMP/xcodebuild.log" 2>&1 || {
+              grep -E 'error:' "$RUNNER_TEMP/xcodebuild.log" | head -50
+              tail -150 "$RUNNER_TEMP/xcodebuild.log"
+              exit 1
+            }
+          grep -E 'warning: .*nmcp-uploader' "$RUNNER_TEMP/xcodebuild.log" | sort -u | head -30 || true
+
+      - name: Simulator end-to-end test (stub Core API)
+        id: e2e
+        # Non-blocking for now: on the iOS 26 simulator runtimes of macos-26 runners,
+        # `simctl privacy grant photos` only yields add-only access, so PhotoKit shows
+        # its full-access sheet, which CI cannot answer (the app itself behaves correctly).
+        # The upload path is verified on device via TestFlight (mobile/docs/ios-acceptance.md).
+        # Follow-up to make it required again: issue #76.
+        continue-on-error: true
+        run: |
+          brew list exiftool >/dev/null 2>&1 || brew install exiftool
+          app=$(ls -d "$RUNNER_TEMP"/dd/Build/Products/Release-iphonesimulator/*.app | head -1)
+          bundle=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")
+          bash e2e/run_ios_simulator_e2e.sh "$app" "$bundle" "$RUNNER_TEMP/e2e"
+
+      - name: Report end-to-end result
+        if: always()
+        run: |
+          if [ "${{ steps.e2e.outcome }}" != "success" ]; then
+            echo "::warning title=Simulator E2E not passing (non-blocking)::Photos full-access sheet cannot be automated on the iOS 26 simulator; see the ios-e2e artifact (failure.png, app.log)."
           fi
 
+      - name: Collect simulator logs
+        if: always()
+        run: |
+          udid=$(xcrun simctl list devices -j | python3 -I -c 'import json,sys; print(next((d["udid"] for r in json.load(sys.stdin)["devices"].values() for d in r if d["name"]=="nmcp-e2e"), ""))')
+          if [ -n "$udid" ]; then
+            xcrun simctl spawn "$udid" log show --last 30m --style compact \
+              --predicate 'subsystem == "io.nmcp.uploader" OR process == "NMCPPhotos"' > "$RUNNER_TEMP/e2e/app.log" 2>&1 || true
+          fi
+          cp "$RUNNER_TEMP/xcodebuild.log" "$RUNNER_TEMP/e2e/" 2>/dev/null || true
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
+        if: always()
         with:
-          name: xcodebuild-log
-          path: ${{ runner.temp }}/xcodebuild.log
-          retention-days: 7
+          name: ios-e2e
+          path: |
+            ${{ runner.temp }}/e2e/stub.jsonl
+            ${{ runner.temp }}/e2e/app.log
+            ${{ runner.temp }}/e2e/dashboard.png
+            ${{ runner.temp }}/e2e/failure.png
+            ${{ runner.temp }}/e2e/app-stdout.log
+            ${{ runner.temp }}/e2e/app-stderr.log
+            ${{ runner.temp }}/e2e/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  testflight:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 90
+    environment: ios-release
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Check signing configuration
+        id: cfg
+        working-directory: .
+        env:
+          P8: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          BUNDLE: ${{ vars.NMCP_IOS_BUNDLE_ID }}
+        run: |
+          missing=""
+          for v in P8 KEY_ID ISSUER TEAM BUNDLE; do [ -n "${!v}" ] || missing="$missing $v"; done
+          if [ -n "$missing" ]; then
+            echo "::warning::TestFlight upload skipped: environment ios-release is missing:$missing (see mobile/docs/ios-testflight-setup.md)"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.cfg.outputs.ok == 'true'
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.cfg.outputs.ok == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Select newest Xcode
+        if: steps.cfg.outputs.ok == 'true'
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+
+      - name: Generate native iOS project
+        if: steps.cfg.outputs.ok == 'true'
+        env:
+          NMCP_IOS_BUNDLE_ID: ${{ vars.NMCP_IOS_BUNDLE_ID }}
+        run: |
+          # Unique across re-runs: App Store Connect rejects a reused build number.
+          export NMCP_BUILD_NUMBER=$(( GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT ))
+          echo "NMCP_BUILD_NUMBER=$NMCP_BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "CFBundleVersion $NMCP_BUILD_NUMBER"
+          npm ci
+          npx expo prebuild --platform ios --clean
+
+      - name: Write App Store Connect key
+        if: steps.cfg.outputs.ok == 'true'
+        env:
+          P8: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/asc"
+          printf '%s' "$P8" | base64 -d > "$RUNNER_TEMP/asc/AuthKey_${KEY_ID}.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/asc/AuthKey_${KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: Archive (automatic signing)
+        if: steps.cfg.outputs.ok == 'true'
+        working-directory: mobile/ios
+        env:
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          workspace=$(ls -d *.xcworkspace | head -1)
+          scheme=$(basename "$workspace" .xcworkspace)
+          set -o pipefail
+          xcodebuild -workspace "$workspace" -scheme "$scheme" -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/NMCPPhotos.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER" \
+            DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic \
+            archive > "$RUNNER_TEMP/archive.log" 2>&1 || {
+              grep -E 'error:' "$RUNNER_TEMP/archive.log" | head -50
+              tail -100 "$RUNNER_TEMP/archive.log"
+              exit 1
+            }
+
+      - name: Export and upload to TestFlight
+        if: steps.cfg.outputs.ok == 'true'
+        working-directory: mobile/ios
+        env:
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${TEAM}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+          set +e
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/NMCPPhotos.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER" \
+            > "$RUNNER_TEMP/export.log" 2>&1
+          status=$?
+          set -e
+          grep -E 'error|Upload|EXPORT' "$RUNNER_TEMP/export.log" || true
+          if [ "$status" -ne 0 ]; then
+            tail -80 "$RUNNER_TEMP/export.log"
+            echo "::error::xcodebuild -exportArchive failed with exit code $status"
+            exit "$status"
+          fi
+          echo "Uploaded build $NMCP_BUILD_NUMBER to App Store Connect; it appears in TestFlight after processing (5-30 min)."
+
+      - name: Remove App Store Connect key
+        if: always()
+        # The checkout (and with it mobile/) is skipped when secrets are missing.
+        working-directory: .
+        run: rm -rf "$RUNNER_TEMP/asc"
