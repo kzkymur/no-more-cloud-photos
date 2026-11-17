@@ -111,7 +111,8 @@ launch() {
   xcrun simctl launch --stdout="$WORK/app-stdout.log" --stderr="$WORK/app-stderr.log" "$UDID" "$BUNDLE" \
     -nmcp.uploader.serverUrl "http://localhost:$PORT" \
     -nmcp.uploader.wifiOnly '<false/>' \
-    -nmcp.uploader.autoUpload '<true/>' >/dev/null
+    -nmcp.uploader.autoUpload '<true/>' \
+    -nmcp.e2e.requestPhotoAccess YES >/dev/null
 }
 uploads() { python3 -I -c 'import json,sys; [print(l.strip()) for l in open(sys.argv[1]) if json.loads(l).get("event")=="upload"]' "$LOG"; }
 stored_fixture_shas() { python3 -I - "$LOG" <<'PY'

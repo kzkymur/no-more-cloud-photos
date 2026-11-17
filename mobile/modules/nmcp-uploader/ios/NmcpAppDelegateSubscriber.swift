@@ -1,4 +1,5 @@
 import ExpoModulesCore
+import Photos
 import UIKit
 
 /// App delegate hooks (listed in expo-module.config.json `appDelegateSubscribers`).
@@ -32,6 +33,21 @@ public class NmcpAppDelegateSubscriber: ExpoAppDelegateSubscriber {
   }
 
   public func applicationDidBecomeActive(_ application: UIApplication) {
+    // Simulator E2E only (launch argument `-nmcp.e2e.requestPhotoAccess YES`, which
+    // real users cannot pass): PhotoKit reports .notDetermined until the app asks,
+    // even when access was pre-granted in TCC by `simctl privacy`. Asking resolves
+    // it without a prompt. The normal path asks from the UI button.
+    if UserDefaults.standard.bool(forKey: "nmcp.e2e.requestPhotoAccess"),
+       PHPhotoLibrary.authorizationStatus(for: .readWrite) == .notDetermined {
+      PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+        guard status == .authorized || status == .limited else { return }
+        LibraryObserver.shared.registerIfAuthorized()
+        let config = ConfigStore.load()
+        if config.isAutoUploadReady {
+          UploadEngine.shared.requestRun(scan: true, upload: true)
+        }
+      }
+    }
     let config = ConfigStore.load()
     BackgroundScheduler.schedule(config)
     LibraryObserver.shared.registerIfAuthorized()
