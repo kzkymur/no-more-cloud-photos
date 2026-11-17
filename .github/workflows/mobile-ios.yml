@@ -117,6 +117,9 @@ jobs:
             ${{ runner.temp }}/e2e/stub.jsonl
             ${{ runner.temp }}/e2e/app.log
             ${{ runner.temp }}/e2e/dashboard.png
+            ${{ runner.temp }}/e2e/failure.png
+            ${{ runner.temp }}/e2e/app-stdout.log
+            ${{ runner.temp }}/e2e/app-stderr.log
             ${{ runner.temp }}/e2e/xcodebuild.log
           if-no-files-found: ignore
           retention-days: 14

@@ -26,7 +26,19 @@ LOG="$WORK/stub.jsonl"
 : > "$LOG"
 
 log() { printf '\n== %s\n' "$*"; }
-fail() { echo "E2E FAIL: $*"; exit 1; }
+diagnose() {
+  [ -n "${UDID:-}" ] || return 0
+  echo "-- diagnostics"
+  xcrun simctl io "$UDID" screenshot "$WORK/failure.png" >/dev/null 2>&1 || true
+  xcrun simctl spawn "$UDID" log show --last 20m --style compact \
+    --predicate 'subsystem == "io.nmcp.uploader" OR process == "NMCPPhotos"' > "$WORK/app.log" 2>&1 || true
+  tail -80 "$WORK/app.log" || true
+  for f in "$WORK"/app-stdout.log "$WORK"/app-stderr.log; do [ -f "$f" ] && { echo "-- $f"; tail -60 "$f"; }; done
+  ls -t ~/Library/Logs/DiagnosticReports/NMCPPhotos* 2>/dev/null | head -1 | xargs -I{} sh -c 'echo "-- crash {}"; head -80 "{}"' || true
+  xcrun simctl spawn "$UDID" launchctl list 2>/dev/null | grep -i nmcp || echo "(app process not running)"
+  curl -s -m 3 "http://localhost:$PORT/readyz" || echo "(stub not reachable from host)"
+}
+fail() { echo "E2E FAIL: $*"; diagnose; exit 1; }
 
 log "fixtures"
 python3 -I - "$WORK/fixtures" <<'PY'
@@ -75,7 +87,7 @@ xcrun simctl privacy "$UDID" grant photos "$BUNDLE"
 
 launch() {
   xcrun simctl terminate "$UDID" "$BUNDLE" >/dev/null 2>&1 || true
-  xcrun simctl launch "$UDID" "$BUNDLE" \
+  xcrun simctl launch --stdout="$WORK/app-stdout.log" --stderr="$WORK/app-stderr.log" "$UDID" "$BUNDLE" \
     -nmcp.uploader.serverUrl "http://localhost:$PORT" \
     -nmcp.uploader.wifiOnly '<false/>' \
     -nmcp.uploader.autoUpload '<true/>' >/dev/null
