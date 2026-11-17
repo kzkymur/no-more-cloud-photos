@@ -73,7 +73,16 @@ trap 'kill $STUB 2>/dev/null || true; [ -n "${UDID:-}" ] && xcrun simctl shutdow
 for _ in $(seq 50); do curl -fs "http://localhost:$PORT/readyz" >/dev/null && break; sleep 0.2; done
 
 log "simulator"
-RUNTIME=$(xcrun simctl list runtimes -j | python3 -I -c 'import json,sys; r=[x for x in json.load(sys.stdin)["runtimes"] if x["platform"]=="iOS" and x["isAvailable"]]; print(sorted(r,key=lambda x:[int(p) for p in x["version"].split(".")])[-1]["identifier"])')
+# Prefer the newest iOS 18.x runtime: on iOS 26 simulators `simctl privacy grant photos`
+# only yields "add only" access and PhotoKit shows the full-access sheet, which CI
+# cannot answer. Override with E2E_IOS_RUNTIME=<runtime identifier>.
+RUNTIME=${E2E_IOS_RUNTIME:-$(xcrun simctl list runtimes -j | python3 -I -c '
+import json, sys
+r = [x for x in json.load(sys.stdin)["runtimes"] if x["platform"] == "iOS" and x["isAvailable"]]
+key = lambda x: [int(p) for p in x["version"].split(".")]
+pref = [x for x in r if x["version"].startswith("18.")]
+print(sorted(pref or r, key=key)[-1]["identifier"])')}
+xcrun simctl list runtimes | grep -i ios || true
 # A device type the runtime supports: take it from the runner's preinstalled devices.
 DEVICE=$(xcrun simctl list devices available -j | python3 -I -c 'import json,sys; d=json.load(sys.stdin)["devices"].get(sys.argv[1],[]); i=[x["deviceTypeIdentifier"] for x in d if "iPhone" in x["name"] and "SE" not in x["name"]]; print(i[0] if i else "")' "$RUNTIME")
 [ -n "$DEVICE" ] || DEVICE=com.apple.CoreSimulator.SimDeviceType.iPhone-16
@@ -85,24 +94,22 @@ xcrun simctl addmedia "$UDID" "$F"/nmcp-e2e-*
 xcrun simctl install "$UDID" "$APP"
 grant_photos() {
   xcrun simctl privacy "$UDID" grant photos "$BUNDLE" || true
-  xcrun simctl privacy "$UDID" grant photos-add "$BUNDLE" || true
-  # simctl privacy has not always reached PhotoKit's read-write check on new runtimes:
-  # make sure TCC holds "allowed" (auth_value 2) for kTCCServicePhotos, then restart tccd.
   local tcc
   tcc="$(xcrun simctl getenv "$UDID" HOME 2>/dev/null || true)"
   tcc="${tcc:-$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data}/Library/TCC/TCC.db"
-  if [ -f "$tcc" ]; then
-    echo "TCC before: $(sqlite3 "$tcc" "select service||'='||auth_value from access where client='$BUNDLE'" | tr '\n' ' ')"
-    if [ "$(sqlite3 "$tcc" "select count(*) from access where client='$BUNDLE' and service='kTCCServicePhotos' and auth_value=2")" = 0 ]; then
-      sqlite3 "$tcc" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) values ('kTCCServicePhotos', '$BUNDLE', 0, 2, 2, 1, 0, strftime('%s','now'))" \
-        || { echo "TCC insert failed; schema:"; sqlite3 "$tcc" ".schema access"; }
-      xcrun simctl spawn "$UDID" launchctl kill TERM system/com.apple.tccd 2>/dev/null || true
-      sleep 2
-    fi
-    echo "TCC after:  $(sqlite3 "$tcc" "select service||'='||auth_value from access where client='$BUNDLE'" | tr '\n' ' ')"
-  else
-    echo "TCC.db not found at $tcc"
-  fi
+  [ -f "$tcc" ] && echo "TCC: $(sqlite3 "$tcc" "select service||'='||auth_value from access where client='$BUNDLE'" | tr '\n' ' ')" || true
+}
+# Best effort: if PhotoKit still shows its access sheet, press "Allow Full Access"
+# through the Simulator window (needs Accessibility for the runner; harmless if absent).
+accept_photos_sheet() {
+  osascript >/dev/null 2>&1 <<'OSA' || true
+tell application "System Events"
+  tell process "Simulator"
+    set btns to every button of (entire contents of front window) whose description is "Allow Full Access"
+    if (count of btns) > 0 then click item 1 of btns
+  end tell
+end tell
+OSA
 }
 grant_photos
 
@@ -113,6 +120,8 @@ launch() {
     -nmcp.uploader.wifiOnly '<false/>' \
     -nmcp.uploader.autoUpload '<true/>' \
     -nmcp.e2e.requestPhotoAccess YES >/dev/null
+  sleep 8
+  accept_photos_sheet
 }
 uploads() { python3 -I -c 'import json,sys; [print(l.strip()) for l in open(sys.argv[1]) if json.loads(l).get("event")=="upload"]' "$LOG"; }
 stored_fixture_shas() { python3 -I - "$LOG" <<'PY'
